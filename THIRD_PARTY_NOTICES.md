@@ -4,19 +4,11 @@ Last updated: 2026-05-01
 
 ## Scope note
 
-This file records the third-party notices Camelid currently needs to keep visible in source and
-release distributions.
+This file records the third-party notices Camelid currently needs to keep visible in source and release distributions.
 
-It is intentionally explicit rather than exhaustive today. Camelid should expand this notice set as
-the project adds more redistributed source, bundled binaries, shipped fixtures, or material
-third-party runtime and build dependencies. A broader dependency inventory may later live in a
-separate generated notice or SBOM workflow, but that future inventory does not replace the current
-obligation to preserve visible credit wherever Camelid's public evidence trail depends on external
-work.
+It is intentionally explicit rather than exhaustive today. Camelid should expand this notice set as the project adds more redistributed source, bundled binaries, shipped fixtures, or material third-party runtime and build dependencies. A broader dependency inventory may later live in a separate generated notice or SBOM workflow, but that future inventory does not replace the current obligation to preserve visible credit wherever Camelid's public evidence trail depends on external work.
 
-Practical rule: documentation cleanup, branding polish, or repository renaming must not remove
-third-party acknowledgement when public claims, parity evidence, tokenizer references, or reference
-benchmarks still depend on that external work.
+Practical rule: documentation cleanup, branding polish, or repository renaming must not remove third-party acknowledgement when public claims, parity evidence, tokenizer references, or reference benchmarks still depend on that external work.
 
 ## Current credited reference work
 

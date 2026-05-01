@@ -4,9 +4,9 @@
 
 ![Camelid banner](assets/camelid-banner.png)
 
-Camelid is a Rust-native local inference backend for GGUF language models. It is being built for teams that want a local-model stack whose claims can be audited: exact support rows, reproducible validation artifacts, and release language that never outruns the evidence.
+Camelid is a Rust-native local inference backend for GGUF language models. It is being built for teams that want a local-model stack they can audit: exact support rows, reproducible validation artifacts, and release language that does not outrun the evidence.
 
-Most local-inference READMEs optimize for breadth. Camelid optimizes for credibility. A row is not "supported" because metadata parses, a tokenizer round-trips, or a prompt partially runs once. Camelid promotes a row only when runtime behavior, API capability reporting, frontend readiness, documentation, and artifact-backed validation all agree for the exact model, tokenizer path, and quantization being claimed.
+Many local-inference projects optimize for breadth of apparent compatibility. Camelid is being built to optimize for decision-grade trust. A row is not "supported" because metadata parses, a tokenizer round-trips, or a prompt partially works once. Camelid promotes a row only when runtime behavior, API capability reporting, frontend readiness, documentation, and artifact-backed validation all agree for the exact model, tokenizer path, and quantization being claimed.
 
 Camelid is also mid-transition in naming. **Camelid** is the product name; the repository, crate, binary, some API diagnostics, and several scripts still use `backendinference`. Keep current commands, package identifiers, and tests on those names until a separate rename plan is validated.
 
@@ -26,7 +26,7 @@ Nothing adjacent inherits support. Model family, quantization, tokenizer path, A
 
 ## Current support ledger
 
-This four-row ledger is the front door for the product. The same boundary should appear in [`COMPATIBILITY.md`](COMPATIBILITY.md), [`STATUS.md`](STATUS.md), `/api/capabilities`, and frontend readiness copy. If another surface sounds broader, treat it as stale and bring it back to this matrix.
+This four-row ledger is Camelid's front door. The same boundary should appear in [`COMPATIBILITY.md`](COMPATIBILITY.md), [`STATUS.md`](STATUS.md), `/api/capabilities`, and frontend readiness copy. If another surface sounds broader, treat it as stale and bring it back to this matrix.
 
 | Exact lane | Release posture | Evidence Camelid has today | What Camelid does **not** yet claim |
 | --- | --- | --- | --- |
@@ -44,7 +44,7 @@ For most readers, the fastest path is:
 3. [`ROADMAP.md`](ROADMAP.md) — the ordered path to the next support expansion.
 4. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — the reference-tool and MIT-license notices behind Camelid's public evidence trail.
 
-## Release discipline
+## Why the release language is strict
 
 Camelid is being built as a dependable local-model backend, not as a broad compatibility claim padded with caveats. If a skeptical reviewer could not trace a statement back to exact, row-specific artifacts, Camelid should not publish that statement yet.
 

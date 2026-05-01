@@ -2,11 +2,13 @@
 
 Last updated: 2026-05-01
 
-`COMPATIBILITY.md` is Camelid's release-language authority. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
+`COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
 
-Use this document to answer one release question: **may Camelid honestly say this exact lane is supported yet?** If a claim cannot be mapped to a specific row here, it should not appear in product copy, UI language, API readiness text, or release messaging. Product, docs, QA, backend, and frontend should all reduce their public support language to this ledger before anything ships.
+Use this document to answer one release question: **may Camelid honestly say this exact lane is supported yet?** If a claim cannot be mapped to a specific row here, it should not appear in product copy, UI language, API readiness text, or release messaging.
 
-## Release-language definitions
+Practical reading rule: if a statement cannot be reduced to an exact row in this file, Camelid should not publish that statement as product truth.
+
+## How to use this matrix
 
 Treat the labels below as release language, not implementation optimism:
 
@@ -17,7 +19,7 @@ Treat the labels below as release language, not implementation optimism:
 
 ## Current release posture
 
-Camelid's public support language is intentionally narrow, evidence-bound, and easy to audit. The rows below are the entire release posture Camelid may claim today, and every public surface should reduce back to this same ledger.
+Camelid's public support language is intentionally narrow, evidence-bound, and easy to audit. For executive review, the current answer is short:
 
 - **Supported generation gate:** TinyLlama 1.1B Chat Q8_0 is the only supported generation lane today. Camelid matches known-good llama-server behavior across the five-prompt, 50-token TinyLlama audit, including prompt token IDs, generated token arrays, and generated text.
 - **Evidence-only lane:** Llama 3.2 1B Instruct Q8_0 has one compact-header `hello` prompt that matches llama.cpp for five deterministic generated tokens. That is useful evidence, not broader Llama 3 support.
@@ -27,14 +29,14 @@ Camelid's public support language is intentionally narrow, evidence-bound, and e
 
 ## Governing rules
 
-Two rules apply across every support row and every public surface:
+Two rules keep this matrix honest across docs, API signals, and UI copy:
 
 - **Support rule:** nothing adjacent inherits support across model size, quantization, tokenizer lane, API surface, or frontend state.
 - **Credit rule:** visible llama.cpp / ggml acknowledgement and the MIT notice remain part of parity-backed release claims.
 
 README, `STATUS.md`, `/api/capabilities`, and frontend readiness copy should continue to mirror this exact ledger. `/api/capabilities` exposes the same compatibility rows as `model_compatibility`; read each row literally. Metadata parsing does not imply tokenizer parity, tokenizer parity does not imply generation, tensor loading does not imply safe execution, and one supported row must never lend support to adjacent model sizes or quantizations.
 
-Executive summary: TinyLlama Q8_0 is the live supported gate; Llama 3.2 1B is a useful but narrow evidence row; Llama 3.2 3B is the chosen next acceptance target but remains blocked before first-token evidence; and Llama 3 8B is still groundwork only until its own bounded runtime artifacts exist.
+In plain terms: TinyLlama Q8_0 is the live supported gate; Llama 3.2 1B is a narrow evidence row; Llama 3.2 3B is the chosen next acceptance target but remains blocked before first-token evidence; and Llama 3 8B is still groundwork only until its own bounded runtime artifacts exist.
 
 ## Current release ledger
 

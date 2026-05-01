@@ -2,13 +2,17 @@
 
 Last updated: 2026-05-01
 
-`STATUS.md` is Camelid's current release-evidence checkpoint. It answers three questions: **what can Camelid prove today, what changed recently, and what still blocks the next support move?** Treat it as a snapshot, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md). Read it as the current evidence and blocker record, not as aspiration.
+`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
+
+Use this file to answer three practical questions: what is supported now, what changed recently, and what still blocks the next support move?
 
 Executive summary: runtime capability improved at the blocker seam, but the public support boundary did not move.
 
 ## Release ledger snapshot
 
-Camelid follows the same four-lane release ledger across the README, compatibility matrix, API capability reporting, and frontend readiness copy. If another surface sounds broader, treat it as stale and bring it back to this ledger. The purpose of this file is straightforward: record exactly what the current evidence can defend, no more and no less.
+Camelid follows the same four-lane release ledger across the README, compatibility matrix, API capability reporting, and frontend readiness copy. If another surface sounds broader, treat it as stale and bring it back to this ledger. The purpose of this file is simple: record exactly what the current evidence can defend, no more and no less.
+
+For a fast read, the current answer is:
 
 - **Supported generation gate:** TinyLlama 1.1B Chat Q8_0 remains the only supported end-to-end generation lane.
 - **Evidence-only lane:** Llama 3.2 1B Instruct Q8_0 remains narrow evidence only.

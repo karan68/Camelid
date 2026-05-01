@@ -8,6 +8,8 @@ Last updated: 2026-05-01
 
 Executive summary: Camelid already has one supported release gate. This roadmap exists to earn the next exact row without relaxing the evidence standard or letting implementation progress outrun public claims.
 
+Practical reading rule: if a task does not protect the current gate, remove the next exact blocker, or prepare aligned support-language updates, it is secondary to this roadmap.
+
 ## Program objective
 
 Camelid is not pursuing breadth for its own sake. The roadmap exists to expand capability only when the product can expand claims just as responsibly and defend them with row-specific evidence.
