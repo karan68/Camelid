@@ -18,7 +18,7 @@ Current program posture:
 
 - **Supported generation gate:** TinyLlama 1.1B Chat Q8_0 is the only supported end-to-end generation lane.
 - **Evidence-only lane:** Llama 3.2 1B Instruct Q8_0 has narrow parity evidence and remains below supported generation.
-- **Acceptance target:** Llama 3.2 3B Instruct Q8_0 is the exact next WebUI real-chat target. The exact GGUF now loads through `/api/models/load` with low backend RSS after streaming metadata parsing, but the guarded first-chat retry still stops before any generated token under host free-page pressure, so the row remains blocked until bounded prompt-token, generation, and memory evidence exist.
+- **Acceptance target:** Llama 3.2 3B Instruct Q8_0 is the exact next WebUI real-chat target. The exact GGUF now loads through `/api/models/load` with low backend RSS after streaming metadata parsing, and one healthy Ubuntu backend-only first-token artifact exists, but the row remains blocked until repeat bounded prompt-token, parity, API, WebUI, and memory evidence exist.
 - **Groundwork-only lane:** Llama 3 8B Instruct Q8_0 has tokenizer/config/Q8 groundwork only. It is not a supported generation row until lazy or on-demand Q8 execution exists and bounded parity and memory evidence are captured.
 - **Explicit non-claim:** no Llama 3-family row is a supported generation lane today.
 
@@ -40,7 +40,7 @@ Recent work improved the engineering seam without moving the release ledger. Tha
 
 - TinyLlama Q8_0 remains the trusted release gate.
 - Llama 3.2 1B Q8_0 remains informative evidence only.
-- Llama 3.2 3B Q8_0 now has the exact local GGUF and successful metadata/load behavior with low backend RSS after streaming metadata parsing, but still no promotable generated-token evidence because the guarded first chat stops before any token under host free-page pressure.
+- Llama 3.2 3B Q8_0 now has the exact local GGUF, successful metadata/load behavior with low backend RSS after streaming metadata parsing, and one healthy Ubuntu backend-only first-token artifact, but still no promotable exact-row support evidence because repeat bounded success, parity, API, and WebUI evidence are not in hand yet.
 - Llama 3 8B Q8_0 now has retained-Q8 groundwork and lazy-linear building blocks, but the runtime seam is not yet wired through attention, FFN, and output projection.
 
 Near-term objective: preserve the supported TinyLlama lane, finish the lazy-Q8 execution seam for larger LLaMA-family rows, and publish no broader support claim until row-specific evidence is in hand.

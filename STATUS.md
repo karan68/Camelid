@@ -16,7 +16,7 @@ For a fast read, the current answer is:
 
 - **Supported generation gate:** TinyLlama 1.1B Chat Q8_0 remains the only supported end-to-end generation lane.
 - **Evidence-only lane:** Llama 3.2 1B Instruct Q8_0 remains narrow evidence only.
-- **Acceptance target:** Llama 3.2 3B Instruct Q8_0 remains the exact WebUI target. The exact GGUF now loads through `/api/models/load` with low backend RSS, and one healthy Ubuntu backend-only probe produced a first token, but support remains frozen until repeat bounded success plus prompt-token/parity/short-generation/API/WebUI evidence exists.
+- **Acceptance target:** Llama 3.2 3B Instruct Q8_0 remains the exact WebUI target. The exact GGUF now loads successfully through `/api/models/load` with low backend RSS, and one healthy Ubuntu backend-only probe produced a first token, but support remains frozen until repeat bounded success plus prompt-token/parity/short-generation/API/WebUI evidence exists.
 - **Groundwork-only lane:** Llama 3 8B Instruct Q8_0 remains below supported generation until lazy or on-demand Q8 execution and bounded parity and memory evidence exist.
 - **Explicit non-claim:** no Llama 3-family row is a supported generation lane today.
 
@@ -35,7 +35,7 @@ Recent work improved the blocker seam without changing the release ledger:
 
 - TinyLlama Q8_0 remains the trusted supported gate.
 - Llama 3.2 1B Q8_0 remains informative evidence only.
-- Llama 3.2 3B Q8_0 now has successful metadata/API load behavior with low backend RSS after streaming metadata parsing, file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike, and one healthy Ubuntu backend-only first-token success artifact.
+- Llama 3.2 3B Q8_0 now has exact-GGUF metadata/API load success with low backend RSS after streaming metadata parsing, file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike, and one healthy Ubuntu backend-only first-token success artifact.
 - Llama 3 8B Q8_0 remains groundwork-only until lazy or on-demand execution is wired through attention, FFN, and output projection and then validated with bounded artifacts.
 
 Bottom line: the engineering seam moved forward, but no new support claim was earned.
@@ -84,7 +84,7 @@ Status: **acceptance target / first-token evidence only**
 Current evidence boundary:
 
 - The exact tracked GGUF is present locally.
-- Metadata and `/api/models/load` behavior work with low backend RSS after streaming metadata parsing.
+- The exact tracked GGUF loads through `/api/models/load` with low backend RSS after streaming metadata parsing.
 - Recent file-backed lazy-Q8 recovery materially reduced the older eager dense-load spike.
 - One healthy Ubuntu backend-only `/v1/completions` probe produced a first token for prompt `hello` with `max_tokens=1`, `temperature=0`, and the required forward trace through `layer_0_attention_q_done`.
 

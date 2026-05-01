@@ -19,9 +19,9 @@ If you are evaluating Camelid quickly, this is the current release boundary:
 - **Supported generation today:** TinyLlama 1.1B Chat Q8_0.
 - **Real Llama 3-family breakthrough, not a support expansion:** Camelid now has materially better Llama 3-family mechanics and evidence than it did before.
   - **1B evidence:** Llama 3.2 1B Instruct Q8_0 has one compact-header `hello` prompt that matches llama.cpp for five deterministic generated tokens.
-  - **3B load breakthrough:** the exact tracked Llama 3.2 3B Instruct Q8_0 GGUF now loads through `/api/models/load` with low backend RSS after streaming metadata parsing plus lazy/file-backed Q8 handling.
+  - **3B blocker-seam breakthrough:** the exact tracked Llama 3.2 3B Instruct Q8_0 GGUF now loads through `/api/models/load` with low backend RSS after streaming metadata parsing plus lazy/file-backed Q8 handling, and one healthy Ubuntu backend-only first-token artifact now exists.
   - **8B groundwork:** Llama 3 8B Instruct Q8_0 now has tokenizer/config/Q8 groundwork plus lazy-execution building blocks.
-- **Public support contract stays unchanged:** 1B remains evidence-only, 3B remains blocked before first token, 8B remains groundwork-only, and no Llama 3-family row is a supported generation lane today.
+- **Public support contract stays unchanged:** 1B remains evidence-only, 3B remains an acceptance target with first-token evidence only, 8B remains groundwork-only, and no Llama 3-family row is a supported generation lane today.
 
 Nothing adjacent inherits support. The same family is not enough. The same quantization is not enough. The same tokenizer path is not enough. Camelid treats every public claim as row-specific.
 
@@ -33,7 +33,7 @@ This four-row ledger is Camelid's front door. The same boundary should appear in
 | --- | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | Supported current gate | Five 50-token prompt audits match known-good llama-server prompt token IDs, generated token arrays, and generated text. | No implied support for adjacent TinyLlama quantizations or other model families. |
 | Llama 3.2 1B Instruct Q8_0 | Evidence only | One compact-header `hello` prompt matches llama.cpp for five deterministic generated tokens. | No broader Llama 3 support claim, no longer-prompt claim, and no neighboring 3B or 8B promotion. |
-| Llama 3.2 3B Instruct Q8_0 | Acceptance target / blocked before first token | The exact tracked GGUF is present locally; `/api/models/load` succeeds with low backend RSS after streaming metadata parsing; file-backed lazy-Q8 materially reduced the earlier eager dense-load spike. | No 3B prompt-token, generation, parity, API, or WebUI readiness claim until bounded evidence exists. |
+| Llama 3.2 3B Instruct Q8_0 | Acceptance target / first-token evidence only | The exact tracked GGUF is present locally; `/api/models/load` succeeds with low backend RSS after streaming metadata parsing; file-backed lazy-Q8 materially reduced the earlier eager dense-load spike; one healthy Ubuntu backend-only `/v1/completions` probe returned a first token for `hello`. | No 3B prompt-token parity, repeat generation, API readiness, or WebUI readiness claim until bounded exact-row evidence exists. |
 | Llama 3 8B Instruct Q8_0 | Groundwork only / generation blocked | Metadata, tokenizer/config fixtures, independent tokenizer references, and Q8_0 retained-block loading plus serial row/all-row lazy-execution groundwork exist. | No supported generation, parity, frontend readiness, or portable-packaging claim until lazy or on-demand Q8 execution and bounded memory/parity evidence exist. |
 
 ## Start here
@@ -85,7 +85,7 @@ The separate fixed-audit `multiline` row also matches, but it stops at EOS after
 Every Llama 3-family row remains below supported generation today. These notes are current boundary statements, not near-term promises.
 
 - **Llama 3.2 1B Instruct Q8_0:** one compact-header `hello` prompt matches llama.cpp for five deterministic generated tokens `[9906,0,2650,649,358]` / `"Hello! How can I"`. This is narrow evidence, not a support promotion.
-- **Llama 3.2 3B Instruct Q8_0:** the exact tracked GGUF is present locally, and metadata/API load now works with low backend RSS after streaming metadata parsing. Recent file-backed lazy-Q8 recovery materially reduced the old eager dense-load spike, but the guarded first-chat retry still stopped before any token under host free-page pressure. See [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md) and [`STATUS.md`](STATUS.md) for the exact blocker state.
+- **Llama 3.2 3B Instruct Q8_0:** the exact tracked GGUF is present locally, metadata/API load now works with low backend RSS after streaming metadata parsing, and one healthy Ubuntu backend-only first-token artifact now exists. Recent file-backed lazy-Q8 recovery materially reduced the old eager dense-load spike, but the row is still blocked on repeat bounded success plus prompt-token parity, short-generation parity, API evidence, and WebUI evidence. See [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md) and [`STATUS.md`](STATUS.md) for the exact blocker state.
 - **Llama 3 8B Instruct Q8_0:** metadata/config handling, GQA/RoPE guardrails, tokenizer/template fixtures, independent llama.cpp tokenizer references, and Q8_0 block-only retained-weight groundwork are in place. Generation remains blocked until lazy or on-demand Q8_0 linear execution is wired through attention, FFN, and output projection, then validated with bounded first-token parity and memory evidence.
 
 Fresh tokenizer revalidations and standalone Q8 block benchmarks are seam evidence only. They do not, by themselves, promote a generation-support claim.
@@ -181,7 +181,7 @@ node scripts/small-model-readiness.mjs \
   --markdown-out target/small-model-readiness.md
 ```
 
-The readiness gate inspects each present manifest GGUF with `backendinference inspect`, binds LLaMA metadata/tensor shapes, chooses the current tokenizer/template lane, estimates eager `f32` plus retained-source CPU materialization against `BACKENDINFERENCE_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`, and reports whether the existing TinyLlama or Llama 3 parity harness is safe to run. A `load_and_generation_candidate` row is only an inventory/readiness result; it still needs target-specific deterministic parity evidence before support changes. The exact 3B WebUI acceptance target is tracked separately in [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md); even with the exact GGUF now present at the tracked model-dir path, the row remains blocked until bounded generation and parity evidence exist.
+The readiness gate inspects each present manifest GGUF with `backendinference inspect`, binds LLaMA metadata/tensor shapes, chooses the current tokenizer/template lane, estimates eager `f32` plus retained-source CPU materialization against `BACKENDINFERENCE_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`, and reports whether the existing TinyLlama or Llama 3 parity harness is safe to run. A `load_and_generation_candidate` row is only an inventory/readiness result; it still needs target-specific deterministic parity evidence before support changes. The exact 3B WebUI acceptance target is tracked separately in [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md); even with exact-GGUF load success and one backend-only first-token artifact, the row remains blocked until repeat bounded generation, parity, API, and WebUI evidence exist.
 
 ## Frontend
 

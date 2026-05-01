@@ -1,6 +1,6 @@
 # Llama 3.2 3B Instruct Q8_0 Parity Acceptance
 
-Last updated: 2026-04-30
+Last updated: 2026-05-01
 
 > [!NOTE]
 > This QA checklist is an acceptance document for one exact model row. It does not change the
@@ -18,16 +18,17 @@ QA checklist for the exact Llama 3.2 3B WebUI real-chat acceptance gate.
 - **Expected size from earlier HEAD check:** `3,421,899,296 bytes` (`3.187 GiB`)
 - **Earlier HEAD ETag/Xet hash:** `291ce1d4ca0fcef86407b7c6531bf85a1c348c65d5d3c69c57c98fec6483bb1f`
 
-Current state: the exact GGUF is now present at the expected model-dir path, and Camelid metadata/API
-load evidence exists. The blocker has moved from artifact presence to safe first-token execution.
+Current state: the exact GGUF is now present at the expected model-dir path, Camelid metadata/API
+load evidence exists, and one healthy Ubuntu backend-only first-token artifact now exists. The
+blocker has moved from artifact presence to repeat bounded parity/API/WebUI acceptance.
 
 ## Current blocker summary
 
 - `/api/models/load` succeeds for the exact 3B target.
 - The latest file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike.
-- The guarded first-chat retry still stopped before any generated token.
-- Therefore the row remains blocked before prompt-token parity, first-token parity, short
-  generation parity, API chat acceptance, and WebUI acceptance.
+- One healthy Ubuntu backend-only `/v1/completions` probe returned a first token for `hello`.
+- Therefore the row remains blocked before repeat bounded success, prompt-token parity,
+  first-token parity, short generation parity, API chat acceptance, and WebUI acceptance.
 
 ## Disk and memory expectations
 
@@ -54,8 +55,8 @@ Do not mark the 3B row green until all applicable items have artifact paths.
 
 ## Current status
 
-Status: **blocked before first generated token**
+Status: **acceptance target / first-token evidence only**
 
 The exact 3B artifact now exists, so older missing-artifact notes are historical only. The current
-work is to turn the reduced memory spike into bounded prompt-token and generated-token evidence
-without changing the support contract early.
+work is to turn exact-GGUF load success plus the single first-token artifact into repeat bounded
+prompt-token, parity, API, and WebUI evidence without changing the support contract early.
