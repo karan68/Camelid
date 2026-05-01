@@ -2,11 +2,11 @@
 
 Last updated: 2026-05-01
 
-`COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document sounds broader, this file wins.
+`COMPATIBILITY.md` is Camelid's single source of truth for support language. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document sounds broader, this file wins.
 
 Use this document to answer one release question: **may Camelid honestly say this exact lane is supported yet?** If a claim cannot be mapped to a specific row here, it should not appear in product copy, UI language, API readiness text, or release messaging. In practice, this is the source of truth product, docs, QA, backend, and frontend should reduce to before changing any public support language.
 
-## Status labels
+## Release-language definitions
 
 Treat the labels below as release language, not implementation optimism:
 

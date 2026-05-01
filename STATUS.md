@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-01
 
-`STATUS.md` is Camelid's current release-evidence snapshot. It answers three questions: **what can Camelid prove today, what changed recently, and what still blocks the next support move?** Treat it as a snapshot, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md). Read it as evidence and blocker state, not as aspiration.
+`STATUS.md` is Camelid's current release-evidence checkpoint. It answers three questions: **what can Camelid prove today, what changed recently, and what still blocks the next support move?** Treat it as a snapshot, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md). Read it as evidence and blocker state, not as aspiration.
 
 Executive summary: runtime capability improved at the blocker seam, but the public support boundary did not move.
 
@@ -108,7 +108,7 @@ Representative artifacts:
 
 ### Docs professionalism pass
 
-The top-level documentation set was tightened for executive readability, hierarchy, and release consistency without changing support truth. `README.md`, `COMPATIBILITY.md`, `ROADMAP.md`, and `STATUS.md` remain the public sources of truth. Visible llama.cpp / ggml acknowledgement and the MIT notice remain intact wherever reference tooling and parity evidence depend on them, and recon/planning docs continue to carry explicit note banners.
+The top-level documentation set was tightened for executive readability, hierarchy, and release consistency without changing support truth. `README.md`, `COMPATIBILITY.md`, `ROADMAP.md`, and `STATUS.md` remain the public sources of truth. The README now pairs the front-door support ledger with a clearer reading order, while visible llama.cpp / ggml acknowledgement and the MIT notice remain intact wherever reference tooling and parity evidence depend on them. Recon and planning docs continue to carry explicit note banners.
 
 ### Llama 3.2 3B lazy-Q8 recovery
 

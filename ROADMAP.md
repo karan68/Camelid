@@ -46,7 +46,7 @@ This section is the highest-level delivery sequence. "Now" protects the current 
 
 ### Now
 
-Protect the one supported lane and finish the engineering seam most likely to produce the next honest promotion artifact.
+Protect the supported lane and finish the engineering seam most likely to produce the next honest promotion artifact.
 
 - Protect the validated TinyLlama Q8_0 gate.
 - Land lazy or on-demand Q8 execution for larger LLaMA-family rows.

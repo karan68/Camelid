@@ -46,6 +46,15 @@ Three rules govern implementation work and public communication:
 
 For the governing support ledger, see [`COMPATIBILITY.md`](COMPATIBILITY.md). For the current evidence snapshot and blockers, see [`STATUS.md`](STATUS.md). For milestone sequencing, see [`ROADMAP.md`](ROADMAP.md).
 
+## Recommended reading order
+
+For most readers, the fastest path through the repository is:
+
+1. [`COMPATIBILITY.md`](COMPATIBILITY.md) — the authoritative support ledger.
+2. [`STATUS.md`](STATUS.md) — the current evidence boundary, blocker state, and artifact references.
+3. [`ROADMAP.md`](ROADMAP.md) — the ordered path to the next support expansion.
+4. [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — the reference-tool and MIT-license notices behind Camelid's public evidence trail.
+
 ## What Camelid can prove today
 
 ### TinyLlama 1.1B Chat Q8_0
