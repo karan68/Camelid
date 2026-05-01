@@ -135,6 +135,17 @@ Recommendation for the next SafeTensors slice:
 
 This is intentionally not a runtime support claim. It gives Camelid a clean model-source seam while Backend/Performance continue the current GGUF Llama 3 lazy-Q8 execution lane.
 
+## 2026-05-01 Current-Head Check
+
+Fresh inspection on `main` at `231d7e1` keeps the same recommendation, and the current code shape still supports it cleanly:
+
+- `src/api/mod.rs` is still explicitly GGUF-shaped at load time: `LoadedModel` stores `path`, `GgufFile`, optional `LlamaModelConfig`, optional `LlamaTensorBinding`, and tokenizer state. That is the exact seam to split into `source manifest/readiness` plus `runtime-ready loaded model` later.
+- `src/model.rs` still has the two most reusable extraction points: `LlamaModelConfig::from_gguf` for architecture/hparam lifting and `LlamaTensorBinding::bind` for dense LLaMA tensor-role binding/shape validation. A SafeTensors lane should add HF-side constructors/mappers beside these, not inside the GGUF reader.
+- `src/tensor/mod.rs` still materializes into `CpuTensor` and already preserves source-type diagnostics plus optional Q8/file-backed metadata. That makes initial SafeTensors F32/F16/BF16 decode into `CpuTensor` a low-risk fit without touching active lazy-Q8 runtime work.
+- `src/tokenizer/mod.rs` now supports the current GGUF LLaMA SPM plus GPT-2/BPE `llama-bpe` lane, but it is still GGUF-metadata-driven. Hugging Face `tokenizer.json` should remain a separate adapter/readiness lane instead of being forced through the GGUF tokenizer path.
+
+Recommended next safe milestone is still docs/test-first: add a tiny `ModelSourceManifest` / `ModelSourceReadiness` module and fixture coverage for local HF directory detection plus `config.json` / SafeTensors header parsing, while keeping `generation_ready=false` and leaving `/api/models/load` GGUF behavior unchanged.
+
 ## Recommended Rust Crates / APIs
 
 - `safetensors` (`0.7.0` current crates.io default as of 2026-04-28): use `safetensors::SafeTensors::deserialize` / tensor views for safe header parsing and per-tensor byte slices. Prefer read-only mmap-backed byte storage for large files; copy/decode into Camelid CPU tensors only at the runtime boundary.
