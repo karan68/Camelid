@@ -1,0 +1,951 @@
+import { useEffect, useMemo, useState } from 'react'
+import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, formatCapabilityStatus, isSupportedCapabilityStatus } from '../lib/capabilities'
+import { formatBytes, formatCompactNumber } from '../lib/formatters'
+import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, isRunnableModel } from '../lib/modelState'
+
+const FILTERS = [
+  { key: 'all', label: 'Everything' },
+  { key: 'installed', label: 'Local / loaded' },
+  { key: 'external', label: 'Hosted links' },
+  { key: 'imported', label: 'Imported' },
+  { key: 'downloading', label: 'Downloading' },
+  { key: 'attention', label: 'Needs attention' },
+]
+
+const CATALOG_PAGE_SIZE = 18
+
+const LLAMA32_3B_ACCEPTANCE_TARGET = {
+  id: 'llama-3.2-3b-instruct-q8',
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  model_path: '$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  runtime_model_name: 'llama-3.2-3b-instruct-q8',
+  source: 'bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  provider_kind: 'local',
+  status: 'registered',
+  engine: 'backendinference',
+  quant: 'Q8_0',
+  size_gb: '3.19',
+  loaded_now: false,
+  generation_ready: false,
+  load_error: 'Exact GGUF is not present locally yet, so no 3B prompt-token, first-token, short-generation, API, or WebUI chat evidence exists. Even after the file arrives, Camelid may still keep generation_ready=false or raise cpu_weight_materialization_exceeds_budget until the lazy/on-demand Q8 path lands.',
+  backendinference: {
+    active: false,
+    loaded_now: false,
+    generation_ready: false,
+    tokenizer_status: null,
+    tokenizer_model: null,
+    tensor_ready: false,
+    config_ready: false,
+  },
+}
+
+function getGroupKey(model, runtime) {
+  if (runtime?.active_model_id === model.id) return 'installed'
+  if (model.load_error || model.install_error) return 'attention'
+  if (isExternalModel(model)) return model.status === 'ready' ? 'external' : 'attention'
+  if (model.status === 'failed' || ((model.status === 'ready' || model.status === 'registered') && !model.model_path)) return 'attention'
+  if (model.status === 'ready' && model.model_path) return 'installed'
+  if (model.status === 'registered') return 'imported'
+  if (model.status === 'downloading' || model.status === 'canceling') return 'downloading'
+  if (model.status === 'not_installed') return 'catalog'
+  return 'attention'
+}
+
+function formatModelMeta(model) {
+  if (isExternalModel(model)) {
+    return [model.source || 'External API', model.runtime_model_name || 'Remote model'].filter(Boolean).join(' · ')
+  }
+  return [model.size_gb ? `${model.size_gb} GB` : null, model.quant || null, model.engine || null].filter(Boolean).join(' · ')
+}
+
+function formatModelOrigin(model) {
+  if (isExternalModel(model)) return 'Connected through an external OpenAI-compatible API.'
+  if (model.status === 'registered') return 'Imported from a local GGUF file and waiting for its first successful load.'
+  if (model.status === 'downloading') return 'Downloading into Camelid-managed storage.'
+  if (model.status === 'canceling') return 'Stopping the download and cleaning up the partial file.'
+  if (model.hf_repo) return 'Tracked from the public Hugging Face GGUF catalog.'
+  return 'Stored locally on this device.'
+}
+
+function formatDownloadCopy(model) {
+  if (model.status === 'canceling') return 'Canceling…'
+  if (model.status === 'downloading' && model.bytes_downloaded) {
+    return `${formatBytes(model.bytes_downloaded)} / ${formatBytes(model.total_bytes)}`
+  }
+  return `${model.progress || 0}%`
+}
+
+function findCatalogMatch(models, item) {
+  return models.find((model) => model.hf_repo === item.repo_id && model.hf_filename === item.filename)
+}
+
+function matchesLlama32ThreeBTarget(model) {
+  const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path].filter(Boolean).join(' ').toLowerCase()
+  return model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
+    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+    || /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
+    || /llama[\s._-]*32[\s._-]*3b/.test(subject)
+}
+
+function formatRemoteMeta(item) {
+  return [
+    item.license ? item.license.toUpperCase() : 'Public repo',
+    item.size_bytes ? `${formatBytes(item.size_bytes)} download` : 'Size checks before download',
+    `${formatCompactNumber(item.downloads)} downloads`,
+    `${formatCompactNumber(item.likes)} likes`,
+  ].join(' · ')
+}
+
+function formatCatalogTitle(item) {
+  const suffix = ` (${item.quant})`
+  return item.name.endsWith(suffix) ? item.name.slice(0, -suffix.length) : item.name
+}
+
+function normalizeCapabilityKey(value) {
+  return (value || '').toString().trim().toUpperCase().replace(/[^A-Z0-9]+/g, '')
+}
+
+function findSupportItem(items = [], value) {
+  const normalizedValue = normalizeCapabilityKey(value)
+  if (!normalizedValue) return null
+  return items.find((item) => item.id.split('/').some((part) => normalizeCapabilityKey(part) === normalizedValue)) || null
+}
+
+function getQuantCapability(capabilities, quant) {
+  if (!quant) return null
+  const supported = findSupportItem(capabilities?.supported_quantization, quant)
+  if (supported) return { ...supported, lane: 'supported' }
+  const planned = findSupportItem(capabilities?.planned_quantization, quant)
+  if (planned) return { ...planned, lane: 'planned' }
+  return null
+}
+
+function quantCapabilityLabel(capability, quant) {
+  if (!quant) return 'Quant unknown'
+  if (!capability) return `${quant}: not advertised`
+  return `${quant}: ${formatCapabilityStatus(capability.status)}`
+}
+
+function quantCapabilityCopy(capability, quant) {
+  if (!quant) return 'No quantization label was returned for this model, so Camelid will only trust the GGUF load/readiness result.'
+  if (!capability) return `${quant} is not advertised by /api/capabilities; keep it disabled/guarded until COMPATIBILITY.md gains evidence for this lane.`
+  if (capability.lane === 'planned') return `${capability.id} is planned, not supported yet: ${capability.notes}. Expect a typed backend refusal until implementation and evidence land.`
+  return `${capability.id} is advertised as ${formatCapabilityStatus(capability.status)}: ${capability.notes}.`
+}
+
+function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
+  const quant = model?.quant || catalogItem?.quant || ''
+  const quantCapability = getQuantCapability(capabilities, quant)
+  const compatibilityHint = findCompatibilityHint(capabilities, model, catalogItem)
+
+  return (
+    <div className="models-card-copy-stack models-capability-evidence" aria-label="Capability evidence boundary">
+      <p className="model-summary"><b>Quant support:</b> {quantCapabilityLabel(quantCapability, quant)}. {quantCapabilityCopy(quantCapability, quant)}</p>
+      <p className="model-summary"><b>Family support:</b> {compatibilityHintLabel(compatibilityHint, 'Family not matched to a support row')}. {compatibilityHintCopy(compatibilityHint)}</p>
+    </div>
+  )
+}
+
+function getNextStepCopy(model, { active, selected, runnable, generationReady } = {}) {
+  if (!model) return 'Pick a model for the next chat or load one now.'
+  if (active && generationReady) return 'Already loaded and ready to answer immediately.'
+  if (active) return 'Loaded now, but Camelid still reports generation_ready=false. Check tokenizer/config/tensor readiness and the CPU materialization budget guard before treating this as a UI issue.'
+  if (model.load_error || model.install_error) return 'Fix the local path or retry Load now; Camelid will report the exact backend error.'
+  if (model.status === 'downloading') return 'Wait for the download to finish before loading it, or cancel it if it is the wrong model.'
+  if (model.status === 'canceling') return 'Camelid is stopping this download.'
+  if (model.status === 'failed') return isExternalModel(model) ? 'Reconnect the API details to make it usable again.' : 'Retry after checking the local GGUF path.'
+  if (model.status === 'registered') return 'Load it once to confirm the file path and move it into the ready set.'
+  if (isExternalModel(model) && selected) return 'Chosen for the next chat once API routing is supported by Camelid.'
+  if (isExternalModel(model) && runnable) return 'API details are present, but Camelid local chat currently uses local GGUF models.'
+  if (model.status === 'ready' && model.model_path && selected) return 'Chosen for your next chat; load it into Camelid before sending a prompt.'
+  if (model.status === 'ready' && model.model_path) return 'Saved locally and loadable; choose it or load it into Camelid now.'
+  if (runnable && selected) return 'Chosen for your next chat, or load it now for immediate use.'
+  if (runnable) return 'Ready locally, choose it for the next chat or load it now.'
+  return 'Download or import a local GGUF before you can use it.'
+}
+
+function statusTone(model) {
+  if (isModelLoadedNow(model) && isModelGenerationReady(model)) return 'ready'
+  if (model.status === 'ready' || model.status === 'downloading' || model.status === 'canceling' || model.status === 'registered') return 'warm'
+  return ''
+}
+
+function modelErrorCopy(model) {
+  return model?.load_error || model?.install_error || ''
+}
+
+function getReadinessRows(model, runtime) {
+  const active = runtime?.active_model_id === model?.id || isModelLoadedNow(model)
+  const readiness = model?.backendinference || {}
+  const generationReady = isModelGenerationReady(model)
+  return [
+    { key: 'loaded_now', label: 'Loaded', value: active ? 'true' : 'false', ready: active },
+    { key: 'generation_ready', label: 'Generation', value: generationReady ? 'true' : 'false', ready: generationReady },
+    { key: 'tokenizer', label: 'Tokenizer', value: readiness.tokenizer_status || (active ? 'unknown' : 'not loaded'), ready: readiness.tokenizer_status === 'available' },
+    { key: 'config', label: 'Config', value: readiness.config_ready ? 'ready' : active ? 'missing' : 'not loaded', ready: readiness.config_ready },
+    { key: 'tensors', label: 'Tensors', value: readiness.tensor_ready ? 'ready' : active ? 'missing' : 'not loaded', ready: readiness.tensor_ready },
+  ]
+}
+
+function ReadinessGrid({ model, runtime, includePath = false }) {
+  const rows = getReadinessRows(model, runtime)
+  const localPath = model?.model_path || model?.path || ''
+
+  return (
+    <dl className="models-definition-grid models-readiness-grid">
+      {rows.map((row) => (
+        <div key={row.key} className={row.ready ? 'ready' : ''}>
+          <dt title={row.key}>{row.label}</dt>
+          <dd>{row.value}</dd>
+        </div>
+      ))}
+      {includePath && localPath && (
+        <div className="models-readiness-path">
+          <dt>Path</dt>
+          <dd title={localPath}>{localPath}</dd>
+        </div>
+      )}
+    </dl>
+  )
+}
+
+function normalizeSortText(value) {
+  return (value || '').toString().trim().toLowerCase()
+}
+
+function compareModelsByName(left, right) {
+  return normalizeSortText(left.name).localeCompare(normalizeSortText(right.name), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  }) || normalizeSortText(left.id).localeCompare(normalizeSortText(right.id), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  })
+}
+
+function compareCatalogItemsByTitle(left, right) {
+  return normalizeSortText(formatCatalogTitle(left)).localeCompare(normalizeSortText(formatCatalogTitle(right)), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  }) || normalizeSortText(left.repo_id).localeCompare(normalizeSortText(right.repo_id), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  })
+}
+
+export default function ModelsView({
+  runtime,
+  capabilities,
+  refreshDashboard,
+  registerForm,
+  setRegisterForm,
+  externalForm,
+  setExternalForm,
+  registerModel,
+  connectExternalModel,
+  models,
+  selectedModelId,
+  setSelectedModelId,
+  loadingModelId,
+  activateModel,
+  unloadCurrentModel,
+  installModel,
+  installCatalogModel,
+  cancelModelDownload,
+}) {
+  const [query, setQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState('all')
+  const [showImportAdvanced, setShowImportAdvanced] = useState(false)
+  const [catalogItems, setCatalogItems] = useState([])
+  const [catalogNextCursor, setCatalogNextCursor] = useState(null)
+  const [catalogLoading, setCatalogLoading] = useState(false)
+  const [catalogLoadingMore, setCatalogLoadingMore] = useState(false)
+  const [catalogError, setCatalogError] = useState('')
+  const [catalogAvailable, setCatalogAvailable] = useState(false)
+  const [refreshingRuntime, setRefreshingRuntime] = useState(false)
+
+  const catalogApiBase = (runtime?.api_base || '').replace(/\/$/, '')
+  const runtimeOnline = runtime?.status === 'online'
+  const hostedRoutingAvailable = Boolean(capabilities?.hosted_provider_routing || capabilities?.external_api_routing || capabilities?.openai_compatible_routing)
+  const catalogInstallAvailable = Boolean(capabilities?.model_catalog_install || capabilities?.model_downloads || capabilities?.hf_catalog_install)
+  const currentCompatibilityTarget = (capabilities?.model_compatibility || []).find((target) => target.status === 'supported_current_gate') || capabilities?.model_compatibility?.[0] || null
+  const compatibilityRows = capabilities?.model_compatibility || []
+  const plannedCompatibilityRows = compatibilityRows.filter((target) => !isSupportedCapabilityStatus(target.status))
+  const supportedQuantSummary = (capabilities?.supported_quantization || []).map((item) => `${item.id}: ${formatCapabilityStatus(item.status)}`).join(' · ') || 'None advertised'
+  const plannedQuantSummary = (capabilities?.planned_quantization || []).map((item) => `${item.id}: ${formatCapabilityStatus(item.status)}`).join(' · ') || 'None advertised'
+
+  const refreshRuntime = async () => {
+    if (!refreshDashboard || refreshingRuntime) return
+    setRefreshingRuntime(true)
+    try {
+      await refreshDashboard()
+    } finally {
+      setRefreshingRuntime(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!catalogApiBase) {
+      setCatalogAvailable(false)
+      setCatalogItems([])
+      setCatalogNextCursor(null)
+      setCatalogError('')
+      setCatalogLoading(false)
+      return undefined
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(async () => {
+      setCatalogLoading(true)
+      setCatalogError('')
+      try {
+        const params = new URLSearchParams({ limit: String(CATALOG_PAGE_SIZE) })
+        if (query.trim()) params.set('query', query.trim())
+        const res = await fetch(`${catalogApiBase}/api/models/catalog?${params.toString()}`, { signal: controller.signal })
+        if (res.status === 404 || res.status === 405) {
+          setCatalogAvailable(false)
+          setCatalogItems([])
+          setCatalogNextCursor(null)
+          return
+        }
+        setCatalogAvailable(true)
+        if (!res.ok) throw new Error('Could not load the Hugging Face catalog.')
+        const data = await res.json()
+        setCatalogItems(data.items || [])
+        setCatalogNextCursor(data.next_cursor || null)
+      } catch (error) {
+        if (error.name === 'AbortError') return
+        setCatalogAvailable(false)
+        setCatalogError(error.message || 'Could not load the Hugging Face catalog.')
+        setCatalogItems([])
+        setCatalogNextCursor(null)
+      } finally {
+        if (!controller.signal.aborted) setCatalogLoading(false)
+      }
+    }, query.trim() ? 250 : 0)
+
+    return () => {
+      controller.abort()
+      clearTimeout(timer)
+    }
+  }, [catalogApiBase, query])
+
+  const loadMoreCatalog = async () => {
+    if (!catalogApiBase || !catalogNextCursor || catalogLoadingMore) return
+    setCatalogLoadingMore(true)
+    setCatalogError('')
+    try {
+      const params = new URLSearchParams({ limit: String(CATALOG_PAGE_SIZE), cursor: catalogNextCursor })
+      if (query.trim()) params.set('query', query.trim())
+      const res = await fetch(`${catalogApiBase}/api/models/catalog?${params.toString()}`)
+      if (res.status === 404 || res.status === 405) {
+        setCatalogAvailable(false)
+        setCatalogItems([])
+        setCatalogNextCursor(null)
+        return
+      }
+      if (!res.ok) throw new Error('Could not load more catalog results.')
+      const data = await res.json()
+      setCatalogItems((current) => {
+        const existing = new Set(current.map((item) => item.catalog_id))
+        return [...current, ...(data.items || []).filter((item) => !existing.has(item.catalog_id))]
+      })
+      setCatalogNextCursor(data.next_cursor || null)
+    } catch (error) {
+      setCatalogError(error.message || 'Could not load more catalog results.')
+    } finally {
+      setCatalogLoadingMore(false)
+    }
+  }
+
+  const filteredModels = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return models.filter((model) => {
+      const groupKey = getGroupKey(model, runtime)
+      const matchesFilter = statusFilter === 'all' || groupKey === statusFilter
+      if (!matchesFilter) return false
+      if (!q) return true
+      return [
+        model.name,
+        model.id,
+        model.quant,
+        model.engine,
+        model.source,
+        model.hf_repo,
+        model.hf_filename,
+        model.runtime_model_name,
+      ].filter(Boolean).some((value) => value.toLowerCase().includes(q))
+    }).sort(compareModelsByName)
+  }, [models, query, runtime, statusFilter])
+
+  const groupedModels = useMemo(() => {
+    const groups = {
+      installed: [],
+      external: [],
+      imported: [],
+      downloading: [],
+      attention: [],
+      catalog: [],
+    }
+    filteredModels.forEach((model) => {
+      groups[getGroupKey(model, runtime)]?.push(model)
+    })
+    return groups
+  }, [filteredModels, runtime])
+
+  const counts = useMemo(() => ({
+    loaded: models.filter((model) => isModelLoadedNow(model) || runtime?.active_model_id === model.id).length || (runtime?.loaded_now ? 1 : 0),
+    generationReady: models.filter(isModelGenerationReady).length || (runtime?.generation_ready ? 1 : 0),
+    localPaths: models.filter((model) => !isExternalModel(model) && hasLocalModelPath(model)).length,
+    installed: models.filter((model) => getGroupKey(model, runtime) === 'installed').length,
+    external: models.filter((model) => getGroupKey(model, runtime) === 'external').length,
+    downloading: models.filter((model) => getGroupKey(model, runtime) === 'downloading').length,
+    imported: models.filter((model) => getGroupKey(model, runtime) === 'imported').length,
+    attention: models.filter((model) => getGroupKey(model, runtime) === 'attention').length,
+  }), [models, runtime])
+
+  const selectedLocalModel = useMemo(
+    () => models.find((model) => model.id === selectedModelId) || null,
+    [models, selectedModelId],
+  )
+
+  const activeLocalModel = useMemo(
+    () => models.find((model) => model.id === runtime?.active_model_id) || null,
+    [models, runtime?.active_model_id],
+  )
+
+  const llama32ThreeBModel = useMemo(
+    () => models.find(matchesLlama32ThreeBTarget) || null,
+    [models],
+  )
+  const showLlama32ThreeBAcceptanceTarget = !llama32ThreeBModel
+  const fillLlama32ThreeBImport = () => {
+    setRegisterForm({
+      id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
+      name: LLAMA32_3B_ACCEPTANCE_TARGET.name,
+      model_path: LLAMA32_3B_ACCEPTANCE_TARGET.model_path,
+      runtime_model_name: LLAMA32_3B_ACCEPTANCE_TARGET.runtime_model_name,
+    })
+    setShowImportAdvanced(true)
+  }
+
+  const selectedRunnable = isRunnableModel(selectedLocalModel)
+  const activeGenerationReady = activeLocalModel ? isModelGenerationReady(activeLocalModel) : Boolean(runtime?.generation_ready)
+  const readyModels = [...groupedModels.installed].sort(compareModelsByName)
+  const apiLinkModels = [...groupedModels.external].sort(compareModelsByName)
+  const setupModels = [...groupedModels.imported, ...groupedModels.downloading, ...groupedModels.attention].sort(compareModelsByName)
+  const discoverCatalogItems = useMemo(
+    () => catalogItems.filter((item) => {
+      const localMatch = findCatalogMatch(models, item)
+      if (!localMatch) return true
+      return localMatch.status === 'failed' || localMatch.status === 'not_installed'
+    }).sort(compareCatalogItemsByTitle),
+    [catalogItems, models],
+  )
+
+  return (
+    <section className="view-stack models-view view-shell-wide">
+      <div className="panel models-toolbar-panel">
+        <div className="models-toolbar-top">
+          <label className="models-search-field">
+            <span>Search models</span>
+            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search by name, repo, quant, source, or file" />
+          </label>
+          <label className="models-filter-field">
+            <span>Show</span>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              {FILTERS.map((filter) => (
+                <option key={filter.key} value={filter.key}>{filter.label}</option>
+              ))}
+            </select>
+          </label>
+          <button type="button" className="ghost-button models-refresh-button" onClick={refreshRuntime} disabled={!refreshDashboard || refreshingRuntime}>
+            {refreshingRuntime ? 'Refreshing…' : 'Refresh runtime'}
+          </button>
+        </div>
+        <p className="model-summary">Models are sorted A→Z by name. The backend currently exposes the loaded runtime model through /v1/models; saved local paths come from this browser until Camelid grows a local registry endpoint.</p>
+        <div className="models-truth-strip" aria-label="Backend model data sources">
+          <div>
+            <span>API</span>
+            <strong>{runtimeOnline ? 'Online' : 'Offline'}</strong>
+            <small>{runtime?.api_base || 'No API base configured'}</small>
+          </div>
+          <div>
+            <span>/v1/models</span>
+            <strong>{runtime?.loaded_now ? 'Loaded model only' : 'No loaded model'}</strong>
+            <small>{runtime?.loaded_now ? `${runtime?.active_model_id}; saved browser paths: ${counts.localPaths}` : `Camelid reports an empty model list when nothing is loaded. Saved browser paths: ${counts.localPaths}.`}</small>
+          </div>
+          <div>
+            <span>/api/capabilities</span>
+            <strong>{capabilities ? 'Contract live' : 'Not available'}</strong>
+            <small>{capabilities?.support_contract?.current_gate || 'No support contract returned; planned quant/model lanes stay disabled.'}{currentCompatibilityTarget ? ` Target: ${currentCompatibilityTarget.id}.` : ''}</small>
+          </div>
+          <div>
+            <span>Catalog</span>
+            <strong>{catalogAvailable ? 'Endpoint detected' : 'Hidden'}</strong>
+            <small>{catalogAvailable ? 'Showing only because /api/models/catalog responded.' : 'Hidden until the backend exposes /api/models/catalog.'}</small>
+          </div>
+          <div>
+            <span>Hosted APIs</span>
+            <strong>{hostedRoutingAvailable ? 'Routing advertised' : 'Routing planned'}</strong>
+            <small>Provider links stay disabled until /api/capabilities exposes hosted-provider routing and the frontend has matching evidence.</small>
+          </div>
+        </div>
+        <div className="models-compatibility-strip" aria-label="Camelid compatibility support contract">
+          <div>
+            <span>Current supported gate</span>
+            <strong>{capabilities?.support_contract?.current_gate || 'No /api/capabilities contract'}</strong>
+            <small>{currentCompatibilityTarget ? `${currentCompatibilityTarget.id}: ${currentCompatibilityTarget.evidence}` : 'The UI will not infer support beyond loaded/model readiness.'}</small>
+          </div>
+          <div>
+            <span>Supported quants</span>
+            <strong>{supportedQuantSummary}</strong>
+            <small>These are the only quant lanes the UI should present as validated; filenames and saved paths do not promote support.</small>
+          </div>
+          <div>
+            <span>Planned / guarded</span>
+            <strong>{plannedQuantSummary}</strong>
+            <small>{plannedCompatibilityRows.length ? `${plannedCompatibilityRows.length} compatibility row${plannedCompatibilityRows.length === 1 ? '' : 's'} remain planned or guarded; backend typed errors are expected until COMPATIBILITY.md records evidence.` : 'No planned compatibility rows advertised.'}</small>
+          </div>
+        </div>
+        <div className="models-summary-strip" aria-label="Model summary">
+          <div className="models-summary-pill models-summary-pill-static">
+            <span>Loaded now</span>
+            <strong>{counts.loaded}</strong>
+          </div>
+          <div className="models-summary-pill models-summary-pill-static">
+            <span>Generation-ready</span>
+            <strong>{counts.generationReady}</strong>
+          </div>
+          <button type="button" className={`ghost-button models-summary-pill ${statusFilter === 'installed' ? 'active' : ''}`} onClick={() => setStatusFilter((current) => current === 'installed' ? 'all' : 'installed')}>
+            <span>Local / loaded</span>
+            <strong>{counts.installed}</strong>
+          </button>
+          <button type="button" className={`ghost-button models-summary-pill ${statusFilter === 'external' ? 'active' : ''}`} onClick={() => setStatusFilter((current) => current === 'external' ? 'all' : 'external')}>
+            <span>Hosted links</span>
+            <strong>{counts.external}</strong>
+          </button>
+          <button type="button" className={`ghost-button models-summary-pill ${statusFilter === 'imported' ? 'active' : ''}`} onClick={() => setStatusFilter((current) => current === 'imported' ? 'all' : 'imported')}>
+            <span>Imported</span>
+            <strong>{counts.imported}</strong>
+          </button>
+          <button type="button" className={`ghost-button models-summary-pill ${statusFilter === 'attention' ? 'active' : ''}`} onClick={() => setStatusFilter((current) => current === 'attention' ? 'all' : 'attention')}>
+            <span>Needs attention</span>
+            <strong>{counts.attention}</strong>
+          </button>
+        </div>
+      </div>
+
+      <section className="models-status-grid" aria-label="Camelid runtime model readiness">
+        <div className="panel models-status-card">
+          <p className="panel-kicker">Loaded now</p>
+          <h3>{runtime?.loaded_now ? activeLocalModel?.name || runtime?.active_model_id : 'Nothing loaded'}</h3>
+          <p className="model-summary">
+            {runtime?.loaded_now
+              ? activeGenerationReady
+                ? 'Camelid reports generation_ready=true for the loaded model.'
+                : 'A model is loaded, but generation_ready=false. Chat stays blocked while Camelid checks tokenizer/config/tensors and the CPU materialization budget guard.'
+              : 'Load a saved local GGUF to make it available for chat.'}
+          </p>
+          <div className="models-card-tags">
+            <div className={`pin-badge ${runtime?.loaded_now ? 'ready' : ''}`}>loaded_now: {runtime?.loaded_now ? 'true' : 'false'}</div>
+            <div className={`pin-badge ${runtime?.generation_ready ? 'ready' : ''}`}>generation_ready: {runtime?.generation_ready ? 'true' : 'false'}</div>
+          </div>
+          {activeLocalModel && <ReadinessGrid model={activeLocalModel} runtime={runtime} includePath />}
+          {runtime?.loaded_now && (
+            <div className="models-card-actions">
+              <button className="ghost-button" onClick={unloadCurrentModel} disabled={Boolean(loadingModelId)}>{loadingModelId === runtime?.active_model_id ? 'Unloading…' : 'Unload current model'}</button>
+            </div>
+          )}
+        </div>
+        <div className="panel models-status-card">
+          <p className="panel-kicker">Next chat</p>
+          <h3>{selectedLocalModel?.name || 'No model selected'}</h3>
+          <p className="model-summary">
+            {selectedRunnable
+              ? 'The selected model is loaded and generation-ready for the next chat.'
+              : selectedLocalModel
+                ? getNextStepCopy(selectedLocalModel, {
+                  active: selectedLocalModel.id === runtime?.active_model_id,
+                  selected: true,
+                  runnable: selectedRunnable,
+                  generationReady: isModelGenerationReady(selectedLocalModel),
+                })
+                : 'Import or load a local GGUF, then choose it for the next chat.'}
+          </p>
+          <div className="models-card-tags">
+            {selectedLocalModel && <div className="pin-badge">selected: {selectedLocalModel.id}</div>}
+            {selectedLocalModel && <div className={`pin-badge ${selectedRunnable ? 'ready' : ''}`}>{selectedRunnable ? 'chat enabled' : 'chat blocked'}</div>}
+          </div>
+          {selectedLocalModel && <ReadinessGrid model={selectedLocalModel} runtime={runtime} includePath />}
+        </div>
+      </section>
+
+      {showLlama32ThreeBAcceptanceTarget && (
+        <section className="panel models-section-panel" aria-label="Llama 3.2 3B Q8 acceptance target">
+          <div className="models-section-heading">
+            <div>
+              <p className="panel-kicker">Acceptance target</p>
+              <h3>Llama 3.2 3B Instruct Q8_0</h3>
+            </div>
+            <p className="model-summary">The exact 3B WebUI acceptance target stays visible even before the GGUF is present. This is a path/readiness card, not a support claim: chat remains blocked until Camelid reports loaded_now=true, generation_ready=true, stays inside the CPU materialization budget guard, and /api/capabilities exposes an exact supported 3B Q8_0 compatibility row.</p>
+          </div>
+
+          <div className="models-card-grid">
+            <article className="model-card models-model-card">
+              <div className="models-card-head">
+                <div className="models-card-title">
+                  <strong>{LLAMA32_3B_ACCEPTANCE_TARGET.name}</strong>
+                  <span>{formatModelMeta(LLAMA32_3B_ACCEPTANCE_TARGET)}</span>
+                </div>
+                <div className="status-pill warm">Artifact missing · chat blocked</div>
+              </div>
+
+              <div className="models-card-tags">
+                <div className="pin-badge">Exact target</div>
+                <div className="pin-badge">Q8_0</div>
+                <div className="pin-badge warm">No 3B WebUI smoke yet</div>
+              </div>
+
+              <div className="models-card-copy-stack">
+                <p className="model-summary">Expected source: {LLAMA32_3B_ACCEPTANCE_TARGET.source}.</p>
+                <p className="model-summary">Local path is reserved for the acceptance run, but the file is not present on this Mac yet. Do not infer readiness from the passing 1B row or tokenizer-only 8B row.</p>
+                <p className="model-summary">Once the backend is genuinely ready, load this exact GGUF and refresh runtime state. If the file loads but `generation_ready` stays false or Camelid returns `cpu_weight_materialization_exceeds_budget`, treat that as the current backend blocker rather than inferred 3B support. The WebUI can enable chat only after the runtime health gate and exact support-contract row both pass.</p>
+              </div>
+
+              <CapabilityEvidenceBlock capabilities={capabilities} model={LLAMA32_3B_ACCEPTANCE_TARGET} />
+              <ReadinessGrid model={LLAMA32_3B_ACCEPTANCE_TARGET} runtime={runtime} includePath />
+              <p className="library-error-copy">{LLAMA32_3B_ACCEPTANCE_TARGET.load_error}</p>
+
+              <div className="models-card-actions">
+                <button className="ghost-button" onClick={fillLlama32ThreeBImport}>Fill import form with exact path</button>
+                <button className="ghost-button" onClick={refreshRuntime} disabled={!refreshDashboard || refreshingRuntime}>{refreshingRuntime ? 'Refreshing…' : 'Refresh runtime'}</button>
+              </div>
+            </article>
+          </div>
+        </section>
+      )}
+
+      <section className="panel models-section-panel">
+        <div className="models-section-heading">
+          <div>
+            <p className="panel-kicker">Local runtime</p>
+            <h3>{readyModels.length === 0 ? 'No local models listed yet' : `${readyModels.length} local ${readyModels.length === 1 ? 'model' : 'models'}`}</h3>
+          </div>
+          <p className="model-summary">These are loaded now or saved with a local GGUF path. The page keeps loadable-local separate from generation-ready: chat unlocks only when Camelid reports loaded_now=true, generation_ready=true, and no CPU materialization budget guard is blocking the active model.</p>
+        </div>
+
+        {readyModels.length === 0 ? (
+          <div className="empty-state">No loaded or saved local GGUF paths yet. Import a local file below, or load a model from another client and refresh.</div>
+        ) : (
+          <div className="models-card-grid">
+            {readyModels.map((model) => {
+              const runnable = isRunnableModel(model)
+              const canLoad = canLoadIntoRuntime(model)
+              const external = isExternalModel(model)
+              const active = runtime?.active_model_id === model.id
+              const loadedNow = isModelLoadedNow(model) || active
+              const generationReady = isModelGenerationReady(model)
+              const selected = selectedModelId === model.id
+              const busy = loadingModelId === model.id
+              const errorCopy = modelErrorCopy(model)
+
+              return (
+                <article key={model.id} className={`model-card models-model-card ${active ? 'active-model-card' : ''} ${selected ? 'selected-model-card' : ''}`}>
+                  <div className="models-card-head">
+                    <div className="models-card-title">
+                      <strong>{model.name}</strong>
+                      <span>{formatModelMeta(model)}</span>
+                    </div>
+                    <div className={`status-pill ${statusTone(model)}`}>{getModelStatusLabel(model)}</div>
+                  </div>
+
+                  <div className="models-card-tags">
+                    {loadedNow && <div className={`pin-badge ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Loaded + generation-ready' : 'Loaded, not ready'}</div>}
+                    {selected && <div className="pin-badge">Next chat</div>}
+                    {external && <div className="pin-badge">API planned</div>}
+                    {model.model_path && !external && <div className="pin-badge">Saved locally</div>}
+                  </div>
+
+                  <div className="models-card-copy-stack">
+                    <p className="model-summary">{describeModelState(model)}</p>
+                    <p className="model-summary">{getNextStepCopy(model, { active: loadedNow, selected, runnable, generationReady })}</p>
+                    <p className="model-summary">{formatModelOrigin(model)}</p>
+                  </div>
+
+                  {!external && <CapabilityEvidenceBlock capabilities={capabilities} model={model} />}
+
+                  {!external && <ReadinessGrid model={model} runtime={runtime} includePath />}
+
+                  {errorCopy && <p className="library-error-copy">{errorCopy}</p>}
+
+                  <div className="models-card-actions">
+                    <button className="ghost-button" onClick={() => setSelectedModelId(model.id)} disabled={busy}>{selected ? 'Chosen for next chat' : generationReady ? 'Use for next chat' : 'Select after load'}</button>
+                    {canLoad && !external && <button className="primary-button" onClick={() => activateModel(model.id)} disabled={busy || (loadedNow && generationReady)}>{busy ? 'Loading…' : loadedNow ? generationReady ? 'Loaded now' : 'Retry readiness check' : 'Load now'}</button>}
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        )}
+      </section>
+
+      {catalogAvailable && (
+        <section className="panel models-section-panel models-catalog-panel-clean">
+          <div className="models-section-heading models-section-heading-catalog">
+          <div>
+            <p className="panel-kicker">Catalog preview</p>
+            <h3>Public Hugging Face GGUF picks</h3>
+          </div>
+          <p className="model-summary">This area stays honest: it appears only if a catalog endpoint responds. Downloads stay disabled unless Camelid advertises a catalog-install capability; local GGUF loading remains the working path today.</p>
+        </div>
+
+        {catalogError && <p className="library-error-copy">{catalogError}</p>}
+
+        {catalogLoading && discoverCatalogItems.length === 0 ? (
+          <div className="empty-state">Loading open Hugging Face models…</div>
+        ) : discoverCatalogItems.length === 0 ? (
+          <div className="empty-state">No new public GGUF models matched that search.</div>
+        ) : (
+          <>
+            <div className="models-card-grid models-catalog-grid-clean">
+              {discoverCatalogItems.map((item) => {
+                const localMatch = findCatalogMatch(models, item)
+                const quantCapability = getQuantCapability(capabilities, item.quant)
+                const runnable = Boolean(localMatch && (localMatch.status === 'ready' || localMatch.status === 'registered' || localMatch.status === 'failed') && hasLocalModelPath(localMatch))
+                const active = runtime?.active_model_id === localMatch?.id
+                const selected = selectedModelId === localMatch?.id
+                const busy = localMatch && loadingModelId === localMatch.id
+                const errorCopy = modelErrorCopy(localMatch)
+
+                return (
+                  <article key={item.catalog_id} className={`model-card models-model-card models-catalog-card-clean ${active ? 'active-model-card' : ''} ${selected ? 'selected-model-card' : ''}`}>
+                    <div className="models-card-head">
+                      <div className="models-card-title">
+                        <strong>{formatCatalogTitle(item)}</strong>
+                        <span>{formatRemoteMeta(item)}</span>
+                      </div>
+                      {localMatch ? <div className={`status-pill ${statusTone(localMatch)}`}>{getModelStatusLabel(localMatch)}</div> : null}
+                    </div>
+
+                    <div className="models-card-tags">
+                      {active && <div className="pin-badge">Loaded now</div>}
+                      {selected && <div className="pin-badge">Next chat</div>}
+                      {item.quant && <div className={`pin-badge ${capabilityStatusTone(quantCapability?.status || '')}`}>{quantCapabilityLabel(quantCapability, item.quant)}</div>}
+                      {hasLocalModelPath(localMatch) && <div className="pin-badge">Saved locally</div>}
+                    </div>
+
+                    <dl className="models-definition-grid">
+                      <div>
+                        <dt>Repo</dt>
+                        <dd title={item.repo_id}>{item.repo_id}</dd>
+                      </div>
+                      <div>
+                        <dt>File</dt>
+                        <dd title={item.filename}>{item.filename}</dd>
+                      </div>
+                      <div>
+                        <dt>Download size</dt>
+                        <dd>{item.size_bytes ? formatBytes(item.size_bytes) : 'Checked before download'}</dd>
+                      </div>
+                    </dl>
+
+                    <CapabilityEvidenceBlock capabilities={capabilities} model={localMatch} catalogItem={item} />
+
+                    {localMatch && <ReadinessGrid model={localMatch} runtime={runtime} />}
+
+                    {errorCopy && <p className="library-error-copy">{errorCopy}</p>}
+
+                    <div className="models-card-actions">
+                      {(!localMatch || localMatch.status === 'not_installed' || (localMatch.status === 'failed' && !hasLocalModelPath(localMatch))) && <button className="primary-button" onClick={() => installCatalogModel(item)} disabled={Boolean(busy) || !catalogInstallAvailable}>{catalogInstallAvailable ? 'Download' : 'Download planned'}</button>}
+                      {(localMatch?.status === 'downloading' || localMatch?.status === 'canceling') && <button className="ghost-button" onClick={() => cancelModelDownload(localMatch.id)} disabled={localMatch.status === 'canceling'}>{localMatch.status === 'canceling' ? 'Canceling…' : 'Cancel download'}</button>}
+                      {runnable && <button className="ghost-button" onClick={() => setSelectedModelId(localMatch.id)} disabled={Boolean(busy)}>{selected ? 'Chosen for next chat' : 'Use for next chat'}</button>}
+                      {runnable && <button className="primary-button" onClick={() => activateModel(localMatch.id)} disabled={Boolean(busy) || active}>{busy ? 'Loading…' : active ? 'Loaded now' : localMatch.status === 'registered' ? 'Load now and confirm file' : 'Load now'}</button>}
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+
+            {catalogNextCursor && (
+              <div className="library-load-more-row">
+                <button className="ghost-button" onClick={loadMoreCatalog} disabled={catalogLoadingMore}>
+                  {catalogLoadingMore ? 'Loading more models…' : 'Load more models'}
+                </button>
+              </div>
+            )}
+          </>
+        )}
+        </section>
+      )}
+
+      <div className="models-setup-grid">
+        <div className="panel models-section-panel">
+          <div className="models-section-heading">
+            <div>
+              <p className="panel-kicker">Import a local GGUF</p>
+              <h3>Bring in a model you already downloaded</h3>
+            </div>
+            <p className="model-summary">Keep the first step simple. Camelid can generate the internal ID, then confirm the file on first load. Support still comes from /api/capabilities, not filename optimism.</p>
+          </div>
+
+          <div className="models-form-stack">
+            <div className="composer-actions import-grid">
+              <input value={registerForm.name} onChange={(e) => setRegisterForm((form) => ({ ...form, name: e.target.value }))} placeholder="Model name" />
+              <input value={registerForm.model_path} onChange={(e) => setRegisterForm((form) => ({ ...form, model_path: e.target.value }))} placeholder="/path/to/your-model.gguf" />
+            </div>
+
+            <button className="ghost-button subtle-action import-advanced-toggle" onClick={() => setShowImportAdvanced((current) => !current)}>
+              {showImportAdvanced ? 'Hide advanced options' : 'Show advanced options'}
+            </button>
+
+            {showImportAdvanced && (
+              <div className="composer-actions import-grid import-grid-advanced">
+                <input value={registerForm.id} onChange={(e) => setRegisterForm((form) => ({ ...form, id: e.target.value }))} placeholder="Internal model ID (optional)" />
+                <input value={registerForm.runtime_model_name} onChange={(e) => setRegisterForm((form) => ({ ...form, runtime_model_name: e.target.value }))} placeholder="Runtime name override (optional)" />
+              </div>
+            )}
+
+            <div className="import-callout-row">
+              <p className="model-summary">Import calls Camelid’s load endpoint immediately, saves the path locally, and records tokenizer/config/tensor readiness. Unsupported tokenizers, quants, model families, or oversized CPU materialization stay visible as typed backend errors instead of becoming chat-ready.</p>
+              <button className="primary-button" onClick={registerModel} disabled={Boolean(loadingModelId)}>{loadingModelId ? 'Loading local model…' : 'Import and load local model'}</button>
+            </div>
+          </div>
+        </div>
+
+        <div className="panel models-section-panel">
+          <div className="models-section-heading">
+            <div>
+              <p className="panel-kicker">Hosted API setup</p>
+              <h3>Planned OpenAI-compatible API link</h3>
+            </div>
+            <p className="model-summary">This form preserves the intended fields, but it stays disabled because the current Camelid API does not expose hosted-provider routing.</p>
+          </div>
+
+          <fieldset className="models-form-stack models-planned-fieldset" disabled>
+            <div className="composer-actions import-grid">
+              <input value={externalForm.name} onChange={(e) => setExternalForm((form) => ({ ...form, name: e.target.value }))} placeholder="Display name" />
+              <input value={externalForm.model_name} onChange={(e) => setExternalForm((form) => ({ ...form, model_name: e.target.value }))} placeholder="Remote model name" />
+            </div>
+            <div className="composer-actions import-grid import-grid-advanced">
+              <input value={externalForm.source} onChange={(e) => setExternalForm((form) => ({ ...form, source: e.target.value }))} placeholder="Provider label" />
+              <input value={externalForm.api_base} onChange={(e) => setExternalForm((form) => ({ ...form, api_base: e.target.value }))} placeholder="https://api.openai.com/v1" />
+            </div>
+            <div className="composer-actions import-grid import-grid-advanced">
+              <input value={externalForm.id} onChange={(e) => setExternalForm((form) => ({ ...form, id: e.target.value }))} placeholder="Internal model ID (optional)" />
+              <input type="password" value={externalForm.api_key} onChange={(e) => setExternalForm((form) => ({ ...form, api_key: e.target.value }))} placeholder="API key" autoComplete="off" />
+            </div>
+            <div className="import-callout-row">
+              <p className="model-summary">Hosted-provider routing is {hostedRoutingAvailable ? 'advertised by capabilities but still waiting for frontend wiring.' : 'planned, so these controls are visible for intent but disabled until Camelid has an endpoint to use them.'}</p>
+              <button className="primary-button" onClick={connectExternalModel} disabled>{hostedRoutingAvailable ? 'Hosted API wiring pending' : 'Hosted API routing planned'}</button>
+            </div>
+          </fieldset>
+        </div>
+      </div>
+
+      {apiLinkModels.length > 0 && (
+        <section className="panel models-section-panel">
+          <div className="models-section-heading">
+            <div>
+              <p className="panel-kicker">API links</p>
+              <h3>{apiLinkModels.length} planned hosted link{apiLinkModels.length === 1 ? '' : 's'}</h3>
+            </div>
+            <p className="model-summary">Camelid is keeping these visible as planned connections, but hosted-provider chat routing is disabled until an API route exists.</p>
+          </div>
+          <div className="models-card-grid">
+            {apiLinkModels.map((model) => {
+              const routingReady = isHostedRoutingAvailable(model) && hostedRoutingAvailable
+              return (
+                <article key={model.id} className="model-card models-model-card">
+                  <div className="models-card-head">
+                    <div className="models-card-title">
+                      <strong>{model.name}</strong>
+                      <span>{formatModelMeta(model)}</span>
+                    </div>
+                    <div className={`status-pill ${routingReady ? 'ready' : 'warm'}`}>{routingReady ? 'API routing advertised' : 'API routing planned'}</div>
+                  </div>
+                  <p className="model-summary">Hosted API links stay disabled until Camelid exposes and wires provider routing for chat.</p>
+                  <div className="models-card-actions">
+                    <button className="ghost-button" disabled>{routingReady ? 'Frontend wiring pending' : 'Planned, not selectable yet'}</button>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
+      {setupModels.length > 0 && (
+        <section className="panel models-section-panel">
+          <div className="models-section-heading">
+            <div>
+              <p className="panel-kicker">Still needs setup</p>
+              <h3>{setupModels.length} model{setupModels.length === 1 ? '' : 's'} still need attention</h3>
+            </div>
+            <p className="model-summary">This is the short list of models that are still importing, downloading, or need a fix before they can be used confidently.</p>
+          </div>
+
+          <div className="models-card-grid">
+            {setupModels.map((model) => {
+              const runnable = isRunnableModel(model)
+              const canLoad = canLoadIntoRuntime(model)
+              const external = isExternalModel(model)
+              const selected = selectedModelId === model.id
+              const active = runtime?.active_model_id === model.id
+              const loadedNow = isModelLoadedNow(model) || active
+              const generationReady = isModelGenerationReady(model)
+              const busy = loadingModelId === model.id
+              const errorCopy = modelErrorCopy(model)
+
+              return (
+                <article key={model.id} className={`model-card models-model-card ${active ? 'active-model-card' : ''} ${selected ? 'selected-model-card' : ''}`}>
+                  <div className="models-card-head">
+                    <div className="models-card-title">
+                      <strong>{model.name}</strong>
+                      <span>{formatModelMeta(model)}</span>
+                    </div>
+                    <div className={`status-pill ${statusTone(model)}`}>{getModelStatusLabel(model)}</div>
+                  </div>
+
+                  <div className="models-card-tags">
+                    {loadedNow && <div className={`pin-badge ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Loaded + generation-ready' : 'Loaded, not ready'}</div>}
+                    {selected && <div className="pin-badge">Next chat</div>}
+                    {external && <div className="pin-badge">API planned</div>}
+                    {model.model_path && !external && <div className="pin-badge">Saved locally</div>}
+                  </div>
+
+                  <div className="models-card-copy-stack">
+                    <p className="model-summary">{describeModelState(model)}</p>
+                    <p className="model-summary">{getNextStepCopy(model, { active: loadedNow, selected, runnable, generationReady })}</p>
+                    <p className="model-summary">{formatModelOrigin(model)}</p>
+                  </div>
+
+                  {!external && <CapabilityEvidenceBlock capabilities={capabilities} model={model} />}
+
+                  {!external && (model.status === 'downloading' || model.status === 'canceling' || model.progress) && (
+                    <div className="progress-wrap">
+                      <div className="progress-bar"><div style={{ width: `${model.progress || 0}%` }} /></div>
+                      <small>{formatDownloadCopy(model)}</small>
+                    </div>
+                  )}
+
+                  {!external && <ReadinessGrid model={model} runtime={runtime} includePath />}
+
+                  {errorCopy && <p className="library-error-copy">{errorCopy}</p>}
+
+                  <div className="models-card-actions">
+                    {!external && (model.status === 'not_installed' || (model.status === 'failed' && !model.model_path)) && <button className="primary-button" onClick={() => installModel(model.id)} disabled={busy}>{model.status === 'failed' ? 'Retry download' : 'Download'}</button>}
+                    {!external && (model.status === 'downloading' || model.status === 'canceling') && <button className="ghost-button" onClick={() => cancelModelDownload(model.id)} disabled={model.status === 'canceling'}>{model.status === 'canceling' ? 'Canceling…' : 'Cancel download'}</button>}
+                    {!external && !model.model_path && (model.status === 'ready' || model.status === 'registered') && <button className="ghost-button" disabled>Re-import with a local file path</button>}
+                    {(runnable || model.model_path) && <button className="ghost-button" onClick={() => setSelectedModelId(model.id)} disabled={busy}>{selected ? 'Chosen for next chat' : runnable ? 'Use for next chat' : 'Select, then load'}</button>}
+                    {canLoad && !external && <button className="primary-button" onClick={() => activateModel(model.id)} disabled={busy || (loadedNow && generationReady)}>{busy ? 'Loading…' : loadedNow ? generationReady ? 'Loaded now' : 'Retry readiness check' : model.status === 'registered' ? 'Load now and confirm file' : 'Load now'}</button>}
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        </section>
+      )}
+    </section>
+  )
+}
