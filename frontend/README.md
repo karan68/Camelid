@@ -17,7 +17,7 @@ The backend data hook is adapted for Camelid's current API surface:
 - keeps the API tab first-class in desktop/sidebar/mobile navigation, browser tab restore, and chat readiness prompts so the support contract is easy to find during readiness checks
 - keeps API examples readiness-gated: `/api/capabilities` explains evidence boundaries, while `/v1/health` `loaded_now`/`generation_ready` decides whether chat calls should run
 - normalizes loaded-model `general.file_type` values into GGUF quant labels (for example file type `7` → `Q8_0`) before comparing them to `/api/capabilities`, so loaded model cards get useful quant evidence without treating filenames as support claims
-- keeps the exact Llama 3.2 3B Instruct Q8_0 acceptance path visible as a guarded target card until the GGUF exists locally, backend evidence lands, and the load path stays inside Camelid's CPU materialization budget guard
+- keeps the exact Llama 3.2 3B Instruct Q8_0 acceptance path visible as a guarded target card even after exact GGUF presence, low-RSS backend load success, and one backend-only first-token artifact, because chat must stay blocked until the exact supported compatibility row and broader parity/API/WebUI evidence exist
 - sends non-streaming chat requests to `POST /v1/chat/completions`
 - blocks chat until `/v1/health` reports the selected `active_model_id` with `generation_ready: true` and `/api/capabilities` has an exact supported model/quant compatibility row
 
