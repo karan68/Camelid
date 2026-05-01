@@ -17,10 +17,11 @@ Many local-inference projects optimize for breadth of apparent compatibility. Ca
 If you are evaluating Camelid quickly, this is the current release boundary:
 
 - **Supported generation today:** TinyLlama 1.1B Chat Q8_0.
-- **Useful evidence, not support:** Llama 3.2 1B Instruct Q8_0 has one compact-header `hello` prompt that matches llama.cpp for five deterministic generated tokens.
-- **Next exact acceptance target:** Llama 3.2 3B Instruct Q8_0. The exact tracked GGUF now loads through `/api/models/load` with low backend RSS after streaming metadata parsing, but the guarded first chat still stops before any generated token under host free-page pressure.
-- **Groundwork only:** Llama 3 8B Instruct Q8_0 has tokenizer/config/Q8 groundwork, but generation remains unsupported until lazy or on-demand Q8 execution and bounded parity and memory evidence land.
-- **Explicit non-claim:** no Llama 3-family row is a supported generation lane today.
+- **Real Llama 3-family breakthrough, not a support expansion:** Camelid now has materially better Llama 3-family mechanics and evidence than it did before.
+  - **1B evidence:** Llama 3.2 1B Instruct Q8_0 has one compact-header `hello` prompt that matches llama.cpp for five deterministic generated tokens.
+  - **3B load breakthrough:** the exact tracked Llama 3.2 3B Instruct Q8_0 GGUF now loads through `/api/models/load` with low backend RSS after streaming metadata parsing plus lazy/file-backed Q8 handling.
+  - **8B groundwork:** Llama 3 8B Instruct Q8_0 now has tokenizer/config/Q8 groundwork plus lazy-execution building blocks.
+- **Public support contract stays unchanged:** 1B remains evidence-only, 3B remains blocked before first token, 8B remains groundwork-only, and no Llama 3-family row is a supported generation lane today.
 
 Nothing adjacent inherits support. The same family is not enough. The same quantization is not enough. The same tokenizer path is not enough. Camelid treats every public claim as row-specific.
 
