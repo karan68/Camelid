@@ -18,8 +18,8 @@ For a fast read, the current answer is:
 
 - **Supported generation gate:** TinyLlama 1.1B Chat Q8_0 remains the only supported end-to-end generation lane.
 - **Evidence-only lane:** Llama 3.2 1B Instruct Q8_0 remains narrow evidence only.
-- **Acceptance target:** Llama 3.2 3B Instruct Q8_0 remains the exact WebUI target. The exact tracked GGUF now loads successfully through `/api/models/load` with low backend RSS, and fresh Ubuntu backend-only artifacts now include repeat 5-token generation plus a bounded 50-token success for that same exact row, but this is still not a supported row. Support remains frozen until prompt-token parity, broader prompt/chat-template parity, API evidence, and WebUI evidence exist.
-- **Groundwork-only lane with backend evidence:** Llama 3 8B Instruct Q8_0 still sits below supported generation, but it now has repeat bounded Ubuntu backend-only 5-token generation, prompt-cache validation, a fresh 50-token backend/API artifact, raw `hello` prompt-token parity, basic API smoke evidence, and a clearly passed memory gate for the exact tracked Q8_0 GGUF. Support remains frozen until broader prompt/chat-template parity, WebUI readiness, and performance/portability evidence exists.
+- **Acceptance target:** Llama 3.2 3B Instruct Q8_0 remains the exact WebUI target. The exact tracked GGUF now loads successfully through `/api/models/load` with low backend RSS, and one healthy Ubuntu backend-only first-token success artifact exists for that same exact row, but this is still not a supported row. Support remains frozen until repeat bounded success plus prompt-token parity, first-token parity, short-generation parity, API evidence, and WebUI evidence exist.
+- **Groundwork-only lane with backend evidence:** Llama 3 8B Instruct Q8_0 still sits below supported generation, but it now has repeat bounded Ubuntu backend-only first-token evidence, raw `hello` prompt-token parity, a short deterministic 5-token backend generation slice, basic API smoke evidence, and a clearly passed memory gate for the exact tracked Q8_0 GGUF. Support remains frozen until broader prompt/chat-template parity, WebUI readiness, and performance/portability evidence exists.
 - **Explicit non-claim:** no Llama 3-family row is a supported generation lane today.
 
 Two standing rules apply to every row:
@@ -37,8 +37,8 @@ Recent work improved the blocker seam without changing the release ledger:
 
 - TinyLlama Q8_0 remains the trusted supported gate.
 - Llama 3.2 1B Q8_0 remains informative evidence only.
-- Llama 3.2 3B Q8_0 now loads successfully through `/api/models/load` with low backend RSS after streaming metadata parsing, file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike, and fresh Ubuntu backend-only artifacts now cover repeat 5-token generation plus a bounded 50-token run for that same exact row. That is blocker-seam progress, not a support change.
-- Llama 3 8B Q8_0 remains groundwork-only in release terms, but the lane now has repeat bounded Ubuntu backend-only 5-token generation, prompt-cache validation, a fresh 50-token backend/API artifact, raw `hello` prompt-token parity, basic API smoke evidence, and an explicit memory gate on top of the earlier lazy/file-backed Q8 execution work.
+- Llama 3.2 3B Q8_0 now loads successfully through `/api/models/load` with low backend RSS after streaming metadata parsing, file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike, and one healthy Ubuntu backend-only first-token success artifact exists for that same exact row. That is blocker-seam progress, not a support change.
+- Llama 3 8B Q8_0 remains groundwork-only in release terms, but the lane now has repeat bounded Ubuntu backend-only first-token evidence, raw `hello` prompt-token parity, a short deterministic 5-token backend generation slice, basic API smoke evidence, and an explicit memory gate on top of the earlier lazy/file-backed Q8 execution work.
 
 Bottom line: the engineering seam moved forward, but no new support claim was earned.
 
@@ -81,25 +81,27 @@ Representative artifacts:
 
 ### Llama 3.2 3B Instruct Q8_0
 
-Status: **acceptance target / backend evidence only**
+Status: **acceptance target / first-token evidence only**
 
 Current evidence boundary:
 
 - The exact tracked GGUF is present locally.
 - The exact tracked GGUF loads successfully through `/api/models/load` with low backend RSS after streaming metadata parsing.
 - Recent file-backed lazy-Q8 recovery materially reduced the older eager dense-load spike.
-- Fresh Ubuntu backend-only `/v1/completions` artifacts now cover repeat 5-token generation for `hello` and one bounded 50-token run.
-- This row is still not supported; prompt-token parity, broader prompt/chat-template parity, API evidence, and WebUI evidence are still missing.
+- One healthy Ubuntu backend-only `/v1/completions` probe produced a first-token success artifact for prompt `hello` with `max_tokens=1`, `temperature=0`, and the required forward trace through `layer_0_attention_q_done`.
+- This row is still not supported; the current artifact is first-token evidence only, and repeatability, prompt-token parity, short-generation parity, API evidence, and WebUI evidence are still missing.
 
 Representative artifacts:
 
-- `target/llama32-3b-streaming-metadata-20260430T233604Z/`
-- `target/llama32-3b-nocache-rowread-20260430T233844Z/`
-- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/`
-- `target/ubuntu-crossboard-20260501T234138Z/llama32-3b-q8/`
-- `target/ubuntu-50tok-20260501T234603Z/llama32-3b-q8/50tok.json`
+- `target/llama32-3b-streaming-metadata-20260430T233604Z/summary.md`
+- `target/llama32-3b-nocache-rowread-20260430T233844Z/summary.md`
+- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/summary.md`
+- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/load-response.json`
+- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/completion-response.json`
+- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/required-forward-trace.log`
+- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/meminfo-samples.log`
 
-Promotion remains blocked until Camelid has prompt-token parity, broader prompt/chat-template parity, API, WebUI, and promotion-quality exact-row evidence for this exact row.
+Promotion remains blocked until Camelid has at least two consecutive bounded successes plus prompt-token parity, short-generation parity, memory, API, and WebUI evidence for this exact row.
 
 ### Llama 3 8B Instruct Q8_0
 
@@ -109,21 +111,25 @@ Current evidence boundary:
 
 - Metadata, config, tokenizer, and chat-template handling are fixture-guarded.
 - Independent tokenizer reference fixtures exist.
-- Lazy/file-backed Q8 execution is now good enough for repeat bounded Ubuntu backend-only generation on the exact tracked Q8_0 GGUF.
-- At current head `268f6fb`, `/api/models/load` succeeded and `/v1/completions` with prompt `hello`, `max_tokens=5`, `temperature=0` returned `, I'm a new`, establishing repeat bounded backend generation before the later current-head follow-up.
+- Lazy/file-backed Q8 execution is now good enough for repeat bounded Ubuntu backend-only first-token evidence on the exact tracked Q8_0 GGUF.
+- At current head `268f6fb`, `/api/models/load` succeeded and `/v1/completions` with prompt `hello`, `max_tokens=1`, `temperature=0` returned text `,`; the required forward trace reached `layer_0_attention_q_done` twice and the backend stayed bounded at roughly `6,220 -> 378,520 KiB` RSS on the sampled process trace.
 - Raw prompt-token parity for `hello` is now captured for this exact model SHA: Camelid returned `[128000, 15339]`, matching the prior llama.cpp `llama-tokenize --ids` reference for the same GGUF SHA.
-- Prompt-cache validation and a fresh backend/API 50-token artifact now exist on Ubuntu; see `target/ubuntu-8b-50tok-fast-20260501T235312Z/50tok.json`.
-- `/api/models/load`, `/api/models/tokenizer/encode`, `/v1/models`, and `/v1/completions` all responded in the current evidence bundle, with sampled backend RSS staying bounded below 400 MiB and no swap/OOM/runaway signature.
+- A short deterministic backend generation slice with `max_tokens=5`, `temperature=0` returned `, I'm a new`; the sampled RSS trace stayed roughly `6,076 -> 396,912 KiB`, and `/api/models/load`, `/api/models/tokenizer/encode`, `/v1/models`, and `/v1/completions` all responded in the artifact.
 - Camelid still does not claim 8B supported generation, broader prompt-pack parity, chat-template parity, WebUI readiness, performance envelope, or portable packaging for this row.
 
 Representative artifacts:
 
-- `target/backend-small-model-readiness-20260429T131209Z/`
-- `target/perf-cron-20260429T122814Z-single-row-adapter-head-da53871/`
-- `target/ubuntu-llama3-8b-q8-first-token-20260501T2152Z/`
-- `target/ubuntu-llama3-8b-q8-validation-20260501T235936Z/`
-- `target/ubuntu-8b-50tok-fast-20260501T235312Z/50tok.json`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/`
+- `target/backend-small-model-readiness-20260429T131209Z/report.json`
+- `target/perf-cron-20260429T122814Z-single-row-adapter-head-da53871/summary.md`
+- `target/ubuntu-llama3-8b-q8-first-token-20260501T2152Z/summary.md`
+- `target/ubuntu-llama3-8b-q8-validation-20260501T235936Z/targeted-lazy-q8-tests.log`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/validation-summary.json`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/first-token.completion-summary.json`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/first-token.meminfo-samples.log`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/first-token.required-forward-trace.log`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/short-5tok.completion-summary.json`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/short-5tok.meminfo-samples.log`
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/short-5tok.required-forward-trace.log`
 
 ## Latest promotion-relevant work
 
@@ -137,33 +143,28 @@ Recent backend work kept the support contract unchanged while improving the 3B e
 
 - streaming metadata parsing moved `/api/models/load` to low backend RSS for the exact 3B artifact
 - file-backed Q8 linear handling reduced the older eager dense-load spike
-- fresh Ubuntu backend-only artifacts now cover repeat 5-token generation plus a bounded 50-token run for the exact tracked 3B row
+- one healthy Ubuntu backend-only `/v1/completions` probe produced a first-token success artifact for the exact tracked 3B row
 
-This is useful blocker-reduction and backend evidence, not a support promotion.
+This is useful blocker-reduction and first-token evidence, not a support promotion.
 
 ### Llama 3 8B backend-evidence groundwork
 
 Recent backend work also converted the first bounded 8B runtime artifact into stronger backend-only evidence without widening the release boundary:
 
 - the exact tracked `Meta-Llama-3-8B-Instruct-Q8_0.gguf` loaded successfully on Ubuntu
-- repeat bounded backend-only `/v1/completions` 5-token generation succeeded for prompt `hello`
+- repeat bounded backend-only `/v1/completions` first-token probes returned `,` for prompt `hello`
 - current-head raw `hello` prompt-token parity matched `[128000, 15339]` for the exact same model SHA
-- prompt-cache validation and a fresh 50-token backend/API artifact were captured at `target/ubuntu-8b-50tok-fast-20260501T235312Z/50tok.json`
-- the current-head memory gate stayed bounded below 400 MiB RSS with no swap, OOM, timeout, or runaway retained-RSS signature
+- a short deterministic 5-token backend slice returned `, I'm a new`
+- the current-head memory gate stayed bounded: first-token sampled RSS roughly `6,220 -> 378,520 KiB`; 5-token sampled RSS roughly `6,076 -> 396,912 KiB`; no swap, OOM, timeout, or runaway retained-RSS signature appeared
 
 This is promising backend evidence, but still not a support promotion.
-
-### Concise commit trail
-
-- `268f6fb` — cached prompt follow-up generation bug fixed.
-- `462008c` — stronger 8B backend evidence recorded across docs, API compatibility reporting, and frontend-facing support surfaces.
 
 ## Next blocking work
 
 In order of importance:
 
 1. Preserve the TinyLlama Q8_0 supported gate.
-2. Convert the new Llama 3.2 3B Q8_0 repeat 5-token and bounded 50-token backend wins into prompt-token parity plus API/WebUI evidence for the exact target row.
+2. Capture the second bounded Llama 3.2 3B Q8_0 success plus prompt-token, short-generation, API, and WebUI evidence for the exact target row.
 3. Extend Llama 3 8B Q8_0 from the current backend-only slice into broader prompt-pack/chat-template parity, WebUI readiness, and performance evidence without changing support language early.
 4. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
 
