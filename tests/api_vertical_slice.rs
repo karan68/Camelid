@@ -96,15 +96,15 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap();
     assert_eq!(
         llama32_3b["status"],
-        "acceptance_target_first_token_evidence_only"
+        "acceptance_target_backend_evidence_only"
     );
     assert_eq!(
         llama32_3b["generation_runs"],
-        "one_backend_only_first_token_success"
+        "repeat_backend_only_short_generation_plus_bounded_50_token_run"
     );
     assert_eq!(
         llama32_3b["tested_context"],
-        "backend_only_completion_prompt_hello_1_token"
+        "backend_only_completion_prompt_hello_5_and_50_tokens"
     );
     let llama3 = compatibility
         .iter()
@@ -121,11 +121,11 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama3["generation_runs"],
-        "repeat_backend_only_first_token_plus_5_token_slice"
+        "repeat_backend_only_5_token_generation_plus_50_token_artifact"
     );
     assert_eq!(
         llama3["tested_context"],
-        "backend_only_completion_prompt_hello_1_and_5_tokens"
+        "backend_only_completion_prompt_hello_5_and_50_tokens"
     );
     let planned_quant = compatibility
         .iter()
