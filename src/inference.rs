@@ -3321,7 +3321,8 @@ fn output_projection_token_row(
     {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "output projection diagnostics cannot lazily decode {} layout for tensor {}",
-            layout.label(), output_weight.name
+            layout.label(),
+            output_weight.name
         )));
     }
 
@@ -3332,7 +3333,9 @@ fn output_projection_token_row(
     disable_file_cache_best_effort(&file);
     let blocks_per_row = hidden_width / Q8_0_BLOCK_VALUES;
     let row_block_start = token_index.checked_mul(blocks_per_row).ok_or_else(|| {
-        BackendError::RuntimeShapeMismatch("output projection token row block offset overflow".to_string())
+        BackendError::RuntimeShapeMismatch(
+            "output projection token row block offset overflow".to_string(),
+        )
     })?;
     let row_offset = backing
         .absolute_offset
@@ -6351,7 +6354,9 @@ mod tests {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
 
-        let input_values = (0..32).map(|idx| idx as f32 * 0.25 - 2.0).collect::<Vec<_>>();
+        let input_values = (0..32)
+            .map(|idx| idx as f32 * 0.25 - 2.0)
+            .collect::<Vec<_>>();
         let input = CpuTensor::from_f32("output_norm", vec![1, 32], input_values.clone()).unwrap();
         let row0 = Q8_0Block {
             scale: 0.125,
