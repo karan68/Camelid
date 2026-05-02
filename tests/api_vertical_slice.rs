@@ -98,10 +98,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "api_completion_and_chat_smoke_validated"
     );
     assert_eq!(llama32_3b["frontend_load_path_verified"], "validated");
-    assert_eq!(
-        llama32_3b["tested_context"],
-        "short_api_webui_smoke"
-    );
+    assert_eq!(llama32_3b["tested_context"], "short_api_webui_smoke");
     let llama3 = compatibility
         .iter()
         .find(|item| item["id"] == "llama3_8b_instruct_gguf")
