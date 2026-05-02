@@ -27,8 +27,8 @@ blocker has moved from artifact presence to repeat bounded parity/API/WebUI acce
 - `/api/models/load` succeeds for the exact 3B target.
 - The latest file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike.
 - One healthy Ubuntu backend-only `/v1/completions` probe returned a first token for `hello`.
-- Therefore the row remains blocked before repeat bounded success, prompt-token parity,
-  first-token parity, short generation parity, API chat acceptance, and WebUI acceptance.
+- Therefore the row remains blocked before broader prompt/chat-template coverage, API chat acceptance,
+  WebUI acceptance, and stronger performance follow-up evidence.
 
 ## Disk and memory expectations
 
@@ -55,8 +55,9 @@ Do not mark the 3B row green until all applicable items have artifact paths.
 
 ## Current status
 
-Status: **acceptance target / first-token evidence only**
+Status: **acceptance target with compact parity evidence**
 
-The exact 3B artifact now exists, so older missing-artifact notes are historical only. The current
-work is to turn exact-GGUF load success plus the single first-token artifact into repeat bounded
-prompt-token, parity, API, and WebUI evidence without changing the support contract early.
+The exact 3B artifact now exists, and the Ubuntu compact-header `hello` harness now matches
+llama.cpp for prompt tokens plus deterministic 1-token and 5-token generation. The current work
+is to widen that exact-row evidence into broader prompt coverage plus API and WebUI acceptance
+without changing the support contract early.
