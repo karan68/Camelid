@@ -105,7 +105,7 @@ Promotion remains blocked until Camelid has at least two consecutive bounded suc
 
 ### Llama 3 8B Instruct Q8_0
 
-Status: **groundwork only / backend evidence only**
+Status: **groundwork only with backend validation**
 
 Current evidence boundary:
 
