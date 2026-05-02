@@ -146,6 +146,17 @@ Fresh inspection on `main` at `231d7e1` keeps the same recommendation, and the c
 
 Recommended next safe milestone is still docs/test-first: add a tiny `ModelSourceManifest` / `ModelSourceReadiness` module and fixture coverage for local HF directory detection plus `config.json` / SafeTensors header parsing, while keeping `generation_ready=false` and leaving `/api/models/load` GGUF behavior unchanged.
 
+## 2026-05-01 Evening Current-Head Check
+
+Fresh inspection on `main` at `c29fd71` keeps the SafeTensors lane firmly in docs/interface territory and does not justify runtime churn while the larger Llama GGUF evidence lane is still active:
+
+- `src/api/mod.rs` still centers `LoadedModel` on a loaded `GgufFile` plus optional dense LLaMA config/binding and GGUF-derived tokenizer state. That remains the cleanest seam for a future split into `ModelSourceManifest`/readiness versus runtime-ready loaded weights.
+- `src/model.rs` still exposes the two right extension points: `LlamaModelConfig::from_gguf` for architecture/config lifting and `LlamaTensorBinding::bind` for required dense LLaMA tensor-role validation. SafeTensors should add HF-side constructors and tensor-role mapping beside those functions rather than teaching the GGUF reader HF naming.
+- `src/tensor/mod.rs` is still a good initial landing zone for SafeTensors dtype decode because `CpuTensor` already preserves source-type diagnostics plus optional retained/file-backed weight metadata. Initial SafeTensors support should stay limited to descriptor/header parsing and later F32/F16/BF16 decode into `CpuTensor`; quantized SafeTensors can wait until a real supported source demands them.
+- `src/tokenizer/mod.rs` remains GGUF-metadata-driven even though it now covers both the current LLaMA/SPM and GPT-2/BPE `llama-bpe` lanes. Hugging Face `tokenizer.json` should still land as a separate adapter/readiness path, not as an overload of the current GGUF tokenizer constructor.
+
+Recommended next safe milestone remains unchanged: add a tiny source/readiness layer and fixture coverage for local HF directory detection plus `config.json` / SafeTensors header parsing, while keeping `/api/models/load` GGUF-compatible and `generation_ready=false` for any SafeTensors directory.
+
 ## Recommended Rust Crates / APIs
 
 - `safetensors` (`0.7.0` current crates.io default as of 2026-04-28): use `safetensors::SafeTensors::deserialize` / tensor views for safe header parsing and per-tensor byte slices. Prefer read-only mmap-backed byte storage for large files; copy/decode into Camelid CPU tensors only at the runtime boundary.
