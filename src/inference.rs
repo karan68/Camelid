@@ -3383,9 +3383,9 @@ fn output_projection_token_diagnostic(
     let mut positive_component_sum = 0.0f32;
     let mut negative_component_sum = 0.0f32;
 
-    for idx in 0..hidden_width {
+    for (idx, row_value) in output_row.iter().enumerate().take(hidden_width) {
         let norm_value = output_norm.data[idx];
-        let row_value = output_row[idx];
+        let row_value = *row_value;
         let component = norm_value * row_value;
         component_products.push(component);
         let final_norm_component = match final_norm_sources {

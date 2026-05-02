@@ -65,7 +65,7 @@ The compact table below is the authoritative release ledger reflected in `/api/c
 
 #### Llama 3.2 3B Instruct Q8_0
 - **Family / quant:** LLaMA decoder + Llama 3 BPE, Q8_0
-- **Validated now:** the exact tracked GGUF has validated metadata/load, compact prompt-token plus deterministic 1-token/5-token/50-token parity, `/v1/completions`, `/v1/chat/completions`, and frontend smoke
+- **Validated now:** the exact tracked GGUF has validated metadata/load, compact prompt-token plus deterministic 1-token/5-token/50-token parity, `/v1/completions`, `/v1/chat/completions`, frontend smoke, and a five-prompt API smoke pack
 - **Missing gates:** broader prompt/chat-template parity, longer contexts, stronger memory/performance follow-up evidence, and portable packaging
 - **Support boundary:** supported only for this exact 3B Instruct Q8_0 row and short smoke envelope; no neighboring Llama row inherits support
 
@@ -92,7 +92,7 @@ Before any Phase 9-15 row moves from planned or blocked to supported, require al
 - Independent reference or parity evidence whenever the claim is about tokenizer IDs, generated tokens/text, sampling, or context behavior.
 - Memory/performance evidence that clearly distinguishes retained quantized weights, avoided `f32` materialization, bounded activation/output buffers, and any optimized-kernel determinism guardrail.
 
-For **Llama 3.2 3B** specifically, tracked model presence, exact-row load success, compact prompt-token/1-token/5-token/50-token parity, API smoke and WebUI smoke are now satisfied for the short smoke-supported row. The next promotable evidence is broader prompt/chat-template parity, longer contexts, and stronger performance/portability evidence before expanding the support claim.
+For **Llama 3.2 3B** specifically, tracked model presence, exact-row load success, compact prompt-token/1-token/5-token/50-token parity, API smoke, WebUI smoke, and a five-prompt API smoke pack are now satisfied for the short smoke-supported row. The next promotable evidence is broader prompt/chat-template parity, longer contexts, and stronger performance/portability evidence before expanding the support claim.
 
 For **Llama 3 8B** specifically, the next promotable evidence is not another tokenizer freshness pass or standalone `bench-q8-blocks` report. Camelid now has repeat bounded backend-only first-token evidence, raw `hello` prompt-token parity, a short deterministic 5-token backend generation slice, basic API smoke, and bounded memory evidence for the exact row. The next promotable evidence is broader prompt-pack/chat-template parity, WebUI readiness, performance, and portability artifacts for that same row.
 

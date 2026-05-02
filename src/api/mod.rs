@@ -757,14 +757,14 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
                 metadata_parses: "validated",
-                tokenizer_works: "validated_for_compact_chat_smoke",
+                tokenizer_works: "validated_for_compact_and_small_prompt_pack",
                 tensors_load: "validated",
-                generation_runs: "api_completion_and_chat_smoke_validated",
+                generation_runs: "api_completion_and_chat_smoke_plus_small_prompt_pack",
                 parity_audited: "compact_50_token_match",
                 performance_measured: "bounded_smoke_runs_only",
                 frontend_load_path_verified: "validated",
-                tested_context: "short_api_webui_smoke",
-                evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, and frontend-smoke evidence plus compact prompt-token, deterministic 1-token, 5-token, and bounded 50-token parity; support is limited to this 3B Instruct Q8_0 row and short smoke envelope",
+                tested_context: "short_api_webui_smoke_plus_five_prompt_pack",
+                evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke, and five-prompt API smoke evidence plus compact prompt-token, deterministic 1-token, 5-token, and bounded 50-token parity; support is limited to this 3B Instruct Q8_0 row and short smoke envelope",
                 next_step: "broaden prompt/chat-template parity, longer context, memory/performance, and portability evidence before expanding beyond this exact 3B Q8_0 smoke-supported row",
             },
             ModelCompatibilityTarget {
@@ -3001,9 +3001,9 @@ mod tests {
         let generated = generate_token_ids(prepared).expect("cached generation should succeed");
 
         assert!(!generated.token_ids.is_empty());
-        assert!(generated.token_ids.len() >= 1);
     }
 
+    #[test]
     fn renders_tinyllama_marker_prompt_with_eos_newline_and_assistant_prefix() {
         let tokenizer = Tokenizer {
             model: TokenizerModel::LlamaSpm,

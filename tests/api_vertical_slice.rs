@@ -95,10 +95,13 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama32_3b["status"], "supported_exact_row_smoke");
     assert_eq!(
         llama32_3b["generation_runs"],
-        "api_completion_and_chat_smoke_validated"
+        "api_completion_and_chat_smoke_plus_small_prompt_pack"
     );
     assert_eq!(llama32_3b["frontend_load_path_verified"], "validated");
-    assert_eq!(llama32_3b["tested_context"], "short_api_webui_smoke");
+    assert_eq!(
+        llama32_3b["tested_context"],
+        "short_api_webui_smoke_plus_five_prompt_pack"
+    );
     let llama3 = compatibility
         .iter()
         .find(|item| item["id"] == "llama3_8b_instruct_gguf")
