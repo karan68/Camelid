@@ -191,24 +191,35 @@ Recent backend work also converted the first bounded 8B runtime artifact into st
 
 This is promising backend evidence, but still not an 8B support promotion.
 
-## Latest broader-prompt sweep
+## Latest downloaded Llama-family matrix
 
-Latest Ubuntu prompt-pack run: `target/parity-broad-20260502T033606Z`
+Latest Ubuntu downloaded-model matrix: `target/downloaded-llama-matrix-20260502T231000Z/summary.json`.
 
-- **Llama 3.2 1B Instruct Q8_0:** all five broader prompts cleared at `max_tokens=50`; prompt tokens, generated token IDs, and generated text all matched llama.cpp.
-- **Llama 3.2 3B Instruct Q8_0:** the first two broader prompts cleared, then the JSON-shaped prompt diverged in output formatting despite matching prompt tokens.
-- **Llama 3 8B Instruct Q8_0:** the broader pack did not run to completion because the 3B divergence needs fixing first.
+Downloaded GGUF rows covered by this sweep:
 
-This is why the repo should claim only exact 1B/3B short-chat smoke support, not broad Llama 3 prompt-pack support.
+- `tinyllama-1.1b-chat-v1.0.Q8_0.gguf`
+- `Llama-3.2-1B-Instruct-Q8_0.gguf`
+- `Llama-3.2-3B-Instruct-Q8_0.gguf`
+- `Meta-Llama-3-8B-Instruct-Q8_0.gguf`
+
+Results:
+
+- **TinyLlama 1.1B Chat Q8_0:** `hello` and the alpacas prompt matched llama.cpp; the JSON-shaped prompt diverged despite matching prompt tokens (`endpoint` vs `function` wording in the generated text).
+- **Llama 3.2 1B Instruct Q8_0:** the three-prompt Llama 3 pack passed completely; prompt tokens, generated token IDs, and generated text all matched llama.cpp.
+- **Llama 3.2 3B Instruct Q8_0:** `hello` and the alpacas prompt passed, but the JSON-shaped prompt diverged on the first generated token despite matching prompt tokens (`\`` vs ``\``, a close first-token logit tie). This preserves exact-row short-chat smoke support but blocks a broader prompt-pack claim.
+- **Llama 3 8B Instruct Q8_0:** `hello` and the JSON-shaped prompt passed; the alpacas prompt did not complete cleanly because the backend request hit a Node/undici headers timeout after llama.cpp completed the 50-token reference generation. This remains below support promotion until rerun with a longer backend client timeout and WebUI/performance evidence.
+
+The downloaded-model matrix disproves a broad “perfect Llama-family parity” claim for the current code. Camelid should continue to claim only the exact supported rows and envelopes that are backed by passing artifacts.
 
 ## Next blocking work
 
 In order of importance:
 
 1. Preserve the TinyLlama Q8_0 supported gate and the exact Llama 3.2 1B/3B short-chat smoke gates.
-2. Fix and rerun the Llama 3.2 3B broader JSON-shaped prompt-pack divergence before widening the 3B support envelope.
-3. Extend Llama 3 8B Q8_0 from the current backend-only slice into broader prompt-pack/chat-template parity, WebUI readiness, and performance evidence without changing support language early.
-4. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
+2. Preserve and publish the Llama 3.2 1B broader prompt-pack win as exact-row evidence, without lending it to neighboring rows.
+3. Fix and rerun the Llama 3.2 3B broader JSON-shaped prompt-pack divergence before widening the 3B support envelope.
+4. Rerun the Llama 3 8B alpacas prompt with a longer backend client timeout, then extend the row into broader prompt-pack/chat-template parity, WebUI readiness, and performance evidence without changing support language early.
+5. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
 
 ### Qwen prerequisite note
 

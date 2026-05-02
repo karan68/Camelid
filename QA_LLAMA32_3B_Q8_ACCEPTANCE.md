@@ -28,7 +28,7 @@ moved from artifact presence to broader prompt/chat-template, API, and WebUI acc
 - `/api/models/load` succeeds for the exact 3B target.
 - The latest file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike.
 - The Ubuntu compact-header `hello` harness now matches llama.cpp for prompt tokens plus deterministic 1-token, 5-token, and bounded 50-token generation.
-- A broader Ubuntu prompt-pack run started to widen that evidence, but it uncovered a real exact-row divergence on the JSON-shaped prompt `answer with valid JSON for {"ok":true,"value":2}`: Camelid returned fenced JSON while llama.cpp returned inline backticked JSON.
+- Broader Ubuntu prompt-pack runs continue to uncover a real exact-row divergence on the JSON-shaped prompt `answer with valid JSON for {"ok":true,"value":2}`. The latest downloaded-model matrix (`target/downloaded-llama-matrix-20260502T231000Z/summary.json`) again passed `hello` and the alpacas prompt for 3B, then failed the JSON-shaped prompt at the first generated token despite matching prompt tokens (`\`` vs ``\``, a close logit tie).
 - Therefore the row remains blocked before broader prompt/chat-template coverage, API chat acceptance,
   WebUI acceptance, and stronger performance follow-up evidence.
 
@@ -61,8 +61,9 @@ Status: **acceptance target with compact parity evidence**
 
 The exact 3B artifact now exists, and the Ubuntu compact-header `hello` harness now matches
 llama.cpp for prompt tokens plus deterministic 1-token, 5-token, and bounded 50-token generation.
-A follow-on broader prompt-pack run (`target/parity-broad-20260502T033606Z`) cleared `hello` and the
+Follow-on broader prompt-pack runs (`target/parity-broad-20260502T033606Z` and the downloaded-model
+matrix at `target/downloaded-llama-matrix-20260502T231000Z/summary.json`) cleared `hello` and the
 three-bullet alpaca prompt, then failed on the JSON-shaped prompt because Camelid and llama.cpp
-formatted the answer differently even though prompt tokens still matched. The current work is to
-fix that exact divergence, rerun the broader pack cleanly, and only then widen the API/WebUI
-support contract.
+selected different first generated backtick tokens even though prompt tokens still matched. The
+current work is to fix that exact divergence, rerun the broader pack cleanly, and only then widen
+the API/WebUI support contract.
