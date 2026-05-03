@@ -1,6 +1,6 @@
 # Camelid Compatibility Matrix
 
-Last updated: 2026-05-02
+Last updated: 2026-05-03
 
 `COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
 
@@ -38,6 +38,13 @@ Two rules keep this matrix honest across docs, API signals, and UI copy:
 README, `STATUS.md`, `/api/capabilities`, and frontend readiness copy should continue to mirror this exact ledger. `/api/capabilities` exposes the same compatibility rows as `model_compatibility`; read each row literally. Metadata parsing does not imply tokenizer parity, tokenizer parity does not imply generation, tensor loading does not imply safe execution, and one supported row must never lend support to adjacent model sizes or quantizations.
 
 In plain terms: TinyLlama Q8_0 is still a live supported gate; exact Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0 rows are smoke-supported when the runtime is loaded, generation-ready, and inside the tested short local-chat/parity envelope.
+
+## Durable evidence anchors
+
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json` plus `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS` are the committed carry-forward row bundles/checksums for the public smoke boundary.
+- `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json` is the committed four-row Ubuntu perf/portability summary.
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/manifest.json` plus its per-row manifests/checksums are the durable current-head citation layer for exact rerun tracks, blocker notes, and command files.
+- Raw `target/` artifacts may appear as drill-down references, but they should not stand alone as the release-facing evidence anchor.
 
 ## Current release ledger
 
@@ -92,11 +99,11 @@ Before any Phase 9-15 row moves from planned or blocked to supported, require al
 - Independent reference or parity evidence whenever the claim is about tokenizer IDs, generated tokens/text, sampling, or context behavior.
 - Memory/performance evidence that clearly distinguishes retained quantized weights, avoided `f32` materialization, bounded activation/output buffers, and any optimized-kernel determinism guardrail.
 
-For **Llama 3.2 1B** specifically, the downloaded-model matrix at `target/downloaded-llama-matrix-20260502T231000Z/summary.json` cleared the current three-prompt Llama 3 pack: prompt tokens, generated token IDs, and generated text all matched llama.cpp. The current-head durable execution manifest for the exact row now lives at `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_1b_instruct_q8_0/manifest.json`, which keeps the next context/template/perf reruns tied to the right row without promoting neighboring rows.
+For **Llama 3.2 1B** specifically, the committed carry-forward row bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_1b_instruct_q8_0.bundle.json` plus the current-head row manifest at `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_1b_instruct_q8_0/manifest.json` are the durable citation anchors for the exact-row smoke boundary. The public row bundle preserves the current compact/broader smoke evidence and checksums, while the current-head manifest pins the next longer-context, chat-template, and perf reruns to this exact row only.
 
-For **Llama 3.2 3B** specifically, tracked model presence, exact-row load success, compact prompt-token/1-token/5-token/50-token parity, broader three-prompt 50-token parity, API smoke, WebUI smoke, and a five-prompt API smoke pack are now satisfied for the smoke-supported row. The earlier downloaded-model JSON-shaped divergence is superseded by the post-Q8-dot clean rerun, where prompt tokens, generated token IDs, and generated text all match llama.cpp. The next promotable evidence is longer context, stronger performance/portability, and broader chat-template coverage before expanding the claim.
+For **Llama 3.2 3B** specifically, the committed carry-forward row bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_3b_instruct_q8_0.bundle.json` preserves the exact-row API/WebUI/compact-parity smoke boundary, and the current-head row manifest at `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_3b_instruct_q8_0/manifest.json` is the durable citation target for the post-Q8-dot broader three-prompt handoff plus the next context/template/perf tracks. The next promotable evidence is still longer context, stronger performance/portability, and broader chat-template coverage before expanding the claim.
 
-For **Llama 3 8B** specifically, the exact row now has promotion evidence: compact-header `hello` parity, the three-prompt 5-token Ubuntu parity run at `target/acceptance-llama3-8b-broader-5tok-longtimeout-20260503T010536Z/summary.json`, API/frontend smoke, and bounded memory evidence. The current-head durable execution manifest for the exact row now lives at `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama3_8b_instruct_q8_0/manifest.json`, which preserves the known 512-context blocker alongside the broader/template/perf rerun commands before any expansion beyond this exact row.
+For **Llama 3 8B** specifically, the durable citation anchors are the current-head row manifest at `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama3_8b_instruct_q8_0/manifest.json` plus the committed perf/portability envelope at `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`; the public carry-forward bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama3_8b_instruct_q8_0.bundle.json` is intentionally a pre-promotion guarded-WebUI smoke slice from source smoke commit `c5e6d7e`. That keeps the exact-row short-smoke promotion boundary and the known 512-context blocker visible without widening beyond this row.
 
 ## Quantization formats
 

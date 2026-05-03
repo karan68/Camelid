@@ -1,6 +1,6 @@
 # Camelid Roadmap
 
-Last updated: 2026-05-02
+Last updated: 2026-05-03
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 
@@ -27,11 +27,12 @@ Near-term thesis: protect the trusted TinyLlama and exact Llama 3.2 1B/3B plus L
 
 ## Roadmap operating rules
 
-Three rules drive prioritization and sequencing:
+Four rules drive prioritization and sequencing:
 
 - **Protect the current gate first.** TinyLlama Q8_0 remains the release anchor.
 - **Remove the next honest blocker.** The highest-leverage work is the exact runtime seam that can create the next promotable artifact.
 - **Move public surfaces together.** Documentation, API signals, and frontend readiness should change in the same change window.
+- **Cite committed evidence anchors first.** The public bundle manifest/checksums, perf/portability envelope, and current-head per-row manifests are the roadmap-facing evidence layer; raw `target/` artifacts are drill-down only.
 
 ## What changed in the support line
 
@@ -104,6 +105,7 @@ Current required discipline:
 - Llama 3.2 3B Q8_0 is supported as an exact-row smoke lane with compact and broader three-prompt parity evidence; longer-context and broader chat-template expansion remain gated.
 - Llama 3 8B Q8_0 is supported as an exact-row smoke/parity lane with compact parity, long-timeout three-prompt 5-token parity, API/frontend smoke, and bounded memory evidence; longer-context, broader chat-template, performance, and portability expansion remain gated.
 - Frontend readiness must remain exact-row and exact-quant aware.
+- Support-language updates should point first to the committed `qa/evidence-bundles/...` manifests/checksums and only then to raw `target/` drill-down artifacts.
 
 Promotion evidence must update docs, API capability reporting, and frontend readiness language in the same change window.
 

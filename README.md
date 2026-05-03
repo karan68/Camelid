@@ -28,12 +28,18 @@ The current product slice includes:
 
 | Exact lane | Public posture | Evidence today | Still needed |
 | --- | --- | --- | --- |
-| TinyLlama 1.1B Chat Q8_0 | Supported current gate | Five 50-token prompt audits match known-good llama-server prompt token IDs, generated token arrays, and generated text. | No implied support for adjacent TinyLlama quantizations or other model families. |
-| Llama 3.2 1B Instruct Q8_0 | Supported exact-row smoke | Exact GGUF load, `/v1/completions`, `/v1/chat/completions`, frontend smoke, compact parity, and broader prompt-pack evidence support short local chat for this 1B Instruct Q8_0 row only. | Longer context, broader chat-template behavior, performance/portability evidence, and no implied support for neighboring rows. |
-| Llama 3.2 3B Instruct Q8_0 | Supported exact-row smoke | Exact GGUF load, `/v1/completions`, `/v1/chat/completions`, frontend smoke, compact prompt-token/1-token/5-token/50-token parity, and the broader three-prompt 50-token pack now match llama.cpp for this 3B Instruct Q8_0 row only. | Longer context, stronger perf/portability evidence, and no implied support for neighboring rows. |
-| Llama 3 8B Instruct Q8_0 | Supported exact-row smoke | End-to-end generation parity artifacts now exist for the exact Q8_0 row: broader 5-token prompt-pack parity on Ubuntu, `/v1/completions`, `/v1/chat/completions`, frontend smoke, and bounded-memory evidence agree. | Longer context, larger prompt packs, stronger performance/portability evidence, and no implied support for neighboring rows. |
+| TinyLlama 1.1B Chat Q8_0 | Supported current gate | Public row bundle plus the current-head row manifest anchor the five-prompt gate for this exact row. | No implied support for adjacent TinyLlama quantizations or other model families. |
+| Llama 3.2 1B Instruct Q8_0 | Supported exact-row smoke | Public row bundle, perf envelope, and current-head row manifest anchor exact-row smoke for this row only. | Longer context, broader chat-template behavior, performance/portability evidence, and no implied support for neighboring rows. |
+| Llama 3.2 3B Instruct Q8_0 | Supported exact-row smoke | Public carry-forward smoke bundle plus the current-head row manifest anchor exact-row smoke and the post-Q8-dot broader-pack handoff for this row only. | Longer context, stronger perf/portability evidence, and no implied support for neighboring rows. |
+| Llama 3 8B Instruct Q8_0 | Supported exact-row smoke | Public carry-forward bundle, perf envelope, and current-head row manifest anchor exact-row smoke while preserving the 512-context blocker. | Longer context, larger prompt packs, stronger performance/portability evidence, and no implied support for neighboring rows. |
 
 TinyLlama and the exact Llama 3.2 1B/3B Instruct Q8_0 plus Llama 3 8B Instruct Q8_0 rows are the supported generation lanes today, with the Llama rows intentionally limited to exact-row short local-chat/parity envelopes. Broader Llama-family support has not been promoted, and nothing adjacent inherits support.
+
+## Durable evidence anchors
+
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json` plus `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS` are the committed carry-forward row bundles and checksums for the current public smoke boundary.
+- `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json` is the committed four-row Ubuntu perf/portability summary.
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/manifest.json` plus its per-row manifests/checksums are the durable current-head rerun scaffold: exact row IDs, required tracks, blocker notes, and command files.
 
 ## Start here
 
@@ -63,23 +69,21 @@ Current validated facts:
 - The 50-token `hello` stream starts `[29907, 13946, 368, 29991, ...]` and decodes to text beginning `"Certainly! Here are some examples..."`.
 - The current five-prompt gate matches known-good llama-server prompt token IDs, generated token arrays, and generated text for 50 completion tokens.
 
-Current gate artifacts:
+Durable gate anchors:
 
-- `target/edge-prompt-audit-fixed-20260428T1530/short.json`
-- `target/edge-prompt-audit-fixed-20260428T1530/trailing-spaces.json`
-- `target/edge-prompt-audit-fixed-20260428T1530/special-chars.json`
-- `target/edge-prompt-audit-fixed-20260428T1530/longer.json`
-- `target/edge-prompt-dequant-default-20260428T1604/multiline-long-default-50.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/tinyllama_1_1b_chat_q8_0.bundle.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json`
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/tinyllama_1_1b_chat_q8_0/manifest.json`
 
-The separate fixed-audit `multiline` row also matches, but it stops at EOS after 41 tokens, so it is not counted as one of the five 50-token gate artifacts.
+The older five 50-token source JSONs remain listed under that current-head row manifest's `broader-parity` carry-forward track rather than standing alone as the public citation. The separate fixed-audit `multiline` row still matches, but it stops at EOS after 41 tokens, so it is not counted as one of the five 50-token gate artifacts.
 
 ### Adjacent Llama 3-family rows
 
 Camelid now has three exact Llama smoke-supported rows beyond TinyLlama: Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0. These are deliberately narrow release claims: they require the exact Instruct Q8_0 row, a loaded runtime with `generation_ready=true`, and the short local-chat/parity envelope validated by the API and frontend smoke harnesses.
 
-- **Llama 3.2 1B Instruct Q8_0:** exact-row load, completions, chat-completions, frontend smoke, compact parity, and the broader prompt pack are validated for this 1B Instruct Q8_0 row. This does not promote neighboring Llama sizes, base variants, other quantizations, longer contexts, or broad chat-template behavior.
-- **Llama 3.2 3B Instruct Q8_0:** exact-row load, completions, chat-completions, frontend smoke, compact prompt-token/1-token/5-token/50-token parity, and the broader three-prompt 50-token pack are validated for this 3B Instruct Q8_0 row. The previous JSON-shaped prompt divergence was fixed by the file-backed Q8_0 dot-parity correction; remaining follow-up is longer-context, performance, portability, and broader chat-template coverage. See [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md) and [`STATUS.md`](STATUS.md) for the exact evidence boundary.
-- **Llama 3 8B Instruct Q8_0:** the exact tracked Q8_0 GGUF now has end-to-end generation parity artifacts: compact `hello` parity, a three-prompt 5-token Ubuntu parity run where prompt tokens, generated token IDs, and generated text match llama.cpp, plus API/frontend smoke evidence. This promotes only the exact Llama 3 8B Instruct Q8_0 row; it does not claim neighboring Llama sizes, other quantizations, longer contexts, or broad chat-template behavior.
+- **Llama 3.2 1B Instruct Q8_0:** exact-row load, completions, chat-completions, frontend smoke, compact parity, and the broader prompt pack are validated for this 1B Instruct Q8_0 row. Durable anchors: `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_1b_instruct_q8_0.bundle.json` and `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_1b_instruct_q8_0/manifest.json`. This does not promote neighboring Llama sizes, base variants, other quantizations, longer contexts, or broad chat-template behavior.
+- **Llama 3.2 3B Instruct Q8_0:** exact-row load, completions, chat-completions, frontend smoke, compact prompt-token/1-token/5-token/50-token parity, and the broader three-prompt 50-token pack are validated for this 3B Instruct Q8_0 row. Durable anchors: `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_3b_instruct_q8_0.bundle.json` for carry-forward smoke plus `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_3b_instruct_q8_0/manifest.json` for the post-Q8-dot broader-pack handoff and next tracks. This does not promote neighboring Llama sizes, base variants, other quantizations, longer contexts, or broad chat-template behavior. See [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md) and [`STATUS.md`](STATUS.md) for the exact evidence boundary.
+- **Llama 3 8B Instruct Q8_0:** the exact tracked Q8_0 GGUF now has end-to-end generation parity artifacts: compact `hello` parity, a three-prompt 5-token Ubuntu parity run where prompt tokens, generated token IDs, and generated text match llama.cpp, plus API/frontend smoke evidence. Durable anchors: `qa/evidence-bundles/four-row-public-20260503T024327Z/llama3_8b_instruct_q8_0.bundle.json` for the pre-promotion guarded-WebUI smoke slice, `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`, and `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama3_8b_instruct_q8_0/manifest.json` for the current exact-row promotion boundary and known 512-context blocker. This promotes only the exact Llama 3 8B Instruct Q8_0 row; it does not claim neighboring Llama sizes, other quantizations, longer contexts, or broad chat-template behavior.
 
 Fresh tokenizer revalidations and standalone Q8 block benchmarks are seam evidence only. They do not, by themselves, expand a generation-support claim.
 

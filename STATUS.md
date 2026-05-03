@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-02
+Last updated: 2026-05-03
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -30,6 +30,13 @@ For the formal support ledger, see [`COMPATIBILITY.md`](COMPATIBILITY.md). For s
 
 Bottom line for reviewers: Camelid has the original TinyLlama supported gate plus three exact Llama Q8_0 short-chat/parity smoke rows: Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B. That is a real end-to-end support expansion, but it is not a broad Llama-family claim.
 
+## Durable evidence anchors
+
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json` plus `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS` are the committed carry-forward row bundles/checksums for the public smoke boundary.
+- `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json` is the committed Ubuntu perf/portability summary for the current four-row sweep.
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/manifest.json` plus its per-row manifests/checksums are the durable current-head citation target for exact rerun tracks, blocker notes, and command files.
+- Raw `target/` paths below are drill-down artifacts only; they are not the sole public evidence anchor.
+
 ## What changed in this support line
 
 Recent work moved the exact-row release ledger in a narrow, evidence-backed way:
@@ -56,14 +63,14 @@ Current evidence boundary:
 - Prompt token IDs, generated token arrays, and generated text match.
 - The token-major `output.weight` interpretation remains a protected correctness guardrail.
 
-Representative artifacts:
+Representative durable evidence:
 
-- `target/edge-prompt-audit-fixed-20260428T1530/short.json`
-- `target/edge-prompt-audit-fixed-20260428T1530/trailing-spaces.json`
-- `target/edge-prompt-audit-fixed-20260428T1530/special-chars.json`
-- `target/edge-prompt-audit-fixed-20260428T1530/longer.json`
-- `target/edge-prompt-dequant-default-20260428T1604/multiline-long-default-50.json`
-- `target/chat-parity-postfix-50-token-audit.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/tinyllama_1_1b_chat_q8_0.bundle.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS`
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/tinyllama_1_1b_chat_q8_0/manifest.json`
+
+The older five 50-token source JSONs remain listed under that current-head row manifest's `broader-parity` carry-forward track instead of standing alone as the release citation.
 
 ### Llama 3.2 1B Instruct Q8_0
 
@@ -77,15 +84,13 @@ Current evidence boundary:
 - `/api/models/load`, `/v1/completions`, `/v1/chat/completions`, and frontend smoke evidence are aligned with `/api/capabilities`.
 - The support claim is limited to this exact 1B Instruct Q8_0 row and short local-chat smoke; neighboring Llama rows, other quantizations, longer contexts, and broader chat-template behavior remain outside the claim.
 
-Representative artifacts:
+Representative durable evidence:
 
-- `target/autonomous-small-model-parity-20260429T134615Z-head-9049492/llama32-1b-q8-chat-parity-5tok.json`
-- `target/qa-small-model-parity-20260429T1338Z-head-35bfd58/`
-- `target/parity-50tok-20260502T031820Z/llama32-1b-50tok/report.json`
-- `target/qa-discord-20260502T1832Z/PROMOTION_QA_SUMMARY.md`
-- `target/qa-discord-20260502T1832Z/llama32-1b-broad-canonical/summary.json`
-- `target/qa-discord-20260502T1832Z/llama32-1b-api-smoke/summary.json`
-- `target/qa-discord-20260502T1832Z/llama32-1b-webui-smoke/summary-node22b.txt`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_1b_instruct_q8_0.bundle.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS`
+- `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_1b_instruct_q8_0/manifest.json`
 
 ### Llama 3.2 3B Instruct Q8_0
 
@@ -100,26 +105,20 @@ Current evidence boundary:
 - `/v1/completions`, `/v1/chat/completions`, and frontend smoke evidence are aligned with `/api/capabilities` for this exact row.
 - The support claim is limited to this exact 3B Instruct Q8_0 row and the validated local-chat/parity envelope; longer contexts, stronger memory/performance evidence, portable packaging, and broader chat-template coverage remain follow-up gates.
 
-Representative artifacts:
+Representative durable evidence:
 
-- `target/llama32-3b-streaming-metadata-20260430T233604Z/summary.md`
-- `target/llama32-3b-nocache-rowread-20260430T233844Z/summary.md`
-- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/summary.md`
-- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/load-response.json`
-- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/completion-response.json`
-- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/required-forward-trace.log`
-- `target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z/meminfo-samples.log`
-- `target/parity-20260502T030911Z/llama32-3b-1tok/report.json`
-- `target/parity-20260502T030911Z/llama32-3b-5tok/report.json`
-- `target/parity-50tok-20260502T031820Z/llama32-3b-50tok/report.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_3b_instruct_q8_0.bundle.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS`
+- `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama32_3b_instruct_q8_0/manifest.json`
+
+Selected source artifacts recorded by those committed files:
+
+- `target/ubuntu-followup-20260502T015231Z/llama32_3b-50tok.json` preserves compact bounded parity inside the carry-forward bundle.
+- `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json` is the post-Q8-dot broader three-prompt clean rerun called out by the current-head row manifest notes.
 
 Expansion beyond the current supported row remains blocked until Camelid has longer-context coverage plus stronger memory/performance, portability, and broader WebUI/chat-template evidence for this exact row.
-
-Latest broader-prompt result:
-
-- `target/camelid-regression-q8dot-20260502T232633Z/llama32-3b-compact/summary.json` passed the compact three-prompt 5-token pack after the file-backed Q8_0 dot-parity fix.
-- `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json` passed the broader three-prompt 50-token pack, including the former JSON-shaped blocker prompt `answer with valid JSON for {"ok":true,"value":2}`.
-- For that broader pack, prompt tokens, generated token IDs, and generated text all matched llama.cpp; every prompt reports `first_generated_token_diff_index=-1` and `first_generated_text_diff_index=-1`.
 
 ### Llama 3 8B Instruct Q8_0
 
@@ -135,25 +134,19 @@ Current evidence boundary:
 - `/api/models/load`, `/v1/completions`, `/v1/chat/completions`, and frontend smoke passed for this exact row.
 - The support claim is limited to this exact Llama 3 8B Instruct Q8_0 row and tested short smoke/parity envelope; neighboring Llama rows, other quantizations, longer contexts, and broader chat-template behavior remain outside the claim.
 
-Representative artifacts:
+Representative durable evidence:
 
-- `target/backend-small-model-readiness-20260429T131209Z/report.json`
-- `target/perf-cron-20260429T122814Z-single-row-adapter-head-da53871/summary.md`
-- `target/ubuntu-llama3-8b-q8-first-token-20260501T2152Z/summary.md`
-- `target/ubuntu-llama3-8b-q8-validation-20260501T235936Z/targeted-lazy-q8-tests.log`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/validation-summary.json`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/first-token.completion-summary.json`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/first-token.meminfo-samples.log`
-- `target/acceptance-llama3-8b-broader-5tok-longtimeout-20260503T010536Z/summary.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/llama3_8b_instruct_q8_0.bundle.json` (the committed pre-promotion guarded-WebUI carry-forward slice)
 - `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json`
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS`
 - `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/first-token.required-forward-trace.log`
-- `target/parity-20260502T030911Z/llama3-8b-1tok/report.json`
-- `target/parity-20260502T030911Z/llama3-8b-5tok/report.json`
-- `target/parity-50tok-20260502T031820Z/llama3-8b-50tok/report.json`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/short-5tok.completion-summary.json`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/short-5tok.meminfo-samples.log`
-- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/short-5tok.required-forward-trace.log`
+- `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/llama3_8b_instruct_q8_0/manifest.json`
+- `qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md`
+
+Selected source artifacts recorded by those committed files:
+
+- `target/acceptance-llama3-8b-broader-5tok-longtimeout-20260503T010536Z/summary.json` is the broader three-prompt 5-token parity pass referenced by the row bundle.
+- `target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z/validation-summary.json` is the bounded-RSS short-slice summary carried forward beside the current-head blocker note.
 
 ## Latest promotion-relevant work
 
