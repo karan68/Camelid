@@ -2648,7 +2648,7 @@ fn render_llama3_instruct_prompt(messages: &[ChatMessage]) -> String {
         prompt.push_str("<|start_header_id|>");
         prompt.push_str(message.role.trim());
         prompt.push_str("<|end_header_id|>\n\n");
-        prompt.push_str(message.content.trim());
+        prompt.push_str(&message.content);
         prompt.push_str("<|eot_id|>");
     }
     if messages
@@ -3100,8 +3100,98 @@ mod tests {
                 }],
                 &tokenizer,
             ),
-            "<|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+            "<|start_header_id|>user<|end_header_id|>\n\n hello <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
+    }
+
+    #[test]
+    fn renders_llama3_instruct_prompt_with_system_and_multi_turn_messages() {
+        let tokenizer = llama3_test_tokenizer();
+
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: "Answer briefly.".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "Say alpha.".to_string(),
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: "alpha".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "Now say beta.".to_string(),
+                    },
+                ],
+                &tokenizer,
+            ),
+            "<|start_header_id|>system<|end_header_id|>\n\nAnswer briefly.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nSay alpha.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nalpha<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nNow say beta.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn renders_llama3_instruct_prompt_without_generation_header_after_assistant_final() {
+        let tokenizer = llama3_test_tokenizer();
+
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "Complete cam".to_string(),
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: "elid".to_string(),
+                    },
+                ],
+                &tokenizer,
+            ),
+            "<|start_header_id|>user<|end_header_id|>\n\nComplete cam<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nelid<|eot_id|>"
+        );
+    }
+
+    #[test]
+    fn renders_llama3_instruct_prompt_preserving_multiline_content() {
+        let tokenizer = llama3_test_tokenizer();
+
+        assert_eq!(
+            render_chat_prompt(
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "Line one.\n\n  Indented line two.  ".to_string(),
+                }],
+                &tokenizer,
+            ),
+            "<|start_header_id|>user<|end_header_id|>\n\nLine one.\n\n  Indented line two.  <|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    fn llama3_test_tokenizer() -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::Gpt2Bpe,
+            tokens: Vec::new(),
+            token_to_id: HashMap::new(),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens::default(),
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: false,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(
+                "<|start_header_id|>{{ role }}<|end_header_id|>{{ content }}<|eot_id|>".to_string(),
+            ),
+        }
     }
 
     fn materialization_binding(

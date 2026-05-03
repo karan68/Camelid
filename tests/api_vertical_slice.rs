@@ -117,7 +117,10 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         llama3["metadata_parses"],
         "real_artifact_inspected_and_config_guarded"
     );
-    assert_eq!(llama3["tokenizer_works"], "validated_for_compact_llama3_bpe");
+    assert_eq!(
+        llama3["tokenizer_works"],
+        "validated_for_compact_llama3_bpe"
+    );
     assert_eq!(
         llama3["generation_runs"],
         "api_completion_and_chat_smoke_validated"

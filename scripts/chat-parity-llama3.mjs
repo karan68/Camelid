@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process'
 import http from 'node:http'
 import https from 'node:https'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 const args = parseArgs(process.argv.slice(2))
@@ -11,6 +11,8 @@ const llamaBase = (args.get('llama-url') || process.env.LLAMA3_LLAMA_SERVER_URL 
 const modelPath = resolve(args.get('model') || process.env.LLAMA3_GGUF || '$CAMELID_MODEL_DIR/Llama-3.2-1B-Instruct-Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.LLAMA3_MODEL_ID || 'llama3-small-q8'
 const userMessage = args.get('message') ?? process.env.LLAMA3_CHAT_MESSAGE ?? 'hello'
+const messagesJson = args.get('messages-json') || process.env.LLAMA3_CHAT_MESSAGES_JSON
+const renderMode = args.get('render-mode') || process.env.LLAMA3_CHAT_RENDER_MODE || 'compact'
 const maxTokens = Number.parseInt(args.get('max-tokens') || process.env.LLAMA3_CHAT_MAX_TOKENS || '1', 10)
 const llamaServerBin = resolve(args.get('llama-server') || process.env.LLAMA3_LLAMA_SERVER || 'target/reference/llama.cpp/build/bin/llama-server')
 const llamaTokenizeBin = resolve(args.get('llama-tokenize') || process.env.LLAMA3_LLAMA_TOKENIZE || 'target/reference/llama.cpp/build/bin/llama-tokenize')
@@ -26,14 +28,17 @@ if (!Number.isInteger(maxTokens) || maxTokens < 1) {
 if (!Number.isInteger(waitMs) || waitMs < 1) {
   throw new Error(`--wait-ms must be a positive integer, got ${args.get('wait-ms')}`)
 }
+if (renderMode !== 'compact') {
+  throw new Error(`unsupported --render-mode ${JSON.stringify(renderMode)}; current Camelid evidence uses compact Llama 3 Instruct header rendering`)
+}
 
-const messages = [{ role: 'user', content: userMessage }]
+const messages = await loadMessages({ messagesJson, fallbackMessage: userMessage })
 // Camelid's current Llama 3 support intentionally renders the compact header/eot
 // form used by the checked-in tokenizer fixtures, then asks the tokenizer to add
 // BOS. Use llama-server /completion with this exact prompt instead of /v1/chat,
 // because newer Llama 3.2 GGUF chat templates inject a default dated system
 // header that Camelid does not implement yet.
-const expectedPrompt = `<|start_header_id|>user<|end_header_id|>\n\n${userMessage}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n`
+const expectedPrompt = renderCompactLlama3Prompt(messages)
 let child
 let childSpawnError
 try {
@@ -124,7 +129,11 @@ try {
     model: modelPath,
     model_id: modelId,
     message: userMessage,
+    messages,
+    render_mode: renderMode,
     expected_prompt: expectedPrompt,
+    expected_prompt_char_count: expectedPrompt.length,
+    reference_prompt_token_count: referencePromptTokens.length,
     prompt_tokens_match: promptMatch,
     generated_tokens_match: generatedTokensMatch,
     generated_text_match: textMatch,
@@ -148,7 +157,11 @@ try {
   console.log(`llama_server=${llamaBase}`)
   console.log(`model=${modelPath}`)
   console.log(`message=${JSON.stringify(userMessage)}`)
+  console.log(`messages=${JSON.stringify(messages)}`)
+  console.log(`render_mode=${renderMode}`)
   console.log(`expected_prompt=${JSON.stringify(expectedPrompt)}`)
+  console.log(`expected_prompt_char_count=${expectedPrompt.length}`)
+  console.log(`reference_prompt_token_count=${referencePromptTokens.length}`)
   console.log(`backend_prompt_tokens=${JSON.stringify(backendPromptTokens)}`)
   console.log(`reference_prompt_tokens=${JSON.stringify(referencePromptTokens)}`)
   console.log(`prompt_tokens_match=${promptMatch}`)
@@ -173,6 +186,34 @@ try {
   if (requireGeneratedMatch && !generatedTokensMatch) process.exitCode = 1
 } finally {
   if (child) child.kill('SIGTERM')
+}
+
+
+async function loadMessages({ messagesJson, fallbackMessage }) {
+  if (!messagesJson) return [{ role: 'user', content: fallbackMessage }]
+  const raw = JSON.parse(await readFile(resolve(messagesJson), 'utf8'))
+  const messages = Array.isArray(raw) ? raw : raw.messages
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new Error(`${messagesJson} must contain a non-empty messages array`)
+  }
+  return messages.map((message, index) => {
+    const role = String(message?.role ?? '').trim()
+    const content = String(message?.content ?? '')
+    if (!role) throw new Error(`${messagesJson} messages[${index}].role must not be empty`)
+    if (content.length === 0) throw new Error(`${messagesJson} messages[${index}].content must not be empty`)
+    return { role, content }
+  })
+}
+
+function renderCompactLlama3Prompt(messages) {
+  let prompt = ''
+  for (const message of messages) {
+    prompt += `<|start_header_id|>${message.role.trim()}<|end_header_id|>\n\n${message.content}<|eot_id|>`
+  }
+  if (messages.at(-1)?.role.trim() !== 'assistant') {
+    prompt += '<|start_header_id|>assistant<|end_header_id|>\n\n'
+  }
+  return prompt
 }
 
 function parseArgs(argv) {

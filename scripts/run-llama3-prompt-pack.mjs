@@ -36,6 +36,7 @@ const modelPath = resolve(modelPathArg)
 await mkdir(outDir, { recursive: true })
 
 const defaultMaxTokens = Number.parseInt(String(pack.defaults?.max_tokens ?? 50), 10)
+const defaultRenderMode = pack.defaults?.render_mode ? String(pack.defaults.render_mode) : 'compact'
 const summary = {
   schema: 'camelid.llama3.prompt-pack-run.v1',
   pack: {
@@ -73,11 +74,18 @@ for (let index = 0; index < prompts.length; index += 1) {
     '--llama-url', llamaBase,
     '--model', modelPath,
     '--model-id', modelId,
-    '--message', String(prompt.message ?? ''),
     '--max-tokens', String(maxTokens),
     '--wait-ms', String(waitMs),
     '--diagnostics-out', diagnosticsPath,
   ]
+  const renderMode = prompt.render_mode ? String(prompt.render_mode) : defaultRenderMode
+  if (renderMode) commandArgs.push('--render-mode', renderMode)
+  const hasMessages = Array.isArray(prompt.messages)
+  if (hasMessages) {
+    commandArgs.push('--messages-json', promptPath)
+  } else {
+    commandArgs.push('--message', String(prompt.message ?? ''))
+  }
   if (requirePromptMatch) commandArgs.push('--require-prompt-match')
   if (requireGeneratedMatch) commandArgs.push('--require-generated-match')
   for (const [flag, enabled] of passthroughFlags) {
@@ -104,6 +112,8 @@ for (let index = 0; index < prompts.length; index += 1) {
   const result = {
     id: promptId,
     message: prompt.message ?? '',
+    messages: Array.isArray(prompt.messages) ? prompt.messages : null,
+    render_mode: renderMode,
     note: prompt.note ?? null,
     max_tokens: maxTokens,
     artifact_dir: promptDir,
