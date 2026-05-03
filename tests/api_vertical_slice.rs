@@ -56,6 +56,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .iter()
         .any(|item| item["id"] == "Q4_K_M/Q5_K_M"));
+    assert!(body["supported_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "llama_bpe_decoder_exact_1b_3b_q8_0"
+            && item["status"] == "supported_exact_row_smoke"));
     assert!(body["planned_model_families"]
         .as_array()
         .unwrap()

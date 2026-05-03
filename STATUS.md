@@ -216,7 +216,7 @@ In order of importance:
 1. Preserve the TinyLlama Q8_0 supported gate and the exact Llama 3.2 1B/3B short-chat smoke gates.
 2. Preserve and publish the Llama 3.2 1B broader prompt-pack win as exact-row evidence, without lending it to neighboring rows.
 3. Preserve the Llama 3.2 3B broader prompt-pack win in docs, API, and regression evidence without lending it to neighboring rows.
-4. Rerun the Llama 3 8B alpacas prompt with a longer backend client timeout, then extend the row into broader prompt-pack/chat-template parity, WebUI readiness, and performance evidence without changing support language early.
+4. Rerun the Llama 3 8B alpacas prompt on the canonical Ubuntu validation host `34.216.78.246` with a materially longer backend client timeout, then extend the row into broader prompt-pack/chat-template parity, WebUI readiness, and performance evidence without changing support language early.
 5. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
 
 ### Qwen prerequisite note

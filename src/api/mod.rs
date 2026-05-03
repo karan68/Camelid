@@ -681,7 +681,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "current TinyLlama parity gate; optimized Q8 block-dot path is opt-in until guarded",
+                notes: "TinyLlama support gate plus exact Llama 3.2 1B/3B short-chat smoke rows; neighboring Q8_0 rows still need their own evidence",
             },
         ],
         planned_quantization: vec![
@@ -696,16 +696,23 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 notes: "K-quant lane after simpler quant validation",
             },
         ],
-        supported_model_families: vec![SupportItem {
-            id: "llama_spm_decoder",
-            status: "supported_current_gate",
-            notes: "LLaMA-style decoder path validated on TinyLlama Q8_0 gate",
-        }],
+        supported_model_families: vec![
+            SupportItem {
+                id: "llama_spm_decoder",
+                status: "supported_current_gate",
+                notes: "LLaMA-style decoder path validated on TinyLlama Q8_0 gate",
+            },
+            SupportItem {
+                id: "llama_bpe_decoder_exact_1b_3b_q8_0",
+                status: "supported_exact_row_smoke",
+                notes: "only the exact Llama 3.2 1B/3B Instruct Q8_0 short-chat smoke rows; Llama 3 8B remains groundwork-only",
+            },
+        ],
         planned_model_families: vec![
             SupportItem {
                 id: "larger_llama_instruct",
                 status: "planned",
-                notes: "progressively larger LLaMA-family instruct models",
+                notes: "8B and broader LLaMA-family instruct support after row-specific parity, API, WebUI, memory/perf, and portability evidence",
             },
             SupportItem {
                 id: "mistral",

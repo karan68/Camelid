@@ -22,6 +22,11 @@ A row is **full-support green** only when all of these are green on the exact GG
 - **Docs/API/frontend agreement:** `COMPATIBILITY.md`, `STATUS.md`, `README.md`, `/api/capabilities`, and WebUI copy all say the same exact thing.
 - **Commit/push status:** the evidence-backed support boundary is committed and pushed; any local artifact paths needed for review are either durable or explicitly reproducible.
 
+## Execution-target guardrail
+
+- For this four-row push, promotion-grade Llama-family parity, API, WebUI, and memory/perf reruns should execute on the canonical Ubuntu validation host `34.216.78.246`.
+- Do not spend that lane on local Mac llama runtimes unless Tim explicitly redirects the work; keep the Mac for docs, frontend, or lightweight guardrail checks.
+
 ## Current full-support blocker matrix
 
 | Row | Current product claim | Parity artifacts | API completions/chat | WebUI readiness | Memory/perf envelope | Docs/API/frontend agreement | Commit/push status | Full-support blocker |
@@ -60,6 +65,7 @@ node scripts/model-promotion-smoke-bundle.mjs \
 ### WP2 — Clear the 8B parity blocker first
 
 - Rerun the broader Llama 3 prompt pack for `Meta-Llama-3-8B-Instruct-Q8_0.gguf` with a longer backend/client timeout.
+- When using `scripts/run-llama3-prompt-pack.mjs`, pass a materially longer wait budget (for example `--wait-ms 600000`) so the backend client does not recreate the prior alpacas timeout.
 - Preserve the failed alpacas case and the successful rerun side by side.
 - Do **not** change 8B support copy until prompt tokens, generated token IDs, and generated text match for the agreed pack.
 

@@ -37,22 +37,25 @@
       "tokenizer": "llama-bpe",
       "chat_template": "Llama 3 instruct header/eot template",
       "quant": "Q8_0",
-      "estimated_ram_materialization_risk": "medium-low on the 16 GiB Mac mini; file is about 1.3 GiB, first generation may materialize several GiB of f32 tensors",
-      "expected_support_row": "small BPE generation candidate; no support claim until prompt-token and generated-token parity artifacts pass against llama.cpp",
-      "load_harness": "./target/release/backendinference inspect, POST /api/models/load, /v1/health, /api/models/tokenizer",
-      "parity_harness": "node scripts/chat-parity-llama3.mjs --max-tokens 1 --require-prompt-match --require-generated-match",
+      "estimated_ram_materialization_risk": "medium-low; validated only for the current short local-chat smoke envelope, with longer contexts and stronger perf/portability still gated",
+      "expected_support_row": "supported exact-row smoke for Llama 3.2 1B Instruct Q8_0 short local chat; do not infer support for neighboring Llama sizes, base variants, other quantizations, longer contexts, or broad chat-template behavior",
+      "load_harness": "./target/release/backendinference inspect, POST /api/models/load, /v1/health, /v1/completions, /v1/chat/completions, and frontend smoke for this exact GGUF row",
+      "parity_harness": "node scripts/chat-parity-llama3.mjs plus the downloaded three-prompt Llama 3 pack; require prompt-token, generated-token, and generated-text match against llama.cpp for this exact row",
       "latest_evidence": {
-        "load_result": "PASS via isolated /api/models/load on release backend 127.0.0.1:19946; /v1/health generation_ready=true for active_model_id llama32-1b-q8",
-        "prompt_token_parity": "PASS: compact Llama 3 prompt IDs matched llama.cpp llama-tokenize on current head 9049492",
+        "load_result": "PASS for exact-row /api/models/load with generation_ready=true, plus /v1/completions, /v1/chat/completions, and frontend smoke evidence documented in STATUS.md",
+        "prompt_token_parity": "PASS: compact-header prompt and the current broader downloaded prompt pack matched llama.cpp",
         "first_token_parity": "PASS: first generated token 9906 / \"Hello\"",
-        "short_generation_parity": "PASS: 5-token deterministic generation matched tokens [9906,0,2650,649,358] and text \"Hello! How can I\"",
-        "artifact_dir": "target/autonomous-small-model-parity-20260429T134615Z-head-9049492",
+        "short_generation_parity": "PASS: compact 5-token deterministic generation matched [9906,0,2650,649,358] / \"Hello! How can I\"; broader prompt-pack generated tokens/text also matched llama.cpp",
+        "artifact_dirs": [
+          "target/autonomous-small-model-parity-20260429T134615Z-head-9049492",
+          "target/qa-small-model-parity-20260429T1338Z-head-35bfd58",
+          "target/parity-50tok-20260502T031820Z/llama32-1b-50tok",
+          "target/downloaded-llama-matrix-20260502T231000Z"
+        ],
         "artifacts": [
           "llama32-1b-q8-chat-parity-5tok.json",
-          "llama32-1b-q8-chat-parity-5tok.log",
-          "llama32-1b-q8-chat-parity-5tok.stderr.log",
-          "backend-ps-after-llama32-1b-5tok.txt",
-          "health-after-llama32-1b-5tok.json"
+          "report.json",
+          "summary.json"
         ]
       }
     },
@@ -64,20 +67,22 @@
       "tokenizer": "llama-bpe",
       "chat_template": "Llama 3 instruct header/eot template",
       "quant": "Q8_0",
-      "estimated_ram_materialization_risk": "high on the 16 GiB Mac mini; treat as metadata/tokenizer/load-only until lazy/on-demand Q8 execution or a higher-RAM VM is available",
-      "expected_support_row": "planned Phase 11 target; generation parity not claimed from descriptor readiness alone",
-      "load_harness": "metadata inspect plus /api/models/load only",
-      "parity_harness": "tokenizer fixture/reference only; do not run full generation on this host by default",
+      "estimated_ram_materialization_risk": "high; lazy/file-backed Q8 groundwork has bounded compact backend evidence, but this row is not support-ready and should stay guarded on smaller hosts",
+      "expected_support_row": "not supported yet; groundwork-only exact Llama 3 8B Instruct Q8_0 row with compact parity/API-smoke/memory evidence, blocked on broader prompt/chat-template parity, supported API chat/completions, WebUI readiness, support-grade perf, and portability",
+      "load_harness": "metadata/config/tokenizer/template inspection plus guarded /api/models/load and basic API smoke only; do not promote contract support from load success",
+      "parity_harness": "rerun the broader Llama 3 prompt pack with a longer backend client timeout, then add chat-template, API chat/completions, WebUI, memory/perf, and portability evidence before any support wording changes",
       "latest_evidence": {
-        "load_result": "NOT RUN as generation/load claim in 13:46 autonomous refresh; readiness inspect present but materialization estimate remains above default budget",
-        "prompt_token_parity": "PASS via existing tokenizer fixtures/cargo tokenizer test coverage; no fresh 8B generation attempt in this run",
-        "first_token_parity": "NOT RUN by policy on 16 GiB host",
-        "short_generation_parity": "NOT RUN; wait for lazy/on-demand Q8 execution or higher-RAM VM",
-        "artifact_dir": "target/autonomous-small-model-parity-20260429T134615Z-head-9049492",
-        "artifacts": [
-          "readiness.json",
-          "readiness.md",
-          "inventory.txt"
+        "load_result": "PASS for exact tracked GGUF in guarded backend evidence runs; this is not a supported-row load claim",
+        "prompt_token_parity": "PASS for compact-header hello; broader downloaded prompt pack is incomplete because the alpacas prompt hit a backend client headers timeout after llama.cpp completed reference generation",
+        "first_token_parity": "PASS for compact-header hello",
+        "short_generation_parity": "PASS for compact-header hello 5-token and bounded 50-token runs; broader prompt-pack generation remains blocked until the longer-timeout rerun passes",
+        "support_status": "NOT SUPPORTED: no normal WebUI readiness, supported API chat/completions row, support-grade memory/perf envelope, or portability evidence yet",
+        "artifact_dirs": [
+          "target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z",
+          "target/parity-20260502T030911Z/llama3-8b-1tok",
+          "target/parity-20260502T030911Z/llama3-8b-5tok",
+          "target/parity-50tok-20260502T031820Z/llama3-8b-50tok",
+          "target/downloaded-llama-matrix-20260502T231000Z"
         ]
       }
     },
@@ -89,20 +94,21 @@
       "tokenizer": "llama-bpe",
       "chat_template": "Llama 3 instruct header/eot template",
       "quant": "Q8_0",
-      "estimated_ram_materialization_risk": "high on this 16 GiB Mac mini with the current eager dense path; metadata/API load succeeds, but first generation hit memory pressure even after avoiding the tied-output clone and default Q8 block retention",
-      "expected_support_row": "next BPE scale/WebUI target; exact artifact is local and has one backend-only first-token success, but no generation support until repeat bounded/parity/API/WebUI evidence exists",
-      "load_harness": "POST /api/models/load succeeds for the exact local GGUF; do not run chat without the bounded memory guard",
-      "parity_harness": "next: repeat bounded first-token run, then capture prompt-token/1-token/5-token parity with process/VM samples before WebUI promotion",
+      "estimated_ram_materialization_risk": "medium-high; exact-row short local-chat smoke is supported, but longer context and stronger memory/perf/portability evidence are still expansion gates",
+      "expected_support_row": "supported exact-row smoke for Llama 3.2 3B Instruct Q8_0 short local chat after compact parity, API/frontend smoke, and post-Q8-dot broader three-prompt parity evidence; do not infer broad Llama-family support",
+      "load_harness": "POST /api/models/load, /v1/health, /v1/completions, /v1/chat/completions, five-prompt API smoke, and frontend smoke for this exact GGUF row",
+      "parity_harness": "node scripts/chat-parity-llama3.mjs for compact 1/5/50-token parity plus the post-Q8-dot broader three-prompt 50-token pack; require prompt-token, generated-token, and generated-text match against llama.cpp",
       "latest_evidence": {
-        "load_result": "PASS for /api/models/load; latest healthy Ubuntu backend-only run also returned one completion token",
-        "first_token_parity": "NOT PARITY YET: one backend-only /v1/completions success on 2026-05-01 returned text comma for prompt hello",
-        "short_generation_parity": "NOT RUN; wait for repeat first-token success and bounded parity harness",
-        "artifact_dir": "target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z",
-        "artifacts": [
-          "summary.md",
-          "completion-response.json",
-          "required-forward-trace.log",
-          "meminfo-samples.log"
+        "load_result": "PASS for exact-row /api/models/load with generation_ready=true, plus /v1/completions, /v1/chat/completions, five-prompt API smoke, and frontend smoke evidence documented in STATUS.md",
+        "prompt_token_parity": "PASS for compact-header prompt and post-Q8-dot broader prompt pack",
+        "first_token_parity": "PASS for compact-header hello",
+        "short_generation_parity": "PASS for compact 1/5/50-token parity and the broader three-prompt 50-token pack; the former JSON-shaped prompt divergence is fixed in the current pack",
+        "artifact_dirs": [
+          "target/parity-20260502T030911Z/llama32-3b-1tok",
+          "target/parity-20260502T030911Z/llama32-3b-5tok",
+          "target/parity-50tok-20260502T031820Z/llama32-3b-50tok",
+          "target/camelid-regression-q8dot-20260502T232633Z/llama32-3b-compact",
+          "target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack"
         ]
       }
     },
@@ -131,9 +137,9 @@
     }
   ],
   "latest_local_audit": {
-    "generated_at": "2026-05-01T21:07:15Z",
-    "head": "commit-containing-this-update",
-    "artifact_dir": "target/ubuntu-llama32-3b-q8-first-token-20260501T210715Z",
-    "summary": "Chunked/file-backed lazy-Q8 backend run on healthy Ubuntu headroom produced one Llama 3.2 3B Q8_0 /v1/completions token for prompt hello with required forward trace through layer_0_attention_q_done. This is first-token evidence only; TinyLlama support and Llama 3.2 1B evidence remain unchanged, and no support row is promoted without repeat bounded/parity/API/WebUI evidence."
+    "generated_at": "2026-05-02T23:45:00Z",
+    "head": "144880f plus working-tree support-contract scrub",
+    "artifact_dir": "target/downloaded-llama-matrix-20260502T231000Z and target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack",
+    "summary": "Manifest realigned to the public four-row truth: TinyLlama Q8_0 remains supported; exact Llama 3.2 1B and 3B Instruct Q8_0 rows are supported only as short local-chat smoke lanes; Llama 3 8B Instruct Q8_0 remains not supported despite compact parity/API-smoke/memory groundwork until broader prompt/chat-template parity, supported API/WebUI readiness, support-grade perf, and portability evidence land."
   }
 }
