@@ -1,8 +1,9 @@
 #!/usr/bin/env node
+import { createHash } from 'node:crypto'
 import os from 'node:os'
 import { execFileSync } from 'node:child_process'
-import { chmod, mkdir, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { chmod, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { dirname, join, relative, resolve } from 'node:path'
 
 const args = parseArgs(process.argv.slice(2))
 const repoRoot = resolve(args.get('repo-root') || '.')
@@ -12,7 +13,7 @@ const gitHeadShort = git(['rev-parse', '--short=12', 'HEAD'], repoRoot)
 const originMain = git(['rev-parse', 'origin/main'], repoRoot)
 const branch = git(['branch', '--show-current'], repoRoot)
 const outDir = resolve(args.get('out-dir') || join(repoRoot, 'target', `full-support-${utcStamp}-head-${gitHeadShort}`))
-const repoRootShell = shellEscape(repoRoot)
+const outDirRelative = relative(repoRoot, outDir) || '.'
 const qaBundleRoot = 'qa/evidence-bundles/four-row-public-20260503T024327Z'
 const perfEnvelopePath = 'qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json'
 const validationNotePath = 'qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md'
@@ -68,7 +69,7 @@ const rows = [
           'target/edge-prompt-audit-fixed-20260428T1530/longer.json',
           'target/edge-prompt-dequant-default-20260428T1604/multiline-long-default-50.json'
         ],
-        command: repoCommand('python3 - <<\'PY\'\nimport json, pathlib\npaths = [\n  "target/edge-prompt-audit-fixed-20260428T1530/short.json",\n  "target/edge-prompt-audit-fixed-20260428T1530/trailing-spaces.json",\n  "target/edge-prompt-audit-fixed-20260428T1530/special-chars.json",\n  "target/edge-prompt-audit-fixed-20260428T1530/longer.json",\n  "target/edge-prompt-dequant-default-20260428T1604/multiline-long-default-50.json",\n]\nreport = {"checked": []}\nfor path in paths:\n  data = json.loads(pathlib.Path(path).read_text())\n  report["checked"].append({\n    "path": path,\n    "prompt_tokens_match": data.get("prompt_tokens_match"),\n    "generated_text_match": data.get("generated_text_match"),\n    "backend_tokens": len(data.get("backend_generated_tokens", [])),\n    "llama_tokens": len(data.get("llama_generated_tokens", data.get("llama_generated_tokens_from_text", []))),\n  })\npathlib.Path("ROW_ROOT/broader-parity/carry-forward-summary.json").write_text(json.dumps(report, indent=2) + "\\n")\nprint("wrote", "ROW_ROOT/broader-parity/carry-forward-summary.json")\nPY')
+        command: repoCommand('python3 - <<\'PY\'\nimport json, os, pathlib\npaths = [\n  "target/edge-prompt-audit-fixed-20260428T1530/short.json",\n  "target/edge-prompt-audit-fixed-20260428T1530/trailing-spaces.json",\n  "target/edge-prompt-audit-fixed-20260428T1530/special-chars.json",\n  "target/edge-prompt-audit-fixed-20260428T1530/longer.json",\n  "target/edge-prompt-dequant-default-20260428T1604/multiline-long-default-50.json",\n]\nreport = {"checked": []}\nfor path in paths:\n  data = json.loads(pathlib.Path(path).read_text())\n  report["checked"].append({\n    "path": path,\n    "prompt_tokens_match": data.get("prompt_tokens_match"),\n    "generated_text_match": data.get("generated_text_match"),\n    "backend_tokens": len(data.get("backend_generated_tokens", [])),\n    "llama_tokens": len(data.get("llama_generated_tokens", data.get("llama_generated_tokens_from_text", []))),\n  })\nout_path = pathlib.Path(os.environ["ROW_ROOT"]) / "broader-parity" / "carry-forward-summary.json"\nout_path.write_text(json.dumps(report, indent=2) + "\\n")\nprint("wrote", out_path)\nPY')
       },
       {
         id: 'chat-template-shapes',
@@ -212,10 +213,10 @@ await mkdir(join(outDir, 'commands'), { recursive: true })
 const manifest = {
   schema: 'camelid.full_support.execution_bundle.v1',
   generated_utc: new Date().toISOString(),
-  bundle_root: outDir,
+  bundle_root: outDirRelative,
   purpose: 'Current-head full-support execution scaffold plus durable exact-row carry-forward references.',
   git: {
-    repo_root: repoRoot,
+    repo_root: '.',
     branch,
     head: gitHead,
     head_short: gitHeadShort,
@@ -256,9 +257,9 @@ const manifest = {
 
 await writeJson(join(outDir, 'manifest.json'), manifest)
 await writeFile(join(outDir, 'README.md'), renderReadme(manifest), 'utf8')
-await writeExecutable(join(outDir, 'commands', 'build-current-head.sh'), shellScript(toolchainCommand))
-await writeExecutable(join(outDir, 'commands', 'capture-host-facts.sh'), shellScript(hostFactsCommand()))
-await writeExecutable(join(outDir, 'commands', 'run-all-rows.sh'), shellScript(renderRunAll(rows)))
+await writeExecutable(join(outDir, 'commands', 'build-current-head.sh'), topLevelShellScript(toolchainCommand))
+await writeExecutable(join(outDir, 'commands', 'capture-host-facts.sh'), topLevelShellScript(hostFactsCommand()))
+await writeExecutable(join(outDir, 'commands', 'run-all-rows.sh'), topLevelShellScript(renderRunAll(rows)))
 
 for (const row of rows) {
   const rowRoot = join(outDir, row.row_id)
@@ -267,13 +268,14 @@ for (const row of rows) {
   const rowManifest = summarizeRow(outDir, row)
   await writeJson(join(rowRoot, 'manifest.json'), rowManifest)
   await writeFile(join(rowRoot, 'README.md'), renderRowReadme(row, rowManifest), 'utf8')
-  await writeExecutable(join(rowRoot, 'commands', '00-model-sha256.sh'), shellScript(modelShaCommand(row.model_file).replaceAll('ROW_ROOT', rowRoot)))
+  await writeExecutable(join(rowRoot, 'commands', '00-model-sha256.sh'), rowShellScript(modelShaCommand(row.model_file)))
   for (const [index, track] of row.tracks.entries()) {
     const scriptName = `${String(index + 1).padStart(2, '0')}-${track.id}.sh`
-    const command = track.command.replaceAll('ROW_ROOT', rowRoot)
-    await writeExecutable(join(rowRoot, 'commands', scriptName), shellScript(command))
+    await writeExecutable(join(rowRoot, 'commands', scriptName), rowShellScript(track.command))
   }
 }
+
+await writeSha256Sums(outDir)
 
 console.log(`bundle_root=${outDir}`)
 console.log(`manifest=${join(outDir, 'manifest.json')}`)
@@ -283,6 +285,7 @@ console.log(`rows=${rows.length}`)
 
 function summarizeRow(outDir, row) {
   const rowRoot = join(outDir, row.row_id)
+  const rowRootRelative = relative(repoRoot, rowRoot) || '.'
   return {
     row_id: row.row_id,
     display_name: row.display_name,
@@ -296,7 +299,7 @@ function summarizeRow(outDir, row) {
     expected_compatibility_status: row.expected_compatibility_status,
     expect_contract_supported: row.expect_contract_supported,
     expect_webui_chat: row.expect_webui_chat,
-    row_root: rowRoot,
+    row_root: rowRootRelative,
     carry_forward_bundle: row.carry_forward_bundle,
     notes: row.notes,
     blockers: row.blockers,
@@ -309,7 +312,7 @@ function summarizeRow(outDir, row) {
       pack_path: track.pack_path ?? null,
       carry_forward_artifacts: track.carry_forward_artifacts ?? [],
       notes: track.notes ?? [],
-      command_file: join(rowRoot, 'commands', `${String(index + 1).padStart(2, '0')}-${track.id}.sh`),
+      command_file: join(rowRootRelative, 'commands', `${String(index + 1).padStart(2, '0')}-${track.id}.sh`),
     })),
   }
 }
@@ -368,41 +371,41 @@ function llamaTracks({ modelFile, modelId, compatibilityRow, compatibilityStatus
 function perfCommand(modelFile, modelId, waitMs = 300000) {
   return [
     'set -euo pipefail',
-    `cd ${repoRootShell}`,
-    'mkdir -p ROW_ROOT/perf-rss-portability',
+    'cd "$REPO_ROOT"',
+    'mkdir -p "$ROW_ROOT/perf-rss-portability"',
     `MODEL=\"${modelDir}/${modelFile}\"`,
     `MODEL_ID=\"${modelId}\"`,
     `API_BASE=\"${apiBase}\"`,
     `FRONTEND_URL=\"${frontendUrl}\"`,
     `WAIT_MS=\"${waitMs}\"`,
-    'date -u +%FT%TZ | tee ROW_ROOT/perf-rss-portability/captured-at.txt',
-    'uname -a | tee ROW_ROOT/perf-rss-portability/uname.txt',
-    'hostname | tee ROW_ROOT/perf-rss-portability/hostname.txt',
-    'node --version | tee ROW_ROOT/perf-rss-portability/node-version.txt',
-    './scripts/with-rustup-cargo.sh --version | tee ROW_ROOT/perf-rss-portability/cargo-version.txt',
-    'free -h | tee ROW_ROOT/perf-rss-portability/free.txt',
-    'df -h / | tee ROW_ROOT/perf-rss-portability/disk-root.txt',
-    'shasum -a 256 "$MODEL" | tee ROW_ROOT/perf-rss-portability/model.sha256.txt',
-    `node scripts/model-promotion-smoke-bundle.mjs --api ${apiBase} --frontend ${frontendUrl} --model \"${modelDir}/${modelFile}\" --model-id ${modelId} --out-dir ROW_ROOT/perf-rss-portability/api-webui-smoke --message hello --max-tokens 1 --temperature 0 || true`,
-    "pgrep -f 'target/release/backendinference serve' | tail -n 1 | tee ROW_ROOT/perf-rss-portability/backend.pid.txt",
-    "if [ -s ROW_ROOT/perf-rss-portability/backend.pid.txt ]; then ps -o pid,rss,vsz,etime,command -p \"$(cat ROW_ROOT/perf-rss-portability/backend.pid.txt)\" | tee ROW_ROOT/perf-rss-portability/backend.ps.txt; fi",
+    'date -u +%FT%TZ | tee "$ROW_ROOT/perf-rss-portability/captured-at.txt"',
+    'uname -a | tee "$ROW_ROOT/perf-rss-portability/uname.txt"',
+    'hostname | tee "$ROW_ROOT/perf-rss-portability/hostname.txt"',
+    'node --version | tee "$ROW_ROOT/perf-rss-portability/node-version.txt"',
+    './scripts/with-rustup-cargo.sh --version | tee "$ROW_ROOT/perf-rss-portability/cargo-version.txt"',
+    'free -h | tee "$ROW_ROOT/perf-rss-portability/free.txt"',
+    'df -h / | tee "$ROW_ROOT/perf-rss-portability/disk-root.txt"',
+    'shasum -a 256 "$MODEL" | tee "$ROW_ROOT/perf-rss-portability/model.sha256.txt"',
+    `node scripts/model-promotion-smoke-bundle.mjs --api ${apiBase} --frontend ${frontendUrl} --model \"${modelDir}/${modelFile}\" --model-id ${modelId} --out-dir \"$ROW_ROOT/perf-rss-portability/api-webui-smoke\" --message hello --max-tokens 1 --temperature 0 || true`,
+    "pgrep -f 'target/release/backendinference serve' | tail -n 1 | tee \"$ROW_ROOT/perf-rss-portability/backend.pid.txt\"",
+    "if [ -s \"$ROW_ROOT/perf-rss-portability/backend.pid.txt\" ]; then ps -o pid,rss,vsz,etime,command -p \"$(cat \"$ROW_ROOT/perf-rss-portability/backend.pid.txt\")\" | tee \"$ROW_ROOT/perf-rss-portability/backend.ps.txt\"; fi",
   ].join('\n')
 }
 
 function modelShaCommand(modelFile) {
   return [
     'set -euo pipefail',
-    `cd ${repoRootShell}`,
+    'cd "$REPO_ROOT"',
     `MODEL=\"${modelDir}/${modelFile}\"`,
-    'mkdir -p ROW_ROOT/evidence',
-    'shasum -a 256 "$MODEL" | tee ROW_ROOT/evidence/model.sha256.txt',
+    'mkdir -p "$ROW_ROOT/evidence"',
+    'shasum -a 256 "$MODEL" | tee "$ROW_ROOT/evidence/model.sha256.txt"',
   ].join('\n')
 }
 
 function hostFactsCommand() {
   return [
     'set -euo pipefail',
-    `cd ${repoRootShell}`,
+    'cd "$REPO_ROOT"',
     'date -u +%FT%TZ',
     'git rev-parse HEAD',
     'git status --short',
@@ -418,12 +421,13 @@ function hostFactsCommand() {
 function renderRunAll(rows) {
   return [
     'set -euo pipefail',
+    'cd "$BUNDLE_ROOT"',
     './commands/build-current-head.sh',
     './commands/capture-host-facts.sh > host-facts.txt',
     ...rows.flatMap(row => [
       `echo "== ${row.row_id} =="`,
-      `( cd ${row.row_id}/commands && ./00-model-sha256.sh )`,
-      ...row.tracks.map((track, index) => `( cd ${row.row_id}/commands && ./${String(index + 1).padStart(2, '0')}-${track.id}.sh )`),
+      `( cd "$BUNDLE_ROOT/${row.row_id}/commands" && ./00-model-sha256.sh )`,
+      ...row.tracks.map((track, index) => `( cd "$BUNDLE_ROOT/${row.row_id}/commands" && ./${String(index + 1).padStart(2, '0')}-${track.id}.sh )`),
     ]),
   ].join('\n')
 }
@@ -437,16 +441,32 @@ function renderRowReadme(row, manifest) {
   return `# ${row.display_name}\n\nPublic status: ${row.public_status}\nExpected model SHA256: \`${row.expected_model_sha256}\`\nCarry-forward bundle: \`${row.carry_forward_bundle}\`\n\nTracks:\n${tracks}\n\nBlockers:\n${blockers}\n`}
 
 function repoCommand(command) {
-  return `cd ${repoRootShell} && ${command}`
-}
-
-function shellEscape(value) {
-  if (/^[A-Za-z0-9_/:=.,-]+$/.test(value)) return value
-  return `'${String(value).replace(/'/g, `'\\''`)}'`
+  return `cd "$REPO_ROOT" && ${command}`
 }
 
 function shellScript(body) {
   return `#!/usr/bin/env bash\nset -euo pipefail\n\n${body}\n`
+}
+
+function topLevelShellScript(body) {
+  return shellScript([
+    'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"',
+    'BUNDLE_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"',
+    'REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"',
+    'export BUNDLE_ROOT REPO_ROOT',
+    body,
+  ].join('\n'))
+}
+
+function rowShellScript(body) {
+  return shellScript([
+    'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"',
+    'ROW_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"',
+    'BUNDLE_ROOT="$(cd -- "$ROW_ROOT/.." && pwd)"',
+    'REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"',
+    'export ROW_ROOT BUNDLE_ROOT REPO_ROOT',
+    body.replaceAll('ROW_ROOT', '$ROW_ROOT'),
+  ].join('\n'))
 }
 
 function parseArgs(argv) {
@@ -469,6 +489,32 @@ function writeJson(path, payload) {
 async function writeExecutable(path, content) {
   await writeFile(path, content, 'utf8')
   await chmod(path, 0o755)
+}
+
+async function writeSha256Sums(rootDir) {
+  const files = []
+  await collectFiles(rootDir, rootDir, files)
+  const lines = []
+  for (const file of files.sort()) {
+    if (file === 'SHA256SUMS') continue
+    const hash = createHash('sha256').update(await readFile(join(rootDir, file))).digest('hex')
+    lines.push(`${hash}  ${file}`)
+  }
+  await writeFile(join(rootDir, 'SHA256SUMS'), `${lines.join('\n')}\n`, 'utf8')
+}
+
+async function collectFiles(rootDir, currentDir, output) {
+  const entries = await readdir(currentDir, { withFileTypes: true })
+  for (const entry of entries) {
+    const fullPath = join(currentDir, entry.name)
+    if (entry.isDirectory()) {
+      await collectFiles(rootDir, fullPath, output)
+      continue
+    }
+    const info = await stat(fullPath)
+    if (!info.isFile()) continue
+    output.push(relative(rootDir, fullPath))
+  }
 }
 
 function git(args, cwd) {

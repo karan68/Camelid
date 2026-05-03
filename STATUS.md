@@ -217,6 +217,8 @@ The downloaded-model matrix still disproves a broad inherited “perfect Llama-f
 
 Public evidence packaging note: sanitized carry-forward bundle manifests/checksums for the four-row smoke slices now live under `qa/evidence-bundles/four-row-public-20260503T024327Z/` and `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/`. They intentionally preserve the blocked public-head rerun state instead of overstating it.
 
+Current-head durable execution note: the exact-row normalized rerun scaffold is now checked in at `qa/evidence-bundles/four-row-current-head-20260503T035707Z-head-e7837a49d3e1/`. Its per-row manifests/commands give docs, API, and frontend a stable current-head citation target while the Ubuntu reruns for longer context, broader template coverage, and stronger perf/portability evidence are still outstanding.
+
 ## Next blocking work
 
 In order of importance:
