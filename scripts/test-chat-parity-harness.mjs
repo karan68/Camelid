@@ -74,6 +74,24 @@ assert.throws(
   () => normalizePromptPack({ schema: 'camelid.unknown.prompt-pack.v1', pack_id: 'bad', prompts: [{ message: 'hi' }] }),
   /unsupported/,
 )
+assert.throws(
+  () => normalizePromptPack({
+    schema: 'camelid.llama3.prompt-pack.v1',
+    pack_id: 'bad-render',
+    defaults: { render_mode: 'tinyllama-marker' },
+    prompts: [{ message: 'hi' }],
+  }),
+  /not allowed/,
+)
+assert.throws(
+  () => normalizePromptPack({
+    schema: 'camelid.tinyllama.prompt-pack.v1',
+    pack_id: 'bad-messages',
+    defaults: { render_mode: 'tinyllama-marker' },
+    prompts: [{ messages: [{ role: 'user', content: '' }] }],
+  }),
+  /non-empty string/,
+)
 
 assert.equal(resolveReferenceContext({ promptTokenCount: 120, maxTokens: 5 }), 512)
 assert.equal(resolveReferenceContext({ promptTokenCount: 520, maxTokens: 5 }), 541)

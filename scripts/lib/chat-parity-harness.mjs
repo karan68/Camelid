@@ -4,6 +4,11 @@ export const SUPPORTED_PROMPT_PACK_SCHEMAS = [
   'camelid.tinyllama.prompt-pack.v1',
 ]
 
+const SCHEMA_RENDER_MODE_ALLOWLIST = {
+  'camelid.llama3.prompt-pack.v1': ['compact'],
+  'camelid.tinyllama.prompt-pack.v1': ['tinyllama-marker'],
+}
+
 export function renderExpectedPrompt(messages, renderMode) {
   if (!Array.isArray(messages) || messages.length === 0) {
     throw new Error('messages must contain at least one entry')
@@ -28,7 +33,11 @@ export function normalizePromptPack(pack, { packPath = 'prompt pack' } = {}) {
   }
   const packId = requireString(pack.pack_id, `${packPath}.pack_id`)
   const defaultMaxTokens = parsePositiveInt(pack.defaults?.max_tokens ?? 50, `${packPath}.defaults.max_tokens`)
-  const defaultRenderMode = normalizeRenderMode(pack.defaults?.render_mode ?? 'compact', `${packPath}.defaults.render_mode`)
+  const defaultRenderMode = normalizeRenderMode(
+    pack.defaults?.render_mode ?? 'compact',
+    `${packPath}.defaults.render_mode`,
+    schema,
+  )
   const targetContextWindow = parseOptionalPositiveInt(pack.target_context_window, `${packPath}.target_context_window`)
   const prompts = Array.isArray(pack.prompts) ? pack.prompts : []
   if (prompts.length === 0) {
@@ -50,6 +59,7 @@ export function normalizePromptPack(pack, { packPath = 'prompt pack' } = {}) {
       defaultMaxTokens,
       defaultRenderMode,
       packTargetContextWindow: targetContextWindow,
+      schema,
     })),
   }
 }
@@ -65,7 +75,7 @@ export function resolveReferenceContext({ promptTokenCount, maxTokens, explicitC
   return Math.max(minimumContext, required)
 }
 
-function normalizePrompt(prompt, { packPath, index, defaultMaxTokens, defaultRenderMode, packTargetContextWindow }) {
+function normalizePrompt(prompt, { packPath, index, defaultMaxTokens, defaultRenderMode, packTargetContextWindow, schema }) {
   if (!prompt || typeof prompt !== 'object' || Array.isArray(prompt)) {
     throw new Error(`${packPath}.prompts[${index}] must be an object`)
   }
@@ -74,12 +84,16 @@ function normalizePrompt(prompt, { packPath, index, defaultMaxTokens, defaultRen
   if (!hasMessages && !hasMessage) {
     throw new Error(`${packPath}.prompts[${index}] must include either message or messages`)
   }
-  const renderMode = normalizeRenderMode(prompt.render_mode ?? defaultRenderMode, `${packPath}.prompts[${index}].render_mode`)
+  const renderMode = normalizeRenderMode(
+    prompt.render_mode ?? defaultRenderMode,
+    `${packPath}.prompts[${index}].render_mode`,
+    schema,
+  )
   return {
     id: typeof prompt.id === 'string' && prompt.id.trim() ? prompt.id.trim() : `p${index + 1}`,
     note: typeof prompt.note === 'string' ? prompt.note : null,
-    message: hasMessages ? null : String(prompt.message ?? ''),
-    messages: hasMessages ? prompt.messages : null,
+    message: hasMessages ? null : requireString(prompt.message, `${packPath}.prompts[${index}].message`),
+    messages: hasMessages ? normalizeMessages(prompt.messages, `${packPath}.prompts[${index}].messages`) : null,
     max_tokens: parsePositiveInt(prompt.max_tokens ?? defaultMaxTokens, `${packPath}.prompts[${index}].max_tokens`),
     render_mode: renderMode,
     target_context_window: parseOptionalPositiveInt(
@@ -89,12 +103,28 @@ function normalizePrompt(prompt, { packPath, index, defaultMaxTokens, defaultRen
   }
 }
 
-function normalizeRenderMode(renderMode, pathLabel) {
+function normalizeRenderMode(renderMode, pathLabel, schema = null) {
   const normalized = String(renderMode)
   if (!SUPPORTED_RENDER_MODES.includes(normalized)) {
     throw new Error(`${pathLabel} ${JSON.stringify(normalized)} is unsupported; supported render modes: ${SUPPORTED_RENDER_MODES.join(', ')}`)
   }
+  if (schema) {
+    const allowed = SCHEMA_RENDER_MODE_ALLOWLIST[schema] ?? []
+    if (!allowed.includes(normalized)) {
+      throw new Error(`${pathLabel} ${JSON.stringify(normalized)} is not allowed for ${schema}; allowed render modes: ${allowed.join(', ')}`)
+    }
+  }
   return normalized
+}
+
+function normalizeMessages(messages, pathLabel) {
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new Error(`${pathLabel} must be a non-empty array`)
+  }
+  return messages.map((message, index) => ({
+    role: requireString(message?.role, `${pathLabel}[${index}].role`),
+    content: requireContentString(message?.content, `${pathLabel}[${index}].content`),
+  }))
 }
 
 function parsePositiveInt(value, pathLabel) {
@@ -113,6 +143,14 @@ function parseOptionalPositiveInt(value, pathLabel) {
 function requireString(value, pathLabel) {
   const normalized = typeof value === 'string' ? value.trim() : ''
   if (!normalized) {
+    throw new Error(`${pathLabel} must be a non-empty string`)
+  }
+  return normalized
+}
+
+function requireContentString(value, pathLabel) {
+  const normalized = typeof value === 'string' ? value : null
+  if (normalized === null || normalized.length === 0) {
     throw new Error(`${pathLabel} must be a non-empty string`)
   }
   return normalized

@@ -11,6 +11,7 @@ const outDirArg = args.get('out-dir') || args.get('output-dir')
 const modelPathArg = args.get('model')
 const modelId = args.get('model-id') || process.env.LLAMA3_MODEL_ID || 'llama3-q8-pack'
 const prefix = args.get('prefix') || modelId
+const chatParityScript = resolve(args.get('chat-parity-script') || process.env.CAMELID_CHAT_PARITY_SCRIPT || 'scripts/chat-parity-llama3.mjs')
 const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.LLAMA3_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
@@ -55,6 +56,7 @@ const summary = {
   model: modelPath,
   model_id: modelId,
   prefix,
+  chat_parity_script: chatParityScript,
   wait_ms: waitMs,
   require_prompt_match: requirePromptMatch,
   require_generated_match: requireGeneratedMatch,
@@ -75,7 +77,7 @@ for (let index = 0; index < prompts.length; index += 1) {
   const promptPath = join(promptDir, 'prompt.json')
   const maxTokens = prompt.max_tokens
   const commandArgs = [
-    resolve('scripts/chat-parity-llama3.mjs'),
+    chatParityScript,
     '--backend', backendBase,
     '--llama-url', llamaBase,
     '--model', modelPath,
