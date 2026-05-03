@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process'
+import http from 'node:http'
+import https from 'node:https'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
@@ -197,19 +199,46 @@ async function tokenizeExpectedPrompt() {
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'content-type': 'application/json',
-      ...(options.headers || {}),
-    },
+  const { timeoutMs = waitMs, headers = {}, body, method = body ? 'POST' : 'GET' } = options
+  const target = new URL(url)
+  const transport = target.protocol === 'https:' ? https : http
+  const requestBody = typeof body === 'string' || Buffer.isBuffer(body) ? body : body ? JSON.stringify(body) : null
+
+  return new Promise((resolvePromise, reject) => {
+    const request = transport.request(target, {
+      method,
+      headers: {
+        'content-type': 'application/json',
+        ...(requestBody ? { 'content-length': Buffer.byteLength(requestBody) } : {}),
+        ...headers,
+      },
+      timeout: timeoutMs,
+    }, response => {
+      let text = ''
+      response.setEncoding('utf8')
+      response.on('data', chunk => { text += chunk })
+      response.on('end', () => {
+        let parsed = null
+        try {
+          parsed = text ? JSON.parse(text) : null
+        } catch (err) {
+          reject(new Error(`${url}: invalid JSON response: ${err.message}: ${text.slice(0, 500)}`))
+          return
+        }
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(new Error(`${url}: ${response.statusCode} ${response.statusMessage}: ${parsed?.error?.message || text}`))
+          return
+        }
+        resolvePromise(parsed)
+      })
+    })
+    request.on('timeout', () => {
+      request.destroy(new Error(`${url}: request timed out after ${timeoutMs} ms`))
+    })
+    request.on('error', reject)
+    if (requestBody) request.write(requestBody)
+    request.end()
   })
-  const text = await response.text()
-  const body = text ? JSON.parse(text) : null
-  if (!response.ok) {
-    throw new Error(`${url}: ${response.status} ${response.statusText}: ${body?.error?.message || text}`)
-  }
-  return body
 }
 
 async function waitForJson(url, options, label, waitMs) {
@@ -217,7 +246,7 @@ async function waitForJson(url, options, label, waitMs) {
   let lastError
   while (Date.now() < deadline) {
     try {
-      return await fetchJson(url, options)
+      return await fetchJson(url, { ...options, timeoutMs: Math.min(waitMs, 5000) })
     } catch (err) {
       lastError = err
       await new Promise(resolve => setTimeout(resolve, 500))

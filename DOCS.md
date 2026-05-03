@@ -1,6 +1,6 @@
 # Camelid Documentation Index
 
-Last updated: 2026-04-30
+Last updated: 2026-05-02
 
 This index helps readers navigate the public Markdown set.
 
@@ -22,6 +22,7 @@ Read these first:
 
 ## QA and acceptance docs
 
+- [`FULL_SUPPORT_BLOCKER_MATRIX.md`](FULL_SUPPORT_BLOCKER_MATRIX.md) — four-row full-support owner matrix with exact missing evidence by row
 - [`QA_SMALL_MODEL_PARITY_MATRIX.md`](QA_SMALL_MODEL_PARITY_MATRIX.md) — current small-model QA matrix
 - [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md) — exact 3B acceptance checklist
 

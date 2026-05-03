@@ -211,6 +211,7 @@ git diff --check
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — evidence-based support matrix and promotion checklist.
 - [`ROADMAP.md`](ROADMAP.md) — phase gates, active priorities, and next support-changing milestones.
 - [`STATUS.md`](STATUS.md) — current evidence snapshot and promotion blockers.
+- [`FULL_SUPPORT_BLOCKER_MATRIX.md`](FULL_SUPPORT_BLOCKER_MATRIX.md) — four-row full-support owner matrix with exact missing evidence by row.
 - [`QA_LLAMA32_3B_Q8_ACCEPTANCE.md`](QA_LLAMA32_3B_Q8_ACCEPTANCE.md) — exact Llama 3.2 3B Q8_0 artifact path, parity/WebUI acceptance checklist, and current blocker.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — Rust architecture proposal and module boundaries.
 - [`SAFETENSORS_PLAN.md`](SAFETENSORS_PLAN.md) — SafeTensors/Hugging Face model-source planning lane.
