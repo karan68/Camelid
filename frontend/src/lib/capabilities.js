@@ -78,7 +78,7 @@ function findCompatibilityRowForQuant(rows, family, quantKey) {
 const EXACT_LLAMA_PROMOTION_ROWS = [
   { id: 'llama32_1b_instruct_q8_0', versionKey: '3.2', sizeKey: '1B', requiresInstruct: true },
   { id: 'llama32_3b_instruct_q8_0', versionKey: '3.2', sizeKey: '3B', requiresInstruct: true },
-  { id: 'llama3_8b_instruct_gguf', versionKey: '3', sizeKey: '8B', requiresInstruct: true },
+  { id: 'llama3_8b_instruct_q8_0', versionKey: '3', sizeKey: '8B', requiresInstruct: true },
 ]
 
 function detectLlamaBpeTarget(subject) {
@@ -159,7 +159,7 @@ export function guardedCapabilityCopy(item, subject = 'UI controls') {
 export const TRACKED_LLAMA_PROMOTION_ROW_IDS = [
   'llama32_1b_instruct_q8_0',
   'llama32_3b_instruct_q8_0',
-  'llama3_8b_instruct_gguf',
+  'llama3_8b_instruct_q8_0',
 ]
 
 export function getCurrentCompatibilityTarget(capabilities) {

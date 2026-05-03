@@ -4116,14 +4116,24 @@ fn dot_q8_0_encoded_row(input: &[Q8_0Block], row_bytes: &[u8]) -> f32 {
         .zip(row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES))
     {
         let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let mut weight_quants = [0_i8; Q8_0_BLOCK_VALUES];
-        for idx in 0..Q8_0_BLOCK_VALUES {
-            weight_quants[idx] = block[2 + idx] as i8;
-        }
-        let int_sum = q8_0_block_int_dot_horizontal_sum(&weight_quants, &input_block.quants);
+        let int_sum = q8_0_block_int_dot_horizontal_sum_encoded(&block[2..], &input_block.quants);
         sum += int_sum as f32 * scale * input_block.scale;
     }
     sum
+}
+
+fn q8_0_block_int_dot_horizontal_sum_encoded(
+    weight: &[u8],
+    input: &[i8; Q8_0_BLOCK_VALUES],
+) -> i32 {
+    debug_assert_eq!(weight.len(), Q8_0_BLOCK_VALUES);
+    let lanes = [
+        q8_0_dot_group4_encoded(weight, input, 0) + q8_0_dot_group4_encoded(weight, input, 16),
+        q8_0_dot_group4_encoded(weight, input, 4) + q8_0_dot_group4_encoded(weight, input, 20),
+        q8_0_dot_group4_encoded(weight, input, 8) + q8_0_dot_group4_encoded(weight, input, 24),
+        q8_0_dot_group4_encoded(weight, input, 12) + q8_0_dot_group4_encoded(weight, input, 28),
+    ];
+    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
 }
 
 fn q8_0_block_int_dot_horizontal_sum(
@@ -4152,6 +4162,13 @@ fn q8_0_dot_group4(
         + i32::from(weight[start + 1]) * i32::from(input[start + 1])
         + i32::from(weight[start + 2]) * i32::from(input[start + 2])
         + i32::from(weight[start + 3]) * i32::from(input[start + 3])
+}
+
+fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start: usize) -> i32 {
+    i32::from(weight[start] as i8) * i32::from(input[start])
+        + i32::from(weight[start + 1] as i8) * i32::from(input[start + 1])
+        + i32::from(weight[start + 2] as i8) * i32::from(input[start + 2])
+        + i32::from(weight[start + 3] as i8) * i32::from(input[start + 3])
 }
 
 fn f32_to_f16_bits(value: f32) -> u16 {
@@ -4358,8 +4375,9 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
     })?;
     let mut row_chunk = vec![0_u8; row_chunk_len];
     let quantized_input = quantize_q8_0_row(input_row);
+    let output_width = output.len();
     let mut output_start = 0usize;
-    while output_start < output.len() {
+    while output_start < output_width {
         let rows_this_chunk = chunk_rows.min(output.len() - output_start);
         let chunk_bytes_len = row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
@@ -4383,9 +4401,22 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
                 output_start + rows_this_chunk
             ))
             })?;
-        for (local_idx, row_bytes) in chunk.chunks_exact(row_bytes_len).enumerate() {
-            output[output_start + local_idx] =
-                dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
+        let output_end = output_start + rows_this_chunk;
+        let output_chunk = &mut output[output_start..output_end];
+        if should_parallelize_linear_output(output_width) {
+            output_chunk
+                .par_iter_mut()
+                .zip(chunk.par_chunks_exact(row_bytes_len))
+                .for_each(|(out_value, row_bytes)| {
+                    *out_value = dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
+                });
+        } else {
+            for (out_value, row_bytes) in output_chunk
+                .iter_mut()
+                .zip(chunk.chunks_exact(row_bytes_len))
+            {
+                *out_value = dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
+            }
         }
         output_start += rows_this_chunk;
     }

@@ -175,7 +175,7 @@ const rows = [
     public_status: 'supported_exact_row_smoke',
     model_file: 'Meta-Llama-3-8B-Instruct-Q8_0.gguf',
     model_id: 'llama3-8b-q8',
-    compatibility_row: 'llama3_8b_instruct_gguf',
+    compatibility_row: 'llama3_8b_instruct_q8_0',
     expected_compatibility_status: 'supported_exact_row_smoke',
     expect_contract_supported: true,
     expect_webui_chat: 'enabled',
@@ -193,7 +193,7 @@ const rows = [
     tracks: llamaTracks({
       modelFile: 'Meta-Llama-3-8B-Instruct-Q8_0.gguf',
       modelId: 'llama3-8b-q8',
-      compatibilityRow: 'llama3_8b_instruct_gguf',
+      compatibilityRow: 'llama3_8b_instruct_q8_0',
       compatibilityStatus: 'supported_exact_row_smoke',
       expectContractSupported: true,
       expectWebUiChat: 'enabled',

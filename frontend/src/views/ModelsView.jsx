@@ -76,6 +76,13 @@ function findModelMatchingCapabilityRow(models, capabilities, target, runtime, s
   }
 }
 
+function evidenceTrackTone(value = '') {
+  const status = value.toLowerCase()
+  if (!status) return ''
+  if (status.includes('validated') || status.includes('measured') || status.includes('supported')) return 'ready'
+  return 'warm'
+}
+
 function formatRemoteMeta(item) {
   return [
     item.license ? item.license.toUpperCase() : 'Public repo',
@@ -614,7 +621,7 @@ export default function ModelsView({
 
               <CapabilityEvidenceBlock capabilities={capabilities} model={LLAMA32_3B_ACCEPTANCE_TARGET} />
               <ReadinessGrid model={LLAMA32_3B_ACCEPTANCE_TARGET} runtime={runtime} includePath />
-              <p className="model-summary">Do not infer readiness from the 1B row or the groundwork-only 8B row; this exact 3B row still needs runtime-green loaded_now=true + generation_ready=true before chat unlocks.</p>
+              <p className="model-summary">Do not infer readiness from the 1B row, the 8B row, or any neighboring quant; this exact 3B row still needs runtime-green loaded_now=true + generation_ready=true before chat unlocks.</p>
 
               <div className="models-card-actions">
                 <button className="ghost-button" onClick={fillLlama32ThreeBImport}>Fill import form with exact path</button>
@@ -657,6 +664,9 @@ export default function ModelsView({
                   <div className="models-card-tags">
                     <div className="pin-badge">{target.tested_context || 'Context not advertised'}</div>
                     <div className={`pin-badge ${target.frontend_load_path_verified === 'validated' ? 'ready' : 'warm'}`}>frontend: {formatCapabilityStatus(target.frontend_load_path_verified || 'not_promoted')}</div>
+                    <div className={`pin-badge ${evidenceTrackTone(target.chat_template_shape_pack)}`}>template pack: {formatCapabilityStatus(target.chat_template_shape_pack || 'not_started')}</div>
+                    <div className={`pin-badge ${evidenceTrackTone(target.bounded_context_512_pack)}`}>512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')}</div>
+                    <div className={`pin-badge ${evidenceTrackTone(target.performance_measured)}`}>perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</div>
                     <div className={`pin-badge ${chatUnlocked ? 'ready' : 'warm'}`}>{chatUnlocked ? 'Chat unlockable' : supported ? 'Runtime still needed' : 'Chat blocked by row status'}</div>
                     {match.active && <div className="pin-badge ready">Loaded exact-row match</div>}
                     {!match.active && match.selected && <div className="pin-badge">Selected exact-row match</div>}

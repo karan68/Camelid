@@ -349,7 +349,7 @@
       "model_path_env": "${CAMELID_MODEL_DIR:?set CAMELID_MODEL_DIR to the GGUF directory}/Meta-Llama-3-8B-Instruct-Q8_0.gguf",
       "expected_model_sha256": "583c616da14b82930f887f991ab446711da0b029166200b67892d7c9f8f45958",
       "template_family": "llama3_instruct",
-      "compatibility_row": "llama3_8b_instruct_gguf",
+      "compatibility_row": "llama3_8b_instruct_q8_0",
       "expected_compatibility_status": "supported_exact_row_smoke",
       "expect_contract_supported": true,
       "expect_webui_chat": "enabled",

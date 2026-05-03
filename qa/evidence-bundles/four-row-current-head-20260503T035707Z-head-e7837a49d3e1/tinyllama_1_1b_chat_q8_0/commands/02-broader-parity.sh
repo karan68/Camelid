@@ -25,7 +25,7 @@ for path in paths:
     "backend_tokens": len(data.get("backend_generated_tokens", [])),
     "llama_tokens": len(data.get("llama_generated_tokens", data.get("llama_generated_tokens_from_text", []))),
   })
-out_path = pathlib.Path(os.environ["$ROW_ROOT"]) / "broader-parity" / "carry-forward-summary.json"
+out_path = pathlib.Path(os.environ["ROW_ROOT"]) / "broader-parity" / "carry-forward-summary.json"
 out_path.write_text(json.dumps(report, indent=2) + "\n")
 print("wrote", out_path)
 PY
