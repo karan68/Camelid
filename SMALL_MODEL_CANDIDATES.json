@@ -67,22 +67,24 @@
       "tokenizer": "llama-bpe",
       "chat_template": "Llama 3 instruct header/eot template",
       "quant": "Q8_0",
-      "estimated_ram_materialization_risk": "high; lazy/file-backed Q8 groundwork has bounded compact backend evidence, but this row is not support-ready and should stay guarded on smaller hosts",
-      "expected_support_row": "not supported yet; groundwork-only exact Llama 3 8B Instruct Q8_0 row with compact parity/API-smoke/memory evidence, blocked on broader prompt/chat-template parity, supported API chat/completions, WebUI readiness, support-grade perf, and portability",
-      "load_harness": "metadata/config/tokenizer/template inspection plus guarded /api/models/load and basic API smoke only; do not promote contract support from load success",
-      "parity_harness": "rerun the broader Llama 3 prompt pack with a longer backend client timeout, then add chat-template, API chat/completions, WebUI, memory/perf, and portability evidence before any support wording changes",
+      "estimated_ram_materialization_risk": "high; lazy/file-backed Q8 support path has bounded compact and prompt-pack evidence, but longer context and stronger perf/portability evidence are still expansion gates",
+      "expected_support_row": "supported exact-row smoke for Llama 3 8B Instruct Q8_0 short local chat/parity after compact parity, long-timeout three-prompt 5-token parity, API/frontend smoke, and bounded-memory evidence; do not infer broad Llama-family support",
+      "load_harness": "POST /api/models/load, /v1/models, /v1/completions, /v1/chat/completions, and frontend smoke for this exact 8B Q8_0 GGUF row",
+      "parity_harness": "compact llama3 parity plus the long-timeout three-prompt 5-token Ubuntu pack; require prompt-token, generated-token, and generated-text match against llama.cpp before preserving the support row",
       "latest_evidence": {
-        "load_result": "PASS for exact tracked GGUF in guarded backend evidence runs; this is not a supported-row load claim",
-        "prompt_token_parity": "PASS for compact-header hello; broader downloaded prompt pack is incomplete because the alpacas prompt hit a backend client headers timeout after llama.cpp completed reference generation",
+        "load_result": "PASS for exact-row load, /v1/completions, /v1/chat/completions, and frontend smoke evidence documented in STATUS.md",
+        "prompt_token_parity": "PASS for compact-header hello and the long-timeout three-prompt 5-token Ubuntu pack",
         "first_token_parity": "PASS for compact-header hello",
-        "short_generation_parity": "PASS for compact-header hello 5-token and bounded 50-token runs; broader prompt-pack generation remains blocked until the longer-timeout rerun passes",
-        "support_status": "NOT SUPPORTED: no normal WebUI readiness, supported API chat/completions row, support-grade memory/perf envelope, or portability evidence yet",
+        "short_generation_parity": "PASS for compact-header 1/5/bounded-50-token runs and the long-timeout three-prompt 5-token Ubuntu pack",
+        "support_status": "SUPPORTED EXACT-ROW SMOKE: exact Llama 3 8B Instruct Q8_0 row only; longer context, broader chat-template, stronger perf/portability, and neighboring rows remain unsupported",
         "artifact_dirs": [
           "target/ubuntu-llama3-8b-q8-current-head-20260502T000207Z",
           "target/parity-20260502T030911Z/llama3-8b-1tok",
           "target/parity-20260502T030911Z/llama3-8b-5tok",
           "target/parity-50tok-20260502T031820Z/llama3-8b-50tok",
-          "target/downloaded-llama-matrix-20260502T231000Z"
+          "target/downloaded-llama-matrix-20260502T231000Z",
+          "target/acceptance-llama3-8b-broader-5tok-longtimeout-20260503T010536Z",
+          "target/private-four-llama-e2e-20260502T212751Z-head-c5e6d7e"
         ]
       }
     },
@@ -138,8 +140,8 @@
   ],
   "latest_local_audit": {
     "generated_at": "2026-05-02T23:45:00Z",
-    "head": "144880f plus working-tree support-contract scrub",
-    "artifact_dir": "target/downloaded-llama-matrix-20260502T231000Z and target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack",
-    "summary": "Manifest realigned to the public four-row truth: TinyLlama Q8_0 remains supported; exact Llama 3.2 1B and 3B Instruct Q8_0 rows are supported only as short local-chat smoke lanes; Llama 3 8B Instruct Q8_0 remains not supported despite compact parity/API-smoke/memory groundwork until broader prompt/chat-template parity, supported API/WebUI readiness, support-grade perf, and portability evidence land."
+    "head": "713c744 plus 8B exact-row support promotion worktree",
+    "artifact_dir": "target/downloaded-llama-matrix-20260502T231000Z, target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack, and target/acceptance-llama3-8b-broader-5tok-longtimeout-20260503T010536Z",
+    "summary": "Manifest realigned to the public four-row truth: TinyLlama Q8_0 remains supported; exact Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0 rows are supported only as short local-chat/parity smoke lanes; broader Llama-family support, longer context, stronger perf/portability, and neighboring rows remain unsupported until row-specific evidence lands."
   }
 }

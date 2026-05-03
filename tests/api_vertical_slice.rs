@@ -44,7 +44,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "TinyLlama Q8_0 plus exact Llama 3.2 1B/3B Q8_0 smoke gates"
+        "TinyLlama Q8_0 plus exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 smoke gates"
     );
     assert!(body["supported_quantization"]
         .as_array()
@@ -60,7 +60,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "llama_bpe_decoder_exact_1b_3b_q8_0"
+        .any(|item| item["id"] == "llama_bpe_decoder_exact_1b_3b_8b_q8_0"
             && item["status"] == "supported_exact_row_smoke"));
     assert!(body["planned_model_families"]
         .as_array()
@@ -112,22 +112,20 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "llama3_8b_instruct_gguf")
         .unwrap();
-    assert_eq!(llama3["status"], "groundwork_backend_evidence_only");
+    assert_eq!(llama3["status"], "supported_exact_row_smoke");
     assert_eq!(
         llama3["metadata_parses"],
         "real_artifact_inspected_and_config_guarded"
     );
-    assert_eq!(
-        llama3["tokenizer_works"],
-        "llama_bpe_fixture_guarded_plus_raw_hello_parity"
-    );
+    assert_eq!(llama3["tokenizer_works"], "validated_for_compact_llama3_bpe");
     assert_eq!(
         llama3["generation_runs"],
-        "basic_api_smoke_plus_compact_1_5_50_token_backend_generation"
+        "api_completion_and_chat_smoke_validated"
     );
+    assert_eq!(llama3["frontend_load_path_verified"], "validated");
     assert_eq!(
         llama3["tested_context"],
-        "compact_header_hello_prompt_1_5_50_tokens_backend_only"
+        "short_api_webui_smoke_with_5_token_prompt_pack_parity"
     );
     let planned_quant = compatibility
         .iter()

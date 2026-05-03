@@ -658,7 +658,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "TinyLlama Q8_0 plus exact Llama 3.2 1B/3B Q8_0 smoke gates",
+            current_gate: "TinyLlama Q8_0 plus exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 smoke gates",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -681,7 +681,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama support gate plus exact Llama 3.2 1B/3B short-chat smoke rows; neighboring Q8_0 rows still need their own evidence",
+                notes: "TinyLlama support gate plus exact Llama 3.2 1B/3B and Llama 3 8B short-chat/parity smoke rows; neighboring Q8_0 rows still need their own evidence",
             },
         ],
         planned_quantization: vec![
@@ -703,16 +703,16 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 notes: "LLaMA-style decoder path validated on TinyLlama Q8_0 gate",
             },
             SupportItem {
-                id: "llama_bpe_decoder_exact_1b_3b_q8_0",
+                id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke",
-                notes: "only the exact Llama 3.2 1B/3B Instruct Q8_0 short-chat smoke rows; Llama 3 8B remains groundwork-only",
+                notes: "only the exact Llama 3.2 1B/3B and Llama 3 8B Instruct Q8_0 short-chat/parity smoke rows",
             },
         ],
         planned_model_families: vec![
             SupportItem {
                 id: "larger_llama_instruct",
                 status: "planned",
-                notes: "8B and broader LLaMA-family instruct support after row-specific parity, API, WebUI, memory/perf, and portability evidence",
+                notes: "broader LLaMA-family instruct support after row-specific parity, API, WebUI, memory/perf, and portability evidence",
             },
             SupportItem {
                 id: "mistral",
@@ -778,17 +778,17 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 id: "llama3_8b_instruct_gguf",
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
-                status: "groundwork_backend_evidence_only",
+                status: "supported_exact_row_smoke",
                 metadata_parses: "real_artifact_inspected_and_config_guarded",
-                tokenizer_works: "llama_bpe_fixture_guarded_plus_raw_hello_parity",
+                tokenizer_works: "validated_for_compact_llama3_bpe",
                 tensors_load: "validated_for_lazy_file_backed_q8_backend_runs",
-                generation_runs: "basic_api_smoke_plus_compact_1_5_50_token_backend_generation",
-                parity_audited: "compact_hello_prompt_1_5_50_token_match",
+                generation_runs: "api_completion_and_chat_smoke_validated",
+                parity_audited: "compact_50_token_plus_5_token_prompt_pack_match",
                 performance_measured: "bounded_ubuntu_backend_memory_gate",
-                frontend_load_path_verified: "not_promoted",
-                tested_context: "compact_header_hello_prompt_1_5_50_tokens_backend_only",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF matches llama.cpp on Ubuntu for the compact-header `hello` harness at prompt-token, deterministic 1-token, deterministic 5-token, and bounded 50-token parity, with basic API smoke and bounded-memory evidence; this remains guarded/backend-evidence-only and is not a supported generation claim",
-                next_step: "add broader prompt-pack parity, chat-template parity, WebUI readiness, performance, and portable packaging evidence before any support promotion",
+                frontend_load_path_verified: "validated",
+                tested_context: "short_api_webui_smoke_with_5_token_prompt_pack_parity",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has end-to-end generation parity artifacts: compact prompt-token/1-token/5-token/50-token parity, a three-prompt 5-token Ubuntu parity run, API completion/chat smoke, frontend smoke, and bounded-memory evidence; support is limited to this exact 8B Instruct Q8_0 row and tested short smoke/parity envelope",
+                next_step: "broaden prompt packs, longer contexts, chat-template behavior, performance, and portable packaging evidence before expanding beyond this exact 8B Q8_0 supported row",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
