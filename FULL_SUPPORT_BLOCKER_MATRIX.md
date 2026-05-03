@@ -40,7 +40,8 @@ A row is **full-support green** only when all of these are green on the exact GG
 
 ### WP0 — Make evidence durable before more claims
 
-- Create one non-ambiguous artifact root per run, for example `target/full-support-YYYYMMDDTHHMMSSZ/<row>/`.
+- Create one non-ambiguous artifact root per run, for example `target/full-support-YYYYMMDDTHHMMSSZ-head-<sha>/`.
+- Generate the normalized current-head scaffold first so every row has the same manifest/command shape before Ubuntu reruns: `node scripts/prepare-full-support-bundle.mjs --out-dir target/full-support-$(date -u +%Y%m%dT%H%M%SZ)-head-$(git rev-parse --short=12 HEAD)`.
 - For each row, save: parity report(s), model-promotion smoke bundle, frontend smoke stdout/stderr/summary, memory samples, command lines, current `git rev-parse HEAD`, and model SHA256.
 - If artifacts stay under gitignored `target/`, publish only the exact artifact manifest/checksums in docs; do not pretend reviewers can fetch local paths from GitHub.
 
