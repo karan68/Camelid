@@ -1,8 +1,8 @@
 # Full-support current-head execution bundle
 
-Generated: 2026-05-03T04:07:24.790Z
+Generated: 2026-05-03T04:25:35.979Z
 
-Git head: `e7837a49d3e1b2eb4f93ed6777b77200fad8307f`
+Git head: `33f38ba9287506dc680b5c0f327251cd9ad6cf94`
 Origin/main: `e7837a49d3e1b2eb4f93ed6777b77200fad8307f`
 
 This bundle is a durable execution scaffold for the four exact rows Tim cares about. It does **not** widen support by itself. Its job is to normalize the evidence shape so each row has the same folders, command files, model SHA capture, and carry-forward references before or during Ubuntu reruns.

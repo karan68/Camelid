@@ -5,6 +5,8 @@ import https from 'node:https'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
+import { renderExpectedPrompt, resolveReferenceContext } from './lib/chat-parity-harness.mjs'
+
 const args = parseArgs(process.argv.slice(2))
 const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.LLAMA3_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
@@ -21,6 +23,7 @@ const diagnosticsOut = args.get('diagnostics-out') || process.env.LLAMA3_CHAT_DI
 const requirePromptMatch = args.has('require-prompt-match') || process.env.LLAMA3_CHAT_REQUIRE_PROMPT_MATCH === '1'
 const requireGeneratedMatch = args.has('require-generated-match') || process.env.LLAMA3_CHAT_REQUIRE_GENERATED_MATCH === '1'
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
+const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') || process.env.LLAMA3_LLAMA_CONTEXT, 'llama-context')
 
 if (!Number.isInteger(maxTokens) || maxTokens < 1) {
   throw new Error(`--max-tokens must be a positive integer, got ${args.get('max-tokens')}`)
@@ -28,17 +31,19 @@ if (!Number.isInteger(maxTokens) || maxTokens < 1) {
 if (!Number.isInteger(waitMs) || waitMs < 1) {
   throw new Error(`--wait-ms must be a positive integer, got ${args.get('wait-ms')}`)
 }
-if (renderMode !== 'compact') {
-  throw new Error(`unsupported --render-mode ${JSON.stringify(renderMode)}; current Camelid evidence uses compact Llama 3 Instruct header rendering`)
-}
 
 const messages = await loadMessages({ messagesJson, fallbackMessage: userMessage })
-// Camelid's current Llama 3 support intentionally renders the compact header/eot
-// form used by the checked-in tokenizer fixtures, then asks the tokenizer to add
-// BOS. Use llama-server /completion with this exact prompt instead of /v1/chat,
-// because newer Llama 3.2 GGUF chat templates inject a default dated system
-// header that Camelid does not implement yet.
-const expectedPrompt = renderCompactLlama3Prompt(messages)
+// Camelid's exact-row parity evidence intentionally renders the checked-in prompt
+// shape itself, then asks the tokenizer to add BOS. Use llama-server /completion
+// with this explicit prompt instead of depending on server-side chat-template
+// expansion, so compact Llama 3 and TinyLlama marker-template lanes stay exact.
+const expectedPrompt = renderExpectedPrompt(messages, renderMode)
+const referencePromptTokens = await tokenizeExpectedPrompt()
+const referenceContext = resolveReferenceContext({
+  promptTokenCount: referencePromptTokens.length,
+  maxTokens,
+  explicitContext: explicitLlamaContext,
+})
 let child
 let childSpawnError
 try {
@@ -49,7 +54,7 @@ try {
       '--port', url.port || '8183',
       '-m', modelPath,
       '-ngl', '0',
-      '-c', '512',
+      '-c', String(referenceContext),
       '--no-warmup',
     ], { stdio: ['ignore', 'pipe', 'pipe'] })
     child.once('error', err => { childSpawnError = err })
@@ -72,7 +77,6 @@ try {
     body: JSON.stringify({ path: modelPath, id: modelId }),
   })
 
-  const referencePromptTokens = await tokenizeExpectedPrompt()
   const chatPayload = {
     model: modelId,
     messages,
@@ -134,6 +138,7 @@ try {
     expected_prompt: expectedPrompt,
     expected_prompt_char_count: expectedPrompt.length,
     reference_prompt_token_count: referencePromptTokens.length,
+    reference_context: referenceContext,
     prompt_tokens_match: promptMatch,
     generated_tokens_match: generatedTokensMatch,
     generated_text_match: textMatch,
@@ -162,6 +167,7 @@ try {
   console.log(`expected_prompt=${JSON.stringify(expectedPrompt)}`)
   console.log(`expected_prompt_char_count=${expectedPrompt.length}`)
   console.log(`reference_prompt_token_count=${referencePromptTokens.length}`)
+  console.log(`reference_context=${referenceContext}`)
   console.log(`backend_prompt_tokens=${JSON.stringify(backendPromptTokens)}`)
   console.log(`reference_prompt_tokens=${JSON.stringify(referencePromptTokens)}`)
   console.log(`prompt_tokens_match=${promptMatch}`)
@@ -205,17 +211,6 @@ async function loadMessages({ messagesJson, fallbackMessage }) {
   })
 }
 
-function renderCompactLlama3Prompt(messages) {
-  let prompt = ''
-  for (const message of messages) {
-    prompt += `<|start_header_id|>${message.role.trim()}<|end_header_id|>\n\n${message.content}<|eot_id|>`
-  }
-  if (messages.at(-1)?.role.trim() !== 'assistant') {
-    prompt += '<|start_header_id|>assistant<|end_header_id|>\n\n'
-  }
-  return prompt
-}
-
 function parseArgs(argv) {
   const parsed = new Map()
   for (let i = 0; i < argv.length; i += 1) {
@@ -237,6 +232,15 @@ async function tokenizeExpectedPrompt() {
     '-p', expectedPrompt,
   ])
   return JSON.parse(stdout.trim())
+}
+
+function parseOptionalPositiveInt(value, name) {
+  if (value === undefined || value === null || value === '') return null
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`--${name} must be a positive integer, got ${value}`)
+  }
+  return parsed
 }
 
 async function fetchJson(url, options = {}) {

@@ -7,8 +7,8 @@ Carry-forward bundle: `qa/evidence-bundles/four-row-public-20260503T024327Z/tiny
 Tracks:
 - compact-parity: ready_to_run — Refresh bounded TinyLlama hello parity on current head.
 - broader-parity: carry_forward_only — Preserve the existing five-prompt/50-token TinyLlama gate while a fresh current-head rerun is scheduled.
-- chat-template-shapes: not_applicable — The checked-in Llama 3 chat-template shape pack is not reusable for TinyLlama marker-template support.
-- context-512: planned — TinyLlama does not yet have a normalized 512-token current-head refresh in the shared bundle shape.
+- chat-template-shapes: ready_to_run — Run the exact-row TinyLlama marker-template shape pack.
+- context-512: ready_to_run — Run the bounded TinyLlama 512-context pack and preserve success or failure durably.
 - api-webui-smoke: ready_to_run — Refresh current-head TinyLlama load/completions/chat/frontend smoke.
 - perf-rss-portability: ready_to_run — Capture host facts plus RSS after load/1tok/5tok/API-WebUI smoke.
 

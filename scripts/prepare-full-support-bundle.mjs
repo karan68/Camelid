@@ -74,16 +74,18 @@ const rows = [
       {
         id: 'chat-template-shapes',
         kind: 'template',
-        status: 'not_applicable',
-        description: 'The checked-in Llama 3 chat-template shape pack is not reusable for TinyLlama marker-template support.',
-        command: repoCommand('printf "tinyllama_marker exact-row template lane; no shared llama3 shape pack\\n" > ROW_ROOT/chat-template-shapes/NOT_APPLICABLE.txt')
+        status: 'ready_to_run',
+        description: 'Run the exact-row TinyLlama marker-template shape pack.',
+        pack_path: 'qa/prompt-packs/tinyllama-chat-template-shapes.json',
+        command: repoCommand(`node scripts/run-llama3-prompt-pack.mjs --backend ${apiBase} --llama-url ${tinyLlamaBase} --model "${modelDir}/tinyllama-1.1b-chat-v1.0.Q8_0.gguf" --model-id tinyllama-q8 --llama-server "${llamaServerBin}" --llama-tokenize "${llamaTokenizeBin}" --start-llama-server --pack qa/prompt-packs/tinyllama-chat-template-shapes.json --out-dir ROW_ROOT/chat-template-shapes --wait-ms 180000 --require-prompt-match --require-generated-match`)
       },
       {
         id: 'context-512',
         kind: 'context',
-        status: 'planned',
-        description: 'TinyLlama does not yet have a normalized 512-token current-head refresh in the shared bundle shape.',
-        command: repoCommand('printf "Plan a TinyLlama-specific longer-context pack before calling this row full-support green.\\n" > ROW_ROOT/context-512/PLANNED.txt')
+        status: 'ready_to_run',
+        description: 'Run the bounded TinyLlama 512-context pack and preserve success or failure durably.',
+        pack_path: 'qa/prompt-packs/tinyllama-context-512-smoke.json',
+        command: repoCommand(`node scripts/run-llama3-prompt-pack.mjs --backend ${apiBase} --llama-url ${tinyLlamaBase} --model "${modelDir}/tinyllama-1.1b-chat-v1.0.Q8_0.gguf" --model-id tinyllama-q8 --llama-server "${llamaServerBin}" --llama-tokenize "${llamaTokenizeBin}" --start-llama-server --pack qa/prompt-packs/tinyllama-context-512-smoke.json --out-dir ROW_ROOT/context-512 --wait-ms 180000 --require-prompt-match --require-generated-match`)
       },
       {
         id: 'api-webui-smoke',

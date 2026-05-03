@@ -38,8 +38,9 @@ await mkdir(outDir, { recursive: true })
 const defaultMaxTokens = Number.parseInt(String(pack.defaults?.max_tokens ?? 50), 10)
 const defaultRenderMode = pack.defaults?.render_mode ? String(pack.defaults.render_mode) : 'compact'
 const summary = {
-  schema: 'camelid.llama3.prompt-pack-run.v1',
+  schema: 'camelid.chat-parity.prompt-pack-run.v1',
   pack: {
+    schema: pack.schema || null,
     id: pack.pack_id || null,
     path: resolve(packPath),
     prompt_count: prompts.length,
