@@ -145,9 +145,10 @@ Current evidence boundary:
 - Independent tokenizer reference fixtures exist.
 - Lazy/file-backed Q8 execution is now good enough for repeat bounded parity on the exact tracked Q8_0 GGUF.
 - The Ubuntu compact-header `hello` harness matches llama.cpp for prompt tokens and deterministic generation at 1, 5, and bounded 50-token lengths on this exact row.
-- The long-timeout Ubuntu three-prompt 5-token parity run passed for `hello`, alpacas, and JSON with prompt tokens, generated token IDs, and generated text all matching llama.cpp.
+- The long-timeout Ubuntu three-prompt 5-token parity run passed for `hello`, alpacas, and JSON with prompt tokens, generated token IDs, and generated text all matching the known-good reference.
+- The first bounded 512-context pack now passes on the reopened Ubuntu lane: prompt tokens, generated token IDs, and generated text matched for `qa/prompt-packs/llama3-context-512-smoke.json` at `58acf592345c69c1b684544124cd23804e2899f1`.
 - `/api/models/load`, `/v1/completions`, `/v1/chat/completions`, and frontend smoke passed for this exact row.
-- The support claim is limited to this exact Llama 3 8B Instruct Q8_0 row and tested short smoke/parity envelope; neighboring Llama rows, other quantizations, longer contexts, and broader chat-template behavior remain outside the claim.
+- The support claim is limited to this exact Llama 3 8B Instruct Q8_0 row and tested smoke/parity envelope; neighboring Llama rows, other quantizations, larger contexts, and broader chat-template behavior remain outside the claim.
 
 Representative durable evidence:
 
@@ -156,6 +157,8 @@ Representative durable evidence:
 - `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS`
 - `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`
 - `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama3_8b_instruct_q8_0/manifest.json`
+- `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`
+- `qa/validation-notes/2026-05-04-8b-context-512-rerun.md`
 - `qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md`
 
 Selected source artifacts recorded by those committed files:
@@ -198,6 +201,7 @@ Recent backend work converted the 8B runtime artifacts into an exact-row support
 - current-head raw `hello` prompt-token parity matched `[128000, 15339]` for the exact same model SHA
 - a short deterministic 5-token backend slice returned `, I'm a new`
 - the long-timeout Ubuntu three-prompt 5-token parity run passed for `hello`, alpacas, and JSON: `target/acceptance-llama3-8b-broader-5tok-longtimeout-20260503T010536Z/summary.json`
+- the reopened-lane first 512-context pack passed with prompt-token, generated-token, and generated-text parity; public summary/checksums live at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/`
 - `/v1/completions`, `/v1/chat/completions`, and frontend smoke are preserved in the sanitized carry-forward bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama3_8b_instruct_q8_0.bundle.json`; that bundle remains a pre-promotion guarded-WebUI slice from source smoke commit `c5e6d7e`, so a fresh current-head contract-supported rerun is still outstanding
 - the current-head memory gate stayed bounded: first-token sampled RSS roughly `6,220 -> 378,520 KiB`; 5-token sampled RSS roughly `6,076 -> 396,912 KiB`; no swap, OOM, timeout, or runaway retained-RSS signature appeared
 
@@ -225,7 +229,7 @@ The downloaded-model matrix still disproves a broad inherited “perfect Llama-f
 
 Public evidence packaging note: sanitized carry-forward bundle manifests/checksums for the four-row smoke slices now live under `qa/evidence-bundles/four-row-public-20260503T024327Z/` and `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/`. They intentionally preserve the blocked public-head rerun state instead of overstating it.
 
-Current-head durable execution note: the exact-row normalized rerun scaffold is now checked in at `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/`. Its per-row manifests/commands give docs, API, and frontend a stable current-head citation target while the Ubuntu reruns for longer context, broader template coverage, and stronger perf/portability evidence are still outstanding.
+Current-head durable execution note: the exact-row normalized rerun scaffold is now checked in at `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/`. Its per-row manifests/commands give docs, API, and frontend a stable current-head citation target while most Ubuntu reruns for broader template coverage and stronger perf/portability evidence are still outstanding. The first exact 8B 512-context rerun is separately captured at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/`.
 
 ## Next blocking work
 
@@ -237,7 +241,7 @@ In order of importance:
 4. Preserve the Llama 3 8B exact-row promotion in docs, API, frontend readiness, and regression evidence without lending it to neighboring rows.
 5. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
 
-Current operator update: Tim has reopened the approved Ubuntu validation lane. Promotion-grade Llama-family reruns for 1B/3B/8B should resume there from clean public `main` checkouts while preserving any dirty remote worktrees. A fresh reopened-lane API-only smoke summary now lives at `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/manifest.json`, but this does not widen support by itself: the 8B 512-context/performance lane remains blocked until passing current-head artifacts exist, and broader/full support still requires normalized parity, frontend, memory/perf, context, and durable-bundle evidence. See `qa/validation-notes/2026-05-04-validation-lane-reopened.md`.
+Current operator update: Tim has reopened the approved Ubuntu validation lane. Promotion-grade Llama-family reruns for 1B/3B/8B should resume there from clean public `main` checkouts while preserving any dirty remote worktrees. A fresh reopened-lane API-only smoke summary now lives at `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/manifest.json`, and the first exact 8B 512-context pack now has a passing public summary at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`. This does not widen support by itself: broader/full support still requires normalized parity, frontend, memory/perf, broader context/template coverage, and durable-bundle evidence. See `qa/validation-notes/2026-05-04-validation-lane-reopened.md` and `qa/validation-notes/2026-05-04-8b-context-512-rerun.md`.
 
 ### Qwen prerequisite note
 

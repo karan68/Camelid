@@ -52,14 +52,14 @@ The compact table below is the authoritative release ledger reflected in `/api/c
 
 Full-support requires the same checklist on every row: backend parity, API evidence, WebUI evidence, repeated runs, 50-token output, bounded memory/RSS evidence, and a current-head durable evidence bundle.
 
-Reopened-lane API-only smoke: `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/manifest.json` records passing exact-row API load/models/capabilities/completions/chat checks for TinyLlama, Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Q8_0. Treat it as API freshness evidence only; it does not replace frontend smoke, parity packs, performance portability, or context validation.
+Reopened-lane API-only smoke: `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/manifest.json` records passing exact-row API load/models/capabilities/completions/chat checks for TinyLlama, Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Q8_0. Treat it as API freshness evidence only; it does not replace frontend smoke, parity packs, performance portability, or context validation. The follow-up 8B context pack at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json` closes only the first bounded 512-context timeout for that exact 8B pack.
 
 | Lane | Status | What Camelid can honestly say now | Missing before full support |
 | --- | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | Supported current gate | End-to-end generation, parity, performance envelope, repeated 50-token runs, durable evidence, and frontend readiness are validated for the current five-prompt gate. | Preserve without regression; rerun when the current-head bundle is regenerated. |
 | Llama 3.2 1B Instruct Q8_0 | Supported exact-row smoke | Exact-row load, compact/broader parity, API smoke, and frontend smoke are supported for this exact row only. | Normalize repeated current-head 50-token parity, API/WebUI evidence, memory bounds, and durable bundle evidence to the TinyLlama bar before any broader/full-support claim. |
 | Llama 3.2 3B Instruct Q8_0 | Supported exact-row smoke | Exact-row load, compact prompt-token/1-token/5-token/50-token parity, broader three-prompt 50-token parity, API smoke, and frontend smoke are supported for this exact row only. | Normalize repeated current-head 50-token parity, API/WebUI evidence, memory bounds, and durable bundle evidence to the TinyLlama bar before any broader/full-support claim. |
-| Llama 3 8B Instruct Q8_0 | Supported exact-row smoke | Compact parity, three-prompt 5-token parity, API/frontend smoke, and bounded-memory evidence support this exact row only. The first 512-context current-head pack is a documented blocker, not a supported context claim. | Repeat current-head 50-token evidence, fix/rerun 512-context evidence, refresh API/WebUI evidence, close performance/RSS bounds, and publish the durable bundle before any broader/full-support claim. The approved Ubuntu validation lane is reopened, but the 512-context timeout remains a blocker until a passing artifact exists. |
+| Llama 3 8B Instruct Q8_0 | Supported exact-row smoke | Compact parity, three-prompt 5-token parity, API/frontend smoke, bounded-memory evidence, and the first bounded 512-context pack support this exact row only. | Repeat current-head 50-token evidence, refresh API/WebUI evidence, broaden context/template coverage, close performance/RSS bounds, and publish the durable bundle before any broader/full-support claim. The approved Ubuntu validation lane is reopened; the earlier 512-context timeout is cleared only for the one checked pack. |
 
 ### Row details
 
@@ -82,9 +82,9 @@ Reopened-lane API-only smoke: `qa/evidence-bundles/four-row-api-only-20260504T23
 
 #### Llama 3 8B Instruct Q8_0
 - **Family / quant:** LLaMA decoder + Llama 3 BPE, Q8_0
-- **Validated now:** metadata/config/template handling, tokenizer reference parity, compact `hello` prompt-token/1-token/5-token/50-token parity, the three-prompt 5-token Ubuntu parity run, `/v1/completions`, `/v1/chat/completions`, frontend smoke, and bounded-memory evidence are validated for the exact 8B Instruct Q8_0 row
-- **Missing gates:** longer-context evidence, larger prompt packs, stronger performance evidence, portable packaging evidence, and broader chat-template coverage
-- **Support boundary:** supported exact-row smoke only for this exact Llama 3 8B Instruct Q8_0 row; no broader/full-support, longer-context, or neighboring-row claim yet
+- **Validated now:** metadata/config/template handling, tokenizer reference parity, compact `hello` prompt-token/1-token/5-token/50-token parity, the three-prompt 5-token Ubuntu parity run, the first bounded 512-context pack, `/v1/completions`, `/v1/chat/completions`, frontend smoke, and bounded-memory evidence are validated for the exact 8B Instruct Q8_0 row
+- **Missing gates:** broader/larger context evidence, larger prompt packs, stronger performance evidence, portable packaging evidence, and broader chat-template coverage
+- **Support boundary:** supported exact-row smoke only for this exact Llama 3 8B Instruct Q8_0 row; no broader/full-support, larger-context, or neighboring-row claim yet
 
 ### Planned lanes
 
@@ -107,7 +107,7 @@ For **Llama 3.2 1B** specifically, the committed carry-forward row bundle at `qa
 
 For **Llama 3.2 3B** specifically, the committed carry-forward row bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_3b_instruct_q8_0.bundle.json` preserves the exact-row API/WebUI/compact-parity smoke boundary, and the current-head row manifest at `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json` is the durable citation target for the post-Q8-dot broader three-prompt handoff plus the next context/template/perf tracks. The next promotable evidence is still longer context, stronger performance/portability, and broader chat-template coverage before expanding the claim.
 
-For **Llama 3 8B** specifically, the durable citation anchors are the current-head row manifest at `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama3_8b_instruct_q8_0/manifest.json` plus the committed perf/portability envelope at `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`; the public carry-forward bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama3_8b_instruct_q8_0.bundle.json` is intentionally a pre-promotion guarded-WebUI smoke slice from source smoke commit `c5e6d7e`. That keeps the exact-row short-smoke promotion boundary and the known 512-context blocker visible without widening beyond this row.
+For **Llama 3 8B** specifically, the durable citation anchors are the current-head row manifest at `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama3_8b_instruct_q8_0/manifest.json`, the committed perf/portability envelope at `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`, and the 512-context rerun bundle at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`; the public carry-forward bundle at `qa/evidence-bundles/four-row-public-20260503T024327Z/llama3_8b_instruct_q8_0.bundle.json` is intentionally a pre-promotion guarded-WebUI smoke slice from source smoke commit `c5e6d7e`. That keeps the exact-row smoke promotion boundary and the cleared single-pack 512-context timeout visible without widening beyond this row.
 
 ## Quantization formats
 
@@ -127,7 +127,7 @@ For **Llama 3 8B** specifically, the durable citation anchors are the current-he
 | --- | --- | --- |
 | LLaMA/SPM decoder | Supported current gate | TinyLlama Q8_0 path; broader LLaMA-family validation planned. |
 | Larger LLaMA-family instruct models | Supported exact-row smoke lanes only | Exact Llama 3.2 1B/3B and Llama 3 8B Instruct Q8_0 have row-specific smoke support, but broad Llama-family behavior and full support remain blocked until each row meets the normalized TinyLlama-standard checklist. |
-| LLaMA decoder + Llama 3 BPE | Exact-row smoke supported; broader support pending normalization | The Llama 3.2 1B row has compact/broader parity plus API/WebUI smoke; the 3B row has compact and broader 50-token parity plus API/WebUI smoke; the 8B row has compact parity, 5-token broader parity, API/WebUI smoke, bounded-memory evidence, and a documented 512-context blocker. Those exact rows are smoke-supported only; broader/full support still waits on repeated current-head 50-token, API, WebUI, memory-bound, context, and durable-bundle normalization. |
+| LLaMA decoder + Llama 3 BPE | Exact-row smoke supported; broader support pending normalization | The Llama 3.2 1B row has compact/broader parity plus API/WebUI smoke; the 3B row has compact and broader 50-token parity plus API/WebUI smoke; the 8B row has compact parity, 5-token broader parity, API/WebUI smoke, bounded-memory evidence, and a passing first bounded 512-context pack. Those exact rows are smoke-supported only; broader/full support still waits on repeated current-head 50-token, API, WebUI, memory-bound, context, and durable-bundle normalization. |
 | Mistral-family GGUF | Planned | Evaluate after LLaMA-family evidence is stable. |
 | Qwen / Gemma / Phi / Falcon / Mamba / others | Future | Track explicitly; do not claim until scoped, implemented, and audited. For Qwen specifically, the first promotable prerequisite is one exact GGUF row with tokenizer/chat-template fixtures, llama.cpp token-reference checks, and bounded load plus prompt-token parity evidence before any runtime-support wording. |
 
@@ -146,7 +146,7 @@ For **Llama 3 8B** specifically, the durable citation anchors are the current-he
 | Context bucket | Status | Evidence / next action |
 | --- | --- | --- |
 | Short prompt / 50-token audit | Supported for TinyLlama; normalization pending for exact Llama rows | TinyLlama has the current 50-token gate. Exact Llama rows need repeated current-head 50-token parity plus API/WebUI/memory evidence before full support. |
-| 512 tokens | Planned / blocked for 8B current head | Phase 13 audit bucket. The exact 8B row's first bounded 512-context pack timed out on Ubuntu current head, so 512-context support must stay blocked until fixed and rerun. |
+| 512 tokens | Exact 8B first-pack pass; broader context still planned | Phase 13 audit bucket. The exact 8B row's first bounded 512-context pack now passes on Ubuntu current head, but this is one pack only; 1k/2k, broader template shapes, and performance portability remain unpromoted. |
 | 1k / 2k tokens | Planned | Phase 13 progressive audit buckets. |
 | Model-native context | Future | Validate only where memory/performance permits. |
 

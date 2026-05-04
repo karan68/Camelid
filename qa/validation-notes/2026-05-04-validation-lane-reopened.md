@@ -17,4 +17,4 @@ Current promotion posture:
 - TinyLlama remains the supported current gate.
 - Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0 remain supported exact-row smoke lanes only.
 - Broader/full support still needs normalized current-head parity, API/WebUI, memory/perf, context, and durable-bundle evidence per exact row.
-- The 8B 512-context timeout remains a known blocker until a passing rerun exists.
+- The first 8B 512-context timeout has a passing rerun at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`; broader context, performance/portability, and full-support normalization remain blockers.

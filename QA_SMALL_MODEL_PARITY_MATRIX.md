@@ -24,7 +24,7 @@ full-support language:
 | TinyLlama 1.1B Chat | Q8_0 | Supported gate evidence is green | PASS | PASS | PASS | Matches known-good llama-server on the active TinyLlama gate. Keep this as the release anchor and refresh artifacts when packaging the four-row evidence set. |
 | Llama 3.2 1B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact-header prompt and broader prompt pack | PASS | PASS for compact and broader short-generation packs | Exact 1B Instruct Q8_0 short local chat is smoke-supported only; longer context, stronger memory/perf, portability, and broader template coverage remain expansion gates. |
 | Llama 3.2 3B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact-header prompt and post-Q8-dot broader prompt pack | PASS | PASS for compact 1/5/50-token and broader 3-prompt/50-token packs | The previous JSON-shaped broader prompt blocker is fixed for the current pack. The row remains limited to exact-row short-chat smoke until longer-context, memory/perf, portability, and broader template evidence land. |
-| Llama 3 8B Instruct | Q8_0 | Groundwork-only / backend evidence only | PASS for compact `hello`; broader prompt pack incomplete | PASS for compact `hello` | PASS for compact `hello` 5-token and bounded 50-token runs | Not supported yet. The broader prompt pack needs a rerun with a longer backend client timeout, then API chat, WebUI readiness, memory/perf, portability, and docs/API/frontend promotion must land together. |
+| Llama 3 8B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact `hello`, broader 5-token pack, and first 512-context pack | PASS for compact `hello` and covered packs | PASS for compact `hello` 5-token, bounded 50-token, broader 5-token, and first 512-context pack | Exact 8B Instruct Q8_0 smoke is supported only for the documented envelopes; larger contexts, stronger memory/perf, portability, and broader template coverage remain expansion gates. |
 
 ## Current evidence summary
 
@@ -77,9 +77,10 @@ Representative artifacts cited by the public docs:
 
 - Tokenizer, metadata, config/template, retained-Q8, and lazy/file-backed Q8 groundwork exist.
 - Compact-header `hello` now has prompt-token parity plus deterministic 1-token, 5-token, and bounded 50-token generation parity.
-- Basic API smoke and bounded memory evidence are documented for the exact tracked Q8_0 GGUF.
-- Broader prompt-pack parity is not green: the downloaded matrix passed `hello` and the JSON-shaped prompt, but the alpacas prompt did not complete cleanly because the backend request hit a Node/undici headers timeout after llama.cpp completed reference generation.
-- No 8B generation attempt should be treated as a support claim until broader prompt/chat-template parity, supported API chat/completions, WebUI readiness, support-grade memory/perf, and portability evidence exist.
+- Basic API smoke, frontend smoke, and bounded memory evidence are documented for the exact tracked Q8_0 GGUF.
+- The later long-timeout broader 5-token pack passed for `hello`, alpacas, and JSON.
+- The first bounded 512-context pack passed on the reopened Ubuntu validation lane and is summarized at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`.
+- Do not treat this as broad/full 8B support: larger context buckets, broader chat-template coverage, support-grade memory/perf, portability, and synchronized docs/API/frontend promotion evidence remain required before widening the claim.
 
 Representative artifacts cited by the public docs:
 
