@@ -44,7 +44,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support and 8B 512-context reruns are blocked while the Ubuntu validation host is shut down"
+        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and 8B 512-context remains a known blocker on the reopened Ubuntu validation lane"
     );
     assert!(body["supported_quantization"]
         .as_array()
@@ -109,7 +109,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama32_1b["chat_template_renderer"], "compact");
     assert_eq!(
         llama32_1b["chat_template_shape_pack"],
-        "blocked_by_validation_host_shutdown"
+        "ready_to_run_on_validation_host"
     );
     assert_eq!(
         llama32_1b["chat_template_shape_pack_id"],
@@ -117,7 +117,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama32_1b["bounded_context_512_pack"],
-        "blocked_by_validation_host_shutdown"
+        "ready_to_run_on_validation_host"
     );
     assert_eq!(
         llama32_1b["bounded_context_512_pack_id"],
@@ -141,7 +141,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama32_3b["chat_template_renderer"], "compact");
     assert_eq!(
         llama32_3b["chat_template_shape_pack"],
-        "blocked_by_validation_host_shutdown"
+        "ready_to_run_on_validation_host"
     );
     assert_eq!(
         llama32_3b["chat_template_shape_pack_id"],
@@ -149,7 +149,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama32_3b["bounded_context_512_pack"],
-        "blocked_by_validation_host_shutdown"
+        "ready_to_run_on_validation_host"
     );
     assert_eq!(
         llama32_3b["bounded_context_512_pack_id"],
@@ -181,16 +181,13 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama3["chat_template_renderer"], "compact");
     assert_eq!(
         llama3["chat_template_shape_pack"],
-        "blocked_by_validation_host_shutdown"
+        "ready_to_run_on_validation_host"
     );
     assert_eq!(
         llama3["chat_template_shape_pack_id"],
         "llama3-chat-template-shapes-v1"
     );
-    assert_eq!(
-        llama3["bounded_context_512_pack"],
-        "known_blocker_and_validation_host_shutdown"
-    );
+    assert_eq!(llama3["bounded_context_512_pack"], "known_blocker");
     assert_eq!(
         llama3["bounded_context_512_pack_id"],
         "llama3-context-512-smoke-v1"

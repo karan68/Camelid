@@ -14,11 +14,11 @@ const originMain = git(['rev-parse', 'origin/main'], repoRoot)
 const branch = git(['branch', '--show-current'], repoRoot)
 const outDir = resolve(args.get('out-dir') || join(repoRoot, 'target', `full-support-${utcStamp}-head-${gitHeadShort}`))
 const outDirRelative = relative(repoRoot, outDir) || '.'
-const validationHostStatus = args.get('validation-host-status') || 'blocked_by_operator_shutdown'
+const validationHostStatus = args.get('validation-host-status') || 'available'
 const runtimeValidationAvailable = validationHostStatus === 'available'
 const qaBundleRoot = 'qa/evidence-bundles/four-row-public-20260503T024327Z'
 const perfEnvelopePath = 'qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json'
-const validationNotePath = 'qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md'
+const validationNotePath = 'qa/validation-notes/2026-05-04-validation-lane-reopened.md'
 const toolchainCommand = repoCommand('./scripts/with-rustup-cargo.sh build --release --bin backendinference')
 const apiBase = '${CAMELID_API_BASE:-http://127.0.0.1:8181}'
 const frontendUrl = '${CAMELID_FRONTEND_URL:-http://127.0.0.1:4175}'
@@ -520,7 +520,20 @@ function renderRunAll(rows) {
 }
 
 function renderReadme(manifest) {
-  return `# Full-support current-head execution bundle\n\nGenerated: ${manifest.generated_utc}\n\nGit head: \`${manifest.git.head}\`\nOrigin/main: \`${manifest.git.origin_main}\`\nValidation host status: \`${manifest.validation_host_status.status}\`\nRuntime validation available: \`${manifest.validation_host_status.runtime_validation_available}\`\n\nThis bundle is a durable execution scaffold for the four exact rows Tim cares about. It does **not** widen support by itself. Its job is to normalize the evidence shape so each row has the same folders, command files, model SHA capture, and carry-forward references before or during Ubuntu reruns.\n\nRequired tracks per row:\n- compact parity\n- broader parity\n- chat-template shapes\n- 512-context\n- API/WebUI smoke\n- perf/RSS/portability\n\nTop-level commands:\n- \`commands/build-current-head.sh\`\n- \`commands/capture-host-facts.sh\`\n- \`commands/run-all-rows.sh\`\n\nGuardrails:\n- Tim has shut down the Ubuntu validation server when this default bundle is generated; runtime command scripts exit blocked unless regenerated with \`--validation-host-status available\` after Tim explicitly says the lane is back.\n- Do not SSH to validation hosts, and do not substitute local Mac llama-server/reference workloads while the host-shutdown blocker is active.\n- Keep claims exact-row only unless docs, API, frontend, and artifacts all agree.\n- Preserve known blockers durably instead of deleting them, especially the 8B 512-context performance/RSS gap.\n\nCarry-forward public references:\n- \`${manifest.carry_forward_public_refs.normalized_bundle_root}\`\n- \`${manifest.carry_forward_public_refs.perf_portability_envelope}\`\n- \`${manifest.carry_forward_public_refs.validation_note}\`\n`}
+  const guardrails = manifest.validation_host_status.runtime_validation_available
+    ? [
+        'Runtime command scripts are runnable because this bundle was generated with an available validation lane; execute them only on the approved validation host or another Tim-authorized runtime lane.',
+        'Use clean public `main` checkouts for reruns, and preserve dirty remote worktrees.',
+        'Keep claims exact-row only unless docs, API, frontend, and artifacts all agree.',
+        'Preserve known blockers durably instead of deleting them, especially the 8B 512-context performance/RSS gap.',
+      ]
+    : [
+        'Tim has shut down the Ubuntu validation server when this default bundle is generated; runtime command scripts exit blocked unless regenerated with `--validation-host-status available` after Tim explicitly says the lane is back.',
+        'Do not SSH to validation hosts, and do not substitute local Mac llama-server/reference workloads while the host-shutdown blocker is active.',
+        'Keep claims exact-row only unless docs, API, frontend, and artifacts all agree.',
+        'Preserve known blockers durably instead of deleting them, especially the 8B 512-context performance/RSS gap.',
+      ]
+  return `# Full-support current-head execution bundle\n\nGenerated: ${manifest.generated_utc}\n\nGit head: \`${manifest.git.head}\`\nOrigin/main: \`${manifest.git.origin_main}\`\nValidation host status: \`${manifest.validation_host_status.status}\`\nRuntime validation available: \`${manifest.validation_host_status.runtime_validation_available}\`\n\nThis bundle is a durable execution scaffold for the four exact rows Tim cares about. It does **not** widen support by itself. Its job is to normalize the evidence shape so each row has the same folders, command files, model SHA capture, and carry-forward references before or during Ubuntu reruns.\n\nRequired tracks per row:\n- compact parity\n- broader parity\n- chat-template shapes\n- 512-context\n- API/WebUI smoke\n- perf/RSS/portability\n\nTop-level commands:\n- \`commands/build-current-head.sh\`\n- \`commands/capture-host-facts.sh\`\n- \`commands/run-all-rows.sh\`\n\nGuardrails:\n${guardrails.map(item => `- ${item}`).join('\n')}\n\nCarry-forward public references:\n- \`${manifest.carry_forward_public_refs.normalized_bundle_root}\`\n- \`${manifest.carry_forward_public_refs.perf_portability_envelope}\`\n- \`${manifest.carry_forward_public_refs.validation_note}\`\n`}
 
 function renderRowReadme(row, manifest) {
   const tracks = manifest.tracks.map(track => `- ${track.id}: ${track.status} — ${track.description}`).join('\n')

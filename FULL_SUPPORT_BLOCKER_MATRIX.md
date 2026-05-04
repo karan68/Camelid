@@ -25,7 +25,7 @@ A row is **full-support green** only when all of these are green on the exact GG
 ## Execution-target guardrail
 
 - For this four-row push, promotion-grade Llama-family parity, API, WebUI, and memory/perf reruns should execute on the canonical Ubuntu validation host recorded in private operator notes, not on ad hoc local runtimes.
-- As of 2026-05-04, Tim has shut down the Ubuntu validation server. Treat larger-model remote runtime validation as **blocked by host shutdown** until Tim explicitly says the host is back. Do not SSH to any remote validation host while this pause is active, and do not publish private host addresses in repo docs.
+- As of 2026-05-04, Tim has reopened the approved Ubuntu validation lane. Use fresh clean public `main` checkouts for promotion-grade reruns, preserve any dirty remote worktrees, and do not publish private host addresses in repo docs.
 - Do not spend that lane on local Mac llama runtimes unless Tim explicitly redirects the work; keep the Mac for docs, frontend, evidence normalization, privacy scrub, or lightweight guardrail checks.
 
 ## Current full-support blocker matrix
@@ -79,13 +79,14 @@ Required before widening the public support ledger beyond exact-row smoke:
 - WebUI smoke shows exact-row contract-supported readiness and normal chat unlock on current head.
 - Memory/perf envelope documents bounded RSS/materialization, latency, token budget, host class, model SHA, and no OOM/swap/runaway retained-RSS signature.
 - Longer context, broader chat-template behavior, stronger performance/portability evidence, and synchronized docs/API/frontend updates land in the same commit.
-- Current state: blocked while the Ubuntu validation server is intentionally shut down; do not substitute local Mac llama-server/reference workloads unless Tim explicitly authorizes that lane.
+- Current state: remote validation is available again on the approved Ubuntu lane; do not substitute local Mac llama-server/reference workloads unless Tim explicitly authorizes that lane.
 
 ## Current repo/artifact observations
 
 - Current public worktree: `1e70e883840d Align CI with pinned Rust toolchain` is on `main` and aligned with `origin/main`; the exact-row smoke guardrails from `713c744` and `9d091ce` remain preserved in that landed state.
 - Local `target/` has fresh 2026-05-04 doc/debug build outputs and `target/evidence-bundle-privacy-audit-20260504-watchdog.json`, which reports `finding_count: 0` for committed `qa/evidence-bundles`. These are local watchdog artifacts only because `/target/` is gitignored.
 - The public checkout’s `target/` directory still does **not** contain the cited raw parity/promotion artifacts. That is expected because `/target/` is gitignored. Sanitized carry-forward manifests/checksums now live under `qa/evidence-bundles/four-row-public-20260503T024327Z/`, `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/`, and `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/`, but reviewers still cannot fetch the private raw target tree itself from GitHub.
-- Larger-model remote runtime validation is presently blocked by Tim’s Ubuntu validation-host shutdown. Keep only local repo-safe work in this lane until Tim explicitly says the host is back.
+- A reopened-lane API-only smoke summary now lives under `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/`. It refreshes exact-row API load/models/capabilities/completions/chat evidence only; it does not close frontend, parity, context, or performance blockers.
+- Larger-model remote runtime validation is available again on Tim’s approved Ubuntu validation lane. Use clean public checkouts for new runs and preserve dirty worktrees.
 - The older `projects/backendinference` worktree is behind public `origin/main` and locally dirty; use the public `projects/Camelid` worktree for release docs/commits unless deliberately recovering old local artifacts.
-- The earlier Ubuntu rebuild failure was an environment/toolchain-selection issue, not a new Cargo.lock mystery: bare distro cargo was too old, while current Camelid head now has a verified Rust/Cargo floor of `1.87+`. Use the checked-in rustup wrapper/toolchain files for Ubuntu validation when the host comes back; details are in `qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md`.
+- The earlier Ubuntu rebuild failure was an environment/toolchain-selection issue, not a new Cargo.lock mystery: bare distro cargo was too old, while current Camelid head now has a verified Rust/Cargo floor of `1.87+`. Use the checked-in rustup wrapper/toolchain files for Ubuntu validation; details are in `qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md`.

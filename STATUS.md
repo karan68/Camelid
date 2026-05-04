@@ -237,7 +237,7 @@ In order of importance:
 4. Preserve the Llama 3 8B exact-row promotion in docs, API, frontend readiness, and regression evidence without lending it to neighboring rows.
 5. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
 
-Current operator blocker: Tim has intentionally shut down the Ubuntu validation host. Until Tim explicitly says that runtime lane is back, promotion-grade Llama-family reruns for 1B/3B/8B are blocked, and the 8B 512-context/performance lane remains blocked rather than merely pending. Local work should stay limited to repo-safe docs, API/frontend contract alignment, evidence normalization, privacy scrubs, and harness preparation; do not substitute local Mac llama-server/reference workloads for the paused remote lane. See `qa/validation-notes/2026-05-04-local-checkmark-lane.md`.
+Current operator update: Tim has reopened the approved Ubuntu validation lane. Promotion-grade Llama-family reruns for 1B/3B/8B should resume there from clean public `main` checkouts while preserving any dirty remote worktrees. A fresh reopened-lane API-only smoke summary now lives at `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/manifest.json`, but this does not widen support by itself: the 8B 512-context/performance lane remains blocked until passing current-head artifacts exist, and broader/full support still requires normalized parity, frontend, memory/perf, context, and durable-bundle evidence. See `qa/validation-notes/2026-05-04-validation-lane-reopened.md`.
 
 ### Qwen prerequisite note
 
