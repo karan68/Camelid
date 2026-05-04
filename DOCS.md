@@ -1,6 +1,6 @@
 # Camelid Documentation Index
 
-Last updated: 2026-05-02
+Last updated: 2026-05-04
 
 This index helps readers navigate the public Markdown set.
 

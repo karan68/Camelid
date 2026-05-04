@@ -203,12 +203,22 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 cargo doc --no-deps --all-features
+bash scripts/check-public-scrub.sh
+```
+
+If the change touches the WebUI or anything that can break frontend delivery, also run:
+
+```bash
+cd frontend
+npm ci
+npm run build
 ```
 
 For docs-only changes, at minimum run:
 
 ```bash
 git diff --check
+bash scripts/check-public-scrub.sh
 ```
 
 ## Documentation map

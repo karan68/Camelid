@@ -1,6 +1,6 @@
 # Camelid Roadmap
 
-Last updated: 2026-05-03
+Last updated: 2026-05-04
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 

@@ -103,11 +103,15 @@ npm run smoke -- --model ../models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf --model-id
 
 This verifies the frontend is reachable, loads the GGUF through the backend API, checks `/v1/health`, `/v1/models`, and the UI guardrails around `/api/capabilities`, and only sends a chat request when `generation_ready=true` **and** the active model has an exact supported compatibility row. The smoke output includes coarse timings for frontend reachability, model load, health/model listing, support-contract matching, and chat completion so real-model runs produce repeatable latency evidence. Add `--require-generation` when the model is expected to run end-to-end; otherwise the smoke exits successfully after confirming the UI/API guardrail state for metadata-only or unsupported-runtime models.
 
-For the exact Llama 3.2 3B Instruct Q8_0 smoke-supported row, use the exact local path when a backend and frontend are running:
+For the exact smoke-supported Llama rows, use the exact local path when a backend and frontend are running:
 
 ```bash
 cd frontend
+npm run smoke -- --model '$CAMELID_MODEL_DIR/Llama-3.2-1B-Instruct-Q8_0.gguf' --model-id llama-3.2-1b-instruct-q8 --require-generation --expect-compatibility-row llama32_1b_instruct_q8_0 --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled
+
 npm run smoke -- --model '$CAMELID_MODEL_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf' --model-id llama-3.2-3b-instruct-q8 --require-generation --expect-compatibility-row llama32_3b_instruct_q8_0 --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled
+
+npm run smoke -- --model '$CAMELID_MODEL_DIR/Meta-Llama-3-8B-Instruct-Q8_0.gguf' --model-id llama-3-8b-instruct-q8 --require-generation --expect-compatibility-row llama3_8b_instruct_gguf --expect-compatibility-status supported_exact_row_smoke --expect-contract-supported true --expect-webui-chat enabled
 ```
 
-The command must still fail closed if the loaded model is the wrong row, lacks Q8_0 metadata, is not `generation_ready`, or is outside the exact supported `/api/capabilities` row. That is intentional: the UI supports the exact 1B/3B smoke rows without making a broad Llama-family claim.
+These commands must still fail closed if the loaded model is the wrong row, lacks Q8_0 metadata, is not `generation_ready`, or is outside the exact supported `/api/capabilities` row. That is intentional: the UI supports only the exact 1B/3B/8B smoke rows without making a broad Llama-family claim.

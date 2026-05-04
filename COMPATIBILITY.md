@@ -1,6 +1,6 @@
 # Camelid Compatibility Matrix
 
-Last updated: 2026-05-03
+Last updated: 2026-05-04
 
 `COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
 

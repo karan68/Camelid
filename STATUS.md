@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-03
+Last updated: 2026-05-04
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -48,6 +48,21 @@ Recent work moved the exact-row release ledger in a narrow, evidence-backed way:
 - Llama 3 8B Q8_0 moved from groundwork-only to supported exact-row smoke after the long-timeout Ubuntu three-prompt 5-token parity run, API/frontend smoke, and bounded memory evidence aligned.
 
 Bottom line: the engineering seam and product surface now agree for exact 1B/3B/8B short chat/parity; the support language stays intentionally narrow.
+
+## Repo-health verification pass
+
+A fresh local repo-health pass ran on 2026-05-04 to keep the public tree and CI contract honest before heavier model work resumes.
+
+Verified locally on the current tree:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test --all-targets --all-features`
+- `cargo doc --no-deps --all-features`
+- `bash scripts/check-public-scrub.sh`
+- `cd frontend && npm ci && npm run build`
+
+Result: all of the above passed locally. The CI workflow was also tightened so the Rust job now enforces clippy and docs generation in addition to format and tests, keeping the GitHub gate aligned with the documented validation contract.
 
 ## Current support evidence
 
