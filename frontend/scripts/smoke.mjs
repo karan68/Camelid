@@ -289,7 +289,7 @@ if (expectWebUiChat) {
 }
 
 if (activeChatGate?.guardedLlamaEvaluation) {
-  console.log('ℹ exact tracked Llama evaluation row: WebUI chat is guarded but intentionally enabled for end-to-end validation')
+  console.log('ℹ exact guarded Llama evidence row: WebUI chat is guarded but intentionally enabled for end-to-end validation')
 } else if (guardedChatBypass) {
   console.log('ℹ allow-guarded-chat enabled: running one QA chat even though the active model is still outside the exact supported /api/capabilities contract row')
 }

@@ -19,7 +19,7 @@ The backend data hook is adapted for Camelid's current API surface:
 - normalizes loaded-model `general.file_type` values into GGUF quant labels (for example file type `7` → `Q8_0`) before comparing them to `/api/capabilities`, so loaded model cards get useful quant evidence without treating filenames as support claims
 - keeps the exact Llama 3.2 3B Instruct Q8_0 row visible as a supported exact-row smoke card, while still requiring the loaded local GGUF to match the exact supported 3B Q8_0 row before chat unlocks
 - sends non-streaming chat requests to `POST /v1/chat/completions`
-- blocks chat until `/v1/health` reports the selected `active_model_id` with `generation_ready: true` and `/api/capabilities` has an exact supported model/quant compatibility row; the Llama 3.2 1B/3B rows are supported only for the short local-chat smoke envelope
+- blocks chat until `/v1/health` reports the selected `active_model_id` with `generation_ready: true` and `/api/capabilities` has an exact supported model/quant compatibility row; the exact Llama 3.2 1B/3B Instruct Q8_0 plus Llama 3 8B Instruct Q8_0 rows are supported only for the short local-chat smoke envelope
 
 Server features Camelid does not expose yet are kept honest: catalog downloads, external-provider setup, planned/future/blocked quantization lanes, and unsupported or partial API parameters show disabled or typed-guardrail copy instead of pretending to work. The analytics view also treats conversation telemetry as usage only, not compatibility evidence. The UI mirrors the compatibility contract documented in `../COMPATIBILITY.md`; filenames, catalog metadata, saved browser paths, and prior usage are not treated as support evidence by themselves.
 
