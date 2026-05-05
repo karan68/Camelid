@@ -1150,6 +1150,9 @@ pub struct LlamaForwardMemoryTimings {
 pub struct LlamaLayerMemoryTimings {
     pub layer_index: usize,
     pub forward_passes: usize,
+    pub q8_file_reads: Q8_0FileReadStats,
+    #[serde(skip)]
+    q8_file_read_start: Q8_0FileReadStats,
     pub start: LlamaMemorySample,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_attention_norm: Option<LlamaMemorySample>,
@@ -1258,11 +1261,14 @@ pub enum LlamaSampler {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaGenerationStep {
     pub prompt_token_count: usize,
+    pub prefill_token_count: usize,
     pub next_token_id: u32,
     pub logits: CpuTensor,
     pub hidden_state: CpuTensor,
     pub output_norm_state: CpuTensor,
     pub timings: LlamaForwardTimings,
+    pub prefill_timings: LlamaForwardTimings,
+    pub first_token_timings: LlamaForwardTimings,
     pub sample: u128,
     pub diagnostics: Option<LlamaForwardDiagnostics>,
 }
@@ -1510,6 +1516,8 @@ impl LlamaInferenceSession {
         let mut output = None;
         let mut diagnostics = None;
         let mut timings = LlamaForwardTimings::default();
+        let mut prefill_timings = LlamaForwardTimings::default();
+        let mut first_token_timings = LlamaForwardTimings::default();
         for (idx, token_id) in token_ids.iter().enumerate() {
             let collect_step_diagnostics = collect_diagnostics && idx + 1 == token_ids.len();
             let compute_logits = idx + 1 == token_ids.len();
@@ -1519,6 +1527,11 @@ impl LlamaInferenceSession {
                 compute_logits,
             )?;
             timings.add_assign(&timed.timings);
+            if compute_logits {
+                first_token_timings.add_assign(&timed.timings);
+            } else {
+                prefill_timings.add_assign(&timed.timings);
+            }
             output = Some(timed.output);
             if let Some(step_diagnostics) = timed.diagnostics {
                 diagnostics = Some(step_diagnostics);
@@ -1534,11 +1547,14 @@ impl LlamaInferenceSession {
         let sample = sample_started.elapsed().as_micros();
         Ok(LlamaGenerationStep {
             prompt_token_count: token_ids.len(),
+            prefill_token_count: token_ids.len().saturating_sub(1),
             next_token_id,
             logits,
             hidden_state,
             output_norm_state,
             timings,
+            prefill_timings,
+            first_token_timings,
             sample,
             diagnostics,
         })
@@ -1588,8 +1604,12 @@ fn trace_forward_memory(phase: &str) {
             )
         });
 
+    let q8_reads = q8_0_file_read_stats();
+    let q8_file_read_mib = q8_reads.read_bytes as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "backendinference_forward_memory_trace phase={phase} rss_kib={rss_kib} free_like_pages={free_like_pages} free_like_mib={free_like_mib} throttled_pages={throttled_pages}"
+        "backendinference_forward_memory_trace phase={phase} rss_kib={rss_kib} free_like_pages={free_like_pages} free_like_mib={free_like_mib} throttled_pages={throttled_pages} q8_file_read_calls={} q8_file_read_bytes={} q8_file_read_mib={q8_file_read_mib:.2}",
+        q8_reads.read_calls,
+        q8_reads.read_bytes
     );
 }
 
@@ -1832,6 +1852,8 @@ impl LlamaLayerMemoryTimings {
         let mut memory = Self {
             layer_index,
             forward_passes: 1,
+            q8_file_reads: Q8_0FileReadStats::default(),
+            q8_file_read_start: q8_0_file_read_stats(),
             peak_rss_kib: None,
             peak_phase: None,
             start,
@@ -1931,6 +1953,10 @@ impl LlamaLayerMemoryTimings {
         });
     }
 
+    fn record_end(&mut self) {
+        self.q8_file_reads = q8_0_file_read_stats().saturating_delta_since(self.q8_file_read_start);
+    }
+
     fn record(
         &mut self,
         phase: &str,
@@ -1952,6 +1978,14 @@ impl LlamaLayerMemoryTimings {
 
     fn merge_assign(&mut self, other: &Self) {
         self.forward_passes += other.forward_passes;
+        self.q8_file_reads.read_calls = self
+            .q8_file_reads
+            .read_calls
+            .saturating_add(other.q8_file_reads.read_calls);
+        self.q8_file_reads.read_bytes = self
+            .q8_file_reads
+            .read_bytes
+            .saturating_add(other.q8_file_reads.read_bytes);
         self.after_attention_norm = other.after_attention_norm.clone();
         self.after_attention_q = other.after_attention_q.clone();
         self.after_attention_k = other.after_attention_k.clone();
@@ -2617,6 +2651,7 @@ fn forward_layer_timed(
     timings.ffn_residual = started.elapsed().as_micros();
     if let Some(memory) = &mut memory {
         memory.record_after_ffn_residual(capture_memory_sample(kv_cache));
+        memory.record_end();
     }
     trace_forward_layer_memory(layer_idx, "ffn_residual_done");
     timings.total = total_started.elapsed().as_micros();
@@ -3603,11 +3638,10 @@ fn matmul_rhs_transposed_with_precision(
         return matmul_rhs_transposed_q8_0_block_dot(input, weight, name);
     }
     if let Some(backing) = q8_0_reader_backing(weight, input_width)? {
-        let file = backing.file()?;
         let mut workspace = InferenceWorkspace::new(input_width);
         return matmul_rhs_transposed_q8_0_block_reader(
             input,
-            file.as_ref(),
+            backing,
             Q8BlockReader::new(backing.absolute_offset, backing.num_blocks),
             weight.dim(0)?,
             name,
@@ -3905,7 +3939,6 @@ fn output_projection_token_row(
         )));
     }
 
-    let file = backing.file()?;
     let blocks_per_row = hidden_width / Q8_0_BLOCK_VALUES;
     let row_block_start = token_index.checked_mul(blocks_per_row).ok_or_else(|| {
         BackendError::RuntimeShapeMismatch(
@@ -3920,16 +3953,19 @@ fn output_projection_token_row(
                 "output projection token row byte offset overflow".to_string(),
             )
         })?;
-    let mut dest = vec![0.0_f32; hidden_width];
-    let reader = Q8BlockReader::new(row_offset, blocks_per_row);
-    for local_block_idx in 0..blocks_per_row {
-        reader
-            .dequantize_block_to_slice(&file, local_block_idx, &mut dest)
-            .map_err(|err| {
-                BackendError::InvalidTensorData(format!(
-                    "output projection diagnostics failed to decode q8_0 token row {token_index} block {local_block_idx}: {err}",
-                ))
-            })?;
+    let row_bytes_len = blocks_per_row
+        .checked_mul(Q8BlockReader::BLOCK_SIZE_BYTES)
+        .ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "output projection token row byte length overflow".to_string(),
+            )
+        })?;
+    let mut row_bytes = vec![0_u8; row_bytes_len];
+    backing.read_exact_at_cached(&mut row_bytes, row_offset)?;
+    let mut dest = Vec::with_capacity(hidden_width);
+    for block in row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES) {
+        let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        dest.extend(block[2..].iter().map(|q| scale * f32::from(*q as i8)));
     }
     Ok(dest)
 }
@@ -3982,15 +4018,8 @@ fn output_projection_q8_0_reconstructed_logit(
                 "output projection q8_0 diagnostic row byte length overflow".to_string(),
             )
         })?;
-    let file = backing.file()?;
     let mut row_bytes = vec![0_u8; row_bytes_len];
-    file.as_ref()
-        .read_exact_at(&mut row_bytes, row_offset)
-        .map_err(|err| {
-            BackendError::InvalidTensorData(format!(
-                "output projection q8_0 diagnostic failed to read token row {token_index}: {err}",
-            ))
-        })?;
+    backing.read_exact_at_cached(&mut row_bytes, row_offset)?;
     let quantized_output_norm = quantize_q8_0_row(&output_norm.data[..hidden_width]);
     Ok(Some(dot_q8_0_encoded_row(
         &quantized_output_norm.blocks,
@@ -4616,7 +4645,7 @@ fn q8_0_reader_backing(weight: &CpuTensor, input_width: usize) -> Result<Option<
 
 fn matmul_rhs_transposed_q8_0_block_reader(
     input: &CpuTensor,
-    file: &File,
+    backing: &Q8_0FileBacking,
     reader: Q8BlockReader,
     output_width: usize,
     name: impl Into<String>,
@@ -4678,13 +4707,7 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                         )
                     })?;
                 let chunk = &mut row_chunk[..chunk_bytes_len];
-                file.read_exact_at(chunk, chunk_offset).map_err(|err| {
-                    BackendError::InvalidTensorData(format!(
-                        "q8_0 block-reader failed to read output rows {output_idx}..{}: {err}",
-                        output_idx + rows_this_chunk
-                    ))
-                })?;
-                record_q8_0_file_read(chunk.len());
+                backing.read_exact_at_cached(chunk, chunk_offset)?;
                 let output_end = out_start + output_idx + rows_this_chunk;
                 let output_chunk = &mut output[out_start + output_idx..output_end];
                 if should_parallelize_linear_output(output_width) {
@@ -4960,7 +4983,6 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
 ) -> Result<()> {
     let input_width = input_row.len();
     let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
-    let file = backing.file()?;
     let row_bytes_len = blocks_per_row
         .checked_mul(Q8BlockReader::BLOCK_SIZE_BYTES)
         .ok_or_else(|| {
@@ -4994,15 +5016,7 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
                     )
                 })?;
             let chunk = &mut row_chunk[..chunk_bytes_len];
-            file.as_ref()
-                .read_exact_at(chunk, chunk_offset)
-                .map_err(|err| {
-                    BackendError::InvalidTensorData(format!(
-                    "q8_0 borrowed block-reader failed to read output rows {output_start}..{}: {err}",
-                    output_start + rows_this_chunk
-                ))
-                })?;
-            record_q8_0_file_read(chunk.len());
+            backing.read_exact_at_cached(chunk, chunk_offset)?;
             let output_end = output_start + rows_this_chunk;
             let output_chunk = &mut output[output_start..output_end];
             if should_parallelize_linear_output(output_width) {
@@ -6212,6 +6226,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn layer_memory_merge_accumulates_q8_file_reads() {
+        let mut first = LlamaLayerMemoryTimings::new(3, memory_sample(100, 0, 0));
+        first.q8_file_reads = Q8_0FileReadStats {
+            read_calls: 2,
+            read_bytes: 128,
+        };
+        let mut second = LlamaLayerMemoryTimings::new(3, memory_sample(105, 1, 1));
+        second.q8_file_reads = Q8_0FileReadStats {
+            read_calls: 5,
+            read_bytes: 512,
+        };
+
+        first.merge_assign(&second);
+
+        assert_eq!(first.forward_passes, 2);
+        assert_eq!(
+            first.q8_file_reads,
+            Q8_0FileReadStats {
+                read_calls: 7,
+                read_bytes: 640,
+            }
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn parses_linux_proc_status_rss_kib() {
@@ -6233,6 +6272,7 @@ mod tests {
             "BACKENDINFERENCE_PARALLEL_LINEAR",
             "BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS",
             "BACKENDINFERENCE_Q8_0_BLOCK_DOT",
+            "BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES",
             "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
             "BACKENDINFERENCE_PARALLEL_LINEAR",
             "BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS",
@@ -6614,12 +6654,12 @@ mod tests {
         .unwrap();
 
         let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
-        let file = temp_file.reopen().unwrap();
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 2);
         let reader = Q8BlockReader::new(0, 2);
         let mut workspace = InferenceWorkspace::new(32);
         let actual = matmul_rhs_transposed_q8_0_block_reader(
             &input,
-            &file,
+            &backing,
             reader,
             2,
             "actual",
@@ -6675,7 +6715,7 @@ mod tests {
         .unwrap();
         let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
 
-        let file = temp_file.reopen().unwrap();
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 5);
         let reader = Q8BlockReader::new(0, 5);
         let mut workspace = InferenceWorkspace::new(32);
         let pool = rayon::ThreadPoolBuilder::new()
@@ -6687,7 +6727,7 @@ mod tests {
                 assert!(should_parallelize_linear_output(5));
                 matmul_rhs_transposed_q8_0_block_reader(
                     &input,
-                    &file,
+                    &backing,
                     reader,
                     5,
                     "actual",
@@ -6748,6 +6788,32 @@ mod tests {
             .unwrap();
 
         assert_slice_close(&actual, &expected.data);
+    }
+
+    #[test]
+    fn q8_0_file_backing_cache_reuses_exact_chunk_reads() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "1024");
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        temp_file.write_all(&[1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        temp_file.flush().unwrap();
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 1);
+        let start = q8_0_file_read_stats();
+        let mut first = [0_u8; 4];
+        let mut second = [0_u8; 4];
+
+        backing.read_exact_at_cached(&mut first, 2).unwrap();
+        let after_first = q8_0_file_read_stats().saturating_delta_since(start);
+        backing.read_exact_at_cached(&mut second, 2).unwrap();
+        let after_second = q8_0_file_read_stats().saturating_delta_since(start);
+
+        assert_eq!(first, [3, 4, 5, 6]);
+        assert_eq!(second, first);
+        assert_eq!(after_first.read_calls, 1);
+        assert_eq!(after_first.read_bytes, 4);
+        assert_eq!(after_second, after_first);
     }
 
     #[test]
@@ -8278,6 +8344,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(step.prompt_token_count, 1);
+        assert_eq!(step.prefill_token_count, 0);
+        assert_eq!(step.prefill_timings.total, 0);
+        assert_eq!(
+            step.first_token_timings
+                .memory
+                .as_ref()
+                .unwrap()
+                .forward_passes,
+            1
+        );
         assert_eq!(step.next_token_id, 1);
         let memory = step
             .timings

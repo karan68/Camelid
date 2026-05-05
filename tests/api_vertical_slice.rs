@@ -1746,6 +1746,21 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     assert!(body["backendinference"]["timings_ms"]["generation"]["forward_total"].is_number());
     assert!(body["backendinference"]["timings_ms"]["generation"]["logits"].is_number());
     assert_eq!(
+        body["backendinference"]["timings_ms"]["prompt_evaluation"]["prompt_token_count"],
+        body["usage"]["prompt_tokens"]
+    );
+    assert!(
+        body["backendinference"]["timings_ms"]["prompt_evaluation"]["first_token"]["forward_total"]
+            .is_number()
+    );
+    assert_eq!(
+        body["backendinference"]["timings_ms"]["prompt_evaluation"]["first_token_layers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
         body["backendinference"]["timings_ms"]["layers"]
             .as_array()
             .unwrap()

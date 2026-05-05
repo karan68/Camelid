@@ -29,8 +29,8 @@ use crate::{
         diagnostic_rope_position_mode, diagnostic_square_linear_layout,
         diagnostic_zero_delta_selector, output_projection_diagnostics, DeltaZeroTarget,
         LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep, LlamaInferenceSession,
-        LlamaLayerMemoryTimings, LlamaLoadedWeights, LlamaOutputProjectionDiagnostic, LlamaSampler,
-        SamplingConfig,
+        LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
+        LlamaOutputProjectionDiagnostic, LlamaSampler, SamplingConfig,
     },
     model::{DenseLlamaDims, LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0Block, TensorStore},
@@ -444,9 +444,25 @@ pub struct GenerationTimings {
     pub session_create: u128,
     pub generate: u128,
     pub generation: GenerationPhaseTimings,
+    pub prompt_evaluation: PromptEvaluationTimings,
     pub layers: Vec<GenerationLayerTimings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::inference::LlamaForwardMemoryTimings>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct PromptEvaluationTimings {
+    pub prompt_token_count: usize,
+    pub prefill_token_count: usize,
+    pub first_token_evaluated: bool,
+    pub prefill: GenerationPhaseTimings,
+    pub first_token: GenerationPhaseTimings,
+    pub prefill_layers: Vec<GenerationLayerTimings>,
+    pub first_token_layers: Vec<GenerationLayerTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_memory: Option<crate::inference::LlamaForwardMemoryTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_token_memory: Option<crate::inference::LlamaForwardMemoryTimings>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -2250,11 +2266,14 @@ fn sample_cached_prompt_prefix(
         })?;
     Ok(LlamaGenerationStep {
         prompt_token_count: cached.token_ids.len(),
+        prefill_token_count: cached.token_ids.len().saturating_sub(1),
         next_token_id,
         logits: cached.logits.clone(),
         hidden_state: cached.hidden_state.clone(),
         output_norm_state: cached.output_norm_state.clone(),
         timings: LlamaForwardTimings::default(),
+        prefill_timings: LlamaForwardTimings::default(),
+        first_token_timings: LlamaForwardTimings::default(),
         sample: sample_started.elapsed().as_micros(),
         diagnostics: None,
     })
@@ -2415,6 +2434,9 @@ fn generate_token_ids(
         {
             store_prompt_prefix_cache(&prepared, &step);
         }
+        if generated.is_empty() && !reused_prompt_prefix {
+            prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        }
         forward_timings.add_assign(&step.timings);
         sample += step.sample;
         if top_logits.is_empty() {
@@ -2480,38 +2502,8 @@ fn generate_token_ids(
     }
 
     prepared.timings.generate = generation_started.elapsed().as_millis();
-    prepared.timings.generation = GenerationPhaseTimings {
-        forward_total: micros_to_ms(forward_timings.total),
-        embedding: micros_to_ms(forward_timings.embedding),
-        layers_total: micros_to_ms(forward_timings.layers_total),
-        final_norm: micros_to_ms(forward_timings.final_norm),
-        logits: micros_to_ms(forward_timings.logits),
-        sample: micros_to_ms(sample),
-    };
-    prepared.timings.layers = forward_timings
-        .layers
-        .into_iter()
-        .map(|layer| GenerationLayerTimings {
-            layer_index: layer.layer_index,
-            total: micros_to_ms(layer.total),
-            attention_norm: micros_to_ms(layer.attention_norm),
-            attention_q: micros_to_ms(layer.attention_q),
-            attention_k: micros_to_ms(layer.attention_k),
-            attention_v: micros_to_ms(layer.attention_v),
-            attention_rope: micros_to_ms(layer.attention_rope),
-            kv_cache_write: micros_to_ms(layer.kv_cache_write),
-            attention_context: micros_to_ms(layer.attention_context),
-            attention_output: micros_to_ms(layer.attention_output),
-            attention_residual: micros_to_ms(layer.attention_residual),
-            ffn_norm: micros_to_ms(layer.ffn_norm),
-            ffn_gate: micros_to_ms(layer.ffn_gate),
-            ffn_up: micros_to_ms(layer.ffn_up),
-            ffn_activation: micros_to_ms(layer.ffn_activation),
-            ffn_down: micros_to_ms(layer.ffn_down),
-            ffn_residual: micros_to_ms(layer.ffn_residual),
-            memory: layer.memory,
-        })
-        .collect();
+    prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
+    prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
     prepared.timings.memory = forward_timings.memory;
 
     Ok(GeneratedTokens {
@@ -2608,6 +2600,62 @@ fn top_logit_diagnostics(
         });
     }
     Ok(entries)
+}
+
+fn prompt_evaluation_timings_from_step(step: &LlamaGenerationStep) -> PromptEvaluationTimings {
+    PromptEvaluationTimings {
+        prompt_token_count: step.prompt_token_count,
+        prefill_token_count: step.prefill_token_count,
+        first_token_evaluated: step.prompt_token_count > 0,
+        prefill: generation_phase_timings_from_forward(&step.prefill_timings, 0),
+        first_token: generation_phase_timings_from_forward(&step.first_token_timings, step.sample),
+        prefill_layers: generation_layer_timings_from_forward(&step.prefill_timings.layers),
+        first_token_layers: generation_layer_timings_from_forward(&step.first_token_timings.layers),
+        prefill_memory: step.prefill_timings.memory.clone(),
+        first_token_memory: step.first_token_timings.memory.clone(),
+    }
+}
+
+fn generation_phase_timings_from_forward(
+    forward_timings: &LlamaForwardTimings,
+    sample: u128,
+) -> GenerationPhaseTimings {
+    GenerationPhaseTimings {
+        forward_total: micros_to_ms(forward_timings.total),
+        embedding: micros_to_ms(forward_timings.embedding),
+        layers_total: micros_to_ms(forward_timings.layers_total),
+        final_norm: micros_to_ms(forward_timings.final_norm),
+        logits: micros_to_ms(forward_timings.logits),
+        sample: micros_to_ms(sample),
+    }
+}
+
+fn generation_layer_timings_from_forward(
+    layers: &[LlamaLayerTimings],
+) -> Vec<GenerationLayerTimings> {
+    layers
+        .iter()
+        .map(|layer| GenerationLayerTimings {
+            layer_index: layer.layer_index,
+            total: micros_to_ms(layer.total),
+            attention_norm: micros_to_ms(layer.attention_norm),
+            attention_q: micros_to_ms(layer.attention_q),
+            attention_k: micros_to_ms(layer.attention_k),
+            attention_v: micros_to_ms(layer.attention_v),
+            attention_rope: micros_to_ms(layer.attention_rope),
+            kv_cache_write: micros_to_ms(layer.kv_cache_write),
+            attention_context: micros_to_ms(layer.attention_context),
+            attention_output: micros_to_ms(layer.attention_output),
+            attention_residual: micros_to_ms(layer.attention_residual),
+            ffn_norm: micros_to_ms(layer.ffn_norm),
+            ffn_gate: micros_to_ms(layer.ffn_gate),
+            ffn_up: micros_to_ms(layer.ffn_up),
+            ffn_activation: micros_to_ms(layer.ffn_activation),
+            ffn_down: micros_to_ms(layer.ffn_down),
+            ffn_residual: micros_to_ms(layer.ffn_residual),
+            memory: layer.memory.clone(),
+        })
+        .collect()
 }
 
 fn micros_to_ms(value: u128) -> f64 {

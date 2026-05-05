@@ -51,6 +51,9 @@ function summarizeResponse(path, payload, timings) {
   const layerSummaries = layers.map(layer => summarizeLayer(layer))
   const totals = sumLayerBuckets(layerSummaries)
   const generation = timings.generation || {}
+  const promptEvaluation = timings.prompt_evaluation || {}
+  const prefill = promptEvaluation.prefill || {}
+  const firstToken = promptEvaluation.first_token || {}
   const forwardTotal = numeric(generation.forward_total)
   const layersTotal = numeric(generation.layers_total)
   const generate = numeric(timings.generate)
@@ -78,6 +81,13 @@ function summarizeResponse(path, payload, timings) {
       final_norm: numeric(generation.final_norm),
       logits: numeric(generation.logits),
       sample: numeric(generation.sample),
+      prompt_eval_prompt_tokens: numeric(promptEvaluation.prompt_token_count),
+      prompt_eval_prefill_tokens: numeric(promptEvaluation.prefill_token_count),
+      prefill_forward_total: numeric(prefill.forward_total),
+      prefill_layers_total: numeric(prefill.layers_total),
+      first_token_forward_total: numeric(firstToken.forward_total),
+      first_token_layers_total: numeric(firstToken.layers_total),
+      first_token_logits: numeric(firstToken.logits),
     },
     layer_count: layers.length,
     buckets_ms: {

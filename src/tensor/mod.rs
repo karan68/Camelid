@@ -7,11 +7,13 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
 };
 
 const RETAIN_Q8_BLOCKS_ENV: &str = "BACKENDINFERENCE_RETAIN_Q8_0_BLOCKS";
+const Q8_FILE_CACHE_BYTES_ENV: &str = "BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES";
+const DEFAULT_Q8_FILE_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -119,6 +121,24 @@ impl Q8_0FileBacking {
 
     pub fn file_handle_cached(&self) -> bool {
         self.file_handle.get().is_some()
+    }
+
+    pub(crate) fn read_exact_at_cached(&self, out: &mut [u8], offset: u64) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        if q8_file_cache_get(&self.path, offset, out) {
+            return Ok(());
+        }
+        let file = self.file()?;
+        file.read_exact_at(out, offset)
+            .map_err(|source| BackendError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        record_q8_0_file_read(out.len());
+        q8_file_cache_insert(self.path.clone(), offset, out);
+        Ok(())
     }
 }
 
@@ -674,7 +694,6 @@ impl CpuTensor {
                 backing.num_blocks
             )));
         }
-        let file = backing.file()?;
         let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
         let mut row = vec![0_u8; row_bytes];
         let mut out = Vec::with_capacity(token_ids.len() * width);
@@ -690,12 +709,7 @@ impl CpuTensor {
                 )));
             }
             let offset = backing.absolute_offset + (token_idx * row_bytes) as u64;
-            file.read_exact_at(&mut row, offset)
-                .map_err(|source| BackendError::Io {
-                    path: backing.path.clone(),
-                    source,
-                })?;
-            record_q8_0_file_read(row.len());
+            backing.read_exact_at_cached(&mut row, offset)?;
             for block in row.chunks_exact(Q8_0_BLOCK_BYTES) {
                 let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
                 out.extend(block[2..].iter().map(|q| scale * f32::from(*q as i8)));
@@ -772,6 +786,7 @@ const DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
 
 static Q8_0_FILE_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static Q8_FILE_CACHE: OnceLock<Mutex<Q8FileCache>> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Q8_0FileReadStats {
@@ -797,6 +812,98 @@ pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
     Q8_0FileReadStats {
         read_calls: Q8_0_FILE_READ_CALLS.load(Ordering::Relaxed),
         read_bytes: Q8_0_FILE_READ_BYTES.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Debug, Default)]
+struct Q8FileCache {
+    entries: Vec<Q8FileCacheEntry>,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct Q8FileCacheEntry {
+    path: PathBuf,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
+fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
+    let capacity = q8_file_cache_capacity_bytes();
+    let Some(cache) = Q8_FILE_CACHE.get() else {
+        return false;
+    };
+    let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
+    cache.apply_capacity(capacity);
+    if capacity == 0 {
+        return false;
+    }
+    let Some(pos) = cache.entries.iter().position(|entry| {
+        entry.path == path && entry.offset == offset && entry.bytes.len() == out.len()
+    }) else {
+        return false;
+    };
+    let entry = cache.entries.remove(pos);
+    out.copy_from_slice(&entry.bytes);
+    cache.entries.push(entry);
+    true
+}
+
+fn q8_file_cache_insert(path: PathBuf, offset: u64, bytes: &[u8]) {
+    let capacity = q8_file_cache_capacity_bytes();
+    let cache = Q8_FILE_CACHE.get_or_init(|| Mutex::new(Q8FileCache::default()));
+    let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
+    cache.apply_capacity(capacity);
+    if capacity == 0 || bytes.len() > capacity {
+        return;
+    }
+    cache.insert(path, offset, bytes.to_vec(), capacity);
+}
+
+fn q8_file_cache_capacity_bytes() -> usize {
+    env::var(Q8_FILE_CACHE_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_Q8_FILE_CACHE_BYTES)
+}
+
+impl Q8FileCache {
+    fn apply_capacity(&mut self, capacity: usize) {
+        if capacity == 0 {
+            self.entries.clear();
+            self.bytes = 0;
+            return;
+        }
+        while self.bytes > capacity {
+            self.evict_oldest();
+        }
+    }
+
+    fn insert(&mut self, path: PathBuf, offset: u64, bytes: Vec<u8>, capacity: usize) {
+        if let Some(pos) = self.entries.iter().position(|entry| {
+            entry.path == path && entry.offset == offset && entry.bytes.len() == bytes.len()
+        }) {
+            let old = self.entries.remove(pos);
+            self.bytes = self.bytes.saturating_sub(old.bytes.len());
+        }
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        self.entries.push(Q8FileCacheEntry {
+            path,
+            offset,
+            bytes,
+        });
+        while self.bytes > capacity {
+            self.evict_oldest();
+        }
+    }
+
+    fn evict_oldest(&mut self) {
+        if self.entries.is_empty() {
+            self.bytes = 0;
+            return;
+        }
+        let entry = self.entries.remove(0);
+        self.bytes = self.bytes.saturating_sub(entry.bytes.len());
     }
 }
 
@@ -1089,7 +1196,33 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{f16_bits_to_f32, CpuTensor};
+    use super::{f16_bits_to_f32, q8_file_cache_get, q8_file_cache_insert, CpuTensor};
+    use crate::test_support::env_lock;
+
+    #[test]
+    fn q8_file_cache_serves_matching_chunks_and_evicts_to_capacity() {
+        let _env_guard = env_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "8");
+        let first_path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-first-{}",
+            std::process::id()
+        ));
+        let second_path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-second-{}",
+            std::process::id()
+        ));
+        q8_file_cache_insert(first_path.clone(), 10, b"abcdefgh");
+        let mut out = [0_u8; 8];
+        assert!(q8_file_cache_get(&first_path, 10, &mut out));
+        assert_eq!(&out, b"abcdefgh");
+
+        q8_file_cache_insert(second_path.clone(), 20, b"ijklmnop");
+        let mut evicted = [0_u8; 8];
+        assert!(!q8_file_cache_get(&first_path, 10, &mut evicted));
+        assert!(q8_file_cache_get(&second_path, 20, &mut evicted));
+        assert_eq!(&evicted, b"ijklmnop");
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+    }
 
     #[test]
     fn matmul_rhs_transposed_handles_single_row_vectors() {
