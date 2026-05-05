@@ -157,13 +157,24 @@ Fresh inspection on `main` at `c29fd71` keeps the SafeTensors lane firmly in doc
 
 Recommended next safe milestone remains unchanged: add a tiny source/readiness layer and fixture coverage for local HF directory detection plus `config.json` / SafeTensors header parsing, while keeping `/api/models/load` GGUF-compatible and `generation_ready=false` for any SafeTensors directory.
 
+## 2026-05-05 Current-Head Check
+
+Fresh inspection on `main` at `96719418a03b` after the latest public evidence/docs updates and guarded metadata-template renderer follow-up does not change the SafeTensors architecture recommendation. Camelid's release ledger is now much stronger for exact GGUF Q8_0 rows, but the code seam is still the same:
+
+- `src/api/mod.rs` still loads through `read_metadata`, stores `LoadedModel` as a GGUF path/file plus optional `LlamaModelConfig`, `LlamaTensorBinding`, and GGUF-derived tokenizer state, and reports capabilities from that runtime-ready GGUF shape. The guarded Llama 3 metadata-template renderer remains an opt-in GGUF metadata path, not a Hugging Face SafeTensors/source-manifest abstraction.
+- `src/model.rs` still has the correct expansion seams: keep `LlamaModelConfig::from_gguf` and `LlamaTensorBinding::bind` intact, then add HF config parsing and table-driven HF tensor-role binding beside them.
+- `src/tensor/mod.rs` now has mature GGUF retained/file-backed Q8_0 helpers and materialization-budget guardrails. Reuse that safety posture for SafeTensors descriptor/header inspection, but do not tie SafeTensors readiness to the GGUF Q8 execution fast path.
+- `src/tokenizer/mod.rs` remains GGUF-metadata driven for SPM and `llama-bpe`; Hugging Face `tokenizer.json` still needs its own adapter/parity fixture before it can affect `generation_ready`.
+
+The next SafeTensors implementation slice should therefore remain local, test-first, and non-generating: introduce `ModelSourceManifest` / `ModelSourceReadiness`, detect Hugging Face-style directories, parse `config.json` plus SafeTensors shard headers into descriptors, and keep `/api/models/load` behavior for existing GGUF files unchanged. `generation_ready` must stay false until tokenizer parity, tensor orientation, dtype decode, and a tiny one-token dense fixture all pass.
+
 ## Recommended Rust Crates / APIs
 
 - `safetensors` (`0.7.0` current crates.io default as of 2026-04-28): use `safetensors::SafeTensors::deserialize` / tensor views for safe header parsing and per-tensor byte slices. Prefer read-only mmap-backed byte storage for large files; copy/decode into Camelid CPU tensors only at the runtime boundary.
 - `memmap2`: mmap local `.safetensors` shards and avoid eagerly reading multi-GB weights into intermediate buffers.
 - `serde` / `serde_json`: parse Hugging Face sidecars (`config.json`, `tokenizer_config.json`, `generation_config.json`, `special_tokens_map.json`) into Camelid-owned structs.
 - `tokenizers` (`0.23.1` current crates.io default as of 2026-04-28): use behind a feature flag or adapter for `tokenizer.json` parity instead of stretching the current GGUF-only SPM parser to cover BPE/Unigram/WordPiece variants.
-- `hf-hub` (`0.5.0` current crates.io default as of 2026-04-28): optional future download/cache layer. Keep it out of the core loader initially; gated model access and license acceptance are product/approval-sensitive.
+- `hf-hub` (`1.0.0-rc.0` is the current crates.io default as of 2026-05-05): optional future download/cache layer. Keep it out of the core loader initially; gated model access and license acceptance are product/approval-sensitive, and an eventual adoption should pin deliberately rather than entering the first local-directory path by accident.
 - `half`: decode F16/BF16 tensors when SafeTensors dtype views are materialized into Camelid `f32` CPU tensors.
 
 Avoid pulling in a full inference framework just to read SafeTensors. Camelid should own the config mapping, tensor binding, and runtime semantics.
