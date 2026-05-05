@@ -2757,11 +2757,13 @@ fn render_llama3_metadata_subset_prompt(
     }
     let bos = tokenizer.token_text(tokenizer.special.bos)?;
     let trim_content = template.contains("| trim") || template.contains(".strip()");
+    let append_generation_prompt = template.contains("add_generation_prompt");
     let mut prompt = String::new();
     prompt.push_str(bos);
     prompt.push_str(&render_llama3_instruct_prompt_with_options(
         messages,
         trim_content,
+        append_generation_prompt,
     ));
     Some(RenderedPrompt {
         text: prompt,
@@ -2795,12 +2797,19 @@ fn render_tinyllama_marker_prompt(messages: &[ChatMessage], tokenizer: &Tokenize
 }
 
 fn render_llama3_instruct_prompt(messages: &[ChatMessage]) -> String {
-    render_llama3_instruct_prompt_with_options(messages, false)
+    render_llama3_instruct_prompt_with_options(
+        messages,
+        false,
+        messages
+            .last()
+            .is_none_or(|message| message.role.trim() != "assistant"),
+    )
 }
 
 fn render_llama3_instruct_prompt_with_options(
     messages: &[ChatMessage],
     trim_content: bool,
+    append_generation_prompt: bool,
 ) -> String {
     let mut prompt = String::new();
     for message in messages {
@@ -2814,10 +2823,7 @@ fn render_llama3_instruct_prompt_with_options(
         }
         prompt.push_str("<|eot_id|>");
     }
-    if messages
-        .last()
-        .is_none_or(|message| message.role.trim() != "assistant")
-    {
+    if append_generation_prompt {
         prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     }
     prompt
@@ -3405,6 +3411,35 @@ mod tests {
         assert_eq!(
             rendered.text,
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+    }
+
+    #[test]
+    fn metadata_subset_renderer_honors_add_generation_prompt_after_assistant_turn() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_SUBSET_TEMPLATE);
+
+        let rendered = render_chat_prompt_for_tokenization(
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "Complete cam".to_string(),
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: " elid ".to_string(),
+                },
+            ],
+            &tokenizer,
+        );
+
+        assert!(!rendered.add_special);
+        assert!(rendered.parse_special);
+        assert_eq!(
+            rendered.text,
+            "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nComplete cam<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nelid<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
     }
