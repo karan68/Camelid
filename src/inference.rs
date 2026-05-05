@@ -4382,7 +4382,7 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
     with_q8_0_file_reader_row_chunk(row_chunk_len, |row_chunk| {
         let mut output_start = 0usize;
         while output_start < output_width {
-            let rows_this_chunk = chunk_rows.min(output.len() - output_start);
+            let rows_this_chunk = chunk_rows.min(output_width - output_start);
             let chunk_bytes_len = row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch(
                     "q8_0 borrowed block-reader chunk byte count overflow".to_string(),
@@ -6069,6 +6069,25 @@ mod tests {
 
         assert_eq!(
             q8_0_block_int_dot_horizontal_sum(&weight, &input),
+            linear_sum
+        );
+    }
+
+    #[test]
+    fn q8_0_encoded_horizontal_sum_matches_linear_int_sum() {
+        let weight: [i8; Q8_0_BLOCK_VALUES] =
+            std::array::from_fn(|idx| (idx as i8).wrapping_mul(7).wrapping_sub(111));
+        let input: [i8; Q8_0_BLOCK_VALUES] =
+            std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(97));
+        let encoded_weight = weight.map(|quant| quant as u8);
+        let linear_sum: i32 = weight
+            .iter()
+            .zip(input.iter())
+            .map(|(w, x)| i32::from(*w) * i32::from(*x))
+            .sum();
+
+        assert_eq!(
+            q8_0_block_int_dot_horizontal_sum_encoded(&encoded_weight, &input),
             linear_sum
         );
     }
