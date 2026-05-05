@@ -106,11 +106,14 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "api_completion_and_chat_smoke_validated"
     );
     assert_eq!(llama32_1b["frontend_load_path_verified"], "validated");
-    assert_eq!(llama32_1b["tested_context"], "short_api_webui_smoke");
+    assert_eq!(
+        llama32_1b["tested_context"],
+        "short_api_webui_smoke_plus_first_512_context_pack"
+    );
     assert_eq!(llama32_1b["chat_template_renderer"], "compact");
     assert_eq!(
         llama32_1b["chat_template_shape_pack"],
-        "ready_to_run_on_validation_host"
+        "validated_bounded_pack"
     );
     assert_eq!(
         llama32_1b["chat_template_shape_pack_id"],
@@ -118,7 +121,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama32_1b["bounded_context_512_pack"],
-        "ready_to_run_on_validation_host"
+        "validated_bounded_pack"
     );
     assert_eq!(
         llama32_1b["bounded_context_512_pack_id"],
@@ -137,12 +140,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama32_3b["frontend_load_path_verified"], "validated");
     assert_eq!(
         llama32_3b["tested_context"],
-        "short_api_webui_smoke_with_broader_prompt_pack_parity"
+        "short_api_webui_smoke_with_broader_prompt_pack_parity_plus_first_512_context_pack"
     );
     assert_eq!(llama32_3b["chat_template_renderer"], "compact");
     assert_eq!(
         llama32_3b["chat_template_shape_pack"],
-        "ready_to_run_on_validation_host"
+        "validated_bounded_pack"
     );
     assert_eq!(
         llama32_3b["chat_template_shape_pack_id"],
@@ -150,7 +153,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama32_3b["bounded_context_512_pack"],
-        "ready_to_run_on_validation_host"
+        "validated_bounded_pack"
     );
     assert_eq!(
         llama32_3b["bounded_context_512_pack_id"],

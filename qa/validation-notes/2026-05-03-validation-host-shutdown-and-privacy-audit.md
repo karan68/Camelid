@@ -10,7 +10,7 @@ Tim intentionally shut down the canonical Ubuntu validation host.
 Until Tim explicitly says that host is back:
 
 - do **not** SSH into the validation host or any substitute remote validation box
-- treat promotion-grade Llama-family runtime reruns as blocked
+- treat promotion-grade exact-row runtime reruns as blocked
 - do **not** try to substitute local Mac llama-server or reference-runtime runs for that blocked lane unless Tim explicitly authorizes it
 
 That means current-head 1B/3B/8B parity, API, WebUI, and memory/perf reruns stay blocked by host shutdown even though the docs/frontend/API normalization work should continue locally.

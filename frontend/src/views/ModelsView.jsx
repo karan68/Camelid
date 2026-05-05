@@ -670,9 +670,15 @@ export default function ModelsView({
                     <div className={`pin-badge ${chatUnlocked ? 'ready' : 'warm'}`}>{chatUnlocked ? 'Chat unlockable' : supported ? 'Runtime still needed' : 'Chat blocked by row status'}</div>
                     {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B API/WebUI smoke passed</div>}
                     {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B compact + broader parity passed</div>}
+                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B first 512-context pack passed</div>}
+                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B compact template-shapes pack passed</div>}
+                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B unique-chat perf/RSS passed</div>}
                     {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B API/WebUI smoke passed</div>}
                     {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B broader 50-token parity passed</div>}
                     {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B five-prompt API smoke passed</div>}
+                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B first 512-context pack passed</div>}
+                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B compact template-shapes pack passed</div>}
+                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B unique-chat perf/RSS passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B API/WebUI smoke passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B clean-main timing/RSS smoke passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge warm">8B lazy-Q8 hot-path costs measured</div>}

@@ -2,7 +2,7 @@
 
 Date: 2026-05-04
 
-Tim reopened the approved Ubuntu validation lane for Camelid promotion-grade runtime evidence. Do not publish private host addresses, SSH commands, key paths, or local operator-only details in the public repo.
+The approved Ubuntu validation lane is reopened for Camelid promotion-grade exact-row runtime evidence. Do not publish private host addresses, SSH commands, key paths, or local operator-only details in the public repo.
 
 Execution guardrails:
 

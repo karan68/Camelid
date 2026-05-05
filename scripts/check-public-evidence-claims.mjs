@@ -76,11 +76,30 @@ function validateSummaryAgreement(bundleRel, manifest, summary) {
       compareRowField(bundleRel, rowId, manifestRow, summaryRow, 'max_tokens')
       compareRowField(bundleRel, rowId, manifestRow, summaryRow, 'max_resident_set_kib')
       if (typeof summaryRow.passed === 'boolean') {
-        const manifestPassed = manifestRow.prompt_tokens_match && manifestRow.generated_tokens_match && manifestRow.generated_text_match
+        const manifestPassed = rowPassed(manifestRow)
         if (manifestPassed !== summaryRow.passed) fail(bundleRel, `${rowId} summary passed=${summaryRow.passed} disagrees with manifest row checks`)
       }
     }
   }
+}
+
+function rowPassed(row) {
+  if (typeof row?.passed === 'boolean') return row.passed
+  if (
+    typeof row?.prompt_tokens_match === 'boolean' ||
+    typeof row?.generated_tokens_match === 'boolean' ||
+    typeof row?.generated_text_match === 'boolean'
+  ) {
+    return row.prompt_tokens_match === true && row.generated_tokens_match === true && row.generated_text_match === true
+  }
+  if (
+    typeof row?.prompt_tokens_all_match === 'boolean' ||
+    typeof row?.generated_tokens_all_match === 'boolean' ||
+    typeof row?.generated_text_all_match === 'boolean'
+  ) {
+    return row.prompt_tokens_all_match === true && row.generated_tokens_all_match === true && row.generated_text_all_match === true
+  }
+  return undefined
 }
 
 async function validateFourRowContext512(bundleRel, manifest, summary) {

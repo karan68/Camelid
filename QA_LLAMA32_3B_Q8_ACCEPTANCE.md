@@ -23,16 +23,21 @@ that claim and for naming the still-missing expansion evidence.
 Current state: the exact GGUF is now present at the expected model-dir path, Camelid metadata/API
 load evidence exists, the Ubuntu compact-header `hello` harness has prompt-token parity plus
 deterministic 1-token, 5-token, and bounded 50-token generation parity, the broader three-prompt
-50-token pack now matches llama.cpp, and reopened-lane API/WebUI smoke is captured for this exact
-row. The support claim is therefore **supported exact-row smoke** only. The blocker has moved from
-short-chat parity/API/WebUI acceptance to longer context, stronger performance/portability, and
-broader chat-template acceptance before any broader/full-support language.
+50-token pack now matches llama.cpp, reopened-lane API/WebUI smoke is captured, and bounded
+compact chat-template-shapes plus unique-chat perf/RSS envelopes are captured for this exact row.
+The support claim is therefore **supported exact-row smoke** only. The blocker has moved from
+short-chat parity/API/WebUI/template/perf acceptance to longer context beyond the checked 512 pack,
+production performance/portability, and arbitrary/Jinja template acceptance before any
+broader/full-support language.
 
 Durable public anchors:
 
 - `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_3b_instruct_q8_0.bundle.json` preserves the carry-forward exact-row smoke boundary.
 - `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json` is the current-head citation target for the compact parity, post-Q8-dot broader-pack handoff, and next context/template/perf tracks.
 - `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json` records the reopened-lane API + frontend smoke refresh for this exact row.
+- `qa/evidence-bundles/four-row-context-512-20260505T051510Z-head-b403884/manifest.json` records the first bounded 512-context pass for this exact row.
+- `qa/evidence-bundles/llama32-1b-3b-chat-template-shapes-20260505T060036Z-head-e9f28572e090/manifest.json` records bounded compact chat-template-shape coverage for this exact row.
+- `qa/evidence-bundles/llama32-1b-3b-unique-chat-perf-rss-20260505T061644Z-head-e9f28572e090/manifest.json` records the bounded unique-chat perf/RSS envelope for this exact row.
 
 ## Current blocker summary
 
@@ -40,7 +45,7 @@ Durable public anchors:
 - The latest file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike.
 - The Ubuntu compact-header `hello` harness now matches llama.cpp for prompt tokens plus deterministic 1-token, 5-token, and bounded 50-token generation.
 - The former broader JSON-shaped prompt blocker is resolved by the post-Q8-dot clean rerun. The public citation target is `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json`; the raw drill-down source path was `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json`. In that checked pack, `hello`, alpacas, and `answer with valid JSON for {"ok":true,"value":2}` all match llama.cpp for prompt tokens, generated token IDs, and generated text.
-- Therefore the row is no longer parity-blocked for the current three-prompt 50-token pack; remaining expansion gates are longer context, stronger performance/portability, and broader chat-template evidence.
+- Therefore the row is no longer parity-blocked for the current three-prompt 50-token pack, the first bounded 512-context pack, the bounded compact chat-template-shapes pack, or the bounded unique-chat perf/RSS envelope; remaining expansion gates are larger/broader context beyond the checked 512 pack, production performance/portability, and arbitrary/Jinja chat-template evidence.
 
 ## Disk and memory expectations
 
@@ -69,8 +74,8 @@ artifact paths.
 
 ## Current status
 
-Status: **accepted exact-row parity/API/WebUI smoke with broader three-prompt parity evidence**
+Status: **accepted exact-row parity/API/WebUI smoke with broader three-prompt parity, compact template-shape, bounded 512-context, and unique-chat perf/RSS evidence**
 
 The exact 3B artifact now exists, and the Ubuntu compact-header `hello` harness matches llama.cpp
 for prompt tokens plus deterministic 1-token, 5-token, and bounded 50-token generation. The former
-JSON-shaped broader prompt blocker is now fixed. The raw drill-down paths were `target/camelid-regression-q8dot-20260502T232633Z/llama32-3b-compact/summary.json` for the compact pack and `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json` for the broader three-prompt 50-token pack; the durable public citation target is `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json`, with API/WebUI freshness in `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`. The current work is to preserve that evidence and expand only after longer-context, performance/portability, and broader chat-template gates land.
+JSON-shaped broader prompt blocker is now fixed. The raw drill-down paths were `target/camelid-regression-q8dot-20260502T232633Z/llama32-3b-compact/summary.json` for the compact pack and `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json` for the broader three-prompt 50-token pack; the durable public citation target is `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json`, with API/WebUI freshness in `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`, first bounded 512-context evidence in `qa/evidence-bundles/four-row-context-512-20260505T051510Z-head-b403884/manifest.json`, bounded compact template-shape evidence in `qa/evidence-bundles/llama32-1b-3b-chat-template-shapes-20260505T060036Z-head-e9f28572e090/manifest.json`, and bounded unique-chat perf/RSS evidence in `qa/evidence-bundles/llama32-1b-3b-unique-chat-perf-rss-20260505T061644Z-head-e9f28572e090/manifest.json`. The current work is to preserve that evidence and expand only after larger-context, production performance/portability, and arbitrary/Jinja chat-template gates land.
