@@ -29,12 +29,12 @@ try {
   assert.match(stdout, /selected_layers=0,1/)
   assert.match(stdout, /first_stage=embedding/)
   assert.match(stdout, /last_stage=logits/)
-  assert.match(stdout, /stage_count=41/)
+  assert.match(stdout, /stage_count=43/)
 
   const trace = JSON.parse(await readFile(outputPath, 'utf8'))
   assert.equal(trace.schema, 'backendinference.forward-trace.v1')
   assert.deepEqual(trace.selected_layers, [0, 1])
-  assert.equal(trace.stage_count, 41)
+  assert.equal(trace.stage_count, 43)
   assert.deepEqual(trace.prompt_token_ids, [1, 529, 29989])
   assert.deepEqual(trace.generated_token_ids, [16301])
   assert.deepEqual(trace.source.known_good_token_ids, [29907])
@@ -61,9 +61,10 @@ try {
     'layers.0.attention_k_rope',
   ])
   assert.deepEqual(paths.slice(-4), ['final_hidden', 'final_norm', 'output_norm', 'logits'])
-  assert.equal(paths.indexOf('layers.1.attention_input'), 19)
+  assert.equal(paths.indexOf('layers.1.attention_input'), 20)
   assert.ok(paths.indexOf('layers.0.ffn_gate') < paths.indexOf('layers.0.ffn_activation'))
-  assert.ok(paths.indexOf('layers.0.attention_q_rope') < paths.indexOf('layers.0.attention_trace'))
+  assert.ok(paths.indexOf('layers.0.attention_q_rope') < paths.indexOf('layers.0.kv_cache_trace'))
+  assert.ok(paths.indexOf('layers.0.kv_cache_trace') < paths.indexOf('layers.0.attention_trace'))
   assert.ok(paths.indexOf('layers.0.attention_trace') < paths.indexOf('layers.0.attention_context'))
   assert.ok(paths.indexOf('layers.0.ffn_residual') < paths.indexOf('layers.1.attention_input'))
 
@@ -74,6 +75,13 @@ try {
   assert.equal(qStage.reconstruction.layout, 'descriptor')
   assert.equal(qStage.reconstruction.max_abs_delta, 0)
   assert.deepEqual(qStage.reconstruction.reported_max_abs_window, [0.1, -0.2])
+
+  const kvStage = trace.stages.find(stage => stage.path === 'layers.0.kv_cache_trace')
+  assert.equal(kvStage.kind, 'kv_cache_trace')
+  assert.equal(kvStage.kv_cache_trace.position_count, 18)
+  assert.equal(kvStage.kv_cache_trace.key_checksum, 12.5)
+  assert.equal(kvStage.kv_cache_trace.sampled_positions[0].position, 17)
+  assert.deepEqual(kvStage.kv_cache_trace.sampled_positions[0].value_first_values, [0.5, -0.6])
 
   const traceStage = trace.stages.find(stage => stage.path === 'layers.0.attention_trace')
   assert.equal(traceStage.kind, 'attention_trace')
@@ -105,7 +113,7 @@ try {
     '--json-out', oneLayerPath,
   ], { cwd: resolve(scriptDir, '..') })
   assert.match(oneLayerStdout, /selected_layers=1/)
-  assert.match(oneLayerStdout, /stage_count=23/)
+  assert.match(oneLayerStdout, /stage_count=24/)
   const oneLayerTrace = JSON.parse(await readFile(oneLayerPath, 'utf8'))
   assert.deepEqual(oneLayerTrace.selected_layers, [1])
   assert.ok(!oneLayerTrace.stages.some(stage => stage.path.startsWith('layers.0.')))
@@ -190,6 +198,7 @@ function layer(layerIndex) {
     attention_q_rope_reconstruction: reconstruction({ pairing: 'adjacent_even_odd', position: 17, effective_position: 17 }),
     attention_k_rope: stats([0.31 + layerIndex, -0.39]),
     attention_k_rope_reconstruction: reconstruction({ pairing: 'adjacent_even_odd', position: 17, effective_position: 17 }),
+    kv_cache_trace: kvCacheTrace(layerIndex),
     attention_trace: attentionTrace(),
     attention_context: stats([0.5 + layerIndex, -0.6]),
     attention_output: stats([0.07 + layerIndex, -0.08]),
@@ -310,6 +319,39 @@ function attentionTrace() {
             value_first_values: [0.5, -0.6],
           },
         ],
+      },
+    ],
+  }
+}
+
+function kvCacheTrace(layerIndex) {
+  return {
+    layer_index: layerIndex,
+    position_count: 18,
+    kv_head_count: 1,
+    head_dim: 2,
+    key_value_width: 2,
+    key_checksum: 12.5 + layerIndex,
+    value_checksum: -3.25 - layerIndex,
+    key_rms: 0.35,
+    value_rms: 0.42,
+    key_max_abs: 0.4,
+    key_max_abs_position: 17,
+    key_max_abs_index: 1,
+    value_max_abs: 0.6,
+    value_max_abs_position: 17,
+    value_max_abs_index: 1,
+    sampled_positions: [
+      {
+        position: 17,
+        key_checksum: 1.1 + layerIndex,
+        value_checksum: -0.7 - layerIndex,
+        key_rms: 0.35,
+        value_rms: 0.42,
+        key_max_abs: 0.4,
+        value_max_abs: 0.6,
+        key_first_values: [0.3 + layerIndex, -0.4],
+        value_first_values: [0.5, -0.6],
       },
     ],
   }

@@ -25,8 +25,9 @@ try {
     '--tolerance', '0.00001',
   ], { cwd: resolve(scriptDir, '..') })
   assert.match(stdout, /schema=backendinference\.forward-trace-invariants\.v1/)
-  assert.match(stdout, /stage_count=4/)
+  assert.match(stdout, /stage_count=5/)
   assert.match(stdout, /reconstruction_checked=2/)
+  assert.match(stdout, /kv_cache_traces_checked=1/)
   assert.match(stdout, /attention_heads_checked=1/)
   assert.match(stdout, /attention_top_probability_positions_checked=2/)
   assert.match(stdout, /output_projection_checked=1/)
@@ -39,6 +40,8 @@ try {
   assert.equal(report.first_failure, null)
   assert.equal(report.stats_checked, 3)
   assert.equal(report.reconstruction_checked, 2)
+  assert.equal(report.kv_cache_traces_checked, 1)
+  assert.equal(report.kv_cache_positions_checked, 2)
   assert.equal(report.attention_heads_checked, 1)
   assert.equal(report.attention_positions_checked, 2)
   assert.equal(report.attention_top_probability_positions_checked, 2)
@@ -46,7 +49,7 @@ try {
 
   const bad = trace()
   bad.stages[1].reconstruction.max_abs_delta = 0.02
-  bad.stages[2].attention_trace.heads[0].probability_sum = 0.80
+  bad.stages[3].attention_trace.heads[0].probability_sum = 0.80
   bad.output_projection[0].absolute_delta = 0.50
   const badPath = join(tempDir, 'bad-trace.json')
   const badReportPath = join(tempDir, 'bad-report.json')
@@ -81,12 +84,27 @@ try {
     await execFileAsync(process.execPath, [checkScript, '--input', countMismatchPath], { cwd: resolve(scriptDir, '..') })
   } catch (err) {
     countMismatchFailed = true
-    assert.match(err.stdout, /stage_count 5 does not match stages length 4/)
+    assert.match(err.stdout, /stage_count 6 does not match stages length 5/)
   }
   assert.equal(countMismatchFailed, true)
 
+  const badKvTrace = trace()
+  badKvTrace.stages[2].kv_cache_trace.key_value_width = 3
+  badKvTrace.stages[2].kv_cache_trace.sampled_positions[1].position = 0
+  const badKvPath = join(tempDir, 'bad-kv-trace.json')
+  await writeFile(badKvPath, `${JSON.stringify(badKvTrace, null, 2)}\n`)
+  let badKvFailed = false
+  try {
+    await execFileAsync(process.execPath, [checkScript, '--input', badKvPath], { cwd: resolve(scriptDir, '..') })
+  } catch (err) {
+    badKvFailed = true
+    assert.match(err.stdout, /failure_count=2/)
+    assert.match(err.stdout, /key_value_width: expected kv_head_count \* head_dim/)
+  }
+  assert.equal(badKvFailed, true)
+
   const badTopProbability = trace()
-  badTopProbability.stages[2].attention_trace.heads[0].top_probability_positions[1].probability = 0.70
+  badTopProbability.stages[3].attention_trace.heads[0].top_probability_positions[1].probability = 0.70
   const badTopPath = join(tempDir, 'bad-top-probability.json')
   await writeFile(badTopPath, `${JSON.stringify(badTopProbability, null, 2)}\n`)
   let badTopFailed = false
@@ -118,7 +136,7 @@ function trace() {
     dense_metadata: { square_linear_diagnostic_layout: 'transposed' },
     layer_count: 1,
     selected_layers: [0],
-    stage_count: 4,
+    stage_count: 5,
     stages: [
       {
         order: 0,
@@ -149,6 +167,13 @@ function trace() {
       },
       {
         order: 2,
+        path: 'layers.0.kv_cache_trace',
+        kind: 'kv_cache_trace',
+        layer_index: 0,
+        kv_cache_trace: kvCacheTrace(),
+      },
+      {
+        order: 3,
         path: 'layers.0.attention_trace',
         kind: 'attention_trace',
         layer_index: 0,
@@ -182,7 +207,7 @@ function trace() {
         },
       },
       {
-        order: 3,
+        order: 4,
         path: 'logits',
         kind: 'tensor_stats',
         stats: stats([8.0, 1.0]),
@@ -205,6 +230,44 @@ function trace() {
         top_negative_components: [{ dimension: 0, component: -0.25 }],
       },
     ],
+  }
+}
+
+function kvCacheTrace() {
+  return {
+    layer_index: 0,
+    position_count: 2,
+    kv_head_count: 1,
+    head_dim: 2,
+    key_value_width: 2,
+    key_checksum: 0.55,
+    value_checksum: -0.35,
+    key_rms: 0.22,
+    value_rms: 0.45,
+    key_max_abs: 0.3,
+    key_max_abs_position: 1,
+    key_max_abs_index: 1,
+    value_max_abs: 0.6,
+    value_max_abs_position: 1,
+    value_max_abs_index: 1,
+    sampled_positions: [
+      kvCachePosition(0, [0.10, 0.20], [0.30, 0.40]),
+      kvCachePosition(1, [0.20, -0.30], [0.50, -0.60]),
+    ],
+  }
+}
+
+function kvCachePosition(positionIndex, keyValues, valueValues) {
+  return {
+    position: positionIndex,
+    key_checksum: keyValues.reduce((sum, value, index) => sum + (index + 1) * value, 0),
+    value_checksum: valueValues.reduce((sum, value, index) => sum + (index + 1) * value, 0),
+    key_rms: Math.sqrt(keyValues.reduce((sum, value) => sum + value * value, 0) / keyValues.length),
+    value_rms: Math.sqrt(valueValues.reduce((sum, value) => sum + value * value, 0) / valueValues.length),
+    key_max_abs: Math.max(...keyValues.map(value => Math.abs(value))),
+    value_max_abs: Math.max(...valueValues.map(value => Math.abs(value))),
+    key_first_values: keyValues,
+    value_first_values: valueValues,
   }
 }
 

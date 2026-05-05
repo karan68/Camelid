@@ -2,7 +2,7 @@
 
 Scope: exact `llama32_1b_instruct_q8_0` row only; bounded `qa/prompt-packs/llama3-context-2048-smoke.json` on the canonical Ubuntu host.
 
-Checkout/host: clean temp checkout `/tmp/camelid-current-main-q8-watchdog-20260505T231544Z` on `ubuntu@54.69.75.77` from local `main` head `7efa98bd6b3e7b4468177b0ff5aca1dd1634bc67`. The standing `/home/ubuntu/work/Camelid` checkout was inspected first and left untouched because it is stale and dirty.
+Checkout/host: clean isolated temp checkout on the approved private Ubuntu validation lane from local `main` head `7efa98bd6b3e7b4468177b0ff5aca1dd1634bc67`. The standing validation checkout was inspected first and left untouched because it is stale and dirty.
 
 Local guardrail before remote:
 

@@ -912,6 +912,7 @@ pub struct LlamaLayerDiagnostics {
     pub attention_k_rope_reconstruction: LlamaRopeDiagnostic,
     pub attention_v: LlamaTensorStats,
     pub attention_v_reconstruction: LlamaLinearProjectionDiagnostic,
+    pub kv_cache_trace: LlamaKvCacheTrace,
     pub attention_trace: LlamaAttentionTrace,
     pub attention_context: LlamaTensorStats,
     pub attention_output: LlamaTensorStats,
@@ -928,6 +929,39 @@ pub struct LlamaLayerDiagnostics {
     pub ffn_output: LlamaTensorStats,
     pub ffn_down_reconstruction: LlamaLinearProjectionDiagnostic,
     pub ffn_residual: LlamaTensorStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaKvCacheTrace {
+    pub layer_index: usize,
+    pub position_count: usize,
+    pub kv_head_count: usize,
+    pub head_dim: usize,
+    pub key_value_width: usize,
+    pub key_checksum: f64,
+    pub value_checksum: f64,
+    pub key_rms: f32,
+    pub value_rms: f32,
+    pub key_max_abs: f32,
+    pub key_max_abs_position: usize,
+    pub key_max_abs_index: usize,
+    pub value_max_abs: f32,
+    pub value_max_abs_position: usize,
+    pub value_max_abs_index: usize,
+    pub sampled_positions: Vec<LlamaKvCachePositionTrace>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaKvCachePositionTrace {
+    pub position: usize,
+    pub key_checksum: f64,
+    pub value_checksum: f64,
+    pub key_rms: f32,
+    pub value_rms: f32,
+    pub key_max_abs: f32,
+    pub value_max_abs: f32,
+    pub key_first_values: Vec<f32>,
+    pub value_first_values: Vec<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -2626,6 +2660,9 @@ fn forward_layer_timed(
 
     let started = Instant::now();
     write_kv_cache(kv_cache, layer_idx, &k, &v)?;
+    let kv_cache_diagnostic = collect_diagnostics
+        .then(|| kv_cache_trace(kv_cache, layer_idx, kv_cache.position + 1))
+        .transpose()?;
     timings.kv_cache_write = started.elapsed().as_micros();
     if let Some(memory) = &mut memory {
         memory.record_after_kv_cache_write(capture_memory_sample(kv_cache));
@@ -2812,6 +2849,7 @@ fn forward_layer_timed(
             attention_v: attention_v_stats.expect("attention v diagnostics collected"),
             attention_v_reconstruction: attention_v_diagnostic
                 .expect("attention v reconstruction diagnostics collected"),
+            kv_cache_trace: kv_cache_diagnostic.expect("KV cache diagnostics collected"),
             attention_trace: attention_trace.expect("attention trace diagnostics collected"),
             attention_context: attention_context_stats
                 .expect("attention context diagnostics collected"),
@@ -6188,6 +6226,161 @@ fn write_kv_cache_batch(
     Ok(())
 }
 
+fn kv_cache_trace(
+    kv_cache: &LlamaKvCache,
+    layer_idx: usize,
+    position_count: usize,
+) -> Result<LlamaKvCacheTrace> {
+    if layer_idx >= kv_cache.plan.layer_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "layer index {layer_idx} is out of range for KV cache layer count {}",
+            kv_cache.plan.layer_count
+        )));
+    }
+    if position_count > kv_cache.plan.max_sequence_length {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "KV trace position count {position_count} exceeds cache capacity {}",
+            kv_cache.plan.max_sequence_length
+        )));
+    }
+    if position_count == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "KV trace requires at least one cached position".to_string(),
+        ));
+    }
+
+    let key_value_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
+    if key_value_width == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "KV trace requires non-empty key/value rows".to_string(),
+        ));
+    }
+    let mut key_sum_square = 0.0_f64;
+    let mut value_sum_square = 0.0_f64;
+    let mut key_checksum = 0.0_f64;
+    let mut value_checksum = 0.0_f64;
+    let mut key_max_abs = 0.0_f32;
+    let mut key_max_abs_position = 0;
+    let mut key_max_abs_index = 0;
+    let mut value_max_abs = 0.0_f32;
+    let mut value_max_abs_position = 0;
+    let mut value_max_abs_index = 0;
+
+    for position in 0..position_count {
+        let start = kv_cache_offset(kv_cache, layer_idx, position, 0);
+        let end = start + key_value_width;
+        for (idx, (&key, &value)) in kv_cache.keys[start..end]
+            .iter()
+            .zip(kv_cache.values[start..end].iter())
+            .enumerate()
+        {
+            if !key.is_finite() || !value.is_finite() {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+                )));
+            }
+            let ordinal = ((position * key_value_width) + idx + 1) as f64;
+            let key64 = key as f64;
+            let value64 = value as f64;
+            key_sum_square += key64 * key64;
+            value_sum_square += value64 * value64;
+            key_checksum += ordinal * key64;
+            value_checksum += ordinal * value64;
+            let key_abs = key.abs();
+            if key_abs > key_max_abs {
+                key_max_abs = key_abs;
+                key_max_abs_position = position;
+                key_max_abs_index = idx;
+            }
+            let value_abs = value.abs();
+            if value_abs > value_max_abs {
+                value_max_abs = value_abs;
+                value_max_abs_position = position;
+                value_max_abs_index = idx;
+            }
+        }
+    }
+
+    let value_count = (position_count * key_value_width) as f64;
+    let sampled_positions = sampled_attention_trace_positions(position_count)
+        .into_iter()
+        .map(|position| kv_cache_position_trace(kv_cache, layer_idx, position, key_value_width))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(LlamaKvCacheTrace {
+        layer_index: layer_idx,
+        position_count,
+        kv_head_count: kv_cache.plan.kv_head_count,
+        head_dim: kv_cache.plan.head_dim,
+        key_value_width,
+        key_checksum,
+        value_checksum,
+        key_rms: (key_sum_square / value_count).sqrt() as f32,
+        value_rms: (value_sum_square / value_count).sqrt() as f32,
+        key_max_abs,
+        key_max_abs_position,
+        key_max_abs_index,
+        value_max_abs,
+        value_max_abs_position,
+        value_max_abs_index,
+        sampled_positions,
+    })
+}
+
+fn kv_cache_position_trace(
+    kv_cache: &LlamaKvCache,
+    layer_idx: usize,
+    position: usize,
+    key_value_width: usize,
+) -> Result<LlamaKvCachePositionTrace> {
+    let start = kv_cache_offset(kv_cache, layer_idx, position, 0);
+    let end = start + key_value_width;
+    let key_slice = &kv_cache.keys[start..end];
+    let value_slice = &kv_cache.values[start..end];
+    let mut key_sum_square = 0.0_f64;
+    let mut value_sum_square = 0.0_f64;
+    let mut key_checksum = 0.0_f64;
+    let mut value_checksum = 0.0_f64;
+    let mut key_max_abs = 0.0_f32;
+    let mut value_max_abs = 0.0_f32;
+    for (idx, (&key, &value)) in key_slice.iter().zip(value_slice.iter()).enumerate() {
+        if !key.is_finite() || !value.is_finite() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV position trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+            )));
+        }
+        let ordinal = (idx + 1) as f64;
+        let key64 = key as f64;
+        let value64 = value as f64;
+        key_sum_square += key64 * key64;
+        value_sum_square += value64 * value64;
+        key_checksum += ordinal * key64;
+        value_checksum += ordinal * value64;
+        key_max_abs = key_max_abs.max(key.abs());
+        value_max_abs = value_max_abs.max(value.abs());
+    }
+    let width = key_value_width as f64;
+    Ok(LlamaKvCachePositionTrace {
+        position,
+        key_checksum,
+        value_checksum,
+        key_rms: (key_sum_square / width).sqrt() as f32,
+        value_rms: (value_sum_square / width).sqrt() as f32,
+        key_max_abs,
+        value_max_abs,
+        key_first_values: key_slice
+            .iter()
+            .take(TENSOR_CHECKPOINT_SAMPLE)
+            .copied()
+            .collect(),
+        value_first_values: value_slice
+            .iter()
+            .take(TENSOR_CHECKPOINT_SAMPLE)
+            .copied()
+            .collect(),
+    })
+}
+
 fn copy_to_f16_kv_cache_storage(dest: &mut [f32], source: &[f32]) {
     debug_assert_eq!(dest.len(), source.len());
     for (dest_value, source_value) in dest.iter_mut().zip(source.iter().copied()) {
@@ -9156,6 +9349,22 @@ mod tests {
         assert_slice_close(&layer.attention_q_rope.checkpoint.first_values, &[1.0, 1.0]);
         assert_slice_close(&layer.attention_k_rope.checkpoint.first_values, &[1.0, 1.0]);
         assert_slice_close(&layer.attention_v.checkpoint.first_values, &[0.5, 0.5]);
+        assert_eq!(layer.kv_cache_trace.layer_index, 0);
+        assert_eq!(layer.kv_cache_trace.position_count, 1);
+        assert_eq!(layer.kv_cache_trace.key_value_width, 2);
+        assert_close(layer.kv_cache_trace.key_checksum as f32, 3.0);
+        assert_close(layer.kv_cache_trace.value_checksum as f32, 1.5);
+        assert_close(layer.kv_cache_trace.key_rms, 1.0);
+        assert_close(layer.kv_cache_trace.value_rms, 0.5);
+        assert_eq!(layer.kv_cache_trace.sampled_positions.len(), 1);
+        assert_slice_close(
+            &layer.kv_cache_trace.sampled_positions[0].key_first_values,
+            &[1.0, 1.0],
+        );
+        assert_slice_close(
+            &layer.kv_cache_trace.sampled_positions[0].value_first_values,
+            &[0.5, 0.5],
+        );
         assert_slice_close(
             &layer.attention_context.checkpoint.first_values,
             &[0.5, 0.5],
@@ -9236,7 +9445,7 @@ mod tests {
         clear_dense_diagnostic_env();
 
         let config = LlamaModelConfig {
-            context_length: 8,
+            context_length: 12,
             embedding_length: 2,
             block_count: 1,
             feed_forward_length: 2,
@@ -9325,25 +9534,27 @@ mod tests {
             }],
         });
 
+        let prompt = [0, 1, 2, 3, 0, 1, 2];
+
         std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "1");
         let mut sequential = LlamaInferenceSession::new(config.clone(), weights.clone()).unwrap();
         let sequential_step = sequential
             .generate_next_token_with_history_diagnostics(
-                &[0, 1, 2],
+                &prompt,
                 LlamaSampler::Greedy,
-                &[0, 1, 2],
+                &prompt,
                 false,
             )
             .unwrap();
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "8");
+        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "2");
         std::env::set_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS", "1");
         let mut chunked = LlamaInferenceSession::new(config, weights).unwrap();
         let chunked_step = chunked
             .generate_next_token_with_history_diagnostics(
-                &[0, 1, 2],
+                &prompt,
                 LlamaSampler::Greedy,
-                &[0, 1, 2],
+                &prompt,
                 false,
             )
             .unwrap();
@@ -9353,26 +9564,27 @@ mod tests {
             .memory
             .as_ref()
             .expect("chunked prefill records structured memory timings");
-        assert_eq!(prefill_memory.forward_passes, 1);
+        assert_eq!(prefill_memory.forward_passes, 3);
         assert_eq!(prefill_memory.layers.len(), 1);
-        assert_eq!(prefill_memory.layers[0].forward_passes, 1);
-        assert_eq!(prefill_memory.end.as_ref().unwrap().kv_cache_position, 2);
-        let layer_memory = &prefill_memory.layers[0];
-        assert!(layer_memory.after_attention_norm.is_some());
-        assert!(layer_memory.after_attention_q.is_some());
-        assert!(layer_memory.after_attention_k.is_some());
-        assert!(layer_memory.after_attention_rope.is_some());
-        assert!(layer_memory.after_attention_v.is_some());
-        assert!(layer_memory.after_kv_cache_write.is_some());
-        assert!(layer_memory.after_attention_context.is_some());
-        assert!(layer_memory.after_attention_output.is_some());
-        assert!(layer_memory.after_attention_residual.is_some());
-        assert!(layer_memory.after_ffn_norm.is_some());
-        assert!(layer_memory.after_ffn_activation.is_some());
-        assert!(layer_memory.after_ffn_down.is_some());
-        assert!(layer_memory.after_ffn_residual.is_some());
+        assert_eq!(prefill_memory.end.as_ref().unwrap().kv_cache_position, 6);
+        for layer_memory in &prefill_memory.layers {
+            assert_eq!(layer_memory.forward_passes, 3);
+            assert!(layer_memory.after_attention_norm.is_some());
+            assert!(layer_memory.after_attention_q.is_some());
+            assert!(layer_memory.after_attention_k.is_some());
+            assert!(layer_memory.after_attention_rope.is_some());
+            assert!(layer_memory.after_attention_v.is_some());
+            assert!(layer_memory.after_kv_cache_write.is_some());
+            assert!(layer_memory.after_attention_context.is_some());
+            assert!(layer_memory.after_attention_output.is_some());
+            assert!(layer_memory.after_attention_residual.is_some());
+            assert!(layer_memory.after_ffn_norm.is_some());
+            assert!(layer_memory.after_ffn_activation.is_some());
+            assert!(layer_memory.after_ffn_down.is_some());
+            assert!(layer_memory.after_ffn_residual.is_some());
+            assert_eq!(layer_memory.q8_file_reads, Q8_0FileReadStats::default());
+        }
         assert_eq!(prefill_memory.q8_file_reads, Q8_0FileReadStats::default());
-        assert_eq!(layer_memory.q8_file_reads, Q8_0FileReadStats::default());
 
         assert_eq!(chunked_step.next_token_id, sequential_step.next_token_id);
         assert_slice_close(&chunked_step.logits.data, &sequential_step.logits.data);

@@ -102,6 +102,7 @@ function buildStages(dense, layers) {
   const stages = []
   const addStats = (pathName, stats, extra = {}) => stages.push(stage(pathName, 'tensor_stats', { ...extra, stats: compactStats(stats) }))
   const addTrace = (pathName, trace, extra = {}) => stages.push(stage(pathName, 'attention_trace', { ...extra, attention_trace: compactAttentionTrace(trace) }))
+  const addKvTrace = (pathName, trace, extra = {}) => stages.push(stage(pathName, 'kv_cache_trace', { ...extra, kv_cache_trace: compactKvCacheTrace(trace) }))
   const addReconstruction = (pathName, reconstruction, extra = {}) => stages.push(stage(pathName, 'reconstruction', { ...extra, reconstruction: compactReconstruction(reconstruction) }))
 
   addStats('embedding', dense.embedding)
@@ -116,6 +117,7 @@ function buildStages(dense, layers) {
     addStats(`layers.${layerIndex}.attention_v`, layer.attention_v, { ...layerExtra, reconstruction: compactReconstruction(layer.attention_v_reconstruction) })
     addStats(`layers.${layerIndex}.attention_q_rope`, layer.attention_q_rope, { ...layerExtra, reconstruction: compactReconstruction(layer.attention_q_rope_reconstruction) })
     addStats(`layers.${layerIndex}.attention_k_rope`, layer.attention_k_rope, { ...layerExtra, reconstruction: compactReconstruction(layer.attention_k_rope_reconstruction) })
+    addKvTrace(`layers.${layerIndex}.kv_cache_trace`, layer.kv_cache_trace, layerExtra)
     addTrace(`layers.${layerIndex}.attention_trace`, layer.attention_trace, layerExtra)
     addStats(`layers.${layerIndex}.attention_context`, layer.attention_context, layerExtra)
     addStats(`layers.${layerIndex}.attention_output`, layer.attention_output, { ...layerExtra, reconstruction: compactReconstruction(layer.attention_output_reconstruction) })
@@ -242,6 +244,38 @@ function compactAttentionTrace(trace) {
         qk_products_max_abs_window: numericArray(position.qk_products_max_abs_window),
         value_first_values: numericArray(position.value_first_values),
       })),
+    })),
+  }
+}
+
+function compactKvCacheTrace(trace) {
+  if (!trace) return null
+  return {
+    layer_index: integerOrNull(trace.layer_index),
+    position_count: integerOrNull(trace.position_count),
+    kv_head_count: integerOrNull(trace.kv_head_count),
+    head_dim: integerOrNull(trace.head_dim),
+    key_value_width: integerOrNull(trace.key_value_width),
+    key_checksum: numberOrNull(trace.key_checksum),
+    value_checksum: numberOrNull(trace.value_checksum),
+    key_rms: numberOrNull(trace.key_rms),
+    value_rms: numberOrNull(trace.value_rms),
+    key_max_abs: numberOrNull(trace.key_max_abs),
+    key_max_abs_position: integerOrNull(trace.key_max_abs_position),
+    key_max_abs_index: integerOrNull(trace.key_max_abs_index),
+    value_max_abs: numberOrNull(trace.value_max_abs),
+    value_max_abs_position: integerOrNull(trace.value_max_abs_position),
+    value_max_abs_index: integerOrNull(trace.value_max_abs_index),
+    sampled_positions: (trace.sampled_positions ?? []).map(position => ({
+      position: integerOrNull(position.position),
+      key_checksum: numberOrNull(position.key_checksum),
+      value_checksum: numberOrNull(position.value_checksum),
+      key_rms: numberOrNull(position.key_rms),
+      value_rms: numberOrNull(position.value_rms),
+      key_max_abs: numberOrNull(position.key_max_abs),
+      value_max_abs: numberOrNull(position.value_max_abs),
+      key_first_values: numericArray(position.key_first_values),
+      value_first_values: numericArray(position.value_first_values),
     })),
   }
 }

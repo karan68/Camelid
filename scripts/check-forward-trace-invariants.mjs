@@ -22,6 +22,8 @@ if (Number.isInteger(root.stage_count) && root.stage_count !== stages.length) {
 
 let statsChecked = 0
 let reconstructionChecked = 0
+let kvCacheTracesChecked = 0
+let kvCachePositionsChecked = 0
 let attentionHeadsChecked = 0
 let attentionPositionsChecked = 0
 let attentionTopProbabilityPositionsChecked = 0
@@ -45,6 +47,14 @@ for (let index = 0; index < stages.length; index += 1) {
   if (stage?.residual_delta) {
     reconstructionChecked += 1
     checkReconstruction(stage.residual_delta, `${stagePath}.residual_delta`, tolerance, failures)
+  }
+  if (stage?.kv_cache_trace) {
+    if (Number.isInteger(stage?.layer_index) && Number.isInteger(stage.kv_cache_trace?.layer_index) && stage.layer_index !== stage.kv_cache_trace.layer_index) {
+      failures.push(failure(`${stagePath}.kv_cache_trace.layer_index`, 'expected stage layer_index to match KV trace layer_index'))
+    }
+    const counts = checkKvCacheTrace(stage.kv_cache_trace, `${stagePath}.kv_cache_trace`, failures)
+    kvCacheTracesChecked += 1
+    kvCachePositionsChecked += counts.positions
   }
   if (stage?.attention_trace) {
     const counts = checkAttentionTrace(stage.attention_trace, `${stagePath}.attention_trace`, tolerance, failures)
@@ -77,6 +87,8 @@ const report = {
   stage_count: stages.length,
   stats_checked: statsChecked,
   reconstruction_checked: reconstructionChecked,
+  kv_cache_traces_checked: kvCacheTracesChecked,
+  kv_cache_positions_checked: kvCachePositionsChecked,
   attention_heads_checked: attentionHeadsChecked,
   attention_positions_checked: attentionPositionsChecked,
   attention_top_probability_positions_checked: attentionTopProbabilityPositionsChecked,
@@ -96,6 +108,7 @@ console.log(`schema=${report.schema}`)
 console.log(`source=${inputPath}`)
 console.log(`stage_count=${report.stage_count}`)
 console.log(`reconstruction_checked=${report.reconstruction_checked}`)
+console.log(`kv_cache_traces_checked=${report.kv_cache_traces_checked}`)
 console.log(`attention_heads_checked=${report.attention_heads_checked}`)
 console.log(`attention_top_probability_positions_checked=${report.attention_top_probability_positions_checked}`)
 console.log(`output_projection_checked=${report.output_projection_checked}`)
@@ -155,6 +168,63 @@ function checkReconstruction(reconstruction, basePath, toleranceValue, out) {
   compareArrays(reconstruction.reconstructed_reported_max_abs_window, reconstruction.reported_max_abs_window, toleranceValue, `${basePath}.reported_max_abs_window`, out)
   compareArrays(reconstruction.reconstructed_output_first_values, reconstruction.reported_output_first_values, toleranceValue, `${basePath}.output_first_values`, out)
   compareArrays(reconstruction.reconstructed_output_window, reconstruction.reported_output_window, toleranceValue, `${basePath}.output_window`, out)
+}
+
+function checkKvCacheTrace(trace, basePath, out) {
+  for (const key of ['key_checksum', 'value_checksum', 'key_rms', 'value_rms', 'key_max_abs', 'value_max_abs']) {
+    checkFinite(trace?.[key], `${basePath}.${key}`, out)
+  }
+  for (const key of ['layer_index', 'position_count', 'kv_head_count', 'head_dim', 'key_value_width', 'key_max_abs_position', 'key_max_abs_index', 'value_max_abs_position', 'value_max_abs_index']) {
+    if (!Number.isInteger(trace?.[key]) || trace[key] < 0) out.push(failure(`${basePath}.${key}`, 'expected non-negative integer'))
+  }
+  if (Number.isInteger(trace?.position_count) && trace.position_count <= 0) out.push(failure(`${basePath}.position_count`, 'expected positive position_count'))
+  if (Number.isInteger(trace?.kv_head_count) && trace.kv_head_count <= 0) out.push(failure(`${basePath}.kv_head_count`, 'expected positive kv_head_count'))
+  if (Number.isInteger(trace?.head_dim) && trace.head_dim <= 0) out.push(failure(`${basePath}.head_dim`, 'expected positive head_dim'))
+  if (
+    Number.isInteger(trace?.kv_head_count)
+    && Number.isInteger(trace?.head_dim)
+    && Number.isInteger(trace?.key_value_width)
+    && trace.key_value_width !== trace.kv_head_count * trace.head_dim
+  ) {
+    out.push(failure(`${basePath}.key_value_width`, 'expected kv_head_count * head_dim'))
+  }
+  for (const key of ['key_max_abs_position', 'value_max_abs_position']) {
+    if (Number.isInteger(trace?.[key]) && Number.isInteger(trace?.position_count) && trace[key] >= trace.position_count) {
+      out.push(failure(`${basePath}.${key}`, 'expected position within trace.position_count'))
+    }
+  }
+  for (const key of ['key_max_abs_index', 'value_max_abs_index']) {
+    if (Number.isInteger(trace?.[key]) && Number.isInteger(trace?.key_value_width) && trace[key] >= trace.key_value_width) {
+      out.push(failure(`${basePath}.${key}`, 'expected index within key_value_width'))
+    }
+  }
+
+  if (!Array.isArray(trace?.sampled_positions)) out.push(failure(`${basePath}.sampled_positions`, 'expected sampled_positions array'))
+  if (Array.isArray(trace?.sampled_positions) && trace.sampled_positions.length === 0) out.push(failure(`${basePath}.sampled_positions`, 'expected at least one sampled position'))
+
+  let positions = 0
+  let previousPosition = -1
+  for (const [index, position] of (trace?.sampled_positions ?? []).entries()) {
+    positions += 1
+    const positionPath = `${basePath}.sampled_positions[${index}]`
+    if (!Number.isInteger(position?.position) || position.position < 0) out.push(failure(`${positionPath}.position`, 'expected non-negative integer position'))
+    if (Number.isInteger(position?.position) && Number.isInteger(trace?.position_count) && position.position >= trace.position_count) {
+      out.push(failure(`${positionPath}.position`, 'expected sampled position within trace.position_count'))
+    }
+    if (Number.isInteger(position?.position) && position.position <= previousPosition) out.push(failure(`${positionPath}.position`, 'expected sampled positions to be strictly increasing'))
+    previousPosition = Number.isInteger(position?.position) ? position.position : previousPosition
+    for (const key of ['key_checksum', 'value_checksum', 'key_rms', 'value_rms', 'key_max_abs', 'value_max_abs']) {
+      checkFinite(position?.[key], `${positionPath}.${key}`, out)
+    }
+    checkFiniteArray(position?.key_first_values ?? [], `${positionPath}.key_first_values`, out)
+    checkFiniteArray(position?.value_first_values ?? [], `${positionPath}.value_first_values`, out)
+    for (const key of ['key_first_values', 'value_first_values']) {
+      if (Array.isArray(position?.[key]) && Number.isInteger(trace?.key_value_width) && position[key].length > trace.key_value_width) {
+        out.push(failure(`${positionPath}.${key}`, 'expected sample length within key_value_width'))
+      }
+    }
+  }
+  return { positions }
 }
 
 function checkAttentionTrace(trace, basePath, toleranceValue, out) {

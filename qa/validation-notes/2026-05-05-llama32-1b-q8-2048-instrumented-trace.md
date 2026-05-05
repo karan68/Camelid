@@ -2,7 +2,7 @@
 
 Scope: exact `llama32_1b_instruct_q8_0` row only; bounded `qa/prompt-packs/llama3-context-2048-smoke.json` on the canonical Ubuntu host.
 
-Checkout/host: isolated temp checkout `/tmp/camelid-q8-trace-20260505T225110Z` on `ubuntu@54.69.75.77` from the local current `main` worktree with the Q8 read/cache instrumentation patch applied. The standing `/home/ubuntu/work/Camelid` checkout was not used.
+Checkout/host: isolated temp checkout on the approved private Ubuntu validation lane from the local current `main` worktree with the Q8 read/cache instrumentation patch applied. The standing validation checkout was not used.
 
 Local guardrail before remote:
 
