@@ -12,6 +12,7 @@ Current public evidence map:
 - `llama3-8b-context-512-20260504T234625Z-head-58acf592345c/` closes only the first bounded 8B 512-context pack.
 - `llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/` closes only the bounded 8B compact chat-template-shapes pack.
 - `llama3-8b-api-webui-rss-clean-20260505T015843Z-head-aee469b9c13a/` is the clean-main exact 8B API/WebUI/RSS timing smoke for completion diagnostics; it does not widen support beyond the exact-row smoke envelope.
+- `llama3-8b-lazy-q8-hotpath-20260505T021411Z-head-723a665/` is the exact 8B retained-block lazy-Q8 hot-path cost probe; it is measurement evidence only, not a broader support/performance-portability promotion.
 
 Rules:
 - Commit only sanitized durable bundle content here.
