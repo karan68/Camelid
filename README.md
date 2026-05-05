@@ -48,7 +48,7 @@ Camelid’s public support boundary is intentionally narrow and exact-row.
 | Exact lane | Public status | What Camelid can honestly claim today |
 | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | **Supported current gate** | End-to-end parity-backed support for the current validated TinyLlama row, including broader parity, bounded template-shape checks, bounded 512-context coverage, and bounded backend RSS/perf sampling. |
-| Llama 3.2 1B Instruct Q8_0 | **Supported exact-row smoke** | Exact-row load, completions, chat completions, WebUI smoke, bounded prompt-pack parity, bounded template-shape checks, bounded unique-chat perf/RSS envelope, and bounded 512/1024-context packs. |
+| Llama 3.2 1B Instruct Q8_0 | **Supported exact-row smoke** | Exact-row load, completions, chat completions, WebUI smoke, bounded prompt-pack parity, bounded template-shape checks, bounded unique-chat perf/RSS envelope, and bounded 512/1024-context packs; the attempted 2048-context pack is blocked by first-token divergence and is not support. |
 | Llama 3.2 3B Instruct Q8_0 | **Supported exact-row smoke** | Exact-row load, completions, chat completions, WebUI smoke, bounded prompt-pack parity, bounded template-shape checks, bounded unique-chat perf/RSS envelope, and bounded 512/1024/2048-context packs. |
 | Llama 3 8B Instruct Q8_0 | **Supported exact-row smoke** | Exact-row load, completions, chat completions, WebUI smoke, bounded three-prompt parity, one bounded 512-context pack, one bounded compact chat-template-shapes pack, and bounded memory evidence. |
 

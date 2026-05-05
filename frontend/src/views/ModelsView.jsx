@@ -667,6 +667,7 @@ export default function ModelsView({
                     <div className={`pin-badge ${evidenceTrackTone(target.chat_template_shape_pack)}`}>template pack: {formatCapabilityStatus(target.chat_template_shape_pack || 'not_started')}</div>
                     <div className={`pin-badge ${evidenceTrackTone(target.bounded_context_512_pack)}`}>512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')}</div>
                     <div className={`pin-badge ${evidenceTrackTone(target.bounded_context_1024_pack)}`}>1024-context: {formatCapabilityStatus(target.bounded_context_1024_pack || 'not_started')}</div>
+                    <div className={`pin-badge ${evidenceTrackTone(target.bounded_context_2048_pack)}`}>2048-context: {formatCapabilityStatus(target.bounded_context_2048_pack || 'not_started')}</div>
                     <div className={`pin-badge ${evidenceTrackTone(target.performance_measured)}`}>perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</div>
                     <div className={`pin-badge ${chatUnlocked ? 'ready' : 'warm'}`}>{chatUnlocked ? 'Chat unlockable' : supported ? 'Runtime still needed' : 'Chat blocked by row status'}</div>
                     {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B API/WebUI smoke passed</div>}
