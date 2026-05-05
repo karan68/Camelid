@@ -855,16 +855,34 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
     if capacity == 0 {
         return false;
     }
-    let Some(pos) = cache.entries.iter().position(|entry| {
-        entry.path == path && entry.offset == offset && entry.bytes.len() == out.len()
-    }) else {
+    let Some(pos) = cache
+        .entries
+        .iter()
+        .position(|entry| q8_file_cache_entry_covers(entry, path, offset, out.len()))
+    else {
         return false;
     };
     let entry = cache.entries.remove(pos);
-    out.copy_from_slice(&entry.bytes);
+    let start = (offset - entry.offset) as usize;
+    out.copy_from_slice(&entry.bytes[start..start + out.len()]);
     cache.entries.push(entry);
     Q8_0_FILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
     true
+}
+
+fn q8_file_cache_entry_covers(
+    entry: &Q8FileCacheEntry,
+    path: &Path,
+    offset: u64,
+    len: usize,
+) -> bool {
+    let Some(request_end) = offset.checked_add(len as u64) else {
+        return false;
+    };
+    let Some(entry_end) = entry.offset.checked_add(entry.bytes.len() as u64) else {
+        return false;
+    };
+    entry.path == path && entry.offset <= offset && request_end <= entry_end
 }
 
 fn q8_file_cache_insert(path: PathBuf, offset: u64, bytes: &[u8]) {
@@ -1260,6 +1278,26 @@ mod tests {
         assert_eq!(after_second.cache_hits, 2);
         assert_eq!(after_second.cache_entries, 1);
         assert_eq!(after_second.cache_bytes, 8);
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn q8_file_cache_serves_subranges_from_retained_chunks() {
+        let _env_guard = env_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-subrange-{}",
+            std::process::id()
+        ));
+        q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
+
+        let start = q8_0_file_read_stats();
+        let mut out = [0_u8; 4];
+        assert!(q8_file_cache_get(&path, 104, &mut out));
+        let stats = q8_0_file_read_stats().saturating_delta_since(start);
+
+        assert_eq!(&out, b"efgh");
+        assert_eq!(stats.cache_hits, 1);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
     }
 

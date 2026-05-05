@@ -854,7 +854,14 @@ pub struct LlamaOutputProjectionDiagnostic {
     pub layout: &'static str,
     pub reported_logit: f32,
     pub reconstructed_logit: f32,
+    pub decoded_component_reconstructed_logit: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q8_direct_reconstructed_logit: Option<f32>,
     pub absolute_delta: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q8_direct_absolute_delta: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q8_direct_decoded_component_delta: Option<f32>,
     pub output_norm_rms: f32,
     pub output_row_rms: f32,
     pub cosine_similarity: f32,
@@ -4231,14 +4238,19 @@ impl EffectiveOutputProjectionRowLayout {
     }
 }
 
+struct OutputProjectionTokenRow {
+    values: Vec<f32>,
+    q8_0_row_bytes: Option<Vec<u8>>,
+}
+
 fn output_projection_token_row(
     output_weight: &CpuTensor,
     hidden_width: usize,
     token_index: usize,
     layout: EffectiveOutputProjectionRowLayout,
-) -> Result<Vec<f32>> {
+) -> Result<OutputProjectionTokenRow> {
     if !output_weight.data.is_empty() {
-        return Ok(match layout {
+        let values = match layout {
             EffectiveOutputProjectionRowLayout::DescriptorInputOutput => {
                 let output_row_width = output_weight.shape.dims[1];
                 (0..hidden_width)
@@ -4256,6 +4268,10 @@ fn output_projection_token_row(
                 })?;
                 output_weight.data[start..start + hidden_width].to_vec()
             }
+        };
+        return Ok(OutputProjectionTokenRow {
+            values,
+            q8_0_row_bytes: None,
         });
     }
 
@@ -4309,7 +4325,10 @@ fn output_projection_token_row(
         let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
         dest.extend(block[2..].iter().map(|q| scale * f32::from(*q as i8)));
     }
-    Ok(dest)
+    Ok(OutputProjectionTokenRow {
+        values: dest,
+        q8_0_row_bytes: Some(row_bytes),
+    })
 }
 
 fn output_projection_q8_0_reconstructed_logit(
@@ -4318,6 +4337,7 @@ fn output_projection_q8_0_reconstructed_logit(
     hidden_width: usize,
     token_index: usize,
     layout: EffectiveOutputProjectionRowLayout,
+    q8_0_row_bytes: Option<&[u8]>,
 ) -> Result<Option<f32>> {
     let Some(backing) = output_weight.q8_0_file_backing.as_ref() else {
         return Ok(None);
@@ -4340,19 +4360,6 @@ fn output_projection_q8_0_reconstructed_logit(
     }
 
     let blocks_per_row = hidden_width / Q8_0_BLOCK_VALUES;
-    let row_block_start = token_index.checked_mul(blocks_per_row).ok_or_else(|| {
-        BackendError::RuntimeShapeMismatch(
-            "output projection q8_0 diagnostic row block offset overflow".to_string(),
-        )
-    })?;
-    let row_offset = backing
-        .absolute_offset
-        .checked_add((row_block_start * Q8BlockReader::BLOCK_SIZE_BYTES) as u64)
-        .ok_or_else(|| {
-            BackendError::RuntimeShapeMismatch(
-                "output projection q8_0 diagnostic row byte offset overflow".to_string(),
-            )
-        })?;
     let row_bytes_len = blocks_per_row
         .checked_mul(Q8BlockReader::BLOCK_SIZE_BYTES)
         .ok_or_else(|| {
@@ -4360,12 +4367,37 @@ fn output_projection_q8_0_reconstructed_logit(
                 "output projection q8_0 diagnostic row byte length overflow".to_string(),
             )
         })?;
-    let mut row_bytes = vec![0_u8; row_bytes_len];
-    backing.read_exact_at_cached(&mut row_bytes, row_offset)?;
+    let mut owned_row_bytes = Vec::new();
+    let row_bytes = if let Some(row_bytes) = q8_0_row_bytes {
+        if row_bytes.len() != row_bytes_len {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "output projection q8_0 diagnostic supplied row bytes length {} does not match expected {row_bytes_len}",
+                row_bytes.len()
+            )));
+        }
+        row_bytes
+    } else {
+        let row_block_start = token_index.checked_mul(blocks_per_row).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "output projection q8_0 diagnostic row block offset overflow".to_string(),
+            )
+        })?;
+        let row_offset = backing
+            .absolute_offset
+            .checked_add((row_block_start * Q8BlockReader::BLOCK_SIZE_BYTES) as u64)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "output projection q8_0 diagnostic row byte offset overflow".to_string(),
+                )
+            })?;
+        owned_row_bytes.resize(row_bytes_len, 0_u8);
+        backing.read_exact_at_cached(&mut owned_row_bytes, row_offset)?;
+        &owned_row_bytes
+    };
     let quantized_output_norm = quantize_q8_0_row(&output_norm.data[..hidden_width]);
     Ok(Some(dot_q8_0_encoded_row(
         &quantized_output_norm.blocks,
-        &row_bytes,
+        row_bytes,
     )))
 }
 
@@ -4380,12 +4412,13 @@ fn output_projection_token_diagnostic(
 ) -> Result<LlamaOutputProjectionDiagnostic> {
     let token_index = token_id as usize;
     let output_row = output_projection_token_row(output_weight, hidden_width, token_index, layout)?;
-    let q8_reconstructed_logit = output_projection_q8_0_reconstructed_logit(
+    let q8_direct_reconstructed_logit = output_projection_q8_0_reconstructed_logit(
         output_norm,
         output_weight,
         hidden_width,
         token_index,
         layout,
+        output_row.q8_0_row_bytes.as_deref(),
     )?;
     let mut reconstructed_logit = 0.0f32;
     let mut norm_sum_sq = 0.0f32;
@@ -4400,7 +4433,7 @@ fn output_projection_token_diagnostic(
     let mut positive_component_sum = 0.0f32;
     let mut negative_component_sum = 0.0f32;
 
-    for (idx, row_value) in output_row.iter().enumerate().take(hidden_width) {
+    for (idx, row_value) in output_row.values.iter().enumerate().take(hidden_width) {
         let norm_value = output_norm.data[idx];
         let row_value = *row_value;
         let component = norm_value * row_value;
@@ -4461,8 +4494,9 @@ fn output_projection_token_diagnostic(
         .copied()
         .collect::<Vec<_>>();
 
-    if let Some(q8_reconstructed_logit) = q8_reconstructed_logit {
-        reconstructed_logit = q8_reconstructed_logit;
+    let decoded_component_reconstructed_logit = reconstructed_logit;
+    if let Some(q8_direct_reconstructed_logit) = q8_direct_reconstructed_logit {
+        reconstructed_logit = q8_direct_reconstructed_logit;
     }
 
     let output_norm_rms = (norm_sum_sq / hidden_width as f32).sqrt();
@@ -4479,7 +4513,13 @@ fn output_projection_token_diagnostic(
         layout: layout.label(),
         reported_logit,
         reconstructed_logit,
+        decoded_component_reconstructed_logit,
+        q8_direct_reconstructed_logit,
         absolute_delta: (reported_logit - reconstructed_logit).abs(),
+        q8_direct_absolute_delta: q8_direct_reconstructed_logit
+            .map(|value| (reported_logit - value).abs()),
+        q8_direct_decoded_component_delta: q8_direct_reconstructed_logit
+            .map(|value| (value - decoded_component_reconstructed_logit).abs()),
         output_norm_rms,
         output_row_rms,
         cosine_similarity,
@@ -8391,6 +8431,7 @@ mod tests {
     fn output_projection_diagnostics_support_q8_0_file_backed_token_major_rows() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
 
         let input_values = (0..32)
             .map(|idx| idx as f32 * 0.25 - 2.0)
@@ -8422,6 +8463,7 @@ mod tests {
         );
 
         let logits = output_projection_runtime(&input, &output_weight, "logits", false).unwrap();
+        let read_start = q8_0_file_read_stats();
         let diagnostics = output_projection_diagnostics(
             &input,
             &output_weight,
@@ -8432,10 +8474,29 @@ mod tests {
             None,
         )
         .unwrap();
+        let reads = q8_0_file_read_stats().saturating_delta_since(read_start);
 
         assert_eq!(diagnostics.len(), 2);
         assert_close(diagnostics[0].reconstructed_logit, logits.data[0]);
         assert_close(diagnostics[1].reconstructed_logit, logits.data[1]);
+        assert_close(
+            diagnostics[0].q8_direct_reconstructed_logit.unwrap(),
+            logits.data[0],
+        );
+        assert_close(
+            diagnostics[1].q8_direct_reconstructed_logit.unwrap(),
+            logits.data[1],
+        );
+        assert_eq!(diagnostics[0].q8_direct_absolute_delta, Some(0.0));
+        assert_eq!(diagnostics[1].q8_direct_absolute_delta, Some(0.0));
+        assert!(diagnostics[0]
+            .q8_direct_decoded_component_delta
+            .is_some_and(|delta| delta.is_finite()));
+        assert_eq!(reads.read_calls, 2);
+        assert_eq!(
+            reads.read_bytes,
+            (Q8BlockReader::BLOCK_SIZE_BYTES * 2) as u64
+        );
     }
 
     #[test]
