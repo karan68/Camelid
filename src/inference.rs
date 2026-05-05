@@ -4101,9 +4101,22 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                         output_idx + rows_this_chunk
                     ))
                 })?;
-                for (local_idx, row_bytes) in chunk.chunks_exact(row_bytes_len).enumerate() {
-                    output[out_start + output_idx + local_idx] =
-                        dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
+                let output_end = out_start + output_idx + rows_this_chunk;
+                let output_chunk = &mut output[out_start + output_idx..output_end];
+                if should_parallelize_linear_output(output_width) {
+                    output_chunk
+                        .par_iter_mut()
+                        .zip(chunk.par_chunks_exact(row_bytes_len))
+                        .for_each(|(out_value, row_bytes)| {
+                            *out_value = dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
+                        });
+                } else {
+                    for (out_value, row_bytes) in output_chunk
+                        .iter_mut()
+                        .zip(chunk.chunks_exact(row_bytes_len))
+                    {
+                        *out_value = dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
+                    }
                 }
                 output_idx += rows_this_chunk;
             }
@@ -5762,6 +5775,75 @@ mod tests {
             &mut workspace,
         )
         .unwrap();
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close(&actual.data, &expected.data);
+    }
+
+    #[test]
+    fn q8_0_block_reader_linear_matches_q8_path_with_parallel_chunks() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "on");
+        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
+        std::env::set_var(
+            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
+        );
+
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        let rows: Vec<Q8_0Block> = (0..5)
+            .map(|row| Q8_0Block {
+                scale: f16_bits_to_f32(f32_to_f16_bits(0.25 + row as f32 * 0.125)),
+                quants: std::array::from_fn(|idx| idx as i8 - 12 + row as i8),
+            })
+            .collect();
+        for block in &rows {
+            temp_file
+                .write_all(&f32_to_f16_bits(block.scale).to_le_bytes())
+                .unwrap();
+            let bytes = block.quants.iter().map(|q| *q as u8).collect::<Vec<_>>();
+            temp_file.write_all(&bytes).unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let input_values = (0..64)
+            .map(|idx| idx as f32 * 0.25 - 4.0)
+            .collect::<Vec<_>>();
+        let input = CpuTensor::from_f32("input", vec![2, 32], input_values).unwrap();
+        let mut dequantized_weight = Vec::with_capacity(rows.len() * 32);
+        for block in &rows {
+            dequantized_weight.extend(block.quants.iter().map(|q| block.scale * f32::from(*q)));
+        }
+        let weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "weight",
+            vec![rows.len(), 32],
+            dequantized_weight,
+            rows,
+        )
+        .unwrap();
+        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+
+        let file = temp_file.reopen().unwrap();
+        let reader = Q8BlockReader::new(0, 5);
+        let mut workspace = InferenceWorkspace::new(32);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let actual = pool
+            .install(|| {
+                assert!(should_parallelize_linear_output(5));
+                matmul_rhs_transposed_q8_0_block_reader(
+                    &input,
+                    &file,
+                    reader,
+                    5,
+                    "actual",
+                    &mut workspace,
+                )
+            })
+            .unwrap();
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close(&actual.data, &expected.data);
