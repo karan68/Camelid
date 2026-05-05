@@ -1,6 +1,6 @@
 # Llama 3 8B checkmark current-head refresh — 2026-05-05
 
-Purpose: preserve a latest public-main exact-row checkmark for Llama 3 8B Instruct Q8_0 without widening the support claim.
+Purpose: preserve an earlier public-main exact-row checkmark for Llama 3 8B Instruct Q8_0 without widening the support claim. The newer current-main refresh is documented separately in `qa/validation-notes/2026-05-05-8b-checkmark-current-main.md`.
 
 Published bundle:
 
