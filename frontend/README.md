@@ -15,13 +15,23 @@ The backend data hook is adapted for Camelid's current API surface:
 - shows the support gate, current compatibility row, model-family/quantization evidence, and guarded API feature rows directly in chat, model setup, per-model/catalog cards, API, analytics, and system surfaces
 - keeps the current runtime chat gate and `/api/capabilities` support gate visible in the page top bar outside the Chat/Models views, with a direct jump to the API contract before users interpret model-family or quant support
 - keeps the API tab first-class in desktop/sidebar/mobile navigation, browser tab restore, and chat readiness prompts so the support contract is easy to find during readiness checks
-- keeps API examples readiness-gated: `/api/capabilities` explains evidence boundaries, while `/v1/health` `loaded_now`/`generation_ready` decides whether chat calls should run
+- keeps API examples readiness-gated: `/api/capabilities` explains evidence boundaries, while `/v1/health` `loaded_now`/`generation_ready` plus `active_model_id` decide whether chat calls should run for the selected local GGUF
 - normalizes loaded-model `general.file_type` values into GGUF quant labels (for example file type `7` → `Q8_0`) before comparing them to `/api/capabilities`, so loaded model cards get useful quant evidence without treating filenames as support claims
-- keeps the exact Llama 3.2 3B Instruct Q8_0 row visible as a supported exact-row smoke card, while still requiring the loaded local GGUF to match the exact supported 3B Q8_0 row before chat unlocks
+- keeps the shipped exact Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 smoke rows visible as row-specific wins, while still requiring the loaded local GGUF to match its exact supported row before chat unlocks
 - sends non-streaming chat requests to `POST /v1/chat/completions`
-- blocks chat until `/v1/health` reports the selected `active_model_id` with `loaded_now: true` and `generation_ready: true` and `/api/capabilities` has an exact supported model/quant compatibility row; the exact Llama 3.2 1B/3B Instruct Q8_0 plus Llama 3 8B Instruct Q8_0 rows are supported only for the short local-chat smoke envelope
+- blocks chat until `/v1/health` reports the selected `active_model_id` with `loaded_now: true` and `generation_ready: true` and `/api/capabilities` has an exact supported model/quant compatibility row; the exact Llama 3.2 1B/3B Instruct Q8_0 plus Llama 3 8B Instruct Q8_0 rows are supported only for their bounded local-chat smoke/parity envelopes
 
 Server features Camelid does not expose yet are kept honest: catalog downloads, external-provider setup, planned/future/blocked quantization lanes, and unsupported or partial API parameters show disabled or typed-guardrail copy instead of pretending to work. The analytics view also treats conversation telemetry as usage only, not compatibility evidence. The UI mirrors the compatibility contract documented in `../COMPATIBILITY.md`; filenames, catalog metadata, saved browser paths, and prior usage are not treated as support evidence by themselves.
+
+## Exact-row smoke wins shown in the UI
+
+The frontend should make these shipped wins easy to see without turning them into broad Llama-family support:
+
+- **Llama 3.2 1B Instruct Q8_0:** exact-row API/WebUI smoke plus compact and broader parity evidence are represented as a supported exact-row smoke lane.
+- **Llama 3.2 3B Instruct Q8_0:** exact-row API/WebUI smoke, compact parity, broader three-prompt 50-token parity, and five-prompt API smoke are represented as a supported exact-row smoke lane.
+- **Llama 3 8B Instruct Q8_0:** exact-row API/WebUI smoke, clean-main timing/RSS smoke, broader 50-token parity, the first bounded 512-context pack, and compact chat-template-shapes pack are represented as bounded exact-row wins.
+
+All three rows still fail closed in the WebUI unless the active local GGUF matches the exact row and `/v1/health` reports `loaded_now=true` plus `generation_ready=true`. Do not infer support for neighboring sizes, base variants, other quantizations, arbitrary GGUF/Jinja templates, larger contexts, or performance portability from these cards.
 
 ## Run locally
 

@@ -22,7 +22,7 @@ export const LLAMA32_3B_ACCEPTANCE_TARGET = {
   },
 }
 
-export const LLAMA32_3B_ACCEPTANCE_SUMMARY = 'This exact 3B Q8_0 row is now smoke-supported for short local chat after exact-row /api/models/load, /v1/completions, /v1/chat/completions, frontend smoke, compact parity, broader three-prompt 50-token parity, and a five-prompt API smoke pack. The claim is intentionally narrow: it does not promote neighboring Llama sizes, base variants, other quantizations, longer context, or broad prompt/chat-template behavior; the 1B and 8B rows require their own exact-row evidence.'
+export const LLAMA32_3B_ACCEPTANCE_SUMMARY = 'This exact 3B Q8_0 row is now smoke-supported for short local chat after exact-row /api/models/load, /v1/completions, /v1/chat/completions, frontend smoke, compact parity, broader three-prompt 50-token parity, and a five-prompt API smoke pack. The claim is intentionally narrow: it does not promote neighboring Llama sizes, base variants, other quantizations, longer context, or broad prompt/chat-template behavior; the 1B and 8B wins are tracked as their own exact rows, not inherited from this 3B row.'
 
 export const LLAMA32_3B_ACCEPTANCE_AVAILABILITY = 'This browser/runtime list does not currently show the exact 3B row. That does not erase the existing support evidence for the row, but it also must not be turned into a green frontend state unless the loaded local GGUF exactly matches the supported 3B Q8_0 row.'
 

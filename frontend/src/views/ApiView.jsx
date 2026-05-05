@@ -37,7 +37,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           <div>
             <p className="panel-kicker">Endpoints</p>
             <h2>OpenAI-compatible surface</h2>
-            <p className="hero-summary">Generation endpoints stay useful only when runtime readiness is green. Capability rows explain supported and guarded lanes, but they never override loaded_now/generation_ready.</p>
+            <p className="hero-summary">Generation endpoints stay useful only when runtime readiness is green and the selected local GGUF has an exact supported compatibility row. Capability rows explain supported and guarded lanes, but they never override loaded_now/generation_ready or active_model_id matching.</p>
           </div>
           <div className={`status-pill ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Local /v1 generation ready' : 'Load a generation-ready model'}</div>
         </div>
@@ -46,7 +46,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           <div className="api-card">
             <strong>Chat completions</strong>
             <code>{apiBase ? `${apiBase}/v1/chat/completions` : 'Unavailable until the local API is running'}</code>
-            <p>{generationReady ? 'Runnable now for the loaded supported GGUF model.' : 'Do not call for UX chat yet; Camelid must report generation_ready=true first.'}</p>
+            <p>{generationReady ? 'Runnable now only for the loaded GGUF when /api/capabilities also matches an exact supported row.' : 'Do not call for UX chat yet; Camelid must report loaded_now=true and generation_ready=true for an exact supported row first.'}</p>
           </div>
           <div className="api-card">
             <strong>Model listing</strong>

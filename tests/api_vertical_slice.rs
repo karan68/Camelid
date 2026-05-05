@@ -45,7 +45,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and the passing 8B broader 50-token, 512-context, and compact chat-template-shapes reruns are bounded packs only"
+        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and the passing 8B broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path reruns are bounded packs/measurements only"
     );
     assert!(body["supported_quantization"]
         .as_array()
@@ -180,6 +180,10 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "compact_50_token_plus_broader_50_token_prompt_pack_match"
     );
     assert_eq!(
+        llama3["performance_measured"],
+        "bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs"
+    );
+    assert_eq!(
         llama3["tested_context"],
         "short_api_webui_smoke_with_broader_50_token_and_first_512_context_pack"
     );
@@ -195,6 +199,14 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "llama3-context-512-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_window"], 512);
+    assert!(llama3["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("retained-block lazy-Q8 hot-path cost probes"));
+    assert!(llama3["next_step"]
+        .as_str()
+        .unwrap()
+        .contains("bounded packs/measurements only"));
     let planned_quant = compatibility
         .iter()
         .find(|item| item["id"] == "llama_spm_q4_k_q5_k")

@@ -143,8 +143,8 @@ export default function ChatWorkspace({
       </div>
       <div>
         <span>Chat unlock</span>
-        <strong>{selectedModelRunnable ? 'loaded_now=true + generation_ready=true + exact supported row' : supportBlocked ? 'Blocked by compatibility contract' : 'Blocked until health is ready'}</strong>
-        <small>loaded_now={runtime?.loaded_now ? 'true' : 'false'} · generation_ready={runtime?.generation_ready ? 'true' : 'false'}; chat requires the active local GGUF to match an exact supported COMPATIBILITY.md row.</small>
+        <strong>{selectedModelRunnable ? 'loaded_now=true + generation_ready=true + exact compatibility row' : supportBlocked ? 'Blocked by exact-row compatibility contract' : 'Blocked until health is ready'}</strong>
+        <small>loaded_now={runtime?.loaded_now ? 'true' : 'false'} · generation_ready={runtime?.generation_ready ? 'true' : 'false'}; chat requires active_model_id to equal the selected local GGUF and match an exact supported COMPATIBILITY.md row.</small>
       </div>
       <div>
         <span>API guardrails</span>
@@ -219,7 +219,7 @@ export default function ChatWorkspace({
               <div className="chat-empty-hero chat-empty-hero-gemini">
                 <p className="chat-empty-greeting">Local Camelid chat</p>
                 <h2>{selectedModelRunnable ? 'Ask the loaded model, then inspect the raw reply.' : supportBlocked ? 'Compatibility contract blocks chat for this model' : 'Load a generation-ready local model first'}</h2>
-                <p className="hero-summary">{selectedModelRunnable ? 'The current smoke-supported rows can answer short local prompts, but Camelid still shows raw text, TPS, and token probabilities instead of promising broader polish.' : supportBlocked ? 'Camelid reports this model is loaded and generation-ready, but the UI will not enable chat unless /api/capabilities has an exact supported COMPATIBILITY.md row for its model family and quantization.' : 'Chat unlocks after Camelid reports loaded_now=true, generation_ready=true, and an exact supported compatibility row for the selected local GGUF.'}</p>
+                <p className="hero-summary">{selectedModelRunnable ? 'The current exact-row smoke lanes can answer short local prompts, but Camelid still shows raw text, TPS, and token probabilities instead of promising broader polish.' : supportBlocked ? 'Camelid reports this model is loaded and generation-ready, but the UI will not enable chat unless /api/capabilities has an exact supported COMPATIBILITY.md row for this model identity and quantization.' : 'Chat unlocks after Camelid reports loaded_now=true, generation_ready=true, active_model_id matches the selected local GGUF, and /api/capabilities exposes an exact supported compatibility row.'}</p>
               </div>
 
               {renderCapabilityStrip(true)}

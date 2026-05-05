@@ -639,7 +639,7 @@ export default function ModelsView({
               <p className="panel-kicker">Exact-row contract</p>
               <h3>Llama Q8 promotion rows</h3>
             </div>
-            <p className="model-summary">These cards mirror the exact 1B/3B/8B rows from /api/capabilities so the frontend shows row-specific readiness instead of inheriting support from neighboring sizes, filenames, or family matches.</p>
+            <p className="model-summary">These cards mirror the shipped exact 1B/3B/8B smoke rows from /api/capabilities. Each row gets credit for its own smoke wins, but chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
           </div>
 
           <div className="models-card-grid">
@@ -668,10 +668,14 @@ export default function ModelsView({
                     <div className={`pin-badge ${evidenceTrackTone(target.bounded_context_512_pack)}`}>512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')}</div>
                     <div className={`pin-badge ${evidenceTrackTone(target.performance_measured)}`}>perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</div>
                     <div className={`pin-badge ${chatUnlocked ? 'ready' : 'warm'}`}>{chatUnlocked ? 'Chat unlockable' : supported ? 'Runtime still needed' : 'Chat blocked by row status'}</div>
-                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B prompt-pack parity passed</div>}
+                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B API/WebUI smoke passed</div>}
+                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B compact + broader parity passed</div>}
+                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B API/WebUI smoke passed</div>}
                     {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B broader 50-token parity passed</div>}
                     {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B five-prompt API smoke passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B API/WebUI smoke passed</div>}
+                    {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B clean-main timing/RSS smoke passed</div>}
+                    {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge warm">8B lazy-Q8 hot-path costs measured</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B broader 50-token pack passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B first 512-context pack passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B compact template-shapes pack passed</div>}

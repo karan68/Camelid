@@ -72,6 +72,13 @@ enum Command {
         /// Q8_0 tensor name to load as block-only data.
         #[arg(long, default_value = "blk.0.ffn_gate.weight")]
         tensor: String,
+        /// Reinterpret a rank-2 tensor by swapping its logical rows/cols before benchmarking.
+        ///
+        /// This mirrors Camelid's guarded rectangular linear/output-projection layout path for
+        /// tensors whose GGUF descriptor dimensions are stored token/input-major but the lazy
+        /// Q8 hot path consumes contiguous logical output rows.
+        #[arg(long)]
+        swap_rank2_shape: bool,
         /// Row index to dequantize. Repeat for multiple rows.
         #[arg(long = "row")]
         rows: Vec<usize>,
@@ -140,18 +147,20 @@ async fn main() -> anyhow::Result<()> {
             rows,
             repeats,
             warmup,
+            swap_rank2_shape,
             all_rows_dot,
             single_input_row_dot,
         } => {
-            let report = bench_q8_blocks(
-                &path,
-                &tensor,
+            let report = bench_q8_blocks(Q8BlockBenchOptions {
+                path: &path,
+                tensor_name: &tensor,
                 rows,
                 repeats,
                 warmup,
+                swap_rank2_shape,
                 all_rows_dot,
                 single_input_row_dot,
-            )?;
+            })?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
@@ -237,6 +246,9 @@ struct Q8BlockBenchReport {
     path: String,
     tensor: String,
     shape: Vec<usize>,
+    storage_shape: Vec<usize>,
+    logical_shape: Vec<usize>,
+    swap_rank2_shape: bool,
     tensor_n_bytes: u64,
     tensor_mib: f64,
     element_count: usize,
@@ -275,15 +287,29 @@ struct Q8BlockBenchReport {
     notes: Vec<&'static str>,
 }
 
-fn bench_q8_blocks(
-    path: &PathBuf,
-    tensor_name: &str,
+struct Q8BlockBenchOptions<'a> {
+    path: &'a PathBuf,
+    tensor_name: &'a str,
     rows: Vec<usize>,
     repeats: usize,
     warmup: usize,
+    swap_rank2_shape: bool,
     all_rows_dot: bool,
     single_input_row_dot: bool,
-) -> anyhow::Result<Q8BlockBenchReport> {
+}
+
+fn bench_q8_blocks(options: Q8BlockBenchOptions<'_>) -> anyhow::Result<Q8BlockBenchReport> {
+    let Q8BlockBenchOptions {
+        path,
+        tensor_name,
+        rows,
+        repeats,
+        warmup,
+        swap_rank2_shape,
+        all_rows_dot,
+        single_input_row_dot,
+    } = options;
+
     anyhow::ensure!(repeats > 0, "--repeats must be greater than zero");
 
     let started = Instant::now();
@@ -299,13 +325,17 @@ fn bench_q8_blocks(
     );
 
     let started = Instant::now();
-    let tensor = store.load_q8_0_blocks(tensor_name)?;
+    let mut tensor = store.load_q8_0_blocks(tensor_name)?;
     let block_load_ms = elapsed_ms(started);
+    let storage_shape = tensor.shape.dims.clone();
     anyhow::ensure!(
         tensor.shape.dims.len() == 2,
         "bench-q8-blocks expects a rank-2 tensor, got {:?}",
         tensor.shape.dims
     );
+    if swap_rank2_shape {
+        tensor.shape.dims.swap(0, 1);
+    }
     let row_count = tensor.shape.dims[0];
     let row_len = tensor.shape.dims[1];
     let rows = if rows.is_empty() { vec![0] } else { rows };
@@ -391,6 +421,9 @@ fn bench_q8_blocks(
         path: path.display().to_string(),
         tensor: tensor_name.to_string(),
         shape: tensor.shape.dims.clone(),
+        storage_shape,
+        logical_shape: tensor.shape.dims.clone(),
+        swap_rank2_shape,
         tensor_n_bytes: desc.n_bytes,
         tensor_mib: bytes_to_mib(desc.n_bytes as f64),
         element_count,
@@ -445,6 +478,7 @@ fn bench_q8_blocks(
             "Loads only the selected Q8_0 tensor payload as retained blocks, not full model f32 weights.",
             "Reports the bounded f32 activation input and optional output-vector sizes so memory pressure evidence distinguishes scratch/output buffers from avoided full f32 weight materialization.",
             "Benchmarks serial bounded row dequantization, row dot products, optional all-row dot output, and optional single-input-row lazy-linear adapter output; this is groundwork evidence for lazy/on-demand Q8_0 execution, not a generation-support claim.",
+            "When swap_rank2_shape is true, the benchmark reinterprets rank-2 rows/cols without transposing payload bytes, matching the current guarded runtime layout path for selected rectangular LLaMA tensors.",
             "Determinism fields intentionally record that this bench path is serial-only today; any future parallel Q8 kernel must add serial-vs-parallel evidence targeting zero delta and failing above 1e-7 unless guarded off by default.",
         ],
     })

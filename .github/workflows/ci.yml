@@ -16,6 +16,14 @@ jobs:
       - name: Check for private operator details
         run: bash scripts/check-public-scrub.sh
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Audit public evidence bundles for private details
+        run: node scripts/audit-evidence-bundle-privacy.mjs --strict
+
   rust:
     runs-on: ubuntu-latest
     needs: public-scrub

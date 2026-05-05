@@ -48,7 +48,7 @@ export default function TopBar({ tab, setTab, selectedConversation, runtime, cap
     : 'Open the API contract before treating any model family or quant as supported.'
   const activeChatGate = getChatGateState(capabilities, activeModel, runtime)
   const runtimeChatReady = activeChatGate.chatUnlocked
-  const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_supported_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
+  const runtimeGateDetail = `loaded_now=${runtime?.loaded_now ? 'true' : 'false'} · generation_ready=${runtime?.generation_ready ? 'true' : 'false'} · exact_compatibility_row=${activeChatGate.contractSupported ? 'true' : 'false'}`
 
   if (tab === 'chat') {
     return (

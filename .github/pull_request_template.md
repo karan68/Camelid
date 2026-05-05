@@ -18,12 +18,13 @@ Explain the user-visible or engineering reason for the change.
 
 - [ ] No private hostnames, SSH commands, user home paths, key paths, or local validation details are included
 - [ ] `bash scripts/check-public-scrub.sh`
+- [ ] `node scripts/audit-evidence-bundle-privacy.mjs --strict`
 
 ## Support-contract check
 
 - [ ] This PR does not overclaim support
 - [ ] TinyLlama Q8_0 remains the current full-support gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows stay limited to their documented exact-row smoke envelopes unless exact new evidence is included
-- [ ] Any 1B / 3B / 8B wording stays aligned with `COMPATIBILITY.md`, `STATUS.md`, and `/api/capabilities`, including bounded-pack caveats for 8B broader 50-token, 512-context, and compact template-shapes evidence
+- [ ] Any 1B / 3B / 8B wording stays aligned with `COMPATIBILITY.md`, `STATUS.md`, and `/api/capabilities`, including bounded-pack caveats for 8B broader 50-token, 512-context, compact template-shapes, and measurement-only lazy-Q8 hot-path evidence
 
 ## Evidence / artifacts
 
