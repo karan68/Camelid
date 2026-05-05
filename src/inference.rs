@@ -1314,6 +1314,56 @@ impl LlamaInferenceSession {
         self.forward_single_token_timed_internal(token_id, false, true)
     }
 
+    fn forward_prefill_chunk_timed_fast(
+        &mut self,
+        token_ids: &[u32],
+    ) -> Result<LlamaForwardTimings> {
+        if token_ids.is_empty() {
+            return Ok(LlamaForwardTimings::default());
+        }
+        if token_ids.len() > self.kv_cache.plan.max_sequence_length - self.kv_cache.position {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "prefill chunk of {} token(s) exceeds remaining context capacity {}",
+                token_ids.len(),
+                self.kv_cache.plan.max_sequence_length - self.kv_cache.position
+            )));
+        }
+
+        let chunk_base_position = self.kv_cache.position;
+        let total_started = Instant::now();
+        let embedding_started = Instant::now();
+        let mut hidden = self
+            .weights
+            .token_embedding
+            .embedding_lookup(token_ids, "token_embedding_prefill_chunk")?;
+        let mut timings = LlamaForwardTimings {
+            embedding: embedding_started.elapsed().as_micros(),
+            ..LlamaForwardTimings::default()
+        };
+        let layers_started = Instant::now();
+        let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let timed = forward_prefill_layer_chunk_timed(
+                &hidden,
+                layer,
+                PrefillLayerChunkParams {
+                    config: &self.config,
+                    rope_freqs: self.weights.rope_freqs.as_ref(),
+                    rms_norm_epsilon,
+                    layer_idx,
+                    base_position: chunk_base_position,
+                },
+                &mut self.kv_cache,
+            )?;
+            hidden = timed.output;
+            timings.layers.push(timed.timings);
+        }
+        self.kv_cache.position += token_ids.len();
+        timings.layers_total = layers_started.elapsed().as_micros();
+        timings.total = total_started.elapsed().as_micros();
+        Ok(timings)
+    }
+
     fn forward_single_token_timed_internal(
         &mut self,
         token_id: u32,
@@ -1513,32 +1563,36 @@ impl LlamaInferenceSession {
             config.validate()?;
         }
 
-        let mut output = None;
         let mut diagnostics = None;
         let mut timings = LlamaForwardTimings::default();
         let mut prefill_timings = LlamaForwardTimings::default();
         let mut first_token_timings = LlamaForwardTimings::default();
-        for (idx, token_id) in token_ids.iter().enumerate() {
-            let collect_step_diagnostics = collect_diagnostics && idx + 1 == token_ids.len();
-            let compute_logits = idx + 1 == token_ids.len();
-            let timed = self.forward_single_token_timed_internal(
-                *token_id,
-                collect_step_diagnostics,
-                compute_logits,
-            )?;
-            timings.add_assign(&timed.timings);
-            if compute_logits {
-                first_token_timings.add_assign(&timed.timings);
-            } else {
-                prefill_timings.add_assign(&timed.timings);
+        let prefill_count = token_ids.len().saturating_sub(1);
+        let prefill_chunk_tokens = prefill_chunk_token_count();
+        if prefill_count > 0 && prefill_chunk_tokens > 1 {
+            for chunk in token_ids[..prefill_count].chunks(prefill_chunk_tokens) {
+                let chunk_timings = self.forward_prefill_chunk_timed_fast(chunk)?;
+                timings.add_assign(&chunk_timings);
+                prefill_timings.add_assign(&chunk_timings);
             }
-            output = Some(timed.output);
-            if let Some(step_diagnostics) = timed.diagnostics {
-                diagnostics = Some(step_diagnostics);
+        } else {
+            for token_id in &token_ids[..prefill_count] {
+                let timed = self.forward_single_token_timed_internal(*token_id, false, false)?;
+                timings.add_assign(&timed.timings);
+                prefill_timings.add_assign(&timed.timings);
             }
         }
 
-        let output = output.expect("non-empty token_ids checked above");
+        let last_token_id = *token_ids.last().expect("non-empty token_ids checked above");
+        let timed =
+            self.forward_single_token_timed_internal(last_token_id, collect_diagnostics, true)?;
+        timings.add_assign(&timed.timings);
+        first_token_timings.add_assign(&timed.timings);
+        if let Some(step_diagnostics) = timed.diagnostics {
+            diagnostics = Some(step_diagnostics);
+        }
+
+        let output = timed.output;
         let logits = output.logits;
         let hidden_state = output.hidden_state;
         let output_norm_state = output.output_norm_state;
@@ -1574,6 +1628,15 @@ fn env_flag_enabled(key: &str) -> bool {
         env::var(key).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") | Ok("on") | Ok("ON")
     )
+}
+
+fn prefill_chunk_token_count() -> usize {
+    const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 32;
+    env::var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PREFILL_CHUNK_TOKENS)
 }
 
 fn trace_forward_memory(phase: &str) {
@@ -2346,6 +2409,14 @@ struct ForwardLayerParams<'a> {
     collect_diagnostics: bool,
 }
 
+struct PrefillLayerChunkParams<'a> {
+    config: &'a LlamaModelConfig,
+    rope_freqs: Option<&'a CpuTensor>,
+    rms_norm_epsilon: f32,
+    layer_idx: usize,
+    base_position: usize,
+}
+
 fn forward_layer_timed(
     hidden: &CpuTensor,
     layer: &LlamaLayerWeights,
@@ -2729,6 +2800,149 @@ struct LlamaTimedLayerOutput {
     output: CpuTensor,
     timings: LlamaLayerTimings,
     diagnostics: Option<LlamaLayerDiagnostics>,
+}
+
+fn forward_prefill_layer_chunk_timed(
+    hidden: &CpuTensor,
+    layer: &LlamaLayerWeights,
+    params: PrefillLayerChunkParams<'_>,
+    kv_cache: &mut LlamaKvCache,
+) -> Result<LlamaTimedLayerOutput> {
+    let config = params.config;
+    let layer_idx = params.layer_idx;
+    let total_started = Instant::now();
+    let mut timings = LlamaLayerTimings {
+        layer_index: layer_idx,
+        ..LlamaLayerTimings::default()
+    };
+
+    let started = Instant::now();
+    let attn_norm = hidden.rms_norm(
+        &layer.attention_norm,
+        params.rms_norm_epsilon,
+        format!("layer_{layer_idx}_prefill_attention_norm"),
+    )?;
+    timings.attention_norm = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let q = linear_runtime(
+        &attn_norm,
+        &layer.attention_q,
+        format!("layer_{layer_idx}_prefill_attention_q"),
+        false,
+    )?;
+    timings.attention_q = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let k = linear_for_role_runtime(
+        &attn_norm,
+        &layer.attention_k,
+        format!("layer_{layer_idx}_prefill_attention_k"),
+        "attention_k",
+        false,
+    )?;
+    timings.attention_k = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let q = apply_rope_batch(
+        &q,
+        params.base_position,
+        config.attention_head_count as usize,
+        config,
+        params.rope_freqs,
+        format!("layer_{layer_idx}_prefill_attention_q_rope"),
+    )?;
+    let k = apply_rope_batch(
+        &k,
+        params.base_position,
+        config.attention_head_count_kv as usize,
+        config,
+        params.rope_freqs,
+        format!("layer_{layer_idx}_prefill_attention_k_rope"),
+    )?;
+    timings.attention_rope = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let v = linear_for_role_runtime(
+        &attn_norm,
+        &layer.attention_v,
+        format!("layer_{layer_idx}_prefill_attention_v"),
+        "attention_v",
+        false,
+    )?;
+    timings.attention_v = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    write_kv_cache_batch(kv_cache, layer_idx, params.base_position, &k, &v)?;
+    timings.kv_cache_write = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let context = causal_attention_context_batch(
+        kv_cache,
+        layer_idx,
+        params.base_position,
+        &q,
+        config.attention_head_count as usize,
+        config.attention_head_count_kv as usize,
+        format!("layer_{layer_idx}_prefill_attention_context"),
+    )?;
+    timings.attention_context = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let attn_out = linear_runtime(
+        &context,
+        &layer.attention_output,
+        format!("layer_{layer_idx}_prefill_attention_output"),
+        false,
+    )?;
+    timings.attention_output = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let residual = hidden.add(
+        &attn_out,
+        format!("layer_{layer_idx}_prefill_attention_residual"),
+    )?;
+    timings.attention_residual = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let ffn_norm = residual.rms_norm(
+        &layer.ffn_norm,
+        params.rms_norm_epsilon,
+        format!("layer_{layer_idx}_prefill_ffn_norm"),
+    )?;
+    timings.ffn_norm = started.elapsed().as_micros();
+
+    let activated = gated_ffn_activation_batch(
+        &ffn_norm,
+        &layer.ffn_gate,
+        &layer.ffn_up,
+        format!("layer_{layer_idx}_prefill_ffn_activated"),
+    )?;
+    timings.ffn_gate = activated.gate;
+    timings.ffn_up = activated.up;
+    timings.ffn_activation = activated.activation;
+    let activated = activated.tensor;
+
+    let started = Instant::now();
+    let ffn_out = linear_for_role_runtime(
+        &activated,
+        &layer.ffn_down,
+        format!("layer_{layer_idx}_prefill_ffn_down"),
+        "ffn_down",
+        false,
+    )?;
+    timings.ffn_down = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let output = residual.add(&ffn_out, format!("layer_{layer_idx}_prefill_ffn_residual"))?;
+    timings.ffn_residual = started.elapsed().as_micros();
+    timings.total = total_started.elapsed().as_micros();
+
+    Ok(LlamaTimedLayerOutput {
+        output,
+        timings,
+        diagnostics: None,
+    })
 }
 
 const TENSOR_CHECKPOINT_SAMPLE: usize = 10;
@@ -4278,6 +4492,53 @@ fn gated_ffn_activation(
     })
 }
 
+fn gated_ffn_activation_batch(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<GatedFfnActivation> {
+    if input.rank() != 2 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "gated FFN batch activation expects rank-2 input, got {:?}",
+            input.shape.dims
+        )));
+    }
+
+    let started = Instant::now();
+    let mut gate =
+        linear_for_role_runtime(input, gate_weight, "ffn_gate_prefill", "ffn gate", false)?;
+    let gate_elapsed = started.elapsed().as_micros();
+
+    let started = Instant::now();
+    let up = linear_for_role_runtime(input, up_weight, "ffn_up_prefill", "ffn up", false)?;
+    let up_elapsed = started.elapsed().as_micros();
+
+    require_tensor_shape(&up, &gate.shape.dims, "gated FFN prefill up projection")?;
+    let order = diagnostic_ffn_gate_up_order()?;
+    let started = Instant::now();
+    for (gate_value, up_value) in gate.data.iter_mut().zip(up.data) {
+        *gate_value = match order {
+            FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
+            FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
+        };
+    }
+    gate.name = name.into();
+    let activation_elapsed = started.elapsed().as_micros();
+
+    Ok(GatedFfnActivation {
+        tensor: gate,
+        gate: gate_elapsed,
+        up: up_elapsed,
+        activation: activation_elapsed,
+        gate_stats: None,
+        up_stats: None,
+        gate_diagnostic: None,
+        up_diagnostic: None,
+        activation_diagnostic: None,
+    })
+}
+
 fn ffn_activation_diagnostics(
     gate: &CpuTensor,
     up: &CpuTensor,
@@ -4682,34 +4943,35 @@ fn matmul_rhs_transposed_q8_0_block_reader(
             "q8_0 block-reader chunk byte count overflow".to_string(),
         )
     })?;
+    let quantized_inputs: Vec<_> = input
+        .data
+        .chunks_exact(input_width)
+        .map(quantize_q8_0_row)
+        .collect();
     with_q8_0_file_reader_row_chunk(row_chunk_len, |row_chunk| {
-        for row in 0..rows {
-            let input_start = row * input_width;
-            let input_row = &input.data[input_start..input_start + input_width];
-            let quantized_input = quantize_q8_0_row(input_row);
-            let out_start = row * output_width;
-            let mut output_idx = 0usize;
-            while output_idx < output_width {
-                let rows_this_chunk = chunk_rows.min(output_width - output_idx);
-                let chunk_bytes_len =
-                    row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
-                        BackendError::RuntimeShapeMismatch(
-                            "q8_0 block-reader chunk byte count overflow".to_string(),
-                        )
-                    })?;
-                let block_start = output_idx * blocks_per_row;
-                let chunk_offset = reader
-                    .offset
-                    .checked_add((block_start * Q8BlockReader::BLOCK_SIZE_BYTES) as u64)
-                    .ok_or_else(|| {
-                        BackendError::RuntimeShapeMismatch(
-                            "q8_0 block-reader chunk offset overflow".to_string(),
-                        )
-                    })?;
-                let chunk = &mut row_chunk[..chunk_bytes_len];
-                backing.read_exact_at_cached(chunk, chunk_offset)?;
-                let output_end = out_start + output_idx + rows_this_chunk;
-                let output_chunk = &mut output[out_start + output_idx..output_end];
+        let mut output_idx = 0usize;
+        while output_idx < output_width {
+            let rows_this_chunk = chunk_rows.min(output_width - output_idx);
+            let chunk_bytes_len = row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "q8_0 block-reader chunk byte count overflow".to_string(),
+                )
+            })?;
+            let block_start = output_idx * blocks_per_row;
+            let chunk_offset = reader
+                .offset
+                .checked_add((block_start * Q8BlockReader::BLOCK_SIZE_BYTES) as u64)
+                .ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch(
+                        "q8_0 block-reader chunk offset overflow".to_string(),
+                    )
+                })?;
+            let chunk = &mut row_chunk[..chunk_bytes_len];
+            backing.read_exact_at_cached(chunk, chunk_offset)?;
+            for (row, quantized_input) in quantized_inputs.iter().enumerate() {
+                let out_start = row * output_width + output_idx;
+                let output_end = out_start + rows_this_chunk;
+                let output_chunk = &mut output[out_start..output_end];
                 if should_parallelize_linear_output(output_width) {
                     output_chunk
                         .par_iter_mut()
@@ -4725,8 +4987,8 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                         *out_value = dot_q8_0_encoded_row(&quantized_input.blocks, row_bytes);
                     }
                 }
-                output_idx += rows_this_chunk;
             }
+            output_idx += rows_this_chunk;
         }
         Ok(())
     })?;
@@ -5254,6 +5516,73 @@ fn apply_rope(
     )
 }
 
+fn apply_rope_batch(
+    tensor: &CpuTensor,
+    base_position: usize,
+    head_count: usize,
+    config: &LlamaModelConfig,
+    rope_freqs: Option<&CpuTensor>,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    if head_count == 0 {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "RoPE head count must be greater than zero".to_string(),
+        ));
+    }
+    if tensor.rank() != 2 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "RoPE batch input {} expected rank 2, got {:?}",
+            tensor.name, tensor.shape.dims
+        )));
+    }
+    let rows = tensor.dim(0)?;
+    let width = tensor.dim(1)?;
+    if !width.is_multiple_of(head_count) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "RoPE batch input width {width} is not divisible by head count {head_count}"
+        )));
+    }
+    let head_dim = width / head_count;
+    let rope_dim = config.rope_dimension_count.unwrap_or(head_dim as u32) as usize;
+    if rope_dim == 0 || rope_dim > head_dim || !rope_dim.is_multiple_of(2) {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "RoPE dimension count {rope_dim} must be even and within head dimension {head_dim}"
+        )));
+    }
+    let freq_base = config.rope_freq_base.unwrap_or(10_000.0);
+    if freq_base <= 0.0 || !freq_base.is_finite() {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "RoPE frequency base {freq_base} must be finite and positive"
+        )));
+    }
+    let scaling = rope_scaling_from_config(config)?;
+    let rope_freqs = rope_freqs
+        .map(|freqs| validate_rope_frequency_tensor(freqs, rope_dim))
+        .transpose()?;
+    let params = RopeParams {
+        position: base_position,
+        head_count,
+        head_dim,
+        rope_dim,
+        freq_base,
+        pairing: diagnostic_rope_pairing()?,
+        direction: diagnostic_rope_direction()?,
+        position_mode: diagnostic_rope_position_mode()?,
+        scaling,
+        rope_freqs,
+    };
+
+    let mut data = tensor.data.clone();
+    for row in 0..rows {
+        apply_rope_to_row(
+            &mut data[row * width..(row + 1) * width],
+            base_position + row,
+            params,
+        );
+    }
+    CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
+}
+
 fn validate_rope_frequency_tensor(rope_freqs: &CpuTensor, rope_dim: usize) -> Result<&[f32]> {
     let expected_count = rope_dim / 2;
     if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
@@ -5393,6 +5722,13 @@ fn apply_rope_with_pairing(
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
     let mut data = tensor.data.clone();
+    apply_rope_to_row(&mut data, params.position, params);
+
+    CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
+}
+
+fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'_>) {
+    params.position = position;
     for head in 0..params.head_count {
         let head_start = head * params.head_dim;
         for pair_idx in 0..(params.rope_dim / 2) {
@@ -5423,8 +5759,6 @@ fn apply_rope_with_pairing(
             }
         }
     }
-
-    CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
 }
 
 fn rope_pair_frequency(pair_idx: usize, params: &RopeParams<'_>) -> f32 {
@@ -5641,6 +5975,51 @@ fn write_kv_cache(
     Ok(())
 }
 
+fn write_kv_cache_batch(
+    kv_cache: &mut LlamaKvCache,
+    layer_idx: usize,
+    base_position: usize,
+    key: &CpuTensor,
+    value: &CpuTensor,
+) -> Result<()> {
+    let expected_width = kv_cache.plan.kv_head_count * kv_cache.plan.head_dim;
+    if key.rank() != 2
+        || value.rank() != 2
+        || key.dim(1)? != expected_width
+        || value.dim(1)? != expected_width
+        || key.dim(0)? != value.dim(0)?
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "KV batch projection shapes must be [rows, {expected_width}], got key {:?}, value {:?}",
+            key.shape.dims, value.shape.dims
+        )));
+    }
+    if layer_idx >= kv_cache.plan.layer_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "layer index {layer_idx} is out of range for KV cache layer count {}",
+            kv_cache.plan.layer_count
+        )));
+    }
+    let rows = key.dim(0)?;
+    kv_cache.ensure_position_capacity(base_position + rows)?;
+    for row in 0..rows {
+        let position = base_position + row;
+        let offset = kv_cache_offset(kv_cache, layer_idx, position, 0);
+        let end = offset + expected_width;
+        let row_start = row * expected_width;
+        let row_end = row_start + expected_width;
+        copy_to_f16_kv_cache_storage(
+            &mut kv_cache.keys[offset..end],
+            &key.data[row_start..row_end],
+        );
+        copy_to_f16_kv_cache_storage(
+            &mut kv_cache.values[offset..end],
+            &value.data[row_start..row_end],
+        );
+    }
+    Ok(())
+}
+
 fn copy_to_f16_kv_cache_storage(dest: &mut [f32], source: &[f32]) {
     debug_assert_eq!(dest.len(), source.len());
     for (dest_value, source_value) in dest.iter_mut().zip(source.iter().copied()) {
@@ -5757,6 +6136,92 @@ fn causal_attention_context(
         })
         .transpose()?;
     Ok(LlamaAttentionContextOutput { tensor, trace })
+}
+
+fn causal_attention_context_batch(
+    kv_cache: &LlamaKvCache,
+    layer_idx: usize,
+    base_position: usize,
+    query: &CpuTensor,
+    attention_heads: usize,
+    kv_heads: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    if kv_heads == 0 || !attention_heads.is_multiple_of(kv_heads) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "attention head count {attention_heads} must be a multiple of kv head count {kv_heads}"
+        )));
+    }
+    let head_dim = kv_cache.plan.head_dim;
+    let expected_width = attention_heads * head_dim;
+    if query.rank() != 2 || query.dim(1)? != expected_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "attention query shape {:?} does not match expected [rows, {expected_width}]",
+            query.shape.dims
+        )));
+    }
+    if kv_heads != kv_cache.plan.kv_head_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "attention kv head count {kv_heads} does not match KV cache plan {}",
+            kv_cache.plan.kv_head_count
+        )));
+    }
+    if layer_idx >= kv_cache.plan.layer_count {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "layer index {layer_idx} is out of range for KV cache layer count {}",
+            kv_cache.plan.layer_count
+        )));
+    }
+
+    let rows = query.dim(0)?;
+    let repeats = attention_heads / kv_heads;
+    let head_mapping = diagnostic_gqa_head_mapping()?;
+    let score_scale = diagnostic_attention_score_scale()?;
+    let scale = attention_score_scale_value(head_dim, score_scale);
+    let mut out = vec![0.0; rows * expected_width];
+
+    for row in 0..rows {
+        let position_count = base_position + row + 1;
+        let query_row_start = row * expected_width;
+        let out_row_start = row * expected_width;
+        if position_count == 1 {
+            for attention_head in 0..attention_heads {
+                let kv_head =
+                    map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
+                let out_start = out_row_start + attention_head * head_dim;
+                let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
+                out[out_start..out_start + head_dim]
+                    .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
+            }
+        } else {
+            for attention_head in 0..attention_heads {
+                let kv_head =
+                    map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
+                let query_start = query_row_start + attention_head * head_dim;
+                let query_slice = &query.data[query_start..query_start + head_dim];
+                let raw_scores = attention_scores_for_head(
+                    kv_cache,
+                    layer_idx,
+                    kv_head,
+                    query_slice,
+                    position_count,
+                    scale,
+                );
+                let probabilities = attention_probabilities(&raw_scores)?;
+
+                let out_start = out_row_start + attention_head * head_dim;
+                for (position, probability) in probabilities.iter().enumerate() {
+                    let value_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
+                    let value_slice = &kv_cache.values[value_start..value_start + head_dim];
+                    for dim in 0..head_dim {
+                        out[out_start + dim] += probability * value_slice[dim];
+                    }
+                }
+            }
+        }
+    }
+
+    CpuTensor::from_f32(name, vec![rows, expected_width], out)
 }
 
 struct AttentionTraceParams<'a> {
@@ -6788,6 +7253,68 @@ mod tests {
             .unwrap();
 
         assert_slice_close(&actual, &expected.data);
+    }
+
+    #[test]
+    fn q8_0_file_backed_batch_matmul_reuses_chunk_reads_across_input_rows() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::set_var(
+            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
+        );
+
+        let rows: Vec<Q8_0Block> = (0..4)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.03125,
+                quants: std::array::from_fn(|idx| idx as i8 - 8 + row as i8),
+            })
+            .collect();
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        for row in &rows {
+            temp_file
+                .write_all(&f32_to_f16_bits(row.scale).to_le_bytes())
+                .unwrap();
+            temp_file
+                .write_all(&row.quants.iter().map(|q| *q as u8).collect::<Vec<_>>())
+                .unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let input_values = (0..96)
+            .map(|idx| idx as f32 * 0.1 - 3.0)
+            .collect::<Vec<_>>();
+        let input = CpuTensor::from_f32("input", vec![3, 32], input_values).unwrap();
+        let weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "weight",
+            vec![4, 32],
+            dequantized_q8_0_rows(&rows),
+            rows.clone(),
+        )
+        .unwrap();
+        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
+        let start = q8_0_file_read_stats();
+
+        let actual = matmul_rhs_transposed_q8_0_block_reader(
+            &input,
+            &backing,
+            Q8BlockReader::new(0, rows.len()),
+            rows.len(),
+            "actual",
+            &mut InferenceWorkspace::new(32),
+        )
+        .unwrap();
+        let reads = q8_0_file_read_stats().saturating_delta_since(start);
+
+        assert_slice_close(&actual.data, &expected.data);
+        assert_eq!(reads.read_calls, 2);
+        assert_eq!(
+            reads.read_bytes,
+            (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
+        );
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
     }
 
     #[test]
@@ -8458,6 +8985,248 @@ mod tests {
             &diagnostics.logits.checkpoint.first_values,
             &expected_logits,
         );
+    }
+
+    #[test]
+    fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+
+        let config = LlamaModelConfig {
+            context_length: 8,
+            embedding_length: 2,
+            block_count: 1,
+            feed_forward_length: 2,
+            attention_head_count: 1,
+            attention_head_count_kv: 1,
+            rope_dimension_count: Some(2),
+            rope_freq_base: Some(10_000.0),
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_scaling_original_context_length: None,
+            rope_scaling_low_freq_factor: None,
+            rope_scaling_high_freq_factor: None,
+            rms_norm_epsilon: 1.0e-5,
+            vocab_size: Some(4),
+            file_type: None,
+        };
+        let weights = Arc::new(LlamaLoadedWeights {
+            token_embedding: CpuTensor::from_f32(
+                "token_embd.weight",
+                vec![4, 2],
+                vec![1.0, 0.25, -0.5, 0.75, 0.3, -0.8, 0.2, 0.4],
+            )
+            .unwrap(),
+            output_norm: CpuTensor::from_f32("output_norm.weight", vec![2], vec![0.9, 1.1])
+                .unwrap(),
+            output: Some(
+                CpuTensor::from_f32(
+                    "output.weight",
+                    vec![4, 2],
+                    vec![0.7, -0.2, -0.4, 0.6, 0.1, 0.3, -0.5, -0.1],
+                )
+                .unwrap(),
+            ),
+            rope_freqs: None,
+            layers: vec![LlamaLayerWeights {
+                attention_norm: CpuTensor::from_f32(
+                    "blk.0.attn_norm.weight",
+                    vec![2],
+                    vec![1.0, 0.8],
+                )
+                .unwrap(),
+                attention_q: CpuTensor::from_f32(
+                    "blk.0.attn_q.weight",
+                    vec![2, 2],
+                    vec![0.5, -0.1, 0.25, 0.7],
+                )
+                .unwrap(),
+                attention_k: CpuTensor::from_f32(
+                    "blk.0.attn_k.weight",
+                    vec![2, 2],
+                    vec![0.3, 0.2, -0.4, 0.6],
+                )
+                .unwrap(),
+                attention_v: CpuTensor::from_f32(
+                    "blk.0.attn_v.weight",
+                    vec![2, 2],
+                    vec![0.2, -0.3, 0.5, 0.4],
+                )
+                .unwrap(),
+                attention_output: CpuTensor::from_f32(
+                    "blk.0.attn_output.weight",
+                    vec![2, 2],
+                    vec![0.6, 0.1, -0.2, 0.9],
+                )
+                .unwrap(),
+                ffn_norm: CpuTensor::from_f32("blk.0.ffn_norm.weight", vec![2], vec![1.2, 0.7])
+                    .unwrap(),
+                ffn_gate: CpuTensor::from_f32(
+                    "blk.0.ffn_gate.weight",
+                    vec![2, 2],
+                    vec![0.4, -0.6, 0.8, 0.2],
+                )
+                .unwrap(),
+                ffn_up: CpuTensor::from_f32(
+                    "blk.0.ffn_up.weight",
+                    vec![2, 2],
+                    vec![-0.3, 0.9, 0.5, 0.1],
+                )
+                .unwrap(),
+                ffn_down: CpuTensor::from_f32(
+                    "blk.0.ffn_down.weight",
+                    vec![2, 2],
+                    vec![0.7, -0.2, 0.4, 0.3],
+                )
+                .unwrap(),
+            }],
+        });
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "1");
+        let mut sequential = LlamaInferenceSession::new(config.clone(), weights.clone()).unwrap();
+        let sequential_step = sequential
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1, 2],
+                LlamaSampler::Greedy,
+                &[0, 1, 2],
+                false,
+            )
+            .unwrap();
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "8");
+        let mut chunked = LlamaInferenceSession::new(config, weights).unwrap();
+        let chunked_step = chunked
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1, 2],
+                LlamaSampler::Greedy,
+                &[0, 1, 2],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(chunked_step.next_token_id, sequential_step.next_token_id);
+        assert_slice_close(&chunked_step.logits.data, &sequential_step.logits.data);
+        assert_slice_close(
+            &chunked_step.hidden_state.data,
+            &sequential_step.hidden_state.data,
+        );
+        assert_eq!(chunked.kv_cache.position, sequential.kv_cache.position);
+        assert_slice_close(&chunked.kv_cache.keys, &sequential.kv_cache.keys);
+        assert_slice_close(&chunked.kv_cache.values, &sequential.kv_cache.values);
+
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+    }
+
+    #[test]
+    fn zero_prefill_chunk_env_falls_back_without_panicking() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+
+        let config = LlamaModelConfig {
+            context_length: 8,
+            embedding_length: 2,
+            block_count: 1,
+            feed_forward_length: 2,
+            attention_head_count: 1,
+            attention_head_count_kv: 1,
+            rope_dimension_count: Some(2),
+            rope_freq_base: Some(10_000.0),
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_scaling_original_context_length: None,
+            rope_scaling_low_freq_factor: None,
+            rope_scaling_high_freq_factor: None,
+            rms_norm_epsilon: 1.0e-5,
+            vocab_size: Some(4),
+            file_type: None,
+        };
+        let weights = Arc::new(LlamaLoadedWeights {
+            token_embedding: CpuTensor::from_f32(
+                "token_embd.weight",
+                vec![4, 2],
+                vec![1.0, 0.25, -0.5, 0.75, 0.3, -0.8, 0.2, 0.4],
+            )
+            .unwrap(),
+            output_norm: CpuTensor::from_f32("output_norm.weight", vec![2], vec![0.9, 1.1])
+                .unwrap(),
+            output: Some(
+                CpuTensor::from_f32(
+                    "output.weight",
+                    vec![4, 2],
+                    vec![0.7, -0.2, -0.4, 0.6, 0.1, 0.3, -0.5, -0.1],
+                )
+                .unwrap(),
+            ),
+            rope_freqs: None,
+            layers: vec![LlamaLayerWeights {
+                attention_norm: CpuTensor::from_f32(
+                    "blk.0.attn_norm.weight",
+                    vec![2],
+                    vec![1.0, 0.8],
+                )
+                .unwrap(),
+                attention_q: CpuTensor::from_f32(
+                    "blk.0.attn_q.weight",
+                    vec![2, 2],
+                    vec![0.5, -0.1, 0.25, 0.7],
+                )
+                .unwrap(),
+                attention_k: CpuTensor::from_f32(
+                    "blk.0.attn_k.weight",
+                    vec![2, 2],
+                    vec![0.3, 0.2, -0.4, 0.6],
+                )
+                .unwrap(),
+                attention_v: CpuTensor::from_f32(
+                    "blk.0.attn_v.weight",
+                    vec![2, 2],
+                    vec![0.2, -0.3, 0.5, 0.4],
+                )
+                .unwrap(),
+                attention_output: CpuTensor::from_f32(
+                    "blk.0.attn_output.weight",
+                    vec![2, 2],
+                    vec![0.6, 0.1, -0.2, 0.9],
+                )
+                .unwrap(),
+                ffn_norm: CpuTensor::from_f32("blk.0.ffn_norm.weight", vec![2], vec![1.2, 0.7])
+                    .unwrap(),
+                ffn_gate: CpuTensor::from_f32(
+                    "blk.0.ffn_gate.weight",
+                    vec![2, 2],
+                    vec![0.4, -0.6, 0.8, 0.2],
+                )
+                .unwrap(),
+                ffn_up: CpuTensor::from_f32(
+                    "blk.0.ffn_up.weight",
+                    vec![2, 2],
+                    vec![-0.3, 0.9, 0.5, 0.1],
+                )
+                .unwrap(),
+                ffn_down: CpuTensor::from_f32(
+                    "blk.0.ffn_down.weight",
+                    vec![2, 2],
+                    vec![0.7, -0.2, 0.4, 0.3],
+                )
+                .unwrap(),
+            }],
+        });
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "0");
+        let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+        let step = session
+            .generate_next_token_with_history_diagnostics(
+                &[0, 1, 2],
+                LlamaSampler::Greedy,
+                &[0, 1, 2],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(step.prefill_token_count, 2);
+        assert!(step.prefill_timings.total > 0);
+
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
     }
 
     #[test]
