@@ -25,6 +25,15 @@ git diff --check
 
 The strict public evidence privacy audit reported `finding_count: 0`.
 
+Remote clean-clone validation on the canonical Ubuntu validation host also passed after push at `3ee2bc7`:
+
+```text
+remote_head=3ee2bc7
+sha256sum_bundle_files_checked=14
+privacy_findings=0
+public_scrub_guard=ok
+```
+
 ## Claim boundary
 
 This pass advances privacy scrub and evidence citation hygiene only. It does **not** add new runtime parity, longer-context, performance, portability, or broad Llama-family support evidence.
