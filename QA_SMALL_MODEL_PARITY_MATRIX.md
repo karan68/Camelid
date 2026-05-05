@@ -89,7 +89,7 @@ Representative artifacts cited by the public docs:
 - `target/parity-20260502T030911Z/llama3-8b-5tok/report.json`
 - `target/parity-50tok-20260502T031820Z/llama3-8b-50tok/report.json`
 - `target/downloaded-llama-matrix-20260502T231000Z/summary.json`
-- `qa/evidence-bundles/four-row-api-webui-20260504T233202Z-head-cb8943d/manifest.json`
+- `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`
 - `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`
 
 ## Artifact caveat

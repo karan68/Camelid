@@ -14,4 +14,4 @@ Covered in this bundle:
 - `/v1/completions`
 - `/v1/chat/completions`
 
-Boundary: this bundle is an API freshness slice only. The later API + frontend smoke summary at `../four-row-api-webui-20260504T233202Z-head-cb8943d/` supersedes it for WebUI freshness, and the first 8B 512-context pass is recorded separately at `../llama3-8b-context-512-20260504T234625Z-head-58acf592345c/`. None of these bundles promote broad/full support, neighboring rows, other quantizations, larger contexts, or performance portability.
+Boundary: this bundle is an API freshness slice only. The later API + frontend smoke summary at `../four-row-api-webui-20260505T003100Z-head-b403884/` supersedes it for WebUI freshness, and the first 8B 512-context pass is recorded separately at `../llama3-8b-context-512-20260504T234625Z-head-58acf592345c/`. None of these bundles promote broad/full support, neighboring rows, other quantizations, larger contexts, or performance portability.

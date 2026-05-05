@@ -9,7 +9,7 @@ Tracks:
 - broader-parity: ready_to_run — Run the broader three-prompt pack and require prompt/generated parity.
 - chat-template-shapes: ready_to_run — Run the chat-template-shapes pack to broaden template coverage on the exact row.
 - context-512: superseded_by_later_pass — The scaffold preserved the bounded 512-context timeout; the later one-pack pass is recorded at `../../llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`.
-- api-webui-smoke: refreshed_by_later_pass — Reopened-lane API + frontend smoke for this exact row is recorded at `../../four-row-api-webui-20260504T233202Z-head-cb8943d/manifest.json`.
+- api-webui-smoke: refreshed_by_later_pass — Reopened-lane API + frontend smoke for this exact row is recorded at `../../four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`.
 - perf-rss-portability: ready_to_run — Capture host facts, versions, model SHA, smoke timing, and backend RSS snapshots in one portable note.
 
 Blockers:

@@ -30,6 +30,6 @@ Guardrails:
 Carry-forward public references:
 - `qa/evidence-bundles/four-row-public-20260503T024327Z`
 - `qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json`
-- `qa/evidence-bundles/four-row-api-webui-20260504T233202Z-head-cb8943d/manifest.json`
+- `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`
 - `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`
 - `qa/validation-notes/2026-05-03-ubuntu-toolchain-and-8b-context.md`
