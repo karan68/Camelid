@@ -1918,6 +1918,13 @@ impl LlamaForwardMemoryTimings {
             .q8_file_reads
             .read_bytes
             .saturating_add(other.q8_file_reads.read_bytes);
+        self.q8_file_reads.cache_hits = self
+            .q8_file_reads
+            .cache_hits
+            .saturating_add(other.q8_file_reads.cache_hits);
+        self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
+        self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
+        self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
         self.after_embedding = other.after_embedding.clone();
         self.after_layers = other.after_layers.clone();
         self.after_final_norm = other.after_final_norm.clone();
@@ -2085,6 +2092,13 @@ impl LlamaLayerMemoryTimings {
             .q8_file_reads
             .read_bytes
             .saturating_add(other.q8_file_reads.read_bytes);
+        self.q8_file_reads.cache_hits = self
+            .q8_file_reads
+            .cache_hits
+            .saturating_add(other.q8_file_reads.cache_hits);
+        self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
+        self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
+        self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
         self.after_attention_norm = other.after_attention_norm.clone();
         self.after_attention_q = other.after_attention_q.clone();
         self.after_attention_k = other.after_attention_k.clone();
@@ -6791,10 +6805,18 @@ mod tests {
         first.memory.as_mut().unwrap().q8_file_reads = Q8_0FileReadStats {
             read_calls: 3,
             read_bytes: 256,
+            cache_hits: 1,
+            cache_entries: 2,
+            cache_bytes: 512,
+            cache_capacity_bytes: 1024,
         };
         second.memory.as_mut().unwrap().q8_file_reads = Q8_0FileReadStats {
             read_calls: 4,
             read_bytes: 1024,
+            cache_hits: 2,
+            cache_entries: 3,
+            cache_bytes: 768,
+            cache_capacity_bytes: 1024,
         };
 
         first.add_assign(&second);
@@ -6806,6 +6828,10 @@ mod tests {
             Q8_0FileReadStats {
                 read_calls: 7,
                 read_bytes: 1280,
+                cache_hits: 3,
+                cache_entries: 3,
+                cache_bytes: 768,
+                cache_capacity_bytes: 1024,
             }
         );
         assert_eq!(memory.peak_rss_kib, Some(140));
@@ -6827,11 +6853,19 @@ mod tests {
         first.q8_file_reads = Q8_0FileReadStats {
             read_calls: 2,
             read_bytes: 128,
+            cache_hits: 1,
+            cache_entries: 1,
+            cache_bytes: 256,
+            cache_capacity_bytes: 512,
         };
         let mut second = LlamaLayerMemoryTimings::new(3, memory_sample(105, 1, 1));
         second.q8_file_reads = Q8_0FileReadStats {
             read_calls: 5,
             read_bytes: 512,
+            cache_hits: 3,
+            cache_entries: 2,
+            cache_bytes: 384,
+            cache_capacity_bytes: 512,
         };
 
         first.merge_assign(&second);
@@ -6842,6 +6876,10 @@ mod tests {
             Q8_0FileReadStats {
                 read_calls: 7,
                 read_bytes: 640,
+                cache_hits: 4,
+                cache_entries: 2,
+                cache_bytes: 384,
+                cache_capacity_bytes: 512,
             }
         );
 
@@ -7475,7 +7513,16 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(after_first.read_calls, 1);
         assert_eq!(after_first.read_bytes, 4);
-        assert_eq!(after_second, after_first);
+        assert_eq!(after_first.cache_hits, 0);
+        assert_eq!(after_first.cache_entries, 1);
+        assert_eq!(after_first.cache_bytes, 4);
+        assert_eq!(after_first.cache_capacity_bytes, 1024);
+        assert_eq!(after_second.read_calls, after_first.read_calls);
+        assert_eq!(after_second.read_bytes, after_first.read_bytes);
+        assert_eq!(after_second.cache_hits, 1);
+        assert_eq!(after_second.cache_entries, 1);
+        assert_eq!(after_second.cache_bytes, 4);
+        assert_eq!(after_second.cache_capacity_bytes, 1024);
     }
 
     #[test]
@@ -9263,20 +9310,8 @@ mod tests {
         assert!(layer_memory.after_ffn_activation.is_some());
         assert!(layer_memory.after_ffn_down.is_some());
         assert!(layer_memory.after_ffn_residual.is_some());
-        assert_eq!(
-            prefill_memory.q8_file_reads,
-            Q8_0FileReadStats {
-                read_calls: 0,
-                read_bytes: 0,
-            }
-        );
-        assert_eq!(
-            layer_memory.q8_file_reads,
-            Q8_0FileReadStats {
-                read_calls: 0,
-                read_bytes: 0,
-            }
-        );
+        assert_eq!(prefill_memory.q8_file_reads, Q8_0FileReadStats::default());
+        assert_eq!(layer_memory.q8_file_reads, Q8_0FileReadStats::default());
 
         assert_eq!(chunked_step.next_token_id, sequential_step.next_token_id);
         assert_slice_close(&chunked_step.logits.data, &sequential_step.logits.data);

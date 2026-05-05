@@ -788,12 +788,17 @@ const DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
 
 static Q8_0_FILE_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static Q8_FILE_CACHE: OnceLock<Mutex<Q8FileCache>> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
 pub struct Q8_0FileReadStats {
     pub read_calls: u64,
     pub read_bytes: u64,
+    pub cache_hits: u64,
+    pub cache_entries: u64,
+    pub cache_bytes: u64,
+    pub cache_capacity_bytes: u64,
 }
 
 impl Q8_0FileReadStats {
@@ -801,6 +806,10 @@ impl Q8_0FileReadStats {
         Self {
             read_calls: self.read_calls.saturating_sub(start.read_calls),
             read_bytes: self.read_bytes.saturating_sub(start.read_bytes),
+            cache_hits: self.cache_hits.saturating_sub(start.cache_hits),
+            cache_entries: self.cache_entries,
+            cache_bytes: self.cache_bytes,
+            cache_capacity_bytes: self.cache_capacity_bytes,
         }
     }
 }
@@ -811,9 +820,15 @@ pub(crate) fn record_q8_0_file_read(bytes: usize) {
 }
 
 pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
+    let cache_capacity_bytes = q8_file_cache_capacity_bytes();
+    let (cache_entries, cache_bytes) = q8_file_cache_snapshot(cache_capacity_bytes);
     Q8_0FileReadStats {
         read_calls: Q8_0_FILE_READ_CALLS.load(Ordering::Relaxed),
         read_bytes: Q8_0_FILE_READ_BYTES.load(Ordering::Relaxed),
+        cache_hits: Q8_0_FILE_CACHE_HITS.load(Ordering::Relaxed),
+        cache_entries,
+        cache_bytes,
+        cache_capacity_bytes: cache_capacity_bytes as u64,
     }
 }
 
@@ -848,6 +863,7 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
     let entry = cache.entries.remove(pos);
     out.copy_from_slice(&entry.bytes);
     cache.entries.push(entry);
+    Q8_0_FILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -867,6 +883,15 @@ fn q8_file_cache_capacity_bytes() -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_Q8_FILE_CACHE_BYTES)
+}
+
+fn q8_file_cache_snapshot(capacity: usize) -> (u64, u64) {
+    let Some(cache) = Q8_FILE_CACHE.get() else {
+        return (0, 0);
+    };
+    let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
+    cache.apply_capacity(capacity);
+    (cache.entries.len() as u64, cache.bytes as u64)
 }
 
 impl Q8FileCache {
@@ -1198,7 +1223,9 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{f16_bits_to_f32, q8_file_cache_get, q8_file_cache_insert, CpuTensor};
+    use super::{
+        f16_bits_to_f32, q8_0_file_read_stats, q8_file_cache_get, q8_file_cache_insert, CpuTensor,
+    };
     use crate::test_support::env_lock;
 
     #[test]
@@ -1215,14 +1242,24 @@ mod tests {
         ));
         q8_file_cache_insert(first_path.clone(), 10, b"abcdefgh");
         let mut out = [0_u8; 8];
+        let start = q8_0_file_read_stats();
         assert!(q8_file_cache_get(&first_path, 10, &mut out));
         assert_eq!(&out, b"abcdefgh");
+        let after_first = q8_0_file_read_stats().saturating_delta_since(start);
+        assert_eq!(after_first.cache_hits, 1);
+        assert_eq!(after_first.cache_entries, 1);
+        assert_eq!(after_first.cache_bytes, 8);
+        assert_eq!(after_first.cache_capacity_bytes, 8);
 
         q8_file_cache_insert(second_path.clone(), 20, b"ijklmnop");
         let mut evicted = [0_u8; 8];
         assert!(!q8_file_cache_get(&first_path, 10, &mut evicted));
         assert!(q8_file_cache_get(&second_path, 20, &mut evicted));
         assert_eq!(&evicted, b"ijklmnop");
+        let after_second = q8_0_file_read_stats().saturating_delta_since(start);
+        assert_eq!(after_second.cache_hits, 2);
+        assert_eq!(after_second.cache_entries, 1);
+        assert_eq!(after_second.cache_bytes, 8);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
     }
 

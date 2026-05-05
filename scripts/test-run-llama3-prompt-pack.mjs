@@ -85,6 +85,7 @@ const command = [
   '--out-dir', outDir,
   '--model', modelPath,
   '--model-id', 'runner-test-model',
+  '--backend-dense-diagnostics',
 ]
 const run = spawnSync(command[0], command.slice(1), {
   cwd: repoRoot,
@@ -107,6 +108,7 @@ assert.equal(summary.prompts[1].reference_context, 640)
 const firstReport = JSON.parse(readFileSync(summary.prompts[0].report_path, 'utf8'))
 assert.equal(firstReport.stub_args['render-mode'], 'compact')
 assert.equal(firstReport.stub_args['llama-context'], '512')
+assert.equal(firstReport.stub_args['backend-dense-diagnostics'], 'true')
 assert.ok(firstReport.stub_args['messages-json'])
 assert.equal(firstReport.prompt.messages[0].role, 'system')
 

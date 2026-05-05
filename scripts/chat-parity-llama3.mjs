@@ -22,6 +22,7 @@ const startLlamaServer = args.has('start-llama-server') || process.env.LLAMA3_ST
 const diagnosticsOut = args.get('diagnostics-out') || process.env.LLAMA3_CHAT_DIAGNOSTICS_OUT
 const requirePromptMatch = args.has('require-prompt-match') || process.env.LLAMA3_CHAT_REQUIRE_PROMPT_MATCH === '1'
 const requireGeneratedMatch = args.has('require-generated-match') || process.env.LLAMA3_CHAT_REQUIRE_GENERATED_MATCH === '1'
+const collectBackendDenseDiagnostics = args.has('backend-dense-diagnostics') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTICS === '1'
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
 const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') || process.env.LLAMA3_LLAMA_CONTEXT, 'llama-context')
 
@@ -110,6 +111,7 @@ try {
     body: JSON.stringify({
       ...chatPayload,
       backendinference_logit_token_ids: diagnosticTokenIds,
+      ...(collectBackendDenseDiagnostics ? { backendinference_dense_diagnostics: true } : {}),
     }),
   })
 

@@ -19,6 +19,7 @@ const requirePromptMatch = args.has('require-prompt-match') || process.env.LLAMA
 const requireGeneratedMatch = args.has('require-generated-match') || process.env.LLAMA3_CHAT_REQUIRE_GENERATED_MATCH === '1'
 const passthroughFlags = [
   ['start-llama-server', args.has('start-llama-server') || process.env.LLAMA3_START_LLAMA_SERVER === '1'],
+  ['backend-dense-diagnostics', args.has('backend-dense-diagnostics') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTICS === '1'],
 ]
 const passthroughArgs = [
   ['llama-server', args.get('llama-server') || process.env.LLAMA3_LLAMA_SERVER],
