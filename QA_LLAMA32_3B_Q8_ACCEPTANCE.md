@@ -1,13 +1,15 @@
 # Llama 3.2 3B Instruct Q8_0 Parity Acceptance
 
-Last updated: 2026-05-02
+Last updated: 2026-05-05
 
 > [!NOTE]
 > This QA checklist is an acceptance document for one exact model row. It does not change the
 > public support contract by itself. For current support truth, use [`COMPATIBILITY.md`](COMPATIBILITY.md)
 > and [`STATUS.md`](STATUS.md).
 
-QA checklist for the exact Llama 3.2 3B WebUI real-chat acceptance gate.
+QA checklist for the exact Llama 3.2 3B WebUI real-chat acceptance gate. The short local-chat
+smoke gate is now accepted for this exact row; this file remains the QA boundary for preserving
+that claim and for naming the still-missing expansion evidence.
 
 ## Exact target artifact
 
@@ -20,16 +22,24 @@ QA checklist for the exact Llama 3.2 3B WebUI real-chat acceptance gate.
 
 Current state: the exact GGUF is now present at the expected model-dir path, Camelid metadata/API
 load evidence exists, the Ubuntu compact-header `hello` harness has prompt-token parity plus
-deterministic 1-token, 5-token, and bounded 50-token generation parity, and the broader
-three-prompt 50-token pack now matches llama.cpp. The blocker has moved from parity to longer
-context, stronger performance/portability, and broader chat-template acceptance.
+deterministic 1-token, 5-token, and bounded 50-token generation parity, the broader three-prompt
+50-token pack now matches llama.cpp, and reopened-lane API/WebUI smoke is captured for this exact
+row. The support claim is therefore **supported exact-row smoke** only. The blocker has moved from
+short-chat parity/API/WebUI acceptance to longer context, stronger performance/portability, and
+broader chat-template acceptance before any broader/full-support language.
+
+Durable public anchors:
+
+- `qa/evidence-bundles/four-row-public-20260503T024327Z/llama32_3b_instruct_q8_0.bundle.json` preserves the carry-forward exact-row smoke boundary.
+- `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json` is the current-head citation target for the compact parity, post-Q8-dot broader-pack handoff, and next context/template/perf tracks.
+- `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json` records the reopened-lane API + frontend smoke refresh for this exact row.
 
 ## Current blocker summary
 
 - `/api/models/load` succeeds for the exact 3B target.
 - The latest file-backed lazy-Q8 recovery materially reduced the earlier eager dense-load spike.
 - The Ubuntu compact-header `hello` harness now matches llama.cpp for prompt tokens plus deterministic 1-token, 5-token, and bounded 50-token generation.
-- The former broader JSON-shaped prompt blocker is resolved by the post-Q8-dot clean rerun at `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json`: `hello`, alpacas, and `answer with valid JSON for {"ok":true,"value":2}` all match llama.cpp for prompt tokens, generated token IDs, and generated text.
+- The former broader JSON-shaped prompt blocker is resolved by the post-Q8-dot clean rerun. The public citation target is `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json`; the raw drill-down source path was `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json`. In that checked pack, `hello`, alpacas, and `answer with valid JSON for {"ok":true,"value":2}` all match llama.cpp for prompt tokens, generated token IDs, and generated text.
 - Therefore the row is no longer parity-blocked for the current three-prompt 50-token pack; remaining expansion gates are longer context, stronger performance/portability, and broader chat-template evidence.
 
 ## Disk and memory expectations
@@ -40,7 +50,9 @@ context, stronger performance/portability, and broader chat-template acceptance.
 
 ## Acceptance checklist
 
-Do not mark the 3B row green until all applicable items have artifact paths.
+The exact-row short-chat smoke items below are accepted for the current row. Do not mark any
+broader/full-support expansion green until all applicable items for that larger claim have durable
+artifact paths.
 
 1. **Model presence** — exact filename exists at the expected model-dir path; record size and hash.
 2. **Readiness/inspect** — `scripts/small-model-readiness.mjs` or equivalent reports the row and
@@ -61,4 +73,4 @@ Status: **accepted exact-row parity/API/WebUI smoke with broader three-prompt pa
 
 The exact 3B artifact now exists, and the Ubuntu compact-header `hello` harness matches llama.cpp
 for prompt tokens plus deterministic 1-token, 5-token, and bounded 50-token generation. The former
-JSON-shaped broader prompt blocker is now fixed: `target/camelid-regression-q8dot-20260502T232633Z/llama32-3b-compact/summary.json` passes the compact pack, and `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json` passes the broader three-prompt 50-token pack with prompt tokens, generated token IDs, and generated text all matching llama.cpp. The current work is to preserve that evidence and expand only after longer-context, performance/portability, and broader chat-template gates land.
+JSON-shaped broader prompt blocker is now fixed. The raw drill-down paths were `target/camelid-regression-q8dot-20260502T232633Z/llama32-3b-compact/summary.json` for the compact pack and `target/camelid-llama32-3b-broad-50-after-q8dot-clean-20260502T233427Z/pack/summary.json` for the broader three-prompt 50-token pack; the durable public citation target is `qa/evidence-bundles/four-row-current-head-20260503T061958Z-head-34b954498a03/llama32_3b_instruct_q8_0/manifest.json`, with API/WebUI freshness in `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`. The current work is to preserve that evidence and expand only after longer-context, performance/portability, and broader chat-template gates land.

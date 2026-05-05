@@ -22,7 +22,7 @@
     ]
   },
   "host": {
-    "hostname": "tims-mac-mini.lan",
+    "hostname": "redacted-local-docs-host",
     "platform": "darwin",
     "release": "25.5.0",
     "arch": "arm64",
