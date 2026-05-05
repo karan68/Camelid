@@ -1142,6 +1142,8 @@ pub struct LlamaForwardMemoryTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_rss_kib: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_delta_kib: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_phase: Option<String>,
     pub layers: Vec<LlamaLayerMemoryTimings>,
 }
@@ -1182,6 +1184,8 @@ pub struct LlamaLayerMemoryTimings {
     pub after_ffn_residual: Option<LlamaMemorySample>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_rss_kib: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_rss_delta_kib: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peak_phase: Option<String>,
 }
@@ -1822,6 +1826,7 @@ impl LlamaForwardMemoryTimings {
             q8_file_reads: Q8_0FileReadStats::default(),
             q8_file_read_start,
             peak_rss_kib: None,
+            peak_rss_delta_kib: None,
             peak_phase: None,
             start,
             after_embedding: None,
@@ -1897,6 +1902,7 @@ impl LlamaForwardMemoryTimings {
     fn consider_peak_rss(&mut self, phase: &str, rss: u64) {
         if self.peak_rss_kib.is_none_or(|peak| rss > peak) {
             self.peak_rss_kib = Some(rss);
+            self.peak_rss_delta_kib = self.start.rss_kib.map(|start| rss as i64 - start as i64);
             self.peak_phase = Some(phase.to_string());
         }
     }
@@ -1942,6 +1948,7 @@ impl LlamaLayerMemoryTimings {
             q8_file_reads: Q8_0FileReadStats::default(),
             q8_file_read_start: q8_0_file_read_stats(),
             peak_rss_kib: None,
+            peak_rss_delta_kib: None,
             peak_phase: None,
             start,
             after_attention_norm: None,
@@ -2056,10 +2063,15 @@ impl LlamaLayerMemoryTimings {
 
     fn consider_peak(&mut self, phase: &str, sample: &LlamaMemorySample) {
         if let Some(rss) = sample.rss_kib {
-            if self.peak_rss_kib.is_none_or(|peak| rss > peak) {
-                self.peak_rss_kib = Some(rss);
-                self.peak_phase = Some(phase.to_string());
-            }
+            self.consider_peak_rss(phase, rss);
+        }
+    }
+
+    fn consider_peak_rss(&mut self, phase: &str, rss: u64) {
+        if self.peak_rss_kib.is_none_or(|peak| rss > peak) {
+            self.peak_rss_kib = Some(rss);
+            self.peak_rss_delta_kib = self.start.rss_kib.map(|start| rss as i64 - start as i64);
+            self.peak_phase = Some(phase.to_string());
         }
     }
 
@@ -2087,10 +2099,7 @@ impl LlamaLayerMemoryTimings {
         self.after_ffn_down = other.after_ffn_down.clone();
         self.after_ffn_residual = other.after_ffn_residual.clone();
         if let (Some(phase), Some(rss)) = (&other.peak_phase, other.peak_rss_kib) {
-            if self.peak_rss_kib.is_none_or(|peak| rss > peak) {
-                self.peak_rss_kib = Some(rss);
-                self.peak_phase = Some(phase.clone());
-            }
+            self.consider_peak_rss(phase, rss);
         }
     }
 }
@@ -3895,18 +3904,14 @@ fn output_projection_with_layout(
                     weight.name, weight.shape.dims
                 )));
             }
-            if weight.dim(0)? == input_width {
-                let mut token_major = weight.clone();
-                token_major.shape.dims.swap(0, 1);
-                matmul_rhs_transposed_with_precision(input, &token_major, name)
-            } else if weight.dim(1)? == input_width {
-                matmul_rhs_transposed_with_precision(input, weight, name)
-            } else {
-                Err(BackendError::RuntimeShapeMismatch(format!(
+            if weight.dim(0)? != input_width && weight.dim(1)? != input_width {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
                     "token-major output projection input shape {:?} is incompatible with weight {} shape {:?}",
                     input.shape.dims, weight.name, weight.shape.dims
-                )))
+                )));
             }
+            let token_major = borrowed_linear_weight_as_transposed(weight, input_width)?;
+            matmul_rhs_transposed_borrowed_with_precision(input, token_major, name)
         }
     }
 }
@@ -3946,6 +3951,35 @@ fn matmul_rhs_transposed_with_precision(
         LinearAccumulationPrecision::F32 => input.matmul_rhs_transposed(weight, name),
         LinearAccumulationPrecision::F64 => matmul_rhs_transposed_f64(input, weight, name),
     }
+}
+
+fn matmul_rhs_transposed_borrowed_with_precision(
+    input: &CpuTensor,
+    weight: BorrowedLinearWeight<'_>,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    if weight.cols != input_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "borrowed transposed matmul shape mismatch: lhs {:?}, rhs [{}, {}]",
+            input.shape.dims, weight.rows, weight.cols
+        )));
+    }
+    let output_width = weight.rows;
+    let mut output = vec![0.0; rows * output_width];
+    let precision = diagnostic_linear_accumulation_precision()?;
+    for row in 0..rows {
+        let input_start = row * input_width;
+        let output_start = row * output_width;
+        accumulate_transposed_linear_row_runtime(
+            &input.data[input_start..input_start + input_width],
+            weight,
+            &mut output[output_start..output_start + output_width],
+            precision,
+        )?;
+    }
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
 fn matmul_descriptor_f64(
@@ -6775,6 +6809,7 @@ mod tests {
             }
         );
         assert_eq!(memory.peak_rss_kib, Some(140));
+        assert_eq!(memory.peak_rss_delta_kib, Some(40));
         assert_eq!(memory.peak_phase.as_deref(), Some("layers_done"));
         assert_eq!(memory.end, None);
         assert_eq!(
@@ -6809,6 +6844,11 @@ mod tests {
                 read_bytes: 640,
             }
         );
+
+        first.record_after_attention_output(memory_sample(160, 1, 1));
+        assert_eq!(first.peak_rss_kib, Some(160));
+        assert_eq!(first.peak_rss_delta_kib, Some(60));
+        assert_eq!(first.peak_phase.as_deref(), Some("attention_output_done"));
     }
 
     #[cfg(target_os = "linux")]

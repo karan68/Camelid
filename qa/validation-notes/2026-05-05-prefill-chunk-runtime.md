@@ -20,7 +20,9 @@ Follow-up instrumentation:
 
 - Chunked prompt prefill now participates in structured forward-memory diagnostics when `BACKENDINFERENCE_FORWARD_RSS_TIMINGS=1` or `BACKENDINFERENCE_FORWARD_MEMORY_TRACE=1` is enabled.
 - The prefill chunk records start/embedding/layers/end samples, Q8 file-read deltas, and per-layer phase samples for attention norm/Q/K/RoPE/V, KV-cache write, attention context/output/residual, FFN norm/activation/down/residual.
-- This is instrumentation for the performance/memory architecture lane only; it is not a row-support promotion or an 8B long-context PASS artifact.
+- Forward and layer memory summaries include `peak_rss_delta_kib`, so prefill/first-token API timing output can show the RSS peak relative to that forward/layer start without post-processing absolute samples.
+- The token-major output projection path uses a borrowed transposed weight view instead of cloning the output-weight tensor metadata/data before matmul, preserving the existing Q8/file-backed reader path while avoiding an avoidable dense clone on the logits hot path.
+- This is instrumentation/hot-path cleanup for the performance/memory architecture lane only; it is not a row-support promotion or an 8B long-context PASS artifact.
 
 Validation:
 
@@ -33,9 +35,21 @@ Validation:
 
 Result: all passed locally.
 
+Additional local follow-up on `f91cd07` plus this lane patch:
+
+```bash
+./scripts/with-rustup-cargo.sh fmt --check
+./scripts/with-rustup-cargo.sh test -q
+./scripts/with-rustup-cargo.sh clippy -q --lib -- -D warnings
+./scripts/with-rustup-cargo.sh build -q --release --bin backendinference
+bash scripts/check-public-scrub.sh
+```
+
+Result: passed locally (full `test -q`: 252 passed across test binaries).
+
 Ubuntu follow-up validation:
 
-- Approved validation target: `ubuntu@54.69.75.77` using `/Users/timtoole/Documents/cert/ubuntu.pem`.
+- Approved validation target: private maintainer-only Ubuntu validation lane; SSH host/key details intentionally omitted from public notes.
 - Isolated remote checkout base: `c4b51de7e7f7cc1bf16bd77ceded4589246b003e`.
 - Applied patch SHA256: `cc30a2cdcae54ba02c2e82b86089ff7dc99dc834592719ab3ecb1a0cab111c42`.
 - Remote work dir: `/tmp/camelid-prefill-memory-lx1w0o/repo`.
