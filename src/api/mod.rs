@@ -843,7 +843,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 parity_audited: "compact_50_token_plus_broader_50_token_prompt_pack_match",
                 performance_measured: "bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs",
                 frontend_load_path_verified: "validated",
-                tested_context: "short_api_webui_smoke_with_broader_50_token_and_first_512_context_pack",
+                tested_context: "short_api_webui_smoke_with_broader_50_token_first_512_context_pack_and_blocked_2048_timeout",
                 chat_template_renderer: "compact",
                 chat_template_shape_pack: "validated_compact_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
@@ -853,11 +853,11 @@ fn capabilities_response() -> CapabilitiesResponse {
                 bounded_context_1024_pack: "not_started",
                 bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "ready_to_run_not_promoted",
+                bounded_context_2048_pack: "blocked_backend_timeout_900s",
                 bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, one passing bounded 512-context pack, one passing compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; exact-row smoke is supported without broad 8B/full-context, arbitrary-template, or performance-portability promotion",
-                next_step: "preserve exact-row smoke support while broadening context/template coverage, refreshing API/WebUI evidence as needed, and closing production performance/RSS portability evidence on the approved Ubuntu validation lane before any broader/full-support claim; treat the passing broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path artifacts as bounded packs/measurements only",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, one passing bounded 512-context pack, one passing compact chat-template-shapes pack, retained-block lazy-Q8 hot-path cost probes, and an explicit blocked 2048-context attempt where the backend did not complete within the 900-second parity timeout; exact-row smoke is supported without broad 8B/full-context, arbitrary-template, or performance-portability promotion",
+                next_step: "preserve exact-row smoke support while debugging the 8B 2048-context backend timeout, running the separate 1024-context pack before any larger-context promotion, refreshing API/WebUI evidence as needed, and closing production performance/RSS portability evidence on the approved Ubuntu validation lane before any broader/full-support claim; treat the passing broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path artifacts as bounded packs/measurements only",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
@@ -3094,7 +3094,7 @@ mod tests {
         assert_eq!(eight_b.bounded_context_1024_pack, "not_started");
         assert_eq!(
             eight_b.bounded_context_2048_pack,
-            "ready_to_run_not_promoted"
+            "blocked_backend_timeout_900s"
         );
     }
 

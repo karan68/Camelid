@@ -689,6 +689,7 @@ export default function ModelsView({
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge warm">8B lazy-Q8 hot-path costs measured</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B broader 50-token pack passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B first 512-context pack passed</div>}
+                    {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge warm">8B 2048-context attempt timeout-blocked</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B compact template-shapes pack passed</div>}
                     {match.active && <div className="pin-badge ready">Loaded exact-row match</div>}
                     {!match.active && match.selected && <div className="pin-badge">Selected exact-row match</div>}
