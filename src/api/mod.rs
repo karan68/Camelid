@@ -194,6 +194,9 @@ pub struct ModelCompatibilityTarget {
     pub bounded_context_512_pack: &'static str,
     pub bounded_context_512_pack_id: &'static str,
     pub bounded_context_window: u32,
+    pub bounded_context_1024_pack: &'static str,
+    pub bounded_context_1024_pack_id: &'static str,
+    pub bounded_context_1024_window: u32,
     pub evidence: &'static str,
     pub next_step: &'static str,
 }
@@ -661,7 +664,11 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
 }
 
 async fn capabilities() -> Json<CapabilitiesResponse> {
-    Json(CapabilitiesResponse {
+    Json(capabilities_response())
+}
+
+fn capabilities_response() -> CapabilitiesResponse {
+    CapabilitiesResponse {
         engine: "backendinference",
         gguf_metadata: true,
         tensor_loading: true,
@@ -756,6 +763,9 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 bounded_context_512_pack: "ready_to_run",
                 bounded_context_512_pack_id: "tinyllama-context-512-smoke-v1",
                 bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
                 evidence: "five-prompt TinyLlama Q8_0 parity gate plus current performance artifacts recorded in STATUS.md",
                 next_step: "extend to larger contexts and additional LLaMA-family/quant targets before broadening support claims",
             },
@@ -777,7 +787,10 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_bounded_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
-                bounded_context_window: 512,
+                bounded_context_window: 1024,
+                bounded_context_1024_pack: "validated_second_pack",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
                 evidence: "the exact bartowski Llama-3.2-1B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke evidence, compact/prompt-pack parity, first bounded 512-context parity, second bounded 1024-context parity, bounded compact template-shape coverage, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
                 next_step: "preserve exact-row smoke support while normalizing larger/broader context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
             },
@@ -799,7 +812,10 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_bounded_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
-                bounded_context_window: 512,
+                bounded_context_window: 1024,
+                bounded_context_1024_pack: "validated_second_pack",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
                 evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
                 next_step: "preserve exact-row smoke support while normalizing larger/broader context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
             },
@@ -822,6 +838,9 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 bounded_context_512_pack: "validated_first_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
                 bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
                 evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, one passing bounded 512-context pack, one passing compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; exact-row smoke is supported without broad 8B/full-context, arbitrary-template, or performance-portability promotion",
                 next_step: "preserve exact-row smoke support while broadening context/template coverage, refreshing API/WebUI evidence as needed, and closing production performance/RSS portability evidence on the approved Ubuntu validation lane before any broader/full-support claim; treat the passing broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path artifacts as bounded packs/measurements only",
             },
@@ -844,6 +863,9 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "not_selected",
                 bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
                 evidence: "planned quant tensor fixtures parse descriptors but reject CPU f32 loading until dequant/matmul support exists",
                 next_step: "implement legacy smaller-quant dequant tests before any real-model support claim",
             },
@@ -866,6 +888,9 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "not_selected",
                 bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
                 evidence: "planned K-quant tensor fixtures parse descriptors but reject CPU f32 loading until dequant/matmul support exists",
                 next_step: "start after simpler Q4_0/Q5_0 support has loader, matmul, and parity evidence",
             },
@@ -888,6 +913,9 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "not_selected",
                 bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
                 evidence: "tracked as the next likely GGUF family after LLaMA-family breadth stabilizes",
                 next_step: "choose a concrete Mistral GGUF target and add tokenizer/chat-template fixtures before generation work",
             },
@@ -919,7 +947,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
             "public completion endpoints can generate small OpenAI-compatible non-streaming responses and SSE token streams from a loaded Camelid-supported dense GGUF model",
             "capability fields are intentionally explicit so the frontend and providers do not infer unsupported model families or quantization formats",
         ],
-    })
+    }
 }
 
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
@@ -2973,6 +3001,44 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn capabilities_report_llama32_second_1024_context_pack() {
+        let response = capabilities_response();
+        let targets = response
+            .model_compatibility
+            .iter()
+            .filter(|target| {
+                matches!(
+                    target.id,
+                    "llama32_1b_instruct_q8_0" | "llama32_3b_instruct_q8_0"
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets.len(), 2);
+        for target in targets {
+            assert_eq!(target.status, "supported_exact_row_smoke");
+            assert_eq!(target.bounded_context_512_pack, "validated_bounded_pack");
+            assert_eq!(target.bounded_context_window, 1024);
+            assert_eq!(target.bounded_context_1024_pack, "validated_second_pack");
+            assert_eq!(
+                target.bounded_context_1024_pack_id,
+                "llama3-context-1024-smoke-v1"
+            );
+            assert_eq!(target.bounded_context_1024_window, 1024);
+            assert!(target
+                .evidence
+                .contains("second bounded 1024-context parity"));
+        }
+
+        let eight_b = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "llama3_8b_instruct_q8_0")
+            .expect("8B row should stay advertised");
+        assert_eq!(eight_b.bounded_context_1024_pack, "not_started");
+    }
 
     #[test]
     fn selected_logit_diagnostics_include_rank_outside_top_count() {

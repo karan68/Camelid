@@ -95,6 +95,9 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "tinyllama-context-512-smoke-v1"
     );
     assert_eq!(tinyllama["bounded_context_window"], 512);
+    assert_eq!(tinyllama["bounded_context_1024_pack"], "not_promoted");
+    assert_eq!(tinyllama["bounded_context_1024_pack_id"], "not_selected");
+    assert_eq!(tinyllama["bounded_context_1024_window"], 1024);
     let llama32_1b = compatibility
         .iter()
         .find(|item| item["id"] == "llama32_1b_instruct_q8_0")
@@ -127,7 +130,16 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         llama32_1b["bounded_context_512_pack_id"],
         "llama3-context-512-smoke-v1"
     );
-    assert_eq!(llama32_1b["bounded_context_window"], 512);
+    assert_eq!(llama32_1b["bounded_context_window"], 1024);
+    assert_eq!(
+        llama32_1b["bounded_context_1024_pack"],
+        "validated_second_pack"
+    );
+    assert_eq!(
+        llama32_1b["bounded_context_1024_pack_id"],
+        "llama3-context-1024-smoke-v1"
+    );
+    assert_eq!(llama32_1b["bounded_context_1024_window"], 1024);
     let llama32_3b = compatibility
         .iter()
         .find(|item| item["id"] == "llama32_3b_instruct_q8_0")
@@ -159,7 +171,16 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         llama32_3b["bounded_context_512_pack_id"],
         "llama3-context-512-smoke-v1"
     );
-    assert_eq!(llama32_3b["bounded_context_window"], 512);
+    assert_eq!(llama32_3b["bounded_context_window"], 1024);
+    assert_eq!(
+        llama32_3b["bounded_context_1024_pack"],
+        "validated_second_pack"
+    );
+    assert_eq!(
+        llama32_3b["bounded_context_1024_pack_id"],
+        "llama3-context-1024-smoke-v1"
+    );
+    assert_eq!(llama32_3b["bounded_context_1024_window"], 1024);
     let llama3 = compatibility
         .iter()
         .find(|item| item["id"] == "llama3_8b_instruct_q8_0")
@@ -202,6 +223,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "llama3-context-512-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_window"], 512);
+    assert_eq!(llama3["bounded_context_1024_pack"], "not_started");
+    assert_eq!(
+        llama3["bounded_context_1024_pack_id"],
+        "llama3-context-1024-smoke-v1"
+    );
+    assert_eq!(llama3["bounded_context_1024_window"], 1024);
     assert!(llama3["evidence"]
         .as_str()
         .unwrap()
@@ -223,6 +250,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(planned_quant["bounded_context_512_pack"], "not_started");
     assert_eq!(planned_quant["bounded_context_512_pack_id"], "not_selected");
     assert_eq!(planned_quant["bounded_context_window"], 512);
+    assert_eq!(planned_quant["bounded_context_1024_pack"], "not_started");
+    assert_eq!(
+        planned_quant["bounded_context_1024_pack_id"],
+        "not_selected"
+    );
+    assert_eq!(planned_quant["bounded_context_1024_window"], 1024);
 }
 
 #[tokio::test]

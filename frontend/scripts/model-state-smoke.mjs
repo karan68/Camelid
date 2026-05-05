@@ -142,15 +142,25 @@ const capabilityFixture = {
   model_compatibility: [
     { id: 'tinyllama_1_1b_chat_q8_0', family: 'llama_spm_decoder', quantization: 'Q8_0', status: 'supported_current_gate', evidence: 'TinyLlama Q8_0 evidence' },
     { id: 'llama_spm_q4_k_q5_k', family: 'llama_spm_decoder', quantization: 'Q4_K_M/Q5_K_M', status: 'planned_phase_10', next_step: 'implement K-quant support' },
-    { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', evidence: '1B exact-row load, completion, chat, frontend smoke, and prompt-pack evidence' },
-    { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', evidence: '3B exact-row load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, and third 2048-context evidence' },
-    { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, first 512-context, and compact template-shapes pack evidence only' },
+    { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'validated_second_pack', evidence: '1B exact-row load, completion, chat, frontend smoke, and second 1024-context evidence' },
+    { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'validated_second_pack', evidence: '3B exact-row load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, and third 2048-context evidence' },
+    { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'not_started', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, first 512-context, and compact template-shapes pack evidence only' },
   ],
 }
+const trackedTargets = getTrackedCompatibilityTargets(capabilityFixture)
 assert.deepEqual(
-  getTrackedCompatibilityTargets(capabilityFixture).map((target) => target.id),
+  trackedTargets.map((target) => target.id),
   ['llama32_1b_instruct_q8_0', 'llama32_3b_instruct_q8_0', 'llama3_8b_instruct_q8_0'],
   'tracked promotion rows should stay pinned to the exact 1B/3B/8B ids in /api/capabilities order',
+)
+assert.deepEqual(
+  trackedTargets.map((target) => [target.id, target.bounded_context_1024_pack]),
+  [
+    ['llama32_1b_instruct_q8_0', 'validated_second_pack'],
+    ['llama32_3b_instruct_q8_0', 'validated_second_pack'],
+    ['llama3_8b_instruct_q8_0', 'not_started'],
+  ],
+  'frontend tracked rows should preserve the API 1024-context pack boundary without lending it to 8B',
 )
 
 const tinyQ8Hint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q8_0' })
