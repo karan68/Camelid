@@ -91,6 +91,7 @@ Reopened-lane API + frontend smoke: `qa/evidence-bundles/four-row-api-webui-2026
 - **Family / quant:** LLaMA decoder + Llama 3 BPE, Q8_0
 - **Validated now:** metadata, tokenizer path, tensor load, compact parity, broader prompt-pack parity, the first bounded 512-context pack, the second bounded 1024-context pack, the bounded compact chat-template-shapes pack, the bounded unique-chat perf/RSS envelope, `/api/models/load`, `/v1/completions`, `/v1/chat/completions`, and frontend smoke are validated for the exact 1B Instruct Q8_0 row
 - **Blocked now:** the attempted third bounded 2048-context pack has exact prompt-token parity but fails generated-token/text parity at generated token index `0`; do not treat 2048 context as supported for this row
+- **Runtime follow-up:** Camelid now loads and prefers GGUF `rope_freqs.weight` under local fmt/clippy/test coverage, targeting a suspected long-context RoPE mismatch; this remains code evidence only and does not clear the 2048 blocker without a fresh passing parity artifact
 - **Missing gates:** model-native/larger context beyond the checked 512/1024 packs, arbitrary/Jinja template behavior beyond the checked compact pack, production throughput evidence, and portable packaging
 - **Support boundary:** supported exact-row smoke only for this exact 1B Instruct Q8_0 row; no broader/full-support or neighboring-row claim yet
 
