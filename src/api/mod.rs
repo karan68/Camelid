@@ -679,7 +679,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles; the 1B third 2048-context pack is blocked by first-token divergence, the 3B third 2048-context pack passed, and the 8B broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path reruns are bounded packs/measurements only",
+            current_gate: "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles; the 1B third 2048-context pack is blocked by first-token divergence, the 3B third 2048-context pack passed, and the 8B broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path reruns are bounded packs/measurements only; 8B 1024/2048-context promotion is paused after backend timeouts",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -726,7 +726,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B/3B and Llama 3 8B Instruct Q8_0 have row-specific smoke support; the 1B third 2048-context pack is explicitly blocked, the 3B third 2048-context pack passed, and the 8B broader 50-token, first 512-context, compact chat-template-shapes, and retained-block lazy-Q8 hot-path passes are bounded pack/measurement evidence only; broader Llama-family/full support still waits on normalized current-head bundles, broader context/template coverage, and production performance evidence",
+                notes: "exact Llama 3.2 1B/3B and Llama 3 8B Instruct Q8_0 have row-specific smoke support; the 1B third 2048-context pack is explicitly blocked, the 3B third 2048-context pack passed, and the 8B broader 50-token, first 512-context, compact chat-template-shapes, and retained-block lazy-Q8 hot-path passes are bounded pack/measurement evidence only; the 8B 1024/2048 context packs are blocked by backend timeout and promotion is paused; broader Llama-family/full support still waits on normalized current-head bundles, broader context/template coverage, and production performance evidence",
             },
         ],
         planned_model_families: vec![
@@ -843,21 +843,21 @@ fn capabilities_response() -> CapabilitiesResponse {
                 parity_audited: "compact_50_token_plus_broader_50_token_prompt_pack_match",
                 performance_measured: "bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs",
                 frontend_load_path_verified: "validated",
-                tested_context: "short_api_webui_smoke_with_broader_50_token_first_512_context_pack_and_blocked_2048_timeout",
+                tested_context: "short_api_webui_smoke_with_broader_50_token_first_512_context_pack_and_blocked_1024_2048_timeouts",
                 chat_template_renderer: "compact",
                 chat_template_shape_pack: "validated_compact_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_first_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack: "blocked_backend_timeout_900s",
                 bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
                 bounded_context_2048_pack: "blocked_backend_timeout_900s",
                 bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, one passing bounded 512-context pack, one passing compact chat-template-shapes pack, retained-block lazy-Q8 hot-path cost probes, and an explicit blocked 2048-context attempt where the backend did not complete within the 900-second parity timeout; exact-row smoke is supported without broad 8B/full-context, arbitrary-template, or performance-portability promotion",
-                next_step: "preserve exact-row smoke support while debugging the 8B 2048-context backend timeout, running the separate 1024-context pack before any larger-context promotion, refreshing API/WebUI evidence as needed, and closing production performance/RSS portability evidence on the approved Ubuntu validation lane before any broader/full-support claim; treat the passing broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path artifacts as bounded packs/measurements only",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, one passing bounded 512-context pack, one passing compact chat-template-shapes pack, retained-block lazy-Q8 hot-path cost probes, and explicit blocked 1024-context and 2048-context attempts where the backend did not complete within the 900-second parity timeout; exact-row smoke is supported without broad 8B/full-context, arbitrary-template, or performance-portability promotion",
+                next_step: "pause 8B long-context promotion after the 1024 diagnostic timeout; preserve exact-row smoke support while shifting to KV/cache and attention memory behavior, Q8 matmul/output-projection hot paths, dense/f32 materialization avoidance, chunked or streamed long-context prefill, and per-layer timing/RSS-peak instrumentation with TinyLlama/1B/3B short-context correctness guardrails before any broader/full-support claim; treat the passing broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path artifacts as bounded packs/measurements only",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
@@ -3091,7 +3091,10 @@ mod tests {
             .iter()
             .find(|target| target.id == "llama3_8b_instruct_q8_0")
             .expect("8B row should stay advertised");
-        assert_eq!(eight_b.bounded_context_1024_pack, "not_started");
+        assert_eq!(
+            eight_b.bounded_context_1024_pack,
+            "blocked_backend_timeout_900s"
+        );
         assert_eq!(
             eight_b.bounded_context_2048_pack,
             "blocked_backend_timeout_900s"

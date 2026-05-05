@@ -45,7 +45,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles; the 1B third 2048-context pack is blocked by first-token divergence, the 3B third 2048-context pack passed, and the 8B broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path reruns are bounded packs/measurements only"
+        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles; the 1B third 2048-context pack is blocked by first-token divergence, the 3B third 2048-context pack passed, and the 8B broader 50-token, 512-context, compact chat-template-shapes, and lazy-Q8 hot-path reruns are bounded packs/measurements only; 8B 1024/2048-context promotion is paused after backend timeouts"
     );
     assert!(body["supported_quantization"]
         .as_array()
@@ -234,7 +234,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama3["tested_context"],
-        "short_api_webui_smoke_with_broader_50_token_and_first_512_context_pack"
+        "short_api_webui_smoke_with_broader_50_token_first_512_context_pack_and_blocked_1024_2048_timeouts"
     );
     assert_eq!(llama3["chat_template_renderer"], "compact");
     assert_eq!(llama3["chat_template_shape_pack"], "validated_compact_pack");
@@ -248,7 +248,10 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "llama3-context-512-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_window"], 512);
-    assert_eq!(llama3["bounded_context_1024_pack"], "not_started");
+    assert_eq!(
+        llama3["bounded_context_1024_pack"],
+        "blocked_backend_timeout_900s"
+    );
     assert_eq!(
         llama3["bounded_context_1024_pack_id"],
         "llama3-context-1024-smoke-v1"
@@ -256,7 +259,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama3["bounded_context_1024_window"], 1024);
     assert_eq!(
         llama3["bounded_context_2048_pack"],
-        "ready_to_run_not_promoted"
+        "blocked_backend_timeout_900s"
     );
     assert_eq!(
         llama3["bounded_context_2048_pack_id"],
