@@ -119,14 +119,15 @@ What exists now:
 - serial `dot_row_f32`, `dot_all_rows_f32`, and single-input-row adapters
 - CPU materialization-budget guardrails
 - Llama 3 tokenizer, config, GQA, and RoPE groundwork
+- a code-only chunked prefill slice (`BACKENDINFERENCE_PREFILL_CHUNK_TOKENS`, default `32`) that batches non-final prompt tokens through embedding, Q/K/V, RoPE, KV writes, causal attention context, attention output, and FFN while leaving the final logits token on the established single-token path
+- Q8_0 file-backed batched matmul read reuse across input rows for bounded prefill chunks
 
 What still needs to happen:
 
-- wire retained-Q8 linear execution through attention projections
-- wire it through FFN projections
-- wire it through final output projection
+- measure chunked prefill on approved row-specific runtime lanes before using it in support claims
+- keep retained-Q8 linear execution wired through attention, FFN, and final output projection without unsafe eager dense materialization
 - keep bounded scratch/output behavior explicit and measured
-- verify first-token generation without unsafe eager dense materialization
+- verify first-token and longer-prompt generation with row-specific parity/RSS evidence before promoting any larger context box
 
 What does **not** count as promotion evidence by itself:
 

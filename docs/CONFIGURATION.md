@@ -84,6 +84,10 @@ Current public docs assume:
 - `node` and `npm` are available for frontend work
 - `llama-server` is in `PATH` only when you are running parity comparisons
 
+Backend runtime knobs used during performance work:
+
+- `BACKENDINFERENCE_PREFILL_CHUNK_TOKENS` controls how many non-final prompt tokens the backend processes per chunk in the chunked prefill path. Default: `32`. Set it to `0` or `1` to force the older sequential prefill path while debugging. This is a runtime/performance knob only; it is not support evidence for any model row by itself.
+
 If a command depends on more than that, document the requirement in the same PR.
 
 ## Maintainer-only/private workflows
