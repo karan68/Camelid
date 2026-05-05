@@ -668,7 +668,11 @@ export default function ModelsView({
                     <div className={`pin-badge ${evidenceTrackTone(target.bounded_context_512_pack)}`}>512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')}</div>
                     <div className={`pin-badge ${evidenceTrackTone(target.performance_measured)}`}>perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</div>
                     <div className={`pin-badge ${chatUnlocked ? 'ready' : 'warm'}`}>{chatUnlocked ? 'Chat unlockable' : supported ? 'Runtime still needed' : 'Chat blocked by row status'}</div>
-                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge">Broader 50-token parity exists</div>}
+                    {target.id === 'llama32_1b_instruct_q8_0' && <div className="pin-badge ready">1B prompt-pack parity passed</div>}
+                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B broader 50-token parity passed</div>}
+                    {target.id === 'llama32_3b_instruct_q8_0' && <div className="pin-badge ready">3B five-prompt API smoke passed</div>}
+                    {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B API/WebUI smoke passed</div>}
+                    {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B first 512-context pack passed</div>}
                     {match.active && <div className="pin-badge ready">Loaded exact-row match</div>}
                     {!match.active && match.selected && <div className="pin-badge">Selected exact-row match</div>}
                   </div>

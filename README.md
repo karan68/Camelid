@@ -83,7 +83,7 @@ The older five 50-token source JSONs remain listed under that current-head row m
 
 ### Adjacent Llama 3-family rows
 
-Camelid now has three exact Llama smoke-supported rows beyond TinyLlama: Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0. These are deliberately narrow release claims: they require the exact Instruct Q8_0 row, a loaded runtime with `generation_ready=true`, and the short local-chat/parity envelope validated by the API and frontend smoke harnesses.
+Camelid now has three exact Llama smoke-supported rows beyond TinyLlama: Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B Instruct Q8_0. These are deliberately narrow release claims: they require the exact Instruct Q8_0 row, `/v1/health` reporting the selected runtime with `loaded_now=true` plus `generation_ready=true`, and the short local-chat/parity envelope validated by the API and frontend smoke harnesses.
 
 Current validation-lane note: promotion-grade Llama-family remote reruns are back on the approved Ubuntu validation lane. Keep the existing exact-row smoke evidence intact, run fresh evidence from clean public `main` checkouts, and do not widen the claim until the new artifacts pass and docs/API/frontend agree.
 

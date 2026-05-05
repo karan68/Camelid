@@ -251,7 +251,7 @@ const activeModel = health.active_model_id ? {
   quant: activeModelQuant,
   provider_kind: 'local',
   status: health.generation_ready ? 'ready' : 'registered',
-  loaded_now: Boolean(health.active_model_id),
+  loaded_now: Boolean(health.loaded_now ?? health.active_model_id),
   generation_ready: Boolean(health.generation_ready),
 } : null
 const activeCompatibilityHint = activeModel ? findCompatibilityHint(capabilities, activeModel) : null
@@ -276,25 +276,23 @@ if (requireGeneration && !health.generation_ready) {
 }
 
 const activeModelListed = Boolean(activeModel && modelIds.includes(activeModel.id))
-const activeChatGate = activeModel ? getChatGateState(capabilities, activeModel, { active_model_id: health.active_model_id, loaded_now: Boolean(health.active_model_id), generation_ready: Boolean(health.generation_ready) }) : null
-const guardedChatBypass = Boolean(allowGuardedChat && health.generation_ready && activeModel && activeModelListed && !activeChatGate?.chatUnlocked)
-const webuiChatEnabled = Boolean(activeModelListed && (activeChatGate?.chatUnlocked || guardedChatBypass))
-const webuiChatState = activeChatGate?.guardedLlamaEvaluation || guardedChatBypass ? 'guarded' : webuiChatEnabled ? 'enabled' : 'blocked'
+const activeChatGate = activeModel ? getChatGateState(capabilities, activeModel, { active_model_id: health.active_model_id, loaded_now: health.loaded_now ?? Boolean(health.active_model_id), generation_ready: Boolean(health.generation_ready) }) : null
+const qaChatBypass = Boolean(allowGuardedChat && health.generation_ready && activeModel && activeModelListed && !activeChatGate?.chatUnlocked)
+const webuiChatEnabled = Boolean(activeModelListed && activeChatGate?.chatUnlocked)
+const webuiChatState = webuiChatEnabled ? 'enabled' : 'blocked'
 
 if (expectWebUiChat) {
-  if (!['enabled', 'blocked', 'guarded'].includes(expectWebUiChat)) {
-    throw new Error(`--expect-webui-chat must be one of enabled, blocked, guarded; got ${expectWebUiChat}`)
+  if (!['enabled', 'blocked'].includes(expectWebUiChat)) {
+    throw new Error(`--expect-webui-chat must be one of enabled, blocked; got ${expectWebUiChat}`)
   }
   assertExpected('WebUI chat state', webuiChatState, expectWebUiChat)
 }
 
-if (activeChatGate?.guardedLlamaEvaluation) {
-  console.log('ℹ exact guarded Llama evidence row: WebUI chat is guarded but intentionally enabled for end-to-end validation')
-} else if (guardedChatBypass) {
-  console.log('ℹ allow-guarded-chat enabled: running one QA chat even though the active model is still outside the exact supported /api/capabilities contract row')
+if (qaChatBypass) {
+  console.log('ℹ allow-guarded-chat enabled: WebUI remains blocked, but the smoke harness will run one backend QA chat outside the exact supported /api/capabilities row')
 }
 
-if (webuiChatEnabled) {
+if (webuiChatEnabled || qaChatBypass) {
   const chatTimings = []
   for (let idx = 0; idx < chatRepeats; idx += 1) {
     const repeatLabel = chatRepeats === 1 ? 'chat_completion' : `chat_completion_${idx + 1}`

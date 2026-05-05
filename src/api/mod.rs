@@ -136,6 +136,7 @@ pub struct LoadModelRequest {
 pub struct HealthResponse {
     pub ok: bool,
     pub engine: &'static str,
+    pub loaded_now: bool,
     pub generation_ready: bool,
     pub active_model_id: Option<String>,
 }
@@ -637,10 +638,12 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let model = state.loaded_model.read().await;
+    let loaded_now = model.is_some();
     let generation_ready = model.as_ref().is_some_and(loaded_model_generation_ready);
     Json(HealthResponse {
         ok: true,
         engine: "backendinference",
+        loaded_now,
         generation_ready,
         active_model_id: model.as_ref().map(|m| m.id.clone()),
     })
@@ -664,7 +667,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and 8B 512-context remains a known blocker on the reopened Ubuntu validation lane",
+            current_gate: "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and the passing 8B 512-context rerun is one bounded pack only",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -814,11 +817,11 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
                 chat_template_renderer: "compact",
                 chat_template_shape_pack: "ready_to_run_on_validation_host",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
-                bounded_context_512_pack: "known_blocker",
+                bounded_context_512_pack: "validated_first_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
                 bounded_context_window: 512,
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 5-token Ubuntu parity run, API/frontend smoke, and bounded-memory evidence; 512-context remains a known blocker for broader/full support, but exact-row short smoke is supported",
-                next_step: "preserve exact-row smoke support while repeating current-head 50-token and 512-context runs, refreshing API/WebUI evidence, and closing performance/RSS portability evidence on the approved Ubuntu validation lane before any broader/full-support claim; keep the 512-context timeout visible until a passing artifact exists",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 5-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, and one passing bounded 512-context pack; exact-row short smoke is supported without broad 8B/full-context promotion",
+                next_step: "preserve exact-row smoke support while repeating current-head 50-token and broader 512-context runs, refreshing API/WebUI evidence, and closing performance/RSS portability evidence on the approved Ubuntu validation lane before any broader/full-support claim; treat the passing 512-context artifact as one bounded pack only",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",

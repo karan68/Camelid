@@ -23,6 +23,7 @@ async fn health_reports_not_generation_ready() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["ok"], true);
     assert_eq!(body["engine"], "backendinference");
+    assert_eq!(body["loaded_now"], false);
     assert_eq!(body["generation_ready"], false);
 }
 
@@ -44,7 +45,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and 8B 512-context remains a known blocker on the reopened Ubuntu validation lane"
+        "TinyLlama Q8_0 current gate; exact Llama 3.2 1B/3B and Llama 3 8B Q8_0 rows are supported for exact-row smoke; broader/full support still requires normalized current-head bundles, and the passing 8B 512-context rerun is one bounded pack only"
     );
     assert!(body["supported_quantization"]
         .as_array()
@@ -187,7 +188,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         llama3["chat_template_shape_pack_id"],
         "llama3-chat-template-shapes-v1"
     );
-    assert_eq!(llama3["bounded_context_512_pack"], "known_blocker");
+    assert_eq!(llama3["bounded_context_512_pack"], "validated_first_pack");
     assert_eq!(
         llama3["bounded_context_512_pack_id"],
         "llama3-context-512-smoke-v1"

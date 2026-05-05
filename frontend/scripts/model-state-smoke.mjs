@@ -179,13 +179,17 @@ assert.deepEqual(
     runtimeLoaded: true,
     runtimeGenerationReady: true,
     contractSupported: true,
-    guardedLlamaEvaluation: false,
     chatUnlocked: true,
     chatMode: 'supported',
     label: 'llama32_1b_instruct_q8_0: supported exact row smoke',
     copy: compatibilityHintCopy(llama32OneBHint),
   },
   'Llama 3.2 1B runtime-green exact rows should unlock supported WebUI chat without broad family claims',
+)
+assert.equal(
+  getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'llama32-1b', name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' }, { active_model_id: 'llama32-1b', loaded_now: false, generation_ready: true }).chatUnlocked,
+  false,
+  'exact supported rows still require runtime loaded_now=true before chat unlocks',
 )
 const llama32OneBQuantMissingHint = findCompatibilityHint(capabilityFixture, { name: 'Llama 3.2 1B Instruct' })
 assert.equal(llama32OneBQuantMissingHint.kind, 'quant_missing', 'Llama 3.2 exact-size matches must not become compatibility matches without quant evidence')
@@ -232,6 +236,14 @@ assert.equal(llama32OneBBaseHint, null, 'Llama 3.2 1B non-instruct names must no
 const noExactThreeBHint = findCompatibilityHint({ ...capabilityFixture, model_compatibility: capabilityFixture.model_compatibility.filter((row) => row.id !== 'llama32_3b_instruct_q8_0') }, { name: 'Llama 3.2 3B Instruct Q8_0', quant: 'Q8_0' })
 assert.equal(noExactThreeBHint, null, 'Llama 3.2 3B must not show family readiness when no exact compatibility row exists')
 assert.match(compatibilityHintCopy(noExactThreeBHint), /No exact COMPATIBILITY\.md row matched/)
+const evidenceOnly1BFixture = {
+  ...capabilityFixture,
+  model_compatibility: capabilityFixture.model_compatibility.map((row) => row.id === 'llama32_1b_instruct_q8_0' ? { ...row, status: 'groundwork_backend_evidence_only' } : row),
+}
+const evidenceOnly1BGate = getChatGateState(evidenceOnly1BFixture, { ...localLoadedReady, id: 'llama32-1b', name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' }, { active_model_id: 'llama32-1b', loaded_now: true, generation_ready: true })
+assert.equal(evidenceOnly1BGate.runtimeReady, true, 'runtime readiness should be visible even for evidence-only rows')
+assert.equal(evidenceOnly1BGate.contractSupported, false, 'evidence-only rows are not exact supported rows')
+assert.equal(evidenceOnly1BGate.chatUnlocked, false, 'WebUI chat must remain blocked unless runtime readiness and an exact supported compatibility row both pass')
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /smoke-supported for short local chat/)
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /\/api\/models\/load, \/v1\/completions, \/v1\/chat\/completions, frontend smoke, compact parity/)
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /five-prompt API smoke pack/)

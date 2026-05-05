@@ -248,23 +248,3 @@ export function isCompatibilitySupportedForModel(capabilities, model, catalogIte
     && hint.confidence !== 'name/path match',
   )
 }
-
-export function isGuardedLlamaEvaluationStatus(status = '') {
-  const value = status.toLowerCase()
-  return Boolean(
-    value.includes('evidence_only')
-    || value.includes('acceptance_target')
-    || value.includes('groundwork')
-  )
-}
-
-export function isGuardedLlamaEvaluationModel(capabilities, model, catalogItem) {
-  const hint = findCompatibilityHint(capabilities, model, catalogItem)
-  return Boolean(
-    hint?.kind === 'compatibility'
-    && TRACKED_LLAMA_PROMOTION_ROW_IDS.includes(hint.target?.id)
-    && hint.confidence !== 'name/path match'
-    && !isSupportedCapabilityStatus(hint.target?.status)
-    && isGuardedLlamaEvaluationStatus(hint.target?.status)
-  )
-}
