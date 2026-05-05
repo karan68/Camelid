@@ -1331,6 +1331,14 @@ impl LlamaInferenceSession {
 
         let chunk_base_position = self.kv_cache.position;
         let total_started = Instant::now();
+        let mut memory = structured_forward_memory_enabled().then(|| {
+            LlamaForwardMemoryTimings::new(
+                capture_memory_sample(&self.kv_cache),
+                collect_weight_materialization_stats(&self.weights),
+                q8_0_file_read_stats(),
+            )
+        });
+        trace_forward_memory("prefill_chunk_start");
         let embedding_started = Instant::now();
         let mut hidden = self
             .weights
@@ -1340,6 +1348,10 @@ impl LlamaInferenceSession {
             embedding: embedding_started.elapsed().as_micros(),
             ..LlamaForwardTimings::default()
         };
+        if let Some(memory) = &mut memory {
+            memory.record_after_embedding(capture_memory_sample(&self.kv_cache));
+        }
+        trace_forward_memory("prefill_chunk_embedding_done");
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
@@ -1356,11 +1368,23 @@ impl LlamaInferenceSession {
                 &mut self.kv_cache,
             )?;
             hidden = timed.output;
+            if let (Some(memory), Some(layer_memory)) = (&mut memory, &timed.timings.memory) {
+                memory.record_layer(layer_memory.clone());
+            }
             timings.layers.push(timed.timings);
         }
-        self.kv_cache.position += token_ids.len();
         timings.layers_total = layers_started.elapsed().as_micros();
+        if let Some(memory) = &mut memory {
+            memory.record_after_layers(capture_memory_sample(&self.kv_cache));
+        }
+        trace_forward_memory("prefill_chunk_layers_done");
+        self.kv_cache.position += token_ids.len();
         timings.total = total_started.elapsed().as_micros();
+        if let Some(memory) = &mut memory {
+            memory.record_end(capture_memory_sample(&self.kv_cache));
+        }
+        trace_forward_memory("prefill_chunk_end");
+        timings.memory = memory;
         Ok(timings)
     }
 
@@ -2815,6 +2839,8 @@ fn forward_prefill_layer_chunk_timed(
         layer_index: layer_idx,
         ..LlamaLayerTimings::default()
     };
+    let mut memory = structured_forward_memory_enabled()
+        .then(|| LlamaLayerMemoryTimings::new(layer_idx, capture_memory_sample(kv_cache)));
 
     let started = Instant::now();
     let attn_norm = hidden.rms_norm(
@@ -2823,6 +2849,10 @@ fn forward_prefill_layer_chunk_timed(
         format!("layer_{layer_idx}_prefill_attention_norm"),
     )?;
     timings.attention_norm = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_norm(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_norm_done");
 
     let started = Instant::now();
     let q = linear_runtime(
@@ -2832,6 +2862,10 @@ fn forward_prefill_layer_chunk_timed(
         false,
     )?;
     timings.attention_q = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_q(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_q_done");
 
     let started = Instant::now();
     let k = linear_for_role_runtime(
@@ -2842,6 +2876,10 @@ fn forward_prefill_layer_chunk_timed(
         false,
     )?;
     timings.attention_k = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_k(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_k_done");
 
     let started = Instant::now();
     let q = apply_rope_batch(
@@ -2861,6 +2899,10 @@ fn forward_prefill_layer_chunk_timed(
         format!("layer_{layer_idx}_prefill_attention_k_rope"),
     )?;
     timings.attention_rope = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_rope(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_rope_done");
 
     let started = Instant::now();
     let v = linear_for_role_runtime(
@@ -2871,10 +2913,18 @@ fn forward_prefill_layer_chunk_timed(
         false,
     )?;
     timings.attention_v = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_v(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_v_done");
 
     let started = Instant::now();
     write_kv_cache_batch(kv_cache, layer_idx, params.base_position, &k, &v)?;
     timings.kv_cache_write = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_kv_cache_write(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_kv_cache_write_done");
 
     let started = Instant::now();
     let context = causal_attention_context_batch(
@@ -2887,6 +2937,10 @@ fn forward_prefill_layer_chunk_timed(
         format!("layer_{layer_idx}_prefill_attention_context"),
     )?;
     timings.attention_context = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_context(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_context_done");
 
     let started = Instant::now();
     let attn_out = linear_runtime(
@@ -2896,6 +2950,10 @@ fn forward_prefill_layer_chunk_timed(
         false,
     )?;
     timings.attention_output = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_output(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_output_done");
 
     let started = Instant::now();
     let residual = hidden.add(
@@ -2903,6 +2961,10 @@ fn forward_prefill_layer_chunk_timed(
         format!("layer_{layer_idx}_prefill_attention_residual"),
     )?;
     timings.attention_residual = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_attention_residual(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_attention_residual_done");
 
     let started = Instant::now();
     let ffn_norm = residual.rms_norm(
@@ -2911,6 +2973,10 @@ fn forward_prefill_layer_chunk_timed(
         format!("layer_{layer_idx}_prefill_ffn_norm"),
     )?;
     timings.ffn_norm = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_ffn_norm(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_ffn_norm_done");
 
     let activated = gated_ffn_activation_batch(
         &ffn_norm,
@@ -2922,6 +2988,10 @@ fn forward_prefill_layer_chunk_timed(
     timings.ffn_up = activated.up;
     timings.ffn_activation = activated.activation;
     let activated = activated.tensor;
+    if let Some(memory) = &mut memory {
+        memory.record_after_ffn_activation(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_ffn_gate_up_activation_done");
 
     let started = Instant::now();
     let ffn_out = linear_for_role_runtime(
@@ -2932,11 +3002,21 @@ fn forward_prefill_layer_chunk_timed(
         false,
     )?;
     timings.ffn_down = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_ffn_down(capture_memory_sample(kv_cache));
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_ffn_down_done");
 
     let started = Instant::now();
     let output = residual.add(&ffn_out, format!("layer_{layer_idx}_prefill_ffn_residual"))?;
     timings.ffn_residual = started.elapsed().as_micros();
+    if let Some(memory) = &mut memory {
+        memory.record_after_ffn_residual(capture_memory_sample(kv_cache));
+        memory.record_end();
+    }
+    trace_forward_layer_memory(layer_idx, "prefill_ffn_residual_done");
     timings.total = total_started.elapsed().as_micros();
+    timings.memory = memory;
 
     Ok(LlamaTimedLayerOutput {
         output,
@@ -6674,11 +6754,26 @@ mod tests {
             .as_mut()
             .unwrap()
             .record_after_layers(memory_sample(140, 1, 2));
+        first.memory.as_mut().unwrap().q8_file_reads = Q8_0FileReadStats {
+            read_calls: 3,
+            read_bytes: 256,
+        };
+        second.memory.as_mut().unwrap().q8_file_reads = Q8_0FileReadStats {
+            read_calls: 4,
+            read_bytes: 1024,
+        };
 
         first.add_assign(&second);
 
         let memory = first.memory.expect("merged memory timings");
         assert_eq!(memory.forward_passes, 2);
+        assert_eq!(
+            memory.q8_file_reads,
+            Q8_0FileReadStats {
+                read_calls: 7,
+                read_bytes: 1280,
+            }
+        );
         assert_eq!(memory.peak_rss_kib, Some(140));
         assert_eq!(memory.peak_phase.as_deref(), Some("layers_done"));
         assert_eq!(memory.end, None);
@@ -9094,6 +9189,7 @@ mod tests {
             .unwrap();
 
         std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "8");
+        std::env::set_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS", "1");
         let mut chunked = LlamaInferenceSession::new(config, weights).unwrap();
         let chunked_step = chunked
             .generate_next_token_with_history_diagnostics(
@@ -9103,6 +9199,44 @@ mod tests {
                 false,
             )
             .unwrap();
+
+        let prefill_memory = chunked_step
+            .prefill_timings
+            .memory
+            .as_ref()
+            .expect("chunked prefill records structured memory timings");
+        assert_eq!(prefill_memory.forward_passes, 1);
+        assert_eq!(prefill_memory.layers.len(), 1);
+        assert_eq!(prefill_memory.layers[0].forward_passes, 1);
+        assert_eq!(prefill_memory.end.as_ref().unwrap().kv_cache_position, 2);
+        let layer_memory = &prefill_memory.layers[0];
+        assert!(layer_memory.after_attention_norm.is_some());
+        assert!(layer_memory.after_attention_q.is_some());
+        assert!(layer_memory.after_attention_k.is_some());
+        assert!(layer_memory.after_attention_rope.is_some());
+        assert!(layer_memory.after_attention_v.is_some());
+        assert!(layer_memory.after_kv_cache_write.is_some());
+        assert!(layer_memory.after_attention_context.is_some());
+        assert!(layer_memory.after_attention_output.is_some());
+        assert!(layer_memory.after_attention_residual.is_some());
+        assert!(layer_memory.after_ffn_norm.is_some());
+        assert!(layer_memory.after_ffn_activation.is_some());
+        assert!(layer_memory.after_ffn_down.is_some());
+        assert!(layer_memory.after_ffn_residual.is_some());
+        assert_eq!(
+            prefill_memory.q8_file_reads,
+            Q8_0FileReadStats {
+                read_calls: 0,
+                read_bytes: 0,
+            }
+        );
+        assert_eq!(
+            layer_memory.q8_file_reads,
+            Q8_0FileReadStats {
+                read_calls: 0,
+                read_bytes: 0,
+            }
+        );
 
         assert_eq!(chunked_step.next_token_id, sequential_step.next_token_id);
         assert_slice_close(&chunked_step.logits.data, &sequential_step.logits.data);
@@ -9115,6 +9249,7 @@ mod tests {
         assert_slice_close(&chunked.kv_cache.values, &sequential.kv_cache.values);
 
         std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS");
     }
 
     #[test]
