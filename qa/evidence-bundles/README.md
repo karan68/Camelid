@@ -13,6 +13,7 @@ Current public evidence map:
 - `llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/` closes only the bounded 8B compact chat-template-shapes pack.
 - `llama3-8b-api-webui-rss-clean-20260505T015843Z-head-aee469b9c13a/` is the clean-main exact 8B API/WebUI/RSS timing smoke for completion diagnostics; it does not widen support beyond the exact-row smoke envelope.
 - `llama3-8b-lazy-q8-hotpath-20260505T021411Z-head-723a665/` is the exact 8B retained-block lazy-Q8 hot-path cost probe; it is measurement evidence only, not a broader support/performance-portability promotion.
+- `llama3-8b-lazy-q8-hotpath-helper-validated-20260505T0350Z-head-e22307f2f90b/` validates the reusable helper on clean public `main` and repeats the exact 8B retained-block Q8 measurements; it is still measurement evidence only.
 
 Reproducibility helper:
 - `node scripts/bench-q8-hotpath-bundle.mjs --model <model.gguf>` regenerates a sanitized retained-block Q8 hot-path bundle with per-tensor JSON, `manifest.json`, and `SHA256SUMS`. Use it for measurement staging only; pair results with production API/WebUI timing/RSS before making portability or throughput claims.
