@@ -136,7 +136,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         llama32_1b["bounded_context_512_pack_id"],
         "llama3-context-512-smoke-v1"
     );
-    assert_eq!(llama32_1b["bounded_context_window"], 1024);
+    assert_eq!(llama32_1b["bounded_context_window"], 512);
     assert_eq!(
         llama32_1b["bounded_context_1024_pack"],
         "validated_second_pack"
@@ -196,7 +196,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         llama32_3b["bounded_context_512_pack_id"],
         "llama3-context-512-smoke-v1"
     );
-    assert_eq!(llama32_3b["bounded_context_window"], 1024);
+    assert_eq!(llama32_3b["bounded_context_window"], 512);
     assert_eq!(
         llama32_3b["bounded_context_1024_pack"],
         "validated_second_pack"

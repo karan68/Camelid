@@ -1,6 +1,6 @@
 # Camelid Compatibility Matrix
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 `COMPATIBILITY.md` is Camelid's release contract. It defines what Camelid may describe as supported in the README, frontend readiness copy, release notes, and `/api/capabilities` without overstating the validated envelope. If another document or UI sounds broader, this file wins.
 
@@ -49,6 +49,7 @@ In plain terms: TinyLlama Q8_0 is still the only full supported gate; exact Llam
 - `qa/evidence-bundles/tinyllama-broader-template-context-perf-rss-20260505T044519Z-head-864e07b51f36/manifest.json` plus `SHA256SUMS` records the current-head TinyLlama final-normalization pass: broader five-prompt/50-token marker-template parity, marker-template-shape parity, bounded 512-context parity, and backend RSS/perf sampling.
 - `qa/evidence-bundles/four-row-context-512-20260505T051510Z-head-b403884/manifest.json` plus `SHA256SUMS` records the first bounded 512-context pack pass across all four exact supported Q8_0 rows.
 - `qa/evidence-bundles/llama32-1b-context-1024-20260505T081001Z-head-156ded6fc76b/manifest.json` plus `SHA256SUMS` records the second bounded 1024-context pack pass for the exact Llama 3.2 1B Instruct Q8_0 row.
+- `qa/evidence-bundles/llama32-1b-context-2048-rope-factors-20260506T0105Z-head-62f8cbc/manifest.json` plus `SHA256SUMS` records the third bounded 2048-context pack pass for the exact Llama 3.2 1B Instruct Q8_0 row after the RoPE frequency-factor fix.
 - `qa/evidence-bundles/llama32-3b-context-1024-20260505T094258Z-head-c14e5e7b5692/manifest.json` plus `SHA256SUMS` records the second bounded 1024-context pack pass for the exact Llama 3.2 3B Instruct Q8_0 row.
 - `qa/evidence-bundles/llama32-3b-context-2048-20260505T105742Z-head-36ec8e492d65/manifest.json` plus `SHA256SUMS` records the third bounded 2048-context pack pass for the exact Llama 3.2 3B Instruct Q8_0 row only.
 - `qa/evidence-bundles/llama32-1b-3b-chat-template-shapes-20260505T060036Z-head-e9f28572e090/manifest.json` plus `SHA256SUMS` records the bounded compact chat-template-shapes pack pass for the exact Llama 3.2 1B/3B Instruct Q8_0 rows.
@@ -92,7 +93,7 @@ Reopened-lane API + frontend smoke: `qa/evidence-bundles/four-row-api-webui-2026
 - **Validated now:** metadata, tokenizer path, tensor load, compact parity, broader prompt-pack parity, the first bounded 512-context pack, the second bounded 1024-context pack, the bounded compact chat-template-shapes pack, the bounded unique-chat perf/RSS envelope, `/api/models/load`, `/v1/completions`, `/v1/chat/completions`, and frontend smoke are validated for the exact 1B Instruct Q8_0 row
 - **Validated now:** the third bounded 2048-context pack now passes after Camelid interprets GGUF `rope_freqs.weight` as llama.cpp-style frequency factors; `qa/evidence-bundles/llama32-1b-context-2048-rope-factors-20260506T0105Z-head-62f8cbc/manifest.json` records prompt-token parity at 1910 prompt tokens plus generated-token/text parity for `[34,2735,35,12,7854]` / `CMLD-204`
 - **Historical blockers:** the earlier 2048 blocker and watchdog notes remain useful red-box history, but they are superseded by the RoPE frequency-factor pass and should not be presented as current support truth
-- **Missing gates:** model-native/larger context beyond the checked 512/1024 packs, arbitrary/Jinja template behavior beyond the checked compact pack, production throughput evidence, and portable packaging
+- **Missing gates:** model-native/larger context beyond the checked 512/1024/2048 packs, arbitrary/Jinja template behavior beyond the checked compact pack, production throughput evidence, and portable packaging
 - **Support boundary:** supported exact-row smoke only for this exact 1B Instruct Q8_0 row; no broader/full-support or neighboring-row claim yet
 
 #### Llama 3.2 3B Instruct Q8_0

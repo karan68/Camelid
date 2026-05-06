@@ -825,7 +825,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_bounded_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
-                bounded_context_window: 1024,
+                bounded_context_window: 512,
                 bounded_context_1024_pack: "validated_second_pack",
                 bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
@@ -856,7 +856,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_bounded_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
-                bounded_context_window: 1024,
+                bounded_context_window: 512,
                 bounded_context_1024_pack: "validated_second_pack",
                 bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
@@ -867,7 +867,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-204",
                 evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
-                next_step: "preserve exact-row smoke support while normalizing larger/broader context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
+                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
             },
             ModelCompatibilityTarget {
                 id: "llama3_8b_instruct_q8_0",
@@ -3151,7 +3151,11 @@ mod tests {
         for target in targets {
             assert_eq!(target.status, "supported_exact_row_smoke");
             assert_eq!(target.bounded_context_512_pack, "validated_bounded_pack");
-            assert_eq!(target.bounded_context_window, 1024);
+            assert_eq!(
+                target.bounded_context_512_pack_id,
+                "llama3-context-512-smoke-v1"
+            );
+            assert_eq!(target.bounded_context_window, 512);
             assert_eq!(target.bounded_context_1024_pack, "validated_second_pack");
             assert_eq!(
                 target.bounded_context_1024_pack_id,
