@@ -6248,7 +6248,11 @@ fn with_q8_0_file_reader_quantized_inputs<T>(
 ) -> Result<T> {
     Q8_0_FILE_READER_QUANTIZED_INPUTS.with(|cell| {
         let mut quantized_inputs = cell.borrow_mut();
-        f(&mut quantized_inputs)
+        let result = f(&mut quantized_inputs);
+        // Keep the allocation as reusable scratch capacity, but do not leave the
+        // previous activation blocks logically live between file-backed Q8 calls.
+        quantized_inputs.clear();
+        result
     })
 }
 
@@ -8477,7 +8481,7 @@ mod tests {
         )
         .unwrap();
 
-        with_q8_0_file_reader_quantized_inputs(|blocks| {
+        let retained_capacity = with_q8_0_file_reader_quantized_inputs(|blocks| {
             *blocks = Vec::new();
 
             {
@@ -8493,6 +8497,13 @@ mod tests {
                 assert_eq!(quantized.row(0)[0].quants[0], 0);
             }
 
+            assert_eq!(blocks.capacity(), retained_capacity);
+            Ok(blocks.capacity())
+        })
+        .unwrap();
+
+        with_q8_0_file_reader_quantized_inputs(|blocks| {
+            assert!(blocks.is_empty());
             assert_eq!(blocks.capacity(), retained_capacity);
             Ok(())
         })
