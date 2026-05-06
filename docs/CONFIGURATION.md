@@ -1,6 +1,6 @@
 # Configuration Guide
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 This guide documents Camelid's current local configuration reality without pretending every workflow is fully automated.
 
@@ -88,6 +88,7 @@ Backend runtime knobs used during performance work:
 
 - `BACKENDINFERENCE_PREFILL_CHUNK_TOKENS` controls how many non-final prompt tokens the backend processes per chunk in the chunked prefill path. Default: `128`. Set it to `0` or `1` to force the older sequential prefill path while debugging. This is a runtime/performance knob only; it is not support evidence for any model row by itself.
 - `BACKENDINFERENCE_PREFILL_LAYER_MAJOR` controls the long-context prefill schedule that processes all prefill chunks one layer at a time, reusing file-backed Q8_0 weights across chunks before moving to the next layer. By default it is enabled only when lazy Q8_0 file-backed weights are present. Set it to `0`, `false`, `off`, or `disabled` to force the older chunk-major schedule while debugging.
+- `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION` enables optional structured per-layer/per-prefill-chunk attribution for the layer-major schedule inside forward-memory timings. This is diagnostic instrumentation for memory/Q8 read attribution, not support evidence or a promotion signal by itself.
 - `BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES` controls the target Q8_0 row-read chunk size for borrowed/file-backed row readers. Default: `33554432` (32 MiB). This is a read-pattern/performance knob only.
 
 If a command depends on more than that, document the requirement in the same PR.
