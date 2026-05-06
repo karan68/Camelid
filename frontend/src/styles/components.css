@@ -1433,7 +1433,7 @@
 .chat-empty-shell-gemini {
   width: 100%;
   min-height: calc(100vh - 140px);
-  padding-top: 0;
+  padding: 0 0 32px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1447,6 +1447,9 @@
   justify-items: center;
 }
 
+.chat-empty-stage-clean {
+  gap: 16px;
+}
 
 .chat-empty-hero {
   width: 100%;
@@ -1460,6 +1463,18 @@
   justify-items: center;
   text-align: center;
   gap: 6px;
+}
+
+.chat-empty-hero-clean {
+  gap: 10px;
+}
+
+.chat-empty-hero-clean .chat-empty-greeting {
+  color: color-mix(in srgb, var(--color-text-muted) 82%, white 18%);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
 }
 
 .chat-empty-greeting {
@@ -1485,8 +1500,22 @@
   letter-spacing: -0.05em;
 }
 
+.chat-empty-hero-clean h2 {
+  max-width: 12ch;
+  font-size: clamp(2.7rem, 4.6vw, 4.4rem);
+  line-height: 0.98;
+  letter-spacing: -0.06em;
+}
+
 .chat-empty-hero .hero-summary {
   max-width: 52ch;
+}
+
+.chat-empty-hero-clean .hero-summary {
+  max-width: 40ch;
+  color: var(--color-text-muted);
+  font-size: 1rem;
+  line-height: 1.6;
 }
 
 .composer-empty {
@@ -1597,6 +1626,26 @@
   width: min(100%, 620px);
 }
 
+.composer-gemini-stage-clean {
+  border-color: color-mix(in srgb, var(--color-border-strong) 28%, transparent);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 96%, rgba(255, 255, 255, 0.03)), color-mix(in srgb, var(--color-surface-strong) 86%, rgba(255, 255, 255, 0.02))),
+    radial-gradient(circle at top, rgba(255, 255, 255, 0.06), transparent 58%);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(18px);
+  padding: 16px 18px 14px;
+}
+
+.composer-gemini-stage-clean .composer-input-gemini-stage {
+  min-height: 58px !important;
+  padding: 10px 4px 12px;
+  font-size: 1rem;
+}
+
+.composer-gemini-stage-clean .composer-input-gemini-stage::placeholder {
+  color: color-mix(in srgb, var(--color-text-muted) 84%, transparent);
+}
+
 .composer-gemini-floating {
   position: sticky;
   bottom: 8px;
@@ -1640,8 +1689,28 @@
   align-items: center;
 }
 
+.composer-gemini-footer-stage-clean {
+  gap: 12px;
+  padding-top: 4px;
+}
+
 .composer-gemini-tools-stage {
   gap: 8px;
+}
+
+.composer-gemini-tools-stage-clean {
+  flex: 1 1 auto;
+}
+
+.composer-gemini-stage-clean .composer-model-picker {
+  background: rgba(255, 255, 255, 0.03);
+  border-color: color-mix(in srgb, var(--color-border-soft) 74%, transparent);
+}
+
+.composer-gemini-stage-clean .composer-send-button {
+  min-width: 92px;
+  border-radius: 999px;
+  padding-inline: 18px;
 }
 
 .composer-gemini-actions-stage {
@@ -1716,6 +1785,15 @@
   color: var(--color-text-muted);
   font-size: 0.76rem;
   white-space: nowrap;
+}
+
+.chat-empty-status-note {
+  margin: 0;
+  max-width: 52ch;
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
 }
 
 .throughput-row,

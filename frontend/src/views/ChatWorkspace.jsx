@@ -50,13 +50,6 @@ export default function ChatWorkspace({
   const awaitingAssistant = Boolean(sending && pendingPrompt)
   const isFreshThread = selectedConversation ? (visibleMessages.length === 0 && !pendingPrompt) : !pendingPrompt
   const latestVisibleAssistantMessage = [...visibleMessages].reverse().find((message) => message.role === 'assistant') || latestAssistantMessage
-  const starterPrompts = [
-    'Say hello',
-    'Explain one idea',
-    'List 3 caveats',
-    'Draft a tiny plan',
-    'Summarize briefly',
-  ]
 
   const handleComposerKeyDown = async (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -215,21 +208,18 @@ export default function ChatWorkspace({
       <div className={`chat-canvas ${isFreshThread ? 'chat-canvas-empty' : ''}`}>
         {isFreshThread ? (
           <div className="chat-empty-shell chat-empty-shell-gemini">
-            <div className="chat-empty-stage">
-              <div className="chat-empty-hero chat-empty-hero-gemini">
-                <p className="chat-empty-greeting">Local Camelid chat</p>
-                <h2>{selectedModelRunnable ? 'Ask the loaded model, then inspect the raw reply.' : supportBlocked ? 'Compatibility contract blocks chat for this model' : 'Load a generation-ready local model first'}</h2>
-                <p className="hero-summary">{selectedModelRunnable ? 'The current exact-row smoke lanes can answer short local prompts, but Camelid still shows raw text, TPS, and token probabilities instead of promising broader polish.' : supportBlocked ? 'Camelid reports this model is loaded and generation-ready, but the UI will not enable chat unless /api/capabilities has an exact supported COMPATIBILITY.md row for this model identity and quantization.' : 'Chat unlocks after Camelid reports loaded_now=true, generation_ready=true, active_model_id matches the selected local GGUF, and /api/capabilities exposes an exact supported compatibility row.'}</p>
+            <div className="chat-empty-stage chat-empty-stage-clean">
+              <div className="chat-empty-hero chat-empty-hero-gemini chat-empty-hero-clean">
+                <p className="chat-empty-greeting">Camelid</p>
+                <h2>{selectedModelRunnable ? 'How can I help?' : supportBlocked ? 'This model is not ready for chat' : 'Load a local model to begin'}</h2>
+                <p className="hero-summary">{selectedModelRunnable ? 'Start a clean local conversation.' : supportBlocked ? 'Pick a supported loaded model to start chatting.' : 'Choose a generation-ready local model and the chat box will unlock.'}</p>
               </div>
 
-              {renderCapabilityStrip(true)}
-
-              <div className="composer composer-gemini composer-gemini-stage">
-                <textarea className="composer-input composer-input-gemini composer-input-gemini-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Ask a short local test prompt' : 'Pick a ready model first, then start your chat'} disabled={sending || !selectedModelRunnable} />
-                <div className="composer-gemini-footer composer-gemini-footer-stage">
-                  <div className="composer-gemini-tools composer-gemini-tools-stage">
+              <div className="composer composer-gemini composer-gemini-stage composer-gemini-stage-clean">
+                <textarea className="composer-input composer-input-gemini composer-input-gemini-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : 'Select a ready model first'} disabled={sending || !selectedModelRunnable} />
+                <div className="composer-gemini-footer composer-gemini-footer-stage composer-gemini-footer-stage-clean">
+                  <div className="composer-gemini-tools composer-gemini-tools-stage composer-gemini-tools-stage-clean">
                     {renderModelPicker()}
-                    <span className="composer-meta-pill">{selectedModelMeta}</span>
                     {!selectedModelRunnable && hasRunnableChoices && <button className="ghost-button ghost-button-quiet" onClick={() => setTab('library')}>Open Library</button>}
                   </div>
                   <div className="composer-gemini-actions composer-gemini-actions-stage">
@@ -238,15 +228,7 @@ export default function ChatWorkspace({
                 </div>
               </div>
 
-              {selectedModelRunnable && (
-                <div className="chat-starter-chips chat-starter-chips-centered" aria-label="Conversation ideas">
-                  {starterPrompts.map((prompt) => (
-                    <button key={prompt} type="button" className="chat-starter-chip chat-starter-chip-stage" onClick={() => setComposer(prompt)}>
-                      {prompt}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <p className="chat-empty-status-note">{selectedModelMeta}</p>
             </div>
           </div>
         ) : (
