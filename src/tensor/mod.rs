@@ -818,15 +818,11 @@ impl Q8_0FileReadStats {
 }
 
 pub(crate) fn record_q8_0_file_read(bytes: usize) {
-    #[cfg(test)]
-    let _guard = crate::test_support::q8_file_state_lock();
     Q8_0_FILE_READ_CALLS.fetch_add(1, Ordering::Relaxed);
     Q8_0_FILE_READ_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
-    #[cfg(test)]
-    let _guard = crate::test_support::q8_file_state_lock();
     let cache_capacity_bytes = q8_file_cache_capacity_bytes();
     let (cache_entries, cache_bytes) = q8_file_cache_snapshot(cache_capacity_bytes);
     Q8_0FileReadStats {
@@ -854,8 +850,6 @@ struct Q8FileCacheEntry {
 }
 
 fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
-    #[cfg(test)]
-    let _guard = crate::test_support::q8_file_state_lock();
     let capacity = q8_file_cache_capacity_bytes();
     let Some(cache) = Q8_FILE_CACHE.get() else {
         return false;
@@ -897,8 +891,6 @@ fn q8_file_cache_entry_covers(
 }
 
 fn q8_file_cache_insert(path: PathBuf, offset: u64, bytes: &[u8]) {
-    #[cfg(test)]
-    let _guard = crate::test_support::q8_file_state_lock();
     let capacity = q8_file_cache_capacity_bytes();
     let cache = Q8_FILE_CACHE.get_or_init(|| Mutex::new(Q8FileCache::default()));
     let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
@@ -917,8 +909,6 @@ fn q8_file_cache_capacity_bytes() -> usize {
 }
 
 fn q8_file_cache_snapshot(capacity: usize) -> (u64, u64) {
-    #[cfg(test)]
-    let _guard = crate::test_support::q8_file_state_lock();
     let Some(cache) = Q8_FILE_CACHE.get() else {
         return (0, 0);
     };

@@ -174,8 +174,6 @@ impl Q8BlockReader {
             .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "block offset overflow"))?;
         let mut block_data = [0u8; Self::BLOCK_SIZE_BYTES];
         file.read_exact_at(&mut block_data, block_offset)?;
-        #[cfg(test)]
-        let _guard = crate::test_support::q8_file_state_lock();
         record_q8_0_file_read(block_data.len());
 
         let scale_bits = u16::from_le_bytes(block_data[0..2].try_into().expect("2-byte scale"));
