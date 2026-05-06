@@ -9,13 +9,13 @@ Change:
 
 Remote diagnostics:
 
-- Canonical Ubuntu host `/home/ubuntu/work/Camelid-diag-4c30c53` produced a diagnostic 8B 1024 compact-context parity PASS at source head `4c30c53`:
+- The canonical Ubuntu validation lane produced a diagnostic 8B 1024 compact-context parity PASS from a sanitized diagnostic worktree at source head `4c30c53`:
   - artifact copied locally: `target/remote-llama3-8b-context-1024-4c30c53-20260506T051812Z/`
   - prompt/generated parity: `prompt_tokens_all_match=true`, `generated_tokens_all_match=true`, `generated_text_all_match=true`
   - reference prompt tokens: 881
   - lazy Q8, prefill chunk 128, Q8 file cache disabled
   - backend trace final: `q8_file_read_bytes=91781055744` (`87529.24 MiB`), cache hit bytes 0, backend RSS trace ~890068 KiB at logits
-- A source-`f8c2d66` 8B 2048 no-cache diagnostic was launched on the canonical Ubuntu host from archived worktree `/home/ubuntu/work/Camelid-longctx-f8c2d66-20260506T061712Z`:
+- A source-`f8c2d66` 8B 2048 no-cache diagnostic was launched on the canonical Ubuntu validation lane from a sanitized archived worktree:
   - run script: `target/run-8b-2048-diag-f8c2d66.sh`
   - active artifact root: `target/llama3-8b-context-2048-diag-20260506T061807Z-source-f8c2d66/`
   - env: lazy Q8 on, retained Q8 blocks off, chunk tokens 128, Q8 file cache bytes 0
