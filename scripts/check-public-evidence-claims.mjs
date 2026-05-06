@@ -46,6 +46,11 @@ async function validateBundle(manifestPath) {
     await validateFourRowContext512(bundleRel, manifest, summaryExists ? await readJson(summaryPath) : null)
   }
 
+  if (schema === 'camelid.llama3_8b_context_1024_2048_current_head_public_evidence.v1') {
+    if (!summaryExists) fail(bundleRel, 'Llama 3 8B context-1024/2048 bundle must include summary.json')
+    validateLlama3_8bContext1024And2048(bundleRel, manifest)
+  }
+
   const singleRowContext = singleRowContextSchema(schema)
   if (singleRowContext) validateSingleRowContextBundle(bundleRel, manifest, singleRowContext)
 
@@ -150,6 +155,52 @@ function validateContext512Row(bundleRel, row) {
     maxTokens: 5,
     minPromptTokens: 1,
   })
+}
+
+function validateLlama3_8bContext1024And2048(bundleRel, manifest) {
+  if (manifest.passed !== true) fail(bundleRel, 'Llama 3 8B context-1024/2048 manifest must be passed=true')
+  if (manifest.checkout_clean !== true) fail(bundleRel, 'Llama 3 8B context-1024/2048 manifest must record checkout_clean=true')
+  if (!boundaryIsNarrow(manifest.claim_boundary)) {
+    fail(bundleRel, 'Llama 3 8B context-1024/2048 claim_boundary must explicitly avoid broader/full-family promotion')
+  }
+  const expectedPackIds = ['llama3-context-1024-smoke-v1', 'llama3-context-2048-smoke-v1']
+  const expectedSourcePacks = ['qa/prompt-packs/llama3-context-1024-smoke.json', 'qa/prompt-packs/llama3-context-2048-smoke.json']
+  if (manifest.pack !== undefined) {
+    if (manifest.pack?.max_tokens !== 5) fail(bundleRel, 'Llama 3 8B context-1024/2048 pack max_tokens must be 5')
+    if (JSON.stringify(manifest.pack?.ids) !== JSON.stringify(expectedPackIds)) {
+      fail(bundleRel, `Llama 3 8B context-1024/2048 pack ids changed: ${JSON.stringify(manifest.pack?.ids)}`)
+    }
+    if (JSON.stringify(manifest.pack?.source_prompt_packs) !== JSON.stringify(expectedSourcePacks)) {
+      fail(bundleRel, `Llama 3 8B context-1024/2048 source_prompt_packs changed: ${JSON.stringify(manifest.pack?.source_prompt_packs)}`)
+    }
+  }
+  if (!Array.isArray(manifest.rows) || manifest.rows.length !== 2) {
+    fail(bundleRel, 'Llama 3 8B context-1024/2048 manifest must include exactly two rows')
+    return
+  }
+  validateContextRow(bundleRel, manifest.rows[0], {
+    rowId: 'llama3_8b_instruct_q8_0',
+    contextWindow: 1024,
+    maxTokens: 5,
+    minPromptTokens: 513,
+    promptId: 'roughly-1024-token-recall',
+  })
+  validateContextText(bundleRel, 'llama3_8b_instruct_q8_0 context-1024', manifest.rows[0], 'CMLD-102')
+  validateContextRow(bundleRel, manifest.rows[1], {
+    rowId: 'llama3_8b_instruct_q8_0',
+    contextWindow: 2048,
+    maxTokens: 5,
+    minPromptTokens: 1025,
+    promptId: 'roughly-2048-token-recall',
+  })
+  validateContextText(bundleRel, 'llama3_8b_instruct_q8_0 context-2048', manifest.rows[1], 'CMLD-204')
+}
+
+function validateContextText(bundleRel, label, row, expected) {
+  const generatedText = row.generated_text ?? row.backend_text
+  const llamaText = row.llama_text ?? generatedText
+  if (generatedText !== expected) fail(bundleRel, `${label} generated text must stay ${JSON.stringify(expected)}, got ${JSON.stringify(generatedText)}`)
+  if (llamaText !== expected) fail(bundleRel, `${label} llama text must stay ${JSON.stringify(expected)}, got ${JSON.stringify(llamaText)}`)
 }
 
 function validateSingleRowContextBundle(bundleRel, manifest, expected) {
