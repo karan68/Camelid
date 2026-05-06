@@ -144,7 +144,7 @@ const capabilityFixture = {
     { id: 'llama_spm_q4_k_q5_k', family: 'llama_spm_decoder', quantization: 'Q4_K_M/Q5_K_M', status: 'planned_phase_10', next_step: 'implement K-quant support' },
     { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '1B exact-row load, completion, chat, frontend smoke, second 1024-context evidence, and third 2048-context evidence after the RoPE factor fix' },
     { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, and third 2048-context evidence' },
-    { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'not_promoted', bounded_context_2048_pack: 'not_promoted', latest_checked_bucket: 'llama3-context-512-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'not_recorded_in_public_manifest', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, first 512-context, and compact template-shapes pack evidence; 1024/2048 stay unpromoted' },
+    { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, first 512-context, second 1024-context, third 2048-context, and compact template-shapes pack evidence; 1024/2048 are bounded exact-row pack claims only' },
   ],
 }
 const trackedTargets = getTrackedCompatibilityTargets(capabilityFixture)
@@ -158,27 +158,27 @@ assert.deepEqual(
   [
     ['llama32_1b_instruct_q8_0', 'validated_second_pack'],
     ['llama32_3b_instruct_q8_0', 'validated_second_pack'],
-    ['llama3_8b_instruct_q8_0', 'not_promoted'],
+    ['llama3_8b_instruct_q8_0', 'validated_second_pack'],
   ],
-  'frontend tracked rows should preserve the API 1024-context pack boundary: 1B/3B passed bounded second packs, 8B remains unpromoted',
+  'frontend tracked rows should preserve the API 1024-context pack boundary as bounded exact-row claims only',
 )
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, target.bounded_context_2048_pack]),
   [
     ['llama32_1b_instruct_q8_0', 'validated_third_pack'],
     ['llama32_3b_instruct_q8_0', 'validated_third_pack'],
-    ['llama3_8b_instruct_q8_0', 'not_promoted'],
+    ['llama3_8b_instruct_q8_0', 'validated_third_pack'],
   ],
-  'frontend tracked rows should preserve the API 2048-context boundary: 1B/3B passed bounded third packs, 8B remains unpromoted',
+  'frontend tracked rows should preserve the API 2048-context boundary as bounded exact-row claims only',
 )
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, target.latest_checked_bucket, target.latest_checked_result, target.latest_checked_output]),
   [
     ['llama32_1b_instruct_q8_0', 'llama3-context-2048-smoke-v1', 'pass', 'CMLD-204'],
     ['llama32_3b_instruct_q8_0', 'llama3-context-2048-smoke-v1', 'pass', 'CMLD-204'],
-    ['llama3_8b_instruct_q8_0', 'llama3-context-512-smoke-v1', 'pass', 'not_recorded_in_public_manifest'],
+    ['llama3_8b_instruct_q8_0', 'llama3-context-2048-smoke-v1', 'pass', 'CMLD-204'],
   ],
-  'frontend tracked rows should surface the API latest bounded check without implying broad/full or 1024/2048 8B support',
+  'frontend tracked rows should surface the API latest bounded check without implying broad/full 8B support',
 )
 
 const tinyQ8Hint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q8_0' })
@@ -239,7 +239,7 @@ assert.equal(
 )
 const llama3EightBHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct Q8_0', quant: 'Q8_0' })
 assert.equal(llama3EightBHint.target.id, 'llama3_8b_instruct_q8_0', 'Llama 3 8B must match its exact supported row')
-assert.match(compatibilityHintCopy(llama3EightBHint), /first 512-context, and compact template-shapes pack evidence; 1024\/2048 stay unpromoted/)
+assert.match(compatibilityHintCopy(llama3EightBHint), /first 512-context, second 1024-context, third 2048-context, and compact template-shapes pack evidence; 1024\/2048 are bounded exact-row pack claims only/)
 const llama3HyphenEightBHint = findCompatibilityHint(capabilityFixture, { name: 'Meta-Llama-3-8B-Instruct-Q8_0', quant: 'Q8_0' })
 assert.equal(llama3HyphenEightBHint.target.id, 'llama3_8b_instruct_q8_0', 'Llama-3-8B filenames should match the exact Llama 3 8B row')
 const llama3EightBQuantMissingHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct' })

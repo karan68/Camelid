@@ -24,7 +24,7 @@ full-support language:
 | TinyLlama 1.1B Chat | Q8_0 | Supported gate evidence is green | PASS | PASS | PASS | Matches known-good llama-server on the active TinyLlama gate. Keep this as the release anchor and refresh artifacts when packaging the four-row evidence set. |
 | Llama 3.2 1B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact-header prompt, broader prompt pack, and checked bounded context packs | PASS | PASS for compact and broader short-generation packs plus checked 512/1024/2048 context packs | Exact 1B Instruct Q8_0 local chat is smoke-supported only for the documented envelopes; the checked 512/1024/2048 context packs are green, with 2048 exact-row only after the RoPE frequency-factor fix, while model-native/larger context beyond checked packs, stronger memory/perf, portability, and broader template coverage remain expansion gates. |
 | Llama 3.2 3B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact-header prompt, post-Q8-dot broader prompt pack, and checked bounded context packs | PASS | PASS for compact 1/5/50-token, broader 3-prompt/50-token, and checked 512/1024/2048 context packs | The previous JSON-shaped broader prompt blocker is fixed for the current pack, and checked 512/1024/2048 context packs are green. The row remains limited to exact-row smoke until model-native/larger context beyond checked packs, memory/perf, portability, and broader template evidence land. |
-| Llama 3 8B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact `hello`, broader 50-token pack, first 512-context pack, and compact chat-template-shapes pack | PASS for compact `hello` and covered packs | PASS for compact `hello` 5-token, bounded 50-token, broader 50-token, first 512-context pack, and compact chat-template-shapes pack | Exact 8B Instruct Q8_0 smoke is supported only for the documented envelopes; 1024/2048 and larger contexts, arbitrary template execution, stronger memory/perf, portability, and broader template coverage remain expansion gates. |
+| Llama 3 8B Instruct | Q8_0 | Supported exact-row smoke | PASS for compact `hello`, broader 50-token pack, bounded 512/1024/2048 context packs, and compact chat-template-shapes pack | PASS for compact `hello` and covered packs | PASS for compact `hello` 5-token, bounded 50-token, broader 50-token, bounded 512/1024/2048 context packs, and compact chat-template-shapes pack | Exact 8B Instruct Q8_0 smoke is supported only for the documented envelopes; 1024/2048 are bounded exact-row pack claims only, and model-native/larger context, arbitrary template execution, stronger memory/perf, portability, and broader template coverage remain expansion gates. |
 
 ## Current evidence summary
 
@@ -88,8 +88,10 @@ Representative artifacts cited by the public docs:
 - Basic API smoke, frontend smoke, and bounded memory evidence are documented for the exact tracked Q8_0 GGUF.
 - The later broader three-prompt 50-token pack passed for `hello`, alpacas, and JSON and is summarized at `qa/evidence-bundles/llama3-8b-broader-50tok-20260505T005031Z-head-d13541ad8d7e/manifest.json`.
 - The first bounded 512-context pack passed on the reopened Ubuntu validation lane and is summarized at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`.
+- The clean-current-main second bounded 1024-context pack passed and is summarized at `qa/evidence-bundles/llama3-8b-context-1024-20260506T182100Z-head-e146d3b335d8/manifest.json`.
+- The clean-current-main third bounded 2048-context pack passed and is summarized at `qa/evidence-bundles/llama3-8b-context-2048-20260506T182534Z-head-e146d3b335d8/manifest.json`.
 - The bounded compact chat-template-shapes pack passed on the reopened Ubuntu validation lane and is summarized at `qa/evidence-bundles/llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/manifest.json`.
-- Do not treat this as broad/full 8B support: 1024/2048 and larger context buckets remain blocked, and arbitrary template execution, broader chat-template coverage, support-grade memory/perf, portability, and synchronized docs/API/frontend promotion evidence remain required before widening the claim.
+- Do not treat this as broad/full 8B support: 1024/2048 are bounded exact-row pack claims only; larger/model-native context, arbitrary template execution, broader chat-template coverage, support-grade memory/perf, and portability remain required before widening the claim.
 
 Representative artifacts cited by the public docs:
 
@@ -100,6 +102,8 @@ Representative artifacts cited by the public docs:
 - `target/downloaded-llama-matrix-20260502T231000Z/summary.json`
 - `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`
 - `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`
+- `qa/evidence-bundles/llama3-8b-context-1024-20260506T182100Z-head-e146d3b335d8/manifest.json`
+- `qa/evidence-bundles/llama3-8b-context-2048-20260506T182534Z-head-e146d3b335d8/manifest.json`
 - `qa/evidence-bundles/llama3-8b-broader-50tok-20260505T005031Z-head-d13541ad8d7e/manifest.json`
 - `qa/evidence-bundles/llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/manifest.json`
 

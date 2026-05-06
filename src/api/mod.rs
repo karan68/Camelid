@@ -766,11 +766,16 @@ fn capabilities_response() -> CapabilitiesResponse {
             },
             SupportItem {
                 id: "mistral",
-                status: "planned",
-                notes: "next likely GGUF architecture family to evaluate",
+                status: "planned_exact_row_closure",
+                notes: "Mistral-7B-Instruct-v0.3.Q8_0.gguf is the immediate closure row; Ubuntu load/serve evidence exists, but tokenizer/template parity blocks support",
             },
             SupportItem {
-                id: "qwen_gemma_phi_falcon_mamba",
+                id: "mixtral_qwen_gemma",
+                status: "planned_exact_row_candidates",
+                notes: "first candidates are Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf, Qwen2.5-7B-Instruct-Q8_0.gguf, and gemma-2-9b-it-Q8_0.gguf; planning only, not support",
+            },
+            SupportItem {
+                id: "phi_falcon_mamba_others",
                 status: "future",
                 notes: "tracked as future lanes, not implied support",
             },
@@ -881,24 +886,24 @@ fn capabilities_response() -> CapabilitiesResponse {
                 parity_audited: "compact_50_token_plus_broader_50_token_prompt_pack_match",
                 performance_measured: "bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs",
                 frontend_load_path_verified: "validated",
-                tested_context: "short_api_webui_smoke_with_broader_50_token_plus_first_512_context_pack_only",
+                tested_context: "short_api_webui_smoke_with_broader_50_token_plus_first_512_second_1024_and_third_2048_context_packs",
                 chat_template_renderer: "compact",
                 chat_template_shape_pack: "validated_compact_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_first_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_promoted",
-                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1-red-pending-fresh-alignment",
+                bounded_context_1024_pack: "validated_second_pack",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "not_promoted",
-                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1-red-pending-fresh-alignment",
+                bounded_context_2048_pack: "validated_third_pack",
+                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "llama3-context-512-smoke-v1",
-                latest_checked_result: "pass_512_only",
-                latest_checked_output: "bounded_512_context_only",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, the first bounded 512-context pack, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; 1024/2048 context buckets remain red/not promoted unless fresh PASS artifacts and docs/API/frontend alignment are present",
-                next_step: "preserve exact-row smoke plus checked 512 context support while continuing KV/cache and attention memory behavior, Q8 matmul/output-projection hot paths, dense/f32 materialization avoidance, chunked or streamed long-context prefill, and per-layer timing/RSS-peak guardrails before any broader/full-support claim; treat any 1024/2048 result as red until fresh PASS artifacts and docs/API/frontend alignment are confirmed",
+                latest_checked_bucket: "llama3-context-2048-smoke-v1",
+                latest_checked_result: "pass",
+                latest_checked_output: "CMLD-204",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, the first bounded 512-context pack, clean-current-main second 1024-context and third 2048-context PASS bundles, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; the 1024/2048 context buckets are bounded exact-row pack claims only",
+                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while continuing KV/cache and attention memory behavior, Q8 matmul/output-projection hot paths, dense/f32 materialization avoidance, chunked or streamed long-context prefill, and per-layer timing/RSS-peak guardrails before any broader/full-support, model-native/larger-context, production-throughput, portability, or arbitrary-template claim",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
@@ -963,21 +968,21 @@ fn capabilities_response() -> CapabilitiesResponse {
                 next_step: "start after simpler Q4_0/Q5_0 support has loader, matmul, and parity evidence",
             },
             ModelCompatibilityTarget {
-                id: "mistral_7b_instruct_v0_2_q8_0",
+                id: "mistral_7b_instruct_v0_3_q8_0",
                 family: "mistral",
                 quantization: "Q8_0",
                 status: "acceptance_target",
                 metadata_parses: "target_selected",
-                tokenizer_works: "fixture_planning_started",
-                tensors_load: "not_started",
-                generation_runs: "not_started",
-                parity_audited: "not_started",
-                performance_measured: "not_started",
+                tokenizer_works: "parity_blocked",
+                tensors_load: "ubuntu_load_serve_observed",
+                generation_runs: "not_promoted",
+                parity_audited: "tokenizer_template_blocked",
+                performance_measured: "not_promoted",
                 frontend_load_path_verified: "fail_closed_planned",
                 tested_context: "pre_generation_readiness_only",
-                chat_template_renderer: "mistral_instruct_v0_2_planned",
+                chat_template_renderer: "mistral_instruct_v0_3_planned",
                 chat_template_shape_pack: "not_started",
-                chat_template_shape_pack_id: "mistral-instruct-v0.2-chat-template-pack-v1",
+                chat_template_shape_pack_id: "mistral-instruct-v0.3-chat-template-pack-v1",
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "mistral-context-512-smoke-v1",
                 bounded_context_window: 512,
@@ -987,11 +992,104 @@ fn capabilities_response() -> CapabilitiesResponse {
                 bounded_context_2048_pack: "not_started",
                 bounded_context_2048_pack_id: "mistral-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "target_selected",
-                latest_checked_result: "not_started",
+                latest_checked_bucket: "ubuntu_load_serve_only",
+                latest_checked_result: "blocked_on_tokenizer_template_parity",
                 latest_checked_output: "not_applicable",
-                evidence: "first exact-row bring-up target selected: Mistral-7B-Instruct-v0.2 Q8_0 so Camelid can reuse the existing Q8_0 lane while adding row-specific tokenizer, chat-template, load/readiness, and prompt-token reference artifacts",
-                next_step: "land tokenizer/chat-template fixtures plus known-good prompt-token references for the exact Mistral-7B-Instruct-v0.2 Q8_0 row before any load, generation, API, or WebUI support claim",
+                evidence: "first exact-row closure target is Mistral-7B-Instruct-v0.3.Q8_0.gguf; Ubuntu load/serve evidence exists, but tokenizer/template parity and independent prompt-token references are not closed, so there is no Mistral support claim",
+                next_step: "land tokenizer/chat-template fixtures plus known-good prompt-token references for the exact Mistral-7B-Instruct-v0.3.Q8_0.gguf row before any generation, API, or WebUI support claim",
+            },
+            ModelCompatibilityTarget {
+                id: "mixtral_8x7b_instruct_v0_1_q8_0",
+                family: "mixtral_moe",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                metadata_parses: "acquisition_planned",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                tested_context: "not_started",
+                chat_template_renderer: "mixtral_instruct_v0_1_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "mixtral-instruct-v0.1-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "mixtral-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "mixtral-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "mixtral-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "first Mixtral candidate row selected for planning only: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf; MoE expert routing, acquisition/SHA/license, tokenizer/template references, bounded load, parity, API/WebUI, RSS, and bundle evidence are all still required",
+                next_step: "capture acquisition path, model SHA and license/access notes, then map MoE expert routing or typed unsupported behavior before any generation or readiness claim",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen25_7b_instruct_q8_0",
+                family: "qwen_decoder",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                metadata_parses: "acquisition_planned",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                tested_context: "not_started",
+                chat_template_renderer: "qwen25_instruct_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen25-instruct-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "qwen25-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "qwen25-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "qwen25-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "first Qwen candidate row selected for planning only: Qwen2.5-7B-Instruct-Q8_0.gguf; tokenizer/template semantics, architecture mapping, bounded load, prompt-token parity, API/WebUI, RSS, and bundle evidence are all still required",
+                next_step: "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and independent prompt-token references before any runtime-support wording",
+            },
+            ModelCompatibilityTarget {
+                id: "gemma2_9b_it_q8_0",
+                family: "gemma2_decoder",
+                quantization: "Q8_0",
+                status: "planned_exact_row_candidate",
+                metadata_parses: "acquisition_planned",
+                tokenizer_works: "not_started",
+                tensors_load: "not_started",
+                generation_runs: "not_started",
+                parity_audited: "not_started",
+                performance_measured: "not_started",
+                frontend_load_path_verified: "fail_closed_planned",
+                tested_context: "not_started",
+                chat_template_renderer: "gemma2_it_planned",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "gemma2-it-chat-template-pack-v1",
+                bounded_context_512_pack: "not_started",
+                bounded_context_512_pack_id: "gemma2-context-512-smoke-v1",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_started",
+                bounded_context_1024_pack_id: "gemma2-context-1024-smoke-v1",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_started",
+                bounded_context_2048_pack_id: "gemma2-context-2048-smoke-v1",
+                bounded_context_2048_window: 2048,
+                latest_checked_bucket: "candidate_selected",
+                latest_checked_result: "planning_only",
+                latest_checked_output: "not_applicable",
+                evidence: "first Gemma candidate row selected for planning only: gemma-2-9b-it-Q8_0.gguf; Gemma2 architecture details, tokenizer/control-token behavior, template formatting, bounded load, parity, API/WebUI, RSS, and bundle evidence are all still required",
+                next_step: "capture acquisition path, model SHA and license/access notes, then add tokenizer/chat-template fixtures and bounded metadata/load checks before any runtime-support wording",
             },
         ],
         api_features: vec![
@@ -2868,6 +2966,19 @@ fn render_chat_prompt_for_tokenization(
                 parse_special: tokenizer.chat_prompt_parse_special(),
             };
         }
+        if is_mistral_instruct_template(template) {
+            return RenderedPrompt {
+                text: render_mistral_instruct_prompt(messages, tokenizer),
+                // The Mistral instruct renderer emits the BOS token text from
+                // the metadata template shape (`{{ bos_token }}[INST] ...`).
+                // Do not also ask the tokenizer to prepend BOS, or the first
+                // exact-row parity check gets a duplicated BOS. Keep special
+                // parsing on so SPM normalization does not add a dummy prefix
+                // before the rendered `<s>` control token.
+                add_special: false,
+                parse_special: true,
+            };
+        }
     }
 
     RenderedPrompt {
@@ -2892,6 +3003,12 @@ fn is_llama3_instruct_template(template: &str) -> bool {
     template.contains("<|start_header_id|>")
         && template.contains("<|end_header_id|>")
         && template.contains("<|eot_id|>")
+}
+
+fn is_mistral_instruct_template(template: &str) -> bool {
+    template.contains("[INST]")
+        && template.contains("[/INST]")
+        && (template.contains("bos_token") || template.contains("</s>"))
 }
 
 fn metadata_chat_template_enabled() -> bool {
@@ -2985,6 +3102,53 @@ fn render_llama3_instruct_prompt_with_options(
     if append_generation_prompt {
         prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
     }
+    prompt
+}
+
+fn render_mistral_instruct_prompt(messages: &[ChatMessage], tokenizer: &Tokenizer) -> String {
+    let bos = tokenizer.token_text(tokenizer.special.bos).unwrap_or("<s>");
+    let eos = tokenizer
+        .token_text(tokenizer.special.eos)
+        .unwrap_or("</s>");
+    let mut prompt = String::new();
+    let mut system = None;
+    let mut idx = 0;
+
+    if let Some(first) = messages.first() {
+        if first.role.trim() == "system" {
+            system = Some(first.content.trim());
+            idx = 1;
+        }
+    }
+
+    while idx < messages.len() {
+        let message = &messages[idx];
+        if message.role.trim() != "user" {
+            idx += 1;
+            continue;
+        }
+
+        prompt.push_str(bos);
+        prompt.push_str("[INST] ");
+        if let Some(system_content) = system.take() {
+            prompt.push_str(system_content);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str(message.content.trim());
+        prompt.push_str(" [/INST]");
+
+        if let Some(assistant) = messages.get(idx + 1) {
+            if assistant.role.trim() == "assistant" {
+                prompt.push(' ');
+                prompt.push_str(assistant.content.trim());
+                prompt.push_str(eos);
+                idx += 2;
+                continue;
+            }
+        }
+        break;
+    }
+
     prompt
 }
 
@@ -3097,6 +3261,8 @@ fn tokenizer_state(gguf: &GgufFile) -> TokenizerLoadState {
 fn detect_chat_template_format(template: &str) -> &'static str {
     if is_llama3_instruct_template(template) {
         "llama3_instruct"
+    } else if is_mistral_instruct_template(template) {
+        "mistral_instruct"
     } else if is_tinyllama_marker_template(template) {
         "tinyllama_marker"
     } else {
@@ -3197,19 +3363,19 @@ mod tests {
             .iter()
             .find(|target| target.id == "llama3_8b_instruct_q8_0")
             .expect("8B row should stay advertised");
-        assert_eq!(eight_b.bounded_context_1024_pack, "not_promoted");
+        assert_eq!(eight_b.bounded_context_1024_pack, "validated_second_pack");
         assert_eq!(
             eight_b.bounded_context_1024_pack_id,
-            "llama3-context-1024-smoke-v1-red-pending-fresh-alignment"
+            "llama3-context-1024-smoke-v1"
         );
-        assert_eq!(eight_b.bounded_context_2048_pack, "not_promoted");
+        assert_eq!(eight_b.bounded_context_2048_pack, "validated_third_pack");
         assert_eq!(
             eight_b.bounded_context_2048_pack_id,
-            "llama3-context-2048-smoke-v1-red-pending-fresh-alignment"
+            "llama3-context-2048-smoke-v1"
         );
         assert!(eight_b
             .evidence
-            .contains("1024/2048 context buckets remain red/not promoted"));
+            .contains("1024/2048 context buckets are bounded exact-row pack claims only"));
     }
 
     #[test]
@@ -3580,6 +3746,75 @@ mod tests {
     }
 
     #[test]
+    fn renders_mistral_instruct_prompt_with_system_preamble() {
+        let tokenizer = mistral_test_tokenizer();
+
+        assert_eq!(
+            detect_chat_template_format(tokenizer.chat_template.as_deref().unwrap()),
+            "mistral_instruct"
+        );
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: " Be brief. ".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: " Hello there. ".to_string(),
+                    },
+                ],
+                &tokenizer,
+            ),
+            "<s>[INST] Be brief.\n\nHello there. [/INST]"
+        );
+    }
+
+    #[test]
+    fn mistral_instruct_renderer_avoids_duplicate_bos_for_tokenization() {
+        let tokenizer = mistral_test_tokenizer();
+
+        let rendered = render_chat_prompt_for_tokenization(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "Hello there.".to_string(),
+            }],
+            &tokenizer,
+        );
+
+        assert!(!rendered.add_special);
+        assert!(rendered.parse_special);
+        assert_eq!(rendered.text, "<s>[INST] Hello there. [/INST]");
+    }
+
+    #[test]
+    fn renders_mistral_instruct_prompt_with_completed_assistant_turn() {
+        let tokenizer = mistral_test_tokenizer();
+
+        assert_eq!(
+            render_chat_prompt(
+                &[
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "Complete cam".to_string(),
+                    },
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: " elid ".to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: "Now say hi".to_string(),
+                    },
+                ],
+                &tokenizer,
+            ),
+            "<s>[INST] Complete cam [/INST] elid</s><s>[INST] Now say hi [/INST]"
+        );
+    }
+
+    #[test]
     fn keeps_compact_llama3_renderer_by_default_for_metadata_templates() {
         let _guard = crate::test_support::env_lock();
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
@@ -3709,6 +3944,56 @@ mod tests {
         llama3_tokenizer_with_template(
             "<|start_header_id|>{{ role }}<|end_header_id|>{{ content }}<|eot_id|>",
         )
+    }
+
+    fn mistral_test_tokenizer() -> Tokenizer {
+        Tokenizer {
+            model: TokenizerModel::LlamaSpm,
+            tokens: vec![
+                Token {
+                    id: 0,
+                    text: "<unk>".to_string(),
+                    score: 0.0,
+                    kind: TokenKind::Unknown,
+                },
+                Token {
+                    id: 1,
+                    text: "<s>".to_string(),
+                    score: 0.0,
+                    kind: TokenKind::Control,
+                },
+                Token {
+                    id: 2,
+                    text: "</s>".to_string(),
+                    score: 0.0,
+                    kind: TokenKind::Control,
+                },
+            ],
+            token_to_id: HashMap::from([
+                ("<unk>".to_string(), 0),
+                ("<s>".to_string(), 1),
+                ("</s>".to_string(), 2),
+            ]),
+            byte_token_to_id: HashMap::new(),
+            bpe_ranks: HashMap::new(),
+            bpe_registry: BpeRegistry::default(),
+            special: SpecialTokens {
+                bos: Some(1),
+                eos: Some(2),
+                eog: BTreeSet::from([2]),
+                ..SpecialTokens::default()
+            },
+            config: TokenizerConfig {
+                add_bos: true,
+                add_eos: false,
+                add_sep: false,
+                add_space_prefix: true,
+                remove_extra_whitespaces: false,
+            },
+            chat_template: Some(
+                "{{ bos_token }}[INST] {{ messages[0]['content'] }} [/INST]".to_string(),
+            ),
+        }
     }
 
     fn llama3_metadata_subset_test_tokenizer() -> Tokenizer {

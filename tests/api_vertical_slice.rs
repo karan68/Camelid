@@ -67,7 +67,13 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "mistral"));
+        .any(|item| item["id"] == "mistral" && item["status"] == "planned_exact_row_closure"));
+    assert!(body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "mixtral_qwen_gemma"
+            && item["status"] == "planned_exact_row_candidates"));
     assert!(body["api_features"]
         .as_array()
         .unwrap()
@@ -258,7 +264,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama3["tested_context"],
-        "short_api_webui_smoke_with_broader_50_token_plus_first_512_context_pack_only"
+        "short_api_webui_smoke_with_broader_50_token_plus_first_512_second_1024_and_third_2048_context_packs"
     );
     assert_eq!(llama3["chat_template_renderer"], "compact");
     assert_eq!(llama3["chat_template_shape_pack"], "validated_compact_pack");
@@ -272,40 +278,40 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "llama3-context-512-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_window"], 512);
-    assert_eq!(llama3["bounded_context_1024_pack"], "not_promoted");
+    assert_eq!(llama3["bounded_context_1024_pack"], "validated_second_pack");
     assert_eq!(
         llama3["bounded_context_1024_pack_id"],
-        "llama3-context-1024-smoke-v1-red-pending-fresh-alignment"
+        "llama3-context-1024-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_1024_window"], 1024);
-    assert_eq!(llama3["bounded_context_2048_pack"], "not_promoted");
+    assert_eq!(llama3["bounded_context_2048_pack"], "validated_third_pack");
     assert_eq!(
         llama3["bounded_context_2048_pack_id"],
-        "llama3-context-2048-smoke-v1-red-pending-fresh-alignment"
+        "llama3-context-2048-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_2048_window"], 2048);
     assert_eq!(
         llama3["latest_checked_bucket"],
-        "llama3-context-512-smoke-v1"
+        "llama3-context-2048-smoke-v1"
     );
-    assert_eq!(llama3["latest_checked_result"], "pass_512_only");
-    assert_eq!(llama3["latest_checked_output"], "bounded_512_context_only");
+    assert_eq!(llama3["latest_checked_result"], "pass");
+    assert_eq!(llama3["latest_checked_output"], "CMLD-204");
     let llama3_evidence = llama3["evidence"].as_str().unwrap();
-    assert!(llama3_evidence.contains("1024/2048 context buckets remain red/not promoted"));
+    assert!(llama3_evidence.contains("second 1024-context and third 2048-context PASS bundles"));
     assert!(llama3_evidence.contains("retained-block lazy-Q8 hot-path cost probes"));
     let llama3_next_step = llama3["next_step"].as_str().unwrap();
-    assert!(llama3_next_step.contains("checked 512 context support"));
-    assert!(llama3_next_step.contains("1024/2048 result as red"));
-    assert!(llama3_next_step.contains("before any broader/full-support claim"));
+    assert!(llama3_next_step.contains("checked 512/1024/2048 context support"));
+    assert!(llama3_next_step.contains("model-native/larger-context"));
+    assert!(llama3_next_step.contains("broader/full-support"));
     let mistral = compatibility
         .iter()
-        .find(|item| item["id"] == "mistral_7b_instruct_v0_2_q8_0")
+        .find(|item| item["id"] == "mistral_7b_instruct_v0_3_q8_0")
         .unwrap();
     assert_eq!(mistral["status"], "acceptance_target");
     assert_eq!(mistral["metadata_parses"], "target_selected");
-    assert_eq!(mistral["tokenizer_works"], "fixture_planning_started");
-    assert_eq!(mistral["tensors_load"], "not_started");
-    assert_eq!(mistral["generation_runs"], "not_started");
+    assert_eq!(mistral["tokenizer_works"], "parity_blocked");
+    assert_eq!(mistral["tensors_load"], "ubuntu_load_serve_observed");
+    assert_eq!(mistral["generation_runs"], "not_promoted");
     assert_eq!(
         mistral["frontend_load_path_verified"],
         "fail_closed_planned"
@@ -313,23 +319,43 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(mistral["tested_context"], "pre_generation_readiness_only");
     assert_eq!(
         mistral["chat_template_renderer"],
-        "mistral_instruct_v0_2_planned"
+        "mistral_instruct_v0_3_planned"
     );
     assert_eq!(mistral["chat_template_shape_pack"], "not_started");
     assert_eq!(
         mistral["chat_template_shape_pack_id"],
-        "mistral-instruct-v0.2-chat-template-pack-v1"
+        "mistral-instruct-v0.3-chat-template-pack-v1"
     );
     assert_eq!(mistral["bounded_context_512_pack"], "not_started");
     assert_eq!(
         mistral["bounded_context_512_pack_id"],
         "mistral-context-512-smoke-v1"
     );
-    assert_eq!(mistral["latest_checked_bucket"], "target_selected");
+    assert_eq!(mistral["latest_checked_bucket"], "ubuntu_load_serve_only");
+    assert_eq!(
+        mistral["latest_checked_result"],
+        "blocked_on_tokenizer_template_parity"
+    );
     let mistral_evidence = mistral["evidence"].as_str().unwrap();
-    assert!(mistral_evidence.contains("Mistral-7B-Instruct-v0.2 Q8_0"));
+    assert!(mistral_evidence.contains("Mistral-7B-Instruct-v0.3.Q8_0.gguf"));
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
     assert!(mistral_next_step.contains("tokenizer/chat-template fixtures"));
+    assert!(mistral_next_step.contains("before any generation, API, or WebUI support claim"));
+    for (id, filename) in [
+        (
+            "mixtral_8x7b_instruct_v0_1_q8_0",
+            "Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf",
+        ),
+        ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
+        ("gemma2_9b_it_q8_0", "gemma-2-9b-it-Q8_0.gguf"),
+    ] {
+        let row = compatibility.iter().find(|item| item["id"] == id).unwrap();
+        assert_eq!(row["status"], "planned_exact_row_candidate");
+        assert_eq!(row["generation_runs"], "not_started");
+        assert_eq!(row["frontend_load_path_verified"], "fail_closed_planned");
+        assert_eq!(row["latest_checked_result"], "planning_only");
+        assert!(row["evidence"].as_str().unwrap().contains(filename));
+    }
     let planned_quant = compatibility
         .iter()
         .find(|item| item["id"] == "llama_spm_q4_k_q5_k")
