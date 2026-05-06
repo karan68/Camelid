@@ -2188,6 +2188,10 @@ impl LlamaForwardMemoryTimings {
             .q8_file_reads
             .cache_hits
             .saturating_add(other.q8_file_reads.cache_hits);
+        self.q8_file_reads.cache_hit_bytes = self
+            .q8_file_reads
+            .cache_hit_bytes
+            .saturating_add(other.q8_file_reads.cache_hit_bytes);
         self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
         self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
         self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
@@ -2214,7 +2218,10 @@ impl LlamaForwardMemoryTimings {
 }
 
 fn q8_file_read_stats_has_activity(stats: Q8_0FileReadStats) -> bool {
-    stats.read_calls > 0 || stats.read_bytes > 0 || stats.cache_hits > 0
+    stats.read_calls > 0
+        || stats.read_bytes > 0
+        || stats.cache_hits > 0
+        || stats.cache_hit_bytes > 0
 }
 
 fn add_q8_file_read_phase_trace(
@@ -2235,6 +2242,10 @@ fn add_q8_file_read_phase_trace(
             .q8_file_reads
             .cache_hits
             .saturating_add(delta.cache_hits);
+        existing.q8_file_reads.cache_hit_bytes = existing
+            .q8_file_reads
+            .cache_hit_bytes
+            .saturating_add(delta.cache_hit_bytes);
         existing.q8_file_reads.cache_entries = delta.cache_entries;
         existing.q8_file_reads.cache_bytes = delta.cache_bytes;
         existing.q8_file_reads.cache_capacity_bytes = delta.cache_capacity_bytes;
@@ -2407,6 +2418,10 @@ impl LlamaLayerMemoryTimings {
             .q8_file_reads
             .cache_hits
             .saturating_add(other.q8_file_reads.cache_hits);
+        self.q8_file_reads.cache_hit_bytes = self
+            .q8_file_reads
+            .cache_hit_bytes
+            .saturating_add(other.q8_file_reads.cache_hit_bytes);
         self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
         self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
         self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
@@ -7515,6 +7530,7 @@ mod tests {
             read_calls: 3,
             read_bytes: 256,
             cache_hits: 1,
+            cache_hit_bytes: 64,
             cache_entries: 2,
             cache_bytes: 512,
             cache_capacity_bytes: 1024,
@@ -7523,6 +7539,7 @@ mod tests {
             read_calls: 4,
             read_bytes: 1024,
             cache_hits: 2,
+            cache_hit_bytes: 128,
             cache_entries: 3,
             cache_bytes: 768,
             cache_capacity_bytes: 1024,
@@ -7538,6 +7555,7 @@ mod tests {
                 read_calls: 7,
                 read_bytes: 1280,
                 cache_hits: 3,
+                cache_hit_bytes: 192,
                 cache_entries: 3,
                 cache_bytes: 768,
                 cache_capacity_bytes: 1024,
@@ -7563,6 +7581,7 @@ mod tests {
             read_calls: 2,
             read_bytes: 128,
             cache_hits: 1,
+            cache_hit_bytes: 32,
             cache_entries: 1,
             cache_bytes: 256,
             cache_capacity_bytes: 512,
@@ -7572,6 +7591,7 @@ mod tests {
             read_calls: 5,
             read_bytes: 512,
             cache_hits: 3,
+            cache_hit_bytes: 96,
             cache_entries: 2,
             cache_bytes: 384,
             cache_capacity_bytes: 512,
@@ -7582,6 +7602,7 @@ mod tests {
                 read_calls: 2,
                 read_bytes: 128,
                 cache_hits: 1,
+                cache_hit_bytes: 32,
                 cache_entries: 1,
                 cache_bytes: 256,
                 cache_capacity_bytes: 512,
@@ -7593,6 +7614,7 @@ mod tests {
                 read_calls: 3,
                 read_bytes: 384,
                 cache_hits: 2,
+                cache_hit_bytes: 64,
                 cache_entries: 2,
                 cache_bytes: 384,
                 cache_capacity_bytes: 512,
@@ -7604,6 +7626,7 @@ mod tests {
                 read_calls: 2,
                 read_bytes: 128,
                 cache_hits: 1,
+                cache_hit_bytes: 32,
                 cache_entries: 2,
                 cache_bytes: 384,
                 cache_capacity_bytes: 512,
@@ -7619,6 +7642,7 @@ mod tests {
                 read_calls: 7,
                 read_bytes: 640,
                 cache_hits: 4,
+                cache_hit_bytes: 128,
                 cache_entries: 2,
                 cache_bytes: 384,
                 cache_capacity_bytes: 512,
@@ -7629,8 +7653,16 @@ mod tests {
         assert_eq!(first.q8_file_read_phases[0].q8_file_reads.read_calls, 5);
         assert_eq!(first.q8_file_read_phases[0].q8_file_reads.read_bytes, 512);
         assert_eq!(first.q8_file_read_phases[0].q8_file_reads.cache_hits, 3);
+        assert_eq!(
+            first.q8_file_read_phases[0].q8_file_reads.cache_hit_bytes,
+            96
+        );
         assert_eq!(first.q8_file_read_phases[1].phase, "ffn_down_done");
         assert_eq!(first.q8_file_read_phases[1].q8_file_reads.read_calls, 2);
+        assert_eq!(
+            first.q8_file_read_phases[1].q8_file_reads.cache_hit_bytes,
+            32
+        );
 
         first.record_after_attention_output(memory_sample(160, 1, 1));
         assert_eq!(first.peak_rss_kib, Some(160));

@@ -789,6 +789,7 @@ const DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS: usize = 1024;
 static Q8_0_FILE_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static Q8_FILE_CACHE: OnceLock<Mutex<Q8FileCache>> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -796,6 +797,7 @@ pub struct Q8_0FileReadStats {
     pub read_calls: u64,
     pub read_bytes: u64,
     pub cache_hits: u64,
+    pub cache_hit_bytes: u64,
     pub cache_entries: u64,
     pub cache_bytes: u64,
     pub cache_capacity_bytes: u64,
@@ -807,6 +809,7 @@ impl Q8_0FileReadStats {
             read_calls: self.read_calls.saturating_sub(start.read_calls),
             read_bytes: self.read_bytes.saturating_sub(start.read_bytes),
             cache_hits: self.cache_hits.saturating_sub(start.cache_hits),
+            cache_hit_bytes: self.cache_hit_bytes.saturating_sub(start.cache_hit_bytes),
             cache_entries: self.cache_entries,
             cache_bytes: self.cache_bytes,
             cache_capacity_bytes: self.cache_capacity_bytes,
@@ -826,6 +829,7 @@ pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
         read_calls: Q8_0_FILE_READ_CALLS.load(Ordering::Relaxed),
         read_bytes: Q8_0_FILE_READ_BYTES.load(Ordering::Relaxed),
         cache_hits: Q8_0_FILE_CACHE_HITS.load(Ordering::Relaxed),
+        cache_hit_bytes: Q8_0_FILE_CACHE_HIT_BYTES.load(Ordering::Relaxed),
         cache_entries,
         cache_bytes,
         cache_capacity_bytes: cache_capacity_bytes as u64,
@@ -867,6 +871,7 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
     out.copy_from_slice(&entry.bytes[start..start + out.len()]);
     cache.entries.push(entry);
     Q8_0_FILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    Q8_0_FILE_CACHE_HIT_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
     true
 }
 
@@ -1265,6 +1270,7 @@ mod tests {
         assert_eq!(&out, b"abcdefgh");
         let after_first = q8_0_file_read_stats().saturating_delta_since(start);
         assert_eq!(after_first.cache_hits, 1);
+        assert_eq!(after_first.cache_hit_bytes, 8);
         assert_eq!(after_first.cache_entries, 1);
         assert_eq!(after_first.cache_bytes, 8);
         assert_eq!(after_first.cache_capacity_bytes, 8);
@@ -1276,6 +1282,7 @@ mod tests {
         assert_eq!(&evicted, b"ijklmnop");
         let after_second = q8_0_file_read_stats().saturating_delta_since(start);
         assert_eq!(after_second.cache_hits, 2);
+        assert_eq!(after_second.cache_hit_bytes, 16);
         assert_eq!(after_second.cache_entries, 1);
         assert_eq!(after_second.cache_bytes, 8);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
@@ -1298,6 +1305,7 @@ mod tests {
 
         assert_eq!(&out, b"efgh");
         assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_hit_bytes, 4);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
     }
 
