@@ -19,6 +19,13 @@ Executive summary: Camelid now has full API + frontend end-to-end smoke for the 
 
 This is the repo story in one sentence: Camelid expanded from one trusted small-model gate to a four-row exact Q8_0 product contract, while preserving fail-closed support language for every unproven neighboring row, context, quantization, and runtime path.
 
+Active work now splits into two explicit tracks:
+
+- **Four-row hardening:** keep TinyLlama as the current full gate, keep Llama 3.2 1B/3B and Llama 3 8B labeled as exact-row smoke until they meet the harder normalized bar, and treat CI reliability as a release blocker rather than a best-effort signal.
+- **First Mistral exact-row bring-up:** start with row selection, tokenizer/template fixtures, known-good prompt-token references, typed unsupported/readiness behavior, and bounded load evidence. There is no Mistral support claim yet; public wording may say planned bring-up only until row-specific artifacts exist.
+
+README screenshot note: capture and add a frontend screenshot only after the UI is demo-ready and visibly communicates the exact support contract. It should show truthful runtime/readiness state, not become a substitute for CI or support evidence.
+
 ## Release ledger snapshot
 
 Camelid follows the same four-lane release ledger across the README, compatibility matrix, API capability reporting, and frontend readiness copy. If another surface sounds broader, treat it as stale and bring it back to this ledger. The purpose of this file is simple: record exactly what the current evidence can defend, no more and no less.
@@ -330,9 +337,18 @@ In order of importance:
 2. Preserve and publish the Llama 3.2 1B broader prompt-pack win as exact-row evidence, without lending it to neighboring rows.
 3. Preserve the Llama 3.2 3B broader prompt-pack win in docs, API, and regression evidence without lending it to neighboring rows.
 4. Preserve the Llama 3 8B exact-row promotion in docs, API, frontend readiness, and regression evidence without lending it to neighboring rows.
-5. Keep docs, `/api/capabilities`, and frontend readiness copy aligned with the exact-row support contract.
+5. Harden the four rows toward full support without changing labels until the missing normalized evidence exists: model-native/larger context beyond checked packs, arbitrary/Jinja template coverage, production throughput, portability, and durable repeated current-head bundles.
+6. Begin the first Mistral exact-row bring-up as planned work only: select one concrete target GGUF row/quant, add tokenizer/template fixtures, record known-good prompt-token references, preserve typed unsupported/readiness behavior, and do not expose Mistral as supported until bounded row-specific artifacts exist.
+7. Keep docs, `/api/capabilities`, frontend readiness copy, and CI gates aligned with the exact-row support contract.
+8. Plan the README frontend screenshot for the UI-demo-ready moment; do not use screenshot polish to block or distract from CI/support hardening.
 
 Current operator update: The approved Ubuntu validation lane is reopened. Promotion-grade exact-row reruns for 1B/3B/8B should resume there from clean public `main` checkouts while preserving any dirty remote worktrees. Fresh reopened-lane API-only and API + frontend smoke summaries now live at `qa/evidence-bundles/four-row-api-only-20260504T230722Z-head-13a465608fbf/manifest.json` and `qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`; the TinyLlama final-normalization bundle has a passing public summary at `qa/evidence-bundles/tinyllama-broader-template-context-perf-rss-20260505T044519Z-head-864e07b51f36/manifest.json`; the exact Llama 3.2 1B/3B compact chat-template-shapes pack has a passing public summary at `qa/evidence-bundles/llama32-1b-3b-chat-template-shapes-20260505T060036Z-head-e9f28572e090/manifest.json`; the exact Llama 3.2 1B/3B unique-chat perf/RSS pack has a passing public summary at `qa/evidence-bundles/llama32-1b-3b-unique-chat-perf-rss-20260505T061644Z-head-e9f28572e090/manifest.json`; the exact 8B broader three-prompt 50-token pack has a passing public summary at `qa/evidence-bundles/llama3-8b-broader-50tok-20260505T005031Z-head-d13541ad8d7e/manifest.json`; the first four-row bounded 512-context pack has a passing public summary at `qa/evidence-bundles/four-row-context-512-20260505T051510Z-head-b403884/manifest.json`; the earlier exact 8B 512-context pack has a passing public summary at `qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`; and the bounded exact 8B compact chat-template-shapes pack has a passing public summary at `qa/evidence-bundles/llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/manifest.json`. This does not widen support by itself: broader/full support still requires normalized parity, memory/perf, broader context/template coverage, and durable-bundle evidence. See `qa/validation-notes/2026-05-04-validation-lane-reopened.md`, `qa/validation-notes/2026-05-04-8b-context-512-rerun.md`, `qa/validation-notes/2026-05-05-four-row-context-512.md`, `qa/validation-notes/2026-05-05-llama32-1b-3b-chat-template-shapes.md`, `qa/validation-notes/2026-05-05-llama32-1b-3b-unique-chat-perf-rss.md`, `qa/validation-notes/2026-05-05-8b-broader-50tok.md`, and `qa/validation-notes/2026-05-05-8b-chat-template-shapes.md`.
+
+### Mistral exact-row bring-up note
+
+Mistral work is now open as a first exact-row bring-up track, but it has no validated release evidence and no runtime support claim yet. The first status-changing work must name a single GGUF row and quantization, then land tokenizer/template fixtures, known-good prompt-token reference evidence, bounded load/readiness behavior, and typed unsupported states before any generation/API/WebUI support language appears. Public docs should call this a planned exact-row bring-up only; phrases like “Mistral support” or “Mistral-family support” are premature until row-specific parity and smoke artifacts exist.
+
+The first Mistral evidence bundle should include, at minimum: exact model filename/SHA, GGUF metadata summary, tokenizer and chat-template fixture IDs, known-good prompt-token reference output, Camelid prompt-token comparison, load/readiness result, memory notes, command transcript, scrubbed manifest, and checksum file. After that, generation parity, API smoke, frontend smoke, bounded context, and performance/portability evidence can be promoted one box at a time.
 
 ### Qwen prerequisite note
 

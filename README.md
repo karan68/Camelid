@@ -21,6 +21,14 @@ Camelid's current milestone is not a loose compatibility demo. It is a synchroni
 - **The context ladder is explicit.** All four rows have checked bounded 512-context evidence; the exact Llama 3.2 1B/3B rows have checked 1024 and 2048 packs, and the exact Llama 3 8B row now has current-head checked 1024 and 2048 packs.
 - **The biggest caveat is still visible.** Llama 3 8B 1024/2048-context support is now a bounded exact-row pack claim, not broad/full 8B support; the checked 1024/2048 packs remain bounded exact-row claims only.
 
+## Current work tracks
+
+Camelid is advancing on two tracks, and both stay gated by CI plus artifact-backed support language:
+
+- **Four-row hardening:** preserve TinyLlama as the current full gate and move the three Llama exact-row smoke lanes toward the same normalized bar without overstating them. The next promotable evidence remains model-native/larger-context behavior beyond checked packs, arbitrary/Jinja template coverage, production-throughput evidence, portability, and repeated current-head bundles. CI reliability is non-negotiable: no public support wording should move if the gate is red.
+- **First Mistral exact-row bring-up:** Mistral work starts as a planned exact-row lane, not as Mistral-family support. The first public milestone is choosing one concrete GGUF row and quantization, then adding tokenizer/template fixtures, known-good prompt-token checks, typed unsupported/readiness behavior, bounded load evidence, and only later generation/API/WebUI artifacts.
+- **README frontend screenshot:** add a real UI screenshot only after the demo surface is ready and shows the exact support contract honestly: loaded runtime readiness, matched exact-row support, and no implied family-wide support. This is planned polish after CI/support gates, not a distraction from the support work.
+
 ## Why Camelid matters
 
 Most local-model stacks emphasize broad compatibility before they can explain what is truly production-ready. Camelid takes the opposite approach.
