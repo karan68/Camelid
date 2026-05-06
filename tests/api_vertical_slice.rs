@@ -258,7 +258,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         llama3["tested_context"],
-        "short_api_webui_smoke_with_broader_50_token_plus_first_512_second_1024_and_third_2048_context_packs"
+        "short_api_webui_smoke_with_broader_50_token_plus_first_512_context_pack_only"
     );
     assert_eq!(llama3["chat_template_renderer"], "compact");
     assert_eq!(llama3["chat_template_shape_pack"], "validated_compact_pack");
@@ -272,31 +272,30 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "llama3-context-512-smoke-v1"
     );
     assert_eq!(llama3["bounded_context_window"], 512);
-    assert_eq!(llama3["bounded_context_1024_pack"], "validated_second_pack");
+    assert_eq!(llama3["bounded_context_1024_pack"], "not_promoted");
     assert_eq!(
         llama3["bounded_context_1024_pack_id"],
-        "llama3-context-1024-smoke-v1"
+        "llama3-context-1024-smoke-v1-red-pending-fresh-alignment"
     );
     assert_eq!(llama3["bounded_context_1024_window"], 1024);
-    assert_eq!(llama3["bounded_context_2048_pack"], "validated_third_pack");
+    assert_eq!(llama3["bounded_context_2048_pack"], "not_promoted");
     assert_eq!(
         llama3["bounded_context_2048_pack_id"],
-        "llama3-context-2048-smoke-v1"
+        "llama3-context-2048-smoke-v1-red-pending-fresh-alignment"
     );
     assert_eq!(llama3["bounded_context_2048_window"], 2048);
     assert_eq!(
         llama3["latest_checked_bucket"],
-        "llama3-context-2048-smoke-v1"
+        "llama3-context-512-smoke-v1"
     );
-    assert_eq!(llama3["latest_checked_result"], "pass");
-    assert_eq!(llama3["latest_checked_output"], "CMLD-204");
+    assert_eq!(llama3["latest_checked_result"], "pass_512_only");
+    assert_eq!(llama3["latest_checked_output"], "bounded_512_context_only");
     let llama3_evidence = llama3["evidence"].as_str().unwrap();
-    assert!(llama3_evidence.contains("passing bounded 512/1024/2048-context packs"));
-    assert!(llama3_evidence.contains("broad 8B/full-context"));
+    assert!(llama3_evidence.contains("1024/2048 context buckets remain red/not promoted"));
     assert!(llama3_evidence.contains("retained-block lazy-Q8 hot-path cost probes"));
     let llama3_next_step = llama3["next_step"].as_str().unwrap();
-    assert!(llama3_next_step.contains("checked 512/1024/2048 context support"));
-    assert!(llama3_next_step.contains("bounded packs/measurements only"));
+    assert!(llama3_next_step.contains("checked 512 context support"));
+    assert!(llama3_next_step.contains("1024/2048 result as red"));
     assert!(llama3_next_step.contains("before any broader/full-support claim"));
     let mistral = compatibility
         .iter()

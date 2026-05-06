@@ -881,24 +881,24 @@ fn capabilities_response() -> CapabilitiesResponse {
                 parity_audited: "compact_50_token_plus_broader_50_token_prompt_pack_match",
                 performance_measured: "bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs",
                 frontend_load_path_verified: "validated",
-                tested_context: "short_api_webui_smoke_with_broader_50_token_plus_first_512_second_1024_and_third_2048_context_packs",
+                tested_context: "short_api_webui_smoke_with_broader_50_token_plus_first_512_context_pack_only",
                 chat_template_renderer: "compact",
                 chat_template_shape_pack: "validated_compact_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_first_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "validated_second_pack",
-                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1-red-pending-fresh-alignment",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "validated_third_pack",
-                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1-red-pending-fresh-alignment",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "llama3-context-2048-smoke-v1",
-                latest_checked_result: "pass",
-                latest_checked_output: "CMLD-204",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, passing bounded 512/1024/2048-context packs on clean current main, one passing compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; exact-row smoke and checked bounded packs are supported without promoting broad 8B/full-context, arbitrary-template, or performance-portability support",
-                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while continuing KV/cache and attention memory behavior, Q8 matmul/output-projection hot paths, dense/f32 materialization avoidance, chunked or streamed long-context prefill, and per-layer timing/RSS-peak guardrails before any broader/full-support claim; treat the passing broader 50-token, bounded context, compact chat-template-shapes, and lazy-Q8 hot-path artifacts as bounded packs/measurements only",
+                latest_checked_bucket: "llama3-context-512-smoke-v1",
+                latest_checked_result: "pass_512_only",
+                latest_checked_output: "bounded_512_context_only",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, the first bounded 512-context pack, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; 1024/2048 context buckets remain red/not promoted unless fresh PASS artifacts and docs/API/frontend alignment are present",
+                next_step: "preserve exact-row smoke plus checked 512 context support while continuing KV/cache and attention memory behavior, Q8 matmul/output-projection hot paths, dense/f32 materialization avoidance, chunked or streamed long-context prefill, and per-layer timing/RSS-peak guardrails before any broader/full-support claim; treat any 1024/2048 result as red until fresh PASS artifacts and docs/API/frontend alignment are confirmed",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
@@ -3197,19 +3197,19 @@ mod tests {
             .iter()
             .find(|target| target.id == "llama3_8b_instruct_q8_0")
             .expect("8B row should stay advertised");
-        assert_eq!(eight_b.bounded_context_1024_pack, "validated_second_pack");
+        assert_eq!(eight_b.bounded_context_1024_pack, "not_promoted");
         assert_eq!(
             eight_b.bounded_context_1024_pack_id,
-            "llama3-context-1024-smoke-v1"
+            "llama3-context-1024-smoke-v1-red-pending-fresh-alignment"
         );
-        assert_eq!(eight_b.bounded_context_2048_pack, "validated_third_pack");
+        assert_eq!(eight_b.bounded_context_2048_pack, "not_promoted");
         assert_eq!(
             eight_b.bounded_context_2048_pack_id,
-            "llama3-context-2048-smoke-v1"
+            "llama3-context-2048-smoke-v1-red-pending-fresh-alignment"
         );
         assert!(eight_b
             .evidence
-            .contains("passing bounded 512/1024/2048-context packs"));
+            .contains("1024/2048 context buckets remain red/not promoted"));
     }
 
     #[test]
