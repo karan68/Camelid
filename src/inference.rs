@@ -1194,8 +1194,11 @@ pub struct LlamaLayerMemoryTimings {
     pub layer_index: usize,
     pub forward_passes: usize,
     pub q8_file_reads: Q8_0FileReadStats,
+    pub q8_file_read_phases: Vec<LlamaQ8FileReadPhaseTrace>,
     #[serde(skip)]
     q8_file_read_start: Q8_0FileReadStats,
+    #[serde(skip)]
+    q8_file_read_phase_start: Q8_0FileReadStats,
     pub start: LlamaMemorySample,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after_attention_norm: Option<LlamaMemorySample>,
@@ -1239,6 +1242,12 @@ pub struct LlamaMemorySample {
     pub kv_cache_allocated_sequence_length: usize,
     pub kv_cache_allocated_elements: usize,
     pub kv_cache_allocated_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LlamaQ8FileReadPhaseTrace {
+    pub phase: String,
+    pub q8_file_reads: Q8_0FileReadStats,
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -1988,6 +1997,39 @@ impl LlamaForwardMemoryTimings {
     }
 }
 
+fn q8_file_read_stats_has_activity(stats: Q8_0FileReadStats) -> bool {
+    stats.read_calls > 0 || stats.read_bytes > 0 || stats.cache_hits > 0
+}
+
+fn add_q8_file_read_phase_trace(
+    phases: &mut Vec<LlamaQ8FileReadPhaseTrace>,
+    phase: &str,
+    delta: Q8_0FileReadStats,
+) {
+    if let Some(existing) = phases.iter_mut().find(|entry| entry.phase == phase) {
+        existing.q8_file_reads.read_calls = existing
+            .q8_file_reads
+            .read_calls
+            .saturating_add(delta.read_calls);
+        existing.q8_file_reads.read_bytes = existing
+            .q8_file_reads
+            .read_bytes
+            .saturating_add(delta.read_bytes);
+        existing.q8_file_reads.cache_hits = existing
+            .q8_file_reads
+            .cache_hits
+            .saturating_add(delta.cache_hits);
+        existing.q8_file_reads.cache_entries = delta.cache_entries;
+        existing.q8_file_reads.cache_bytes = delta.cache_bytes;
+        existing.q8_file_reads.cache_capacity_bytes = delta.cache_capacity_bytes;
+        return;
+    }
+    phases.push(LlamaQ8FileReadPhaseTrace {
+        phase: phase.to_string(),
+        q8_file_reads: delta,
+    });
+}
+
 impl LlamaLayerMemoryTimings {
     fn new(layer_index: usize, start: LlamaMemorySample) -> Self {
         let mut memory = Self {
@@ -1995,6 +2037,8 @@ impl LlamaLayerMemoryTimings {
             forward_passes: 1,
             q8_file_reads: Q8_0FileReadStats::default(),
             q8_file_read_start: q8_0_file_read_stats(),
+            q8_file_read_phases: Vec::new(),
+            q8_file_read_phase_start: q8_0_file_read_stats(),
             peak_rss_kib: None,
             peak_rss_delta_kib: None,
             peak_phase: None,
@@ -2106,7 +2150,17 @@ impl LlamaLayerMemoryTimings {
         set: impl FnOnce(&mut Self, LlamaMemorySample),
     ) {
         self.consider_peak(phase, &sample);
+        self.record_q8_file_read_phase(phase);
         set(self, sample);
+    }
+
+    fn record_q8_file_read_phase(&mut self, phase: &str) {
+        let current = q8_0_file_read_stats();
+        let delta = current.saturating_delta_since(self.q8_file_read_phase_start);
+        self.q8_file_read_phase_start = current;
+        if q8_file_read_stats_has_activity(delta) {
+            add_q8_file_read_phase_trace(&mut self.q8_file_read_phases, phase, delta);
+        }
     }
 
     fn consider_peak(&mut self, phase: &str, sample: &LlamaMemorySample) {
@@ -2140,6 +2194,13 @@ impl LlamaLayerMemoryTimings {
         self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
         self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
         self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
+        for phase in &other.q8_file_read_phases {
+            add_q8_file_read_phase_trace(
+                &mut self.q8_file_read_phases,
+                &phase.phase,
+                phase.q8_file_reads,
+            );
+        }
         self.after_attention_norm = other.after_attention_norm.clone();
         self.after_attention_q = other.after_attention_q.clone();
         self.after_attention_k = other.after_attention_k.clone();
@@ -7135,6 +7196,39 @@ mod tests {
             cache_bytes: 384,
             cache_capacity_bytes: 512,
         };
+        first.q8_file_read_phases.push(LlamaQ8FileReadPhaseTrace {
+            phase: "attention_q_done".to_string(),
+            q8_file_reads: Q8_0FileReadStats {
+                read_calls: 2,
+                read_bytes: 128,
+                cache_hits: 1,
+                cache_entries: 1,
+                cache_bytes: 256,
+                cache_capacity_bytes: 512,
+            },
+        });
+        second.q8_file_read_phases.push(LlamaQ8FileReadPhaseTrace {
+            phase: "attention_q_done".to_string(),
+            q8_file_reads: Q8_0FileReadStats {
+                read_calls: 3,
+                read_bytes: 384,
+                cache_hits: 2,
+                cache_entries: 2,
+                cache_bytes: 384,
+                cache_capacity_bytes: 512,
+            },
+        });
+        second.q8_file_read_phases.push(LlamaQ8FileReadPhaseTrace {
+            phase: "ffn_down_done".to_string(),
+            q8_file_reads: Q8_0FileReadStats {
+                read_calls: 2,
+                read_bytes: 128,
+                cache_hits: 1,
+                cache_entries: 2,
+                cache_bytes: 384,
+                cache_capacity_bytes: 512,
+            },
+        });
 
         first.merge_assign(&second);
 
@@ -7150,6 +7244,13 @@ mod tests {
                 cache_capacity_bytes: 512,
             }
         );
+        assert_eq!(first.q8_file_read_phases.len(), 2);
+        assert_eq!(first.q8_file_read_phases[0].phase, "attention_q_done");
+        assert_eq!(first.q8_file_read_phases[0].q8_file_reads.read_calls, 5);
+        assert_eq!(first.q8_file_read_phases[0].q8_file_reads.read_bytes, 512);
+        assert_eq!(first.q8_file_read_phases[0].q8_file_reads.cache_hits, 3);
+        assert_eq!(first.q8_file_read_phases[1].phase, "ffn_down_done");
+        assert_eq!(first.q8_file_read_phases[1].q8_file_reads.read_calls, 2);
 
         first.record_after_attention_output(memory_sample(160, 1, 1));
         assert_eq!(first.peak_rss_kib, Some(160));
