@@ -338,7 +338,7 @@ In order of importance:
 3. Preserve the Llama 3.2 3B broader prompt-pack win in docs, API, and regression evidence without lending it to neighboring rows.
 4. Preserve the Llama 3 8B exact-row promotion in docs, API, frontend readiness, and regression evidence without lending it to neighboring rows.
 5. Harden the four rows toward full support without changing labels until the missing normalized evidence exists: model-native/larger context beyond checked packs, arbitrary/Jinja template coverage, production throughput, portability, and durable repeated current-head bundles.
-6. Begin the first Mistral exact-row bring-up as planned work only: select one concrete target GGUF row/quant, add tokenizer/template fixtures, record known-good prompt-token references, preserve typed unsupported/readiness behavior, and do not expose Mistral as supported until bounded row-specific artifacts exist.
+6. Begin the first Mistral exact-row bring-up as planned work only: the chosen acceptance target is `Mistral-7B-Instruct-v0.2 Q8_0`; add tokenizer/template fixtures, record known-good prompt-token references, preserve typed unsupported/readiness behavior, and do not expose Mistral as supported until bounded row-specific artifacts exist.
 7. Keep docs, `/api/capabilities`, frontend readiness copy, and CI gates aligned with the exact-row support contract.
 8. Plan the README frontend screenshot for the UI-demo-ready moment; do not use screenshot polish to block or distract from CI/support hardening.
 
@@ -346,9 +346,9 @@ Current operator update: The approved Ubuntu validation lane is reopened. Promot
 
 ### Mistral exact-row bring-up note
 
-Mistral work is now open as a first exact-row bring-up track, but it has no validated release evidence and no runtime support claim yet. The first status-changing work must name a single GGUF row and quantization, then land tokenizer/template fixtures, known-good prompt-token reference evidence, bounded load/readiness behavior, and typed unsupported states before any generation/API/WebUI support language appears. Public docs should call this a planned exact-row bring-up only; phrases like “Mistral support” or “Mistral-family support” are premature until row-specific parity and smoke artifacts exist.
+Mistral work is now open as a first exact-row bring-up track, but it has no validated release evidence and no runtime support claim yet. Camelid has chosen `Mistral-7B-Instruct-v0.2 Q8_0` as the first acceptance target because it keeps the first bring-up on the existing Q8_0 lane while scoping the effort to one exact instruct row. The next status-changing work must land tokenizer/template fixtures, known-good prompt-token reference evidence, bounded load/readiness behavior, and typed unsupported states before any generation/API/WebUI support language appears. Public docs should call this a planned exact-row bring-up only; phrases like “Mistral support” or “Mistral-family support” are premature until row-specific parity and smoke artifacts exist.
 
-The first Mistral evidence bundle should include, at minimum: exact model filename/SHA, GGUF metadata summary, tokenizer and chat-template fixture IDs, known-good prompt-token reference output, Camelid prompt-token comparison, load/readiness result, memory notes, command transcript, scrubbed manifest, and checksum file. After that, generation parity, API smoke, frontend smoke, bounded context, and performance/portability evidence can be promoted one box at a time.
+The first Mistral evidence bundle should include, at minimum: the exact `Mistral-7B-Instruct-v0.2 Q8_0` filename/SHA, GGUF metadata summary, tokenizer and chat-template fixture IDs, known-good prompt-token reference output, Camelid prompt-token comparison, load/readiness result, memory notes, command transcript, scrubbed manifest, and checksum file. After that, generation parity, API smoke, frontend smoke, bounded context, and performance/portability evidence can be promoted one box at a time.
 
 ### Qwen prerequisite note
 

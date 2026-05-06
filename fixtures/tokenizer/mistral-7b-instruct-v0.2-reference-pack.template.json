@@ -1,0 +1,28 @@
+{
+  "target_row": "mistral_7b_instruct_v0_2_q8_0",
+  "model_name": "Mistral-7B-Instruct-v0.2",
+  "quantization": "Q8_0",
+  "status": "template_only",
+  "notes": "Fill this pack only with row-specific reference data gathered from the exact chosen GGUF. Do not promote runtime support from this file alone.",
+  "expected_artifacts": {
+    "gguf_sha256": "TBD",
+    "tokenizer_fixture_id": "mistral-instruct-v0.2-tokenizer-v1",
+    "chat_template_fixture_id": "mistral-instruct-v0.2-chat-template-pack-v1",
+    "prompt_token_reference_source": "llama.cpp or equivalent independently checked reference",
+    "prompt_cases": [
+      {
+        "id": "hello",
+        "text": "hello",
+        "expected_tokens": []
+      },
+      {
+        "id": "chat_turn_minimal",
+        "messages": [
+          { "role": "user", "content": "Hello" }
+        ],
+        "rendered_prompt": "TBD",
+        "expected_tokens": []
+      }
+    ]
+  }
+}

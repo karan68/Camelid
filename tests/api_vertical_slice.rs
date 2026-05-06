@@ -298,6 +298,39 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     let llama3_next_step = llama3["next_step"].as_str().unwrap();
     assert!(llama3_next_step.contains("bounded packs/measurements only"));
     assert!(llama3_next_step.contains("before any broader/full-support claim"));
+    let mistral = compatibility
+        .iter()
+        .find(|item| item["id"] == "mistral_7b_instruct_v0_2_q8_0")
+        .unwrap();
+    assert_eq!(mistral["status"], "acceptance_target");
+    assert_eq!(mistral["metadata_parses"], "target_selected");
+    assert_eq!(mistral["tokenizer_works"], "fixture_planning_started");
+    assert_eq!(mistral["tensors_load"], "not_started");
+    assert_eq!(mistral["generation_runs"], "not_started");
+    assert_eq!(
+        mistral["frontend_load_path_verified"],
+        "fail_closed_planned"
+    );
+    assert_eq!(mistral["tested_context"], "pre_generation_readiness_only");
+    assert_eq!(
+        mistral["chat_template_renderer"],
+        "mistral_instruct_v0_2_planned"
+    );
+    assert_eq!(mistral["chat_template_shape_pack"], "not_started");
+    assert_eq!(
+        mistral["chat_template_shape_pack_id"],
+        "mistral-instruct-v0.2-chat-template-pack-v1"
+    );
+    assert_eq!(mistral["bounded_context_512_pack"], "not_started");
+    assert_eq!(
+        mistral["bounded_context_512_pack_id"],
+        "mistral-context-512-smoke-v1"
+    );
+    assert_eq!(mistral["latest_checked_bucket"], "target_selected");
+    let mistral_evidence = mistral["evidence"].as_str().unwrap();
+    assert!(mistral_evidence.contains("Mistral-7B-Instruct-v0.2 Q8_0"));
+    let mistral_next_step = mistral["next_step"].as_str().unwrap();
+    assert!(mistral_next_step.contains("tokenizer/chat-template fixtures"));
     let planned_quant = compatibility
         .iter()
         .find(|item| item["id"] == "llama_spm_q4_k_q5_k")
