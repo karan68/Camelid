@@ -22,7 +22,7 @@ Remote diagnostics:
     - `pack.stdout.log`: `696b2e7d1b966d87c09807e488cbe458af2de977c8718d4bf49bf7ad8105a217`
     - `pack.stderr.log`: `67e9b8c7e7b3044bed43a69c98ec0bab3abdb4c932dd298e67399c4166c58ab8`
 - The source-`f8c2d66` 8B 2048 no-cache diagnostic completed on the canonical Ubuntu validation lane from a sanitized archived worktree:
-  - remote artifact root: `/home/ubuntu/work/Camelid-longctx-f8c2d66-20260506T061712Z/target/llama3-8b-context-2048-diag-20260506T061807Z-source-f8c2d66/`
+  - sanitized remote artifact root: `target/llama3-8b-context-2048-diag-20260506T061807Z-source-f8c2d66/` inside the archived validation worktree
   - copied local summary/tails: `target/remote-llama3-8b-context-2048-f8c2d66-20260506T061807Z/`
   - prompt/generated parity: `prompt_tokens_match=true`, `generated_tokens_match=true`, `generated_text_match=true`
   - generated token IDs: Camelid `[34,2735,35,12,7854]`; llama.cpp `[34,2735,35,12,7854]`
@@ -35,8 +35,8 @@ Remote diagnostics:
     - `pack.stdout.log`: `9301fa14eeccd6dccfdb1909b7c770552582a7a7a51deb73846351b249197325`
     - `pack.stderr.log`: `1a7b59e9bd7f28692be0785874ab37d778003760c6e8998aebb62bb0de81c7b7`
 - The follow-on source-`f8c2d66` 8B 2048 cache hypothesis run started after the no-cache run exited; do not duplicate it:
-  - run script: `/home/ubuntu/work/Camelid-longctx-f8c2d66-20260506T061712Z/target/run-8b-2048-cache-diag-f8c2d66.sh`
-  - active artifact root at audit time: `/home/ubuntu/work/Camelid-longctx-f8c2d66-20260506T061712Z/target/llama3-8b-context-2048-cache320m-diag-20260506T073251Z-source-f8c2d66/`
+  - run script: `target/run-8b-2048-cache-diag-f8c2d66.sh` inside the archived validation worktree
+  - active artifact root at audit time: `target/llama3-8b-context-2048-cache320m-diag-20260506T073251Z-source-f8c2d66/` inside the archived validation worktree
   - env delta: `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=335544320` (320 MiB)
 
 Local gates:
