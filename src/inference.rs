@@ -7182,30 +7182,25 @@ fn causal_attention_context(
                 .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
         }
     } else {
+        let mut scores = Vec::with_capacity(position_count);
         for attention_head in 0..attention_heads {
             let kv_head =
                 map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
             let query_start = attention_head * head_dim;
             let query_slice = &query.data[query_start..query_start + head_dim];
-
-            let raw_scores = attention_scores_for_head(
-                kv_cache,
-                layer_idx,
-                kv_head,
-                query_slice,
-                position_count,
-                scale,
-            );
-            let probabilities = attention_probabilities(&raw_scores)?;
-
             let out_start = attention_head * head_dim;
-            for (position, probability) in probabilities.iter().enumerate() {
-                let value_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
-                let value_slice = &kv_cache.values[value_start..value_start + head_dim];
-                for dim in 0..head_dim {
-                    out[out_start + dim] += probability * value_slice[dim];
-                }
-            }
+            attention_context_for_head_into(
+                AttentionContextHeadParams {
+                    kv_cache,
+                    layer_idx,
+                    kv_head,
+                    query_slice,
+                    position_count,
+                    scale,
+                },
+                &mut out[out_start..out_start + head_dim],
+                &mut scores,
+            )?;
         }
     }
 
