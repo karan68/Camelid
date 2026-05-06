@@ -19,4 +19,19 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh fmt --all -- --check`
 - `./scripts/with-rustup-cargo.sh test -q q8_0_file_backed --lib`
 
-Claim boundary: diagnostic/performance-only. 8B 1024/2048 remain red/timeout-blocked diagnostic targets until fresh PASS artifacts exist.
+Follow-up local instrumentation slice:
+
+- `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION=1` now adds optional structured per-layer/per-prefill-chunk attribution to forward memory timings for the layer-major prefill schedule.
+- Each attribution record carries layer index, chunk start/rows/base position, hidden/next-hidden/chunk-input byte sizes, KV-cache allocated bytes before/after, Q8_0 file-read deltas, and the existing per-layer chunk timings.
+- The flag also enables structured forward-memory output when no broader RSS/trace flag is enabled, so a diagnostic run can request only this attribution without changing public API/support claims.
+- Focused coverage asserts the attribution serializes and keeps chunked/layer-major prefill output, logits, hidden state, and KV cache equal to the sequential path.
+
+Follow-up local gates on current main `041b345` plus the attribution patch:
+
+- `./scripts/with-rustup-cargo.sh fmt --all -- --check`
+- `./scripts/with-rustup-cargo.sh test -q chunked_prefill_matches_sequential_prefill_outputs_and_cache --lib`
+- `./scripts/with-rustup-cargo.sh test -q q8_0_file_backed --lib`
+- `./scripts/with-rustup-cargo.sh clippy -q --lib -- -D warnings`
+- `./scripts/with-rustup-cargo.sh test -q --lib` (`117 passed`)
+
+Claim boundary: diagnostic/performance-only. 8B 1024/2048 remain red/timeout-blocked diagnostic targets until fresh row-specific PASS artifacts are committed and docs/API/frontend are deliberately aligned.

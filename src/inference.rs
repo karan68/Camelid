@@ -1183,12 +1183,37 @@ pub struct LlamaLayerTimings {
     pub memory: Option<LlamaLayerMemoryTimings>,
 }
 
+impl From<&LlamaLayerTimings> for LlamaPrefillLayerMajorChunkTimings {
+    fn from(value: &LlamaLayerTimings) -> Self {
+        Self {
+            total: value.total,
+            attention_norm: value.attention_norm,
+            attention_q: value.attention_q,
+            attention_k: value.attention_k,
+            attention_v: value.attention_v,
+            attention_rope: value.attention_rope,
+            kv_cache_write: value.kv_cache_write,
+            attention_context: value.attention_context,
+            attention_output: value.attention_output,
+            attention_residual: value.attention_residual,
+            ffn_norm: value.ffn_norm,
+            ffn_gate: value.ffn_gate,
+            ffn_up: value.ffn_up,
+            ffn_activation: value.ffn_activation,
+            ffn_down: value.ffn_down,
+            ffn_residual: value.ffn_residual,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaForwardMemoryTimings {
     pub forward_passes: usize,
     pub materialization: LlamaWeightMaterializationStats,
     pub q8_file_reads: Q8_0FileReadStats,
     pub q8_file_read_phases: Vec<LlamaQ8FileReadPhaseTrace>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub prefill_layer_major_attribution: Vec<LlamaPrefillLayerMajorChunkAttribution>,
     #[serde(skip)]
     q8_file_read_start: Q8_0FileReadStats,
     #[serde(skip)]
@@ -1272,6 +1297,41 @@ pub struct LlamaMemorySample {
 pub struct LlamaQ8FileReadPhaseTrace {
     pub phase: String,
     pub q8_file_reads: Q8_0FileReadStats,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaPrefillLayerMajorChunkAttribution {
+    pub layer_index: usize,
+    pub chunk_start: usize,
+    pub chunk_rows: usize,
+    pub base_position: usize,
+    pub hidden_bytes: u64,
+    pub next_hidden_bytes: u64,
+    pub chunk_input_bytes: u64,
+    pub kv_cache_bytes_before: u64,
+    pub kv_cache_bytes_after: u64,
+    pub q8_file_reads: Q8_0FileReadStats,
+    pub timings: LlamaPrefillLayerMajorChunkTimings,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LlamaPrefillLayerMajorChunkTimings {
+    pub total: u128,
+    pub attention_norm: u128,
+    pub attention_q: u128,
+    pub attention_k: u128,
+    pub attention_v: u128,
+    pub attention_rope: u128,
+    pub kv_cache_write: u128,
+    pub attention_context: u128,
+    pub attention_output: u128,
+    pub attention_residual: u128,
+    pub ffn_norm: u128,
+    pub ffn_gate: u128,
+    pub ffn_up: u128,
+    pub ffn_activation: u128,
+    pub ffn_down: u128,
+    pub ffn_residual: u128,
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -1518,7 +1578,9 @@ impl LlamaInferenceSession {
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         let hidden_width = hidden.dim(1)?;
+        let capture_prefill_attribution = prefill_layer_major_attribution_enabled();
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            let hidden_bytes = tensor_f32_bytes(&hidden);
             let mut next_hidden = vec![0.0_f32; hidden.data.len()];
             let mut layer_timings = LlamaLayerTimings {
                 layer_index: layer_idx,
@@ -1541,6 +1603,8 @@ impl LlamaInferenceSession {
                 )?;
                 let saved_position = self.kv_cache.position;
                 self.kv_cache.position = chunk_base_position;
+                let kv_cache_bytes_before = self.kv_cache.allocated_bytes();
+                let q8_file_read_start = q8_0_file_read_stats();
                 let timed = forward_prefill_layer_chunk_timed(
                     &hidden_chunk,
                     layer,
@@ -1555,10 +1619,33 @@ impl LlamaInferenceSession {
                     },
                     &mut self.kv_cache,
                 );
+                let kv_cache_bytes_after = self.kv_cache.allocated_bytes();
+                let q8_file_reads =
+                    q8_0_file_read_stats().saturating_delta_since(q8_file_read_start);
                 self.kv_cache.position = saved_position;
                 let timed = timed?;
+                let chunk_input_bytes = tensor_f32_bytes(&hidden_chunk);
                 chunk_input_buffer = hidden_chunk.data;
                 copy_tensor_rows_into(&timed.output, &mut next_hidden, chunk_start, hidden_width)?;
+                if capture_prefill_attribution {
+                    if let Some(memory) = &mut memory {
+                        memory.record_prefill_layer_major_attribution(
+                            LlamaPrefillLayerMajorChunkAttribution {
+                                layer_index: layer_idx,
+                                chunk_start,
+                                chunk_rows: rows_this_chunk,
+                                base_position: chunk_base_position,
+                                hidden_bytes,
+                                next_hidden_bytes: vec_f32_bytes(&next_hidden),
+                                chunk_input_bytes,
+                                kv_cache_bytes_before,
+                                kv_cache_bytes_after,
+                                q8_file_reads,
+                                timings: LlamaPrefillLayerMajorChunkTimings::from(&timed.timings),
+                            },
+                        );
+                    }
+                }
                 layer_timings.add_assign(&timed.timings);
             }
             if let (Some(memory), Some(layer_memory)) = (&mut memory, &layer_timings.memory) {
@@ -1920,7 +2007,13 @@ fn forward_memory_trace_enabled() -> bool {
 }
 
 fn structured_forward_memory_enabled() -> bool {
-    env_flag_enabled("BACKENDINFERENCE_FORWARD_RSS_TIMINGS") || forward_memory_trace_enabled()
+    env_flag_enabled("BACKENDINFERENCE_FORWARD_RSS_TIMINGS")
+        || forward_memory_trace_enabled()
+        || prefill_layer_major_attribution_enabled()
+}
+
+fn prefill_layer_major_attribution_enabled() -> bool {
+    env_flag_enabled("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION")
 }
 
 fn env_flag_enabled(key: &str) -> bool {
@@ -2042,6 +2135,14 @@ fn capture_memory_sample(kv_cache: &LlamaKvCache) -> LlamaMemorySample {
     }
 }
 
+fn tensor_f32_bytes(tensor: &CpuTensor) -> u64 {
+    vec_f32_bytes(&tensor.data)
+}
+
+fn vec_f32_bytes(data: &[f32]) -> u64 {
+    (data.len() as u64) * (std::mem::size_of::<f32>() as u64)
+}
+
 fn collect_weight_materialization_stats(
     weights: &LlamaLoadedWeights,
 ) -> LlamaWeightMaterializationStats {
@@ -2156,6 +2257,7 @@ impl LlamaForwardMemoryTimings {
             materialization,
             q8_file_reads: Q8_0FileReadStats::default(),
             q8_file_read_phases: Vec::new(),
+            prefill_layer_major_attribution: Vec::new(),
             q8_file_read_start,
             q8_file_read_phase_start: q8_file_read_start,
             peak_rss_kib: None,
@@ -2214,6 +2316,13 @@ impl LlamaForwardMemoryTimings {
             self.layers.resize_with(layer_index + 1, || layer.clone());
         }
         self.layers[layer_index] = layer;
+    }
+
+    fn record_prefill_layer_major_attribution(
+        &mut self,
+        trace: LlamaPrefillLayerMajorChunkAttribution,
+    ) {
+        self.prefill_layer_major_attribution.push(trace);
     }
 
     fn record(
@@ -2279,6 +2388,8 @@ impl LlamaForwardMemoryTimings {
                 phase.q8_file_reads,
             );
         }
+        self.prefill_layer_major_attribution
+            .extend(other.prefill_layer_major_attribution.iter().cloned());
         self.after_embedding = other.after_embedding.clone();
         self.after_layers = other.after_layers.clone();
         self.after_final_norm = other.after_final_norm.clone();
@@ -10542,6 +10653,7 @@ mod tests {
         assert_slice_close(&chunked.kv_cache.values, &sequential.kv_cache.values);
 
         std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR", "1");
+        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION", "1");
         let mut layer_major = LlamaInferenceSession::new(config, weights).unwrap();
         let layer_major_step = layer_major
             .generate_next_token_with_history_diagnostics(
@@ -10551,6 +10663,27 @@ mod tests {
                 false,
             )
             .unwrap();
+        let layer_major_memory = layer_major_step
+            .prefill_timings
+            .memory
+            .as_ref()
+            .expect("layer-major attribution enables structured prefill memory");
+        assert!(!layer_major_memory
+            .prefill_layer_major_attribution
+            .is_empty());
+        let first_attribution = &layer_major_memory.prefill_layer_major_attribution[0];
+        assert_eq!(first_attribution.layer_index, 0);
+        assert_eq!(first_attribution.chunk_start, 0);
+        assert!(first_attribution.chunk_rows > 0);
+        assert!(first_attribution.hidden_bytes > 0);
+        assert!(first_attribution.next_hidden_bytes > 0);
+        assert!(first_attribution.chunk_input_bytes > 0);
+        assert!(first_attribution.kv_cache_bytes_after >= first_attribution.kv_cache_bytes_before);
+        let serialized_memory = serde_json::to_value(layer_major_memory).unwrap();
+        assert!(serialized_memory
+            .get("prefill_layer_major_attribution")
+            .and_then(|value| value.as_array())
+            .is_some_and(|value| !value.is_empty()));
         assert_eq!(
             layer_major_step.next_token_id,
             sequential_step.next_token_id
@@ -10566,6 +10699,7 @@ mod tests {
 
         std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
         std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION");
         std::env::remove_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS");
     }
 
