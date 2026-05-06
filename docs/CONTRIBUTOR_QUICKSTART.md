@@ -11,7 +11,7 @@ This guide is the shortest safe path to getting productive in Camelid locally.
 3. Use this guide to get a local backend/frontend loop running.
 4. Use [`docs/VALIDATION_MATRIX.md`](VALIDATION_MATRIX.md) to choose the smallest meaningful validation lane for your change.
 
-Current public support is exact-row: TinyLlama Q8_0 is the supported gate, Llama 3.2 1B/3B Q8_0 are checked through bounded 2048-context packs, and Llama 3 8B Q8_0 is checked through bounded 512-context only. The 8B 1024/2048 lanes remain red unless fresh PASS artifacts and synchronized docs/API/frontend updates land together. Do not broaden those claims from local experiments or adjacent GGUFs without new evidence bundles and synchronized docs/API/frontend updates.
+Current public support is exact-row: TinyLlama Q8_0 is the supported gate, Llama 3.2 1B/3B Q8_0 are checked through bounded 2048-context packs, and Llama 3 8B Q8_0 is checked through bounded 2048-context packs after clean-current-main 1024/2048 reruns. The 8B 1024/2048 lanes are bounded exact-row pack claims only. Do not broaden those claims to model-native/larger context, production throughput, portability, local experiments, or adjacent GGUFs without new evidence bundles and synchronized docs/API/frontend updates.
 
 ## Prerequisites
 

@@ -224,6 +224,24 @@ function singleRowContextSchema(schema) {
       promptId: 'roughly-2048-token-recall',
       generatedText: 'CMLD-204',
     },
+    'camelid.llama3_8b_context_1024_public_evidence.v1': {
+      rowId: 'llama3_8b_instruct_q8_0',
+      contextWindow: 1024,
+      maxTokens: 5,
+      minPromptTokens: 513,
+      sourcePromptPack: 'qa/prompt-packs/llama3-context-1024-smoke.json',
+      promptId: 'roughly-1024-token-recall',
+      generatedText: 'CMLD-102',
+    },
+    'camelid.llama3_8b_context_2048_public_evidence.v1': {
+      rowId: 'llama3_8b_instruct_q8_0',
+      contextWindow: 2048,
+      maxTokens: 5,
+      minPromptTokens: 1025,
+      sourcePromptPack: 'qa/prompt-packs/llama3-context-2048-smoke.json',
+      promptId: 'roughly-2048-token-recall',
+      generatedText: 'CMLD-204',
+    },
   }
   return schemas[schema]
 }

@@ -11,9 +11,11 @@ const badRoot = join(tempRoot, 'bad')
 
 await writeBundle(goodRoot, { mutate: false })
 await writeSingleRowContextBundle(goodRoot, { mutate: false })
+await writeEightBContextBundle(goodRoot, { mutate: false })
 await writeLegacyPublicContextBundle(goodRoot, { mutate: false })
 await writeBundle(badRoot, { mutate: true })
 await writeSingleRowContextBundle(badRoot, { mutate: true })
+await writeEightBContextBundle(badRoot, { mutate: true })
 await writeLegacyPublicContextBundle(badRoot, { mutate: true })
 
 const good = spawnSync(process.execPath, ['scripts/check-public-evidence-claims.mjs', '--root', goodRoot], {
@@ -117,22 +119,13 @@ async function writeLegacyPublicContextBundle(root, { mutate }) {
 async function writeSingleRowContextBundle(root, { mutate }) {
   const dir = join(root, 'llama32-1b-context-1024-test')
   await mkdir(dir, { recursive: true })
-  const rowItem = {
-    row_id: 'llama32_1b_instruct_q8_0',
-    context_window: 1024,
-    max_tokens: 5,
-    prompt_id: 'roughly-1024-token-recall',
-    reference_prompt_token_count: 881,
-    prompt_tokens_match: true,
-    generated_tokens_match: true,
-    generated_text_match: true,
-    first_generated_token_diff_index: -1,
-    generated_text: 'CMLD-102',
-    max_resident_set_kib: 2897852,
-    model_sha256: 'b'.repeat(64),
-    raw_artifact: 'target/llama32-1b-context-1024-test/summary.json',
-    passed: true,
-  }
+  const rowItem = contextRow({
+    rowId: 'llama32_1b_instruct_q8_0',
+    contextWindow: 1024,
+    promptId: 'roughly-1024-token-recall',
+    generatedText: 'CMLD-102',
+    rawArtifact: 'target/llama32-1b-context-1024-test/summary.json',
+  })
   const manifest = {
     schema: 'camelid.llama32_1b_context_1024_public_evidence.v1',
     passed: true,
@@ -148,6 +141,52 @@ async function writeSingleRowContextBundle(root, { mutate }) {
       'Closes only the second bounded 1024-context pack for the exact Llama 3.2 1B row. It does not promote neighboring rows, other quantizations, model-native/larger context buckets, arbitrary templates, broad/full Llama-family support, production throughput, or portability support.',
   }
   await writeFile(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+}
+
+async function writeEightBContextBundle(root, { mutate }) {
+  const dir = join(root, 'llama3-8b-context-2048-test')
+  await mkdir(dir, { recursive: true })
+  const rowItem = contextRow({
+    rowId: 'llama3_8b_instruct_q8_0',
+    contextWindow: 2048,
+    promptId: 'roughly-2048-token-recall',
+    generatedText: mutate ? 'CMLD-102' : 'CMLD-204',
+    rawArtifact: 'target/llama3-8b-context-2048-test/summary.json',
+  })
+  const manifest = {
+    schema: 'camelid.llama3_8b_context_2048_public_evidence.v1',
+    passed: true,
+    checkout_clean: true,
+    pack: {
+      target_context_window: 2048,
+      max_tokens: 5,
+      source_prompt_pack: 'qa/prompt-packs/llama3-context-2048-smoke.json',
+      prompt_count: 1,
+    },
+    rows: [rowItem],
+    claim_boundary:
+      'Closes only the third bounded 2048-context pack for the exact Llama 3 8B row. It does not promote neighboring rows, other quantizations, model-native/larger context buckets, arbitrary templates, broad/full Llama-family support, production throughput, or portability support.',
+  }
+  await writeFile(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+}
+
+function contextRow({ rowId, contextWindow, promptId, generatedText, rawArtifact }) {
+  return {
+    row_id: rowId,
+    context_window: contextWindow,
+    max_tokens: 5,
+    prompt_id: promptId,
+    reference_prompt_token_count: contextWindow === 2048 ? 1910 : 881,
+    prompt_tokens_match: true,
+    generated_tokens_match: true,
+    generated_text_match: true,
+    first_generated_token_diff_index: -1,
+    generated_text: generatedText,
+    max_resident_set_kib: 2897852,
+    model_sha256: 'b'.repeat(64),
+    raw_artifact: rawArtifact,
+    passed: true,
+  }
 }
 
 function row(rowId, tokenCount) {
