@@ -36,7 +36,7 @@ Remote diagnostics:
     - `pack.stdout.log`: `9301fa14eeccd6dccfdb1909b7c770552582a7a7a51deb73846351b249197325`
     - `pack.stderr.log`: `1a7b59e9bd7f28692be0785874ab37d778003760c6e8998aebb62bb0de81c7b7`
 - Read-only follow-up audit of the source-`f8c2d66` 8B 2048 cache hypothesis run on the canonical Ubuntu validation lane; no duplicate long run was started:
-  - remote artifact root: `/home/ubuntu/work/Camelid-longctx-f8c2d66-20260506T061712Z/target/llama3-8b-context-2048-cache320m-diag-20260506T073251Z-source-f8c2d66/`
+  - sanitized remote artifact root: `target/llama3-8b-context-2048-cache320m-diag-20260506T073251Z-source-f8c2d66/` inside the archived validation worktree
   - env delta: `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=335544320` (320 MiB)
   - prompt/generated parity remained diagnostic PASS for the same 1910-token prompt (`prompt_tokens_match=true`, `generated_tokens_match=true`, `generated_text_match=true`)
   - backend trace final: `q8_file_read_bytes=47285433088` (`45094.90 MiB`) plus `q8_file_cache_hit_bytes=103824336640` (`99014.60 MiB`) with cache residency `323292672` bytes (`308.32 MiB`) and RSS trace `1997468 KiB` at logits
