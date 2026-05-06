@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-05
+Last updated: 2026-05-06
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -146,6 +146,7 @@ Representative durable evidence:
 - `qa/evidence-bundles/llama32-1b-3b-chat-template-shapes-20260505T060036Z-head-e9f28572e090/manifest.json`
 - `qa/evidence-bundles/llama32-1b-3b-unique-chat-perf-rss-20260505T061644Z-head-e9f28572e090/manifest.json`
 - `qa/evidence-bundles/llama32-1b-context-1024-20260505T081001Z-head-156ded6fc76b/manifest.json`
+- `qa/evidence-bundles/llama32-1b-context-2048-rope-factors-20260506T0105Z-head-62f8cbc/manifest.json`
 - `qa/validation-notes/2026-05-05-llama32-1b-rope-freqs-runtime.md` (code/runtime slice only; not a 2048-context PASS artifact)
 
 ### Llama 3.2 3B Instruct Q8_0
