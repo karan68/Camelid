@@ -7282,7 +7282,7 @@ fn causal_attention_context_batch(
     let scale = attention_score_scale_value(head_dim, score_scale);
     let mut out = vec![0.0; rows * expected_width];
 
-    let fill_row = |row: usize, out_row: &mut [f32]| -> Result<()> {
+    let fill_row = |row: usize, out_row: &mut [f32], scores: &mut Vec<f32>| -> Result<()> {
         let position_count = base_position + row + 1;
         let query_row_start = row * expected_width;
         if position_count == 1 {
@@ -7300,24 +7300,19 @@ fn causal_attention_context_batch(
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
                 let query_start = query_row_start + attention_head * head_dim;
                 let query_slice = &query.data[query_start..query_start + head_dim];
-                let raw_scores = attention_scores_for_head(
-                    kv_cache,
-                    layer_idx,
-                    kv_head,
-                    query_slice,
-                    position_count,
-                    scale,
-                );
-                let probabilities = attention_probabilities(&raw_scores)?;
-
                 let out_start = attention_head * head_dim;
-                for (position, probability) in probabilities.iter().enumerate() {
-                    let value_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
-                    let value_slice = &kv_cache.values[value_start..value_start + head_dim];
-                    for dim in 0..head_dim {
-                        out_row[out_start + dim] += probability * value_slice[dim];
-                    }
-                }
+                attention_context_for_head_into(
+                    AttentionContextHeadParams {
+                        kv_cache,
+                        layer_idx,
+                        kv_head,
+                        query_slice,
+                        position_count,
+                        scale,
+                    },
+                    &mut out_row[out_start..out_start + head_dim],
+                    scores,
+                )?;
             }
         }
         Ok(())
@@ -7326,14 +7321,78 @@ fn causal_attention_context_batch(
     if should_parallelize_attention_context_batch(rows, attention_heads) {
         out.par_chunks_mut(expected_width)
             .enumerate()
-            .try_for_each(|(row, out_row)| fill_row(row, out_row))?;
+            .try_for_each(|(row, out_row)| {
+                let mut scores = Vec::with_capacity(base_position + row + 1);
+                fill_row(row, out_row, &mut scores)
+            })?;
     } else {
+        let mut scores = Vec::with_capacity(required_sequence_length);
         for (row, out_row) in out.chunks_mut(expected_width).enumerate() {
-            fill_row(row, out_row)?;
+            fill_row(row, out_row, &mut scores)?;
         }
     }
 
     CpuTensor::from_f32(name, vec![rows, expected_width], out)
+}
+
+struct AttentionContextHeadParams<'a> {
+    kv_cache: &'a LlamaKvCache,
+    layer_idx: usize,
+    kv_head: usize,
+    query_slice: &'a [f32],
+    position_count: usize,
+    scale: f32,
+}
+
+fn attention_context_for_head_into(
+    params: AttentionContextHeadParams<'_>,
+    out_slice: &mut [f32],
+    scores: &mut Vec<f32>,
+) -> Result<()> {
+    let head_dim = params.kv_cache.plan.head_dim;
+    debug_assert_eq!(params.query_slice.len(), head_dim);
+    debug_assert_eq!(out_slice.len(), head_dim);
+    scores.clear();
+    scores.reserve(params.position_count);
+
+    for position in 0..params.position_count {
+        let key_start =
+            kv_cache_offset(params.kv_cache, params.layer_idx, position, params.kv_head);
+        let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
+        let score = params
+            .query_slice
+            .iter()
+            .zip(key_slice.iter())
+            .map(|(q, k)| q * k)
+            .sum::<f32>()
+            * params.scale;
+        scores.push(score);
+    }
+
+    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut score_sum = 0.0;
+    for score in scores.iter_mut() {
+        *score = (*score - max_score).exp();
+        score_sum += *score;
+    }
+    if score_sum == 0.0 || !score_sum.is_finite() {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "attention softmax produced invalid normalization sum".to_string(),
+        ));
+    }
+
+    let inv_score_sum = 1.0 / score_sum;
+    for (position, score) in scores.iter().copied().enumerate() {
+        let probability = score * inv_score_sum;
+        let value_start =
+            kv_cache_offset(params.kv_cache, params.layer_idx, position, params.kv_head);
+        let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
+        for dim in 0..head_dim {
+            out_slice[dim] += probability * value_slice[dim];
+        }
+    }
+
+    Ok(())
 }
 
 const PARALLEL_ATTENTION_CONTEXT_MIN_UNITS: usize = 256;
