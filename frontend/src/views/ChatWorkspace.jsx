@@ -130,33 +130,33 @@ export default function ChatWorkspace({
   const emptyHeroTitle = selectedModelRunnable
     ? 'Ask Camelid anything local.'
     : supportBlocked
-      ? 'Exact support row required.'
-      : 'Load a local model to begin.'
+      ? 'Exact row required.'
+      : 'Load a proven local model.'
   const emptyHeroSummary = selectedModelRunnable
-    ? 'A quiet Gemini-like workspace for bounded local chat. Camelid keeps runtime readiness and the exact support contract in view before every send.'
+    ? 'A quiet, Gemini-like chat surface for bounded local replies. Readiness stays visible without turning filenames into support claims.'
     : supportBlocked
-      ? 'Camelid found a loaded model, but chat stays locked because the selected GGUF does not match an exact supported compatibility row.'
-      : 'Choose or load a GGUF. Chat unlocks only when /v1/health and /api/capabilities agree that this exact local model is ready.'
+      ? 'The runtime sees a loaded GGUF, but chat stays locked until /api/capabilities matches its exact supported row.'
+      : 'Choose a GGUF, then Camelid unlocks chat only when health and the compatibility contract agree on that exact model.'
   const readinessFacts = [
     {
       label: 'Runtime',
-      value: selectedModel ? (selectedRuntimeReady ? 'Loaded + generation-ready' : 'Not ready yet') : 'No active model',
-      copy: 'Requires active_model_id, loaded_now=true, and generation_ready=true from /v1/health.',
+      value: selectedModel ? (selectedRuntimeReady ? 'Ready' : 'Waiting') : 'No model',
+      copy: 'active_model_id + loaded_now + generation_ready',
     },
     {
-      label: 'Support contract',
-      value: selectedModelRunnable ? 'Exact row matched' : supportBlocked ? 'Exact row missing' : capabilityGate,
-      copy: selectedModel ? selectedCompatibilityLabel : 'No compatibility row is inferred before a local model is selected.',
+      label: 'Contract',
+      value: selectedModelRunnable ? 'Matched' : supportBlocked ? 'Missing row' : capabilityGate,
+      copy: selectedModel ? selectedCompatibilityLabel : 'No inferred compatibility before selection',
     },
     {
-      label: 'Honesty boundary',
-      value: 'No filename optimism',
-      copy: 'Names, paths, and neighboring families never become support claims without evidence.',
+      label: 'Boundary',
+      value: 'Exact evidence only',
+      copy: 'No filename, path, or neighboring-family optimism',
     },
   ]
   const proofPills = [
     selectedModelRunnable ? 'Chat unlocked' : 'Chat guarded',
-    selectedModelName,
+    selectedModel ? selectedModelName : 'Local GGUF required',
     `Demo cap ${CHAT_DEMO_TOKEN_CAP} tokens`,
   ]
 
@@ -253,6 +253,7 @@ export default function ChatWorkspace({
                 <div className="chat-empty-proofbar" aria-label="Current chat guard summary">
                   {proofPills.map((pill) => <span key={pill}>{pill}</span>)}
                 </div>
+                <p className="chat-empty-contract-note">Chat opens only when /v1/health and /api/capabilities agree on the selected exact GGUF.</p>
               </div>
 
               <div className="chat-empty-readiness chat-empty-readiness-ledger" aria-label="Local chat readiness summary">
