@@ -932,7 +932,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 latest_checked_bucket: "llama3-context-2048-smoke-v1",
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-204",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; Camelid supports exact-row smoke plus the checked bounded 512/1024/2048 packs for this row only. The fresh current-head 1024/2048 artifact is qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260507T185917Z-head-bb8b616a09d6/manifest.json; no model-native/larger context or broader/full support is implied",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes; Camelid supports exact-row smoke plus the checked bounded 512/1024/2048 packs for this row only. The fresh current-head 1024/2048 artifact is qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260507T194559Z-head-ab8e465b50c3/manifest.json; no model-native/larger context or broader/full support is implied",
                 next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while collecting model-native/larger-context proof beyond checked packs, broader/full-support, production-throughput, portability, and arbitrary-template evidence before any wider 8B claim",
             },
             ModelCompatibilityTarget {
@@ -3445,7 +3445,7 @@ mod tests {
             .contains("checked bounded 512/1024/2048 packs"));
         assert!(eight_b
             .evidence
-            .contains("20260507T185917Z-head-bb8b616a09d6"));
+            .contains("20260507T194559Z-head-ab8e465b50c3"));
     }
 
     #[test]

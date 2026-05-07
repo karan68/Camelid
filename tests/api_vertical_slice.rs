@@ -318,7 +318,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     let llama3_evidence = llama3["evidence"].as_str().unwrap();
     assert!(llama3_evidence.contains("checked 512/1024/2048-context packs"));
     assert!(llama3_evidence.contains("checked bounded 512/1024/2048 packs"));
-    assert!(llama3_evidence.contains("20260507T185917Z-head-bb8b616a09d6"));
+    assert!(llama3_evidence.contains("20260507T194559Z-head-ab8e465b50c3"));
     assert!(llama3_evidence.contains("retained-block lazy-Q8 hot-path cost probes"));
     let llama3_next_step = llama3["next_step"].as_str().unwrap();
     assert!(llama3_next_step.contains("model-native/larger-context proof beyond checked packs"));
