@@ -17,8 +17,8 @@ use crate::{
     gguf::GgufTensorType,
     model::{DenseLlamaDims, LlamaModelConfig, LlamaTensorBinding},
     tensor::{
-        q8_0_file_read_stats, record_q8_0_file_read, should_parallelize_linear_output, CpuTensor,
-        Q8_0Block, Q8_0FileBacking, Q8_0FileReadStats, TensorShape, TensorStore,
+        dot_product, q8_0_file_read_stats, record_q8_0_file_read, should_parallelize_linear_output,
+        CpuTensor, Q8_0Block, Q8_0FileBacking, Q8_0FileReadStats, TensorShape, TensorStore,
     },
     BackendError, Result,
 };
@@ -7424,19 +7424,17 @@ fn attention_context_for_head_into(
     debug_assert_eq!(out_slice.len(), head_dim);
     scores.clear();
     scores.reserve(params.position_count);
+    let head_base = kv_cache_head_base_offset(params.kv_cache, params.layer_idx, params.kv_head);
+    let position_stride = kv_cache_position_stride(params.kv_cache);
 
+    let mut key_start = head_base;
     for position in 0..params.position_count {
-        let key_start =
-            kv_cache_offset(params.kv_cache, params.layer_idx, position, params.kv_head);
         let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
-        let score = params
-            .query_slice
-            .iter()
-            .zip(key_slice.iter())
-            .map(|(q, k)| q * k)
-            .sum::<f32>()
-            * params.scale;
+        let score = dot_product(params.query_slice, key_slice) * params.scale;
         scores.push(score);
+        if position + 1 < params.position_count {
+            key_start += position_stride;
+        }
     }
 
     let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -7452,17 +7450,27 @@ fn attention_context_for_head_into(
     }
 
     let inv_score_sum = 1.0 / score_sum;
+    let mut value_start = head_base;
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
-        let value_start =
-            kv_cache_offset(params.kv_cache, params.layer_idx, position, params.kv_head);
         let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
-        for dim in 0..head_dim {
-            out_slice[dim] += probability * value_slice[dim];
+        for (out_value, value) in out_slice.iter_mut().zip(value_slice) {
+            *out_value += probability * *value;
+        }
+        if position + 1 < params.position_count {
+            value_start += position_stride;
         }
     }
 
     Ok(())
+}
+
+fn kv_cache_head_base_offset(kv_cache: &LlamaKvCache, layer_idx: usize, kv_head: usize) -> usize {
+    ((layer_idx * kv_cache.plan.kv_head_count) + kv_head) * kv_cache.plan.head_dim
+}
+
+fn kv_cache_position_stride(kv_cache: &LlamaKvCache) -> usize {
+    kv_cache.plan.layer_count * kv_cache.plan.kv_head_count * kv_cache.plan.head_dim
 }
 
 const PARALLEL_ATTENTION_CONTEXT_MIN_UNITS: usize = 256;
@@ -7631,16 +7639,15 @@ fn attention_scores_for_head(
 ) -> Vec<f32> {
     let head_dim = kv_cache.plan.head_dim;
     let mut scores = Vec::with_capacity(position_count);
+    let mut key_start = kv_cache_head_base_offset(kv_cache, layer_idx, kv_head);
+    let position_stride = kv_cache_position_stride(kv_cache);
     for position in 0..position_count {
-        let key_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
         let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
-        let score = query_slice
-            .iter()
-            .zip(key_slice.iter())
-            .map(|(q, k)| q * k)
-            .sum::<f32>()
-            * scale;
+        let score = dot_product(query_slice, key_slice) * scale;
         scores.push(score);
+        if position + 1 < position_count {
+            key_start += position_stride;
+        }
     }
     scores
 }

@@ -783,7 +783,7 @@ fn require_rank(tensor: &CpuTensor, rank: usize, op: &str) -> Result<()> {
     Ok(())
 }
 
-fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
+pub(crate) fn dot_product(lhs: &[f32], rhs: &[f32]) -> f32 {
     debug_assert_eq!(lhs.len(), rhs.len());
     let mut sum = 0.0;
     let mut idx = 0;
