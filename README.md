@@ -20,9 +20,9 @@ Camelid's current milestone is not a loose compatibility demo. It is a synchroni
 - **The UI and API fail closed instead of guessing.** Chat unlocks only when the loaded local GGUF is `loaded_now=true`, `generation_ready=true`, and matched to an exact supported `/api/capabilities` row.
 - **The context ladder is explicit.** All four rows have checked bounded 512-context evidence, and the exact Llama 3.2 1B/3B rows have checked 1024 and 2048 packs. Llama 3 8B 1024/2048 remain red pending fresh PASS artifacts and docs/API/frontend alignment.
 
-![Camelid WebUI chat surface](docs/assets/chat-surface-gemini-clean-20260506.png)
+![Camelid WebUI chat surface](docs/assets/ui-screenshot-v2.png)
 
-The WebUI screenshot above is intentionally readiness-first: the chat surface is simple, but it still shows that local chat remains locked until runtime health and an exact support-contract row agree. It is not a broad model-family or arbitrary-GGUF support claim.
+The WebUI screenshot above is intentionally readiness-first: the chat surface is simple, but it still reflects the product's local-first contract clearly. It is not a broad model-family or arbitrary-GGUF support claim.
 
 ## Current work tracks
 
