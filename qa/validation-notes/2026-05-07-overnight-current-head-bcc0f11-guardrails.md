@@ -7,7 +7,7 @@ Scope: cron `Camelid overnight all-models fixer` safe guardrail slice on current
 Starting state:
 
 - Local `main` was clean at `bcc0f11fc8533f286ab4e1fa207be02bf8789147` (`Polish Gemini-style chat landing`) and ahead of `origin/main` by one UI-only commit.
-- Canonical Ubuntu host check via `ssh -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@54.69.75.77` found the stale/self-matching `run-8b-1024-diag-4c30c53` watcher, but no active `chat-parity-llama3`, `context-1024`, `context-2048`, or port `29183` long 8B parity run. No duplicate 8B long-context run was launched.
+- Canonical Ubuntu validation-host check used the private operator SSH lane and found the stale/self-matching `run-8b-1024-diag-4c30c53` watcher, but no active `chat-parity-llama3`, `context-1024`, `context-2048`, or long 8B parity run on the tracked validation port. No duplicate 8B long-context run was launched.
 - The host was still busy with other long-running non-8B Q8 hot-path benchmarks, so this slice stayed on local exact-support guardrails.
 
 Current-head gates:
