@@ -1891,6 +1891,7 @@ impl LlamaInferenceSession {
             && prefill_layer_major_enabled(&self.weights)
         {
             let prefill_token_ids = &token_ids[..prefill_count];
+            let prefill_chunk_tokens = prefill_layer_major_chunk_token_count(prefill_count);
             let layer_major_timings = self
                 .forward_prefill_layer_major_timed_fast(prefill_token_ids, prefill_chunk_tokens)?;
             timings.add_assign(&layer_major_timings);
@@ -2032,23 +2033,44 @@ fn env_flag_enabled(key: &str) -> bool {
 
 fn prefill_chunk_token_count(prefill_count: usize) -> usize {
     const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 256;
-    match env::var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS") {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if matches!(
-                trimmed.to_ascii_lowercase().as_str(),
-                "all" | "full" | "prompt" | "unbounded"
-            ) {
-                return prefill_count.max(1);
-            }
-            trimmed
-                .parse::<usize>()
-                .ok()
-                .filter(|value| *value > 0)
-                .unwrap_or(DEFAULT_PREFILL_CHUNK_TOKENS)
-        }
-        Err(_) => DEFAULT_PREFILL_CHUNK_TOKENS,
+    prefill_chunk_token_count_from_env(
+        "BACKENDINFERENCE_PREFILL_CHUNK_TOKENS",
+        prefill_count,
+        DEFAULT_PREFILL_CHUNK_TOKENS,
+    )
+}
+
+fn prefill_layer_major_chunk_token_count(prefill_count: usize) -> usize {
+    const DEFAULT_PREFILL_LAYER_MAJOR_CHUNK_TOKENS: usize = 512;
+    if env::var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS").is_ok() {
+        return prefill_chunk_token_count_from_env(
+            "BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS",
+            prefill_count,
+            DEFAULT_PREFILL_LAYER_MAJOR_CHUNK_TOKENS,
+        );
     }
+    if env::var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS").is_ok() {
+        return prefill_chunk_token_count(prefill_count);
+    }
+    DEFAULT_PREFILL_LAYER_MAJOR_CHUNK_TOKENS
+}
+
+fn prefill_chunk_token_count_from_env(key: &str, prefill_count: usize, default: usize) -> usize {
+    match env::var(key) {
+        Ok(value) => parse_prefill_chunk_token_count(&value, prefill_count).unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+fn parse_prefill_chunk_token_count(value: &str, prefill_count: usize) -> Option<usize> {
+    let trimmed = value.trim();
+    if matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "all" | "full" | "prompt" | "unbounded"
+    ) {
+        return Some(prefill_count.max(1));
+    }
+    trimmed.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
 fn prefill_layer_major_enabled(weights: &LlamaLoadedWeights) -> bool {
@@ -5794,46 +5816,58 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                     decode_q8_0_encoded_row_scales(chunk, scales);
                     // Multi-row prefill reuses the same file-backed Q8 weight chunk across
                     // every input row. Decode each weight-block scale once per chunk row,
-                    // then write results directly into the row-major output to avoid an
-                    // extra scratch matrix and transpose-style copy.
+                    // then walk output columns outermost so each compact weight row stays hot
+                    // while it is dotted against all quantized input rows. The older row-major
+                    // loop rescanned the full chunk once per input row; that kept RSS low but
+                    // turned long-context prefill into unnecessary memory-bandwidth pressure.
                     let output_rows = &mut output[..rows * output_width];
                     if should_parallelize_q8_0_file_reader_output(output_width) {
-                        output_rows
-                            .par_chunks_mut(output_width)
-                            .enumerate()
-                            .for_each(|(row, output_row)| {
-                                let quantized_input = quantized_inputs.row(row);
+                        let scratch_len = rows_this_chunk.checked_mul(rows).ok_or_else(|| {
+                            BackendError::RuntimeShapeMismatch(
+                                "q8_0 block-reader output scratch size overflow".to_string(),
+                            )
+                        })?;
+                        with_q8_0_file_reader_output_chunk(scratch_len, |output_chunk_scratch| {
+                            output_chunk_scratch
+                                .par_chunks_mut(rows)
+                                .zip(chunk.par_chunks_exact(row_bytes_len))
+                                .zip(scales.par_chunks_exact(blocks_per_row))
+                                .for_each(|((column_outputs, row_bytes), row_scales)| {
+                                    for (out_value, quantized_input) in
+                                        column_outputs.iter_mut().zip(quantized_inputs.rows())
+                                    {
+                                        *out_value = dot_q8_0_encoded_row_with_scales(
+                                            quantized_input,
+                                            row_bytes,
+                                            row_scales,
+                                        );
+                                    }
+                                });
+                            for (row, output_row) in
+                                output_rows.chunks_mut(output_width).enumerate()
+                            {
                                 let output_chunk =
                                     &mut output_row[output_idx..output_idx + rows_this_chunk];
-                                for ((out_value, row_bytes), row_scales) in output_chunk
-                                    .iter_mut()
-                                    .zip(chunk.chunks_exact(row_bytes_len))
-                                    .zip(scales.chunks_exact(blocks_per_row))
-                                {
-                                    *out_value = dot_q8_0_encoded_row_with_scales(
+                                for (chunk_col, out_value) in output_chunk.iter_mut().enumerate() {
+                                    *out_value = output_chunk_scratch[chunk_col * rows + row];
+                                }
+                            }
+                            Ok(())
+                        })?;
+                    } else {
+                        for (chunk_col, (row_bytes, row_scales)) in chunk
+                            .chunks_exact(row_bytes_len)
+                            .zip(scales.chunks_exact(blocks_per_row))
+                            .enumerate()
+                        {
+                            let absolute_col = output_idx + chunk_col;
+                            for (row, quantized_input) in quantized_inputs.rows().enumerate() {
+                                output_rows[row * output_width + absolute_col] =
+                                    dot_q8_0_encoded_row_with_scales(
                                         quantized_input,
                                         row_bytes,
                                         row_scales,
                                     );
-                                }
-                            });
-                    } else {
-                        for (output_row, quantized_input) in output_rows
-                            .chunks_mut(output_width)
-                            .zip(quantized_inputs.rows())
-                        {
-                            let output_chunk =
-                                &mut output_row[output_idx..output_idx + rows_this_chunk];
-                            for ((out_value, row_bytes), row_scales) in output_chunk
-                                .iter_mut()
-                                .zip(chunk.chunks_exact(row_bytes_len))
-                                .zip(scales.chunks_exact(blocks_per_row))
-                            {
-                                *out_value = dot_q8_0_encoded_row_with_scales(
-                                    quantized_input,
-                                    row_bytes,
-                                    row_scales,
-                                );
                             }
                         }
                     }
@@ -6190,6 +6224,7 @@ thread_local! {
     static Q8_0_FILE_READER_ROW_CHUNK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static Q8_0_FILE_READER_CHUNK_SCALES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static Q8_0_FILE_READER_QUANTIZED_INPUTS: RefCell<Vec<Q8_0Block>> = const { RefCell::new(Vec::new()) };
+    static Q8_0_FILE_READER_OUTPUT_CHUNK: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 fn with_q8_0_file_reader_row_chunk<T>(
@@ -6228,6 +6263,19 @@ fn with_q8_0_file_reader_quantized_inputs<T>(
         // previous activation blocks logically live between file-backed Q8 calls.
         quantized_inputs.clear();
         result
+    })
+}
+
+fn with_q8_0_file_reader_output_chunk<T>(
+    len: usize,
+    f: impl FnOnce(&mut [f32]) -> Result<T>,
+) -> Result<T> {
+    Q8_0_FILE_READER_OUTPUT_CHUNK.with(|cell| {
+        let mut output_chunk = cell.borrow_mut();
+        if output_chunk.len() < len {
+            output_chunk.resize(len, 0.0);
+        }
+        f(&mut output_chunk[..len])
     })
 }
 
@@ -7866,6 +7914,7 @@ mod tests {
     fn prefill_chunk_token_count_accepts_full_prompt_probe() {
         let _env_guard = env_lock();
         std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
         assert_eq!(prefill_chunk_token_count(2047), 256);
 
         std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "256");
@@ -7879,6 +7928,29 @@ mod tests {
         std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "0");
         assert_eq!(prefill_chunk_token_count(2047), 256);
         std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+    }
+
+    #[test]
+    fn prefill_layer_major_chunk_token_count_has_separate_headroom_default() {
+        let _env_guard = env_lock();
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
+        assert_eq!(prefill_chunk_token_count(2047), 256);
+        assert_eq!(prefill_layer_major_chunk_token_count(2047), 512);
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "128");
+        assert_eq!(prefill_layer_major_chunk_token_count(2047), 128);
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "1024");
+        assert_eq!(prefill_layer_major_chunk_token_count(2047), 1024);
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "all");
+        assert_eq!(prefill_layer_major_chunk_token_count(2047), 2047);
+
+        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "0");
+        assert_eq!(prefill_layer_major_chunk_token_count(2047), 512);
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
     }
 
     #[test]
