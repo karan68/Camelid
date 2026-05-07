@@ -122,6 +122,42 @@ function findLlamaBpeCompatibilityHint(rows, plannedFamilies, quantKey, identity
   return null
 }
 
+function quantAwareCompatibilityHint(target, quantKey, confidence) {
+  if (!target) return null
+  if (quantKey && targetMatchesQuant(target, quantKey)) return { kind: 'compatibility', target, confidence }
+  if (!quantKey) return { kind: 'quant_missing', target, confidence: `${confidence} without quant evidence` }
+  return { kind: 'quant_mismatch', target, observedQuant: quantKey, confidence: `${confidence} with different quant` }
+}
+
+function futureExactRowHint(rows, subject, quantKey) {
+  const matchers = [
+    {
+      confidence: 'Mistral exact row + quant match',
+      predicate: (row) => row.id === 'mistral_7b_instruct_v0_3_q8_0',
+      subjectMatches: () => subject.includes('mistral') && /(?:^|[^a-z0-9])7\s*b(?:[^a-z0-9]|$)/i.test(subject) && subject.includes('instruct') && /v?0[._-]?3/.test(subject),
+    },
+    {
+      confidence: 'Mixtral exact row + quant match',
+      predicate: (row) => row.id === 'mixtral_8x7b_instruct_v0_1_q8_0',
+      subjectMatches: () => subject.includes('mixtral') && /8\s*x\s*7\s*b/.test(subject) && subject.includes('instruct') && /v?0[._-]?1/.test(subject),
+    },
+    {
+      confidence: 'Qwen exact row + quant match',
+      predicate: (row) => row.id === 'qwen25_7b_instruct_q8_0',
+      subjectMatches: () => subject.includes('qwen') && /(qwen2[._-]?5|qwen25)/.test(subject) && /(?:^|[^a-z0-9])7\s*b(?:[^a-z0-9]|$)/i.test(subject) && subject.includes('instruct'),
+    },
+    {
+      confidence: 'Gemma exact row + quant match',
+      predicate: (row) => row.id === 'gemma2_9b_it_q8_0',
+      subjectMatches: () => subject.includes('gemma') && /gemma[\s._-]*2/.test(subject) && /(?:^|[^a-z0-9])9\s*b(?:[^a-z0-9]|$)/i.test(subject) && /(?:^|[^a-z0-9])(?:it|instruct)(?:[^a-z0-9]|$)/i.test(subject),
+    },
+  ]
+
+  const matcher = matchers.find((item) => item.subjectMatches())
+  if (!matcher) return null
+  return quantAwareCompatibilityHint(rows.find(matcher.predicate) || null, quantKey, matcher.confidence)
+}
+
 export function isSupportedCapabilityStatus(status = '') {
   const value = status.toLowerCase()
   return value === 'supported' || value.startsWith('supported_') || value === 'validated' || value === 'measured'
@@ -218,13 +254,42 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   }
 
   if (subject.includes('mistral')) {
+    const hint = futureExactRowHint(rows, subject, quantKey)
+    if (hint) return hint
     const target = findRow((row) => row.family === 'mistral' || row.id.includes('mistral'))
-    if (target) return { kind: 'compatibility', target, confidence: 'name/path match' }
+    if (target) return { kind: 'family', target, confidence: 'Mistral family name match without exact row match' }
     const family = findFamily((item) => item.id.includes('mistral'))
     if (family) return { kind: 'family', target: family, confidence: 'family name match' }
   }
 
-  const futureFamily = findFamily((item) => item.id.includes('qwen_gemma_phi_falcon_mamba') && /(qwen|gemma|phi|falcon|mamba)/.test(subject))
+  if (subject.includes('mixtral')) {
+    const hint = futureExactRowHint(rows, subject, quantKey)
+    if (hint) return hint
+    const target = findRow((row) => row.family === 'mixtral_moe' || row.family === 'mixtral' || row.id.includes('mixtral'))
+    if (target) return { kind: 'family', target, confidence: 'Mixtral family name match without exact row match' }
+    const family = findFamily((item) => item.id.includes('mixtral'))
+    if (family) return { kind: 'family', target: family, confidence: 'family name match' }
+  }
+
+  if (subject.includes('qwen')) {
+    const hint = futureExactRowHint(rows, subject, quantKey)
+    if (hint) return hint
+    const target = findRow((row) => row.family === 'qwen_decoder' || row.family === 'qwen2' || row.id.includes('qwen'))
+    if (target) return { kind: 'family', target, confidence: 'Qwen family name match without exact row match' }
+    const family = findFamily((item) => item.id.includes('qwen'))
+    if (family) return { kind: 'family', target: family, confidence: 'family name match' }
+  }
+
+  if (subject.includes('gemma')) {
+    const hint = futureExactRowHint(rows, subject, quantKey)
+    if (hint) return hint
+    const target = findRow((row) => row.family === 'gemma2_decoder' || row.family === 'gemma2' || row.id.includes('gemma'))
+    if (target) return { kind: 'family', target, confidence: 'Gemma family name match without exact row match' }
+    const family = findFamily((item) => item.id.includes('gemma'))
+    if (family) return { kind: 'family', target: family, confidence: 'family name match' }
+  }
+
+  const futureFamily = findFamily((item) => item.id.includes('phi_falcon_mamba') && /(phi|falcon|mamba)/.test(subject))
   if (futureFamily) return { kind: 'family', target: futureFamily, confidence: 'future family name match' }
 
   return null
