@@ -45,24 +45,39 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Four exact Q8_0 rows: TinyLlama current gate; exact Llama 3.2 1B/3B rows have checked bounded 512/1024/2048-context packs; exact Llama 3 8B has checked bounded 512-context support, while its 1024/2048 bounded packs stay gated on the fresh current-head PASS bundle plus synchronized docs/API/frontend alignment. These are exact-row bounded-pack claims only; model-native/larger context, arbitrary-template behavior, throughput, portability, neighboring rows, and broad family support remain unsupported."
+        "Four exact Q8_0 rows: TinyLlama current gate; exact Llama 3.2 1B/3B and exact Llama 3 8B rows have checked bounded 512/1024/2048-context packs. The 8B 1024/2048 buckets are promoted only by the fresh current-head PASS bundle plus synchronized docs/API/frontend alignment. These are exact-row bounded-pack claims only; model-native/larger context, arbitrary-template behavior, throughput, portability, neighboring rows, and broad family support remain unsupported."
     );
-    assert!(body["supported_quantization"]
+    let q8 = body["supported_quantization"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "Q8_0" && item["status"] == "supported_current_gate"));
+        .find(|item| item["id"] == "Q8_0")
+        .unwrap();
+    assert_eq!(q8["status"], "supported_current_gate");
+    let q8_notes = q8["notes"].as_str().unwrap();
+    assert!(q8_notes
+        .contains("exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs"));
+    assert!(!q8_notes.contains("conditional"));
+    assert!(!q8_notes.contains("gated"));
     assert!(body["planned_quantization"]
         .as_array()
         .unwrap()
         .iter()
         .any(|item| item["id"] == "Q4_K_M/Q5_K_M"));
-    assert!(body["supported_model_families"]
+    let llama_bpe_family = body["supported_model_families"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "llama_bpe_decoder_exact_1b_3b_8b_q8_0"
-            && item["status"] == "supported_exact_row_smoke_lanes"));
+        .find(|item| item["id"] == "llama_bpe_decoder_exact_1b_3b_8b_q8_0")
+        .unwrap();
+    assert_eq!(
+        llama_bpe_family["status"],
+        "supported_exact_row_smoke_lanes"
+    );
+    let llama_bpe_notes = llama_bpe_family["notes"].as_str().unwrap();
+    assert!(llama_bpe_notes.contains("exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs"));
+    assert!(!llama_bpe_notes.contains("conditional"));
+    assert!(!llama_bpe_notes.contains("gated"));
     assert!(body["planned_model_families"]
         .as_array()
         .unwrap()
