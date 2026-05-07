@@ -157,7 +157,6 @@ For a first supported local run, TinyLlama is the clearest path — but it is **
 
 Camelid includes a built-in React/Vite frontend in [`frontend/`](frontend/) so the local runtime ships with a real product surface, not just a backend API.
 
-![Camelid WebUI screenshot](docs/assets/ui-screenshot-v2.png)
 
 The UI is designed to feel straightforward and approachable while still staying honest about model readiness. It keeps the main path simple — pick a local model, see whether Camelid reports it as ready, and start chatting when the runtime and support contract agree.
 
