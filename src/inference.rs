@@ -9133,6 +9133,90 @@ mod tests {
     }
 
     #[test]
+    fn q8_0_file_backed_batch_matmul_reuses_cached_chunks_across_calls() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "1024");
+        std::env::set_var(
+            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
+        );
+
+        let rows: Vec<Q8_0Block> = (0..4)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.03125,
+                quants: std::array::from_fn(|idx| idx as i8 - 7 + row as i8),
+            })
+            .collect();
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        for row in &rows {
+            temp_file
+                .write_all(&f32_to_f16_bits(row.scale).to_le_bytes())
+                .unwrap();
+            temp_file
+                .write_all(&row.quants.iter().map(|q| *q as u8).collect::<Vec<_>>())
+                .unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let input_values = (0..96)
+            .map(|idx| idx as f32 * 0.075 - 2.5)
+            .collect::<Vec<_>>();
+        let input = CpuTensor::from_f32("input", vec![3, 32], input_values).unwrap();
+        let weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "weight",
+            vec![4, 32],
+            dequantized_q8_0_rows(&rows),
+            rows.clone(),
+        )
+        .unwrap();
+        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
+
+        let start = q8_0_file_read_stats();
+        let first = matmul_rhs_transposed_q8_0_block_reader(
+            &input,
+            &backing,
+            Q8BlockReader::new(0, rows.len()),
+            rows.len(),
+            "first",
+            &mut InferenceWorkspace::new(32),
+        )
+        .unwrap();
+        let after_first = q8_0_file_read_stats();
+        let first_reads = after_first.saturating_delta_since(start);
+
+        let second = matmul_rhs_transposed_q8_0_block_reader(
+            &input,
+            &backing,
+            Q8BlockReader::new(0, rows.len()),
+            rows.len(),
+            "second",
+            &mut InferenceWorkspace::new(32),
+        )
+        .unwrap();
+        let second_reads = q8_0_file_read_stats().saturating_delta_since(after_first);
+
+        assert_slice_close(&first.data, &expected.data);
+        assert_slice_close(&second.data, &expected.data);
+        assert_eq!(first_reads.read_calls, 2);
+        assert_eq!(
+            first_reads.read_bytes,
+            (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
+        );
+        assert_eq!(second_reads.read_calls, 0);
+        assert_eq!(second_reads.read_bytes, 0);
+        assert_eq!(second_reads.cache_hits, 2);
+        assert_eq!(
+            second_reads.cache_hit_bytes,
+            (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
+        );
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+    }
+
+    #[test]
     fn q8_0_file_backed_borrowed_batch_matmul_reuses_chunk_reads_across_input_rows() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
