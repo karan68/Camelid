@@ -1440,7 +1440,7 @@
 }
 
 .chat-empty-stage {
-  width: min(100%, 620px);
+  width: min(100%, 680px);
   margin-inline: auto;
   display: grid;
   gap: 18px;
@@ -1448,29 +1448,33 @@
 }
 
 .chat-empty-stage-clean {
-  gap: 16px;
+  gap: 18px;
 }
 
 .chat-empty-readiness {
-  width: min(100%, 620px);
+  width: min(100%, 680px);
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin: 2px 0 4px;
 }
 
+.chat-empty-readiness-ledger {
+  gap: 12px;
+}
+
 .chat-empty-readiness-card {
-  min-height: 116px;
+  min-height: 118px;
   display: grid;
   align-content: start;
   gap: 7px;
-  padding: 14px;
-  border: 1px solid color-mix(in srgb, var(--color-border-soft) 72%, transparent);
-  border-radius: 20px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 64%, transparent);
+  border-radius: 24px;
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 72%, transparent), color-mix(in srgb, var(--color-surface-strong) 22%, transparent)),
-    color-mix(in srgb, var(--color-chip) 54%, transparent);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 82%, rgba(255, 255, 255, 0.03)), color-mix(in srgb, var(--color-surface-strong) 32%, transparent)),
+    color-mix(in srgb, var(--color-chip) 48%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045), 0 16px 34px rgba(0, 0, 0, 0.12);
   text-align: left;
 }
 
@@ -1510,7 +1514,57 @@
 }
 
 .chat-empty-hero-clean {
-  gap: 10px;
+  gap: 12px;
+}
+
+.chat-empty-orb {
+  position: relative;
+  width: 58px;
+  height: 58px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 2px;
+  border-radius: 22px;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(255, 255, 255, 0.36), transparent 32%),
+    linear-gradient(135deg, color-mix(in srgb, var(--color-info) 56%, white 6%), color-mix(in srgb, var(--color-selected-row) 52%, #111 48%));
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  color: white;
+  font-weight: 780;
+  letter-spacing: -0.05em;
+}
+
+.chat-empty-orb i {
+  position: absolute;
+  inset: -8px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 28px;
+  transform: rotate(9deg);
+}
+
+.chat-empty-proofbar {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.chat-empty-proofbar span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  max-width: min(100%, 290px);
+  padding: 6px 11px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 62%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 56%, transparent);
+  color: color-mix(in srgb, var(--color-text) 86%, var(--color-text-muted) 14%);
+  font-size: 0.76rem;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .chat-empty-hero-clean .chat-empty-greeting {
@@ -1545,8 +1599,8 @@
 }
 
 .chat-empty-hero-clean h2 {
-  max-width: 12ch;
-  font-size: clamp(2.7rem, 4.6vw, 4.4rem);
+  max-width: 13ch;
+  font-size: clamp(2.85rem, 4.8vw, 4.7rem);
   line-height: 0.98;
   letter-spacing: -0.06em;
 }
@@ -1667,7 +1721,7 @@
 }
 
 .composer-gemini-stage {
-  width: min(100%, 620px);
+  width: min(100%, 680px);
 }
 
 .composer-gemini-stage-clean {

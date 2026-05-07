@@ -126,6 +126,39 @@ export default function ChatWorkspace({
     ? `${formatCapabilityStatus(chatFeature.status)} · ${chatFeature.notes}`
     : 'Chat capability was not advertised; health and typed backend errors remain the source of truth.'
   const guardedFeatureSummary = summarizeGuardedFeatures(apiFeatures)
+  const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
+  const emptyHeroTitle = selectedModelRunnable
+    ? 'Ask Camelid anything local.'
+    : supportBlocked
+      ? 'Exact support row required.'
+      : 'Load a local model to begin.'
+  const emptyHeroSummary = selectedModelRunnable
+    ? 'A quiet Gemini-like workspace for bounded local chat. Camelid keeps runtime readiness and the exact support contract in view before every send.'
+    : supportBlocked
+      ? 'Camelid found a loaded model, but chat stays locked because the selected GGUF does not match an exact supported compatibility row.'
+      : 'Choose or load a GGUF. Chat unlocks only when /v1/health and /api/capabilities agree that this exact local model is ready.'
+  const readinessFacts = [
+    {
+      label: 'Runtime',
+      value: selectedModel ? (selectedRuntimeReady ? 'Loaded + generation-ready' : 'Not ready yet') : 'No active model',
+      copy: 'Requires active_model_id, loaded_now=true, and generation_ready=true from /v1/health.',
+    },
+    {
+      label: 'Support contract',
+      value: selectedModelRunnable ? 'Exact row matched' : supportBlocked ? 'Exact row missing' : capabilityGate,
+      copy: selectedModel ? selectedCompatibilityLabel : 'No compatibility row is inferred before a local model is selected.',
+    },
+    {
+      label: 'Honesty boundary',
+      value: 'No filename optimism',
+      copy: 'Names, paths, and neighboring families never become support claims without evidence.',
+    },
+  ]
+  const proofPills = [
+    selectedModelRunnable ? 'Chat unlocked' : 'Chat guarded',
+    selectedModelName,
+    `Demo cap ${CHAT_DEMO_TOKEN_CAP} tokens`,
+  ]
 
   const renderCapabilityStrip = (stage = false) => (
     <div className={`chat-capability-strip ${stage ? 'chat-capability-strip-stage' : ''}`} aria-label="Camelid support contract and chat readiness">
@@ -210,27 +243,26 @@ export default function ChatWorkspace({
           <div className="chat-empty-shell chat-empty-shell-gemini">
             <div className="chat-empty-stage chat-empty-stage-clean">
               <div className="chat-empty-hero chat-empty-hero-gemini chat-empty-hero-clean">
-                <p className="chat-empty-greeting">Camelid</p>
-                <h2>{selectedModelRunnable ? 'How can I help?' : supportBlocked ? 'This model is not ready for chat' : 'Load a local model to begin'}</h2>
-                <p className="hero-summary">{selectedModelRunnable ? 'Start a focused local conversation. Camelid will keep the runtime and support contract visible while you chat.' : supportBlocked ? 'This loaded model is outside the exact support row, so chat stays locked instead of guessing.' : 'Choose a generation-ready local model and Camelid unlocks chat only after the exact support row matches.'}</p>
+                <div className="chat-empty-orb" aria-hidden="true">
+                  <span>C</span>
+                  <i />
+                </div>
+                <p className="chat-empty-greeting">Camelid local chat</p>
+                <h2>{emptyHeroTitle}</h2>
+                <p className="hero-summary">{emptyHeroSummary}</p>
+                <div className="chat-empty-proofbar" aria-label="Current chat guard summary">
+                  {proofPills.map((pill) => <span key={pill}>{pill}</span>)}
+                </div>
               </div>
 
-              <div className="chat-empty-readiness" aria-label="Local chat readiness summary">
-                <div className="chat-empty-readiness-card">
-                  <span>Runtime</span>
-                  <strong>{selectedModel ? (selectedRuntimeReady ? 'Loaded + ready' : 'Not generation-ready') : 'No model loaded'}</strong>
-                  <small>Requires loaded_now=true and generation_ready=true from /v1/health.</small>
-                </div>
-                <div className="chat-empty-readiness-card">
-                  <span>Support contract</span>
-                  <strong>{capabilityGate}</strong>
-                  <small>{selectedModel ? selectedCompatibilityLabel : 'Pick an exact supported GGUF row before chat can unlock.'}</small>
-                </div>
-                <div className="chat-empty-readiness-card">
-                  <span>Boundary</span>
-                  <strong>No broad claims</strong>
-                  <small>Filenames and neighboring model families never count as support evidence.</small>
-                </div>
+              <div className="chat-empty-readiness chat-empty-readiness-ledger" aria-label="Local chat readiness summary">
+                {readinessFacts.map((item) => (
+                  <div key={item.label} className="chat-empty-readiness-card">
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                    <small>{item.copy}</small>
+                  </div>
+                ))}
               </div>
 
               <div className="composer composer-gemini composer-gemini-stage composer-gemini-stage-clean">
