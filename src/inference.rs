@@ -4997,10 +4997,12 @@ fn output_projection_q8_0_reconstructed_logit(
         backing.read_exact_at_cached(&mut owned_row_bytes, row_offset)?;
         &owned_row_bytes
     };
-    let quantized_output_norm = quantize_q8_0_row(&output_norm.data[..hidden_width]);
-    Ok(Some(dot_q8_0_encoded_row(
-        &quantized_output_norm.blocks,
+    let mut scales = vec![0.0_f32; blocks_per_row];
+    decode_q8_0_encoded_row_scales(row_bytes, &mut scales);
+    Ok(Some(dot_q8_0_encoded_row_f32_input_with_scales(
+        &output_norm.data[..hidden_width],
         row_bytes,
+        &scales,
     )))
 }
 
@@ -5768,10 +5770,8 @@ fn matmul_rhs_transposed_q8_0_block_reader(
     })?;
     with_q8_0_file_reader_row_chunk(row_chunk_len, |row_chunk| {
         with_q8_0_file_reader_quantized_inputs(|quantized_input_blocks| {
-            let quantized_inputs =
-                quantize_q8_0_rows_into(input, input_width, quantized_input_blocks)?;
+            quantized_input_blocks.clear();
             if rows == 1 {
-                let quantized_input = quantized_inputs.row(0);
                 let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
                     BackendError::RuntimeShapeMismatch(
                         "q8_0 block-reader chunk scale count overflow".to_string(),
@@ -5807,8 +5807,8 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                 .zip(chunk.par_chunks_exact(row_bytes_len))
                                 .zip(scales.par_chunks_exact(blocks_per_row))
                                 .for_each(|((out_value, row_bytes), row_scales)| {
-                                    *out_value = dot_q8_0_encoded_row_with_scales(
-                                        quantized_input,
+                                    *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
+                                        &input.data[..input_width],
                                         row_bytes,
                                         row_scales,
                                     );
@@ -5819,8 +5819,8 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                 .zip(chunk.chunks_exact(row_bytes_len))
                                 .zip(scales.chunks_exact(blocks_per_row))
                             {
-                                *out_value = dot_q8_0_encoded_row_with_scales(
-                                    quantized_input,
+                                *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
+                                    &input.data[..input_width],
                                     row_bytes,
                                     row_scales,
                                 );
@@ -5863,7 +5863,7 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                     // Multi-row prefill reuses the same file-backed Q8 weight chunk across
                     // every input row. Decode each weight-block scale once per chunk row,
                     // then walk output columns outermost so each compact weight row stays hot
-                    // while it is dotted against all quantized input rows. The older row-major
+                    // while it is dotted against all input rows. The older row-major
                     // loop rescanned the full chunk once per input row; that kept RSS low but
                     // turned long-context prefill into unnecessary memory-bandwidth pressure.
                     let output_rows = &mut output[..rows * output_width];
@@ -5879,11 +5879,13 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                 .zip(chunk.par_chunks_exact(row_bytes_len))
                                 .zip(scales.par_chunks_exact(blocks_per_row))
                                 .for_each(|((column_outputs, row_bytes), row_scales)| {
-                                    for (out_value, quantized_input) in
-                                        column_outputs.iter_mut().zip(quantized_inputs.rows())
+                                    for (row_idx, out_value) in
+                                        column_outputs.iter_mut().enumerate()
                                     {
-                                        *out_value = dot_q8_0_encoded_row_with_scales(
-                                            quantized_input,
+                                        let row_start = row_idx * input_width;
+                                        let row_end = row_start + input_width;
+                                        *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
+                                            &input.data[row_start..row_end],
                                             row_bytes,
                                             row_scales,
                                         );
@@ -5907,10 +5909,12 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                             .enumerate()
                         {
                             let absolute_col = output_idx + chunk_col;
-                            for (row, quantized_input) in quantized_inputs.rows().enumerate() {
+                            for row in 0..rows {
+                                let row_start = row * input_width;
+                                let row_end = row_start + input_width;
                                 output_rows[row * output_width + absolute_col] =
-                                    dot_q8_0_encoded_row_with_scales(
-                                        quantized_input,
+                                    dot_q8_0_encoded_row_f32_input_with_scales(
+                                        &input.data[row_start..row_end],
                                         row_bytes,
                                         row_scales,
                                     );
@@ -5962,6 +5966,25 @@ fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scale
     {
         let int_sum = q8_0_block_int_dot_horizontal_sum_encoded(&block[2..], &input_block.quants);
         sum += int_sum as f32 * *scale * input_block.scale;
+    }
+    sum
+}
+
+fn dot_q8_0_encoded_row_f32_input_with_scales(
+    input: &[f32],
+    row_bytes: &[u8],
+    scales: &[f32],
+) -> f32 {
+    debug_assert_eq!(input.len(), scales.len() * Q8_0_BLOCK_VALUES);
+    let mut sum = 0.0_f32;
+    for ((input_block, block), scale) in input
+        .chunks_exact(Q8_0_BLOCK_VALUES)
+        .zip(row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES))
+        .zip(scales)
+    {
+        for (input_value, quant) in input_block.iter().zip(block[2..].iter()) {
+            sum += *input_value * (*scale * f32::from(*quant as i8));
+        }
     }
     sum
 }
@@ -6225,9 +6248,6 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
     with_q8_0_file_reader_row_chunk(row_chunk_len, |row_chunk| {
         with_q8_0_file_reader_quantized_inputs(|quantized_input_blocks| {
             quantized_input_blocks.clear();
-            quantized_input_blocks.reserve(blocks_per_row);
-            quantize_q8_0_blocks_into(input_row, quantized_input_blocks);
-            let quantized_input = quantized_input_blocks.as_slice();
             let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch(
                     "q8_0 borrowed block-reader chunk scale count overflow".to_string(),
@@ -6263,10 +6283,8 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
                             .zip(chunk.par_chunks_exact(row_bytes_len))
                             .zip(scales.par_chunks_exact(blocks_per_row))
                             .for_each(|((out_value, row_bytes), row_scales)| {
-                                *out_value = dot_q8_0_encoded_row_with_scales(
-                                    quantized_input,
-                                    row_bytes,
-                                    row_scales,
+                                *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
+                                    input_row, row_bytes, row_scales,
                                 );
                             });
                     } else {
@@ -6275,10 +6293,8 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
                             .zip(chunk.chunks_exact(row_bytes_len))
                             .zip(scales.chunks_exact(blocks_per_row))
                         {
-                            *out_value = dot_q8_0_encoded_row_with_scales(
-                                quantized_input,
-                                row_bytes,
-                                row_scales,
+                            *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
+                                input_row, row_bytes, row_scales,
                             );
                         }
                     }
@@ -8835,7 +8851,7 @@ mod tests {
         )
         .unwrap();
 
-        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let expected = matmul_rhs_transposed_with_precision(&input, &weight, "expected").unwrap();
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 2);
         let reader = Q8BlockReader::new(0, 2);
         let mut workspace = InferenceWorkspace::new(32);
@@ -8896,7 +8912,7 @@ mod tests {
             rows,
         )
         .unwrap();
-        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let expected = matmul_rhs_transposed_with_precision(&input, &weight, "expected").unwrap();
 
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 5);
         let reader = Q8BlockReader::new(0, 5);
@@ -9034,7 +9050,7 @@ mod tests {
             rows.clone(),
         )
         .unwrap();
-        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let expected = matmul_rhs_transposed_with_precision(&input, &weight, "expected").unwrap();
 
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
         let mut actual = vec![0.0; rows.len()];
@@ -9108,7 +9124,7 @@ mod tests {
             rows.clone(),
         )
         .unwrap();
-        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let expected = matmul_rhs_transposed_with_precision(&input, &weight, "expected").unwrap();
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
         let start = q8_0_file_read_stats();
 
@@ -9171,7 +9187,7 @@ mod tests {
             rows.clone(),
         )
         .unwrap();
-        let expected = matmul_rhs_transposed_q8_0_block_dot(&input, &weight, "expected").unwrap();
+        let expected = matmul_rhs_transposed_with_precision(&input, &weight, "expected").unwrap();
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
 
         let start = q8_0_file_read_stats();
@@ -9256,7 +9272,7 @@ mod tests {
         )
         .unwrap();
         let expected =
-            matmul_rhs_transposed_q8_0_block_dot(&input, &expected_weight, "expected").unwrap();
+            matmul_rhs_transposed_with_precision(&input, &expected_weight, "expected").unwrap();
         let output_weight = CpuTensor::q8_0_file_backed_linear(
             "output.weight",
             crate::tensor::TensorShape { dims: vec![32, 4] },
