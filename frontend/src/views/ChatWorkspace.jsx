@@ -128,36 +128,39 @@ export default function ChatWorkspace({
   const guardedFeatureSummary = summarizeGuardedFeatures(apiFeatures)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
   const emptyHeroTitle = selectedModelRunnable
-    ? 'Ask Camelid anything local.'
+    ? 'How can Camelid help?'
     : supportBlocked
-      ? 'Exact row required.'
-      : 'Load a proven local model.'
+      ? 'Exact support row required.'
+      : 'Load a verified local model.'
   const emptyHeroSummary = selectedModelRunnable
-    ? 'A quiet, Gemini-like chat surface for bounded local replies. Readiness stays visible without turning filenames into support claims.'
+    ? 'A calm local chat surface for bounded replies, with the runtime and support contract still visible before every send.'
     : supportBlocked
-      ? 'The runtime sees a loaded GGUF, but chat stays locked until /api/capabilities matches its exact supported row.'
-      : 'Choose a GGUF, then Camelid unlocks chat only when health and the compatibility contract agree on that exact model.'
+      ? 'The runtime can see this GGUF, but Camelid keeps chat locked until /api/capabilities names the exact supported model/quant row.'
+      : 'Start with a local GGUF. Chat unlocks only when health, loaded model, and the compatibility contract agree on that exact target.'
   const readinessFacts = [
     {
       label: 'Runtime',
       value: selectedModel ? (selectedRuntimeReady ? 'Ready' : 'Waiting') : 'No model',
-      copy: 'active_model_id + loaded_now + generation_ready',
+      copy: 'Requires active_model_id, loaded_now, and generation_ready.',
+      tone: selectedRuntimeReady ? 'ready' : 'waiting',
     },
     {
       label: 'Contract',
-      value: selectedModelRunnable ? 'Matched' : supportBlocked ? 'Missing row' : capabilityGate,
-      copy: selectedModel ? selectedCompatibilityLabel : 'No inferred compatibility before selection',
+      value: selectedModelRunnable ? 'Matched' : supportBlocked ? 'Missing exact row' : capabilityGate,
+      copy: selectedModel ? selectedCompatibilityLabel : 'No compatibility inferred before selection.',
+      tone: selectedModelRunnable ? 'ready' : supportBlocked ? 'blocked' : 'waiting',
     },
     {
       label: 'Boundary',
-      value: 'Exact evidence only',
-      copy: 'No filename, path, or neighboring-family optimism',
+      value: 'Evidence only',
+      copy: 'No filename, saved-path, or neighboring-family optimism.',
+      tone: 'neutral',
     },
   ]
   const proofPills = [
-    selectedModelRunnable ? 'Chat unlocked' : 'Chat guarded',
+    selectedModelRunnable ? 'Ready for bounded local chat' : 'Chat stays guarded',
     selectedModel ? selectedModelName : 'Local GGUF required',
-    `Demo cap ${CHAT_DEMO_TOKEN_CAP} tokens`,
+    `${CHAT_DEMO_TOKEN_CAP}-token demo cap`,
   ]
 
   const renderCapabilityStrip = (stage = false) => (
@@ -253,12 +256,12 @@ export default function ChatWorkspace({
                 <div className="chat-empty-proofbar" aria-label="Current chat guard summary">
                   {proofPills.map((pill) => <span key={pill}>{pill}</span>)}
                 </div>
-                <p className="chat-empty-contract-note">Chat opens only when /v1/health and /api/capabilities agree on the selected exact GGUF.</p>
+                <p className="chat-empty-contract-note">No broad GGUF promise: chat opens only when /v1/health and /api/capabilities agree on the selected exact model.</p>
               </div>
 
               <div className="chat-empty-readiness chat-empty-readiness-ledger" aria-label="Local chat readiness summary">
                 {readinessFacts.map((item) => (
-                  <div key={item.label} className="chat-empty-readiness-card">
+                  <div key={item.label} className={`chat-empty-readiness-card ${item.tone ? `is-${item.tone}` : ''}`}>
                     <span>{item.label}</span>
                     <strong>{item.value}</strong>
                     <small>{item.copy}</small>
@@ -277,6 +280,7 @@ export default function ChatWorkspace({
                     <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit}>{sending ? 'Sending…' : 'Send'}</button>
                   </div>
                 </div>
+                <p className="composer-gemini-disclaimer">Raw local replies are capped at {CHAT_DEMO_TOKEN_CAP} demo tokens until longer-generation polish is validated.</p>
               </div>
 
               <p className="chat-empty-status-note">{selectedModelMeta}</p>
