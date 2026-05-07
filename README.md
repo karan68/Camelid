@@ -10,7 +10,7 @@ Many local-model stacks are easy to demo and hard to trust. Camelid is designed 
 
 Camelid does not treat “probably works” as “supported.” Support moves only when the evidence is real.
 
-> **Current public posture:** four exact GGUF rows have evidence-backed support boundaries: TinyLlama at the current validated gate, Llama 3.2 1B/3B Q8_0 through checked bounded 2048-context packs, and Llama 3 8B Q8_0 through the checked bounded 512-context pack only. 8B 1024/2048 remain red until fresh current-head PASS artifacts and synchronized docs/API/frontend copy exist. Wider model-native context, production throughput, portability, arbitrary templates, and broad-family support remain outside the claim.
+> **Current public posture:** four exact GGUF rows have evidence-backed support boundaries: TinyLlama at the current validated gate, Llama 3.2 1B/3B Q8_0 through checked bounded 2048-context packs, and Llama 3 8B Q8_0 through checked bounded 2048-context packs. These are exact-row bounded-pack claims only; wider model-native context, production throughput, portability, arbitrary templates, and broad-family support remain outside the claim.
 
 ## Milestone at a glance
 
@@ -18,7 +18,7 @@ Camelid's current milestone is not a loose compatibility demo. It is a synchroni
 
 - **Four exact Q8_0 rows are public and evidence-backed.** TinyLlama remains the full current gate; Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B now have verified exact-row support within their validated bounds.
 - **The UI and API fail closed instead of guessing.** Chat unlocks only when the loaded local GGUF is `loaded_now=true`, `generation_ready=true`, and matched to an exact supported `/api/capabilities` row.
-- **The context ladder is explicit.** TinyLlama stays at the current gate with bounded 512-context coverage; Llama 3.2 1B/3B have checked bounded 512/1024/2048-context evidence; Llama 3 8B is green only for the checked bounded 512-context pack while 1024/2048 remain red pending fresh current-head PASS evidence plus synchronized docs/API/frontend copy. These checked packs do not imply model-native/larger context, arbitrary-template, production-throughput, portability, or broader-family support.
+- **The context ladder is explicit.** TinyLlama stays at the current gate with bounded 512-context coverage; Llama 3.2 1B/3B and Llama 3 8B have checked bounded 512/1024/2048-context evidence. These checked packs do not imply model-native/larger context, arbitrary-template, production-throughput, portability, or broader-family support.
 
 ![Camelid WebUI chat surface](docs/assets/ui-screenshot-v2.png)
 
@@ -74,7 +74,7 @@ Camelid’s public support boundary is intentionally narrow and exact-row. Read 
 | TinyLlama 1.1B Chat Q8_0 | **Verified support** | End-to-end generation, broader five-prompt/50-token parity, bounded template-shape checks, bounded 512-context coverage, and backend RSS/perf sampling. | This is the trusted current gate, not a promise about other TinyLlama variants or quants. |
 | Llama 3.2 1B Instruct Q8_0 | **Verified support (bounded)** | Load, completions, chat completions, WebUI validation, compact/broader parity, bounded template-shape checks, bounded unique-chat perf/RSS, and checked 512/1024/2048-context packs. | The 2048 pass is exact-row only after the RoPE frequency-factor fix; it is not model-native/larger-context, arbitrary-template, production-throughput, or portability support. |
 | Llama 3.2 3B Instruct Q8_0 | **Verified support (bounded)** | Load, completions, chat completions, WebUI validation, compact/broader 50-token parity, bounded template-shape checks, bounded unique-chat perf/RSS, checked 512/1024/2048-context packs, and an opt-in parallel Q8 first-token direction probe. | The parallel Q8 result is a direction probe, not production throughput; broader/full support still needs model-native/larger context, arbitrary-template, and portability evidence. |
-| Llama 3 8B Instruct Q8_0 | **Verified support (bounded)** | Load, completions, chat completions, WebUI validation, compact parity, three-prompt 50-token parity, the bounded 512-context pack, compact chat-template-shapes pack, bounded memory evidence, and lazy-Q8 hot-path measurements. | 1024/2048 stay red until fresh current-head PASS artifacts and synchronized docs/API/frontend copy exist; do not claim model-native/larger context beyond checked packs, production throughput, arbitrary templates, portability, neighboring-row, or broad 8B/Llama support. |
+| Llama 3 8B Instruct Q8_0 | **Verified support (bounded)** | Load, completions, chat completions, WebUI validation, compact parity, three-prompt 50-token parity, checked 512/1024/2048-context packs, compact chat-template-shapes pack, bounded memory evidence, and lazy-Q8 hot-path measurements. | Do not claim model-native/larger context beyond checked packs, production throughput, arbitrary templates, portability, neighboring-row, or broad 8B/Llama support. |
 | Mistral-7B-Instruct-v0.3.Q8_0.gguf | **In active validation** | Ubuntu load/serve lane exists; closure is blocked on tokenizer/template parity and independent prompt-token references. | No Mistral-family support, neighboring Mistral row, generation readiness, API/WebUI readiness, or frontend green state yet. |
 | Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/metadata planning only. | No MoE/Mixtral support until expert routing, tokenizer/template, bounded load, parity, API/WebUI, RSS, and bundle evidence exist. |
 | Qwen2.5-7B-Instruct-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/tokenizer planning only. | No Qwen support until tokenizer/template references, architecture mapping, bounded load, parity, API/WebUI, RSS, and bundle evidence exist. |
@@ -89,7 +89,7 @@ The most recent four-row maintainer matrix on the cleaned support head confirmed
 | TinyLlama 1.1B Chat Q8_0 | direct chat validation | PASS | `Certainly! Here` |
 | Llama 3.2 1B Instruct Q8_0 | 2048-context bounded recall pack | PASS | `CMLD-204` |
 | Llama 3.2 3B Instruct Q8_0 | 2048-context bounded recall pack | PASS | `CMLD-204` |
-| Llama 3 8B Instruct Q8_0 | 512-context bounded recall pack | PASS | `CMLD-512-CHECK` |
+| Llama 3 8B Instruct Q8_0 | 2048-context bounded recall pack | PASS | `CMLD-204` |
 
 ### Read this boundary carefully
 
