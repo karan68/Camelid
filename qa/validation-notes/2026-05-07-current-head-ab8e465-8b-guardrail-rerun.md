@@ -10,7 +10,7 @@ Preflight:
 
 - Local `main` was clean at `ab8e465b50c3dca9c81d078f86c24cdc027013eb` before this evidence slice.
 - Canonical host process scan showed existing backend/Vite activity, including other 8B-capable servers, so this used a fresh worktree/ports and did not duplicate an already-running 8B prompt-pack job.
-- Canonical worktree: `/home/ubuntu/work/Camelid-current-head-ab8e465-8b-rerun-20260507T1940Z`.
+- Canonical worktree: maintainer-private approved Ubuntu validation-lane worktree; committed public artifact root is listed below.
 
 Canonical command shape:
 

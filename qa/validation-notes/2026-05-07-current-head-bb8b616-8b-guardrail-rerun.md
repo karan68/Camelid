@@ -2,7 +2,7 @@
 
 Date: 2026-05-07
 Git head: `bb8b616a09d6cdde00d157a586722b1688e87eff`
-Canonical host: `ubuntu@54.69.75.77`
+Canonical lane: approved Ubuntu validation lane
 Committed artifact root: `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260507T185917Z-head-bb8b616a09d6`
 
 ## Claim boundary
