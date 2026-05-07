@@ -806,6 +806,14 @@ static Q8_0_FILE_READ_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 static Q8_0_FILE_CACHE_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_MISS_BYTES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_INSERTS: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_INSERT_BYTES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_MERGES: AtomicU64 = AtomicU64::new(0);
+static Q8_0_FILE_CACHE_MERGED_BYTES: AtomicU64 = AtomicU64::new(0);
 static Q8_FILE_CACHE: OnceLock<Mutex<Q8FileCache>> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -814,6 +822,14 @@ pub struct Q8_0FileReadStats {
     pub read_bytes: u64,
     pub cache_hits: u64,
     pub cache_hit_bytes: u64,
+    pub cache_misses: u64,
+    pub cache_miss_bytes: u64,
+    pub cache_inserts: u64,
+    pub cache_insert_bytes: u64,
+    pub cache_evictions: u64,
+    pub cache_evicted_bytes: u64,
+    pub cache_merges: u64,
+    pub cache_merged_bytes: u64,
     pub cache_entries: u64,
     pub cache_bytes: u64,
     pub cache_capacity_bytes: u64,
@@ -826,6 +842,20 @@ impl Q8_0FileReadStats {
             read_bytes: self.read_bytes.saturating_sub(start.read_bytes),
             cache_hits: self.cache_hits.saturating_sub(start.cache_hits),
             cache_hit_bytes: self.cache_hit_bytes.saturating_sub(start.cache_hit_bytes),
+            cache_misses: self.cache_misses.saturating_sub(start.cache_misses),
+            cache_miss_bytes: self.cache_miss_bytes.saturating_sub(start.cache_miss_bytes),
+            cache_inserts: self.cache_inserts.saturating_sub(start.cache_inserts),
+            cache_insert_bytes: self
+                .cache_insert_bytes
+                .saturating_sub(start.cache_insert_bytes),
+            cache_evictions: self.cache_evictions.saturating_sub(start.cache_evictions),
+            cache_evicted_bytes: self
+                .cache_evicted_bytes
+                .saturating_sub(start.cache_evicted_bytes),
+            cache_merges: self.cache_merges.saturating_sub(start.cache_merges),
+            cache_merged_bytes: self
+                .cache_merged_bytes
+                .saturating_sub(start.cache_merged_bytes),
             cache_entries: self.cache_entries,
             cache_bytes: self.cache_bytes,
             cache_capacity_bytes: self.cache_capacity_bytes,
@@ -846,6 +876,14 @@ pub fn q8_0_file_read_stats() -> Q8_0FileReadStats {
         read_bytes: Q8_0_FILE_READ_BYTES.load(Ordering::Relaxed),
         cache_hits: Q8_0_FILE_CACHE_HITS.load(Ordering::Relaxed),
         cache_hit_bytes: Q8_0_FILE_CACHE_HIT_BYTES.load(Ordering::Relaxed),
+        cache_misses: Q8_0_FILE_CACHE_MISSES.load(Ordering::Relaxed),
+        cache_miss_bytes: Q8_0_FILE_CACHE_MISS_BYTES.load(Ordering::Relaxed),
+        cache_inserts: Q8_0_FILE_CACHE_INSERTS.load(Ordering::Relaxed),
+        cache_insert_bytes: Q8_0_FILE_CACHE_INSERT_BYTES.load(Ordering::Relaxed),
+        cache_evictions: Q8_0_FILE_CACHE_EVICTIONS.load(Ordering::Relaxed),
+        cache_evicted_bytes: Q8_0_FILE_CACHE_EVICTED_BYTES.load(Ordering::Relaxed),
+        cache_merges: Q8_0_FILE_CACHE_MERGES.load(Ordering::Relaxed),
+        cache_merged_bytes: Q8_0_FILE_CACHE_MERGED_BYTES.load(Ordering::Relaxed),
         cache_entries,
         cache_bytes,
         cache_capacity_bytes: cache_capacity_bytes as u64,
@@ -871,6 +909,7 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
         return false;
     }
     let Some(cache) = Q8_FILE_CACHE.get() else {
+        record_q8_file_cache_miss(out.len());
         return false;
     };
     let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
@@ -880,6 +919,7 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
         .iter()
         .position(|entry| q8_file_cache_entry_covers(entry, path, offset, out.len()))
     else {
+        record_q8_file_cache_miss(out.len());
         return false;
     };
     let entry = cache.entries.remove(pos);
@@ -889,6 +929,11 @@ fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
     Q8_0_FILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
     Q8_0_FILE_CACHE_HIT_BYTES.fetch_add(out.len() as u64, Ordering::Relaxed);
     true
+}
+
+fn record_q8_file_cache_miss(bytes: usize) {
+    Q8_0_FILE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    Q8_0_FILE_CACHE_MISS_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 fn q8_file_cache_entry_covers(
@@ -1086,6 +1131,9 @@ impl Q8FileCache {
             {
                 let old = self.entries.remove(pos);
                 self.bytes = self.bytes.saturating_sub(old.bytes.len());
+                Q8_0_FILE_CACHE_MERGES.fetch_add(1, Ordering::Relaxed);
+                Q8_0_FILE_CACHE_MERGED_BYTES
+                    .fetch_add(merged.bytes.len() as u64, Ordering::Relaxed);
                 entry = merged;
                 pos = 0;
             } else {
@@ -1093,6 +1141,8 @@ impl Q8FileCache {
             }
         }
         self.bytes = self.bytes.saturating_add(entry.bytes.len());
+        Q8_0_FILE_CACHE_INSERTS.fetch_add(1, Ordering::Relaxed);
+        Q8_0_FILE_CACHE_INSERT_BYTES.fetch_add(entry.bytes.len() as u64, Ordering::Relaxed);
         self.entries.push(entry);
         while self.bytes > capacity {
             self.evict_oldest();
@@ -1106,6 +1156,8 @@ impl Q8FileCache {
         }
         let entry = self.entries.remove(0);
         self.bytes = self.bytes.saturating_sub(entry.bytes.len());
+        Q8_0_FILE_CACHE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        Q8_0_FILE_CACHE_EVICTED_BYTES.fetch_add(entry.bytes.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -1521,6 +1573,49 @@ mod tests {
         assert_eq!(stats.cache_hit_bytes, 8);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 16);
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn q8_file_cache_reports_miss_insert_merge_and_eviction_stats() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        let _ = q8_0_file_read_stats();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-stats-{}",
+            std::process::id()
+        ));
+        let other_path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-stats-other-{}",
+            std::process::id()
+        ));
+
+        let start = q8_0_file_read_stats();
+        let mut miss = [0_u8; 4];
+        assert!(!q8_file_cache_get(&path, 100, &mut miss));
+        q8_file_cache_insert(path.clone(), 100, b"abcdefgh");
+        q8_file_cache_insert(path.clone(), 108, b"ijklmnop");
+        let mut hit = [0_u8; 8];
+        assert!(q8_file_cache_get(&path, 104, &mut hit));
+        q8_file_cache_insert(other_path, 200, b"qrstuvwx");
+        let stats = q8_0_file_read_stats().saturating_delta_since(start);
+
+        assert_eq!(&hit, b"efghijkl");
+        assert_eq!(stats.cache_misses, 1);
+        assert_eq!(stats.cache_miss_bytes, 4);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_hit_bytes, 8);
+        assert_eq!(stats.cache_inserts, 3);
+        assert_eq!(stats.cache_insert_bytes, 32);
+        assert_eq!(stats.cache_merges, 1);
+        assert_eq!(stats.cache_merged_bytes, 16);
+        assert_eq!(stats.cache_evictions, 1);
+        assert_eq!(stats.cache_evicted_bytes, 16);
+        assert_eq!(stats.cache_entries, 1);
+        assert_eq!(stats.cache_bytes, 8);
+        assert_eq!(stats.cache_capacity_bytes, 16);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
     }
 

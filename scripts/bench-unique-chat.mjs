@@ -185,6 +185,16 @@ function compactForwardMemory(memory) {
     peak_phase: memory.peak_phase ?? null,
     q8_file_read_calls: Number.isFinite(q8Reads.read_calls) ? q8Reads.read_calls : null,
     q8_file_read_mib: bytesToMiB(q8Reads.read_bytes),
+    q8_file_cache_hits: Number.isFinite(q8Reads.cache_hits) ? q8Reads.cache_hits : null,
+    q8_file_cache_hit_mib: bytesToMiB(q8Reads.cache_hit_bytes),
+    q8_file_cache_misses: Number.isFinite(q8Reads.cache_misses) ? q8Reads.cache_misses : null,
+    q8_file_cache_miss_mib: bytesToMiB(q8Reads.cache_miss_bytes),
+    q8_file_cache_inserts: Number.isFinite(q8Reads.cache_inserts) ? q8Reads.cache_inserts : null,
+    q8_file_cache_insert_mib: bytesToMiB(q8Reads.cache_insert_bytes),
+    q8_file_cache_evictions: Number.isFinite(q8Reads.cache_evictions) ? q8Reads.cache_evictions : null,
+    q8_file_cache_evicted_mib: bytesToMiB(q8Reads.cache_evicted_bytes),
+    q8_file_cache_merges: Number.isFinite(q8Reads.cache_merges) ? q8Reads.cache_merges : null,
+    q8_file_cache_merged_mib: bytesToMiB(q8Reads.cache_merged_bytes),
     dense_f32_mib: bytesToMiB(materialization.dense_f32_bytes),
     q8_f32_materialized_mib: bytesToMiB(materialization.q8_0_f32_materialized_bytes),
     q8_retained_block_mib: bytesToMiB(materialization.q8_0_retained_block_bytes),
@@ -221,6 +231,10 @@ function summarizeRuns(runs) {
     avg_q8_file_read_mib: round(avgMemory('q8_file_read_mib')),
     max_q8_file_read_mib: maxMemory('q8_file_read_mib'),
     avg_q8_file_read_calls: round(avgMemory('q8_file_read_calls')),
+    avg_q8_file_cache_hit_mib: round(avgMemory('q8_file_cache_hit_mib')),
+    avg_q8_file_cache_miss_mib: round(avgMemory('q8_file_cache_miss_mib')),
+    avg_q8_file_cache_insert_mib: round(avgMemory('q8_file_cache_insert_mib')),
+    avg_q8_file_cache_evicted_mib: round(avgMemory('q8_file_cache_evicted_mib')),
     avg_wall_ms: round(avg('wall_ms')),
     avg_generate_ms: round(avgGenerate),
     avg_layers_ms: round(avg('layers_ms')),
@@ -466,6 +480,10 @@ function printReport(report) {
   console.log(`avg_q8_file_read_mib=${summary.avg_q8_file_read_mib}`)
   console.log(`max_q8_file_read_mib=${summary.max_q8_file_read_mib}`)
   console.log(`avg_q8_file_read_calls=${summary.avg_q8_file_read_calls}`)
+  console.log(`avg_q8_file_cache_hit_mib=${summary.avg_q8_file_cache_hit_mib}`)
+  console.log(`avg_q8_file_cache_miss_mib=${summary.avg_q8_file_cache_miss_mib}`)
+  console.log(`avg_q8_file_cache_insert_mib=${summary.avg_q8_file_cache_insert_mib}`)
+  console.log(`avg_q8_file_cache_evicted_mib=${summary.avg_q8_file_cache_evicted_mib}`)
   console.log(`avg_wall_ms=${summary.avg_wall_ms}`)
   console.log(`avg_generate_ms=${summary.avg_generate_ms}`)
   console.log(`avg_layers_ms=${summary.avg_layers_ms}`)
@@ -480,7 +498,7 @@ function printReport(report) {
   console.log(`avg_generate_ms_per_prompt_token=${summary.avg_generate_ms_per_prompt_token}`)
   for (const run of report.runs) {
     const forwardMemory = run.forward_memory
-      ? ` q8_read_mib:${run.forward_memory.q8_file_read_mib} peak_rss_mib:${run.forward_memory.peak_rss_mib} peak_phase:${run.forward_memory.peak_phase}`
+      ? ` q8_read_mib:${run.forward_memory.q8_file_read_mib} q8_cache_hit_mib:${run.forward_memory.q8_file_cache_hit_mib} q8_cache_miss_mib:${run.forward_memory.q8_file_cache_miss_mib} q8_cache_evicted_mib:${run.forward_memory.q8_file_cache_evicted_mib} peak_rss_mib:${run.forward_memory.peak_rss_mib} peak_phase:${run.forward_memory.peak_phase}`
       : ''
     console.log(`run_${run.index}=tokens:${run.prompt_token_count} wall:${run.wall_ms}ms generate:${run.generate_ms}ms layers:${run.layers_ms}ms logits:${run.logits_ms}ms ffn:${run.ffn_total_ms}ms attn_proj:${run.attention_projection_ms}ms prompt_cache:${run.prompt_cache_hit}${forwardMemory} token:${JSON.stringify(run.generated_token_ids)} text:${JSON.stringify(run.text)}`)
   }

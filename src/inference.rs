@@ -2119,14 +2119,26 @@ fn trace_forward_memory(phase: &str) {
     let q8_reads = q8_0_file_read_stats();
     let q8_file_read_mib = q8_reads.read_bytes as f64 / (1024.0 * 1024.0);
     let q8_file_cache_hit_mib = q8_reads.cache_hit_bytes as f64 / (1024.0 * 1024.0);
+    let q8_file_cache_miss_mib = q8_reads.cache_miss_bytes as f64 / (1024.0 * 1024.0);
+    let q8_file_cache_insert_mib = q8_reads.cache_insert_bytes as f64 / (1024.0 * 1024.0);
+    let q8_file_cache_evicted_mib = q8_reads.cache_evicted_bytes as f64 / (1024.0 * 1024.0);
+    let q8_file_cache_merged_mib = q8_reads.cache_merged_bytes as f64 / (1024.0 * 1024.0);
     let q8_file_cache_mib = q8_reads.cache_bytes as f64 / (1024.0 * 1024.0);
     let q8_file_cache_capacity_mib = q8_reads.cache_capacity_bytes as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "backendinference_forward_memory_trace phase={phase} rss_kib={rss_kib} free_like_pages={free_like_pages} free_like_mib={free_like_mib} throttled_pages={throttled_pages} q8_file_read_calls={} q8_file_read_bytes={} q8_file_read_mib={q8_file_read_mib:.2} q8_file_cache_hits={} q8_file_cache_hit_bytes={} q8_file_cache_hit_mib={q8_file_cache_hit_mib:.2} q8_file_cache_entries={} q8_file_cache_bytes={} q8_file_cache_mib={q8_file_cache_mib:.2} q8_file_cache_capacity_bytes={} q8_file_cache_capacity_mib={q8_file_cache_capacity_mib:.2}",
+        "backendinference_forward_memory_trace phase={phase} rss_kib={rss_kib} free_like_pages={free_like_pages} free_like_mib={free_like_mib} throttled_pages={throttled_pages} q8_file_read_calls={} q8_file_read_bytes={} q8_file_read_mib={q8_file_read_mib:.2} q8_file_cache_hits={} q8_file_cache_hit_bytes={} q8_file_cache_hit_mib={q8_file_cache_hit_mib:.2} q8_file_cache_misses={} q8_file_cache_miss_bytes={} q8_file_cache_miss_mib={q8_file_cache_miss_mib:.2} q8_file_cache_inserts={} q8_file_cache_insert_bytes={} q8_file_cache_insert_mib={q8_file_cache_insert_mib:.2} q8_file_cache_evictions={} q8_file_cache_evicted_bytes={} q8_file_cache_evicted_mib={q8_file_cache_evicted_mib:.2} q8_file_cache_merges={} q8_file_cache_merged_bytes={} q8_file_cache_merged_mib={q8_file_cache_merged_mib:.2} q8_file_cache_entries={} q8_file_cache_bytes={} q8_file_cache_mib={q8_file_cache_mib:.2} q8_file_cache_capacity_bytes={} q8_file_cache_capacity_mib={q8_file_cache_capacity_mib:.2}",
         q8_reads.read_calls,
         q8_reads.read_bytes,
         q8_reads.cache_hits,
         q8_reads.cache_hit_bytes,
+        q8_reads.cache_misses,
+        q8_reads.cache_miss_bytes,
+        q8_reads.cache_inserts,
+        q8_reads.cache_insert_bytes,
+        q8_reads.cache_evictions,
+        q8_reads.cache_evicted_bytes,
+        q8_reads.cache_merges,
+        q8_reads.cache_merged_bytes,
         q8_reads.cache_entries,
         q8_reads.cache_bytes,
         q8_reads.cache_capacity_bytes
@@ -2390,25 +2402,7 @@ impl LlamaForwardMemoryTimings {
     fn merge_assign(&mut self, other: &Self) {
         self.forward_passes += other.forward_passes;
         self.materialization = other.materialization.clone();
-        self.q8_file_reads.read_calls = self
-            .q8_file_reads
-            .read_calls
-            .saturating_add(other.q8_file_reads.read_calls);
-        self.q8_file_reads.read_bytes = self
-            .q8_file_reads
-            .read_bytes
-            .saturating_add(other.q8_file_reads.read_bytes);
-        self.q8_file_reads.cache_hits = self
-            .q8_file_reads
-            .cache_hits
-            .saturating_add(other.q8_file_reads.cache_hits);
-        self.q8_file_reads.cache_hit_bytes = self
-            .q8_file_reads
-            .cache_hit_bytes
-            .saturating_add(other.q8_file_reads.cache_hit_bytes);
-        self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
-        self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
-        self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
+        add_q8_file_read_stats_delta(&mut self.q8_file_reads, other.q8_file_reads);
         for phase in &other.q8_file_read_phases {
             add_q8_file_read_phase_trace(
                 &mut self.q8_file_read_phases,
@@ -2445,6 +2439,40 @@ fn q8_file_read_stats_has_activity(stats: Q8_0FileReadStats) -> bool {
         || stats.read_bytes > 0
         || stats.cache_hits > 0
         || stats.cache_hit_bytes > 0
+        || stats.cache_misses > 0
+        || stats.cache_miss_bytes > 0
+        || stats.cache_inserts > 0
+        || stats.cache_insert_bytes > 0
+        || stats.cache_evictions > 0
+        || stats.cache_evicted_bytes > 0
+        || stats.cache_merges > 0
+        || stats.cache_merged_bytes > 0
+}
+
+fn add_q8_file_read_stats_delta(target: &mut Q8_0FileReadStats, delta: Q8_0FileReadStats) {
+    target.read_calls = target.read_calls.saturating_add(delta.read_calls);
+    target.read_bytes = target.read_bytes.saturating_add(delta.read_bytes);
+    target.cache_hits = target.cache_hits.saturating_add(delta.cache_hits);
+    target.cache_hit_bytes = target.cache_hit_bytes.saturating_add(delta.cache_hit_bytes);
+    target.cache_misses = target.cache_misses.saturating_add(delta.cache_misses);
+    target.cache_miss_bytes = target
+        .cache_miss_bytes
+        .saturating_add(delta.cache_miss_bytes);
+    target.cache_inserts = target.cache_inserts.saturating_add(delta.cache_inserts);
+    target.cache_insert_bytes = target
+        .cache_insert_bytes
+        .saturating_add(delta.cache_insert_bytes);
+    target.cache_evictions = target.cache_evictions.saturating_add(delta.cache_evictions);
+    target.cache_evicted_bytes = target
+        .cache_evicted_bytes
+        .saturating_add(delta.cache_evicted_bytes);
+    target.cache_merges = target.cache_merges.saturating_add(delta.cache_merges);
+    target.cache_merged_bytes = target
+        .cache_merged_bytes
+        .saturating_add(delta.cache_merged_bytes);
+    target.cache_entries = delta.cache_entries;
+    target.cache_bytes = delta.cache_bytes;
+    target.cache_capacity_bytes = delta.cache_capacity_bytes;
 }
 
 fn add_q8_file_read_phase_trace(
@@ -2453,25 +2481,7 @@ fn add_q8_file_read_phase_trace(
     delta: Q8_0FileReadStats,
 ) {
     if let Some(existing) = phases.iter_mut().find(|entry| entry.phase == phase) {
-        existing.q8_file_reads.read_calls = existing
-            .q8_file_reads
-            .read_calls
-            .saturating_add(delta.read_calls);
-        existing.q8_file_reads.read_bytes = existing
-            .q8_file_reads
-            .read_bytes
-            .saturating_add(delta.read_bytes);
-        existing.q8_file_reads.cache_hits = existing
-            .q8_file_reads
-            .cache_hits
-            .saturating_add(delta.cache_hits);
-        existing.q8_file_reads.cache_hit_bytes = existing
-            .q8_file_reads
-            .cache_hit_bytes
-            .saturating_add(delta.cache_hit_bytes);
-        existing.q8_file_reads.cache_entries = delta.cache_entries;
-        existing.q8_file_reads.cache_bytes = delta.cache_bytes;
-        existing.q8_file_reads.cache_capacity_bytes = delta.cache_capacity_bytes;
+        add_q8_file_read_stats_delta(&mut existing.q8_file_reads, delta);
         return;
     }
     phases.push(LlamaQ8FileReadPhaseTrace {
@@ -2629,25 +2639,7 @@ impl LlamaLayerMemoryTimings {
 
     fn merge_assign(&mut self, other: &Self) {
         self.forward_passes += other.forward_passes;
-        self.q8_file_reads.read_calls = self
-            .q8_file_reads
-            .read_calls
-            .saturating_add(other.q8_file_reads.read_calls);
-        self.q8_file_reads.read_bytes = self
-            .q8_file_reads
-            .read_bytes
-            .saturating_add(other.q8_file_reads.read_bytes);
-        self.q8_file_reads.cache_hits = self
-            .q8_file_reads
-            .cache_hits
-            .saturating_add(other.q8_file_reads.cache_hits);
-        self.q8_file_reads.cache_hit_bytes = self
-            .q8_file_reads
-            .cache_hit_bytes
-            .saturating_add(other.q8_file_reads.cache_hit_bytes);
-        self.q8_file_reads.cache_entries = other.q8_file_reads.cache_entries;
-        self.q8_file_reads.cache_bytes = other.q8_file_reads.cache_bytes;
-        self.q8_file_reads.cache_capacity_bytes = other.q8_file_reads.cache_capacity_bytes;
+        add_q8_file_read_stats_delta(&mut self.q8_file_reads, other.q8_file_reads);
         for phase in &other.q8_file_read_phases {
             add_q8_file_read_phase_trace(
                 &mut self.q8_file_read_phases,
@@ -8185,6 +8177,7 @@ mod tests {
                     cache_entries: 2,
                     cache_bytes: 512,
                     cache_capacity_bytes: 1024,
+                    ..Q8_0FileReadStats::default()
                 },
             });
 
@@ -8212,6 +8205,7 @@ mod tests {
                     cache_entries: 3,
                     cache_bytes: 768,
                     cache_capacity_bytes: 1024,
+                    ..Q8_0FileReadStats::default()
                 },
             });
         first.memory.as_mut().unwrap().q8_file_reads = Q8_0FileReadStats {
@@ -8222,6 +8216,7 @@ mod tests {
             cache_entries: 2,
             cache_bytes: 512,
             cache_capacity_bytes: 1024,
+            ..Q8_0FileReadStats::default()
         };
         second.memory.as_mut().unwrap().q8_file_reads = Q8_0FileReadStats {
             read_calls: 4,
@@ -8231,6 +8226,7 @@ mod tests {
             cache_entries: 3,
             cache_bytes: 768,
             cache_capacity_bytes: 1024,
+            ..Q8_0FileReadStats::default()
         };
 
         first.add_assign(&second);
@@ -8247,6 +8243,7 @@ mod tests {
                 cache_entries: 3,
                 cache_bytes: 768,
                 cache_capacity_bytes: 1024,
+                ..Q8_0FileReadStats::default()
             }
         );
         assert_eq!(memory.peak_rss_kib, Some(140));
@@ -8281,6 +8278,7 @@ mod tests {
             cache_entries: 1,
             cache_bytes: 256,
             cache_capacity_bytes: 512,
+            ..Q8_0FileReadStats::default()
         };
         let mut second = LlamaLayerMemoryTimings::new(3, memory_sample(105, 1, 1));
         second.q8_file_reads = Q8_0FileReadStats {
@@ -8291,6 +8289,7 @@ mod tests {
             cache_entries: 2,
             cache_bytes: 384,
             cache_capacity_bytes: 512,
+            ..Q8_0FileReadStats::default()
         };
         first.q8_file_read_phases.push(LlamaQ8FileReadPhaseTrace {
             phase: "attention_q_done".to_string(),
@@ -8302,6 +8301,7 @@ mod tests {
                 cache_entries: 1,
                 cache_bytes: 256,
                 cache_capacity_bytes: 512,
+                ..Q8_0FileReadStats::default()
             },
         });
         second.q8_file_read_phases.push(LlamaQ8FileReadPhaseTrace {
@@ -8314,6 +8314,7 @@ mod tests {
                 cache_entries: 2,
                 cache_bytes: 384,
                 cache_capacity_bytes: 512,
+                ..Q8_0FileReadStats::default()
             },
         });
         second.q8_file_read_phases.push(LlamaQ8FileReadPhaseTrace {
@@ -8326,6 +8327,7 @@ mod tests {
                 cache_entries: 2,
                 cache_bytes: 384,
                 cache_capacity_bytes: 512,
+                ..Q8_0FileReadStats::default()
             },
         });
 
@@ -8342,6 +8344,7 @@ mod tests {
                 cache_entries: 2,
                 cache_bytes: 384,
                 cache_capacity_bytes: 512,
+                ..Q8_0FileReadStats::default()
             }
         );
         assert_eq!(first.q8_file_read_phases.len(), 2);
