@@ -18,7 +18,7 @@ Camelid's current milestone is not a loose compatibility demo. It is a synchroni
 
 - **Four exact Q8_0 rows are public and evidence-backed.** TinyLlama remains the full current gate; Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B now have verified exact-row support within their validated bounds.
 - **The UI and API fail closed instead of guessing.** Chat unlocks only when the loaded local GGUF is `loaded_now=true`, `generation_ready=true`, and matched to an exact supported `/api/capabilities` row.
-- **The context ladder is explicit.** All four rows have checked bounded 512/1024/2048-context evidence. These checked packs do not imply model-native/larger context, arbitrary-template, production-throughput, portability, or broader-family support.
+- **The context ladder is explicit.** TinyLlama stays at the current gate with bounded 512-context coverage; Llama 3.2 1B/3B and Llama 3 8B have checked bounded 512/1024/2048-context evidence for their exact Q8_0 rows. These checked packs do not imply model-native/larger context, arbitrary-template, production-throughput, portability, or broader-family support.
 
 ![Camelid WebUI chat surface](docs/assets/ui-screenshot-v2.png)
 
