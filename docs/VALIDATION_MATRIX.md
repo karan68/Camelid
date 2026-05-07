@@ -13,6 +13,15 @@ Every public surface should tell the same four-row story:
 - Llama 3 8B Instruct Q8_0 is exact-row smoke-supported through the checked 512 bounded context pack only.
 - Llama 3 8B 1024/2048 remain red unless fresh PASS artifacts and synchronized docs/API/frontend alignment exist; broad/full 8B support still requires model-native/larger context beyond checked packs, arbitrary-template, throughput, and portability evidence.
 
+Next-family public language is locked to planning/validation, not support:
+
+- Mistral 7B Instruct: “In active validation for `Mistral-7B-Instruct-v0.3.Q8_0.gguf`; not supported yet.”
+- Mixtral 8x7B Instruct: “Planned first MoE exact-row candidate for `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`; not supported yet.”
+- Qwen 2.5 7B Instruct: “Planned exact-row candidate for `Qwen2.5-7B-Instruct-Q8_0.gguf`; not supported yet.”
+- Gemma 2 9B Instruct: “Planned exact-row candidate for `gemma-2-9b-it-Q8_0.gguf`; not supported yet.”
+
+First promotion for any of those rows requires row-specific source/SHA/license, tokenizer/template references, bounded load/readiness, parity, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence. Mixtral also needs MoE expert-routing proof or typed unsupported behavior before any runtime claim.
+
 | Change type | Minimum expected checks | Extra checks when relevant | Notes |
 | --- | --- | --- | --- |
 | Docs-only | `git diff --check`<br>`bash scripts/check-public-scrub.sh` | n/a | Keep support language synchronized with `README.md`, `COMPATIBILITY.md`, `STATUS.md`, and UI copy when claims change. |

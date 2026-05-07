@@ -87,7 +87,12 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "mistral" && item["status"] == "planned_exact_row_closure"));
+        .any(|item| item["id"] == "mistral"
+            && item["status"] == "active_validation_unsupported"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("not supported yet")));
     for id in ["mixtral_moe", "qwen25", "gemma2"] {
         assert!(body["planned_model_families"]
             .as_array()
@@ -322,7 +327,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "mistral_7b_instruct_v0_3_q8_0")
         .unwrap();
-    assert_eq!(mistral["status"], "acceptance_target");
+    assert_eq!(mistral["status"], "active_validation_unsupported");
     assert_eq!(mistral["metadata_parses"], "target_selected");
     assert_eq!(mistral["tokenizer_works"], "parity_blocked");
     assert_eq!(mistral["tensors_load"], "ubuntu_load_serve_observed");
