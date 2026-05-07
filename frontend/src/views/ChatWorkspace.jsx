@@ -136,31 +136,31 @@ export default function ChatWorkspace({
     ? 'A calm local chat surface for bounded replies, with the runtime and support contract still visible before every send.'
     : supportBlocked
       ? 'The runtime can see this GGUF, but Camelid keeps chat locked until /api/capabilities names the exact supported model/quant row.'
-      : 'Start with a local GGUF. Chat unlocks only when health, loaded model, and the compatibility contract agree on that exact target.'
+      : 'Load a local model to start chatting. Camelid will enable chat when that model is ready.'
   const readinessFacts = [
     {
       label: 'Runtime',
-      value: selectedModel ? (selectedRuntimeReady ? 'Ready' : 'Waiting') : 'No model',
-      copy: 'Requires active_model_id, loaded_now, and generation_ready.',
+      value: selectedModel ? (selectedRuntimeReady ? 'Ready' : 'Waiting') : 'No model loaded',
+      copy: 'Model must be loaded and ready before chat starts.',
       tone: selectedRuntimeReady ? 'ready' : 'waiting',
     },
     {
       label: 'Contract',
-      value: selectedModelRunnable ? 'Matched' : supportBlocked ? 'Missing exact row' : capabilityGate,
-      copy: selectedModel ? selectedCompatibilityLabel : 'No compatibility inferred before selection.',
+      value: selectedModelRunnable ? 'Matched' : supportBlocked ? 'Needs support row' : capabilityGate,
+      copy: selectedModel ? selectedCompatibilityLabel : 'Select a model to see compatibility.',
       tone: selectedModelRunnable ? 'ready' : supportBlocked ? 'blocked' : 'waiting',
     },
     {
       label: 'Boundary',
-      value: 'Evidence only',
-      copy: 'No filename, saved-path, or neighboring-family optimism.',
+      value: 'Exact model only',
+      copy: 'Support is shown only for the specific model currently loaded.',
       tone: 'neutral',
     },
   ]
   const proofPills = [
-    selectedModelRunnable ? 'Ready for bounded local chat' : 'Chat stays guarded',
-    selectedModel ? selectedModelName : 'Local GGUF required',
-    `${CHAT_DEMO_TOKEN_CAP}-token demo cap`,
+    selectedModelRunnable ? 'Ready to chat' : 'Load a model to begin',
+    selectedModel ? selectedModelName : 'Choose a local model',
+    `Local ${CHAT_DEMO_TOKEN_CAP}-token preview`,
   ]
 
   const renderCapabilityStrip = (stage = false) => (
@@ -256,7 +256,7 @@ export default function ChatWorkspace({
                 <div className="chat-empty-proofbar" aria-label="Current chat guard summary">
                   {proofPills.map((pill) => <span key={pill}>{pill}</span>)}
                 </div>
-                <p className="chat-empty-contract-note">No broad GGUF promise: chat opens only when /v1/health and /api/capabilities agree on the selected exact model.</p>
+                <p className="chat-empty-contract-note">Chat becomes available once the selected local model is loaded and ready.</p>
               </div>
 
               <div className="chat-empty-readiness chat-empty-readiness-ledger" aria-label="Local chat readiness summary">
