@@ -2,13 +2,13 @@
 
 Git head checked locally: `8eb8f033d13d792e52bfe8ee0e484d643b723524` (`Restore README chat screenshot`) on `main`, clean before this note.
 
-Canonical host check: `ubuntu@54.69.75.77` was reachable. I did **not** launch a duplicate long Llama 3 8B 1024/2048 run. The host still had existing backend servers from the earlier normalized-pack sweep, but no new long 8B context validation was started in this slice.
+Canonical validation lane check: the approved Ubuntu lane was reachable. I did **not** launch a duplicate long Llama 3 8B 1024/2048 run. The lane still had existing backend servers from the earlier normalized-pack sweep, but no new long 8B context validation was started in this slice.
 
 ## Existing source-head-bounded sweep evidence
 
-Artifact root on canonical host:
+Artifact root on the validation lane:
 
-`/home/ubuntu/work/Camelid-current-head-normalized-pack-sweep-20260507T155124Z/target/four-row-current-head-normalized-pack-sweep-20260507T155303Z-head-ba9a7a1eff74/`
+`target/four-row-current-head-normalized-pack-sweep-20260507T155303Z-head-ba9a7a1eff74/`
 
 Sweep git head: `ba9a7a1eff7412be91e59a2e921e8bccdd53f430`.
 
