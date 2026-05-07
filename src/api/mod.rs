@@ -712,7 +712,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "Four exact Q8_0 rows: TinyLlama current gate; exact Llama 3.2 1B/3B rows have checked bounded 512/1024/2048-context packs; exact Llama 3 8B has checked bounded 512/1024/2048-context packs. These are exact-row bounded-pack claims only; model-native/larger context, arbitrary-template behavior, throughput, portability, neighboring rows, and broad family support remain unsupported.",
+            current_gate: "Four exact Q8_0 rows: TinyLlama current gate; exact Llama 3.2 1B/3B rows have checked bounded 512/1024/2048-context packs; exact Llama 3 8B has checked bounded 512-context support, while its 1024/2048 bounded packs stay gated on the fresh current-head PASS bundle plus synchronized docs/API/frontend alignment. These are exact-row bounded-pack claims only; model-native/larger context, arbitrary-template behavior, throughput, portability, neighboring rows, and broad family support remain unsupported.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -735,7 +735,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs. These are exact-row bounded-pack claims only, not model-native/larger-context, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Q8_0 rows have checked bounded 512/1024/2048-context packs, and the exact Llama 3 8B Q8_0 row has checked bounded 512-context support with 1024/2048 kept conditional on the fresh current-head PASS bundle plus synchronized docs/API/frontend alignment. These are exact-row bounded-pack claims only, not model-native/larger-context, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support.",
             },
         ],
         planned_quantization: vec![
@@ -759,7 +759,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs. 8B broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only; broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512-context support and conditional 1024/2048 bounded packs tied to the fresh current-head PASS bundle plus synchronized docs/API/frontend alignment. 8B broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only; broad/full support still needs separate proof.",
             },
         ],
         planned_model_families: vec![

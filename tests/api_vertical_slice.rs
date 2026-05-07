@@ -45,7 +45,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Four exact Q8_0 rows: TinyLlama current gate; exact Llama 3.2 1B/3B rows have checked bounded 512/1024/2048-context packs; exact Llama 3 8B has checked bounded 512/1024/2048-context packs. These are exact-row bounded-pack claims only; model-native/larger context, arbitrary-template behavior, throughput, portability, neighboring rows, and broad family support remain unsupported."
+        "Four exact Q8_0 rows: TinyLlama current gate; exact Llama 3.2 1B/3B rows have checked bounded 512/1024/2048-context packs; exact Llama 3 8B has checked bounded 512-context support, while its 1024/2048 bounded packs stay gated on the fresh current-head PASS bundle plus synchronized docs/API/frontend alignment. These are exact-row bounded-pack claims only; model-native/larger context, arbitrary-template behavior, throughput, portability, neighboring rows, and broad family support remain unsupported."
     );
     assert!(body["supported_quantization"]
         .as_array()
