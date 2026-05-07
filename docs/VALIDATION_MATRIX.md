@@ -10,8 +10,8 @@ Every public surface should tell the same four-row story:
 
 - TinyLlama 1.1B Chat Q8_0 is the supported current gate, with checked 512-context/template/RSS evidence.
 - Llama 3.2 1B and 3B Instruct Q8_0 are exact-row smoke-supported through checked 512/1024/2048 bounded context packs.
-- Llama 3 8B Instruct Q8_0 is exact-row smoke-supported through checked 512/1024/2048 bounded context packs where the cited committed PASS bundle applies.
-- Llama 3 8B 1024/2048 are promoted only as exact-row bounded-pack support from the cited PASS bundle; broad/full 8B support still requires model-native/larger context beyond checked packs, arbitrary-template, throughput, and portability evidence.
+- Llama 3 8B Instruct Q8_0 is exact-row smoke-supported through the checked 512 bounded context pack only.
+- Llama 3 8B 1024/2048 remain red unless fresh PASS artifacts and synchronized docs/API/frontend alignment exist; broad/full 8B support still requires model-native/larger context beyond checked packs, arbitrary-template, throughput, and portability evidence.
 
 | Change type | Minimum expected checks | Extra checks when relevant | Notes |
 | --- | --- | --- | --- |
