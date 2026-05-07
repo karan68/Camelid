@@ -949,9 +949,6 @@ fn q8_file_cache_try_merge_entries(
     let merged_offset = left.offset.min(right.offset);
     let merged_end = left_end.max(right_end);
     let merged_len = usize::try_from(merged_end.checked_sub(merged_offset)?).ok()?;
-    if merged_len > capacity {
-        return None;
-    }
 
     let mut merged_bytes = vec![0u8; merged_len];
     let left_start = usize::try_from(left.offset.checked_sub(merged_offset)?).ok()?;
@@ -962,11 +959,55 @@ fn q8_file_cache_try_merge_entries(
     // the behavior deterministic for tests and any future synthetic cache probes.
     merged_bytes[right_start..right_start + right.bytes.len()].copy_from_slice(&right.bytes);
 
-    Some(Q8FileCacheEntry {
+    let merged = Q8FileCacheEntry {
         path: left.path.clone(),
         offset: merged_offset,
         bytes: merged_bytes,
-    })
+    };
+    Some(q8_file_cache_trim_merged_entry_to_capacity(
+        merged,
+        right.offset,
+        right.bytes.len(),
+        capacity,
+    ))
+}
+
+fn q8_file_cache_trim_merged_entry_to_capacity(
+    mut entry: Q8FileCacheEntry,
+    newest_offset: u64,
+    newest_len: usize,
+    capacity: usize,
+) -> Q8FileCacheEntry {
+    if entry.bytes.len() <= capacity {
+        return entry;
+    }
+
+    debug_assert!(newest_len <= capacity);
+    let entry_end = entry.offset + entry.bytes.len() as u64;
+    let newest_end = newest_offset + newest_len as u64;
+    debug_assert!(entry.offset <= newest_offset);
+    debug_assert!(newest_end <= entry_end);
+
+    // Keep a contiguous cache window that retains the newest read. This matters for
+    // sequential Q8 tensor streams where adjacent 32 MiB chunks can coalesce up to
+    // the cache cap: when the next chunk arrives, dropping the whole old coalesced
+    // entry would collapse a 320 MiB tail cache down to one chunk. Trimming preserves
+    // the most recent contiguous window instead, which is the part most likely to be
+    // reused by the next long-prefill chunk.
+    let capacity_u64 = capacity as u64;
+    let max_window_start = entry_end - capacity_u64;
+    let lower_start = entry.offset.max(newest_end.saturating_sub(capacity_u64));
+    let upper_start = newest_offset.min(max_window_start);
+    let window_start = if lower_start <= upper_start {
+        upper_start
+    } else {
+        lower_start.clamp(entry.offset, max_window_start)
+    };
+    let trim_start = (window_start - entry.offset) as usize;
+    let trim_end = trim_start + capacity;
+    entry.bytes = entry.bytes[trim_start..trim_end].to_vec();
+    entry.offset = window_start;
+    entry
 }
 
 impl Q8FileCache {
@@ -1428,6 +1469,34 @@ mod tests {
         assert_eq!(&out, b"efghijkl");
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.cache_hit_bytes, 8);
+        assert_eq!(stats.cache_entries, 1);
+        assert_eq!(stats.cache_bytes, 16);
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn q8_file_cache_trims_coalesced_stream_to_newest_capacity_window() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-trim-window-{}",
+            std::process::id()
+        ));
+        q8_file_cache_insert(path.clone(), 100, b"abcdefgh");
+        q8_file_cache_insert(path.clone(), 108, b"ijklmnop");
+        q8_file_cache_insert(path.clone(), 116, b"qrstuvwx");
+
+        let start = q8_0_file_read_stats();
+        let mut evicted = [0_u8; 8];
+        let mut retained = [0_u8; 16];
+        assert!(!q8_file_cache_get(&path, 100, &mut evicted));
+        assert!(q8_file_cache_get(&path, 108, &mut retained));
+        let stats = q8_0_file_read_stats().saturating_delta_since(start);
+
+        assert_eq!(&retained, b"ijklmnopqrstuvwx");
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_hit_bytes, 16);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 16);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
