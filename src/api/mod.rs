@@ -3496,10 +3496,11 @@ mod tests {
             .iter()
             .find(|target| target.id == "mistral_7b_instruct_v0_3_q8_0")
             .expect("Mistral exact-row bring-up lane should stay advertised");
-        assert_eq!(mistral.status, "acceptance_target");
+        assert_eq!(mistral.status, "active_validation_unsupported");
         assert_eq!(mistral.support_scope, "bringup_exact_row_unsupported");
         assert_eq!(mistral.full_support_status, "blocked_unsupported_bringup");
         assert!(mistral.frontend_readiness_gate.contains("fail-closed"));
+        assert!(mistral.evidence.contains("no Mistral support claim"));
     }
 
     #[test]

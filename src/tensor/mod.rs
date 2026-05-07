@@ -906,6 +906,7 @@ struct Q8FileCacheEntry {
 fn q8_file_cache_get(path: &Path, offset: u64, out: &mut [u8]) -> bool {
     let capacity = q8_file_cache_capacity_bytes();
     if capacity == 0 {
+        q8_file_cache_apply_capacity(0);
         return false;
     }
     let Some(cache) = Q8_FILE_CACHE.get() else {
@@ -954,6 +955,9 @@ fn q8_file_cache_entry_covers(
 fn q8_file_cache_insert(path: PathBuf, offset: u64, bytes: &[u8]) {
     let capacity = q8_file_cache_capacity_bytes();
     if capacity == 0 || bytes.len() > capacity {
+        if capacity == 0 {
+            q8_file_cache_apply_capacity(0);
+        }
         return;
     }
     let cache = Q8_FILE_CACHE.get_or_init(|| Mutex::new(Q8FileCache::default()));
@@ -967,6 +971,15 @@ fn q8_file_cache_capacity_bytes() -> usize {
         .ok()
         .and_then(|value| parse_byte_count(&value))
         .unwrap_or(DEFAULT_Q8_FILE_CACHE_BYTES)
+}
+
+fn q8_file_cache_apply_capacity(capacity: usize) {
+    if let Some(cache) = Q8_FILE_CACHE.get() {
+        cache
+            .lock()
+            .expect("q8 file cache mutex poisoned")
+            .apply_capacity(capacity);
+    }
 }
 
 pub(crate) fn parse_byte_count_env(key: &str) -> Option<usize> {
@@ -1477,6 +1490,30 @@ mod tests {
         assert_eq!(stats.cache_entries, 0);
         assert_eq!(stats.cache_bytes, 0);
         assert_eq!(stats.cache_capacity_bytes, 0);
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn q8_file_cache_zero_capacity_clears_retained_entries_on_use() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-zero-clear-{}",
+            std::process::id()
+        ));
+        q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
+
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        let mut disabled_out = [0_u8; 4];
+        assert!(!q8_file_cache_get(&path, 100, &mut disabled_out));
+
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        let mut stale_out = [0_u8; 16];
+        assert!(!q8_file_cache_get(&path, 100, &mut stale_out));
+        let stats = q8_0_file_read_stats();
+        assert_eq!(stats.cache_entries, 0);
+        assert_eq!(stats.cache_bytes, 0);
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
     }
 
