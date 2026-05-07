@@ -5774,45 +5774,64 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                 quantize_q8_0_rows_into(input, input_width, quantized_input_blocks)?;
             if rows == 1 {
                 let quantized_input = quantized_inputs.row(0);
-                let mut output_idx = 0usize;
-                while output_idx < output_width {
-                    let rows_this_chunk = chunk_rows.min(output_width - output_idx);
-                    let chunk_bytes_len =
-                        row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
-                            BackendError::RuntimeShapeMismatch(
-                                "q8_0 block-reader chunk byte count overflow".to_string(),
-                            )
-                        })?;
-                    let block_start = output_idx * blocks_per_row;
-                    let chunk_offset = reader
-                        .offset
-                        .checked_add((block_start * Q8BlockReader::BLOCK_SIZE_BYTES) as u64)
-                        .ok_or_else(|| {
-                            BackendError::RuntimeShapeMismatch(
-                                "q8_0 block-reader chunk offset overflow".to_string(),
-                            )
-                        })?;
-                    let chunk = &mut row_chunk[..chunk_bytes_len];
-                    backing.read_exact_at_cached(chunk, chunk_offset)?;
-                    let output_chunk = &mut output[output_idx..output_idx + rows_this_chunk];
-                    if should_parallelize_q8_0_file_reader_output(output_width) {
-                        output_chunk
-                            .par_iter_mut()
-                            .zip(chunk.par_chunks_exact(row_bytes_len))
-                            .for_each(|(out_value, row_bytes)| {
-                                *out_value = dot_q8_0_encoded_row(quantized_input, row_bytes);
-                            });
-                    } else {
-                        for (out_value, row_bytes) in output_chunk
-                            .iter_mut()
-                            .zip(chunk.chunks_exact(row_bytes_len))
-                        {
-                            *out_value = dot_q8_0_encoded_row(quantized_input, row_bytes);
+                let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch(
+                        "q8_0 block-reader chunk scale count overflow".to_string(),
+                    )
+                })?;
+                return with_q8_0_file_reader_chunk_scales(chunk_scales_len, |chunk_scales| {
+                    let mut output_idx = 0usize;
+                    while output_idx < output_width {
+                        let rows_this_chunk = chunk_rows.min(output_width - output_idx);
+                        let chunk_bytes_len =
+                            row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
+                                BackendError::RuntimeShapeMismatch(
+                                    "q8_0 block-reader chunk byte count overflow".to_string(),
+                                )
+                            })?;
+                        let block_start = output_idx * blocks_per_row;
+                        let chunk_offset = reader
+                            .offset
+                            .checked_add((block_start * Q8BlockReader::BLOCK_SIZE_BYTES) as u64)
+                            .ok_or_else(|| {
+                                BackendError::RuntimeShapeMismatch(
+                                    "q8_0 block-reader chunk offset overflow".to_string(),
+                                )
+                            })?;
+                        let chunk = &mut row_chunk[..chunk_bytes_len];
+                        backing.read_exact_at_cached(chunk, chunk_offset)?;
+                        let scales = &mut chunk_scales[..rows_this_chunk * blocks_per_row];
+                        decode_q8_0_encoded_row_scales(chunk, scales);
+                        let output_chunk = &mut output[output_idx..output_idx + rows_this_chunk];
+                        if should_parallelize_q8_0_file_reader_output(output_width) {
+                            output_chunk
+                                .par_iter_mut()
+                                .zip(chunk.par_chunks_exact(row_bytes_len))
+                                .zip(scales.par_chunks_exact(blocks_per_row))
+                                .for_each(|((out_value, row_bytes), row_scales)| {
+                                    *out_value = dot_q8_0_encoded_row_with_scales(
+                                        quantized_input,
+                                        row_bytes,
+                                        row_scales,
+                                    );
+                                });
+                        } else {
+                            for ((out_value, row_bytes), row_scales) in output_chunk
+                                .iter_mut()
+                                .zip(chunk.chunks_exact(row_bytes_len))
+                                .zip(scales.chunks_exact(blocks_per_row))
+                            {
+                                *out_value = dot_q8_0_encoded_row_with_scales(
+                                    quantized_input,
+                                    row_bytes,
+                                    row_scales,
+                                );
+                            }
                         }
+                        output_idx += rows_this_chunk;
                     }
-                    output_idx += rows_this_chunk;
-                }
-                return Ok(());
+                    Ok(())
+                });
             }
 
             let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
@@ -6206,45 +6225,64 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
             quantized_input_blocks.reserve(blocks_per_row);
             quantize_q8_0_blocks_into(input_row, quantized_input_blocks);
             let quantized_input = quantized_input_blocks.as_slice();
-            let mut output_start = 0usize;
-            while output_start < output_width {
-                let rows_this_chunk = chunk_rows.min(output_width - output_start);
-                let chunk_bytes_len =
-                    row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
-                        BackendError::RuntimeShapeMismatch(
-                            "q8_0 borrowed block-reader chunk byte count overflow".to_string(),
-                        )
-                    })?;
-                let chunk_offset = backing
-                    .absolute_offset
-                    .checked_add((output_start * row_bytes_len) as u64)
-                    .ok_or_else(|| {
-                        BackendError::RuntimeShapeMismatch(
-                            "q8_0 borrowed block-reader chunk offset overflow".to_string(),
-                        )
-                    })?;
-                let chunk = &mut row_chunk[..chunk_bytes_len];
-                backing.read_exact_at_cached(chunk, chunk_offset)?;
-                let output_end = output_start + rows_this_chunk;
-                let output_chunk = &mut output[output_start..output_end];
-                if should_parallelize_q8_0_file_reader_output(output_width) {
-                    output_chunk
-                        .par_iter_mut()
-                        .zip(chunk.par_chunks_exact(row_bytes_len))
-                        .for_each(|(out_value, row_bytes)| {
-                            *out_value = dot_q8_0_encoded_row(quantized_input, row_bytes);
-                        });
-                } else {
-                    for (out_value, row_bytes) in output_chunk
-                        .iter_mut()
-                        .zip(chunk.chunks_exact(row_bytes_len))
-                    {
-                        *out_value = dot_q8_0_encoded_row(quantized_input, row_bytes);
+            let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "q8_0 borrowed block-reader chunk scale count overflow".to_string(),
+                )
+            })?;
+            with_q8_0_file_reader_chunk_scales(chunk_scales_len, |chunk_scales| {
+                let mut output_start = 0usize;
+                while output_start < output_width {
+                    let rows_this_chunk = chunk_rows.min(output_width - output_start);
+                    let chunk_bytes_len =
+                        row_bytes_len.checked_mul(rows_this_chunk).ok_or_else(|| {
+                            BackendError::RuntimeShapeMismatch(
+                                "q8_0 borrowed block-reader chunk byte count overflow".to_string(),
+                            )
+                        })?;
+                    let chunk_offset = backing
+                        .absolute_offset
+                        .checked_add((output_start * row_bytes_len) as u64)
+                        .ok_or_else(|| {
+                            BackendError::RuntimeShapeMismatch(
+                                "q8_0 borrowed block-reader chunk offset overflow".to_string(),
+                            )
+                        })?;
+                    let chunk = &mut row_chunk[..chunk_bytes_len];
+                    backing.read_exact_at_cached(chunk, chunk_offset)?;
+                    let scales = &mut chunk_scales[..rows_this_chunk * blocks_per_row];
+                    decode_q8_0_encoded_row_scales(chunk, scales);
+                    let output_end = output_start + rows_this_chunk;
+                    let output_chunk = &mut output[output_start..output_end];
+                    if should_parallelize_q8_0_file_reader_output(output_width) {
+                        output_chunk
+                            .par_iter_mut()
+                            .zip(chunk.par_chunks_exact(row_bytes_len))
+                            .zip(scales.par_chunks_exact(blocks_per_row))
+                            .for_each(|((out_value, row_bytes), row_scales)| {
+                                *out_value = dot_q8_0_encoded_row_with_scales(
+                                    quantized_input,
+                                    row_bytes,
+                                    row_scales,
+                                );
+                            });
+                    } else {
+                        for ((out_value, row_bytes), row_scales) in output_chunk
+                            .iter_mut()
+                            .zip(chunk.chunks_exact(row_bytes_len))
+                            .zip(scales.chunks_exact(blocks_per_row))
+                        {
+                            *out_value = dot_q8_0_encoded_row_with_scales(
+                                quantized_input,
+                                row_bytes,
+                                row_scales,
+                            );
+                        }
                     }
+                    output_start += rows_this_chunk;
                 }
-                output_start += rows_this_chunk;
-            }
-            Ok(())
+                Ok(())
+            })
         })
     })
 }
