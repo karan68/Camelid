@@ -171,6 +171,7 @@ impl Q8_0FileBacking {
         let reused_scales = self.read_exact_at_cached_impl(out, offset, Some(&mut *scales))?;
         if !reused_scales {
             decode_q8_0_scales_from_bytes(out, scales);
+            q8_file_cache_store_decoded_scales(&self.path, offset, scales);
         }
         Ok(reused_scales)
     }
@@ -1204,6 +1205,63 @@ fn q8_file_cache_copy_decoded_scales(
     out_scales[out_scale_start..out_scale_end]
         .copy_from_slice(&entry_scales[entry_scale_start..entry_scale_end]);
     true
+}
+
+fn q8_file_cache_store_decoded_scales(path: &Path, offset: u64, scales: &[f32]) {
+    let Some(byte_len) = scales.len().checked_mul(Q8_0_BLOCK_BYTES) else {
+        return;
+    };
+    let capacity = q8_file_cache_capacity_bytes();
+    if capacity == 0 {
+        q8_file_cache_apply_capacity(0);
+        return;
+    }
+    let Some(cache) = Q8_FILE_CACHE.get() else {
+        return;
+    };
+
+    let mut cache = cache.lock().expect("q8 file cache mutex poisoned");
+    cache.apply_capacity(capacity);
+    let Some(entry) = cache
+        .entries
+        .iter_mut()
+        .rev()
+        .find(|entry| q8_file_cache_entry_covers(entry, path, offset, byte_len))
+    else {
+        return;
+    };
+    if entry.path != path || !entry.bytes.len().is_multiple_of(Q8_0_BLOCK_BYTES) {
+        return;
+    }
+    let Some(relative_start) = offset.checked_sub(entry.offset) else {
+        return;
+    };
+    let Ok(relative_start) = usize::try_from(relative_start) else {
+        return;
+    };
+    if relative_start % Q8_0_BLOCK_BYTES != 0 {
+        return;
+    }
+    let scale_start = relative_start / Q8_0_BLOCK_BYTES;
+    let Some(scale_end) = scale_start.checked_add(scales.len()) else {
+        return;
+    };
+    let entry_scale_len = entry.bytes.len() / Q8_0_BLOCK_BYTES;
+    if scale_end > entry_scale_len {
+        return;
+    }
+    if entry
+        .decoded_q8_0_scales
+        .as_ref()
+        .is_none_or(|entry_scales| entry_scales.len() != entry_scale_len)
+    {
+        let mut decoded_scales = vec![0.0_f32; entry_scale_len];
+        decode_q8_0_scales_from_bytes(&entry.bytes, &mut decoded_scales);
+        entry.decoded_q8_0_scales = Some(decoded_scales);
+    }
+    if let Some(entry_scales) = entry.decoded_q8_0_scales.as_mut() {
+        entry_scales[scale_start..scale_end].copy_from_slice(scales);
+    }
 }
 
 fn q8_file_cache_merge_decoded_scales(
@@ -2282,6 +2340,68 @@ mod tests {
 
         assert!(second_reused);
         assert_eq!(second, bytes);
+        assert_eq!(second_scales, vec![1.0, 2.0]);
+        assert_eq!(second_stats.read_calls, 0);
+        assert_eq!(second_stats.read_bytes, 0);
+        assert_eq!(second_stats.cache_hits, 1);
+        assert_eq!(second_stats.cache_hit_bytes, (Q8_0_BLOCK_BYTES * 2) as u64);
+
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q8_file_cache_promotes_decoded_scales_after_byte_only_hit() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "128");
+        let _ = q8_0_file_read_stats();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-scale-upgrade-{}",
+            std::process::id()
+        ));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x3c00_u16.to_le_bytes());
+        bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+        bytes.extend_from_slice(&0x4000_u16.to_le_bytes());
+        bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+        std::fs::write(&path, &bytes).unwrap();
+        let backing = Q8_0FileBacking::new(path.clone(), 0, 2);
+
+        let start = q8_0_file_read_stats();
+        let mut byte_only_seed = vec![0_u8; Q8_0_BLOCK_BYTES * 2];
+        backing
+            .read_exact_at_cached(&mut byte_only_seed, 0)
+            .unwrap();
+        let seed_stats = q8_0_file_read_stats().saturating_delta_since(start);
+        assert_eq!(byte_only_seed, bytes);
+        assert_eq!(seed_stats.read_calls, 1);
+        assert_eq!(seed_stats.cache_misses, 1);
+
+        let after_seed = q8_0_file_read_stats();
+        let mut first_scale_hit = vec![0_u8; Q8_0_BLOCK_BYTES * 2];
+        let mut first_scales = vec![-1.0_f32; 2];
+        let first_reused = backing
+            .read_exact_at_cached_with_q8_0_scales(&mut first_scale_hit, 0, &mut first_scales)
+            .unwrap();
+        let first_stats = q8_0_file_read_stats().saturating_delta_since(after_seed);
+        assert!(!first_reused);
+        assert_eq!(first_scale_hit, bytes);
+        assert_eq!(first_scales, vec![1.0, 2.0]);
+        assert_eq!(first_stats.read_calls, 0);
+        assert_eq!(first_stats.read_bytes, 0);
+        assert_eq!(first_stats.cache_hits, 1);
+        assert_eq!(first_stats.cache_hit_bytes, (Q8_0_BLOCK_BYTES * 2) as u64);
+
+        let after_upgrade = q8_0_file_read_stats();
+        let mut second_scale_hit = vec![0_u8; Q8_0_BLOCK_BYTES * 2];
+        let mut second_scales = vec![-1.0_f32; 2];
+        let second_reused = backing
+            .read_exact_at_cached_with_q8_0_scales(&mut second_scale_hit, 0, &mut second_scales)
+            .unwrap();
+        let second_stats = q8_0_file_read_stats().saturating_delta_since(after_upgrade);
+        assert!(second_reused);
+        assert_eq!(second_scale_hit, bytes);
         assert_eq!(second_scales, vec![1.0, 2.0]);
         assert_eq!(second_stats.read_calls, 0);
         assert_eq!(second_stats.read_bytes, 0);
