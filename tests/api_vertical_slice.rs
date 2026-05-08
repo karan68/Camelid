@@ -83,16 +83,26 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(llama_bpe_notes.contains("broader 50-token"));
     assert!(!llama_bpe_notes.contains("conditional"));
     assert!(!llama_bpe_notes.contains("gated"));
+    assert!(body["supported_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "mistral_exact_7b_v0_3_q8_0"
+            && item["status"] == "supported_exact_row_smoke_lane"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("checked bounded 512/1024/2048-context packs")));
     assert!(body["planned_model_families"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "mistral"
-            && item["status"] == "active_validation_unsupported"
+        .any(|item| item["id"] == "mistral_family_broader"
+            && item["status"] == "planned_unsupported"
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("not supported yet")));
+                .contains("Mistral-family support")));
     for id in ["mixtral_moe", "qwen25", "gemma2"] {
         assert!(body["planned_model_families"]
             .as_array()
@@ -332,40 +342,66 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "mistral_7b_instruct_v0_3_q8_0")
         .unwrap();
-    assert_eq!(mistral["status"], "active_validation_unsupported");
-    assert_eq!(mistral["metadata_parses"], "target_selected");
-    assert_eq!(mistral["tokenizer_works"], "parity_blocked");
-    assert_eq!(mistral["tensors_load"], "ubuntu_load_serve_observed");
-    assert_eq!(mistral["generation_runs"], "not_promoted");
+    assert_eq!(mistral["status"], "supported_exact_row_smoke");
+    assert_eq!(mistral["support_scope"], "exact_row_smoke_only");
+    assert_eq!(
+        mistral["full_support_status"],
+        "blocked_pending_normalized_full_support"
+    );
+    assert_eq!(mistral["metadata_parses"], "validated_exact_row_sha");
+    assert_eq!(
+        mistral["tokenizer_works"],
+        "validated_for_mistral_instruct_v0_3_reference_pack"
+    );
+    assert_eq!(mistral["tensors_load"], "validated");
+    assert_eq!(
+        mistral["generation_runs"],
+        "api_completion_and_chat_smoke_validated"
+    );
     assert_eq!(
         mistral["frontend_load_path_verified"],
-        "fail_closed_planned"
+        "validated_by_capability_gate_smoke"
     );
-    assert_eq!(mistral["tested_context"], "pre_generation_readiness_only");
     assert_eq!(
-        mistral["chat_template_renderer"],
-        "mistral_instruct_v0_3_planned"
+        mistral["tested_context"],
+        "first_token_api_smoke_plus_checked_512_1024_2048_context_packs"
     );
-    assert_eq!(mistral["chat_template_shape_pack"], "not_started");
+    assert_eq!(mistral["chat_template_renderer"], "mistral_instruct_v0_3");
+    assert_eq!(mistral["chat_template_shape_pack"], "not_promoted");
     assert_eq!(
         mistral["chat_template_shape_pack_id"],
         "mistral-instruct-v0.3-chat-template-pack-v1"
     );
-    assert_eq!(mistral["bounded_context_512_pack"], "not_started");
+    assert_eq!(mistral["bounded_context_512_pack"], "validated_first_pack");
     assert_eq!(
         mistral["bounded_context_512_pack_id"],
         "mistral-context-512-smoke-v1"
     );
-    assert_eq!(mistral["latest_checked_bucket"], "ubuntu_load_serve_only");
     assert_eq!(
-        mistral["latest_checked_result"],
-        "blocked_on_tokenizer_template_parity"
+        mistral["bounded_context_1024_pack"],
+        "validated_second_pack"
     );
+    assert_eq!(
+        mistral["bounded_context_1024_pack_id"],
+        "mistral-context-1024-smoke-v1"
+    );
+    assert_eq!(mistral["bounded_context_2048_pack"], "validated_third_pack");
+    assert_eq!(
+        mistral["bounded_context_2048_pack_id"],
+        "mistral-context-2048-smoke-v1"
+    );
+    assert_eq!(
+        mistral["latest_checked_bucket"],
+        "mistral-context-2048-smoke-v1"
+    );
+    assert_eq!(mistral["latest_checked_result"], "pass");
+    assert_eq!(mistral["latest_checked_output"], " The repeat marker is \"");
     let mistral_evidence = mistral["evidence"].as_str().unwrap();
-    assert!(mistral_evidence.contains("Mistral-7B-Instruct-v0.3.Q8_0.gguf"));
+    assert!(mistral_evidence.contains("checked bounded 512/1024/2048-context packs"));
+    assert!(mistral_evidence.contains("no Mistral-family"));
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
-    assert!(mistral_next_step.contains("1-token generation parity"));
-    assert!(mistral_next_step.contains("before any generation, API, or WebUI support claim"));
+    assert!(mistral_next_step.contains("50-token parity"));
+    assert!(mistral_next_step.contains("before any wider Mistral claim"));
     for (id, filename) in [
         (
             "mixtral_8x7b_instruct_v0_1_q8_0",

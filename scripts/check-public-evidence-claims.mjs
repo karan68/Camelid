@@ -51,6 +51,11 @@ async function validateBundle(manifestPath) {
     validateLlama3_8bContext1024And2048(bundleRel, manifest)
   }
 
+  if (schema === 'camelid.mistral_7b_context_512_1024_2048_current_head_public_evidence.v1') {
+    if (!summaryExists) fail(bundleRel, 'Mistral 7B context-512/1024/2048 bundle must include summary.json')
+    validateMistral7bContext51210242048(bundleRel, manifest)
+  }
+
   const singleRowContext = singleRowContextSchema(schema)
   if (singleRowContext) validateSingleRowContextBundle(bundleRel, manifest, singleRowContext)
 
@@ -195,6 +200,80 @@ function validateLlama3_8bContext1024And2048(bundleRel, manifest) {
     promptId: 'roughly-2048-token-recall',
   })
   validateContextText(bundleRel, 'llama3_8b_instruct_q8_0 context-2048', manifest.rows[1], 'CMLD-204')
+}
+
+function validateMistral7bContext51210242048(bundleRel, manifest) {
+  if (manifest.passed !== true) fail(bundleRel, 'Mistral 7B context-512/1024/2048 manifest must be passed=true')
+  if (!boundaryIsNarrow(manifest.claim_boundary)) {
+    fail(bundleRel, 'Mistral 7B context-512/1024/2048 claim_boundary must explicitly avoid broader/full-family promotion')
+  }
+  validateChecksObject(bundleRel, 'manifest.checks', manifest.checks, [
+    'prompt_tokens_all_match',
+    'generated_tokens_all_match',
+    'generated_text_all_match',
+    'api_health_loaded_generation_ready',
+    'v1_completions_passed',
+    'v1_chat_completions_passed',
+    'privacy_scrub_required',
+  ])
+  const expectedPackIds = ['mistral-context-512-smoke-v1', 'mistral-context-1024-smoke-v1', 'mistral-context-2048-smoke-v1']
+  const expectedSourcePacks = ['qa/prompt-packs/mistral-context-512-smoke.json', 'qa/prompt-packs/mistral-context-1024-smoke.json', 'qa/prompt-packs/mistral-context-2048-smoke.json']
+  if (manifest.pack !== undefined) {
+    if (manifest.pack?.max_tokens !== 5) fail(bundleRel, 'Mistral 7B context-512/1024/2048 pack max_tokens must be 5')
+    if (JSON.stringify(manifest.pack?.ids) !== JSON.stringify(expectedPackIds)) {
+      fail(bundleRel, `Mistral 7B context-512/1024/2048 pack ids changed: ${JSON.stringify(manifest.pack?.ids)}`)
+    }
+    if (JSON.stringify(manifest.pack?.source_prompt_packs) !== JSON.stringify(expectedSourcePacks)) {
+      fail(bundleRel, `Mistral 7B context-512/1024/2048 source_prompt_packs changed: ${JSON.stringify(manifest.pack?.source_prompt_packs)}`)
+    }
+  }
+  if (!Array.isArray(manifest.rows) || manifest.rows.length !== 3) {
+    fail(bundleRel, 'Mistral 7B context-512/1024/2048 manifest must include exactly three rows')
+    return
+  }
+  const expectedByWindow = new Map([
+    [512, { promptId: 'mistral-roughly-512-token-recall', minPromptTokens: 257 }],
+    [1024, { promptId: 'mistral-roughly-1024-token-recall', minPromptTokens: 513 }],
+    [2048, { promptId: 'mistral-roughly-2048-token-recall', minPromptTokens: 1025 }],
+  ])
+  const seen = new Set()
+  for (const row of manifest.rows) {
+    const expected = expectedByWindow.get(row?.context_window)
+    if (!expected) {
+      fail(bundleRel, `unexpected Mistral context_window ${JSON.stringify(row?.context_window)}`)
+      continue
+    }
+    seen.add(row.context_window)
+    validateMistralContextRow(bundleRel, row, expected)
+  }
+  for (const window of expectedByWindow.keys()) {
+    if (!seen.has(window)) fail(bundleRel, `missing Mistral context_window ${window}`)
+  }
+}
+
+function validateMistralContextRow(bundleRel, row, expected) {
+  const rowId = row?.row_id || '<missing row_id>'
+  if (rowId !== 'mistral_7b_instruct_v0_3_q8_0') fail(bundleRel, `row_id must be mistral_7b_instruct_v0_3_q8_0, got ${rowId}`)
+  if (row.max_tokens !== 5) fail(bundleRel, `${rowId} max_tokens must be 5`)
+  if (row.prompt_id !== expected.promptId) fail(bundleRel, `${rowId} prompt_id must be ${expected.promptId}`)
+  if (row.generated_text !== ' The repeat marker is "') fail(bundleRel, `${rowId} generated_text must stay ${JSON.stringify(' The repeat marker is "')}, got ${JSON.stringify(row.generated_text)}`)
+  if (row.llama_text !== ' The repeat marker is "') fail(bundleRel, `${rowId} llama_text must stay ${JSON.stringify(' The repeat marker is "')}, got ${JSON.stringify(row.llama_text)}`)
+  if (row.passed !== undefined && row.passed !== true) fail(bundleRel, `${rowId} passed must be true`)
+  if (row.prompt_tokens_match !== true) fail(bundleRel, `${rowId} prompt_tokens_match must be true`)
+  if (row.generated_tokens_match !== true) fail(bundleRel, `${rowId} generated_tokens_match must be true`)
+  if (row.generated_text_match !== true) fail(bundleRel, `${rowId} generated_text_match must be true`)
+  if (row.first_generated_token_diff_index !== -1) fail(bundleRel, `${rowId} first_generated_token_diff_index must be -1`)
+  if (!Number.isInteger(row.reference_prompt_token_count) || row.reference_prompt_token_count < expected.minPromptTokens) {
+    fail(bundleRel, `${rowId} reference_prompt_token_count must be at least ${expected.minPromptTokens}`)
+  }
+  if (JSON.stringify(row.backend_generated_tokens) !== JSON.stringify([1183, 14518, 19612, 1117, 1113])) {
+    fail(bundleRel, `${rowId} backend_generated_tokens must stay [1183,14518,19612,1117,1113]`)
+  }
+  if (JSON.stringify(row.llama_generated_tokens) !== JSON.stringify([1183, 14518, 19612, 1117, 1113])) {
+    fail(bundleRel, `${rowId} llama_generated_tokens must stay [1183,14518,19612,1117,1113]`)
+  }
+  if (typeof row.model_sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(row.model_sha256)) fail(bundleRel, `${rowId} model_sha256 must be a 64-character lowercase sha256`)
+  if (typeof row.raw_artifact !== 'string' || row.raw_artifact.startsWith('/') || row.raw_artifact.includes('..')) fail(bundleRel, `${rowId} raw_artifact must be a safe relative path`)
 }
 
 function validateContextText(bundleRel, label, row, expected) {
@@ -365,7 +444,7 @@ function validateChecksObject(bundleRel, label, checks, requiredKeys) {
 
 function boundaryIsNarrow(boundary) {
   if (typeof boundary !== 'string') return false
-  return /does not promote/i.test(boundary) && /full Llama-family support/i.test(boundary)
+  return /does not promote/i.test(boundary) && (/full Llama-family support/i.test(boundary) || /Mistral-family support/i.test(boundary) || /full support/i.test(boundary))
 }
 
 function compareRowField(bundleRel, rowId, manifestRow, summaryRow, field) {

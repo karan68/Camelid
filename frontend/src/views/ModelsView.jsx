@@ -639,7 +639,7 @@ export default function ModelsView({
               <p className="panel-kicker">Exact-row full-support hardening</p>
               <h3>Current Q8 support rows</h3>
             </div>
-            <p className="model-summary">These cards mirror the four current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, while the stricter full-support bar stays visible; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
+            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, while the stricter full-support bar stays visible; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
           </div>
 
           <div className="models-card-grid">
@@ -703,6 +703,10 @@ export default function ModelsView({
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B first 512-context pack passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B 1024/2048 bounded packs passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B compact template-shapes pack passed</div>}
+                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral tokenizer/template parity passed</div>}
+                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral first-token parity passed</div>}
+                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral API/chat smoke passed</div>}
+                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral 512/1024/2048 bounded packs passed</div>}
                     {match.active && <div className="pin-badge ready">Loaded exact-row match</div>}
                     {!match.active && match.selected && <div className="pin-badge">Selected exact-row match</div>}
                   </div>
