@@ -4,7 +4,7 @@ Scope: diagnostic telemetry only. This does not promote 8B long-context support,
 
 Change:
 
-- `BACKENDINFERENCE_FORWARD_MEMORY_TRACE=1` stderr lines now include Q8_0 file-cache hit counts/bytes plus cache occupancy/capacity fields alongside existing Q8_0 read counts/bytes.
+- `CAMELID_FORWARD_MEMORY_TRACE=1` stderr lines now include Q8_0 file-cache hit counts/bytes plus cache occupancy/capacity fields alongside existing Q8_0 read counts/bytes.
 - Structured JSON timings already carried `cache_hit_bytes`; this makes long-running stderr traces self-contained when a diagnostic run times out before a full report is emitted.
 - The file-backed Q8_0 row-reader now decodes weight-block scales once per loaded chunk for single-row matmuls too, instead of decoding the same fp16 scale inside each dot-product loop. The multi-row prefill path already used this pattern; this extends the same low-risk hot-path cleanup to single-token/file-backed projections.
 
@@ -21,7 +21,7 @@ Local gates:
 
 Follow-up local instrumentation slice:
 
-- `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION=1` now adds optional structured per-layer/per-prefill-chunk attribution to forward memory timings for the layer-major prefill schedule.
+- `CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION=1` now adds optional structured per-layer/per-prefill-chunk attribution to forward memory timings for the layer-major prefill schedule.
 - Each attribution record carries layer index, chunk start/rows/base position, hidden/next-hidden/chunk-input byte sizes, KV-cache allocated bytes before/after, Q8_0 file-read deltas, and the existing per-layer chunk timings.
 - The flag also enables structured forward-memory output when no broader RSS/trace flag is enabled, so a diagnostic run can request only this attribution without changing public API/support claims.
 - Focused coverage asserts the attribution serializes and keeps chunked/layer-major prefill output, logits, hidden state, and KV cache equal to the sequential path.

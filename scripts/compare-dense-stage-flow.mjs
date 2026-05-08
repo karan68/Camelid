@@ -47,9 +47,9 @@ function parseArgs(argv) {
 
 function loadCapture(path) {
   const raw = JSON.parse(fs.readFileSync(path, 'utf8'))
-  const root = raw.backendinference || raw.backend_chat?.backendinference || raw
+  const root = raw.camelid || raw.backend_chat?.camelid || raw
   const dense = root.dense
-  if (!dense || typeof dense !== 'object') throw new Error(`${path}: missing backendinference.dense diagnostics; rerun with backendinference_dense_diagnostics=true`)
+  if (!dense || typeof dense !== 'object') throw new Error(`${path}: missing camelid.dense diagnostics; rerun with camelid_dense_diagnostics=true`)
   return { path, raw, root, dense }
 }
 

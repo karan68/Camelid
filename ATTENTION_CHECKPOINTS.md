@@ -3,11 +3,11 @@
 > [!NOTE]
 > This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
 
-`backendinference.attention-checkpoints.v1` is a narrow parity schema for comparing Camelid attention internals against a future independently instrumented known-good CPU trace. It intentionally stores compact samples and summary statistics, not full tensors.
+`camelid.attention-checkpoints.v1` is a narrow parity schema for comparing Camelid attention internals against a future independently instrumented known-good CPU trace. It intentionally stores compact samples and summary statistics, not full tensors.
 
 ## Capture from Camelid diagnostics
 
-Start from a chat parity diagnostics JSON that includes `backendinference.dense.layers[*]`, then extract the focused layers:
+Start from a chat parity diagnostics JSON that includes `camelid.dense.layers[*]`, then extract the focused layers:
 
 ```bash
 node scripts/extract-attention-checkpoints.mjs \

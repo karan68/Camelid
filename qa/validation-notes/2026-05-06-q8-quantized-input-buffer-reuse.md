@@ -28,6 +28,6 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh clippy -q --all-targets -- -D warnings`
 - `./scripts/with-rustup-cargo.sh test -q`
 - `bash scripts/check-public-scrub.sh`
-- `./scripts/with-rustup-cargo.sh build -q --release --bin backendinference`
+- `./scripts/with-rustup-cargo.sh build -q --release --bin camelid`
 
 Claim boundary: performance/diagnostic-only. Exact supported generation remains TinyLlama, Llama 3.2 1B/3B bounded 2048, and Llama 3 8B bounded 512; 8B 1024/2048 remain red/diagnostic until current-head artifacts are reviewed and support surfaces are deliberately aligned.

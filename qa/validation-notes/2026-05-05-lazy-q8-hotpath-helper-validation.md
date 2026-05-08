@@ -9,7 +9,7 @@ Result: PASS.
 Validated steps:
 
 - clean public clone with dirty tree `false`
-- release `backendinference` build via the pinned Rust wrapper
+- release `camelid` build via the pinned Rust wrapper
 - helper execution with `--skip-build --repeats 20 --warmup 3`
 - sanitized `manifest.json`, per-tensor JSON, and `SHA256SUMS` generation
 - exact model SHA256 `583c616da14b82930f887f991ab446711da0b029166200b67892d7c9f8f45958`

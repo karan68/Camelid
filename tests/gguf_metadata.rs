@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use backendinference::gguf::{read_metadata, GgufMetadataValue, GgufTensorType};
+use camelid::gguf::{read_metadata, GgufMetadataValue, GgufTensorType};
 
 #[test]
 fn parses_minimal_gguf_metadata_and_tensor_directory() {

@@ -8,7 +8,7 @@ import { dirname, resolve } from 'node:path'
 import { renderExpectedPrompt, resolveReferenceContext } from './lib/chat-parity-harness.mjs'
 
 const args = parseArgs(process.argv.slice(2))
-const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const backendBase = (args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.LLAMA3_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.LLAMA3_GGUF || '$CAMELID_MODEL_DIR/Llama-3.2-1B-Instruct-Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.LLAMA3_MODEL_ID || 'llama3-small-q8'
@@ -115,14 +115,14 @@ try {
     method: 'POST',
     body: JSON.stringify({
       ...chatPayload,
-      backendinference_logit_token_ids: diagnosticTokenIds,
-      ...(collectBackendDenseDiagnostics ? { backendinference_dense_diagnostics: true } : {}),
+      camelid_logit_token_ids: diagnosticTokenIds,
+      ...(collectBackendDenseDiagnostics ? { camelid_dense_diagnostics: true } : {}),
     }),
   })
 
-  const backendPromptTokens = backendChat.backendinference?.prompt_token_ids || []
-  const backendGeneratedTokens = backendChat.backendinference?.generated_token_ids || []
-  const backendTopLogits = backendChat.backendinference?.top_logits || []
+  const backendPromptTokens = backendChat.camelid?.prompt_token_ids || []
+  const backendGeneratedTokens = backendChat.camelid?.generated_token_ids || []
+  const backendTopLogits = backendChat.camelid?.top_logits || []
   const promptMatch = JSON.stringify(backendPromptTokens) === JSON.stringify(referencePromptTokens)
   const generatedTokensMatch = JSON.stringify(backendGeneratedTokens) === JSON.stringify(llamaGeneratedTokens)
   const backendText = backendChat.choices?.[0]?.message?.content ?? ''
@@ -164,7 +164,7 @@ try {
     llama_text: llamaText,
     backend_usage: backendChat.usage,
     llama_usage: llamaCompletion.timings,
-    backendinference: backendChat.backendinference,
+    camelid: backendChat.camelid,
   }
 
   console.log(`backend=${backendBase}`)

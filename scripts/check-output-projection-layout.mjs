@@ -73,7 +73,7 @@ if (tensor) {
 
 const ok = checks.every(item => item.ok)
 const report = {
-  object: 'backendinference.output_projection_layout_check',
+  object: 'camelid.output_projection_layout_check',
   tensor_dump: tensorDumpPath,
   hidden,
   vocab,

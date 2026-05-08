@@ -9,7 +9,7 @@ Result: PASS.
 Validated steps:
 
 - clean public checkout with dirty tree `false`
-- release `backendinference` build via the pinned Rust wrapper
+- release `camelid` build via the pinned Rust wrapper
 - `scripts/bench-unique-chat.mjs` with `--warmup 2 --repeats 4 --max-tokens 5`
 - unique `/v1/chat/completions` prompts for each warmup/measured request so prompt-cache hits stay false
 - backend RSS milestones before model load, after model load, after first generated token, and after first 10 generated tokens

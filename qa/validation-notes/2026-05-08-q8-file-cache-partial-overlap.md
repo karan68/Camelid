@@ -11,7 +11,7 @@ Change:
 - `Q8_0FileBacking::read_exact_at_cached` now reuses cached overlap bytes and reads only missing gaps before reinserting the assembled contiguous range.
 - Partial cache reads record both hit bytes and miss bytes, preserving full-cache-hit behavior as a zero-file-read path and keeping cache disabled by default.
 - Added a focused file-backed test proving a seeded `[0, 8)` cache entry lets a later `[4, 20)` read reuse 4 cached bytes, read only 12 bytes from disk, then serve the same 16-byte span entirely from cache.
-- Kept lazy/file-backed Q8 block-dot behind reader-specific `BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT`, separate from the broader `BACKENDINFERENCE_Q8_0_BLOCK_DOT` diagnostic flag.
+- Kept lazy/file-backed Q8 block-dot behind reader-specific `CAMELID_Q8_0_FILE_READER_BLOCK_DOT`, separate from the broader `CAMELID_Q8_0_BLOCK_DOT` diagnostic flag.
 
 Validation:
 - `./scripts/with-rustup-cargo.sh fmt --all -- --check`: PASS

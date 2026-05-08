@@ -6,12 +6,12 @@ export const LLAMA32_3B_ACCEPTANCE_TARGET = {
   source: 'bartowski/Llama-3.2-3B-Instruct-GGUF/Llama-3.2-3B-Instruct-Q8_0.gguf',
   provider_kind: 'local',
   status: 'registered',
-  engine: 'backendinference',
+  engine: 'camelid',
   quant: 'Q8_0',
   size_gb: '3.19',
   loaded_now: false,
   generation_ready: false,
-  backendinference: {
+  camelid: {
     active: false,
     loaded_now: false,
     generation_ready: false,

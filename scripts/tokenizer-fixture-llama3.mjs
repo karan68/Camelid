@@ -4,13 +4,13 @@ import { readFile, writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 
 const args = parseArgs(process.argv.slice(2))
-const apiBase = (args.get('api') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const apiBase = (args.get('api') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.LLAMA3_GGUF || '$CAMELID_MODEL_DIR/Meta-Llama-3-8B-Instruct-Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.LLAMA3_MODEL_ID || 'llama3-8b-q8'
 const out = args.get('out') || process.env.LLAMA3_TOKENIZER_FIXTURE_OUT
 const expectedPath = args.get('expected') || process.env.LLAMA3_TOKENIZER_EXPECTED_JSON
-const startBackend = args.has('start-backend') || process.env.BACKENDINFERENCE_START_BACKEND === '1'
-const buildRelease = args.has('build') || process.env.BACKENDINFERENCE_TOKENIZER_FIXTURE_BUILD === '1'
+const startBackend = args.has('start-backend') || process.env.CAMELID_START_BACKEND === '1'
+const buildRelease = args.has('build') || process.env.CAMELID_TOKENIZER_FIXTURE_BUILD === '1'
 
 const cases = [
   {
@@ -28,7 +28,7 @@ const cases = [
 ]
 
 if (buildRelease) {
-  const build = spawnSync('cargo', ['build', '--release', '--bin', 'backendinference'], { stdio: 'inherit' })
+  const build = spawnSync('cargo', ['build', '--release', '--bin', 'camelid'], { stdio: 'inherit' })
   if (build.status !== 0) process.exit(build.status ?? 1)
 }
 
@@ -41,7 +41,7 @@ let backend
 try {
   if (startBackend) {
     const url = new URL(apiBase)
-    backend = spawn('target/release/backendinference', [
+    backend = spawn('target/release/camelid', [
       'serve',
       '--addr',
       `${url.hostname}:${url.port || '8181'}`,

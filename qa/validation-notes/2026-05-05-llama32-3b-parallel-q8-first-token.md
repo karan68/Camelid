@@ -23,8 +23,8 @@ Validation gates:
 
 Measured direction:
 
-- `BACKENDINFERENCE_PARALLEL_LINEAR=off`: avg generate `13960 ms`, avg layers `13847.54 ms`, avg logits `105.95 ms`, avg FFN total `10326.48 ms`, max sampled backend RSS `283.57 MiB`.
-- `BACKENDINFERENCE_PARALLEL_LINEAR=on`: avg generate `12200 ms`, avg layers `12110.67 ms`, avg logits `81.75 ms`, avg FFN total `8912.14 ms`, max sampled backend RSS `282.97 MiB`.
+- `CAMELID_PARALLEL_LINEAR=off`: avg generate `13960 ms`, avg layers `13847.54 ms`, avg logits `105.95 ms`, avg FFN total `10326.48 ms`, max sampled backend RSS `283.57 MiB`.
+- `CAMELID_PARALLEL_LINEAR=on`: avg generate `12200 ms`, avg layers `12110.67 ms`, avg logits `81.75 ms`, avg FFN total `8912.14 ms`, max sampled backend RSS `282.97 MiB`.
 - Direction: generate `-12.61%`, layers `-12.54%`, logits `-22.84%`, FFN total `-13.7%`.
 
 Claim boundary: this closes only the exact 3B opt-in parallel Q8 first-token runtime direction sub-box. It does **not** promote broad/full Llama-family support, neighboring rows, arbitrary/Jinja template support, model-native/larger context, production-throughput support, or portability.

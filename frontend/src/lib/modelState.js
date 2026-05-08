@@ -11,11 +11,11 @@ export function isHostedRoutingAvailable(model) {
 }
 
 export function isModelLoadedNow(model) {
-  return Boolean(model?.loaded_now || model?.backendinference?.loaded_now || model?.backendinference?.active)
+  return Boolean(model?.loaded_now || model?.camelid?.loaded_now || model?.camelid?.active)
 }
 
 export function isModelGenerationReady(model) {
-  return Boolean(model?.generation_ready || model?.backendinference?.generation_ready)
+  return Boolean(model?.generation_ready || model?.camelid?.generation_ready)
 }
 
 export function isRunnableModel(model) {

@@ -6,7 +6,7 @@ Scope: cron `Camelid overnight all-models fixer` guardrail slice. No new 8B long
 
 Starting state:
 - Local `main` was clean at `1428b3c` (`Promote exact 8B bounded context packs`) and aligned with `origin/main`.
-- Local process check found frontend/dev-server leftovers and one local `backendinference serve --addr 127.0.0.1:8191`, not a long 8B parity run.
+- Local process check found frontend/dev-server leftovers and one local `camelid serve --addr 127.0.0.1:8191`, not a long 8B parity run.
 - Canonical Ubuntu check via the private operator SSH target showed a stale/self-matching 8B diagnostic watcher (`run-8b-1024-diag-4c30c53`) plus active non-8B `bench-q8-blocks` work for Qwen/Mixtral/Gemma. No duplicate 8B long-context run was started.
 
 Validation gates run from this head:

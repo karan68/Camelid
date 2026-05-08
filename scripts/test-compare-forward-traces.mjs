@@ -41,14 +41,14 @@ try {
     '--top', '5',
   ], { cwd: resolve(scriptDir, '..') })
 
-  assert.match(stdout, /schema=backendinference\.forward-trace-comparison\.v1/)
+  assert.match(stdout, /schema=camelid\.forward-trace-comparison\.v1/)
   assert.match(stdout, /known_good_token_delta=\{"left":\[29907\],"right":\[29907\],"match":true\}/)
   assert.match(stdout, /stage_paths_match=true/)
   assert.match(stdout, /first_changed_stage=layers\.0\.attention_q/)
   assert.match(stdout, /changed_stage_count=3/)
 
   const report = JSON.parse(await readFile(reportPath, 'utf8'))
-  assert.equal(report.schema, 'backendinference.forward-trace-comparison.v1')
+  assert.equal(report.schema, 'camelid.forward-trace-comparison.v1')
   assert.equal(report.prompt_tokens_match, true)
   assert.deepEqual(report.generated_token_delta.left, [16301])
   assert.deepEqual(report.generated_token_delta.right, [315])
@@ -199,7 +199,7 @@ function trace() {
     stage(22, 'logits', stats([7.5, -0.1])),
   ]
   return {
-    schema: 'backendinference.forward-trace.v1',
+    schema: 'camelid.forward-trace.v1',
     source: {
       input: 'chat-parity.json',
       prompt_tokens_match: true,

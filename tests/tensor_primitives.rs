@@ -1,4 +1,4 @@
-use backendinference::tensor::CpuTensor;
+use camelid::tensor::CpuTensor;
 
 #[test]
 fn matmul_2x2() {

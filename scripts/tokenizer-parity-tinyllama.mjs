@@ -11,7 +11,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
   args.set(key, value)
 }
 
-const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const backendBase = (args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.TINYLLAMA_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.TINYLLAMA_GGUF || 'models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.TINYLLAMA_MODEL_ID || 'tinyllama-q8'

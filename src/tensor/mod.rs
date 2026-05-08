@@ -12,8 +12,8 @@ use std::{
     },
 };
 
-const RETAIN_Q8_BLOCKS_ENV: &str = "BACKENDINFERENCE_RETAIN_Q8_0_BLOCKS";
-const Q8_FILE_CACHE_BYTES_ENV: &str = "BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES";
+const RETAIN_Q8_BLOCKS_ENV: &str = "CAMELID_RETAIN_Q8_0_BLOCKS";
+const Q8_FILE_CACHE_BYTES_ENV: &str = "CAMELID_Q8_0_FILE_CACHE_BYTES";
 const Q8_0_BLOCK_BYTES: usize = 34;
 // Keep lazy Q8_0 file reads memory-safe by default. The bounded chunk cache is an
 // explicit diagnostic/performance probe until long-context prefill has row-specific evidence.
@@ -1635,7 +1635,7 @@ pub(crate) fn should_parallelize_linear_output(output_width: usize) -> bool {
 }
 
 fn parallel_linear_enabled() -> bool {
-    match env::var("BACKENDINFERENCE_PARALLEL_LINEAR") {
+    match env::var("CAMELID_PARALLEL_LINEAR") {
         Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "on" | "yes" | "enabled"
@@ -1645,7 +1645,7 @@ fn parallel_linear_enabled() -> bool {
 }
 
 fn parallel_linear_min_outputs() -> usize {
-    env::var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS")
+    env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1928,7 +1928,7 @@ mod tests {
     fn q8_file_cache_disabled_path_does_not_store_or_hit() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-disabled-{}",
             std::process::id()
@@ -1945,38 +1945,38 @@ mod tests {
         assert_eq!(stats.cache_entries, 0);
         assert_eq!(stats.cache_bytes, 0);
         assert_eq!(stats.cache_capacity_bytes, 0);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_zero_capacity_clears_retained_entries_on_use() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-zero-clear-{}",
             std::process::id()
         ));
         q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let mut disabled_out = [0_u8; 4];
         assert!(!q8_file_cache_get(&path, 100, &mut disabled_out));
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let mut stale_out = [0_u8; 16];
         assert!(!q8_file_cache_get(&path, 100, &mut stale_out));
         let stats = q8_0_file_read_stats();
         assert_eq!(stats.cache_entries, 0);
         assert_eq!(stats.cache_bytes, 0);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_scoped_capacity_override_is_bounded_and_restored() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-scoped-{}",
             std::process::id()
@@ -2018,7 +2018,7 @@ mod tests {
     fn q8_file_cache_serves_matching_chunks_and_evicts_to_capacity() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "8");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "8");
         let first_path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-first-{}",
             std::process::id()
@@ -2049,14 +2049,14 @@ mod tests {
         assert_eq!(after_second.cache_hit_bytes, 16);
         assert_eq!(after_second.cache_entries, 1);
         assert_eq!(after_second.cache_bytes, 8);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_serves_subranges_from_retained_chunks() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-subrange-{}",
             std::process::id()
@@ -2071,14 +2071,14 @@ mod tests {
         assert_eq!(&out, b"efgh");
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.cache_hit_bytes, 4);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_coalesces_adjacent_chunks_for_cross_boundary_reuse() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-adjacent-{}",
             std::process::id()
@@ -2096,16 +2096,16 @@ mod tests {
         assert_eq!(stats.cache_hit_bytes, 8);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 16);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_reports_miss_insert_merge_and_eviction_stats() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-stats-{}",
             std::process::id()
@@ -2139,14 +2139,14 @@ mod tests {
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 8);
         assert_eq!(stats.cache_capacity_bytes, 16);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_trims_coalesced_stream_to_newest_capacity_window() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-trim-window-{}",
             std::process::id()
@@ -2167,14 +2167,14 @@ mod tests {
         assert_eq!(stats.cache_hit_bytes, 16);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 16);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_coalesces_overlapping_chunks_with_newest_bytes() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "12");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "12");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-overlap-{}",
             std::process::id()
@@ -2192,14 +2192,14 @@ mod tests {
         assert_eq!(stats.cache_hit_bytes, 10);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 12);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_skips_reinserting_identical_fully_covered_subranges() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-covered-{}",
             std::process::id()
@@ -2217,14 +2217,14 @@ mod tests {
         assert_eq!(stats.cache_hit_bytes, 16);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 16);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_keeps_newest_bytes_for_conflicting_covered_subranges() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "16");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-covered-conflict-{}",
             std::process::id()
@@ -2242,21 +2242,21 @@ mod tests {
         assert_eq!(stats.cache_hit_bytes, 16);
         assert_eq!(stats.cache_entries, 1);
         assert_eq!(stats.cache_bytes, 16);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_file_cache_file_read_reuses_partial_overlap_and_reads_gaps() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-partial-file-read-{}",
             std::process::id()
         ));
         std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "32");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "32");
         let backing = Q8_0FileBacking::new(path.clone(), 0, 1);
 
         let start = q8_0_file_read_stats();
@@ -2295,7 +2295,7 @@ mod tests {
         assert_eq!(cached_stats.cache_misses, 0);
         assert_eq!(cached_stats.cache_miss_bytes, 0);
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         let _ = std::fs::remove_file(path);
     }
 
@@ -2303,7 +2303,7 @@ mod tests {
     fn q8_file_cache_reuses_decoded_scales_on_full_block_hits() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "128");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "128");
         let _ = q8_0_file_read_stats();
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-scales-{}",
@@ -2346,7 +2346,7 @@ mod tests {
         assert_eq!(second_stats.cache_hits, 1);
         assert_eq!(second_stats.cache_hit_bytes, (Q8_0_BLOCK_BYTES * 2) as u64);
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         let _ = std::fs::remove_file(path);
     }
 
@@ -2355,7 +2355,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES",
+            "CAMELID_Q8_0_FILE_CACHE_BYTES",
             (Q8_0_BLOCK_BYTES * 3).to_string(),
         );
         let _ = q8_0_file_read_stats();
@@ -2416,7 +2416,7 @@ mod tests {
         assert_eq!(retained_stats.cache_entries, 1);
         assert_eq!(retained_stats.cache_bytes, (Q8_0_BLOCK_BYTES * 3) as u64);
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         let _ = std::fs::remove_file(path);
     }
 
@@ -2424,7 +2424,7 @@ mod tests {
     fn q8_file_cache_promotes_decoded_scales_after_byte_only_hit() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "128");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "128");
         let _ = q8_0_file_read_stats();
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-cache-scale-upgrade-{}",
@@ -2478,7 +2478,7 @@ mod tests {
         assert_eq!(second_stats.cache_hits, 1);
         assert_eq!(second_stats.cache_hit_bytes, (Q8_0_BLOCK_BYTES * 2) as u64);
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         let _ = std::fs::remove_file(path);
     }
 
@@ -2486,7 +2486,7 @@ mod tests {
     fn q8_file_backing_rejects_reads_outside_declared_storage_before_file_io() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-backing-bounds-{}",
@@ -2520,7 +2520,7 @@ mod tests {
         assert_eq!(after_beyond_err.read_calls, 0);
         assert_eq!(after_beyond_err.read_bytes, 0);
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         let _ = std::fs::remove_file(path);
     }
 
@@ -2528,7 +2528,7 @@ mod tests {
     fn q8_file_backing_rejects_nonempty_zero_block_reads_before_file_io() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "32");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "32");
         let _ = q8_0_file_read_stats();
         let path = std::path::PathBuf::from(format!(
             "/tmp/camelid-q8-zero-block-bounds-{}",
@@ -2552,7 +2552,7 @@ mod tests {
         assert_eq!(stats.cache_misses, 0);
         assert!(!backing.file_handle_cached());
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]

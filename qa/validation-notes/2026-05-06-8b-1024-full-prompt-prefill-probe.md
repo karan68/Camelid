@@ -4,7 +4,7 @@ Scope: exact tracked Llama 3 8B Instruct Q8_0 diagnostic only. This does not pro
 
 Change under probe:
 
-- Current head `86effbf219bf294e19d19f8bece72bb26de07cb9` includes `BACKENDINFERENCE_PREFILL_CHUNK_TOKENS=full|all|prompt|unbounded`, which runs the prefill portion as one layer-major prompt chunk instead of the default 128-token chunks.
+- Current head `86effbf219bf294e19d19f8bece72bb26de07cb9` includes `CAMELID_PREFILL_CHUNK_TOKENS=full|all|prompt|unbounded`, which runs the prefill portion as one layer-major prompt chunk instead of the default 128-token chunks.
 - The run kept lazy file-backed Q8 enabled, retained Q8 blocks disabled, and Q8 file cache disabled.
 
 Canonical remote diagnostic:
@@ -15,7 +15,7 @@ Canonical remote diagnostic:
 - Local copied summary/tails: `target/remote-llama3-8b-context-1024-fullprompt-86effbf-20260506T103900Z/`.
 - Prompt pack: `qa/prompt-packs/llama3-context-1024-smoke.json` (`roughly-1024-token-recall`).
 - Model: `$CAMELID_MODEL_DIR/Meta-Llama-3-8B-Instruct-Q8_0.gguf`.
-- Env: `BACKENDINFERENCE_LAZY_Q8_0_LINEAR=1`, `BACKENDINFERENCE_RETAIN_Q8_0_BLOCKS=0`, `BACKENDINFERENCE_PREFILL_CHUNK_TOKENS=full`, `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=0`, `BACKENDINFERENCE_FORWARD_MEMORY_TRACE=1`, `BACKENDINFERENCE_FORWARD_RSS_TIMINGS=1`, `RAYON_NUM_THREADS=4`.
+- Env: `CAMELID_LAZY_Q8_0_LINEAR=1`, `CAMELID_RETAIN_Q8_0_BLOCKS=0`, `CAMELID_PREFILL_CHUNK_TOKENS=full`, `CAMELID_Q8_0_FILE_CACHE_BYTES=0`, `CAMELID_FORWARD_MEMORY_TRACE=1`, `CAMELID_FORWARD_RSS_TIMINGS=1`, `RAYON_NUM_THREADS=4`.
 
 Result:
 

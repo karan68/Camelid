@@ -172,7 +172,7 @@ function modelErrorCopy(model) {
 
 function getReadinessRows(model, runtime) {
   const active = runtime?.active_model_id === model?.id || isModelLoadedNow(model)
-  const readiness = model?.backendinference || {}
+  const readiness = model?.camelid || {}
   const generationReady = isModelGenerationReady(model)
   return [
     { key: 'loaded_now', label: 'Loaded', value: active ? 'true' : 'false', ready: active },

@@ -4,7 +4,7 @@ Head at start of lane: `ea1b7c4842540a9a954731ffb6777f7974ec46d2` (`Polish guard
 
 ## Change
 
-- Tightened the bounded lazy Q8_0 file-byte cache so `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=0` clears any retained cache entries immediately on the next cache get/insert path, not only when a later stats snapshot applies capacity.
+- Tightened the bounded lazy Q8_0 file-byte cache so `CAMELID_Q8_0_FILE_CACHE_BYTES=0` clears any retained cache entries immediately on the next cache get/insert path, not only when a later stats snapshot applies capacity.
 - Added a regression test proving bytes inserted under a nonzero cap cannot be served after the cap is toggled to zero and then back to nonzero.
 - Aligned the API capability test with the current fail-closed Mistral row status (`active_validation_unsupported`) and explicitly guards that no Mistral support claim is present.
 

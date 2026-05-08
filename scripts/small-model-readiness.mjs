@@ -5,12 +5,12 @@ import { dirname, resolve } from 'node:path'
 
 const args = parseArgs(process.argv.slice(2))
 const manifestPath = resolve(args.get('manifest') || 'SMALL_MODEL_CANDIDATES.json')
-const inspectBin = resolve(args.get('inspect-bin') || './target/release/backendinference')
+const inspectBin = resolve(args.get('inspect-bin') || './target/release/camelid')
 const outPath = args.get('out') ? resolve(args.get('out')) : null
 const markdownOutPath = args.get('markdown-out') ? resolve(args.get('markdown-out')) : null
 const budgetBytes = parseByteBudget(
   args.get('budget') ||
-  process.env.BACKENDINFERENCE_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES ||
+  process.env.CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES ||
   String(24 * 1024 * 1024 * 1024),
 )
 const q8RuntimeBlockBytes = Number.parseInt(args.get('q8-runtime-block-bytes') || '36', 10)
@@ -30,7 +30,7 @@ for (const candidate of candidates) {
 }
 
 const report = {
-  schema: 'backendinference.small-model-readiness-report.v1',
+  schema: 'camelid.small-model-readiness-report.v1',
   generated_at: startedAt,
   manifest: manifestPath,
   inspect_bin: inspectBin,

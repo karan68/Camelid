@@ -13,7 +13,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 
 if (!args.has('diagnostics') || !args.has('tensor-dump')) {
   console.error('usage: node scripts/correlate-prompt-token-rows.mjs --diagnostics <chat-parity.json> --tensor-dump <tensor-dump.json> [--json-out <path>]')
-  console.error('expects a tensor dump created with backendinference tensor-dump --tensor token_embd.weight --token <prompt-token-id> ...')
+  console.error('expects a tensor dump created with camelid tensor-dump --tensor token_embd.weight --token <prompt-token-id> ...')
   process.exit(2)
 }
 
@@ -23,7 +23,7 @@ const jsonOut = args.get('json-out')
 
 const diagnostics = JSON.parse(await readFile(diagnosticsPath, 'utf8'))
 const tensorDump = JSON.parse(await readFile(tensorDumpPath, 'utf8'))
-const promptTokens = diagnostics.backend_prompt_tokens || diagnostics.backendinference?.prompt_token_ids || []
+const promptTokens = diagnostics.backend_prompt_tokens || diagnostics.camelid?.prompt_token_ids || []
 if (!Array.isArray(promptTokens) || promptTokens.length === 0) {
   throw new Error(`${diagnosticsPath} does not contain backend prompt token ids`)
 }

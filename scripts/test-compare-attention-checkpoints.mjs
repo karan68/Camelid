@@ -59,7 +59,7 @@ async function runCompare(args) {
 
 function bundle({ score, probability }) {
   return {
-    schema: 'backendinference.attention-checkpoints.v1',
+    schema: 'camelid.attention-checkpoints.v1',
     prompt_token_ids: [1, 529, 29989, 1792],
     dense_metadata: {
       attention_head_count: 4,

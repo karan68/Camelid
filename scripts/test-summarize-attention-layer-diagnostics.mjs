@@ -50,7 +50,7 @@ assert.equal(largest.first_position_diff_index, 0)
 
 function fixture({ token, attentionOutputRms, query0, context0, score0, probability0 }) {
   return {
-    backendinference: {
+    camelid: {
       generated_token_ids: [token],
       top_logits: [{ token_id: token, logit: 1, rank: 1 }],
       dense: {

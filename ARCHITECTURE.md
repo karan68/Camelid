@@ -5,7 +5,7 @@
 
 Camelid is a Rust-native local inference backend for loading GGUF language models, tokenizing prompts, running autoregressive inference, sampling tokens, and serving local HTTP APIs. It should follow proven local-inference runtime patterns without copying external implementation code.
 
-Naming transition: this architecture describes Camelid, but the current Rust crate, binary, repository metadata, and some proposed module/package names may still use `backendinference`. Treat those as current implementation names, not the long-term product name.
+Naming transition: this architecture describes Camelid, but the current Rust crate, binary, repository metadata, and some proposed module/package names may still use `camelid`. Treat those as current implementation names, not the long-term product name.
 
 ## Goals
 
@@ -30,7 +30,7 @@ Naming transition: this architecture describes Camelid, but the current Rust cra
 Start as a single Rust crate if speed matters, but preserve these module boundaries. Split into workspace crates once the APIs stabilize.
 
 ```text
-backendinference/  # current repo/crate root during the Camelid transition
+camelid/  # current repo/crate root during the Camelid transition
   Cargo.toml
   src/
     lib.rs
@@ -61,8 +61,8 @@ backendinference/  # current repo/crate root during the Camelid transition
       openai.rs
       routes.rs
     bin/
-      backendinference.rs
-      backendinference-server.rs
+      camelid.rs
+      camelid-server.rs
   tests/
     gguf_metadata.rs
     gguf_malformed.rs
@@ -72,7 +72,7 @@ backendinference/  # current repo/crate root during the Camelid transition
 
 Long-term workspace split, pending a separate naming decision:
 
-- Current/internal crate-prefix option: `backendinference-*` (least disruptive during transition)
+- Current/internal crate-prefix option: `camelid-*` (least disruptive during transition)
 - Future Camelid-facing crate-prefix option: `camelid-*`
 
 Do not rename crates or binaries as part of docs-only work; plan that separately so commands, package metadata, and tests move together.

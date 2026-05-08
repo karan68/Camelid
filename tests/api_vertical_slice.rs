@@ -7,7 +7,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn health_reports_not_generation_ready() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -22,14 +22,14 @@ async fn health_reports_not_generation_ready() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["ok"], true);
-    assert_eq!(body["engine"], "backendinference");
+    assert_eq!(body["engine"], "camelid");
     assert_eq!(body["loaded_now"], false);
     assert_eq!(body["generation_ready"], false);
 }
 
 #[tokio::test]
 async fn capabilities_report_support_contract_and_planned_lanes() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -406,7 +406,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
 
 #[tokio::test]
 async fn chat_completion_validates_generation_input_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -429,7 +429,7 @@ async fn chat_completion_validates_generation_input_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_requires_loaded_model_after_valid_input() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -452,7 +452,7 @@ async fn chat_completion_requires_loaded_model_after_valid_input() {
 
 #[tokio::test]
 async fn streaming_chat_completion_validates_input_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -475,7 +475,7 @@ async fn streaming_chat_completion_validates_input_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_rejects_empty_message_role_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -503,7 +503,7 @@ async fn chat_completion_rejects_empty_message_role_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_rejects_empty_message_content_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -527,7 +527,7 @@ async fn chat_completion_rejects_empty_message_content_before_runtime() {
 
 #[tokio::test]
 async fn completion_validates_sampling_parameters_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -550,7 +550,7 @@ async fn completion_validates_sampling_parameters_before_runtime() {
 
 #[tokio::test]
 async fn streaming_completion_validates_top_p_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -573,7 +573,7 @@ async fn streaming_completion_validates_top_p_before_runtime() {
 
 #[tokio::test]
 async fn completion_validates_presence_penalty_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -596,7 +596,7 @@ async fn completion_validates_presence_penalty_before_runtime() {
 
 #[tokio::test]
 async fn streaming_chat_completion_validates_frequency_penalty_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -619,7 +619,7 @@ async fn streaming_chat_completion_validates_frequency_penalty_before_runtime() 
 
 #[tokio::test]
 async fn chat_completion_validates_logit_bias_token_ids_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -643,7 +643,7 @@ async fn chat_completion_validates_logit_bias_token_ids_before_runtime() {
 
 #[tokio::test]
 async fn completion_validates_logit_bias_values_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -667,7 +667,7 @@ async fn completion_validates_logit_bias_values_before_runtime() {
 
 #[tokio::test]
 async fn completion_rejects_unsupported_best_of_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -691,7 +691,7 @@ async fn completion_rejects_unsupported_best_of_before_runtime() {
 
 #[tokio::test]
 async fn completion_rejects_invalid_zero_choice_fields_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .clone()
         .oneshot(
@@ -736,7 +736,7 @@ async fn completion_rejects_invalid_zero_choice_fields_before_runtime() {
 
 #[tokio::test]
 async fn streaming_completion_rejects_unsupported_multiple_choices_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -760,7 +760,7 @@ async fn streaming_completion_rejects_unsupported_multiple_choices_before_runtim
 
 #[tokio::test]
 async fn chat_completion_rejects_unsupported_multiple_choices_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -784,7 +784,7 @@ async fn chat_completion_rejects_unsupported_multiple_choices_before_runtime() {
 
 #[tokio::test]
 async fn completion_rejects_unsupported_logprobs_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -808,7 +808,7 @@ async fn completion_rejects_unsupported_logprobs_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_rejects_unsupported_logprobs_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -832,7 +832,7 @@ async fn chat_completion_rejects_unsupported_logprobs_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_rejects_unsupported_top_logprobs_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -856,7 +856,7 @@ async fn chat_completion_rejects_unsupported_top_logprobs_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_rejects_top_logprobs_without_logprobs_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -880,7 +880,7 @@ async fn chat_completion_rejects_top_logprobs_without_logprobs_before_runtime() 
 
 #[tokio::test]
 async fn completion_returns_typed_error_for_malformed_logprobs_payload() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -903,7 +903,7 @@ async fn completion_returns_typed_error_for_malformed_logprobs_payload() {
 
 #[tokio::test]
 async fn single_choice_defaults_preserve_loaded_model_preflight_order() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -926,7 +926,7 @@ async fn single_choice_defaults_preserve_loaded_model_preflight_order() {
 
 #[tokio::test]
 async fn chat_single_choice_defaults_preserve_loaded_model_preflight_order() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -949,7 +949,7 @@ async fn chat_single_choice_defaults_preserve_loaded_model_preflight_order() {
 
 #[tokio::test]
 async fn completion_validates_stop_sequences_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -973,7 +973,7 @@ async fn completion_validates_stop_sequences_before_runtime() {
 
 #[tokio::test]
 async fn valid_advanced_sampling_fields_preserve_loaded_model_preflight_order() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -1000,7 +1000,7 @@ async fn v1_models_supports_openai_style_model_retrieve() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "llama", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
     let response = app
         .clone()
@@ -1031,13 +1031,13 @@ async fn v1_models_supports_openai_style_model_retrieve() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["id"], "tiny-tokenizer");
     assert_eq!(body["object"], "model");
-    assert_eq!(body["owned_by"], "backendinference");
+    assert_eq!(body["owned_by"], "camelid");
     assert_eq!(body["created"], 0);
 }
 
 #[tokio::test]
 async fn v1_model_retrieve_rejects_unloaded_or_unknown_model() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -1061,7 +1061,7 @@ async fn v1_model_retrieve_reports_loaded_dense_model_shape() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -1092,7 +1092,7 @@ async fn v1_model_retrieve_reports_loaded_dense_model_shape() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["id"], "tiny-generation");
     assert_eq!(body["object"], "model");
-    assert_eq!(body["owned_by"], "backendinference");
+    assert_eq!(body["owned_by"], "camelid");
     assert_eq!(body["created"], 0);
 }
 
@@ -1102,7 +1102,7 @@ async fn load_model_reports_tokenizer_summary() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "llama", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
     let response = app
         .oneshot(
@@ -1135,7 +1135,7 @@ async fn generation_session_endpoint_preflights_tokenizer_then_reports_missing_d
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "llama", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
     let response = app
         .clone()
@@ -1184,7 +1184,7 @@ async fn tokenizer_endpoint_returns_current_model_tokenizer_summary() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "llama", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
     let response = app
         .clone()
@@ -1227,7 +1227,7 @@ async fn tokenizer_endpoint_reports_unsupported_tokenizer_honestly() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "wordpiece", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "unsupported-tokenizer"});
     let response = app
         .clone()
@@ -1261,7 +1261,7 @@ async fn tokenizer_endpoint_reports_unsupported_tokenizer_honestly() {
 
 #[tokio::test]
 async fn tokenizer_endpoint_requires_loaded_model() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -1284,7 +1284,7 @@ async fn tokenizer_encode_decode_endpoints_use_loaded_tokenizer() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "llama", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
     let response = app
         .clone()
@@ -1341,7 +1341,7 @@ async fn tokenizer_encode_decode_endpoints_use_loaded_tokenizer() {
 
 #[tokio::test]
 async fn tokenizer_encode_requires_loaded_model() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -1366,7 +1366,7 @@ async fn tokenizer_decode_reports_unsupported_tokenizer() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "wordpiece", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "unsupported-tokenizer"});
     let response = app
         .clone()
@@ -1402,7 +1402,7 @@ async fn tokenizer_decode_reports_unsupported_tokenizer() {
 
 #[tokio::test]
 async fn tokenizer_endpoints_return_typed_malformed_request_errors() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .clone()
         .oneshot(
@@ -1444,7 +1444,7 @@ async fn tokenizer_decode_reports_out_of_range_token_ids() {
     let path = dir.path().join("tokenizer.gguf");
     write_tokenizer_gguf(&path, "llama", true, false, true);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let body = serde_json::json!({"path": path, "id": "tiny-tokenizer"});
     let response = app
         .clone()
@@ -1485,7 +1485,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -1516,7 +1516,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny-generation","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":false,"backendinference_dense_diagnostics":true}"#,
+                    r#"{"model":"tiny-generation","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"stream":false,"camelid_dense_diagnostics":true}"#,
                 ))
                 .unwrap(),
         )
@@ -1541,11 +1541,11 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     assert_eq!(body["choices"][0]["finish_reason"], "length");
     assert!(body["choices"][0].get("logprobs").is_none());
     assert_eq!(body["usage"]["completion_tokens"], 1);
-    assert!(body["backendinference"]["prompt_token_ids"]
+    assert!(body["camelid"]["prompt_token_ids"]
         .as_array()
         .is_some_and(|tokens| !tokens.is_empty()));
-    assert_eq!(body["backendinference"]["generated_token_ids"], json!([0]));
-    let dense_metadata = &body["backendinference"]["dense_metadata"];
+    assert_eq!(body["camelid"]["generated_token_ids"], json!([0]));
+    let dense_metadata = &body["camelid"]["dense_metadata"];
     assert_eq!(dense_metadata["embedding_length"], 4);
     assert_eq!(dense_metadata["attention_head_count"], 2);
     assert_eq!(dense_metadata["attention_head_count_kv"], 1);
@@ -1593,7 +1593,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
         orientations["ffn_down"]["descriptor_layout"],
         "input_output"
     );
-    let top_logits = body["backendinference"]["top_logits"].as_array().unwrap();
+    let top_logits = body["camelid"]["top_logits"].as_array().unwrap();
     assert!(!top_logits.is_empty());
     assert_eq!(top_logits[0]["token_id"], 0);
     assert!(top_logits[0]["logit"].is_number());
@@ -1601,9 +1601,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     assert_eq!(top_logits[0]["rank"], 1);
     assert_eq!(top_logits[0]["selected"], false);
     assert_eq!(top_logits[0]["text"], "<unk>");
-    let output_projection = body["backendinference"]["output_projection"]
-        .as_array()
-        .unwrap();
+    let output_projection = body["camelid"]["output_projection"].as_array().unwrap();
     assert_eq!(output_projection.len(), top_logits.len());
     assert_eq!(output_projection[0]["token_id"], top_logits[0]["token_id"]);
     assert_eq!(output_projection[0]["layout"], "output_input");
@@ -1642,7 +1640,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
         assert!(component["output_row_value"].is_number());
         assert!(component["component"].is_number());
     }
-    let dense = &body["backendinference"]["dense"];
+    let dense = &body["camelid"]["dense"];
     assert!(dense["embedding"]["rms"].is_number());
     assert!(dense["final_hidden"]["mean"].is_number());
     assert!(dense["final_norm"]["hidden_mean_square"].is_number());
@@ -1848,36 +1846,33 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     assert!(
         dense["layers"][0]["ffn_activation_reconstruction"]["reported_max_abs_window"].is_array()
     );
+    assert_eq!(body["camelid"]["timings_ms"]["weight_cache_hit"], false);
+    assert!(body["camelid"]["timings_ms"]["generation"]["forward_total"].is_number());
+    assert!(body["camelid"]["timings_ms"]["generation"]["logits"].is_number());
     assert_eq!(
-        body["backendinference"]["timings_ms"]["weight_cache_hit"],
-        false
-    );
-    assert!(body["backendinference"]["timings_ms"]["generation"]["forward_total"].is_number());
-    assert!(body["backendinference"]["timings_ms"]["generation"]["logits"].is_number());
-    assert_eq!(
-        body["backendinference"]["timings_ms"]["prompt_evaluation"]["prompt_token_count"],
+        body["camelid"]["timings_ms"]["prompt_evaluation"]["prompt_token_count"],
         body["usage"]["prompt_tokens"]
     );
     assert!(
-        body["backendinference"]["timings_ms"]["prompt_evaluation"]["first_token"]["forward_total"]
+        body["camelid"]["timings_ms"]["prompt_evaluation"]["first_token"]["forward_total"]
             .is_number()
     );
     assert_eq!(
-        body["backendinference"]["timings_ms"]["prompt_evaluation"]["first_token_layers"]
+        body["camelid"]["timings_ms"]["prompt_evaluation"]["first_token_layers"]
             .as_array()
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        body["backendinference"]["timings_ms"]["layers"]
+        body["camelid"]["timings_ms"]["layers"]
             .as_array()
             .unwrap()
             .len(),
         1
     );
-    assert!(body["backendinference"]["timings_ms"]["layers"][0]["attention_q"].is_number());
-    assert!(body["backendinference"]["timings_ms"]["layers"][0]["ffn_down"].is_number());
+    assert!(body["camelid"]["timings_ms"]["layers"][0]["attention_q"].is_number());
+    assert!(body["camelid"]["timings_ms"]["layers"][0]["ffn_down"].is_number());
 
     let response = app
         .oneshot(
@@ -1902,10 +1897,7 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
         String::from_utf8_lossy(&body_bytes)
     );
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(
-        body["backendinference"]["timings_ms"]["weight_cache_hit"],
-        true
-    );
+    assert_eq!(body["camelid"]["timings_ms"]["weight_cache_hit"], true);
 }
 
 #[tokio::test]
@@ -1914,7 +1906,7 @@ async fn chat_completion_streams_openai_compatible_sse_chunks() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -1970,7 +1962,7 @@ async fn completion_endpoint_generates_multiple_greedy_tokens() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -2023,15 +2015,12 @@ async fn completion_endpoint_generates_multiple_greedy_tokens() {
     assert_eq!(body["choices"][0]["finish_reason"], "length");
     assert!(body["choices"][0].get("logprobs").is_none());
     assert_eq!(body["usage"]["completion_tokens"], 2);
-    assert!(body["backendinference"]["prompt_token_ids"]
+    assert!(body["camelid"]["prompt_token_ids"]
         .as_array()
         .is_some_and(|tokens| !tokens.is_empty()));
-    assert_eq!(
-        body["backendinference"]["generated_token_ids"],
-        json!([0, 0])
-    );
-    assert!(body["backendinference"]["timings_ms"]["generation"]["forward_total"].is_number());
-    assert!(body["backendinference"]["timings_ms"]["layers"].is_array());
+    assert_eq!(body["camelid"]["generated_token_ids"], json!([0, 0]));
+    assert!(body["camelid"]["timings_ms"]["generation"]["forward_total"].is_number());
+    assert!(body["camelid"]["timings_ms"]["layers"].is_array());
 }
 
 #[tokio::test]
@@ -2040,7 +2029,7 @@ async fn completion_endpoint_honors_stop_sequence() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -2086,7 +2075,7 @@ async fn completion_endpoint_honors_stop_sequence() {
 
 #[tokio::test]
 async fn completion_rejects_invalid_stop_sequence_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -2110,7 +2099,7 @@ async fn completion_rejects_invalid_stop_sequence_before_runtime() {
 
 #[tokio::test]
 async fn completion_rejects_empty_stop_string_before_runtime() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -2134,7 +2123,7 @@ async fn completion_rejects_empty_stop_string_before_runtime() {
 
 #[tokio::test]
 async fn chat_completion_returns_typed_error_for_malformed_stop_payload() {
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let response = app
         .oneshot(
             Request::builder()
@@ -2162,7 +2151,7 @@ async fn completion_endpoint_truncates_stop_sequence_after_partial_text() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -2212,7 +2201,7 @@ async fn streaming_completion_honors_stop_sequence_finish_reason() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -2264,7 +2253,7 @@ async fn completion_endpoint_streams_openai_compatible_sse_chunks() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -2319,7 +2308,7 @@ async fn streaming_completion_accepts_advanced_sampling_controls() {
     let path = dir.path().join("tiny-generation.gguf");
     write_generation_gguf(&path);
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-generation"});
     let response = app
         .clone()
@@ -2379,7 +2368,7 @@ async fn streaming_completion_rejects_context_overflow_before_loading_weights() 
         },
     );
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-short-context"});
     let response = app
         .clone()
@@ -2429,7 +2418,7 @@ async fn completion_reports_missing_tokenizer_for_dense_model() {
         },
     );
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-no-tokenizer"});
     let response = app
         .clone()
@@ -2485,7 +2474,7 @@ async fn load_model_rejects_truncated_weight_payload() {
         },
     );
 
-    let app = backendinference::api::router();
+    let app = camelid::api::router();
     let load_body = serde_json::json!({"path": path, "id": "tiny-truncated-weights"});
     let response = app
         .clone()

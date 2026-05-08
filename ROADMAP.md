@@ -121,7 +121,7 @@ What exists now:
 - serial `dot_row_f32`, `dot_all_rows_f32`, and single-input-row adapters
 - CPU materialization-budget guardrails
 - Llama 3 tokenizer, config, GQA, and RoPE groundwork
-- a code-only chunked prefill slice (`BACKENDINFERENCE_PREFILL_CHUNK_TOKENS`, default `128`) that batches non-final prompt tokens through embedding, Q/K/V, RoPE, KV writes, causal attention context, attention output, and FFN while leaving the final logits token on the established single-token path
+- a code-only chunked prefill slice (`CAMELID_PREFILL_CHUNK_TOKENS`, default `128`) that batches non-final prompt tokens through embedding, Q/K/V, RoPE, KV writes, causal attention context, attention output, and FFN while leaving the final logits token on the established single-token path
 - Q8_0 file-backed batched matmul read reuse across input rows for bounded prefill chunks, plus a layer-major lazy-Q8 prefill schedule that reuses each layer's file-backed weights across all prefill chunks before moving to the next layer
 
 What still needs to happen:

@@ -10,7 +10,7 @@ Existing evidence check: the latest committed bounded Llama 3 8B 1024/2048 artif
 
 ## Change
 
-`output_projection_q8_0_reconstructed_logit` now mirrors the existing opt-in `BACKENDINFERENCE_Q8_0_BLOCK_DOT` probe when reconstructing a Q8_0 file-backed output row for diagnostics:
+`output_projection_q8_0_reconstructed_logit` now mirrors the existing opt-in `CAMELID_Q8_0_BLOCK_DOT` probe when reconstructing a Q8_0 file-backed output row for diagnostics:
 
 - default/unset flag: unchanged decoded Q8 row × f32 input reconstruction;
 - opt-in flag enabled: quantize the output-norm row once and reconstruct with encoded Q8 row × quantized-input block dot, matching the file-reader runtime probe.

@@ -38,7 +38,7 @@ const validationNotePath = 'qa/validation-notes/2026-05-04-validation-lane-reope
 const context512EvidencePath = 'qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json'
 const chatTemplateShapesEvidencePath = 'qa/evidence-bundles/llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/manifest.json'
 const broader50EvidencePath = 'qa/evidence-bundles/llama3-8b-broader-50tok-20260505T005031Z-head-d13541ad8d7e/manifest.json'
-const toolchainCommand = repoCommand('./scripts/with-rustup-cargo.sh build --release --bin backendinference')
+const toolchainCommand = repoCommand('./scripts/with-rustup-cargo.sh build --release --bin camelid')
 const apiBase = '${CAMELID_API_BASE:-http://127.0.0.1:8181}'
 const frontendUrl = '${CAMELID_FRONTEND_URL:-http://127.0.0.1:4175}'
 const llamaBase = '${LLAMA3_LLAMA_SERVER_URL:-http://127.0.0.1:8183}'
@@ -277,7 +277,7 @@ const manifest = {
   required_tracks: ['compact-parity', 'broader-parity', 'chat-template-shapes', 'context-512', 'api-webui-smoke', 'perf-rss-portability'],
   prerequisites: {
     build_command: toolchainCommand,
-    backend_binary: 'target/release/backendinference',
+    backend_binary: 'target/release/camelid',
     reference_llama_server: llamaServerBin,
     reference_llama_tokenize: llamaTokenizeBin,
     required_env: {
@@ -465,7 +465,7 @@ function perfCommand(modelFile, modelId, waitMs = 300000) {
     'df -h / | tee "ROW_ROOT/perf-rss-portability/disk-root.txt"',
     portableShaToFile('"$MODEL"', 'ROW_ROOT/perf-rss-portability/model.sha256.txt'),
     `node scripts/model-promotion-smoke-bundle.mjs --api ${apiBase} --frontend ${frontendUrl} --model \"${modelDir}/${modelFile}\" --model-id ${modelId} --out-dir \"ROW_ROOT/perf-rss-portability/api-webui-smoke\" --message hello --max-tokens 1 --temperature 0 || true`,
-    "pgrep -f 'target/release/backendinference serve' | tail -n 1 | tee \"ROW_ROOT/perf-rss-portability/backend.pid.txt\"",
+    "pgrep -f 'target/release/camelid serve' | tail -n 1 | tee \"ROW_ROOT/perf-rss-portability/backend.pid.txt\"",
     "if [ -s \"ROW_ROOT/perf-rss-portability/backend.pid.txt\" ]; then ps -o pid,rss,vsz,etime,command -p \"$(cat \"ROW_ROOT/perf-rss-portability/backend.pid.txt\")\" | tee \"ROW_ROOT/perf-rss-portability/backend.ps.txt\"; fi",
   ].join('\n')
 }

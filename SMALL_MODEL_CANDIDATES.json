@@ -1,5 +1,5 @@
 {
-  "schema": "backendinference.small-model-candidates.v1",
+  "schema": "camelid.small-model-candidates.v1",
   "purpose": "Repeatable candidate manifest for small GGUF load/parity expansion without overclaiming support.",
   "candidate_order": [
     {
@@ -39,7 +39,7 @@
       "quant": "Q8_0",
       "estimated_ram_materialization_risk": "medium-low; validated only for the current short local-chat smoke envelope, with longer contexts and stronger perf/portability still gated",
       "expected_support_row": "supported exact-row smoke for Llama 3.2 1B Instruct Q8_0 short local chat; do not infer support for neighboring Llama sizes, base variants, other quantizations, longer contexts, or broad chat-template behavior",
-      "load_harness": "./target/release/backendinference inspect, POST /api/models/load, /v1/health, /v1/completions, /v1/chat/completions, and frontend smoke for this exact GGUF row",
+      "load_harness": "./target/release/camelid inspect, POST /api/models/load, /v1/health, /v1/completions, /v1/chat/completions, and frontend smoke for this exact GGUF row",
       "parity_harness": "node scripts/chat-parity-llama3.mjs plus the downloaded three-prompt Llama 3 pack; require prompt-token, generated-token, and generated-text match against llama.cpp for this exact row",
       "latest_evidence": {
         "load_result": "PASS for exact-row /api/models/load with generation_ready=true, plus /v1/completions, /v1/chat/completions, and frontend smoke evidence documented in STATUS.md",

@@ -1,4 +1,4 @@
-use backendinference::{
+use camelid::{
     inference::{
         LlamaInferenceSession, LlamaKvCachePlan, LlamaLayerWeights, LlamaLoadedWeights,
         LlamaSampler, SamplingConfig,

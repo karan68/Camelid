@@ -23,7 +23,7 @@ Fathom:
 
 ## Source-of-truth rule
 
-Camelid is the project/product name going forward. Current implementation names may still say `backendinference` in crate, binary, route diagnostic, and metadata contexts until a separate code/package rename is planned.
+Camelid is the project/product name going forward. Current implementation names may still say `camelid` in crate, binary, route diagnostic, and metadata contexts until a separate code/package rename is planned.
 
 Use the full ForgeLocal repository as the product/frontend source of truth:
 
@@ -132,7 +132,7 @@ Rationale:
 ```json
 {
   "ok": true,
-  "engine": "backendinference",
+  "engine": "camelid",
   "generation_ready": false,
   "active_model_id": null
 }
@@ -150,7 +150,7 @@ The frontend treats `generation_ready` as the chat gate. A model can be loaded b
       "id": "loaded-model-id",
       "object": "model",
       "created": 0,
-      "owned_by": "backendinference"
+      "owned_by": "camelid"
     }
   ]
 }
@@ -218,7 +218,7 @@ Concern: ForgeLocal may require an API key for external providers. A local Camel
 
 ### Phase 0B — thin ForgeLocal adapter
 
-Later, add `provider_kind = "backendinference"` while reusing most external-provider code.
+Later, add `provider_kind = "camelid"` while reusing most external-provider code.
 
 Potential adapter trait:
 
@@ -234,9 +234,9 @@ Implementations:
 
 - Existing local process adapter
 - `OpenAiCompatibleHttpAdapter`
-- `BackendInferenceHttpAdapter`
+- `CamelidHttpAdapter`
 
-`BackendInferenceHttpAdapter` can initially wrap the OpenAI-compatible HTTP adapter.
+`CamelidHttpAdapter` can initially wrap the OpenAI-compatible HTTP adapter.
 
 ## Fathom alignment
 
@@ -274,5 +274,5 @@ Do not integrate yet. Prepare Camelid so it can later become a runtime target by
 1. Maintaining `/v1` compatibility.
 2. Providing `/api/capabilities`.
 3. Returning structured model metadata.
-4. Keeping runtime-specific metadata namespaced under `backendinference`.
+4. Keeping runtime-specific metadata namespaced under `camelid`.
 5. Avoiding ForgeLocal-only assumptions in core APIs.

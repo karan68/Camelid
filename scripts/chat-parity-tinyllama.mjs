@@ -12,7 +12,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
   args.set(key, value)
 }
 
-const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const backendBase = (args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.TINYLLAMA_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.TINYLLAMA_GGUF || 'models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.TINYLLAMA_MODEL_ID || 'tinyllama-q8'
@@ -110,17 +110,17 @@ try {
     method: 'POST',
     body: JSON.stringify({
       ...chatPayload,
-      backendinference_logit_token_ids: diagnosticTokenIds,
-      backendinference_dense_diagnostics: true,
+      camelid_logit_token_ids: diagnosticTokenIds,
+      camelid_dense_diagnostics: true,
     }),
   })
 
-  const backendPromptTokens = backendChat.backendinference?.prompt_token_ids || []
-  const backendGeneratedTokens = backendChat.backendinference?.generated_token_ids || []
-  const backendDenseMetadata = backendChat.backendinference?.dense_metadata || null
-  const backendTopLogits = backendChat.backendinference?.top_logits || []
-  const backendOutputProjection = backendChat.backendinference?.output_projection || []
-  const backendDense = compactDenseDiagnostics(backendChat.backendinference?.dense)
+  const backendPromptTokens = backendChat.camelid?.prompt_token_ids || []
+  const backendGeneratedTokens = backendChat.camelid?.generated_token_ids || []
+  const backendDenseMetadata = backendChat.camelid?.dense_metadata || null
+  const backendTopLogits = backendChat.camelid?.top_logits || []
+  const backendOutputProjection = backendChat.camelid?.output_projection || []
+  const backendDense = compactDenseDiagnostics(backendChat.camelid?.dense)
   const baselinePromptTokens = llamaTokens.tokens || []
   const promptMatch = JSON.stringify(backendPromptTokens) === JSON.stringify(baselinePromptTokens)
   const backendText = backendChat.choices?.[0]?.message?.content ?? ''
@@ -173,7 +173,7 @@ try {
       llama_text: llamaText,
       backend_usage: backendChat.usage,
       llama_usage: llamaChat.usage,
-      backendinference: backendChat.backendinference,
+      camelid: backendChat.camelid,
     }, null, 2)}\n`)
     console.log(`diagnostics_out=${diagnosticsPath}`)
   }

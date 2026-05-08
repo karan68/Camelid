@@ -1,6 +1,6 @@
 # Camelid frontend
 
-This frontend targets Camelid. During the naming transition, the backend crate, binary, and some diagnostics still use `backendinference`; the commands below keep those current implementation names.
+This frontend targets Camelid. During the naming transition, the backend crate, binary, and some diagnostics still use `camelid`; the commands below keep those current implementation names.
 
 ## Source of truth
 
@@ -68,7 +68,7 @@ http://127.0.0.1:8181
 Override it at build/dev time with:
 
 ```bash
-VITE_BACKENDINFERENCE_API_BASE=http://127.0.0.1:8181 npm run dev
+VITE_CAMELID_API_BASE=http://127.0.0.1:8181 npm run dev
 ```
 
 You can also edit the API base in the UI sidebar while testing.

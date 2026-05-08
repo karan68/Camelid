@@ -33,7 +33,7 @@ console.log(`output_projection_token_deltas=${JSON.stringify(report.output_proje
 
 function usage() {
   console.error('usage: node scripts/compare-forward-traces.mjs --left <forward-trace.json> --right <forward-trace.json> [--tolerance 0.000001] [--top 20] [--json-out <report.json>]')
-  console.error('compares ordered backendinference.forward-trace.v1 bundles and reports the first changed forward-pass stage from embedding through logits')
+  console.error('compares ordered camelid.forward-trace.v1 bundles and reports the first changed forward-pass stage from embedding through logits')
   process.exit(2)
 }
 
@@ -65,8 +65,8 @@ function nonNegativeNumber(value, name) {
 
 function loadTrace(path) {
   const trace = JSON.parse(fs.readFileSync(path, 'utf8'))
-  if (trace.schema !== 'backendinference.forward-trace.v1') {
-    throw new Error(`${path}: expected schema backendinference.forward-trace.v1, got ${JSON.stringify(trace.schema)}`)
+  if (trace.schema !== 'camelid.forward-trace.v1') {
+    throw new Error(`${path}: expected schema camelid.forward-trace.v1, got ${JSON.stringify(trace.schema)}`)
   }
   if (!Array.isArray(trace.stages)) throw new Error(`${path}: missing stages array`)
   if (trace.stage_count !== undefined && trace.stage_count !== trace.stages.length) {
@@ -85,7 +85,7 @@ function compareForwardTraces(left, right, { tolerance, topN }) {
   const stageDeltas = compareStages(left.trace.stages, right.trace.stages, tolerance)
   const changedStageDeltas = stageDeltas.filter(delta => delta.changed)
   return {
-    schema: 'backendinference.forward-trace-comparison.v1',
+    schema: 'camelid.forward-trace-comparison.v1',
     tolerance,
     left: summarizeTrace(left),
     right: summarizeTrace(right),

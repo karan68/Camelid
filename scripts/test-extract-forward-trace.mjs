@@ -25,14 +25,14 @@ try {
     '--json-out', outputPath,
   ], { cwd: resolve(scriptDir, '..') })
 
-  assert.match(stdout, /schema=backendinference\.forward-trace\.v1/)
+  assert.match(stdout, /schema=camelid\.forward-trace\.v1/)
   assert.match(stdout, /selected_layers=0,1/)
   assert.match(stdout, /first_stage=embedding/)
   assert.match(stdout, /last_stage=logits/)
   assert.match(stdout, /stage_count=43/)
 
   const trace = JSON.parse(await readFile(outputPath, 'utf8'))
-  assert.equal(trace.schema, 'backendinference.forward-trace.v1')
+  assert.equal(trace.schema, 'camelid.forward-trace.v1')
   assert.deepEqual(trace.selected_layers, [0, 1])
   assert.equal(trace.stage_count, 43)
   assert.deepEqual(trace.prompt_token_ids, [1, 529, 29989])
@@ -125,10 +125,10 @@ try {
   )
 
   const sparsePath = join(tempDir, 'sparse-capture.json')
-  await writeFile(sparsePath, `${JSON.stringify({ backendinference: { prompt_token_ids: [1] } }, null, 2)}\n`)
+  await writeFile(sparsePath, `${JSON.stringify({ camelid: { prompt_token_ids: [1] } }, null, 2)}\n`)
   await assert.rejects(
     () => execFileAsync(process.execPath, [extractScript, '--input', sparsePath, '--json-out', join(tempDir, 'sparse-trace.json')], { cwd: resolve(scriptDir, '..') }),
-    /missing backendinference\.dense diagnostics; rerun with backendinference_dense_diagnostics=true/,
+    /missing camelid\.dense diagnostics; rerun with camelid_dense_diagnostics=true/,
   )
 
   console.log('extract-forward-trace self-test passed')
@@ -148,7 +148,7 @@ function capture() {
       { id: 29907, token: 'C', logprob: -0.03 },
       { id: 315, token: ' C', logprob: -5.25 },
     ],
-    backendinference: {
+    camelid: {
       prompt_token_ids: [1, 529, 29989],
       generated_token_ids: [16301],
       dense_metadata: {

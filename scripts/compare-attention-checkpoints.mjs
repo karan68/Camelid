@@ -14,7 +14,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 
 if (!args.has('left') || !args.has('right')) {
   console.error('usage: node scripts/compare-attention-checkpoints.mjs --left <bundle.json> --right <bundle.json> [--atol 1e-5] [--rtol 1e-4] [--json-out <report.json>]')
-  console.error('compares two backendinference.attention-checkpoints.v1 bundles and reports the first sampled q/k/v/o or attention-trace mismatch')
+  console.error('compares two camelid.attention-checkpoints.v1 bundles and reports the first sampled q/k/v/o or attention-trace mismatch')
   process.exit(2)
 }
 

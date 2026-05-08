@@ -23,7 +23,7 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh clippy -q --lib -- -D warnings`
 - `./scripts/with-rustup-cargo.sh clippy -q --all-targets -- -D warnings`
 - `bash scripts/check-public-scrub.sh`
-- `./scripts/with-rustup-cargo.sh build -q --release --bin backendinference`
+- `./scripts/with-rustup-cargo.sh build -q --release --bin camelid`
 
 Result: all passed locally.
 

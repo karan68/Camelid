@@ -20,6 +20,6 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh test -q`
 - `./scripts/with-rustup-cargo.sh clippy -q --all-targets -- -D warnings`
 - `bash scripts/check-public-scrub.sh`
-- `./scripts/with-rustup-cargo.sh build -q --release --bin backendinference`
+- `./scripts/with-rustup-cargo.sh build -q --release --bin camelid`
 
 Claim boundary: performance-only. 8B 1024/2048 remain red/timeout-blocked until fresh PASS artifacts exist.

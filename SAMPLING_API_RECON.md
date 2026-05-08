@@ -7,7 +7,7 @@ Source: sampling/API behavior recon focused on common OpenAI-compatible local-ru
 
 ## Summary
 
-backendinference should keep sampling independent from inference execution and HTTP serving. The inference engine should produce logits; the sampler chooses the next token from logits and token history; the HTTP/API layer translates OpenAI-compatible requests into generation settings and returns truthful responses.
+camelid should keep sampling independent from inference execution and HTTP serving. The inference engine should produce logits; the sampler chooses the next token from logits and token history; the HTTP/API layer translates OpenAI-compatible requests into generation settings and returns truthful responses.
 
 Initial implementation should support deterministic greedy sampling first, then seeded random sampling with temperature, top-k, top-p, and repeat penalty. Streaming should be planned as SSE but should continue returning `501 stream_not_supported` until real token streaming exists.
 
@@ -15,7 +15,7 @@ Initial implementation should support deterministic greedy sampling first, then 
 
 Local inference runtimes commonly use a composable sampler chain. User-facing sampling parameters can map to penalties, grammar constraints, top-k, top-p, min-p, typical, temperature, mirostat, distribution sampling, or greedy sampling.
 
-For backendinference, do not implement the whole chain at once. Implement a small, deterministic subset with clear tests:
+For camelid, do not implement the whole chain at once. Implement a small, deterministic subset with clear tests:
 
 1. repeat penalty
 2. temperature
@@ -172,7 +172,7 @@ Map to OpenAI-compatible strings:
 
 ## OpenAI-compatible API structs
 
-Current backendinference API has a minimal `ChatCompletionRequest`. Expand toward:
+Current camelid API has a minimal `ChatCompletionRequest`. Expand toward:
 
 ```rust
 pub struct ChatCompletionRequest {
@@ -210,7 +210,7 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatChoice>,
     pub usage: Usage,
-    pub backendinference: BackendMetadata,
+    pub camelid: BackendMetadata,
 }
 ```
 
@@ -261,7 +261,7 @@ Do not expose streaming until the generation loop can yield real token events an
 
 ## ForgeLocal compatibility notes
 
-ForgeLocal can use backendinference through its external OpenAI-compatible provider flow if backendinference exposes:
+ForgeLocal can use camelid through its external OpenAI-compatible provider flow if camelid exposes:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
@@ -286,7 +286,7 @@ ForgeLocal expects at least:
 }
 ```
 
-It may provide an API key even for local providers. backendinference should ignore authorization locally unless auth is explicitly added later.
+It may provide an API key even for local providers. camelid should ignore authorization locally unless auth is explicitly added later.
 
 ## Phase sampling/API implementation tasks
 

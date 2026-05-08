@@ -1,6 +1,6 @@
 # Camelid Decisions
 
-Naming transition: Camelid is the project/product name. Existing `backendinference` names below are historical/current implementation names unless a later decision explicitly renames crates, binaries, or repository metadata.
+Naming transition: Camelid is the project/product name. Existing `camelid` names below are historical/current implementation names unless a later decision explicitly renames crates, binaries, or repository metadata.
 
 ## Decision log
 

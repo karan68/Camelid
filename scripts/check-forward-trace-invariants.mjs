@@ -11,8 +11,8 @@ const tolerance = numberArg(args.tolerance ?? '0.00001', '--tolerance')
 const root = JSON.parse(fs.readFileSync(inputPath, 'utf8'))
 const failures = []
 
-if (root.schema !== 'backendinference.forward-trace.v1') {
-  failures.push(failure('schema', `expected backendinference.forward-trace.v1, got ${JSON.stringify(root.schema)}`))
+if (root.schema !== 'camelid.forward-trace.v1') {
+  failures.push(failure('schema', `expected camelid.forward-trace.v1, got ${JSON.stringify(root.schema)}`))
 }
 const stages = Array.isArray(root.stages) ? root.stages : []
 if (!Array.isArray(root.stages)) failures.push(failure('stages', 'expected stages array'))
@@ -81,7 +81,7 @@ for (const [index, row] of (root.top_logits ?? []).entries()) {
 }
 
 const report = {
-  schema: 'backendinference.forward-trace-invariants.v1',
+  schema: 'camelid.forward-trace-invariants.v1',
   source: inputPath,
   tolerance,
   stage_count: stages.length,

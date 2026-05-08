@@ -405,8 +405,8 @@ pub fn diagnostic_zero_delta_selector(target: DeltaZeroTarget) -> Result<String>
 
 fn diagnostic_zero_delta_key(target: DeltaZeroTarget) -> &'static str {
     match target {
-        DeltaZeroTarget::Attention => "BACKENDINFERENCE_ZERO_ATTENTION_DELTA",
-        DeltaZeroTarget::Ffn => "BACKENDINFERENCE_ZERO_FFN_DELTA",
+        DeltaZeroTarget::Attention => "CAMELID_ZERO_ATTENTION_DELTA",
+        DeltaZeroTarget::Ffn => "CAMELID_ZERO_FFN_DELTA",
     }
 }
 
@@ -437,101 +437,101 @@ fn diagnostic_zero_delta_value(key: &str, value: &str, layer_idx: usize) -> Resu
 }
 
 pub fn diagnostic_rope_pairing() -> Result<RopePairing> {
-    match env::var("BACKENDINFERENCE_ROPE_PAIRING") {
+    match env::var("CAMELID_ROPE_PAIRING") {
         Ok(value) if value == "split_half" => Ok(RopePairing::SplitHalf),
         Ok(value) if value == "adjacent_even_odd" || value.is_empty() => {
             Ok(RopePairing::AdjacentEvenOdd)
         }
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_ROPE_PAIRING {value:?}; expected adjacent_even_odd or split_half"
+            "unsupported CAMELID_ROPE_PAIRING {value:?}; expected adjacent_even_odd or split_half"
         ))),
         Err(env::VarError::NotPresent) => Ok(RopePairing::AdjacentEvenOdd),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_ROPE_PAIRING: {err}"
+            "invalid CAMELID_ROPE_PAIRING: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_rope_direction() -> Result<RopeDirection> {
-    match env::var("BACKENDINFERENCE_ROPE_DIRECTION") {
+    match env::var("CAMELID_ROPE_DIRECTION") {
         Ok(value) if value == "inverse" => Ok(RopeDirection::Inverse),
         Ok(value) if value == "forward" || value.is_empty() => Ok(RopeDirection::Forward),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_ROPE_DIRECTION {value:?}; expected forward or inverse"
+            "unsupported CAMELID_ROPE_DIRECTION {value:?}; expected forward or inverse"
         ))),
         Err(env::VarError::NotPresent) => Ok(RopeDirection::Forward),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_ROPE_DIRECTION: {err}"
+            "invalid CAMELID_ROPE_DIRECTION: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_rope_position_mode() -> Result<RopePositionMode> {
-    match env::var("BACKENDINFERENCE_ROPE_POSITION_MODE") {
+    match env::var("CAMELID_ROPE_POSITION_MODE") {
         Ok(value) if value == "one_based" => Ok(RopePositionMode::OneBased),
         Ok(value) if value == "zero_based" || value.is_empty() => Ok(RopePositionMode::ZeroBased),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_ROPE_POSITION_MODE {value:?}; expected zero_based or one_based"
+            "unsupported CAMELID_ROPE_POSITION_MODE {value:?}; expected zero_based or one_based"
         ))),
         Err(env::VarError::NotPresent) => Ok(RopePositionMode::ZeroBased),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_ROPE_POSITION_MODE: {err}"
+            "invalid CAMELID_ROPE_POSITION_MODE: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_gqa_head_mapping() -> Result<GqaHeadMapping> {
-    match env::var("BACKENDINFERENCE_GQA_HEAD_MAPPING") {
+    match env::var("CAMELID_GQA_HEAD_MAPPING") {
         Ok(value) if value == "modulo" => Ok(GqaHeadMapping::Modulo),
         Ok(value) if value == "grouped" || value.is_empty() => Ok(GqaHeadMapping::Grouped),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_GQA_HEAD_MAPPING {value:?}; expected grouped or modulo"
+            "unsupported CAMELID_GQA_HEAD_MAPPING {value:?}; expected grouped or modulo"
         ))),
         Err(env::VarError::NotPresent) => Ok(GqaHeadMapping::Grouped),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_GQA_HEAD_MAPPING: {err}"
+            "invalid CAMELID_GQA_HEAD_MAPPING: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_attention_score_scale() -> Result<AttentionScoreScale> {
-    match env::var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE") {
+    match env::var("CAMELID_ATTENTION_SCORE_SCALE") {
         Ok(value) if value == "none" => Ok(AttentionScoreScale::None),
         Ok(value) if value == "head_dim" || value.is_empty() => Ok(AttentionScoreScale::HeadDim),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_ATTENTION_SCORE_SCALE {value:?}; expected head_dim or none"
+            "unsupported CAMELID_ATTENTION_SCORE_SCALE {value:?}; expected head_dim or none"
         ))),
         Err(env::VarError::NotPresent) => Ok(AttentionScoreScale::HeadDim),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_ATTENTION_SCORE_SCALE: {err}"
+            "invalid CAMELID_ATTENTION_SCORE_SCALE: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_linear_accumulation_precision() -> Result<LinearAccumulationPrecision> {
-    match env::var("BACKENDINFERENCE_LINEAR_ACCUMULATION") {
+    match env::var("CAMELID_LINEAR_ACCUMULATION") {
         Ok(value) if value == "f64" => Ok(LinearAccumulationPrecision::F64),
         Ok(value) if value == "f32" || value.is_empty() => Ok(LinearAccumulationPrecision::F32),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_LINEAR_ACCUMULATION {value:?}; expected f32 or f64"
+            "unsupported CAMELID_LINEAR_ACCUMULATION {value:?}; expected f32 or f64"
         ))),
         Err(env::VarError::NotPresent) => Ok(LinearAccumulationPrecision::F32),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_LINEAR_ACCUMULATION: {err}"
+            "invalid CAMELID_LINEAR_ACCUMULATION: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_ffn_gate_up_order() -> Result<FfnGateUpOrder> {
-    match env::var("BACKENDINFERENCE_FFN_GATE_UP_ORDER") {
+    match env::var("CAMELID_FFN_GATE_UP_ORDER") {
         Ok(value) if value == "up_gate" => Ok(FfnGateUpOrder::UpGate),
         Ok(value) if value == "gate_up" || value.is_empty() => Ok(FfnGateUpOrder::GateUp),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_FFN_GATE_UP_ORDER {value:?}; expected gate_up or up_gate"
+            "unsupported CAMELID_FFN_GATE_UP_ORDER {value:?}; expected gate_up or up_gate"
         ))),
         Err(env::VarError::NotPresent) => Ok(FfnGateUpOrder::GateUp),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_FFN_GATE_UP_ORDER: {err}"
+            "invalid CAMELID_FFN_GATE_UP_ORDER: {err}"
         ))),
     }
 }
@@ -556,35 +556,37 @@ fn map_attention_head_to_kv_head(
 }
 
 pub fn diagnostic_output_projection_layout() -> Result<OutputProjectionLayout> {
-    match env::var("BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT") {
+    match env::var("CAMELID_OUTPUT_PROJECTION_LAYOUT") {
         Ok(value) if value == "descriptor" => Ok(OutputProjectionLayout::Descriptor),
         Ok(value) if value == "token_major" || value.is_empty() => Ok(OutputProjectionLayout::TokenMajor),
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT {value:?}; expected descriptor or token_major"
+            "unsupported CAMELID_OUTPUT_PROJECTION_LAYOUT {value:?}; expected descriptor or token_major"
         ))),
         Err(env::VarError::NotPresent) => Ok(OutputProjectionLayout::TokenMajor),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT: {err}"
+            "invalid CAMELID_OUTPUT_PROJECTION_LAYOUT: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_square_linear_layout() -> Result<SquareLinearLayout> {
-    match env::var("BACKENDINFERENCE_SQUARE_LINEAR_LAYOUT") {
+    match env::var("CAMELID_SQUARE_LINEAR_LAYOUT") {
         Ok(value) if value == "transposed" => Ok(SquareLinearLayout::Transposed),
-        Ok(value) if value == "descriptor" || value.is_empty() => Ok(SquareLinearLayout::Descriptor),
+        Ok(value) if value == "descriptor" || value.is_empty() => {
+            Ok(SquareLinearLayout::Descriptor)
+        }
         Ok(value) => Err(BackendError::InvalidModelMetadata(format!(
-            "unsupported BACKENDINFERENCE_SQUARE_LINEAR_LAYOUT {value:?}; expected descriptor or transposed"
+            "unsupported CAMELID_SQUARE_LINEAR_LAYOUT {value:?}; expected descriptor or transposed"
         ))),
         Err(env::VarError::NotPresent) => Ok(SquareLinearLayout::Transposed),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_SQUARE_LINEAR_LAYOUT: {err}"
+            "invalid CAMELID_SQUARE_LINEAR_LAYOUT: {err}"
         ))),
     }
 }
 
 pub fn diagnostic_rectangular_linear_layout() -> Result<RectangularLinearLayout> {
-    diagnostic_rectangular_linear_layout_env("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT")
+    diagnostic_rectangular_linear_layout_env("CAMELID_RECTANGULAR_LINEAR_LAYOUT")
 }
 
 pub fn diagnostic_rectangular_linear_layout_for_role(
@@ -600,7 +602,7 @@ pub fn diagnostic_rectangular_linear_layout_for_role(
             }
         })
         .collect::<String>();
-    let key = format!("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_{role_key}");
+    let key = format!("CAMELID_RECTANGULAR_LINEAR_LAYOUT_{role_key}");
     match env::var(&key) {
         Ok(_) => diagnostic_rectangular_linear_layout_env(&key),
         Err(env::VarError::NotPresent) => diagnostic_rectangular_linear_layout(),
@@ -626,24 +628,24 @@ fn diagnostic_rectangular_linear_layout_env(key: &str) -> Result<RectangularLine
 }
 
 pub fn diagnostic_rms_norm_epsilon(config_epsilon: f32) -> Result<f32> {
-    match env::var("BACKENDINFERENCE_RMS_NORM_EPSILON") {
+    match env::var("CAMELID_RMS_NORM_EPSILON") {
         Ok(value) if value.is_empty() => Ok(config_epsilon),
         Ok(value) => {
             let epsilon = value.parse::<f32>().map_err(|err| {
                 BackendError::InvalidModelMetadata(format!(
-                    "invalid BACKENDINFERENCE_RMS_NORM_EPSILON {value:?}: {err}"
+                    "invalid CAMELID_RMS_NORM_EPSILON {value:?}: {err}"
                 ))
             })?;
             if !epsilon.is_finite() || epsilon < 0.0 {
                 return Err(BackendError::InvalidModelMetadata(format!(
-                    "unsupported BACKENDINFERENCE_RMS_NORM_EPSILON {value:?}; expected a finite non-negative float"
+                    "unsupported CAMELID_RMS_NORM_EPSILON {value:?}; expected a finite non-negative float"
                 )));
             }
             Ok(epsilon)
         }
         Err(env::VarError::NotPresent) => Ok(config_epsilon),
         Err(err) => Err(BackendError::InvalidModelMetadata(format!(
-            "invalid BACKENDINFERENCE_RMS_NORM_EPSILON: {err}"
+            "invalid CAMELID_RMS_NORM_EPSILON: {err}"
         ))),
     }
 }
@@ -2029,22 +2031,22 @@ fn copy_tensor_rows_into(
 }
 
 fn forward_memory_trace_enabled() -> bool {
-    env_flag_enabled("BACKENDINFERENCE_FORWARD_MEMORY_TRACE")
+    env_flag_enabled("CAMELID_FORWARD_MEMORY_TRACE")
 }
 
 fn structured_forward_memory_enabled() -> bool {
-    env_flag_enabled("BACKENDINFERENCE_FORWARD_RSS_TIMINGS")
+    env_flag_enabled("CAMELID_FORWARD_RSS_TIMINGS")
         || forward_memory_trace_enabled()
         || prefill_layer_major_attribution_enabled()
 }
 
 fn prefill_layer_major_attribution_enabled() -> bool {
-    env_flag_enabled("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION")
+    env_flag_enabled("CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION")
 }
 
-const Q8_FILE_CACHE_BYTES_ENV: &str = "BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES";
+const Q8_FILE_CACHE_BYTES_ENV: &str = "CAMELID_Q8_0_FILE_CACHE_BYTES";
 const PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES_ENV: &str =
-    "BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES";
+    "CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES";
 const DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 fn prefill_layer_major_q8_file_cache_capacity_override(
@@ -2079,7 +2081,7 @@ fn env_flag_enabled(key: &str) -> bool {
 fn prefill_chunk_token_count(prefill_count: usize) -> usize {
     const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 256;
     prefill_chunk_token_count_from_env(
-        "BACKENDINFERENCE_PREFILL_CHUNK_TOKENS",
+        "CAMELID_PREFILL_CHUNK_TOKENS",
         prefill_count,
         DEFAULT_PREFILL_CHUNK_TOKENS,
     )
@@ -2087,14 +2089,14 @@ fn prefill_chunk_token_count(prefill_count: usize) -> usize {
 
 fn prefill_layer_major_chunk_token_count(prefill_count: usize) -> usize {
     const DEFAULT_PREFILL_LAYER_MAJOR_CHUNK_TOKENS: usize = 512;
-    if env::var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS").is_ok() {
+    if env::var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS").is_ok() {
         return prefill_chunk_token_count_from_env(
-            "BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS",
+            "CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS",
             prefill_count,
             DEFAULT_PREFILL_LAYER_MAJOR_CHUNK_TOKENS,
         );
     }
-    if env::var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS").is_ok() {
+    if env::var("CAMELID_PREFILL_CHUNK_TOKENS").is_ok() {
         return prefill_chunk_token_count(prefill_count);
     }
     DEFAULT_PREFILL_LAYER_MAJOR_CHUNK_TOKENS
@@ -2119,7 +2121,7 @@ fn parse_prefill_chunk_token_count(value: &str, prefill_count: usize) -> Option<
 }
 
 fn prefill_layer_major_enabled(weights: &LlamaLoadedWeights) -> bool {
-    match env::var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR") {
+    match env::var("CAMELID_PREFILL_LAYER_MAJOR") {
         Ok(value) => {
             let trimmed = value.trim();
             !(trimmed.eq_ignore_ascii_case("0")
@@ -2170,7 +2172,7 @@ fn trace_forward_memory(phase: &str) {
     let q8_file_cache_mib = q8_reads.cache_bytes as f64 / (1024.0 * 1024.0);
     let q8_file_cache_capacity_mib = q8_reads.cache_capacity_bytes as f64 / (1024.0 * 1024.0);
     eprintln!(
-        "backendinference_forward_memory_trace phase={phase} rss_kib={rss_kib} free_like_pages={free_like_pages} free_like_mib={free_like_mib} throttled_pages={throttled_pages} q8_file_read_calls={} q8_file_read_bytes={} q8_file_read_mib={q8_file_read_mib:.2} q8_file_cache_hits={} q8_file_cache_hit_bytes={} q8_file_cache_hit_mib={q8_file_cache_hit_mib:.2} q8_file_cache_misses={} q8_file_cache_miss_bytes={} q8_file_cache_miss_mib={q8_file_cache_miss_mib:.2} q8_file_cache_inserts={} q8_file_cache_insert_bytes={} q8_file_cache_insert_mib={q8_file_cache_insert_mib:.2} q8_file_cache_evictions={} q8_file_cache_evicted_bytes={} q8_file_cache_evicted_mib={q8_file_cache_evicted_mib:.2} q8_file_cache_merges={} q8_file_cache_merged_bytes={} q8_file_cache_merged_mib={q8_file_cache_merged_mib:.2} q8_file_cache_entries={} q8_file_cache_bytes={} q8_file_cache_mib={q8_file_cache_mib:.2} q8_file_cache_capacity_bytes={} q8_file_cache_capacity_mib={q8_file_cache_capacity_mib:.2}",
+        "camelid_forward_memory_trace phase={phase} rss_kib={rss_kib} free_like_pages={free_like_pages} free_like_mib={free_like_mib} throttled_pages={throttled_pages} q8_file_read_calls={} q8_file_read_bytes={} q8_file_read_mib={q8_file_read_mib:.2} q8_file_cache_hits={} q8_file_cache_hit_bytes={} q8_file_cache_hit_mib={q8_file_cache_hit_mib:.2} q8_file_cache_misses={} q8_file_cache_miss_bytes={} q8_file_cache_miss_mib={q8_file_cache_miss_mib:.2} q8_file_cache_inserts={} q8_file_cache_insert_bytes={} q8_file_cache_insert_mib={q8_file_cache_insert_mib:.2} q8_file_cache_evictions={} q8_file_cache_evicted_bytes={} q8_file_cache_evicted_mib={q8_file_cache_evicted_mib:.2} q8_file_cache_merges={} q8_file_cache_merged_bytes={} q8_file_cache_merged_mib={q8_file_cache_merged_mib:.2} q8_file_cache_entries={} q8_file_cache_bytes={} q8_file_cache_mib={q8_file_cache_mib:.2} q8_file_cache_capacity_bytes={} q8_file_cache_capacity_mib={q8_file_cache_capacity_mib:.2}",
         q8_reads.read_calls,
         q8_reads.read_bytes,
         q8_reads.cache_hits,
@@ -5619,14 +5621,14 @@ fn should_use_borrowed_q8_0_block_dot(
 fn q8_0_block_dot_enabled() -> bool {
     // Keep known-good parity on the dequantized f32 path by default. The q8_0 x q8_0
     // block-dot path remains available as an explicit performance/diagnostic probe.
-    q8_0_env_flag_enabled("BACKENDINFERENCE_Q8_0_BLOCK_DOT")
+    q8_0_env_flag_enabled("CAMELID_Q8_0_BLOCK_DOT")
 }
 
 fn q8_0_file_reader_block_dot_enabled() -> bool {
     // Lazy/file-backed Q8 rows are Camelid's production Q8_0 surface. Use the
     // quantized-input block-dot path by default to match llama.cpp-style Q8_0 matmul
     // tie-break behavior, while keeping an explicit dequantized-f32 escape hatch.
-    !q8_0_env_flag_disabled("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT")
+    !q8_0_env_flag_disabled("CAMELID_Q8_0_FILE_READER_BLOCK_DOT")
 }
 
 fn q8_0_env_flag_disabled(key: &str) -> bool {
@@ -5657,7 +5659,7 @@ fn q8_0_env_flag_enabled(key: &str) -> bool {
 }
 
 fn lazy_q8_0_linear_enabled() -> bool {
-    match env::var("BACKENDINFERENCE_LAZY_Q8_0_LINEAR") {
+    match env::var("CAMELID_LAZY_Q8_0_LINEAR") {
         Ok(value)
             if value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
@@ -6576,10 +6578,10 @@ fn should_parallelize_q8_0_file_reader_output(output_width: usize) -> bool {
     if rayon::current_num_threads() <= 1 {
         return false;
     }
-    if env::var("BACKENDINFERENCE_PARALLEL_LINEAR").is_ok() {
+    if env::var("CAMELID_PARALLEL_LINEAR").is_ok() {
         return should_parallelize_linear_output(output_width);
     }
-    let min_outputs = env::var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS")
+    let min_outputs = env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -6597,7 +6599,7 @@ fn q8_0_file_reader_chunk_rows(row_bytes_len: usize, output_width: usize) -> Res
     if output_width == 0 {
         return Ok(1);
     }
-    let chunk_bytes = parse_byte_count_env("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES")
+    let chunk_bytes = parse_byte_count_env("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES")
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_Q8_0_FILE_READER_CHUNK_BYTES);
     let budget_rows = (chunk_bytes / row_bytes_len).max(1).min(output_width);
@@ -6639,10 +6641,9 @@ fn q8_0_file_reader_output_scratch_chunk_rows(
     if output_width == 0 {
         return Ok(1);
     }
-    let scratch_bytes =
-        parse_byte_count_env("BACKENDINFERENCE_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES")
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES);
+    let scratch_bytes = parse_byte_count_env("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES")
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES);
     let bytes_per_output_row = input_rows
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| {
@@ -8383,55 +8384,52 @@ mod tests {
     #[test]
     fn prefill_chunk_token_count_accepts_full_prompt_probe() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
         assert_eq!(prefill_chunk_token_count(2047), 256);
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "256");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "256");
         assert_eq!(prefill_chunk_token_count(2047), 256);
 
         for value in ["all", "full", "prompt", "unbounded", " FULL "] {
-            std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", value);
+            std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", value);
             assert_eq!(prefill_chunk_token_count(2047), 2047);
         }
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "0");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "0");
         assert_eq!(prefill_chunk_token_count(2047), 256);
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
     }
 
     #[test]
     fn prefill_layer_major_chunk_token_count_has_separate_headroom_default() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
         assert_eq!(prefill_chunk_token_count(2047), 256);
         assert_eq!(prefill_layer_major_chunk_token_count(2047), 512);
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "128");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "128");
         assert_eq!(prefill_layer_major_chunk_token_count(2047), 128);
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "1024");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "1024");
         assert_eq!(prefill_layer_major_chunk_token_count(2047), 1024);
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "all");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "all");
         assert_eq!(prefill_layer_major_chunk_token_count(2047), 2047);
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "0");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS", "0");
         assert_eq!(prefill_layer_major_chunk_token_count(2047), 512);
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS");
     }
 
     #[test]
     fn q8_file_reader_batch_chunk_rows_respect_output_scratch_budget() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES", "1024");
-        std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES",
-            "64",
-        );
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES", "1024");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES", "64");
 
         assert_eq!(q8_0_file_reader_chunk_rows(32, 100).unwrap(), 32);
         assert_eq!(
@@ -8450,11 +8448,8 @@ mod tests {
         assert_eq!(q8_0_file_reader_chunk_rows(32, 64).unwrap(), 64);
         assert_eq!(q8_0_file_reader_chunk_rows(32, 65).unwrap(), 32);
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES", "1 KiB");
-        std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES",
-            "64_B",
-        );
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES", "1 KiB");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES", "64_B");
         assert_eq!(q8_0_file_reader_chunk_rows(32, 100).unwrap(), 32);
         assert_eq!(
             q8_0_file_reader_chunk_rows_for_batch(32, 100, 8, true).unwrap(),
@@ -8465,16 +8460,16 @@ mod tests {
             32
         );
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES");
     }
 
     #[test]
     fn q8_file_reader_default_coalesces_llama3_8b_ffn_q8_shapes() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES");
 
         let llama3_8b_hidden_row_bytes = 4096 / Q8_0_BLOCK_VALUES * Q8BlockReader::BLOCK_SIZE_BYTES;
         let llama3_8b_ffn_row_bytes = 14336 / Q8_0_BLOCK_VALUES * Q8BlockReader::BLOCK_SIZE_BYTES;
@@ -8510,15 +8505,15 @@ mod tests {
         let lazy_q8_weights = tiny_prefill_schedule_weights(lazy_q8_attention_q);
         assert!(prefill_layer_major_enabled(&lazy_q8_weights));
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR", "1");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "1");
         assert!(prefill_layer_major_enabled(&dense_weights));
 
         for value in ["0", "false", "off", "disabled", " FALSE ", "Off"] {
-            std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR", value);
+            std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", value);
             assert!(!prefill_layer_major_enabled(&lazy_q8_weights));
         }
 
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
     }
 
     #[test]
@@ -8552,25 +8547,19 @@ mod tests {
             Some(DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES)
         );
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "64 MiB");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "64 MiB");
         assert_eq!(
             prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 2),
             None
         );
 
-        std::env::set_var(
-            "BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES",
-            "0",
-        );
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES", "0");
         assert_eq!(
             prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 1),
             Some(0)
         );
 
-        std::env::set_var(
-            "BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES",
-            "1 MiB",
-        );
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES", "1 MiB");
         assert_eq!(
             prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 1),
             Some(1024 * 1024)
@@ -8916,35 +8905,35 @@ mod tests {
 
     fn clear_dense_diagnostic_env() {
         for key in [
-            "BACKENDINFERENCE_ATTENTION_SCORE_SCALE",
-            "BACKENDINFERENCE_FFN_GATE_UP_ORDER",
-            "BACKENDINFERENCE_FORWARD_MEMORY_TRACE",
-            "BACKENDINFERENCE_FORWARD_RSS_TIMINGS",
-            "BACKENDINFERENCE_GQA_HEAD_MAPPING",
-            "BACKENDINFERENCE_LINEAR_ACCUMULATION",
-            "BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT",
-            "BACKENDINFERENCE_PREFILL_LAYER_MAJOR",
-            "BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES",
-            "BACKENDINFERENCE_PARALLEL_LINEAR",
-            "BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS",
-            "BACKENDINFERENCE_Q8_0_BLOCK_DOT",
-            "BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT",
-            "BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES",
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
-            "BACKENDINFERENCE_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES",
-            "BACKENDINFERENCE_PARALLEL_LINEAR",
-            "BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS",
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT",
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K",
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_V",
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_FFN_DOWN",
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_FFN_GATE",
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_FFN_UP",
-            "BACKENDINFERENCE_RMS_NORM_EPSILON",
-            "BACKENDINFERENCE_ROPE_DIRECTION",
-            "BACKENDINFERENCE_ROPE_PAIRING",
-            "BACKENDINFERENCE_ROPE_POSITION_MODE",
-            "BACKENDINFERENCE_SQUARE_LINEAR_LAYOUT",
+            "CAMELID_ATTENTION_SCORE_SCALE",
+            "CAMELID_FFN_GATE_UP_ORDER",
+            "CAMELID_FORWARD_MEMORY_TRACE",
+            "CAMELID_FORWARD_RSS_TIMINGS",
+            "CAMELID_GQA_HEAD_MAPPING",
+            "CAMELID_LINEAR_ACCUMULATION",
+            "CAMELID_OUTPUT_PROJECTION_LAYOUT",
+            "CAMELID_PREFILL_LAYER_MAJOR",
+            "CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES",
+            "CAMELID_PARALLEL_LINEAR",
+            "CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS",
+            "CAMELID_Q8_0_BLOCK_DOT",
+            "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
+            "CAMELID_Q8_0_FILE_CACHE_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES",
+            "CAMELID_PARALLEL_LINEAR",
+            "CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_V",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT_FFN_DOWN",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT_FFN_GATE",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT_FFN_UP",
+            "CAMELID_RMS_NORM_EPSILON",
+            "CAMELID_ROPE_DIRECTION",
+            "CAMELID_ROPE_PAIRING",
+            "CAMELID_ROPE_POSITION_MODE",
+            "CAMELID_SQUARE_LINEAR_LAYOUT",
         ] {
             std::env::remove_var(key);
         }
@@ -9037,8 +9026,8 @@ mod tests {
     #[test]
     fn linear_projection_diagnostics_reconstruct_descriptor_layout() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K");
-        std::env::set_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K");
+        std::env::set_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
 
         let input = CpuTensor::from_f32("input", vec![1, 3], vec![2.0, -1.0, 0.5]).unwrap();
         let weight =
@@ -9076,8 +9065,8 @@ mod tests {
     #[test]
     fn linear_projection_diagnostics_reconstruct_transposed_layout() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_V");
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_V");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT");
 
         let input = CpuTensor::from_f32("input", vec![1, 3], vec![2.0, -1.0, 0.5]).unwrap();
         let weight =
@@ -9107,8 +9096,8 @@ mod tests {
     #[test]
     fn linear_projection_diagnostics_report_nonzero_reconstruction_delta() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_Q");
-        std::env::set_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_Q");
+        std::env::set_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
 
         let input = CpuTensor::from_f32("input", vec![1, 3], vec![2.0, -1.0, 0.5]).unwrap();
         let weight =
@@ -9138,7 +9127,7 @@ mod tests {
     fn parallel_linear_matches_serial_descriptor_transposed_and_q8_rows() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "off");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "off");
 
         let input = CpuTensor::from_f32("input", vec![1, 4], vec![2.0, -1.0, 0.5, 3.0]).unwrap();
         let descriptor_weight = CpuTensor::from_f32(
@@ -9175,8 +9164,8 @@ mod tests {
         )
         .unwrap();
 
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "on");
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "on");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
         let parallel_descriptor = linear_with_diagnostic_layouts(
             &input,
             &descriptor_weight,
@@ -9198,8 +9187,8 @@ mod tests {
         assert_eq!(parallel_transposed.data, serial_transposed.data);
 
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "off");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "off");
         let mut input_values = Vec::with_capacity(32);
         input_values.push(127.0);
         input_values.extend((1..32).map(|idx| idx as f32 - 17.0));
@@ -9225,8 +9214,8 @@ mod tests {
         .unwrap();
         let serial_q8 =
             matmul_rhs_transposed_with_precision(&q8_input, &q8_weight, "serial_q8").unwrap();
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "on");
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "on");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
         let parallel_q8 =
             matmul_rhs_transposed_with_precision(&q8_input, &q8_weight, "parallel_q8").unwrap();
 
@@ -9263,14 +9252,14 @@ mod tests {
         assert!(!q8_0_block_dot_enabled());
         assert!(q8_0_file_reader_block_dot_enabled());
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "off");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "off");
         assert!(!q8_0_file_reader_block_dot_enabled());
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
         assert!(q8_0_block_dot_enabled());
         assert!(!q8_0_file_reader_block_dot_enabled());
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "on");
         assert!(q8_0_file_reader_block_dot_enabled());
     }
 
@@ -9279,20 +9268,17 @@ mod tests {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", " on ");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", " on ");
         assert!(q8_0_block_dot_enabled());
 
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", " f32 ");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", " f32 ");
         assert!(!q8_0_file_reader_block_dot_enabled());
 
-        std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT",
-            " dequantized ",
-        );
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", " dequantized ");
         assert!(!q8_0_file_reader_block_dot_enabled());
 
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT");
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
@@ -9365,7 +9351,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "off");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "off");
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         let row0 = Q8_0Block {
             scale: 0.5,
@@ -9417,7 +9403,7 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close(&actual.data, &expected.data);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
@@ -9425,11 +9411,11 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "on");
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "off");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "on");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "off");
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
             (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
         );
 
@@ -9489,7 +9475,7 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close(&actual.data, &expected.data);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
@@ -9511,8 +9497,8 @@ mod tests {
     fn q8_0_file_reader_parallel_respects_explicit_linear_off() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR", "off");
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "off");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
@@ -9525,7 +9511,7 @@ mod tests {
     fn q8_0_file_reader_parallel_uses_existing_linear_threshold_env() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_PARALLEL_LINEAR_MIN_OUTPUTS", "2048");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", "2048");
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
@@ -9566,9 +9552,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
             (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
         );
 
@@ -9618,7 +9604,7 @@ mod tests {
             reads.read_bytes,
             (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
         );
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
     }
 
     #[test]
@@ -9626,9 +9612,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
             (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
         );
 
@@ -9675,7 +9661,7 @@ mod tests {
             reads.read_bytes,
             (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
         );
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
     }
 
     #[test]
@@ -9683,7 +9669,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "on");
 
         let rows: Vec<Q8_0Block> = (0..3)
             .map(|row| Q8_0Block {
@@ -9717,7 +9703,7 @@ mod tests {
             .unwrap();
 
         assert_slice_close(&actual, &expected);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
@@ -9742,9 +9728,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
             (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
         );
 
@@ -9797,7 +9783,7 @@ mod tests {
             reads.read_bytes,
             (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
         );
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
     }
 
     #[test]
@@ -9805,7 +9791,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "on");
 
         let rows: Vec<Q8_0Block> = (0..4)
             .map(|row| Q8_0Block {
@@ -9849,7 +9835,7 @@ mod tests {
         .unwrap();
 
         assert_slice_close(&actual.data, &expected);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
@@ -9857,9 +9843,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "1024");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "1024");
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
             (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
         );
 
@@ -9932,8 +9918,8 @@ mod tests {
             second_reads.cache_hit_bytes,
             (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
         );
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
     }
 
     #[test]
@@ -9941,9 +9927,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
         std::env::set_var(
-            "BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES",
+            "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
             (Q8BlockReader::BLOCK_SIZE_BYTES * 2).to_string(),
         );
 
@@ -9996,7 +9982,7 @@ mod tests {
             reads.read_bytes,
             (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
         );
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
     }
 
     #[test]
@@ -10004,9 +9990,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "1024");
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "1024");
 
         let mut temp_file = tempfile::NamedTempFile::new().unwrap();
         temp_file.write_all(&[1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
@@ -10035,14 +10021,14 @@ mod tests {
         assert_eq!(after_second.cache_entries, 1);
         assert_eq!(after_second.cache_bytes, 4);
         assert_eq!(after_second.cache_capacity_bytes, 1024);
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
     #[test]
     fn q8_0_block_dot_uses_raw_weight_blocks_and_quantized_input_when_opted_in() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
 
         let mut input_values = Vec::with_capacity(32);
         input_values.push(127.0);
@@ -10085,7 +10071,7 @@ mod tests {
     fn rectangular_shape_reinterpretation_preserves_q8_0_blocks_for_transposed_dot() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
 
         let block = Q8_0Block {
             scale: 1.0,
@@ -10111,7 +10097,7 @@ mod tests {
     fn q8_0_block_dot_reads_descriptor_shaped_blocks_as_transposed_rows_when_opted_in() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
 
         let mut input_values = Vec::with_capacity(32);
         input_values.push(127.0);
@@ -10157,7 +10143,7 @@ mod tests {
     fn output_projection_q8_0_descriptor_shape_uses_storage_token_rows() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
 
         let mut input_values = Vec::with_capacity(32);
         input_values.push(127.0);
@@ -10219,7 +10205,7 @@ mod tests {
     fn gated_ffn_activation_uses_q8_0_descriptor_blocks_for_gate_and_up_when_opted_in() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
 
         let mut input_values = Vec::with_capacity(32);
         input_values.push(127.0);
@@ -10334,9 +10320,9 @@ mod tests {
     #[test]
     fn applies_rope_to_each_attention_head() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ROPE_PAIRING");
-        std::env::remove_var("BACKENDINFERENCE_ROPE_DIRECTION");
-        std::env::remove_var("BACKENDINFERENCE_ROPE_POSITION_MODE");
+        std::env::remove_var("CAMELID_ROPE_PAIRING");
+        std::env::remove_var("CAMELID_ROPE_DIRECTION");
+        std::env::remove_var("CAMELID_ROPE_POSITION_MODE");
 
         let config = LlamaModelConfig {
             context_length: 4,
@@ -10519,9 +10505,9 @@ mod tests {
     #[test]
     fn rope_diagnostics_reconstruct_reported_rotation() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ROPE_PAIRING");
-        std::env::remove_var("BACKENDINFERENCE_ROPE_DIRECTION");
-        std::env::remove_var("BACKENDINFERENCE_ROPE_POSITION_MODE");
+        std::env::remove_var("CAMELID_ROPE_PAIRING");
+        std::env::remove_var("CAMELID_ROPE_DIRECTION");
+        std::env::remove_var("CAMELID_ROPE_POSITION_MODE");
 
         let config = LlamaModelConfig {
             context_length: 4,
@@ -10727,7 +10713,7 @@ mod tests {
     #[test]
     fn one_based_rope_position_mode_is_available_for_diagnostics() {
         let _env_guard = env_lock();
-        std::env::set_var("BACKENDINFERENCE_ROPE_POSITION_MODE", "one_based");
+        std::env::set_var("CAMELID_ROPE_POSITION_MODE", "one_based");
 
         let config = LlamaModelConfig {
             context_length: 4,
@@ -10761,9 +10747,9 @@ mod tests {
         assert_eq!(diagnostic.effective_position, 1);
         assert!(diagnostic.max_abs_delta < 1e-7);
 
-        std::env::set_var("BACKENDINFERENCE_ROPE_POSITION_MODE", "diagonal");
+        std::env::set_var("CAMELID_ROPE_POSITION_MODE", "diagonal");
         assert!(diagnostic_rope_position_mode().is_err());
-        std::env::remove_var("BACKENDINFERENCE_ROPE_POSITION_MODE");
+        std::env::remove_var("CAMELID_ROPE_POSITION_MODE");
     }
 
     #[test]
@@ -10795,7 +10781,7 @@ mod tests {
     fn output_projection_diagnostics_reconstruct_tied_output_rows() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_OUTPUT_PROJECTION_LAYOUT", "descriptor");
 
         let output_norm =
             CpuTensor::from_f32("output_norm", vec![1, 3], vec![2.0, -1.0, 0.5]).unwrap();
@@ -10906,7 +10892,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
 
         let input_values = (0..32)
             .map(|idx| idx as f32 * 0.25 - 2.0)
@@ -10979,7 +10965,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
 
         let output_norm = CpuTensor::from_f32("output_norm", vec![1, 33], vec![0.0; 33]).unwrap();
         let logits = CpuTensor::from_f32("logits", vec![1, 1], vec![0.0]).unwrap();
@@ -11013,7 +10999,7 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
 
         let output_norm = CpuTensor::from_f32("output_norm", vec![1, 32], vec![0.0; 32]).unwrap();
         let logits = CpuTensor::from_f32("logits", vec![1, 2], vec![0.0, 0.0]).unwrap();
@@ -11048,9 +11034,9 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
-        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "on");
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "on");
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
 
         let input_values = (0..32)
             .map(|idx| ((idx % 13) as f32 - 6.0) * 0.17)
@@ -11109,15 +11095,15 @@ mod tests {
         assert!(diagnostics[0]
             .q8_direct_decoded_component_delta
             .is_some_and(|delta| delta.is_finite()));
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT");
-        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
     fn output_projection_runtime_ignores_diagnostic_layout_env_without_dense_collection() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_OUTPUT_PROJECTION_LAYOUT", "descriptor");
 
         let input = CpuTensor::from_f32("output_norm", vec![1, 2], vec![2.0, 3.0]).unwrap();
         let token_major_weight = CpuTensor::from_f32(
@@ -11152,7 +11138,7 @@ mod tests {
     fn output_projection_diagnostics_reconstruct_selected_logits() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_OUTPUT_PROJECTION_LAYOUT", "descriptor");
 
         let output_norm = CpuTensor::from_f32("output_norm", vec![1, 2], vec![2.0, 3.0]).unwrap();
         let output_weight = CpuTensor::from_f32(
@@ -11324,7 +11310,7 @@ mod tests {
     fn rectangular_linear_role_override_reinterprets_only_named_projection() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
 
         let input = CpuTensor::from_f32("input", vec![1, 2], vec![2.0, 3.0]).unwrap();
         let descriptor_weight = CpuTensor::from_f32(
@@ -11338,15 +11324,15 @@ mod tests {
         .unwrap();
 
         std::env::set_var(
-            "BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K",
+            "CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K",
             "transposed",
         );
         let overridden =
             linear_for_role(&input, &descriptor_weight, "overridden", "attention_k").unwrap();
         let unaffected =
             linear_for_role(&input, &descriptor_weight, "unaffected", "attention_v").unwrap();
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K");
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT_ATTENTION_K");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT");
 
         assert_eq!(overridden.shape.dims, vec![1, 3]);
         assert_eq!(unaffected.shape.dims, vec![1, 3]);
@@ -11361,8 +11347,8 @@ mod tests {
     #[test]
     fn linear_accumulation_precision_f64_reconstructs_descriptor_layout() {
         let _env_guard = env_lock();
-        std::env::set_var("BACKENDINFERENCE_LINEAR_ACCUMULATION", "f64");
-        std::env::set_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_LINEAR_ACCUMULATION", "f64");
+        std::env::set_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
 
         let input = CpuTensor::from_f32("input", vec![1, 3], vec![1.0, 1.0e-3, -2.0]).unwrap();
         let weight = CpuTensor::from_f32(
@@ -11374,8 +11360,8 @@ mod tests {
 
         let actual = linear(&input, &weight, "out").unwrap();
 
-        std::env::remove_var("BACKENDINFERENCE_LINEAR_ACCUMULATION");
-        std::env::remove_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT");
+        std::env::remove_var("CAMELID_LINEAR_ACCUMULATION");
+        std::env::remove_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT");
         let expected = vec![
             (1.0_f64 * 1.0e8 + 1.0e-3 * -1.0e8 + -2.0 * 0.25) as f32,
             (1.0_f64 * -1.0e8 + 1.0e-3 * 1.0e8 + -2.0 * -0.5) as f32,
@@ -11388,7 +11374,7 @@ mod tests {
     fn linear_accumulation_precision_f64_reconstructs_transposed_layout() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_LINEAR_ACCUMULATION", "f64");
+        std::env::set_var("CAMELID_LINEAR_ACCUMULATION", "f64");
 
         let input = CpuTensor::from_f32("input", vec![1, 3], vec![1.0, 1.0e-3, -2.0]).unwrap();
         let weight = CpuTensor::from_f32(
@@ -11400,7 +11386,7 @@ mod tests {
 
         let actual = linear(&input, &weight, "out").unwrap();
 
-        std::env::remove_var("BACKENDINFERENCE_LINEAR_ACCUMULATION");
+        std::env::remove_var("CAMELID_LINEAR_ACCUMULATION");
         let expected = vec![
             (1.0_f64 * 1.0e8 + 1.0e-3 * -1.0e8 + -2.0 * 0.25) as f32,
             (1.0_f64 * -1.0e8 + 1.0e-3 * 1.0e8 + -2.0 * -0.5) as f32,
@@ -11452,7 +11438,7 @@ mod tests {
     #[test]
     fn gated_ffn_activation_matches_separate_linear_silu_mul_for_transposed_weights() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_FFN_GATE_UP_ORDER");
+        std::env::remove_var("CAMELID_FFN_GATE_UP_ORDER");
 
         let input = CpuTensor::from_f32("input", vec![1, 3], vec![1.0, -2.0, 0.5]).unwrap();
         let gate = CpuTensor::from_f32(
@@ -11552,7 +11538,7 @@ mod tests {
     #[test]
     fn gated_ffn_activation_matches_separate_linear_silu_mul_for_direct_weights() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_FFN_GATE_UP_ORDER");
+        std::env::remove_var("CAMELID_FFN_GATE_UP_ORDER");
 
         let input = CpuTensor::from_f32("input", vec![1, 2], vec![2.0, -1.0]).unwrap();
         let gate = CpuTensor::from_f32(
@@ -11584,7 +11570,7 @@ mod tests {
     #[test]
     fn ffn_gate_up_order_diagnostic_can_apply_silu_to_up_projection() {
         let _env_guard = env_lock();
-        std::env::set_var("BACKENDINFERENCE_FFN_GATE_UP_ORDER", "up_gate");
+        std::env::set_var("CAMELID_FFN_GATE_UP_ORDER", "up_gate");
 
         let input = CpuTensor::from_f32("input", vec![1, 2], vec![2.0, -1.0]).unwrap();
         let gate = CpuTensor::from_f32(
@@ -11613,17 +11599,17 @@ mod tests {
         assert_eq!(diagnostic.activation_order, "up_gate");
         assert_close(diagnostic.max_abs_delta, 0.0);
 
-        std::env::remove_var("BACKENDINFERENCE_FFN_GATE_UP_ORDER");
+        std::env::remove_var("CAMELID_FFN_GATE_UP_ORDER");
     }
 
     #[test]
     fn single_token_forward_diagnostics_follow_llama_stage_order() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
-        std::env::set_var("BACKENDINFERENCE_SQUARE_LINEAR_LAYOUT", "descriptor");
-        std::env::set_var("BACKENDINFERENCE_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
-        std::env::set_var("BACKENDINFERENCE_OUTPUT_PROJECTION_LAYOUT", "descriptor");
-        std::env::set_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS", "1");
+        std::env::set_var("CAMELID_SQUARE_LINEAR_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_RECTANGULAR_LINEAR_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_OUTPUT_PROJECTION_LAYOUT", "descriptor");
+        std::env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "1");
 
         let config = LlamaModelConfig {
             context_length: 4,
@@ -11957,7 +11943,7 @@ mod tests {
 
         let prompt = [0, 1, 2, 3, 0, 1, 2];
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "1");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "1");
         let mut sequential = LlamaInferenceSession::new(config.clone(), weights.clone()).unwrap();
         let sequential_step = sequential
             .generate_next_token_with_history_diagnostics(
@@ -11968,8 +11954,8 @@ mod tests {
             )
             .unwrap();
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "2");
-        std::env::set_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS", "1");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "2");
+        std::env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "1");
         let mut chunked = LlamaInferenceSession::new(config.clone(), weights.clone()).unwrap();
         let chunked_step = chunked
             .generate_next_token_with_history_diagnostics(
@@ -12017,8 +12003,8 @@ mod tests {
         assert_slice_close(&chunked.kv_cache.keys, &sequential.kv_cache.keys);
         assert_slice_close(&chunked.kv_cache.values, &sequential.kv_cache.values);
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR", "1");
-        std::env::set_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION", "1");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "1");
+        std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION", "1");
         let mut layer_major = LlamaInferenceSession::new(config, weights).unwrap();
         let layer_major_step = layer_major
             .generate_next_token_with_history_diagnostics(
@@ -12062,10 +12048,10 @@ mod tests {
         assert_slice_close(&layer_major.kv_cache.keys, &sequential.kv_cache.keys);
         assert_slice_close(&layer_major.kv_cache.values, &sequential.kv_cache.values);
 
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR");
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_LAYER_MAJOR_ATTRIBUTION");
-        std::env::remove_var("BACKENDINFERENCE_FORWARD_RSS_TIMINGS");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
+        std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION");
+        std::env::remove_var("CAMELID_FORWARD_RSS_TIMINGS");
     }
 
     #[test]
@@ -12399,7 +12385,7 @@ mod tests {
             }],
         });
 
-        std::env::set_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS", "0");
+        std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "0");
         let mut session = LlamaInferenceSession::new(config, weights).unwrap();
         let step = session
             .generate_next_token_with_history_diagnostics(
@@ -12413,7 +12399,7 @@ mod tests {
         assert_eq!(step.prefill_token_count, 2);
         assert!(step.prefill_timings.total > 0);
 
-        std::env::remove_var("BACKENDINFERENCE_PREFILL_CHUNK_TOKENS");
+        std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
     }
 
     #[test]
@@ -12503,8 +12489,8 @@ mod tests {
     #[test]
     fn causal_attention_context_attends_over_prior_and_current_positions() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
-        std::env::remove_var("BACKENDINFERENCE_GQA_HEAD_MAPPING");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let plan = LlamaKvCachePlan {
             max_sequence_length: 3,
@@ -12601,8 +12587,8 @@ mod tests {
     #[test]
     fn causal_attention_context_repeats_grouped_kv_heads_for_single_position() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
-        std::env::remove_var("BACKENDINFERENCE_GQA_HEAD_MAPPING");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let plan = LlamaKvCachePlan {
             max_sequence_length: 1,
@@ -12660,8 +12646,8 @@ mod tests {
     #[test]
     fn causal_attention_context_repeats_grouped_kv_heads_across_positions() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
-        std::env::remove_var("BACKENDINFERENCE_GQA_HEAD_MAPPING");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let plan = LlamaKvCachePlan {
             max_sequence_length: 2,
@@ -12744,8 +12730,8 @@ mod tests {
     #[test]
     fn attention_trace_reports_top_probability_positions_outside_edge_samples() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
-        std::env::remove_var("BACKENDINFERENCE_GQA_HEAD_MAPPING");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let plan = LlamaKvCachePlan {
             max_sequence_length: 10,
@@ -12811,7 +12797,7 @@ mod tests {
     #[test]
     fn attention_score_scale_diagnostic_supports_default_and_unscaled_modes() {
         let _env_guard = env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
         assert_eq!(
             diagnostic_attention_score_scale().unwrap(),
             AttentionScoreScale::HeadDim
@@ -12821,7 +12807,7 @@ mod tests {
             0.5,
         );
 
-        std::env::set_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE", "none");
+        std::env::set_var("CAMELID_ATTENTION_SCORE_SCALE", "none");
         assert_eq!(
             diagnostic_attention_score_scale().unwrap(),
             AttentionScoreScale::None
@@ -12831,9 +12817,9 @@ mod tests {
             1.0,
         );
 
-        std::env::set_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE", "bogus");
+        std::env::set_var("CAMELID_ATTENTION_SCORE_SCALE", "bogus");
         assert!(diagnostic_attention_score_scale().is_err());
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
     }
 
     #[test]

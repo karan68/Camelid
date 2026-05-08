@@ -4,7 +4,7 @@ Scope: diagnostic/performance structural headroom only. This does not promote 8B
 
 Change:
 
-- `BACKENDINFERENCE_FORWARD_MEMORY_TRACE=1` layer prefill phase labels now include chunk-local context:
+- `CAMELID_FORWARD_MEMORY_TRACE=1` layer prefill phase labels now include chunk-local context:
   - `chunk_start`
   - `rows`
   - `base` KV-cache position

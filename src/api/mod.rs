@@ -39,11 +39,10 @@ use crate::{
 };
 
 const DEFAULT_CPU_WEIGHT_MATERIALIZATION_LIMIT_BYTES: u64 = 6 * 1024 * 1024 * 1024;
-const CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV: &str =
-    "BACKENDINFERENCE_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES";
-const RETAIN_Q8_BLOCKS_ENV: &str = "BACKENDINFERENCE_RETAIN_Q8_0_BLOCKS";
-const LAZY_Q8_LINEAR_ENV: &str = "BACKENDINFERENCE_LAZY_Q8_0_LINEAR";
-const METADATA_CHAT_TEMPLATE_ENV: &str = "BACKENDINFERENCE_METADATA_CHAT_TEMPLATE";
+const CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV: &str = "CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES";
+const RETAIN_Q8_BLOCKS_ENV: &str = "CAMELID_RETAIN_Q8_0_BLOCKS";
+const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
+const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -243,8 +242,8 @@ pub struct ChatCompletionRequest {
     pub n: Option<u32>,
     pub logprobs: Option<bool>,
     pub top_logprobs: Option<u32>,
-    pub backendinference_logit_token_ids: Option<Vec<u32>>,
-    pub backendinference_dense_diagnostics: Option<bool>,
+    pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_dense_diagnostics: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,8 +263,8 @@ pub struct CompletionRequest {
     pub n: Option<u32>,
     pub best_of: Option<u32>,
     pub logprobs: Option<u32>,
-    pub backendinference_logit_token_ids: Option<Vec<u32>>,
-    pub backendinference_dense_diagnostics: Option<bool>,
+    pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_dense_diagnostics: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -331,8 +330,8 @@ pub struct GenerationSessionRequest {
     pub completion_logprobs: Option<u32>,
     pub chat_logprobs: Option<bool>,
     pub top_logprobs: Option<u32>,
-    pub backendinference_logit_token_ids: Option<Vec<u32>>,
-    pub backendinference_dense_diagnostics: Option<bool>,
+    pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_dense_diagnostics: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -361,7 +360,7 @@ pub struct ChatCompletionResponse {
     pub model: String,
     pub choices: Vec<ChatCompletionChoice>,
     pub usage: CompletionUsage,
-    pub backendinference: GenerationDiagnostics,
+    pub camelid: GenerationDiagnostics,
 }
 
 #[derive(Debug, Serialize)]
@@ -526,7 +525,7 @@ pub struct CompletionResponse {
     pub model: String,
     pub choices: Vec<CompletionChoice>,
     pub usage: CompletionUsage,
-    pub backendinference: GenerationDiagnostics,
+    pub camelid: GenerationDiagnostics,
 }
 
 #[derive(Debug, Serialize)]
@@ -673,7 +672,7 @@ pub fn router() -> Router {
 
 pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "backendinference server listening");
+    tracing::info!(%addr, "camelid server listening");
     axum::serve(listener, router()).await
 }
 
@@ -683,7 +682,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let generation_ready = model.as_ref().is_some_and(loaded_model_generation_ready);
     Json(HealthResponse {
         ok: true,
-        engine: "backendinference",
+        engine: "camelid",
         loaded_now,
         generation_ready,
         active_model_id: model.as_ref().map(|m| m.id.clone()),
@@ -705,7 +704,7 @@ async fn capabilities() -> Json<CapabilitiesResponse> {
 
 fn capabilities_response() -> CapabilitiesResponse {
     CapabilitiesResponse {
-        engine: "backendinference",
+        engine: "camelid",
         gguf_metadata: true,
         tensor_loading: true,
         tokenization: true,
@@ -1394,7 +1393,7 @@ fn model_list_item(model: &LoadedModel) -> ModelListItem {
         id: model.id.clone(),
         object: "model",
         created: 0,
-        owned_by: "backendinference",
+        owned_by: "camelid",
     }
 }
 
@@ -1454,8 +1453,8 @@ async fn completions(
         completion_logprobs: req.logprobs,
         chat_logprobs: None,
         top_logprobs: None,
-        backendinference_logit_token_ids: req.backendinference_logit_token_ids,
-        backendinference_dense_diagnostics: req.backendinference_dense_diagnostics,
+        camelid_logit_token_ids: req.camelid_logit_token_ids,
+        camelid_dense_diagnostics: req.camelid_dense_diagnostics,
     };
     let stream = req.stream.unwrap_or(false);
     let prepared = match prepare_generation(&state, req).await {
@@ -1499,7 +1498,7 @@ async fn completions(
                         completion_tokens,
                         total_tokens: prompt_token_count + completion_tokens,
                     },
-                    backendinference: GenerationDiagnostics {
+                    camelid: GenerationDiagnostics {
                         prompt_token_ids,
                         generated_token_ids,
                         dense_metadata,
@@ -1543,8 +1542,8 @@ async fn chat_completions(
         completion_logprobs: None,
         chat_logprobs: req.logprobs,
         top_logprobs: req.top_logprobs,
-        backendinference_logit_token_ids: req.backendinference_logit_token_ids,
-        backendinference_dense_diagnostics: req.backendinference_dense_diagnostics,
+        camelid_logit_token_ids: req.camelid_logit_token_ids,
+        camelid_dense_diagnostics: req.camelid_dense_diagnostics,
     };
     let stream = req.stream.unwrap_or(false);
     let prepared = match prepare_generation(&state, req).await {
@@ -1578,7 +1577,7 @@ async fn chat_completions(
                     completion_tokens: generated.completion_tokens,
                     total_tokens: prompt_token_count + generated.completion_tokens,
                 },
-                backendinference: GenerationDiagnostics {
+                camelid: GenerationDiagnostics {
                     prompt_token_ids: generated.prompt_token_ids,
                     generated_token_ids: generated.generated_token_ids,
                     dense_metadata: generated.dense_metadata,
@@ -1794,7 +1793,7 @@ async fn prepare_generation(
     let stop_sequences =
         stop_sequences_from_request(req.stop.as_ref()).map_err(|response| *response)?;
     let logit_diagnostic_token_ids =
-        diagnostic_logit_token_ids(req.backendinference_logit_token_ids.as_deref())
+        diagnostic_logit_token_ids(req.camelid_logit_token_ids.as_deref())
             .map_err(|response| *response)?;
     if max_tokens == 0 {
         return Err(api_error(
@@ -1987,7 +1986,7 @@ async fn prepare_generation(
         sampling,
         stop_sequences,
         logit_diagnostic_token_ids,
-        collect_dense_diagnostics: req.backendinference_dense_diagnostics.unwrap_or(false),
+        collect_dense_diagnostics: req.camelid_dense_diagnostics.unwrap_or(false),
         dense_metadata,
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
@@ -2310,8 +2309,8 @@ fn diagnostic_logit_token_ids(
         return Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
             "invalid_logit_diagnostic_token_ids",
-            "backendinference_logit_token_ids accepts at most 16 token ids".to_string(),
-            Some("backendinference_logit_token_ids"),
+            "camelid_logit_token_ids accepts at most 16 token ids".to_string(),
+            Some("camelid_logit_token_ids"),
         )));
     }
     let mut deduped = Vec::with_capacity(token_ids.len());
@@ -3668,7 +3667,7 @@ mod tests {
             .expect_err("invalid materialization budget env should fail closed")
             .to_string();
 
-        assert!(err.contains("invalid BACKENDINFERENCE_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES"));
+        assert!(err.contains("invalid CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES"));
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
     }
 
@@ -3690,8 +3689,8 @@ mod tests {
     #[test]
     fn prompt_prefix_cache_reuses_exact_prompt_and_invalidates_key_changes() {
         let _env_guard = crate::test_support::env_lock();
-        std::env::remove_var("BACKENDINFERENCE_ATTENTION_SCORE_SCALE");
-        std::env::remove_var("BACKENDINFERENCE_GQA_HEAD_MAPPING");
+        std::env::remove_var("CAMELID_ATTENTION_SCORE_SCALE");
+        std::env::remove_var("CAMELID_GQA_HEAD_MAPPING");
 
         let config = tiny_config();
         let weights = tiny_weights();

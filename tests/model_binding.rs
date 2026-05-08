@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use backendinference::{
+use camelid::{
     gguf::read_metadata,
     inference::LlamaKvCachePlan,
     model::{LlamaModelConfig, LlamaTensorBinding},

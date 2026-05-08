@@ -16,9 +16,9 @@ On the approved Ubuntu validation host, bare `/usr/bin/cargo` is still `1.75.0` 
 
 Validated outcomes:
 
-- `/usr/bin/cargo build --release --bin backendinference` fails on current head.
+- `/usr/bin/cargo build --release --bin camelid` fails on current head.
 - `./scripts/with-rustup-cargo.sh --version` resolves to rustup cargo and succeeds.
-- `./scripts/with-rustup-cargo.sh +1.87.0 build --release --bin backendinference` succeeds in a clean clone.
+- `./scripts/with-rustup-cargo.sh +1.87.0 build --release --bin camelid` succeeds in a clean clone.
 - Separate spot checks showed `cargo +1.86.0 build` still fails, while `cargo +1.87.0 build` succeeds.
 
 Conclusion: the current checked-in floor is Rust/Cargo `1.87+`, and Ubuntu validation must not rely on the older distro cargo.
@@ -35,7 +35,7 @@ A clean Ubuntu clone built with the rustup-selected toolchain still passes the e
 
 Important timing detail from Camelid's own response payload:
 
-- `backendinference.timings_ms.generate = 21515`
+- `camelid.timings_ms.generate = 21515`
 
 That is good enough for the existing short smoke lane, but it is already slow for support-grade expansion.
 

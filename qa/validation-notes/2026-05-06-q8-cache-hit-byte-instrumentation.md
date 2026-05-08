@@ -6,7 +6,7 @@ Change:
 
 - `Q8_0FileReadStats` now reports `cache_hit_bytes` alongside `cache_hits`, `read_calls`, and `read_bytes`.
 - Forward/layer/phase merge logic accumulates `cache_hit_bytes`, so structured RSS/forward timing artifacts can distinguish "a hit occurred" from "how much Q8 payload was actually served from the bounded cache".
-- Existing cache behavior remains opt-in and memory-safe by default (`BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=0` unless explicitly raised).
+- Existing cache behavior remains opt-in and memory-safe by default (`CAMELID_Q8_0_FILE_CACHE_BYTES=0` unless explicitly raised).
 
 Why this slice:
 
@@ -24,6 +24,6 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh clippy -q --all-targets -- -D warnings`
 - `bash scripts/check-public-scrub.sh`
 - `./scripts/with-rustup-cargo.sh test -q`
-- `./scripts/with-rustup-cargo.sh build -q --release --bin backendinference`
+- `./scripts/with-rustup-cargo.sh build -q --release --bin camelid`
 
 Claim boundary: this adds byte-level cache-hit accounting to make future Q8 read-reduction artifacts auditable. It is not a correctness fix, throughput claim, support promotion, or 8B 1024/2048 green-box change.

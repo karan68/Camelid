@@ -99,7 +99,7 @@ Goal: lower avoidable friction without changing behavior.
 
 Suggested cleanup targets:
 - prefer `npm ci` over `npm install` in reproducibility-sensitive docs unless a genuinely first-time workflow needs `install`
-- keep backend build commands consistent (`cargo build --release --bin backendinference` vs `cargo build`)
+- keep backend build commands consistent (`cargo build --release --bin camelid` vs `cargo build`)
 - mark commands that require exact supported local GGUF paths versus synthetic fixtures
 - make docs-only validation commands consistent across `README.md` and `CONTRIBUTING.md`
 

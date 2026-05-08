@@ -13,7 +13,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 
 if (!args.has('input')) {
   console.error('usage: node scripts/check-attention-checkpoints.mjs --input <attention-checkpoints.v1.json>')
-  console.error('validates the focused backendinference.attention-checkpoints.v1 schema and sampled internal consistency')
+  console.error('validates the focused camelid.attention-checkpoints.v1 schema and sampled internal consistency')
   process.exit(2)
 }
 
@@ -36,7 +36,7 @@ if (failures.length > 0) {
 
 function validateBundle(bundle) {
   const failures = []
-  check(bundle.schema === 'backendinference.attention-checkpoints.v1', 'schema', 'expected backendinference.attention-checkpoints.v1')
+  check(bundle.schema === 'camelid.attention-checkpoints.v1', 'schema', 'expected camelid.attention-checkpoints.v1')
   check(Array.isArray(bundle.layers) && bundle.layers.length > 0, 'layers', 'expected non-empty layers array')
 
   if (bundle.prompt_token_ids !== null && bundle.prompt_token_ids !== undefined) {

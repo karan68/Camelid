@@ -95,7 +95,7 @@ try {
 
 function capture({ generated, qFirst, ffnRms, selectedLogit, finalNormMaxDelta }) {
   return {
-    backendinference: {
+    camelid: {
       prompt_token_ids: [1, 529, 29989, 1792],
       generated_token_ids: generated,
       dense_metadata: {

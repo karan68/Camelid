@@ -60,13 +60,13 @@ function usage(code) {
   console.log(`Usage: node scripts/bench-q8-hotpath-bundle.mjs --model <model.gguf> [options]
 
 Builds a sanitized lazy-Q8 hot-path measurement bundle under target/ by running
-backendinference bench-q8-blocks for representative Q8_0 tensors.
+camelid bench-q8-blocks for representative Q8_0 tensors.
 
 Options:
   --out-dir <dir>                  Output directory (default target/lazy-q8-hotpath-bundle-...)
   --repeats <n>                    Measured iterations per tensor (default 20)
   --warmup <n>                     Warmup iterations per tensor (default 3)
-  --skip-build                     Reuse target/release/backendinference
+  --skip-build                     Reuse target/release/camelid
   --tensor <name[:swap]>           Override tensor list; repeatable. Use :swap for swapped rank-2 layout.
   --no-all-rows-dot                Do not run all-row dot timing
   --no-single-input-row-dot        Do not run single-input-row adapter timing
@@ -182,7 +182,7 @@ async function main() {
   await fs.mkdir(outDir, { recursive: true })
 
   const modelSha256 = await sha256(options.model)
-  const binary = 'target/release/backendinference'
+  const binary = 'target/release/camelid'
   const reports = []
   const files = []
 
@@ -211,7 +211,7 @@ async function main() {
       sha256: modelSha256,
     },
     bench: {
-      command: 'target/release/backendinference bench-q8-blocks <model-path> --tensor <tensor> [--swap-rank2-shape] --all-rows-dot --single-input-row-dot',
+      command: 'target/release/camelid bench-q8-blocks <model-path> --tensor <tensor> [--swap-rank2-shape] --all-rows-dot --single-input-row-dot',
       repeats: Number(options.repeats),
       warmup: Number(options.warmup),
       all_rows_dot: options.allRowsDot,

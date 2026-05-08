@@ -108,7 +108,7 @@ try {
 
 function dump() {
   return {
-    object: 'backendinference.tensor_dump',
+    object: 'camelid.tensor_dump',
     path: '/tmp/tinyllama.gguf',
     tensors: [
       {

@@ -2,7 +2,7 @@
 
 Scope: exact `llama3_8b_instruct_q8_0` only.
 
-A fresh Ubuntu clone of public `origin/main` at `8cef7af4d6c6198210681257f2b7b111d5801ff4` was patched locally so non-streaming `/v1/completions` exposes `backendinference.timings_ms`, matching the existing chat-completions diagnostics shape. This fixed the promotion smoke bundle's response-local timing summary step without widening support language.
+A fresh Ubuntu clone of public `origin/main` at `8cef7af4d6c6198210681257f2b7b111d5801ff4` was patched locally so non-streaming `/v1/completions` exposes `camelid.timings_ms`, matching the existing chat-completions diagnostics shape. This fixed the promotion smoke bundle's response-local timing summary step without widening support language.
 
 Result: PASS.
 
@@ -23,7 +23,7 @@ Validated steps:
 Key 8B observations:
 
 - model SHA: `583c616da14b82930f887f991ab446711da0b029166200b67892d7c9f8f45958`
-- completion response now had `backendinference.timings_ms`, 2 prompt tokens, 1 generated token `[11]`, and `forward_total_ms=3746.333`
+- completion response now had `camelid.timings_ms`, 2 prompt tokens, 1 generated token `[11]`, and `forward_total_ms=3746.333`
 - chat response had 11 prompt tokens, 1 generated token `[9906]`, and `forward_total_ms=19969.736`
 - frontend smoke generated `Hello` in `20283 ms` with WebUI chat enabled for `llama3_8b_instruct_q8_0`
 - sampled backend RSS moved from `6308 KiB` before smoke to `286216 KiB` after smoke; this is a smoke-window RSS sample, not peak model-memory proof

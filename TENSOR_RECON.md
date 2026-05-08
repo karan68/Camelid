@@ -3,13 +3,13 @@
 > [!NOTE]
 > This document is a design or recon note, not the public support ledger. For current support truth and release status, use [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`STATUS.md`](STATUS.md).
 
-Source: GGUF/GGML-format recon focused on tensor descriptors, tensor type metadata, tensor byte-size validation, and the first CPU reference runtime needed by backendinference.
+Source: GGUF/GGML-format recon focused on tensor descriptors, tensor type metadata, tensor byte-size validation, and the first CPU reference runtime needed by camelid.
 
 ## Summary
 
-backendinference should treat tensor work as a separate lane from GGUF metadata parsing and model inference. The immediate goal is not fast matrix kernels; it is a correct, validated CPU tensor representation that can load tensor payloads, recognize GGML dtypes, convert simple stored formats to f32, and reject unsupported quantization clearly.
+camelid should treat tensor work as a separate lane from GGUF metadata parsing and model inference. The immediate goal is not fast matrix kernels; it is a correct, validated CPU tensor representation that can load tensor payloads, recognize GGML dtypes, convert simple stored formats to f32, and reject unsupported quantization clearly.
 
-The current backendinference GGUF reader already parses tensor descriptors and validates byte ranges for common GGML types. Phase 4 should extend this into actual payload access and CPU tensor loading.
+The current camelid GGUF reader already parses tensor descriptors and validates byte ranges for common GGML types. Phase 4 should extend this into actual payload access and CPU tensor loading.
 
 ## Key GGUF/GGML concepts
 
@@ -44,13 +44,13 @@ Mirror the important GGUF/GGML validation rules:
 - tensor byte range must fit inside the file
 - tensor absolute offset = aligned data start offset + descriptor relative offset
 
-backendinference already implements much of this in `src/gguf/reader.rs`; keep improving it with malformed fixture tests.
+camelid already implements much of this in `src/gguf/reader.rs`; keep improving it with malformed fixture tests.
 
 ## DType mapping table
 
 Initial mapping for descriptor validation and future loading:
 
-| GGML id | backendinference type | block size | type size bytes | Phase 4 action |
+| GGML id | camelid type | block size | type size bytes | Phase 4 action |
 |---:|---|---:|---:|---|
 | 0 | F32 | 1 | 4 | load directly |
 | 1 | F16 | 1 | 2 | convert to f32 |

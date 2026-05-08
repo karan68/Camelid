@@ -12,11 +12,11 @@ for (let i = 2; i < process.argv.length; i += 1) {
   args.set(key, value)
 }
 
-const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const backendBase = (args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.TINYLLAMA_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.TINYLLAMA_GGUF || 'models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.TINYLLAMA_MODEL_ID || 'tinyllama-q8'
-const backendBin = resolve(args.get('backend-bin') || process.env.BACKENDINFERENCE_BIN || 'target/release/backendinference')
+const backendBin = resolve(args.get('backend-bin') || process.env.CAMELID_BIN || 'target/release/camelid')
 const llamaServerBin = args.get('llama-server') || process.env.TINYLLAMA_LLAMA_SERVER || 'llama-server'
 const startLlamaServer = args.has('start-llama-server') || process.env.TINYLLAMA_START_LLAMA_SERVER === '1'
 const userMessage = args.get('message') ?? process.env.TINYLLAMA_CHAT_MESSAGE ?? 'hello'
@@ -105,13 +105,13 @@ async function runVariant({ name, attention, ffn, llamaBaseline }) {
       method: 'POST',
       body: JSON.stringify(chatRequest(llamaBaseline.generatedTokens)),
     })
-    const promptTokens = chat.backendinference?.prompt_token_ids || []
-    const generatedTokens = chat.backendinference?.generated_token_ids || []
+    const promptTokens = chat.camelid?.prompt_token_ids || []
+    const generatedTokens = chat.camelid?.generated_token_ids || []
     const text = chat.choices?.[0]?.message?.content ?? ''
-    const topLogits = chat.backendinference?.top_logits || []
+    const topLogits = chat.camelid?.top_logits || []
     const targetToken = llamaBaseline.generatedTokens[0]
     const targetLogit = topLogits.find(item => item.token_id === targetToken) || null
-    const denseMetadata = chat.backendinference?.dense_metadata || null
+    const denseMetadata = chat.camelid?.dense_metadata || null
     const row = {
       name,
       zero_attention_delta: attention,
@@ -128,11 +128,11 @@ async function runVariant({ name, attention, ffn, llamaBaseline }) {
         zero_attention_delta: denseMetadata?.zero_attention_delta,
         zero_ffn_delta: denseMetadata?.zero_ffn_delta,
       },
-      layer_count: chat.backendinference?.dense?.layers?.length ?? null,
+      layer_count: chat.camelid?.dense?.layers?.length ?? null,
     }
     if (keepDiagnostics) {
       const file = resolve(diagnosticsDir, `${name}.json`)
-      await writeFile(file, `${JSON.stringify({ ...row, backendinference: chat.backendinference }, null, 2)}\n`)
+      await writeFile(file, `${JSON.stringify({ ...row, camelid: chat.camelid }, null, 2)}\n`)
       row.diagnostics_out = file
     }
     console.log(`${name}: token=${row.selected_token_id} text=${JSON.stringify(text)} known_good_rank=${targetLogit?.rank ?? 'n/a'} prompt_match=${row.prompt_tokens_match}`)
@@ -150,8 +150,8 @@ function chatRequest(logitTokenIds) {
     max_tokens: maxTokens,
     stream: false,
     temperature: 0,
-    backendinference_logit_token_ids: logitTokenIds,
-    backendinference_dense_diagnostics: true,
+    camelid_logit_token_ids: logitTokenIds,
+    camelid_dense_diagnostics: true,
   }
 }
 
@@ -160,8 +160,8 @@ function startBackend({ attention, ffn }) {
   const child = spawn(backendBin, ['serve', '--addr', `${url.hostname}:${url.port || '8181'}`], {
     env: {
       ...process.env,
-      BACKENDINFERENCE_ZERO_ATTENTION_DELTA: attention,
-      BACKENDINFERENCE_ZERO_FFN_DELTA: ffn,
+      CAMELID_ZERO_ATTENTION_DELTA: attention,
+      CAMELID_ZERO_FFN_DELTA: ffn,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   })

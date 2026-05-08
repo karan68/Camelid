@@ -14,7 +14,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 
 if (!args.has('input') || !args.has('json-out')) {
   console.error('usage: node scripts/extract-attention-checkpoints.mjs --input <diagnostics.json> --layers 0,2 --json-out <focused-trace.json>')
-  console.error('extracts a compact layer-focused attention q/k/v/o checkpoint bundle from backendinference chat diagnostics')
+  console.error('extracts a compact layer-focused attention q/k/v/o checkpoint bundle from camelid chat diagnostics')
   process.exit(2)
 }
 
@@ -22,14 +22,14 @@ const inputPath = args.get('input')
 const outputPath = args.get('json-out')
 const layers = parseLayerList(args.get('layers') ?? '0,2')
 const root = JSON.parse(fs.readFileSync(inputPath, 'utf8'))
-const diagnostics = findBackendInferenceDiagnostics(root)
+const diagnostics = findCamelidDiagnostics(root)
 if (!diagnostics?.dense?.layers) {
-  throw new Error(`could not find backendinference.dense.layers in ${inputPath}`)
+  throw new Error(`could not find camelid.dense.layers in ${inputPath}`)
 }
 
 const dense = diagnostics.dense
 const extracted = {
-  schema: 'backendinference.attention-checkpoints.v1',
+  schema: 'camelid.attention-checkpoints.v1',
   source: {
     input: inputPath,
     basename: path.basename(inputPath),
@@ -60,12 +60,12 @@ function parseLayerList(value) {
   return [...new Set(layers)]
 }
 
-function findBackendInferenceDiagnostics(value) {
-  if (value?.backendinference) return value.backendinference
-  if (value?.backend?.diagnostics?.backendinference) return value.backend.diagnostics.backendinference
-  if (value?.diagnostics?.backendinference) return value.diagnostics.backendinference
-  if (value?.choices?.[0]?.message?.backendinference) return value.choices[0].message.backendinference
-  if (value?.choices?.[0]?.backendinference) return value.choices[0].backendinference
+function findCamelidDiagnostics(value) {
+  if (value?.camelid) return value.camelid
+  if (value?.backend?.diagnostics?.camelid) return value.backend.diagnostics.camelid
+  if (value?.diagnostics?.camelid) return value.diagnostics.camelid
+  if (value?.choices?.[0]?.message?.camelid) return value.choices[0].message.camelid
+  if (value?.choices?.[0]?.camelid) return value.choices[0].camelid
   return null
 }
 

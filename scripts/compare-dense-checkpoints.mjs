@@ -79,10 +79,10 @@ function parseNumberArg(name, fallback) {
 
 async function loadDiagnostics(path) {
   const json = JSON.parse(await readFile(path, 'utf8'))
-  const root = json.backendinference || json
+  const root = json.camelid || json
   const dense = root.dense
   if (!dense || !Array.isArray(dense.layers)) {
-    throw new Error(`${path} does not look like a chat-parity diagnostics capture with backendinference.dense.layers`)
+    throw new Error(`${path} does not look like a chat-parity diagnostics capture with camelid.dense.layers`)
   }
   return { path, json, root, dense }
 }

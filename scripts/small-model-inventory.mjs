@@ -95,7 +95,7 @@ const manifestRows = manifestCandidates.map(candidate => {
 })
 
 const report = {
-  schema: 'backendinference.small-model-inventory-report.v1',
+  schema: 'camelid.small-model-inventory-report.v1',
   generated_at: new Date().toISOString(),
   manifest: manifestPath,
   max_depth: maxDepth,

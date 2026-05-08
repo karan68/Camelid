@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, time::Instant};
 
-use backendinference::{
+use camelid::{
     api,
     gguf::{read_metadata, GgufTensorType},
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
@@ -10,10 +10,7 @@ use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "backendinference",
-    about = "Rust-native local GGUF inference backend"
-)]
+#[command(name = "camelid", about = "Rust-native local GGUF inference backend")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -23,7 +20,7 @@ struct Cli {
 enum Command {
     /// Start the local HTTP API server.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8181", env = "BACKENDINFERENCE_ADDR")]
+        #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
         addr: SocketAddr,
     },
     /// Inspect GGUF metadata and tensor descriptors.

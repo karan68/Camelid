@@ -7,7 +7,7 @@ Source: tokenizer recon focused on GGUF tokenizer metadata keys and common LLaMA
 
 ## Summary
 
-backendinference implements tokenizer support as a separate module from GGUF parsing, model execution, and chat-template formatting. The proven baseline remains LLaMA-style SPM from GGUF metadata for TinyLlama, and the current Phase 12 expansion accepts `tokenizer.ggml.model = "gpt2"` only when `tokenizer.ggml.pre = "llama-bpe"` for Llama 3-style GPT-2/BPE tokenizers. WPM/BERT, UGM/T5, RWKV, Gemma variants, Plamo, and other tokenizer models should continue to return explicit unsupported errors until they get their own fixtures and parity evidence.
+camelid implements tokenizer support as a separate module from GGUF parsing, model execution, and chat-template formatting. The proven baseline remains LLaMA-style SPM from GGUF metadata for TinyLlama, and the current Phase 12 expansion accepts `tokenizer.ggml.model = "gpt2"` only when `tokenizer.ggml.pre = "llama-bpe"` for Llama 3-style GPT-2/BPE tokenizers. WPM/BERT, UGM/T5, RWKV, Gemma variants, Plamo, and other tokenizer models should continue to return explicit unsupported errors until they get their own fixtures and parity evidence.
 
 ## Current Llama 3 BPE implementation notes
 

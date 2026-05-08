@@ -1,6 +1,6 @@
 use std::{fs, path::Path, sync::Arc};
 
-use backendinference::{
+use camelid::{
     gguf::{read_metadata, GgufTensorType},
     tensor::{CpuTensor, Q8_0Block, RuntimeDType, TensorStore},
 };

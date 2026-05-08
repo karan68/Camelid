@@ -14,7 +14,7 @@ Small Q8/file-backed guardrail slice from the overnight all-models fixer. This i
 ## Change
 
 - `Q8_0FileBacking::read_exact_at_cached` now rejects reads before the declared backing offset or beyond the declared Q8_0 tensor slice before file I/O/cache lookup.
-- Layer-major lazy-Q8 scoped cache default now applies only to multi-chunk prefill, where file-backed Q8_0 weights can be reused across chunks. Single-chunk prefill skips the 256 MiB default scoped cache unless `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES` is set explicitly.
+- Layer-major lazy-Q8 scoped cache default now applies only to multi-chunk prefill, where file-backed Q8_0 weights can be reused across chunks. Single-chunk prefill skips the 256 MiB default scoped cache unless `CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES` is set explicitly.
 - `docs/CONFIGURATION.md` documents the single-chunk behavior.
 
 ## Local validation

@@ -61,7 +61,7 @@ Camelid currently gives you:
 - a React/Vite WebUI that unlocks chat only when runtime readiness and support-contract readiness both agree
 - parity and validation harnesses used to compare behavior against llama.cpp before support language moves
 
-**Naming note.** Camelid is the product name. The repository, crate, binary, and some diagnostics still use `backendinference` during the transition. Keep current commands and package identifiers on those names until a separate rename plan lands.
+**Naming note.** Camelid is the product name. The repository, crate, binary, and some diagnostics still use `camelid` during the transition. Keep current commands and package identifiers on those names until a separate rename plan lands.
 
 **Reference credit.** Camelid is original Rust code, and it keeps visible credit for the reference work behind tokenizer checks, compatibility baselines, and parity evidence. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for current acknowledgements and MIT-license notices, including llama.cpp / ggml.
 
@@ -127,8 +127,8 @@ This quickstart verifies that Camelid builds and the backend starts on your mach
 ```bash
 git checkout main
 git pull --ff-only
-cargo build --release --bin backendinference
-target/release/backendinference serve --addr 127.0.0.1:8181
+cargo build --release --bin camelid
+target/release/camelid serve --addr 127.0.0.1:8181
 ```
 
 Toolchain note: Camelid currently requires Rust/Cargo 1.87+. If your host exposes an older system `cargo`, use the rustup-managed toolchain described in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).

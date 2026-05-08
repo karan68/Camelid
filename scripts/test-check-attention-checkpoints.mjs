@@ -31,7 +31,7 @@ try {
 
   const valid = await runCheck(validPath)
   assert.equal(valid.code, 0)
-  assert.match(valid.stdout, /schema=backendinference\.attention-checkpoints\.v1/)
+  assert.match(valid.stdout, /schema=camelid\.attention-checkpoints\.v1/)
   assert.match(valid.stdout, /layers=2/)
   assert.match(valid.stdout, /valid=true/)
 
@@ -72,7 +72,7 @@ async function runCheck(inputPath) {
 
 function bundle() {
   return {
-    schema: 'backendinference.attention-checkpoints.v1',
+    schema: 'camelid.attention-checkpoints.v1',
     prompt_token_ids: [1, 529, 29989, 1792],
     dense_metadata: {
       attention_head_count: 4,

@@ -37,7 +37,7 @@ Remote diagnostics:
     - `pack.stderr.log`: `1a7b59e9bd7f28692be0785874ab37d778003760c6e8998aebb62bb0de81c7b7`
 - Read-only follow-up audit of the source-`f8c2d66` 8B 2048 cache hypothesis run on the canonical Ubuntu validation lane; no duplicate long run was started:
   - sanitized remote artifact root: `target/llama3-8b-context-2048-cache320m-diag-20260506T073251Z-source-f8c2d66/` inside the archived validation worktree
-  - env delta: `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=335544320` (320 MiB)
+  - env delta: `CAMELID_Q8_0_FILE_CACHE_BYTES=335544320` (320 MiB)
   - prompt/generated parity remained diagnostic PASS for the same 1910-token prompt (`prompt_tokens_match=true`, `generated_tokens_match=true`, `generated_text_match=true`)
   - backend trace final: `q8_file_read_bytes=47285433088` (`45094.90 MiB`) plus `q8_file_cache_hit_bytes=103824336640` (`99014.60 MiB`) with cache residency `323292672` bytes (`308.32 MiB`) and RSS trace `1997468 KiB` at logits
   - compared with the no-cache source-`f8c2d66` diagnostic above, the 320 MiB cache reduced physical Q8 file reads from `151109769728` bytes to `47285433088` bytes, while cache-hit telemetry accounts for another `103824336640` bytes served from RAM; RSS at logits increased from ~`1415552 KiB` to ~`1997468 KiB`

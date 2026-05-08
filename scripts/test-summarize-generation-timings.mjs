@@ -52,7 +52,7 @@ try {
     await execFileAsync(process.execPath, [summaryScript, missingPath], { cwd: resolve(scriptDir, '..') })
   } catch (err) {
     failed = true
-    assert.match(err.stderr, /missing backendinference\.timings_ms/)
+    assert.match(err.stderr, /missing camelid\.timings_ms/)
   }
   assert.equal(failed, true)
 
@@ -70,7 +70,7 @@ function response(object, multiplier) {
       completion_tokens: 1,
       total_tokens: 4,
     },
-    backendinference: {
+    camelid: {
       timings_ms: {
         tokenize: 1 * multiplier,
         weight_load: 2 * multiplier,

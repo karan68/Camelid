@@ -118,7 +118,7 @@ Recommended next slice remains deliberately small and non-invasive:
 - Parse SafeTensors headers/shards via mmap-backed byte storage first. Defer tensor materialization and generation until dtype decode, tensor orientation, tokenizer/chat-template parity, and a tiny one-token fixture are proven.
 - Keep `generation_ready=false` for Hugging Face SafeTensors directories until all config, tokenizer, required tensor roles, and one-token execution gates pass.
 
-This keeps Camelid's product story honest: SafeTensors becomes a model-source abstraction and readiness lane first, while current technical identifiers and GGUF/TinyLlama/Llama 3 Q8 work continue under the existing `backendinference` crate/binary during the transition.
+This keeps Camelid's product story honest: SafeTensors becomes a model-source abstraction and readiness lane first, while current technical identifiers and GGUF/TinyLlama/Llama 3 Q8 work continue under the existing `camelid` crate/binary during the transition.
 
 ## 2026-04-29 05:06 PT Current-Head Check
 

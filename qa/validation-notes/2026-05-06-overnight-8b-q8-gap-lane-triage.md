@@ -5,7 +5,7 @@ Scope: diagnostic/performance evidence and guardrail alignment only. This does n
 Starting state:
 
 - Local main/head at start of this slice: `97ac0a3` (`Keep quickstart 8B context boundary red`), clean and tracking `origin/main`.
-- Canonical Ubuntu active-run check at `2026-05-07T02:20:46Z` found no active high-CPU long 8B parity/perf run to duplicate; only older idle `backendinference serve` processes and a stale completed diagnostic watcher were visible.
+- Canonical Ubuntu active-run check at `2026-05-07T02:20:46Z` found no active high-CPU long 8B parity/perf run to duplicate; only older idle `camelid serve` processes and a stale completed diagnostic watcher were visible.
 
 Evidence reviewed on the canonical Ubuntu lane:
 
@@ -20,7 +20,7 @@ Evidence reviewed on the canonical Ubuntu lane:
 
 Local follow-up in this slice:
 
-- Documented `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_CHUNK_TOKENS`, the layer-major-only chunk-size knob added for 8B long-prefill headroom/comparison work.
+- Documented `CAMELID_PREFILL_LAYER_MAJOR_CHUNK_TOKENS`, the layer-major-only chunk-size knob added for 8B long-prefill headroom/comparison work.
 - Kept the wording explicit that this is a runtime/performance knob only, not support evidence or an 8B 1024/2048 promotion signal.
 
 Claim boundary:

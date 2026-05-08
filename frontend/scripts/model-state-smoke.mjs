@@ -64,7 +64,7 @@ const nestedLoadedReady = {
   ...localLoadedReady,
   loaded_now: false,
   generation_ready: false,
-  backendinference: { loaded_now: true, generation_ready: true },
+  camelid: { loaded_now: true, generation_ready: true },
 }
 assert.equal(isModelLoadedNow(nestedLoadedReady), true)
 assert.equal(isModelGenerationReady(nestedLoadedReady), true)
@@ -75,7 +75,7 @@ const localSavedPath = {
   status: 'registered',
   loaded_now: false,
   generation_ready: false,
-  backendinference: { loaded_now: false, generation_ready: false },
+  camelid: { loaded_now: false, generation_ready: false },
 }
 assert.equal(canLoadIntoRuntime(localSavedPath), true)
 assert.equal(isRunnableModel(localSavedPath), false)
@@ -86,7 +86,7 @@ const localLoadedNotReady = {
   ...localLoadedReady,
   loaded_now: true,
   generation_ready: false,
-  backendinference: { loaded_now: true, generation_ready: false },
+  camelid: { loaded_now: true, generation_ready: false },
 }
 assert.equal(isRunnableModel(localLoadedNotReady), false)
 assert.equal(getModelStatusLabel(localLoadedNotReady), 'Loaded, not generation-ready')
@@ -96,7 +96,7 @@ assert.match(describeModelState(localLoadedNotReady), /materialization budget/)
 const staleReadyRecord = {
   ...localLoadedReady,
   loaded_now: false,
-  backendinference: { loaded_now: false, generation_ready: true },
+  camelid: { loaded_now: false, generation_ready: true },
 }
 assert.equal(isRunnableModel(staleReadyRecord), false, 'a stale saved record is not runnable unless it is loaded now')
 assert.equal(isRunnableInCurrentRuntime(staleReadyRecord, { active_model_id: 'tiny-generation', generation_ready: true }), false)

@@ -20,10 +20,10 @@ if (!args.has('input')) {
 const inputPath = resolve(args.get('input'))
 const jsonOut = args.get('json-out')
 const capture = JSON.parse(await readFile(inputPath, 'utf8'))
-const root = capture.backendinference || capture
+const root = capture.camelid || capture
 const dense = root.dense
 if (!dense || !Array.isArray(dense.layers)) {
-  throw new Error(`${inputPath} does not look like a chat-parity diagnostics capture with backendinference.dense.layers`)
+  throw new Error(`${inputPath} does not look like a chat-parity diagnostics capture with camelid.dense.layers`)
 }
 
 const topLogits = root.top_logits || []

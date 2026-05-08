@@ -7,12 +7,12 @@ const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
 const SELECTED_MODEL_STORAGE_KEY = 'camelid.selectedModelId'
 const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
-const CONVERSATIONS_STORAGE_KEY = 'backendinference.conversations'
-const MEMORIES_STORAGE_KEY = 'backendinference.memories'
-const API_BASE_STORAGE_KEY = 'backendinference.apiBase'
+const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
+const MEMORIES_STORAGE_KEY = 'camelid.memories'
+const API_BASE_STORAGE_KEY = 'camelid.apiBase'
 const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system'])
 const NEW_CHAT_SENTINEL = '__new__'
-const DEFAULT_API_BASE = import.meta.env.VITE_BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181'
+const DEFAULT_API_BASE = import.meta.env.VITE_CAMELID_API_BASE || 'http://127.0.0.1:8181'
 const LOCAL_CHAT_DEMO_MAX_TOKENS = 16
 
 function getInitialTab() {
@@ -91,7 +91,7 @@ function finiteNumber(value) {
 }
 
 function topFiveLogitProbabilities(response) {
-  return (response?.backendinference?.top_logits || [])
+  return (response?.camelid?.top_logits || [])
     .slice(0, 5)
     .map((entry) => ({
       token_id: entry.token_id,
@@ -106,7 +106,7 @@ function topFiveLogitProbabilities(response) {
 function completionTokensPerSecond(response, elapsedMs) {
   const completionTokens = finiteNumber(response?.usage?.completion_tokens)
   if (!completionTokens || completionTokens <= 0) return null
-  const generationMs = finiteNumber(response?.backendinference?.timings_ms?.generate)
+  const generationMs = finiteNumber(response?.camelid?.timings_ms?.generate)
   const denominatorMs = generationMs && generationMs > 0 ? generationMs : finiteNumber(elapsedMs)
   if (!denominatorMs || denominatorMs <= 0) return null
   return completionTokens / (denominatorMs / 1000)
@@ -145,7 +145,7 @@ function normalizeLocalModelRecord(record) {
     model_path: modelPath,
     runtime_model_name: String(record.runtime_model_name || id).trim(),
     source: record.source || 'Local GGUF file',
-    engine: record.engine || 'backendinference',
+    engine: record.engine || 'camelid',
     quant: record.quant || null,
     size_gb: record.size_gb || null,
     api_base: record.api_base || null,
@@ -156,7 +156,7 @@ function normalizeLocalModelRecord(record) {
     last_loaded_at: optionalString(record.last_loaded_at),
     loaded_now: false,
     generation_ready: false,
-    backendinference: {
+    camelid: {
       active: false,
       loaded_now: false,
       generation_ready: false,
@@ -199,7 +199,7 @@ function modelFromLocalRecord(record, health, currentModel, apiBase) {
     load_error: active ? null : record.load_error,
     loaded_now: active,
     generation_ready: generationReady,
-    backendinference: modelReadinessFromCurrent(currentModel, active, generationReady),
+    camelid: modelReadinessFromCurrent(currentModel, active, generationReady),
   }
 }
 
@@ -218,7 +218,7 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
     model_path: modelPath,
     runtime_model_name: item.id,
     source: localRecord?.source || 'Camelid local runtime',
-    engine: 'backendinference',
+    engine: 'camelid',
     quant: quantLabel || localRecord?.quant || null,
     size_gb: localRecord?.size_gb || null,
     api_base: apiBase,
@@ -229,7 +229,7 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
     last_loaded_at: localRecord?.last_loaded_at || null,
     loaded_now: active,
     generation_ready: generationReady,
-    backendinference: modelReadinessFromCurrent(currentModel, active, generationReady),
+    camelid: modelReadinessFromCurrent(currentModel, active, generationReady),
   }
 }
 
@@ -309,7 +309,7 @@ async function fetchJson(pathOrUrl, options = {}) {
 
 function makeDashboard({ health, models, currentModel, capabilities, conversations, memories, apiBase }) {
   return {
-    app: 'backendinference',
+    app: 'camelid',
     api_base: apiBase,
     health,
     capabilities,
@@ -317,7 +317,7 @@ function makeDashboard({ health, models, currentModel, capabilities, conversatio
     memories,
     models,
     runtime: {
-      engine: health?.engine || 'backendinference',
+      engine: health?.engine || 'camelid',
       loaded_now: Boolean(health?.loaded_now ?? health?.active_model_id),
       active_model_id: health?.active_model_id || null,
       generation_ready: Boolean(health?.generation_ready),
@@ -428,10 +428,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
       })
     } catch (error) {
       const fallbackDashboard = makeDashboard({
-        health: { ok: false, engine: 'backendinference', generation_ready: false, active_model_id: null },
+        health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
         models: mergeModelLists({
           modelItems: [],
-          health: { ok: false, engine: 'backendinference', generation_ready: false, active_model_id: null },
+          health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
           currentModel: null,
           localModels: localModelsOverride || localModels,
           apiBase: normalizedApiBase,
@@ -592,9 +592,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
         tokens_in_per_sec: null,
         tokens_out_per_sec: completionTokensPerSecond(response, elapsedMs),
         top_logits: topFiveLogitProbabilities(response),
-        generated_token_ids: Array.isArray(response?.backendinference?.generated_token_ids) ? response.backendinference.generated_token_ids : [],
+        generated_token_ids: Array.isArray(response?.camelid?.generated_token_ids) ? response.camelid.generated_token_ids : [],
         demo_token_cap: LOCAL_CHAT_DEMO_MAX_TOKENS,
-        timings_ms: response?.backendinference?.timings_ms || null,
+        timings_ms: response?.camelid?.timings_ms || null,
         usage: response?.usage || null,
       }
       persistConversations((current) => current.map((item) => (

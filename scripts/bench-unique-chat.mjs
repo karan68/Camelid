@@ -4,17 +4,17 @@ import { writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 
 const args = parseArgs(process.argv.slice(2))
-const apiBase = (args.get('api') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const apiBase = (args.get('api') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.TINYLLAMA_GGUF || 'models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.TINYLLAMA_MODEL_ID || 'tinyllama-q8'
-const repeats = parsePositiveInt('repeats', args.get('repeats') || process.env.BACKENDINFERENCE_UNIQUE_CHAT_REPEATS || '6')
-const warmup = parseNonNegativeInt('warmup', args.get('warmup') || process.env.BACKENDINFERENCE_UNIQUE_CHAT_WARMUP || '3')
-const maxTokens = parsePositiveInt('max-tokens', args.get('max-tokens') || process.env.BACKENDINFERENCE_UNIQUE_CHAT_MAX_TOKENS || '1')
-const messagePrefix = args.get('message-prefix') || process.env.BACKENDINFERENCE_UNIQUE_CHAT_MESSAGE_PREFIX || 'unique perf prompt'
-const startBackend = args.has('start-backend') || process.env.BACKENDINFERENCE_START_BACKEND === '1'
-const backendPid = parseOptionalPositiveInt('backend-pid', args.get('backend-pid') || process.env.BACKENDINFERENCE_BACKEND_PID)
-const buildRelease = args.has('build') || process.env.BACKENDINFERENCE_UNIQUE_CHAT_BUILD === '1'
-const out = args.get('out') || process.env.BACKENDINFERENCE_UNIQUE_CHAT_OUT
+const repeats = parsePositiveInt('repeats', args.get('repeats') || process.env.CAMELID_UNIQUE_CHAT_REPEATS || '6')
+const warmup = parseNonNegativeInt('warmup', args.get('warmup') || process.env.CAMELID_UNIQUE_CHAT_WARMUP || '3')
+const maxTokens = parsePositiveInt('max-tokens', args.get('max-tokens') || process.env.CAMELID_UNIQUE_CHAT_MAX_TOKENS || '1')
+const messagePrefix = args.get('message-prefix') || process.env.CAMELID_UNIQUE_CHAT_MESSAGE_PREFIX || 'unique perf prompt'
+const startBackend = args.has('start-backend') || process.env.CAMELID_START_BACKEND === '1'
+const backendPid = parseOptionalPositiveInt('backend-pid', args.get('backend-pid') || process.env.CAMELID_BACKEND_PID)
+const buildRelease = args.has('build') || process.env.CAMELID_UNIQUE_CHAT_BUILD === '1'
+const out = args.get('out') || process.env.CAMELID_UNIQUE_CHAT_OUT
 
 if (buildRelease) {
   const build = spawnSync('cargo', ['build', '--release'], { stdio: 'inherit' })
@@ -25,7 +25,7 @@ let backend
 try {
   if (startBackend) {
     const url = new URL(apiBase)
-    backend = spawn('target/release/backendinference', [
+    backend = spawn('target/release/camelid', [
       'serve',
       '--addr',
       `${url.hostname}:${url.port || '8181'}`,
@@ -90,7 +90,7 @@ try {
       'Ordinary non-diagnostic /v1/chat/completions, temperature=0.',
       'Measured summary excludes warmup; use warmup to load weights before collecting hot-path evidence.',
       'memory_samples report backend process RSS/VSZ in MiB before model load, after model load, after the first generated token, and after the first 10 generated tokens when this script starts the backend or --backend-pid is provided; vm/swap/page-in and storage_io fields are best-effort host pressure context.',
-      'forward_memory is present only when the backend is run with BACKENDINFERENCE_FORWARD_RSS_TIMINGS=on or BACKENDINFERENCE_FORWARD_MEMORY_TRACE=on; it keeps a compact per-request view of structured forward-pass RSS/KV/Q8 file-read counters.',
+      'forward_memory is present only when the backend is run with CAMELID_FORWARD_RSS_TIMINGS=on or CAMELID_FORWARD_MEMORY_TRACE=on; it keeps a compact per-request view of structured forward-pass RSS/KV/Q8 file-read counters.',
     ],
     memory_samples: memorySamples,
     warmup_runs: warmupRuns,
@@ -121,7 +121,7 @@ async function runChat({ idx, phase }) {
     }),
   })
   const wallMs = performance.now() - started
-  const diagnostics = response.backendinference || {}
+  const diagnostics = response.camelid || {}
   const timings = diagnostics.timings_ms || {}
   const split = layerSplit(timings.layers || [])
   return {

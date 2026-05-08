@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use backendinference::{
+use camelid::{
     gguf::read_metadata,
     inference::{LlamaInferenceSession, LlamaLayerDiagnostics, LlamaLoadedWeights},
     model::{LlamaModelConfig, LlamaTensorBinding},

@@ -24,7 +24,7 @@ try {
     '--json-out', reportPath,
     '--tolerance', '0.00001',
   ], { cwd: resolve(scriptDir, '..') })
-  assert.match(stdout, /schema=backendinference\.forward-trace-invariants\.v1/)
+  assert.match(stdout, /schema=camelid\.forward-trace-invariants\.v1/)
   assert.match(stdout, /stage_count=5/)
   assert.match(stdout, /reconstruction_checked=2/)
   assert.match(stdout, /kv_cache_traces_checked=1/)
@@ -35,7 +35,7 @@ try {
   assert.match(stdout, /first_failure=none/)
 
   const report = JSON.parse(await readFile(reportPath, 'utf8'))
-  assert.equal(report.schema, 'backendinference.forward-trace-invariants.v1')
+  assert.equal(report.schema, 'camelid.forward-trace-invariants.v1')
   assert.equal(report.failure_count, 0)
   assert.equal(report.first_failure, null)
   assert.equal(report.stats_checked, 3)
@@ -124,7 +124,7 @@ try {
 
 function trace() {
   return {
-    schema: 'backendinference.forward-trace.v1',
+    schema: 'camelid.forward-trace.v1',
     source: {
       prompt_tokens_match: true,
       generated_text_match: false,

@@ -6,7 +6,7 @@ Scope: one guardrail slice for the overnight all-models fixer. This does not pro
 
 Starting state:
 - Local `main` was clean at `89a6b6d` (`Promote exact 8B bounded context packs`) and aligned with `origin/main`.
-- No duplicate long Llama 3 8B 1024/2048 diagnostic was started. Local process check found only an existing local `backendinference serve --addr 127.0.0.1:8191`; canonical Ubuntu showed stale/completed 8B watchers plus active non-8B Mixtral/Qwen/Gemma `bench-q8-blocks` work, not an active long 8B context run.
+- No duplicate long Llama 3 8B 1024/2048 diagnostic was started. Local process check found only an existing local `camelid serve --addr 127.0.0.1:8191`; canonical Ubuntu showed stale/completed 8B watchers plus active non-8B Mixtral/Qwen/Gemma `bench-q8-blocks` work, not an active long 8B context run.
 
 Change:
 - Added a `/api/capabilities` regression test that locks the planned next-family exact rows (`mixtral_8x7b_instruct_v0_1_q8_0`, `qwen25_7b_instruct_q8_0`, `gemma2_9b_it_q8_0`) to `planned_exact_row_candidate`, `future_exact_row_planning_only`, fail-closed frontend readiness, no tensor/generation/parity/perf promotion, and no 512/1024/2048 context promotion.

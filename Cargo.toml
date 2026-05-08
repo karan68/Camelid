@@ -1,5 +1,5 @@
 [package]
-name = "backendinference"
+name = "camelid"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
@@ -30,9 +30,9 @@ tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 
 [lib]
-name = "backendinference"
+name = "camelid"
 path = "src/lib.rs"
 
 [[bin]]
-name = "backendinference"
+name = "camelid"
 path = "src/main.rs"

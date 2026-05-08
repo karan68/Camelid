@@ -31,7 +31,7 @@ Current-main 2048-context blocker confirmation:
 - Backend generated tokens/text: `[11, 11, 11, 315, 315]` / `",,, of of"`
 - Reference generated tokens/text: `[34, 2735, 35, 12, 7854]` / `"CMLD-204"`
 - First-token comparison: backend picks token `11` (`,`) while llama.cpp picks token `34` (`C`); backend ranks token `34` at `1996`, with backend logit `6.4547954` for token `11` vs `2.5268857` for token `34`.
-- Q8 file-backed read stats with `BACKENDINFERENCE_FORWARD_RSS_TIMINGS=on` and default Q8 cache capacity `0`:
+- Q8 file-backed read stats with `CAMELID_FORWARD_RSS_TIMINGS=on` and default Q8 cache capacity `0`:
   - total generation: `24089` reads / `68,602,825,984` bytes, cache `0` hits / `0` bytes / capacity `0`
   - prefill: `22069` reads / `62,037,910,144` bytes, cache `0` hits / `0` bytes / capacity `0`
   - first generated token: `404` reads / `1,312,983,168` bytes, cache `0` hits / `0` bytes / capacity `0`

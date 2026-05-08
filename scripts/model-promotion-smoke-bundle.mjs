@@ -15,9 +15,9 @@ Required options:
   --out-dir <path>                     Output artifact directory
 
 Common options:
-  --api <url>                          Camelid API base (default: BACKENDINFERENCE_API_BASE or http://127.0.0.1:8181)
-  --frontend <url>                     Frontend URL (default: BACKENDINFERENCE_FRONTEND_URL or http://127.0.0.1:4175)
-  --model-id <id>                      Runtime model id to load (default: BACKENDINFERENCE_SMOKE_MODEL_ID or smoke-model)
+  --api <url>                          Camelid API base (default: CAMELID_API_BASE or http://127.0.0.1:8181)
+  --frontend <url>                     Frontend URL (default: CAMELID_FRONTEND_URL or http://127.0.0.1:4175)
+  --model-id <id>                      Runtime model id to load (default: CAMELID_SMOKE_MODEL_ID or smoke-model)
   --message <text>                     Prompt/chat message (default: hello)
   --max-tokens <n>                     Positive token budget (default: 1)
   --temperature <number>               Sampling temperature (default: 0)
@@ -34,10 +34,10 @@ Common options:
   process.exit(0)
 }
 
-const apiBase = (args.get('api') || args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
-const frontendUrl = (args.get('frontend') || process.env.BACKENDINFERENCE_FRONTEND_URL || 'http://127.0.0.1:4175').replace(/\/$/, '')
+const apiBase = (args.get('api') || args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const frontendUrl = (args.get('frontend') || process.env.CAMELID_FRONTEND_URL || 'http://127.0.0.1:4175').replace(/\/$/, '')
 const modelPath = args.get('model') ? resolve(args.get('model')) : null
-const modelId = args.get('model-id') || process.env.BACKENDINFERENCE_SMOKE_MODEL_ID || 'smoke-model'
+const modelId = args.get('model-id') || process.env.CAMELID_SMOKE_MODEL_ID || 'smoke-model'
 const outDir = args.get('out-dir') ? resolve(args.get('out-dir')) : null
 const message = args.get('message') ?? 'hello'
 const maxTokens = parsePositiveInt('max-tokens', args.get('max-tokens') || '1')

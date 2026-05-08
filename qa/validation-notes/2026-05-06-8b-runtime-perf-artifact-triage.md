@@ -6,7 +6,7 @@ Scope: exact Llama 3 8B Instruct Q8_0 only. This promotes only the copied/scrubb
 
 - Source head for copied public artifacts: `ae672d935a9df500fe67e3fcc17ab692c0cdada8` (`origin/main` at run time).
 - Validation lane: clean public Ubuntu validation lane.
-- Runtime shape: lazy Q8 on, retained Q8 blocks off, `BACKENDINFERENCE_PREFILL_CHUNK_TOKENS=256`, Q8 file cache `0`, Q8 file reader chunk bytes `67108864`, parallel linear enabled.
+- Runtime shape: lazy Q8 on, retained Q8 blocks off, `CAMELID_PREFILL_CHUNK_TOKENS=256`, Q8 file cache `0`, Q8 file reader chunk bytes `67108864`, parallel linear enabled.
 
 ## Public PASS artifacts
 

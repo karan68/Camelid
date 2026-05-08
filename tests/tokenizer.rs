@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use backendinference::{gguf::read_metadata, tokenizer::Tokenizer, BackendError};
+use camelid::{gguf::read_metadata, tokenizer::Tokenizer, BackendError};
 
 #[test]
 fn loads_llama_spm_tokenizer_metadata() {

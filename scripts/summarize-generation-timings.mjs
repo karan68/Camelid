@@ -16,9 +16,9 @@ if (paths.length === 0) {
 const responses = []
 for (const path of paths) {
   const payload = JSON.parse(await readFile(path, 'utf8'))
-  const timings = payload?.backendinference?.timings_ms
+  const timings = payload?.camelid?.timings_ms
   if (!timings) {
-    throw new Error(`${path}: missing backendinference.timings_ms`)
+    throw new Error(`${path}: missing camelid.timings_ms`)
   }
   responses.push(summarizeResponse(path, payload, timings))
 }

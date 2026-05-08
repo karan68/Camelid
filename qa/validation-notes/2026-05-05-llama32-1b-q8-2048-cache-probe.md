@@ -22,9 +22,9 @@ Remote guardrail before probe:
 Probe shape:
 
 - Same 1910-token 2048-context prompt content, capped to `max_tokens=1` so the run isolates the first generated-token red box.
-- `BACKENDINFERENCE_FORWARD_RSS_TIMINGS=on`
-- `BACKENDINFERENCE_PREFILL_CHUNK_TOKENS=32`
-- Compared default memory-safe Q8 file cache capacity `0` against an explicit `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES=268435456` diagnostic run.
+- `CAMELID_FORWARD_RSS_TIMINGS=on`
+- `CAMELID_PREFILL_CHUNK_TOKENS=32`
+- Compared default memory-safe Q8 file cache capacity `0` against an explicit `CAMELID_Q8_0_FILE_CACHE_BYTES=268435456` diagnostic run.
 
 Results:
 

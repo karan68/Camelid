@@ -55,9 +55,9 @@ function parseLayerList(value) {
 
 async function loadDiagnostics(path) {
   const json = JSON.parse(await readFile(path, 'utf8'))
-  const root = json.backendinference || json
+  const root = json.camelid || json
   const dense = root.dense
-  if (!dense || !Array.isArray(dense.layers)) throw new Error(`${path} does not contain backendinference.dense.layers diagnostics`)
+  if (!dense || !Array.isArray(dense.layers)) throw new Error(`${path} does not contain camelid.dense.layers diagnostics`)
   return { path, json, root, dense }
 }
 

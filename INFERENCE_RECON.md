@@ -7,7 +7,7 @@ Source: inference architecture recon focused on LLaMA-family model structure, GG
 
 ## Summary
 
-Phase 5 should start with a narrow, explicit LLaMA-family dense decoder-only path. The goal is a correct CPU reference implementation before quantized/performance paths. backendinference currently has GGUF metadata parsing and an HTTP skeleton; it needs model config extraction, tensor payload loading, tensor runtime primitives, KV cache, model binding, and inference session orchestration before generation can work.
+Phase 5 should start with a narrow, explicit LLaMA-family dense decoder-only path. The goal is a correct CPU reference implementation before quantized/performance paths. camelid currently has GGUF metadata parsing and an HTTP skeleton; it needs model config extraction, tensor payload loading, tensor runtime primitives, KV cache, model binding, and inference session orchestration before generation can work.
 
 ## Initial supported model scope
 
@@ -174,7 +174,7 @@ For token IDs and positions:
 
 Common decoder-only runtimes use the same graph shape with different batch sizes.
 
-For backendinference first version:
+For camelid first version:
 
 ```rust
 struct InferenceSession { /* model, runtime, kv_cache, position */ }

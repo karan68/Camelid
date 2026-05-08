@@ -13,7 +13,7 @@ for (let i = 2; i < process.argv.length; i += 1) {
 
 if (!args.has('left') || !args.has('right')) {
   console.error('usage: node scripts/compare-tensor-dumps.mjs --left <tensor-dump.json> --right <tensor-dump.json> [--atol 1e-6] [--rtol 1e-5] [--json-out <path>]')
-  console.error('compares backendinference tensor-dump descriptor, Q8_0 scale/quant, and decoded f32 sample diagnostics')
+  console.error('compares camelid tensor-dump descriptor, Q8_0 scale/quant, and decoded f32 sample diagnostics')
   process.exit(2)
 }
 
@@ -67,7 +67,7 @@ function parseNumberArg(name, fallback) {
 
 async function loadDump(path) {
   const json = JSON.parse(await readFile(path, 'utf8'))
-  if (!Array.isArray(json.tensors)) throw new Error(`${path} does not look like backendinference tensor-dump JSON`)
+  if (!Array.isArray(json.tensors)) throw new Error(`${path} does not look like camelid tensor-dump JSON`)
   return { path, json, tensors: new Map(json.tensors.map(tensor => [tensor.name, tensor])) }
 }
 

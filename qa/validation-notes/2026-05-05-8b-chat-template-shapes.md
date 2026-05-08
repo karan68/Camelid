@@ -10,7 +10,7 @@ The approved Ubuntu validation lane ran `qa/prompt-packs/llama3-chat-template-sh
 Outcome:
 
 - model SHA256 matched `583c616da14b82930f887f991ab446711da0b029166200b67892d7c9f8f45958`
-- `./scripts/with-rustup-cargo.sh build --release --bin backendinference` passed
+- `./scripts/with-rustup-cargo.sh build --release --bin camelid` passed
 - the chat-template-shapes pack exited `0` with a `600000 ms` client wait budget
 - all 4 compact prompt shapes matched prompt tokens
 - all 4 compact prompt shapes matched generated token IDs

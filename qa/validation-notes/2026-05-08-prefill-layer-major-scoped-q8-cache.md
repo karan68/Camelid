@@ -15,9 +15,9 @@ Because this change touches runtime/source code after that bundle, it does **not
 ## Change
 
 - Added `with_q8_file_cache_capacity_override(...)` around the layer-major prefill path.
-- Default scoped capacity for lazy file-backed layer-major prefill: `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES=268435456` (256 MiB) when the global `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES` is unset.
-- Setting `BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES` explicitly preserves the existing global cache behavior.
-- Setting `BACKENDINFERENCE_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES=0` disables the scoped layer-major cache.
+- Default scoped capacity for lazy file-backed layer-major prefill: `CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES=268435456` (256 MiB) when the global `CAMELID_Q8_0_FILE_CACHE_BYTES` is unset.
+- Setting `CAMELID_Q8_0_FILE_CACHE_BYTES` explicitly preserves the existing global cache behavior.
+- Setting `CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES=0` disables the scoped layer-major cache.
 - The scoped override is restored after the prefill call, and the global cache is trimmed back to the restored capacity.
 
 This is a bounded read-reuse/RSS tuning change only; it is not support evidence for broader 8B, larger-context, model-native, throughput, portability, neighboring rows, or full Llama-family claims.

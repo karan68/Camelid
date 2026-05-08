@@ -145,7 +145,7 @@ function minimalCapture() {
     backend_text: 'backend-token',
     llama_text: 'known-good-token',
     llama_generated_token_ids: [20],
-    backendinference: {
+    camelid: {
       generated_token_ids: [10],
       top_logits: [
         { token_id: 10, text: 'backend-token', rank: 1, logit: 3.5 },

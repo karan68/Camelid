@@ -19,6 +19,6 @@ Local gates:
 - `./scripts/with-rustup-cargo.sh test -q`
 - `./scripts/with-rustup-cargo.sh clippy -q --all-targets -- -D warnings`
 - `bash scripts/check-public-scrub.sh`
-- `./scripts/with-rustup-cargo.sh build -q --release --bin backendinference`
+- `./scripts/with-rustup-cargo.sh build -q --release --bin camelid`
 
 Claim boundary: this is a structural batching/read-reuse guardrail for Q8_0 file-backed execution. It is not a support, throughput, portability, or 8B promotion claim; the 8B 1024/2048 timeout boxes remain frozen red until broader backend architecture work lands.

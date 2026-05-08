@@ -5,7 +5,7 @@ Scope: backend/runtime test guard only. This does not widen model support, API c
 Git/evidence posture:
 - Started from clean `main` at `f794b06` (`Scrub validation note host details`) matching `origin/main`.
 - Canonical Ubuntu check found an already-completed Llama 3 8B 1024/2048 run workspace at `Camelid-current-head-8b-1024-2048-20260507T1357Z-head-72fccb3e95b9`; `run.log` showed both bounded packs passed, but that was for head `72fccb3e95b9`, not this new source head.
-- The same workspace left a stale `backendinference serve --addr 127.0.0.1:8391` process consuming CPU with no active pack client; after confirming its cwd matched that completed run workspace, it was stopped cleanly. A stale self-matching 8B diagnostic waiter was also stopped. No duplicate long 8B run was launched during this patch.
+- The same workspace left a stale `camelid serve --addr 127.0.0.1:8391` process consuming CPU with no active pack client; after confirming its cwd matched that completed run workspace, it was stopped cleanly. A stale self-matching 8B diagnostic waiter was also stopped. No duplicate long 8B run was launched during this patch.
 
 Change:
 - Extended the single-row file-backed Q8_0 accumulate test to assert exact chunked read count and bytes with the file cache disabled.

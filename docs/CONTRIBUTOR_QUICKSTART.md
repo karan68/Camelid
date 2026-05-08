@@ -37,15 +37,15 @@ From the repo root:
 ```bash
 git checkout main
 git pull --ff-only
-cargo build --release --bin backendinference
-target/release/backendinference serve --addr 127.0.0.1:8181
+cargo build --release --bin camelid
+target/release/camelid serve --addr 127.0.0.1:8181
 ```
 
 If you prefer the rustup wrapper:
 
 ```bash
-scripts/with-rustup-cargo.sh build --release --bin backendinference
-target/release/backendinference serve --addr 127.0.0.1:8181
+scripts/with-rustup-cargo.sh build --release --bin camelid
+target/release/camelid serve --addr 127.0.0.1:8181
 ```
 
 ## Frontend quickstart

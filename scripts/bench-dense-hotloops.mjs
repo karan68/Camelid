@@ -11,7 +11,7 @@ if (!skipBuild) {
 }
 
 const bench = spawnSync(
-  'target/release/backendinference',
+  'target/release/camelid',
   ['bench-dense-hotloops', ...passthrough],
   { stdio: 'inherit' },
 )

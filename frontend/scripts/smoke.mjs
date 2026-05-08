@@ -17,19 +17,19 @@ for (let i = 2; i < process.argv.length; i += 1) {
   }
 }
 
-const apiBase = (args.get('api') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
-const frontendUrl = (args.get('frontend') || process.env.BACKENDINFERENCE_FRONTEND_URL || 'http://127.0.0.1:4175').replace(/\/$/, '')
-const loadTiny = args.has('load-tiny') || process.env.BACKENDINFERENCE_SMOKE_LOAD_TINY === '1'
-const rawModelPath = args.get('model') || process.env.BACKENDINFERENCE_SMOKE_MODEL
+const apiBase = (args.get('api') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const frontendUrl = (args.get('frontend') || process.env.CAMELID_FRONTEND_URL || 'http://127.0.0.1:4175').replace(/\/$/, '')
+const loadTiny = args.has('load-tiny') || process.env.CAMELID_SMOKE_LOAD_TINY === '1'
+const rawModelPath = args.get('model') || process.env.CAMELID_SMOKE_MODEL
 const modelPath = rawModelPath ? resolve(rawModelPath) : undefined
-const modelId = args.get('model-id') || process.env.BACKENDINFERENCE_SMOKE_MODEL_ID || (modelPath ? 'smoke-model' : 'tiny-generation')
-const requireGeneration = args.has('require-generation') || process.env.BACKENDINFERENCE_SMOKE_REQUIRE_GENERATION === '1'
-const allowGuardedChat = args.has('allow-guarded-chat') || process.env.BACKENDINFERENCE_SMOKE_ALLOW_GUARDED_CHAT === '1'
-const chatRepeats = Number.parseInt(args.get('chat-repeats') || process.env.BACKENDINFERENCE_SMOKE_CHAT_REPEATS || '1', 10)
-const expectCompatibilityRow = args.get('expect-compatibility-row') || process.env.BACKENDINFERENCE_SMOKE_EXPECT_COMPATIBILITY_ROW || ''
-const expectCompatibilityStatus = args.get('expect-compatibility-status') || process.env.BACKENDINFERENCE_SMOKE_EXPECT_COMPATIBILITY_STATUS || ''
-const expectContractSupported = parseOptionalBoolean(args.get('expect-contract-supported') || process.env.BACKENDINFERENCE_SMOKE_EXPECT_CONTRACT_SUPPORTED, 'expect-contract-supported')
-const expectWebUiChat = args.get('expect-webui-chat') || process.env.BACKENDINFERENCE_SMOKE_EXPECT_WEBUI_CHAT || ''
+const modelId = args.get('model-id') || process.env.CAMELID_SMOKE_MODEL_ID || (modelPath ? 'smoke-model' : 'tiny-generation')
+const requireGeneration = args.has('require-generation') || process.env.CAMELID_SMOKE_REQUIRE_GENERATION === '1'
+const allowGuardedChat = args.has('allow-guarded-chat') || process.env.CAMELID_SMOKE_ALLOW_GUARDED_CHAT === '1'
+const chatRepeats = Number.parseInt(args.get('chat-repeats') || process.env.CAMELID_SMOKE_CHAT_REPEATS || '1', 10)
+const expectCompatibilityRow = args.get('expect-compatibility-row') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_ROW || ''
+const expectCompatibilityStatus = args.get('expect-compatibility-status') || process.env.CAMELID_SMOKE_EXPECT_COMPATIBILITY_STATUS || ''
+const expectContractSupported = parseOptionalBoolean(args.get('expect-contract-supported') || process.env.CAMELID_SMOKE_EXPECT_CONTRACT_SUPPORTED, 'expect-contract-supported')
+const expectWebUiChat = args.get('expect-webui-chat') || process.env.CAMELID_SMOKE_EXPECT_WEBUI_CHAT || ''
 
 if (!Number.isInteger(chatRepeats) || chatRepeats < 1) {
   throw new Error(`--chat-repeats must be a positive integer, got ${args.get('chat-repeats')}`)
@@ -201,7 +201,7 @@ console.log('✓ frontend returned HTTP 200')
 if (loadTiny || modelPath) {
   let pathToLoad = modelPath
   if (loadTiny) {
-    const dir = join(tmpdir(), 'backendinference-smoke')
+    const dir = join(tmpdir(), 'camelid-smoke')
     await mkdir(dir, { recursive: true })
     pathToLoad = join(dir, 'tiny-generation.gguf')
     await writeFile(pathToLoad, writeTinyGenerationGgufBytes())
@@ -308,7 +308,7 @@ if (webuiChatEnabled || qaChatBypass) {
     }))
     const text = chat?.choices?.[0]?.message?.content
     if (typeof text !== 'string') throw new Error('chat response did not include choices[0].message.content')
-    const diagnostics = chat?.backendinference
+    const diagnostics = chat?.camelid
     if (diagnostics?.prompt_token_ids) {
       console.log(`  backend_prompt_token_ids=${JSON.stringify(diagnostics.prompt_token_ids)}`)
     }

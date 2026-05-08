@@ -12,15 +12,15 @@ for (let i = 2; i < process.argv.length; i += 1) {
   args.set(key, value)
 }
 
-const apiBase = (args.get('api') || args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
+const apiBase = (args.get('api') || args.get('backend') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const modelPath = resolve(args.get('model') || process.env.TINYLLAMA_GGUF || 'models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf')
 const modelId = args.get('model-id') || process.env.TINYLLAMA_MODEL_ID || 'tinyllama-q8'
 const userMessage = args.get('message') ?? process.env.TINYLLAMA_CHAT_MESSAGE ?? 'hello'
-const repeats = parsePositiveInt('repeats', args.get('repeats') || process.env.BACKENDINFERENCE_PROMPT_BENCH_REPEATS || '4')
-const maxTokens = parsePositiveInt('max-tokens', args.get('max-tokens') || process.env.BACKENDINFERENCE_PROMPT_BENCH_MAX_TOKENS || '1')
-const startBackend = args.has('start-backend') || process.env.BACKENDINFERENCE_START_BACKEND === '1'
-const buildRelease = args.has('build') || process.env.BACKENDINFERENCE_PROMPT_BENCH_BUILD === '1'
-const out = args.get('out') || args.get('output') || process.env.BACKENDINFERENCE_PROMPT_BENCH_OUT
+const repeats = parsePositiveInt('repeats', args.get('repeats') || process.env.CAMELID_PROMPT_BENCH_REPEATS || '4')
+const maxTokens = parsePositiveInt('max-tokens', args.get('max-tokens') || process.env.CAMELID_PROMPT_BENCH_MAX_TOKENS || '1')
+const startBackend = args.has('start-backend') || process.env.CAMELID_START_BACKEND === '1'
+const buildRelease = args.has('build') || process.env.CAMELID_PROMPT_BENCH_BUILD === '1'
+const out = args.get('out') || args.get('output') || process.env.CAMELID_PROMPT_BENCH_OUT
 
 if (buildRelease) {
   const build = spawnSync('cargo', ['build', '--release'], { stdio: 'inherit' })
@@ -31,7 +31,7 @@ let backend
 try {
   if (startBackend) {
     const url = new URL(apiBase)
-    backend = spawn('target/release/backendinference', [
+    backend = spawn('target/release/camelid', [
       'serve',
       '--addr',
       `${url.hostname}:${url.port || '8181'}`,
@@ -82,7 +82,7 @@ try {
         body: JSON.stringify(benchCase.body),
       })
       const wall_ms = performance.now() - started
-      const diagnostics = response.backendinference || {}
+      const diagnostics = response.camelid || {}
       runs.push({
         index: idx + 1,
         wall_ms,
