@@ -5862,12 +5862,37 @@ fn quantize_q8_0_blocks_into(input: &[f32], blocks: &mut Vec<Q8_0Block>) {
 }
 
 fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if aarch64_dotprod_enabled() {
+            // SAFETY: runtime feature detection confirms dot-product support; the slice
+            // iterator only passes complete Q8_0 blocks.
+            return unsafe { q8_0_dot_rows_dotprod(weight, input) };
+        }
+    }
+
     weight
         .iter()
         .zip(input)
         .map(|(weight_block, input_block)| {
             let int_sum =
                 q8_0_block_int_dot_horizontal_sum(&weight_block.quants, &input_block.quants);
+            int_sum as f32 * weight_block.scale * input_block.scale
+        })
+        .sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_dot_rows_dotprod(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    weight
+        .iter()
+        .zip(input)
+        .map(|(weight_block, input_block)| {
+            // SAFETY: each Q8_0Block contains exactly 32 contiguous i8 values.
+            let int_sum = unsafe {
+                q8_0_i8_block_dotprod(weight_block.quants.as_ptr(), input_block.quants.as_ptr())
+            };
             int_sum as f32 * weight_block.scale * input_block.scale
         })
         .sum()
@@ -6195,6 +6220,15 @@ fn decode_q8_0_encoded_row_scales(row_bytes: &[u8], scales: &mut [f32]) {
 
 fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scales: &[f32]) -> f32 {
     debug_assert_eq!(input.len(), scales.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        if aarch64_dotprod_enabled() {
+            // SAFETY: runtime feature detection confirms dot-product support; row_bytes is
+            // traversed as exact Q8_0 encoded blocks.
+            return unsafe { dot_q8_0_encoded_row_with_scales_dotprod(input, row_bytes, scales) };
+        }
+    }
+
     let mut sum = 0.0_f32;
     for ((input_block, block), scale) in input
         .iter()
@@ -6202,6 +6236,32 @@ fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scale
         .zip(scales)
     {
         let int_sum = q8_0_block_int_dot_horizontal_sum_encoded(&block[2..], &input_block.quants);
+        sum += int_sum as f32 * *scale * input_block.scale;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_q8_0_encoded_row_with_scales_dotprod(
+    input: &[Q8_0Block],
+    row_bytes: &[u8],
+    scales: &[f32],
+) -> f32 {
+    let mut sum = 0.0_f32;
+    for ((input_block, block), scale) in input
+        .iter()
+        .zip(row_bytes.chunks_exact(Q8BlockReader::BLOCK_SIZE_BYTES))
+        .zip(scales)
+    {
+        // SAFETY: each encoded Q8_0 block stores 32 contiguous signed quant bytes after
+        // the two-byte f16 scale header.
+        let int_sum = unsafe {
+            q8_0_i8_block_dotprod(
+                block[2..].as_ptr().cast::<i8>(),
+                input_block.quants.as_ptr(),
+            )
+        };
         sum += int_sum as f32 * *scale * input_block.scale;
     }
     sum
@@ -6320,10 +6380,61 @@ fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start
 }
 
 #[cfg(target_arch = "aarch64")]
+fn aarch64_dotprod_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !q8_0_env_flag_disabled("CAMELID_AARCH64_DOTPROD")
+            && std::arch::is_aarch64_feature_detected!("dotprod")
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
 unsafe fn q8_0_i8_block_neon(weight: *const i8, input: *const i8) -> i32 {
+    if aarch64_dotprod_enabled() {
+        // SAFETY: feature detection above guarantees the dot-product instructions are
+        // available, and callers pass pointers to at least 32 contiguous i8 values.
+        return unsafe { q8_0_i8_block_dotprod(weight, input) };
+    }
+
+    // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
+    unsafe { q8_0_i8_block_neon_mul(weight, input) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_i8_block_dotprod(weight: *const i8, input: *const i8) -> i32 {
+    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
+    use std::arch::asm;
+
+    // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
+    let weight_lo = unsafe { vld1q_s8(weight) };
+    let input_lo = unsafe { vld1q_s8(input) };
+    let weight_hi = unsafe { vld1q_s8(weight.add(16)) };
+    let input_hi = unsafe { vld1q_s8(input.add(16)) };
+
+    let mut acc = vdupq_n_s32(0);
+    // SAFETY: target_feature(dotprod) enables SDOT for this function. The operands are full
+    // 128-bit vector registers loaded above, and the instruction only updates `acc`.
+    unsafe {
+        asm!(
+            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
+            acc = inout(vreg) acc,
+            weight_lo = in(vreg) weight_lo,
+            input_lo = in(vreg) input_lo,
+            weight_hi = in(vreg) weight_hi,
+            input_hi = in(vreg) input_hi,
+            options(nostack, preserves_flags)
+        );
+    }
+    horizontal_sum_i32x4(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn q8_0_i8_block_neon_mul(weight: *const i8, input: *const i8) -> i32 {
     use std::arch::aarch64::{
-        int32x4_t, vaddq_s32, vdupq_n_s32, vget_high_s8, vget_low_s8, vld1q_s8, vmull_s8,
-        vpaddlq_s16,
+        vaddq_s32, vdupq_n_s32, vget_high_s8, vget_low_s8, vld1q_s8, vmull_s8, vpaddlq_s16,
     };
 
     // SAFETY: callers pass pointers to at least 32 contiguous i8 values.
@@ -6349,8 +6460,15 @@ unsafe fn q8_0_i8_block_neon(weight: *const i8, input: *const i8) -> i32 {
         acc,
         vpaddlq_s16(vmull_s8(vget_high_s8(weight_hi), vget_high_s8(input_hi))),
     );
+    horizontal_sum_i32x4(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn horizontal_sum_i32x4(acc: std::arch::aarch64::int32x4_t) -> i32 {
     // SAFETY: int32x4_t is a four-lane i32 vector; extracting via transmute preserves lanes.
-    let lanes: [i32; 4] = unsafe { std::mem::transmute::<int32x4_t, [i32; 4]>(acc) };
+    let lanes: [i32; 4] =
+        unsafe { std::mem::transmute::<std::arch::aarch64::int32x4_t, [i32; 4]>(acc) };
     lanes.iter().sum()
 }
 
@@ -6462,6 +6580,10 @@ fn accumulate_descriptor_linear_row(
     weight: BorrowedLinearWeight<'_>,
     output: &mut [f32],
 ) {
+    if try_accumulate_descriptor_linear_row_accelerate(input_row, weight, output) {
+        return;
+    }
+
     if should_parallelize_linear_output(output.len()) {
         let output_width = output.len();
         output
@@ -6490,6 +6612,100 @@ fn accumulate_descriptor_linear_row(
             *out_value += lhs_value * rhs_value;
         }
     }
+}
+
+fn try_accumulate_descriptor_linear_row_accelerate(
+    input_row: &[f32],
+    weight: BorrowedLinearWeight<'_>,
+    output: &mut [f32],
+) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if !apple_accelerate_blas_enabled() {
+            return false;
+        }
+        if weight.rows != input_row.len() || weight.cols != output.len() {
+            return false;
+        }
+        let Ok(m) = i32::try_from(weight.rows) else {
+            return false;
+        };
+        let Ok(n) = i32::try_from(weight.cols) else {
+            return false;
+        };
+        let Some(element_count) = weight.rows.checked_mul(weight.cols) else {
+            return false;
+        };
+        if element_count < apple_accelerate_min_elements() {
+            return false;
+        }
+        // SAFETY: dimensions are checked above. `weight.data` is row-major [M, N], so
+        // CblasTrans computes output[N] += input[M]^T * weight[M, N].
+        unsafe {
+            cblas_sgemv(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                m,
+                n,
+                1.0,
+                weight.data.as_ptr(),
+                n,
+                input_row.as_ptr(),
+                1,
+                1.0,
+                output.as_mut_ptr(),
+                1,
+            );
+        }
+        true
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (input_row, weight, output);
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apple_accelerate_blas_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !q8_0_env_flag_disabled("CAMELID_APPLE_ACCELERATE"))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_accelerate_min_elements() -> usize {
+    static MIN_ELEMENTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN_ELEMENTS.get_or_init(|| {
+        env::var("CAMELID_APPLE_ACCELERATE_MIN_ELEMENTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(262_144)
+    })
+}
+
+#[cfg(target_os = "macos")]
+const CBLAS_ROW_MAJOR: i32 = 101;
+#[cfg(target_os = "macos")]
+const CBLAS_TRANS: i32 = 112;
+
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemv(
+        order: i32,
+        trans_a: i32,
+        m: i32,
+        n: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        x: *const f32,
+        inc_x: i32,
+        beta: f32,
+        y: *mut f32,
+        inc_y: i32,
+    );
 }
 
 fn accumulate_transposed_linear_row_runtime(
