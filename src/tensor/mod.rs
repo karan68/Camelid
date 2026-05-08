@@ -2088,6 +2088,37 @@ mod tests {
     }
 
     #[test]
+    fn q8_file_backing_rejects_nonempty_zero_block_reads_before_file_io() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "32");
+        let _ = q8_0_file_read_stats();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-zero-block-bounds-{}",
+            std::process::id()
+        ));
+        let backing = Q8_0FileBacking::new(path.clone(), 128, 0);
+
+        let mut empty = [];
+        backing.read_exact_at_cached(&mut empty, 128).unwrap();
+        assert!(!backing.file_handle_cached());
+
+        let after_empty = q8_0_file_read_stats();
+        let mut out = [0_u8; 1];
+        let err = backing.read_exact_at_cached(&mut out, 128).unwrap_err();
+        let stats = q8_0_file_read_stats().saturating_delta_since(after_empty);
+
+        assert!(err.to_string().contains("exceeds backing storage range"));
+        assert_eq!(stats.read_calls, 0);
+        assert_eq!(stats.read_bytes, 0);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 0);
+        assert!(!backing.file_handle_cached());
+
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
     fn matmul_rhs_transposed_handles_single_row_vectors() {
         let lhs = CpuTensor::from_f32("lhs", vec![1, 5], vec![1.0, -2.0, 3.0, 0.5, 4.0]).unwrap();
         let rhs = CpuTensor::from_f32(
