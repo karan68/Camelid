@@ -703,10 +703,6 @@ export default function ModelsView({
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B first 512-context pack passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B 1024/2048 bounded packs passed</div>}
                     {target.id === 'llama3_8b_instruct_q8_0' && <div className="pin-badge ready">8B compact template-shapes pack passed</div>}
-                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral tokenizer/template parity passed</div>}
-                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral first-token parity passed</div>}
-                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral API/chat smoke passed</div>}
-                    {target.id === 'mistral_7b_instruct_v0_3_q8_0' && <div className="pin-badge ready">Mistral 512/1024/2048 bounded packs passed</div>}
                     {match.active && <div className="pin-badge ready">Loaded exact-row match</div>}
                     {!match.active && match.selected && <div className="pin-badge">Selected exact-row match</div>}
                   </div>

@@ -146,7 +146,7 @@ const capabilityFixture = {
     { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '1B exact-row load, completion, chat, frontend smoke, second 1024-context evidence, and third 2048-context evidence after the RoPE factor fix' },
     { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, and third 2048-context evidence' },
     { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary templates, throughput, portability, repeated current-head evidence, and durable normalized full-support bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_512_pack: 'validated_first_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, checked 512/1024/2048-context packs, compact template-shapes pack evidence, and bounded memory/hot-path measurements. The fresh current-head 1024/2048 bundle is listed in COMPATIBILITY.md; no model-native/larger context or broader/full support is implied.' },
-    { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: '50-token parity, broader prompt packs, arbitrary/Jinja template behavior, production throughput, portability, repeated current-head API/WebUI/RSS evidence, and durable normalized full-support bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_512_pack: 'validated_first_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'mistral-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: ' The repeat marker is "', evidence: 'Mistral v0.3 exact-row smoke plus checked bounded 512/1024/2048 packs; no Mistral-family, arbitrary-template, 50-token, throughput, portability, or full support is implied' },
+    { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'active_validation_unsupported', support_scope: 'bringup_exact_row_unsupported', full_support_status: 'blocked_unsupported_bringup', full_support_blockers: 'source/SHA/license, exact tokenizer/template references, 1-token generation parity, bounded load/readiness, API/WebUI, RSS/timing, scrubbed manifest, checksums, and durable row-specific bundle evidence are not complete as promotion evidence', evidence: 'Mistral v0.3 active validation only; exact support-promotion evidence remains fail-closed' },
     { id: 'mixtral_8x7b_instruct_v0_1_q8_0', family: 'mixtral', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'MoE runtime, tokenizer/template parity, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Mixtral planning row only; no support evidence exists' },
     { id: 'qwen25_7b_instruct_q8_0', family: 'qwen2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'qwen2 runtime, tokenizer/pre-tokenizer fixtures, ChatML parity, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Qwen 2.5 planning row only; no support evidence exists' },
     { id: 'gemma2_9b_it_q8_0', family: 'gemma2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Gemma 2 planning row only; no support evidence exists' },
@@ -167,8 +167,8 @@ assert.doesNotMatch(
 const trackedTargets = getTrackedCompatibilityTargets(capabilityFixture)
 assert.deepEqual(
   trackedTargets.map((target) => target.id),
-  ['tinyllama_1_1b_chat_q8_0', 'llama32_1b_instruct_q8_0', 'llama32_3b_instruct_q8_0', 'llama3_8b_instruct_q8_0', 'mistral_7b_instruct_v0_3_q8_0'],
-  'tracked full-support hardening rows should stay pinned to the exact TinyLlama/1B/3B/8B/Mistral ids in /api/capabilities order',
+  ['tinyllama_1_1b_chat_q8_0', 'llama32_1b_instruct_q8_0', 'llama32_3b_instruct_q8_0', 'llama3_8b_instruct_q8_0'],
+  'tracked full-support hardening rows should stay pinned to the exact TinyLlama/1B/3B/8B ids in /api/capabilities order',
 )
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, target.full_support_status, Boolean(target.full_support_blockers), Boolean(target.frontend_readiness_gate)]),
@@ -177,7 +177,6 @@ assert.deepEqual(
     ['llama32_1b_instruct_q8_0', 'blocked_pending_normalized_full_support', true, true],
     ['llama32_3b_instruct_q8_0', 'blocked_pending_normalized_full_support', true, true],
     ['llama3_8b_instruct_q8_0', 'blocked_pending_normalized_full_support', true, true],
-    ['mistral_7b_instruct_v0_3_q8_0', 'blocked_pending_normalized_full_support', true, true],
   ],
   'all current rows should carry an explicit stricter full-support bar and fail-closed frontend readiness gate',
 )
@@ -188,9 +187,8 @@ assert.deepEqual(
     ['llama32_1b_instruct_q8_0', 'validated_second_pack'],
     ['llama32_3b_instruct_q8_0', 'validated_second_pack'],
     ['llama3_8b_instruct_q8_0', 'validated_second_pack'],
-    ['mistral_7b_instruct_v0_3_q8_0', 'validated_second_pack'],
   ],
-  'frontend tracked rows should preserve the API 1024-context boundary: TinyLlama not promoted; exact 1B/3B/8B/Mistral promoted only for their checked bounded packs',
+  'frontend tracked rows should preserve the API 1024-context boundary: TinyLlama not promoted; exact 1B/3B/8B promoted only for their checked bounded packs',
 )
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, target.bounded_context_2048_pack]),
@@ -199,9 +197,8 @@ assert.deepEqual(
     ['llama32_1b_instruct_q8_0', 'validated_third_pack'],
     ['llama32_3b_instruct_q8_0', 'validated_third_pack'],
     ['llama3_8b_instruct_q8_0', 'validated_third_pack'],
-    ['mistral_7b_instruct_v0_3_q8_0', 'validated_third_pack'],
   ],
-  'frontend tracked rows should preserve the API 2048-context boundary: TinyLlama not promoted; exact 1B/3B/8B/Mistral promoted only for their checked bounded packs',
+  'frontend tracked rows should preserve the API 2048-context boundary: TinyLlama not promoted; exact 1B/3B/8B promoted only for their checked bounded packs',
 )
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, target.latest_checked_bucket, target.latest_checked_result, target.latest_checked_output]),
@@ -210,7 +207,6 @@ assert.deepEqual(
     ['llama32_1b_instruct_q8_0', 'llama3-context-2048-smoke-v1', 'pass', 'CMLD-204'],
     ['llama32_3b_instruct_q8_0', 'llama3-context-2048-smoke-v1', 'pass', 'CMLD-204'],
     ['llama3_8b_instruct_q8_0', 'llama3-context-2048-smoke-v1', 'pass', 'CMLD-204'],
-    ['mistral_7b_instruct_v0_3_q8_0', 'mistral-context-2048-smoke-v1', 'pass', ' The repeat marker is "'],
   ],
   'frontend tracked rows should surface the API latest bounded checks without implying broad/full support or model-native/larger-context support',
 )
@@ -312,16 +308,16 @@ assert.equal(evidenceOnly1BGate.runtimeReady, true, 'runtime readiness should be
 assert.equal(evidenceOnly1BGate.contractSupported, false, 'evidence-only rows are not exact supported rows')
 assert.equal(evidenceOnly1BGate.chatUnlocked, false, 'WebUI chat must remain blocked unless runtime readiness and an exact supported compatibility row both pass')
 const mistralExactHint = findCompatibilityHint(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' })
-assert.equal(mistralExactHint.kind, 'compatibility', 'the supported Mistral lane should identify only the exact v0.3 7B Instruct Q8_0 row')
+assert.equal(mistralExactHint.kind, 'compatibility', 'the future Mistral lane should identify only the exact v0.3 7B Instruct Q8_0 row')
 assert.equal(mistralExactHint.target.id, 'mistral_7b_instruct_v0_3_q8_0')
-assert.equal(mistralExactHint.target.status, 'supported_exact_row_smoke', 'Mistral exact-row matching should advertise bounded exact-row smoke support')
-assert.equal(mistralExactHint.target.full_support_status, 'blocked_pending_normalized_full_support', 'Mistral still needs normalized full-support evidence')
-assert.match(mistralExactHint.target.full_support_blockers, /50-token parity|arbitrary\/Jinja|portability/i, 'Mistral exact-row matching must carry its remaining blocking evidence list')
-assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' }), true, 'Mistral exact-row smoke support should unlock only exact Q8_0 matches')
+assert.equal(mistralExactHint.target.status, 'active_validation_unsupported', 'Mistral exact-row matching must still advertise unsupported active-validation status')
+assert.equal(mistralExactHint.target.full_support_status, 'blocked_unsupported_bringup', 'Mistral exact-row matching must still advertise unsupported bring-up status')
+assert.match(mistralExactHint.target.full_support_blockers, /1-token generation parity|API\/WebUI|durable row-specific bundle/i, 'Mistral exact-row matching must carry its blocking evidence list')
+assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' }), false, 'Mistral acceptance-target evidence must not unlock chat')
 assert.equal(
   getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'mistral-v03', name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' }, { active_model_id: 'mistral-v03', loaded_now: true, generation_ready: true }).chatUnlocked,
-  true,
-  'runtime-green exact Mistral v0.3 should unlock after /api/capabilities promotes the exact row to supported',
+  false,
+  'even runtime-green Mistral v0.3 remains blocked until /api/capabilities promotes the exact row to supported',
 )
 const mistralNoQuantHint = findCompatibilityHint(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3' })
 assert.equal(mistralNoQuantHint.kind, 'quant_missing', 'Mistral exact-row support must still require quant evidence')
