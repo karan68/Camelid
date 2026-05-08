@@ -630,7 +630,11 @@ impl Tokenizer {
                 piece.len()
             };
             if self.bpe_ranks.is_empty() {
-                out.extend(self.encode_piece_greedy(&piece[byte_start..byte_end])?);
+                if parse_special {
+                    self.encode_spm_segment(&piece[byte_start..byte_end], &mut out)?;
+                } else {
+                    out.extend(self.encode_piece_greedy(&piece[byte_start..byte_end])?);
+                }
             } else {
                 self.encode_spm_segment(&piece[byte_start..byte_end], &mut out)?;
             }
@@ -651,88 +655,63 @@ impl Tokenizer {
             return Ok(());
         }
 
-        let boundaries: Vec<usize> = segment
-            .char_indices()
-            .map(|(idx, _)| idx)
-            .chain(std::iter::once(segment.len()))
-            .collect();
-        let max_token_bytes = self
-            .tokens
-            .iter()
-            .map(|token| token.text.len())
-            .max()
-            .unwrap_or(0);
-        let mut best: Vec<Option<(f32, usize, Option<TokenId>)>> = vec![None; segment.len() + 1];
-        best[0] = Some((0.0, 0, None));
+        let symbols = if self.bpe_ranks.is_empty() {
+            self.merge_spm_symbols_by_score(segment)
+        } else {
+            self.bpe_registry
+                .merge_symbols(segment.chars().map(|ch| ch.to_string()).collect())
+        };
 
-        for &byte_start in &boundaries {
-            let Some((start_score, _, _)) = best[byte_start] else {
+        let mut unresolved = String::new();
+        for symbol in symbols {
+            if symbol.contains("▁▁") {
+                unresolved.push_str(&symbol);
                 continue;
-            };
+            }
 
-            // SPM/unigram tokenization is a best-path problem over vocab pieces. This matters
-            // for parse-special prompt segments after control tokens: they can need a single
-            // vocab piece such as "Hello" rather than char-by-char unknown fallback.
-            for &byte_end in boundaries
-                .iter()
-                .filter(|idx| **idx > byte_start && **idx - byte_start <= max_token_bytes)
-            {
-                let candidate = &segment[byte_start..byte_end];
+            if let Some(id) = self.token_to_id.get(&symbol).copied() {
+                if !unresolved.is_empty() {
+                    out.extend(self.encode_piece_greedy(&unresolved)?);
+                    unresolved.clear();
+                }
+                out.push(id);
+            } else {
+                unresolved.push_str(&symbol);
+            }
+        }
+        if !unresolved.is_empty() {
+            out.extend(self.encode_piece_greedy(&unresolved)?);
+        }
+        Ok(())
+    }
+
+    fn merge_spm_symbols_by_score(&self, segment: &str) -> Vec<String> {
+        let mut symbols: Vec<String> = segment.chars().map(|ch| ch.to_string()).collect();
+
+        loop {
+            let mut best: Option<(f32, usize)> = None;
+            for idx in 0..symbols.len().saturating_sub(1) {
+                let candidate = format!("{}{}", symbols[idx], symbols[idx + 1]);
                 if candidate.contains("▁▁") {
                     continue;
                 }
-                let Some(id) = self.token_to_id.get(candidate).copied() else {
+                let Some(id) = self.token_to_id.get(&candidate).copied() else {
                     continue;
                 };
-                let score = start_score + self.tokens[id as usize].score;
-                match best[byte_end] {
-                    Some((best_score, best_prev, _))
-                        if score < best_score
-                            || (score == best_score && byte_start <= best_prev) =>
-                    {
-                        continue;
-                    }
-                    _ => best[byte_end] = Some((score, byte_start, Some(id))),
+                let score = self.tokens[id as usize].score;
+                match best {
+                    Some((best_score, best_idx))
+                        if score < best_score || (score == best_score && idx >= best_idx) => {}
+                    _ => best = Some((score, idx)),
                 }
             }
 
-            if let Some((char_end, _)) = segment[byte_start..]
-                .char_indices()
-                .nth(1)
-                .map(|(offset, ch)| (byte_start + offset, ch))
-                .or_else(|| {
-                    segment[byte_start..]
-                        .chars()
-                        .next()
-                        .map(|ch| (segment.len(), ch))
-                })
-            {
-                if best[char_end].is_none() {
-                    best[char_end] = Some((start_score + f32::MIN / 4.0, byte_start, None));
-                }
-            }
+            let Some((_, idx)) = best else { break };
+            symbols[idx] = format!("{}{}", symbols[idx], symbols[idx + 1]);
+            symbols.remove(idx + 1);
         }
 
-        let mut pieces = Vec::new();
-        let mut cursor = segment.len();
-        while cursor > 0 {
-            let Some((_, prev, id)) = best[cursor] else {
-                self.encode_unknown_symbol_bytes(&segment[cursor..], out)?;
-                return Ok(());
-            };
-            pieces.push((prev, cursor, id));
-            cursor = prev;
-        }
-
-        pieces.reverse();
-        for (start, end, id) in pieces {
-            if let Some(id) = id {
-                out.push(id);
-            } else {
-                self.encode_unknown_symbol_bytes(&segment[start..end], out)?;
-            }
-        }
-        Ok(())
+        symbols
     }
 
     fn encode_unknown_symbol_bytes(&self, symbol: &str, out: &mut Vec<TokenId>) -> Result<()> {

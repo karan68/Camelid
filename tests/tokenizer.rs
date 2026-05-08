@@ -229,6 +229,43 @@ fn encodes_mistral_real_prompts_like_llama_cpp_when_available() {
             true,
             vec![1, 3, 29473, 23325, 29473, 4],
         ),
+        (
+            "broader_prompt_give_split",
+            "<s>[INST] You write compact engineering checklists.\n\ngive three short steps for checking a rust change before a public push. [/INST]",
+            false,
+            true,
+            vec![
+                1, 3, 29473, 1763, 4092, 13192, 14088, 2645, 24707, 29491, 781, 781,
+                29489, 1263, 2480, 3253, 6712, 1122, 13547, 1032, 15680, 3036, 1927,
+                1032, 1566, 6464, 29491, 29473, 4,
+            ],
+        ),
+        (
+            "broader_prompt_tokenizer_stress_words",
+            "<s>[INST] You are checking tokenizer coverage. Reply with one simple sentence.\n\nUse these exact words once: Fact alpaca MSTR mstr CMLD checksum gamma llama. Then say the check is done. [/INST]",
+            false,
+            true,
+            vec![
+                1, 3, 29473, 1763, 1228, 13547, 6797, 4792, 11634, 29491, 4125,
+                1114, 1163, 1392, 4356, 13039, 29491, 781, 781, 9311, 1935,
+                4227, 3853, 3095, 29515, 1169, 1340, 1157, 29488, 14458, 1119,
+                5340, 1058, 1810, 1102, 4595, 29525, 2645, 2569, 1087, 3421,
+                9582, 3554, 29491, 3247, 2083, 1040, 2645, 1117, 2971, 29491,
+                29473, 4,
+            ],
+        ),
+        (
+            "broader_prompt_later_drift_question",
+            "<s>[INST] You are helpful, direct, and practical.\n\nwhat should a developer look at first if a local chat model gives the right first token but drifts later? [/INST]",
+            false,
+            true,
+            vec![
+                1, 3, 29473, 1763, 1228, 11633, 29493, 2631, 29493, 1072, 11886,
+                29491, 781, 781, 7570, 1791, 1032, 22550, 1681, 1206, 1675, 1281,
+                1032, 2630, 11474, 2997, 5980, 1040, 1871, 1675, 6797, 1330,
+                2373, 9805, 2830, 29572, 29473, 4,
+            ],
+        ),
     ];
 
     for (name, text, add_special, parse_special, expected) in cases {
