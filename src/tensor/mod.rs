@@ -146,6 +146,29 @@ impl Q8_0FileBacking {
         if out.is_empty() {
             return Ok(());
         }
+        let relative_start = offset.checked_sub(self.absolute_offset).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(format!(
+                "q8_0 file-backed read offset {offset} is before backing offset {}",
+                self.absolute_offset
+            ))
+        })?;
+        let relative_end = relative_start
+            .checked_add(out.len() as u64)
+            .ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "q8_0 file-backed read byte range overflow".to_string(),
+                )
+            })?;
+        let storage_bytes = self.storage_bytes();
+        if relative_end > storage_bytes {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "q8_0 file-backed read offset {offset} length {} exceeds backing storage range {}..{} ({} bytes)",
+                out.len(),
+                self.absolute_offset,
+                self.absolute_offset.saturating_add(storage_bytes),
+                storage_bytes
+            )));
+        }
         let Q8FileCacheRead::Missing { ranges } =
             q8_file_cache_prepare_read(&self.path, offset, out)
         else {
@@ -1980,7 +2003,7 @@ mod tests {
         ));
         std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
         std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "32");
-        let backing = Q8_0FileBacking::new(path.clone(), 0, 0);
+        let backing = Q8_0FileBacking::new(path.clone(), 0, 1);
 
         let start = q8_0_file_read_stats();
         let mut seed = [0_u8; 8];
@@ -2017,6 +2040,48 @@ mod tests {
         assert_eq!(cached_stats.cache_hit_bytes, 16);
         assert_eq!(cached_stats.cache_misses, 0);
         assert_eq!(cached_stats.cache_miss_bytes, 0);
+
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn q8_file_backing_rejects_reads_outside_declared_storage_before_file_io() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "0");
+        let _ = q8_0_file_read_stats();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-backing-bounds-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, (0_u8..64).collect::<Vec<_>>()).unwrap();
+        let backing = Q8_0FileBacking::new(path.clone(), 8, 1);
+
+        let mut valid = [0_u8; 34];
+        backing.read_exact_at_cached(&mut valid, 8).unwrap();
+        assert_eq!(&valid[..4], &[8, 9, 10, 11]);
+
+        let after_valid = q8_0_file_read_stats();
+        let mut before = [0_u8; 1];
+        let before_err = backing.read_exact_at_cached(&mut before, 7).unwrap_err();
+        let after_before_err = q8_0_file_read_stats().saturating_delta_since(after_valid);
+        assert!(before_err.to_string().contains("before backing offset 8"));
+        assert_eq!(after_before_err.read_calls, 0);
+        assert_eq!(after_before_err.read_bytes, 0);
+
+        let after_before_err_absolute = q8_0_file_read_stats();
+        let mut beyond = [0_u8; 2];
+        let beyond_err = backing
+            .read_exact_at_cached(&mut beyond, 8 + 34 - 1)
+            .unwrap_err();
+        let after_beyond_err =
+            q8_0_file_read_stats().saturating_delta_since(after_before_err_absolute);
+        assert!(beyond_err
+            .to_string()
+            .contains("exceeds backing storage range"));
+        assert_eq!(after_beyond_err.read_calls, 0);
+        assert_eq!(after_beyond_err.read_bytes, 0);
 
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES");
         let _ = std::fs::remove_file(path);

@@ -1537,8 +1537,13 @@ impl LlamaInferenceSession {
         token_ids: &[u32],
         chunk_tokens: usize,
     ) -> Result<LlamaForwardTimings> {
+        let forward_passes = if token_ids.is_empty() {
+            0
+        } else {
+            token_ids.len().div_ceil(chunk_tokens)
+        };
         let q8_file_cache_capacity =
-            prefill_layer_major_q8_file_cache_capacity_override(&self.weights);
+            prefill_layer_major_q8_file_cache_capacity_override(&self.weights, forward_passes);
         with_q8_file_cache_capacity_override(q8_file_cache_capacity, || {
             self.forward_prefill_layer_major_timed_fast_inner(token_ids, chunk_tokens)
         })
@@ -2044,6 +2049,7 @@ const DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES: usize = 256 * 1024 * 1024
 
 fn prefill_layer_major_q8_file_cache_capacity_override(
     weights: &LlamaLoadedWeights,
+    forward_passes: usize,
 ) -> Option<usize> {
     if !weights.has_lazy_q8_0_file_backing() {
         return None;
@@ -2055,6 +2061,9 @@ fn prefill_layer_major_q8_file_cache_capacity_override(
         );
     }
     if env::var(Q8_FILE_CACHE_BYTES_ENV).is_ok() {
+        return None;
+    }
+    if forward_passes <= 1 {
         return None;
     }
     Some(DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES)
@@ -8397,7 +8406,7 @@ mod tests {
             CpuTensor::from_f32("blk.0.attn_q.weight", vec![2, 2], vec![1.0; 4]).unwrap(),
         );
         assert_eq!(
-            prefill_layer_major_q8_file_cache_capacity_override(&dense_weights),
+            prefill_layer_major_q8_file_cache_capacity_override(&dense_weights, 2),
             None
         );
 
@@ -8411,13 +8420,17 @@ mod tests {
         .with_q8_0_file_backing(Q8_0FileBacking::new("unused.gguf".into(), 0, 1));
         let lazy_q8_weights = tiny_prefill_schedule_weights(lazy_q8_attention_q);
         assert_eq!(
-            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights),
+            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 1),
+            None
+        );
+        assert_eq!(
+            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 2),
             Some(DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES)
         );
 
         std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_CACHE_BYTES", "64 MiB");
         assert_eq!(
-            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights),
+            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 2),
             None
         );
 
@@ -8426,7 +8439,7 @@ mod tests {
             "0",
         );
         assert_eq!(
-            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights),
+            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 1),
             Some(0)
         );
 
@@ -8435,7 +8448,7 @@ mod tests {
             "1 MiB",
         );
         assert_eq!(
-            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights),
+            prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 1),
             Some(1024 * 1024)
         );
     }
