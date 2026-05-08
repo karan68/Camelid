@@ -10,7 +10,7 @@ Every public surface should tell the same four-row story:
 
 - TinyLlama 1.1B Chat Q8_0 is the supported current gate, with checked 512-context/template/RSS evidence.
 - Llama 3.2 1B and 3B Instruct Q8_0 are exact-row smoke-supported through checked 512/1024/2048 bounded context packs where row-specific PASS artifacts are cited.
-- Llama 3 8B Instruct Q8_0 is exact-row smoke-supported through checked 512/1024/2048 bounded context packs where row-specific PASS artifacts are cited.
+- Llama 3 8B Instruct Q8_0 is exact-row smoke-supported through the checked bounded 512-context pack only on current `main`; 1024/2048 remain red until fresh current-head PASS artifacts plus docs/API/frontend alignment exist.
 - Current-head language requires a fresh canonical PASS after later runtime/source commits; broad/full support for every non-TinyLlama row still requires model-native/larger context beyond checked packs, arbitrary-template evidence, throughput, portability, and durable normalized current-head bundles.
 
 Next-family public language is locked to planning/validation, not support:
