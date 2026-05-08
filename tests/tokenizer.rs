@@ -177,13 +177,17 @@ fn encodes_llama3_real_prompts_like_llama_cpp_when_available() {
 }
 
 #[test]
-fn mistral_reference_template_lists_required_prompt_shapes() {
+fn mistral_reference_pack_records_required_prompt_shapes_and_tokens() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
-        "../fixtures/tokenizer/mistral-7b-instruct-v0.3-reference-pack.template.json"
+        "../fixtures/tokenizer/mistral-7b-instruct-v0.3-reference-pack.json"
     ))
     .unwrap();
 
-    assert_eq!(fixture["status"], "template_only");
+    assert_eq!(fixture["status"], "reference_capture");
+    assert_eq!(
+        fixture["expected_artifacts"]["gguf_sha256"],
+        "404857e776114baada71a08ebd3bba79d721ec7fca99705e7e7b892ae8bc583f"
+    );
     assert_eq!(
         fixture["expected_artifacts"]["tokenizer_fixture_id"],
         "mistral-instruct-v0.3-tokenizer-v1"
@@ -195,6 +199,10 @@ fn mistral_reference_template_lists_required_prompt_shapes() {
     assert_eq!(
         fixture["expected_artifacts"]["prompt_cases"][1]["rendered_prompt"],
         "<s>[INST] Hello [/INST]"
+    );
+    assert_eq!(
+        fixture["expected_artifacts"]["prompt_cases"][1]["expected_tokens"],
+        serde_json::json!([1, 3, 29473, 23325, 29473, 4])
     );
     assert_eq!(
         fixture["expected_artifacts"]["prompt_cases"][2]["rendered_prompt"],

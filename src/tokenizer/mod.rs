@@ -613,7 +613,8 @@ impl Tokenizer {
                             && byte_start < piece.len()
                             && self.longest_control_token_at(piece, byte_start).is_none()
                         {
-                            if let Some(dummy_prefix) = self.token_to_id.get(&SPM_SPACE.to_string()) {
+                            if let Some(dummy_prefix) = self.token_to_id.get(&SPM_SPACE.to_string())
+                            {
                                 out.push(*dummy_prefix);
                             }
                         }

@@ -62,8 +62,9 @@ const report = {
   notes: 'Tokenizer/chat-template reference pack generated from llama.cpp llama-tokenize for the exact chosen GGUF row. Do not promote support from this file alone.',
   reference: {
     tool: 'llama.cpp llama-tokenize --ids',
-    binary: llamaTokenizeBin,
-    model: modelPath,
+    binary: '<llama.cpp>/llama-tokenize',
+    model: 'Mistral-7B-Instruct-v0.3-Q8_0.gguf',
+    local_paths_redacted: true,
     generated_at_utc: new Date().toISOString(),
   },
   expected_artifacts: {

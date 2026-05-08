@@ -37,11 +37,14 @@ if (!Number.isInteger(waitMs) || waitMs < 1) {
 
 const messages = await loadMessages({ messagesJson, fallbackMessage: userMessage })
 // Camelid's exact-row parity evidence intentionally renders the checked-in prompt
-// shape itself, then asks the tokenizer to add BOS. Use llama-server /completion
-// with this explicit prompt instead of depending on server-side chat-template
-// expansion, so compact Llama 3 and TinyLlama marker-template lanes stay exact.
+// shape itself. Use llama-server /completion with this explicit prompt instead of
+// depending on server-side chat-template expansion, so compact Llama 3,
+// TinyLlama marker-template, and Mistral instruct lanes stay exact. Mistral
+// prompts already include <s>, so that lane sends token ids to llama-server to
+// avoid a second reference-side BOS insertion.
 const expectedPrompt = renderExpectedPrompt(messages, renderMode)
 const referencePromptTokens = await tokenizeExpectedPrompt()
+const llamaCompletionPrompt = renderMode === 'mistral_instruct' ? referencePromptTokens : expectedPrompt
 const referenceContext = resolveReferenceContext({
   promptTokenCount: referencePromptTokens.length,
   maxTokens,
@@ -93,7 +96,7 @@ try {
   const llamaCompletion = await fetchJson(`${llamaBase}/completion`, {
     method: 'POST',
     body: JSON.stringify({
-      prompt: expectedPrompt,
+      prompt: llamaCompletionPrompt,
       n_predict: maxTokens,
       temperature: 0,
       cache_prompt: false,
@@ -147,6 +150,7 @@ try {
     reference_prompt_token_count: referencePromptTokens.length,
     reference_context: referenceContext,
     llama_flash_attn: llamaFlashAttn,
+    llama_completion_prompt_kind: Array.isArray(llamaCompletionPrompt) ? 'tokens' : 'text',
     llama_server_args: llamaServerArgs,
     prompt_tokens_match: promptMatch,
     generated_tokens_match: generatedTokensMatch,
@@ -178,6 +182,7 @@ try {
   console.log(`reference_prompt_token_count=${referencePromptTokens.length}`)
   console.log(`reference_context=${referenceContext}`)
   console.log(`llama_flash_attn=${llamaFlashAttn}`)
+  console.log(`llama_completion_prompt_kind=${Array.isArray(llamaCompletionPrompt) ? 'tokens' : 'text'}`)
   console.log(`backend_prompt_tokens=${JSON.stringify(backendPromptTokens)}`)
   console.log(`reference_prompt_tokens=${JSON.stringify(referencePromptTokens)}`)
   console.log(`prompt_tokens_match=${promptMatch}`)
@@ -235,12 +240,14 @@ function parseArgs(argv) {
 }
 
 async function tokenizeExpectedPrompt() {
-  const { stdout } = await run(llamaTokenizeBin, [
+  const llamaTokenizeArgs = [
     '-m', modelPath,
     '--ids',
     '--log-disable',
     '-p', expectedPrompt,
-  ])
+  ]
+  if (renderMode === 'mistral_instruct') llamaTokenizeArgs.push('--no-bos')
+  const { stdout } = await run(llamaTokenizeBin, llamaTokenizeArgs)
   return JSON.parse(stdout.trim())
 }
 
