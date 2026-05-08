@@ -5833,7 +5833,7 @@ textarea.composer-input-gemini {
 }
 
 .message-row-gemini.assistant.is-streaming::before {
-  animation: camelid-pacman-chomp 320ms steps(2, end) infinite, camelid-pacman-bob 780ms ease-in-out infinite;
+  animation: camelid-pacman-chomp 320ms steps(2, end) infinite;
 }
 
 .message-row-gemini.assistant.is-streaming::after {
@@ -5863,11 +5863,6 @@ textarea.composer-input-gemini {
   50% {
     background: conic-gradient(from 19deg, transparent 0 38deg, #ffd84d 38deg 360deg);
   }
-}
-
-@keyframes camelid-pacman-bob {
-  0%, 100% { transform: translateY(7px); }
-  50% { transform: translateY(5px); }
 }
 
 @keyframes camelid-pellets-feed {

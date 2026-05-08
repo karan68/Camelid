@@ -200,29 +200,52 @@ const renderHighlightedCode = (code, language, keyPrefix) => {
   return nodes
 }
 
+const splitFenceInfo = (value) => {
+  const trimmed = String(value || '').trim()
+  if (!trimmed) return { language: 'Code', firstCodeLine: '' }
+  const [, rawLanguage = '', firstCodeLine = ''] = trimmed.match(/^([a-zA-Z0-9_+#.-]+)?\s*([\s\S]*)$/) || []
+  return {
+    language: normalizeCodeLanguage(rawLanguage),
+    firstCodeLine: firstCodeLine.trimStart(),
+  }
+}
+
+const pushCodeBlock = (blocks, language, code, keyPrefix) => {
+  const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
+  blocks.push(
+    <figure className="message-code-card" key={`code-${blocks.length}`}>
+      <figcaption>
+        <span>{language}</span>
+        <button type="button" onClick={() => copyText(trimmedCode)} aria-label={`Copy ${language} code`}>Copy</button>
+      </figcaption>
+      <pre><code>{renderHighlightedCode(trimmedCode, language, keyPrefix)}</code></pre>
+    </figure>,
+  )
+}
+
 function AssistantMarkdown({ content }) {
   const normalized = String(content || '').replace(/\r\n/g, '\n')
   const blocks = []
-  const fencePattern = /```\s*([^\n`]*)\n?([\s\S]*?)```/g
   let cursor = 0
-  let match = fencePattern.exec(normalized)
+  let fenceStart = normalized.indexOf('```', cursor)
 
-  while (match) {
-    const before = normalized.slice(cursor, match.index)
+  while (fenceStart !== -1) {
+    const before = normalized.slice(cursor, fenceStart)
     blocks.push(...renderMarkdownText(before, `md-${blocks.length}`))
-    const language = normalizeCodeLanguage(match[1])
-    const code = match[2].replace(/^\n+|\n+$/g, '')
-    blocks.push(
-      <figure className="message-code-card" key={`code-${blocks.length}`}>
-        <figcaption>
-          <span>{language}</span>
-          <button type="button" onClick={() => copyText(code)} aria-label={`Copy ${language} code`}>Copy</button>
-        </figcaption>
-        <pre><code>{renderHighlightedCode(code, language, `code-${blocks.length}`)}</code></pre>
-      </figure>,
-    )
-    cursor = match.index + match[0].length
-    match = fencePattern.exec(normalized)
+
+    const infoStart = fenceStart + 3
+    const nextLine = normalized.indexOf('\n', infoStart)
+    const infoEnd = nextLine === -1 ? normalized.length : nextLine
+    const { language, firstCodeLine } = splitFenceInfo(normalized.slice(infoStart, infoEnd))
+    const codeStart = nextLine === -1 ? infoEnd : nextLine + 1
+    const fenceEnd = normalized.indexOf('```', codeStart)
+    const codeEnd = fenceEnd === -1 ? normalized.length : fenceEnd
+    const codeBody = normalized.slice(codeStart, codeEnd)
+    const code = firstCodeLine ? `${firstCodeLine}${codeBody ? `\n${codeBody}` : ''}` : codeBody
+
+    pushCodeBlock(blocks, language, code, `code-${blocks.length}`)
+    cursor = fenceEnd === -1 ? normalized.length : fenceEnd + 3
+    fenceStart = normalized.indexOf('```', cursor)
   }
   blocks.push(...renderMarkdownText(normalized.slice(cursor), `md-${blocks.length}`))
 
