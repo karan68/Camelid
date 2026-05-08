@@ -138,34 +138,29 @@ export default function ChatWorkspace({
       ? 'Support row required.'
       : 'Bring a local model online.'
   const emptyHeroSummary = selectedModelRunnable
-    ? `Ask a bounded local prompt. Camelid is green only for ${selectedCompatibilityLabel}, with the ${CHAT_DEMO_TOKEN_CAP}-token demo envelope still visible.`
+    ? `Ask a bounded local prompt. Camelid is green only because ${selectedCompatibilityLabel} matches the loaded runtime, with the ${CHAT_DEMO_TOKEN_CAP}-token preview envelope still visible.`
     : supportBlocked
       ? 'The runtime can see this GGUF, but chat stays locked until /api/capabilities names the exact supported model and quant row.'
-      : 'Choose a GGUF and load it. Camelid enables chat only after runtime health and the support contract both agree.'
+      : 'Choose a GGUF and load it. Chat unlocks only after runtime health and the exact support contract agree.'
   const readinessFacts = [
     {
-      label: 'Runtime health',
-      value: selectedModel ? (selectedRuntimeReady ? 'Ready' : 'Waiting') : 'No model loaded',
-      copy: 'Requires loaded_now=true and generation_ready=true for the selected local model.',
+      label: 'Runtime',
+      value: selectedModel ? (selectedRuntimeReady ? 'Ready' : 'Waiting') : 'No model',
+      copy: 'Needs loaded_now=true and generation_ready=true for this selection.',
       tone: selectedRuntimeReady ? 'ready' : 'waiting',
     },
     {
-      label: 'Support contract',
-      value: selectedModelRunnable ? 'Matched' : supportBlocked ? 'Needs support row' : capabilityGate,
+      label: 'Contract',
+      value: selectedModelRunnable ? 'Exact row matched' : supportBlocked ? 'Exact row missing' : capabilityGate,
       copy: selectedModel ? selectedCompatibilityLabel : 'Select a model to see exact compatibility.',
       tone: selectedModelRunnable ? 'ready' : supportBlocked ? 'blocked' : 'waiting',
     },
     {
-      label: 'Reply envelope',
+      label: 'Scope',
       value: `${CHAT_DEMO_TOKEN_CAP}-token preview`,
-      copy: 'Short local replies are supported here; longer-generation polish stays separately gated.',
+      copy: 'No broad family, arbitrary-GGUF, portability, or production-throughput claim.',
       tone: 'neutral',
     },
-  ]
-  const proofPills = [
-    selectedModelRunnable ? 'Ready for bounded chat' : 'Chat locked until green',
-    selectedModel ? selectedModelName : 'No local model selected',
-    selectedModelRunnable ? selectedCompatibilityLabel : 'Exact row required',
   ]
   const readinessState = selectedModelRunnable ? 'ready' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const readinessLabel = selectedModelRunnable
@@ -175,14 +170,6 @@ export default function ChatWorkspace({
       : selectedModel
         ? 'Waiting for runtime readiness'
         : 'Choose a model to begin'
-  const supportPanelTitle = selectedModelRunnable
-    ? 'Ready because runtime and contract agree'
-    : supportBlocked
-      ? 'Runtime is loaded, but the exact support row is missing'
-      : 'Camelid will not guess from filenames or saved paths'
-  const supportPanelCopy = selectedModel
-    ? selectedCompatibilityCopy
-    : 'Load a local GGUF first. The frontend keeps the chat affordance visible, but disabled, until the backend reports a supported exact model/quant row and generation readiness.'
   const starterPrompts = [
     {
       label: 'Smoke reply',
@@ -281,30 +268,20 @@ export default function ChatWorkspace({
           <div className="chat-empty-shell chat-empty-shell-gemini">
             <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
               <div className="chat-empty-hero chat-empty-hero-gemini chat-empty-hero-clean">
-                <div className="chat-empty-orb chat-empty-orb-product" aria-hidden="true">
-                  <span>C</span>
-                  <i />
+                <div className="chat-empty-product-lockup">
+                  <div className="chat-empty-orb chat-empty-orb-product" aria-hidden="true">
+                    <span>C</span>
+                    <i />
+                  </div>
+                  <div className={`chat-empty-readiness-ribbon chat-empty-readiness-ribbon-compact is-${readinessState}`} aria-label="Current chat readiness">
+                    <span className="readiness-ribbon-dot" aria-hidden="true" />
+                    <strong>{readinessLabel}</strong>
+                    <small>{selectedModel ? selectedModelName : 'No local model selected'}</small>
+                  </div>
                 </div>
                 <p className="chat-empty-greeting">{emptyHeroEyebrow}</p>
                 <h2>{emptyHeroTitle}</h2>
                 <p className="hero-summary">{emptyHeroSummary}</p>
-                <div className={`chat-empty-readiness-ribbon is-${readinessState}`} aria-label="Current chat readiness">
-                  <span className="readiness-ribbon-dot" aria-hidden="true" />
-                  <strong>{readinessLabel}</strong>
-                  <small>{selectedModel ? selectedModelName : 'No local model selected'}</small>
-                </div>
-                <div className="chat-empty-proofbar chat-empty-proofbar-product" aria-label="Current chat guard summary">
-                  {proofPills.map((pill) => <span key={pill}>{pill}</span>)}
-                </div>
-              </div>
-
-              <div className={`chat-empty-support-panel is-${readinessState}`} aria-label="Current support boundary">
-                <div>
-                  <span>Current truth</span>
-                  <strong>{supportPanelTitle}</strong>
-                  <small>{supportPanelCopy}</small>
-                </div>
-                <button type="button" className="ghost-button ghost-button-quiet" onClick={() => setTab('api')}>View contract</button>
               </div>
 
               <div className="composer composer-gemini composer-gemini-stage composer-gemini-stage-clean">
@@ -325,6 +302,16 @@ export default function ChatWorkspace({
                 </div>
               </div>
 
+              <div className="chat-empty-assurance-row" aria-label="Local chat readiness summary">
+                {readinessFacts.map((item) => (
+                  <div key={item.label} className={`chat-empty-assurance-card ${item.tone ? `is-${item.tone}` : ''}`}>
+                    <span>{item.label}</span>
+                    <strong>{item.value}</strong>
+                    <small>{item.copy}</small>
+                  </div>
+                ))}
+              </div>
+
               <div className="chat-starter-chips chat-starter-chips-centered chat-starter-chips-stage" aria-label="Starter prompts">
                 {starterPrompts.map((starter) => (
                   <button
@@ -340,17 +327,7 @@ export default function ChatWorkspace({
                 ))}
               </div>
 
-              <div className="chat-empty-readiness chat-empty-readiness-ledger chat-empty-readiness-product" aria-label="Local chat readiness summary">
-                {readinessFacts.map((item) => (
-                  <div key={item.label} className={`chat-empty-readiness-card ${item.tone ? `is-${item.tone}` : ''}`}>
-                    <span>{item.label}</span>
-                    <strong>{item.value}</strong>
-                    <small>{item.copy}</small>
-                  </div>
-                ))}
-              </div>
-
-              <p className="chat-empty-status-note">{selectedModelMeta}</p>
+              <p className="chat-empty-status-note">{selectedModelMeta} · Camelid never promotes filenames or saved paths into support claims.</p>
             </div>
           </div>
         ) : (

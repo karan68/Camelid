@@ -1455,9 +1455,9 @@
 }
 
 .chat-empty-stage-product {
-  width: min(100%, 820px);
-  gap: 12px;
-  padding: 10px 0 4px;
+  width: min(100%, 780px);
+  gap: 14px;
+  padding: 6px 0 4px;
 }
 
 .chat-empty-stage-clean::before {
@@ -1474,13 +1474,13 @@
 }
 
 .chat-empty-stage-product::before {
-  inset: -54px -82px -42px;
+  inset: -44px -74px -38px;
   border-radius: 64px;
   background:
-    radial-gradient(circle at 50% -2%, color-mix(in srgb, var(--color-info) 20%, transparent), transparent 42%),
-    radial-gradient(circle at 18% 74%, color-mix(in srgb, var(--color-ready) 10%, transparent), transparent 34%),
-    radial-gradient(circle at 84% 70%, color-mix(in srgb, var(--color-warning) 9%, transparent), transparent 34%),
-    linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 42%, transparent), transparent 62%);
+    radial-gradient(circle at 50% -6%, color-mix(in srgb, var(--color-info) 18%, transparent), transparent 42%),
+    radial-gradient(circle at 16% 74%, color-mix(in srgb, var(--color-ready) 8%, transparent), transparent 32%),
+    radial-gradient(circle at 86% 70%, color-mix(in srgb, var(--color-warning) 7%, transparent), transparent 32%),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 32%, transparent), transparent 66%);
 }
 
 .chat-empty-stage-product.is-blocked::before {
@@ -1582,7 +1582,15 @@
 }
 
 .chat-empty-hero-clean {
-  gap: 10px;
+  gap: 9px;
+}
+
+.chat-empty-product-lockup {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-bottom: 4px;
 }
 
 .chat-empty-orb {
@@ -1669,6 +1677,14 @@
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
 }
 
+.chat-empty-readiness-ribbon-compact {
+  max-width: min(100%, 470px);
+  min-height: 34px;
+  padding: 7px 11px;
+  border-color: color-mix(in srgb, var(--color-border-soft) 50%, transparent);
+  background: color-mix(in srgb, var(--color-bg-elevated) 62%, transparent);
+}
+
 .chat-empty-readiness-ribbon strong {
   color: var(--color-text);
   font-size: 0.84rem;
@@ -1741,9 +1757,9 @@
 }
 
 .chat-empty-hero-clean h2 {
-  max-width: 15ch;
-  font-size: clamp(3rem, 4.9vw, 4.8rem);
-  line-height: 0.98;
+  max-width: 16ch;
+  font-size: clamp(2.8rem, 4.6vw, 4.35rem);
+  line-height: 1;
   letter-spacing: -0.06em;
 }
 
@@ -1752,10 +1768,82 @@
 }
 
 .chat-empty-hero-clean .hero-summary {
-  max-width: 43ch;
+  max-width: 49ch;
   color: var(--color-text-muted);
   font-size: 1rem;
   line-height: 1.58;
+}
+
+.chat-empty-assurance-row {
+  width: min(100%, 760px);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: -2px;
+}
+
+.chat-empty-assurance-card {
+  position: relative;
+  min-height: 74px;
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 12px 13px 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 46%, transparent);
+  border-radius: 18px;
+  background: color-mix(in srgb, var(--color-bg-elevated) 48%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  text-align: left;
+  overflow: hidden;
+}
+
+.chat-empty-assurance-card::before {
+  content: '';
+  position: absolute;
+  top: 13px;
+  right: 13px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-text-muted) 42%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-text-muted) 9%, transparent);
+}
+
+.chat-empty-assurance-card.is-ready::before {
+  background: var(--color-ready);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-ready) 13%, transparent);
+}
+
+.chat-empty-assurance-card.is-blocked::before {
+  background: var(--color-error);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-error) 12%, transparent);
+}
+
+.chat-empty-assurance-card.is-waiting::before {
+  background: var(--color-warning);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-warning) 12%, transparent);
+}
+
+.chat-empty-assurance-card span {
+  color: var(--color-text-muted);
+  font-size: 0.68rem;
+  font-weight: 780;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.chat-empty-assurance-card strong {
+  padding-right: 18px;
+  color: var(--color-text);
+  font-size: 0.9rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.chat-empty-assurance-card small {
+  color: var(--color-text-muted);
+  font-size: 0.73rem;
+  line-height: 1.38;
 }
 
 .chat-empty-contract-note {
@@ -1945,7 +2033,7 @@
     radial-gradient(circle at top, rgba(255, 255, 255, 0.065), transparent 58%);
   box-shadow: 0 28px 70px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.055);
   backdrop-filter: blur(20px);
-  padding: 16px 18px 14px;
+  padding: 15px 18px 13px;
   transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
 }
 
@@ -2167,7 +2255,7 @@
 }
 
 .chat-starter-chips-stage {
-  margin-top: 0;
+  margin-top: -2px;
 }
 
 .chat-starter-chip-product {
@@ -2196,8 +2284,8 @@
 }
 
 .chat-empty-status-note {
-  margin: 0;
-  max-width: 52ch;
+  margin: -2px 0 0;
+  max-width: 64ch;
   text-align: center;
   color: var(--color-text-muted);
   font-size: 0.78rem;
@@ -4361,7 +4449,8 @@
   .library-focus-grid,
   .library-facts-row,
   .models-toolbar-top,
-  .models-status-grid {
+  .models-status-grid,
+  .chat-empty-assurance-row {
     grid-template-columns: 1fr;
   }
 
@@ -4551,6 +4640,17 @@
 
   .chat-empty-greeting {
     font-size: 0.88rem;
+  }
+
+  .chat-empty-product-lockup {
+    width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .chat-empty-readiness-ribbon-compact {
+    max-width: 100%;
   }
 
   .chat-empty-hero h2 {
