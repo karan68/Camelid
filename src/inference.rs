@@ -673,6 +673,27 @@ impl LlamaLoadedWeights {
             })
     }
 
+    fn largest_q8_0_file_backed_layer_storage_bytes(&self) -> u64 {
+        self.layers
+            .iter()
+            .map(|layer| {
+                [
+                    &layer.attention_q,
+                    &layer.attention_k,
+                    &layer.attention_v,
+                    &layer.attention_output,
+                    &layer.ffn_gate,
+                    &layer.ffn_up,
+                    &layer.ffn_down,
+                ]
+                .into_iter()
+                .map(tensor_q8_0_file_backed_storage_bytes)
+                .sum()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn load(store: &TensorStore, binding: &LlamaTensorBinding) -> Result<Self> {
         let auto_retain_q8_0_blocks = auto_retain_q8_0_blocks_for_fast_local_chat(binding);
         let load_linear = |name: &str| {
@@ -810,6 +831,17 @@ impl LlamaLoadedWeights {
 
 fn tensor_has_q8_0_file_backing(tensor: &CpuTensor) -> bool {
     tensor.source_type == Some(GgufTensorType::Q8_0) && tensor.q8_0_file_backing.is_some()
+}
+
+fn tensor_q8_0_file_backed_storage_bytes(tensor: &CpuTensor) -> u64 {
+    if tensor.source_type != Some(GgufTensorType::Q8_0) {
+        return 0;
+    }
+    tensor
+        .q8_0_file_backing
+        .as_ref()
+        .map(Q8_0FileBacking::storage_bytes)
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1605,6 +1637,7 @@ impl LlamaInferenceSession {
         let hidden_dims = vec![token_ids.len(), hidden_width];
         let capture_prefill_attribution = prefill_layer_major_attribution_enabled();
         let mut next_hidden = vec![0.0_f32; hidden.data.len()];
+        let mut chunk_input_buffer = Vec::with_capacity(chunk_tokens * hidden_width);
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
             let hidden_bytes = tensor_f32_bytes(&hidden);
             if next_hidden.len() != hidden.data.len() {
@@ -1614,7 +1647,6 @@ impl LlamaInferenceSession {
                 layer_index: layer_idx,
                 ..LlamaLayerTimings::default()
             };
-            let mut chunk_input_buffer = Vec::with_capacity(chunk_tokens * hidden_width);
             for chunk_start in (0..token_ids.len()).step_by(chunk_tokens) {
                 let rows_this_chunk = chunk_tokens.min(token_ids.len() - chunk_start);
                 let chunk_base_position = prefill_base_position + chunk_start;
@@ -2053,6 +2085,15 @@ const PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES_ENV: &str =
     "CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES";
 const DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
+fn prefill_layer_major_default_q8_file_cache_capacity(weights: &LlamaLoadedWeights) -> usize {
+    DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES.max(
+        weights
+            .largest_q8_0_file_backed_layer_storage_bytes()
+            .try_into()
+            .unwrap_or(usize::MAX),
+    )
+}
+
 fn prefill_layer_major_q8_file_cache_capacity_override(
     weights: &LlamaLoadedWeights,
     forward_passes: usize,
@@ -2060,10 +2101,11 @@ fn prefill_layer_major_q8_file_cache_capacity_override(
     if !weights.has_lazy_q8_0_file_backing() {
         return None;
     }
+    let default_capacity = prefill_layer_major_default_q8_file_cache_capacity(weights);
     if env::var(PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES_ENV).is_ok() {
         return Some(
             parse_byte_count_env(PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES_ENV)
-                .unwrap_or(DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES),
+                .unwrap_or(default_capacity),
         );
     }
     if env::var(Q8_FILE_CACHE_BYTES_ENV).is_ok() {
@@ -2072,7 +2114,7 @@ fn prefill_layer_major_q8_file_cache_capacity_override(
     if forward_passes <= 1 {
         return None;
     }
-    Some(DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES)
+    Some(default_capacity)
 }
 
 fn env_flag_enabled(key: &str) -> bool {
@@ -8963,6 +9005,24 @@ mod tests {
         assert_eq!(
             prefill_layer_major_q8_file_cache_capacity_override(&lazy_q8_weights, 2),
             Some(DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES)
+        );
+
+        let large_layer_blocks =
+            (DEFAULT_PREFILL_LAYER_MAJOR_Q8_FILE_CACHE_BYTES / Q8BlockReader::BLOCK_SIZE_BYTES) + 1;
+        let large_layer_capacity = large_layer_blocks * Q8BlockReader::BLOCK_SIZE_BYTES;
+        let large_lazy_q8_attention_q = CpuTensor::q8_0_file_backed_linear(
+            "blk.0.attn_q.weight",
+            TensorShape { dims: vec![1, 32] },
+            Q8_0FileBacking::new("unused.gguf".into(), 0, large_layer_blocks),
+        );
+        let large_lazy_q8_weights = tiny_prefill_schedule_weights(large_lazy_q8_attention_q);
+        assert_eq!(
+            large_lazy_q8_weights.largest_q8_0_file_backed_layer_storage_bytes(),
+            large_layer_capacity as u64
+        );
+        assert_eq!(
+            prefill_layer_major_q8_file_cache_capacity_override(&large_lazy_q8_weights, 2),
+            Some(large_layer_capacity)
         );
 
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "64 MiB");
