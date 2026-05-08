@@ -5,7 +5,7 @@ Scope: backend Q8_0 file-backed read-call/perf guard only. This does not widen m
 Git/evidence posture:
 - Started from clean `main` at `051bebf01307` (`Align q8 output projection diagnostics`) matching `origin/main`.
 - Local process scan found only stale frontend/headless-browser work and no long Llama 3 8B run.
-- Canonical Ubuntu scan (`ubuntu@54.69.75.77`) found stale backend/frontend serves and active Qwen2.5/Mixtral/Gemma Q8 hotpath benches, but no active Llama 3 8B long-context pack. No duplicate long 8B run was launched.
+- Canonical Ubuntu validation-host scan found stale backend/frontend serves and active Qwen2.5/Mixtral/Gemma Q8 hotpath benches, but no active Llama 3 8B long-context pack. No duplicate long 8B run was launched.
 - Latest committed bounded 8B artifact remains `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260507T194559Z-head-ab8e465b50c3`; it predates later runtime/source commits, so this source head still needs fresh canonical PASS artifacts before any current-head 8B green claim.
 
 Change:
