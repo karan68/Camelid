@@ -349,7 +349,7 @@
 }
 
 .primary-button:disabled {
-  opacity: 0.72;
+  opacity: 0.5;
   cursor: default;
   box-shadow: none;
 }
@@ -1455,9 +1455,9 @@
 }
 
 .chat-empty-stage-product {
-  width: min(100%, 780px);
-  gap: 14px;
-  padding: 6px 0 4px;
+  width: min(100%, 760px);
+  gap: 13px;
+  padding: 4px 0 2px;
 }
 
 .chat-empty-stage-clean::before {
@@ -1474,13 +1474,13 @@
 }
 
 .chat-empty-stage-product::before {
-  inset: -44px -74px -38px;
+  inset: -38px -66px -32px;
   border-radius: 64px;
   background:
-    radial-gradient(circle at 50% -6%, color-mix(in srgb, var(--color-info) 18%, transparent), transparent 42%),
-    radial-gradient(circle at 16% 74%, color-mix(in srgb, var(--color-ready) 8%, transparent), transparent 32%),
-    radial-gradient(circle at 86% 70%, color-mix(in srgb, var(--color-warning) 7%, transparent), transparent 32%),
-    linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 32%, transparent), transparent 66%);
+    radial-gradient(circle at 50% -6%, color-mix(in srgb, var(--color-info) 13%, transparent), transparent 42%),
+    radial-gradient(circle at 16% 74%, color-mix(in srgb, var(--color-ready) 6%, transparent), transparent 32%),
+    radial-gradient(circle at 86% 70%, color-mix(in srgb, var(--color-warning) 5%, transparent), transparent 32%),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 24%, transparent), transparent 66%);
 }
 
 .chat-empty-stage-product.is-blocked::before {
@@ -1582,7 +1582,7 @@
 }
 
 .chat-empty-hero-clean {
-  gap: 9px;
+  gap: 8px;
 }
 
 .chat-empty-product-lockup {
@@ -1757,8 +1757,8 @@
 }
 
 .chat-empty-hero-clean h2 {
-  max-width: 16ch;
-  font-size: clamp(2.8rem, 4.6vw, 4.35rem);
+  max-width: 15ch;
+  font-size: clamp(2.65rem, 4.35vw, 4.15rem);
   line-height: 1;
   letter-spacing: -0.06em;
 }
@@ -1768,10 +1768,10 @@
 }
 
 .chat-empty-hero-clean .hero-summary {
-  max-width: 49ch;
+  max-width: 48ch;
   color: var(--color-text-muted);
-  font-size: 1rem;
-  line-height: 1.58;
+  font-size: 0.98rem;
+  line-height: 1.54;
 }
 
 .chat-empty-assurance-row {
@@ -1844,6 +1844,68 @@
   color: var(--color-text-muted);
   font-size: 0.73rem;
   line-height: 1.38;
+}
+
+.chat-empty-contract-bar {
+  width: min(100%, 760px);
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 0.72fr) minmax(280px, 1.28fr);
+  align-items: center;
+  gap: 10px 14px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 68%, transparent);
+  border-radius: 24px;
+  background: color-mix(in srgb, var(--color-bg-elevated) 62%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  text-align: left;
+}
+
+.chat-empty-contract-bar span {
+  color: var(--color-text-muted);
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.chat-empty-contract-bar strong {
+  min-width: 0;
+  color: var(--color-text);
+  font-size: 0.9rem;
+  font-weight: 720;
+  letter-spacing: -0.02em;
+}
+
+.chat-empty-contract-bar small {
+  min-width: 0;
+  color: var(--color-text-muted);
+  font-size: 0.78rem;
+  line-height: 1.38;
+}
+
+.chat-empty-contract-bar::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-text-muted);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-text-muted) 12%, transparent);
+}
+
+.chat-empty-contract-bar.is-ready::before {
+  background: var(--color-ready);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-ready) 16%, transparent);
+}
+
+.chat-empty-contract-bar.is-blocked::before {
+  background: var(--color-error);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-error) 15%, transparent);
+}
+
+.chat-empty-contract-bar.is-waiting::before {
+  background: var(--color-warning);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-warning) 15%, transparent);
 }
 
 .chat-empty-contract-note {
@@ -2029,9 +2091,9 @@
   border-color: color-mix(in srgb, var(--color-border-strong) 24%, transparent);
   border-radius: 30px;
   background:
-    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 98%, rgba(255, 255, 255, 0.035)), color-mix(in srgb, var(--color-surface-strong) 88%, rgba(255, 255, 255, 0.02))),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 99%, rgba(255, 255, 255, 0.035)), color-mix(in srgb, var(--color-surface-strong) 90%, rgba(255, 255, 255, 0.02))),
     radial-gradient(circle at top, rgba(255, 255, 255, 0.065), transparent 58%);
-  box-shadow: 0 28px 70px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  box-shadow: 0 24px 58px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.055);
   backdrop-filter: blur(20px);
   padding: 15px 18px 13px;
   transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
@@ -4450,7 +4512,8 @@
   .library-facts-row,
   .models-toolbar-top,
   .models-status-grid,
-  .chat-empty-assurance-row {
+  .chat-empty-assurance-row,
+  .chat-empty-contract-bar {
     grid-template-columns: 1fr;
   }
 
@@ -4706,6 +4769,16 @@
     min-width: 0;
     flex: 1 1 auto;
     padding: 5px 10px;
+  }
+
+  .chat-empty-contract-bar {
+    gap: 6px;
+    padding: 11px 12px;
+    border-radius: 20px;
+  }
+
+  .chat-empty-contract-bar small {
+    font-size: 0.74rem;
   }
 
   .composer-gemini-actions-stage .composer-send-button {

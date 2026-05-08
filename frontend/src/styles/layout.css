@@ -28,7 +28,7 @@
   top: 0;
   height: 100vh;
   overflow: hidden;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 98%, transparent), color-mix(in srgb, #171717 88%, var(--color-surface-subtle) 12%));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 98%, transparent), color-mix(in srgb, var(--color-surface-subtle) 92%, var(--color-bg-elevated) 8%));
   border-right: 1px solid color-mix(in srgb, var(--color-border-soft) 72%, transparent);
   backdrop-filter: blur(20px);
   padding: 18px 14px 14px;
@@ -54,7 +54,7 @@
   z-index: 8;
   align-items: center;
   justify-content: space-between;
-  background: rgba(27, 27, 27, 0.96);
+  background: color-mix(in srgb, var(--color-bg-elevated) 96%, transparent);
 }
 
 .sidebar-brand-row {
@@ -98,7 +98,11 @@
   height: 72px;
   border-radius: 999px;
   background: color-mix(in srgb, var(--color-border-strong) 72%, transparent);
-  transition: background 140ms ease, transform 140ms ease;
+  transition: background 140ms ease, opacity 140ms ease, transform 140ms ease;
+}
+
+.sidebar-resizer-line {
+  opacity: 0;
 }
 
 .sidebar-unhide-button-label {
@@ -116,6 +120,7 @@
 .sidebar-unhide-button:hover .sidebar-unhide-button-line,
 .sidebar-unhide-button:focus-visible .sidebar-unhide-button-line {
   background: color-mix(in srgb, var(--color-info) 65%, var(--color-border-strong) 35%);
+  opacity: 1;
   transform: scaleX(1.12);
 }
 
