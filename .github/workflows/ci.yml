@@ -30,6 +30,9 @@ jobs:
       - name: Check public evidence claims
         run: node scripts/check-public-evidence-claims.mjs
 
+      - name: Check README screenshot contract
+        run: node scripts/test-readme-screenshot.mjs
+
   rust:
     runs-on: ubuntu-latest
     needs: public-scrub

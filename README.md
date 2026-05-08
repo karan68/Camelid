@@ -20,9 +20,9 @@ Camelid's current milestone is not a loose compatibility demo. It is a synchroni
 - **The UI and API fail closed instead of guessing.** Chat unlocks only when the loaded local GGUF is `loaded_now=true`, `generation_ready=true`, and matched to an exact supported `/api/capabilities` row.
 - **The context ladder is explicit.** TinyLlama stays at the current gate with bounded 512-context coverage; Llama 3.2 1B/3B have checked bounded 512/1024/2048-context evidence; Llama 3 8B has checked bounded 512-context support only on current `main`, with 1024/2048 held as source-head history until rerun. These checked packs do not imply model-native/larger context, arbitrary-template, production-throughput, portability, or broader-family support.
 
-![Camelid WebUI chat surface](docs/assets/ui-screenshot-v2.png)
+![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
-The WebUI screenshot above is intentionally readiness-first: the chat surface is simple, but it still reflects the product's local-first contract clearly. It is not a broad model-family or arbitrary-GGUF support claim.
+The WebUI screenshot above is intentionally the dark, collapsed-rail chat surface: the chat entrypoint is simple and product-forward, while still reflecting the local-first runtime contract. It is not a broad model-family or arbitrary-GGUF support claim.
 
 ## Current work tracks
 
