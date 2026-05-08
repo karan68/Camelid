@@ -5554,28 +5554,30 @@ fn q8_0_file_reader_block_dot_enabled() -> bool {
 }
 
 fn q8_0_env_flag_disabled(key: &str) -> bool {
-    matches!(
-        env::var(key),
-        Ok(value)
-            if value.eq_ignore_ascii_case("0")
+    env::var(key)
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
                 || value.eq_ignore_ascii_case("off")
                 || value.eq_ignore_ascii_case("disabled")
                 || value.eq_ignore_ascii_case("dequantized")
                 || value.eq_ignore_ascii_case("f32")
-    )
+        })
+        .unwrap_or(false)
 }
 
 fn q8_0_env_flag_enabled(key: &str) -> bool {
-    matches!(
-        env::var(key),
-        Ok(value)
-            if value.eq_ignore_ascii_case("1")
+    env::var(key)
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("1")
                 || value.eq_ignore_ascii_case("true")
                 || value.eq_ignore_ascii_case("on")
                 || value.eq_ignore_ascii_case("enabled")
                 || value.eq_ignore_ascii_case("block_dot")
-    )
+        })
+        .unwrap_or(false)
 }
 
 fn lazy_q8_0_linear_enabled() -> bool {
@@ -8925,6 +8927,27 @@ mod tests {
 
         std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", "on");
         assert!(q8_0_file_reader_block_dot_enabled());
+    }
+
+    #[test]
+    fn q8_0_block_dot_env_flags_ignore_outer_whitespace() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+
+        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", " on ");
+        assert!(q8_0_block_dot_enabled());
+
+        std::env::set_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT", " f32 ");
+        assert!(!q8_0_file_reader_block_dot_enabled());
+
+        std::env::set_var(
+            "BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT",
+            " dequantized ",
+        );
+        assert!(!q8_0_file_reader_block_dot_enabled());
+
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT");
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_BLOCK_DOT");
     }
 
     #[test]
