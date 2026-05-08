@@ -251,6 +251,7 @@ fn write_mistral_gguf(path: &Path) {
     write_architecture_prefixed_gguf(path, "mistral", 128, 8, 16, 2, Some(1), 4, 10_000.0, 1e-6);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_architecture_prefixed_gguf(
     path: &Path,
     architecture: &str,

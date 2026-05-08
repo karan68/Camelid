@@ -4610,14 +4610,12 @@ fn matmul_rhs_transposed_with_precision(
         return matmul_rhs_transposed_q8_0_block_dot(input, weight, name);
     }
     if let Some(backing) = q8_0_reader_backing(weight, input_width)? {
-        let mut workspace = InferenceWorkspace::new(input_width);
         return matmul_rhs_transposed_q8_0_block_reader(
             input,
             backing,
             Q8BlockReader::new(backing.absolute_offset, backing.num_blocks),
             weight.dim(0)?,
             name,
-            &mut workspace,
         );
     }
     match diagnostic_linear_accumulation_precision()? {
@@ -4641,14 +4639,12 @@ fn matmul_rhs_transposed_borrowed_with_precision(
     }
     let output_width = weight.rows;
     if let Some(backing) = borrowed_q8_0_reader_backing(weight, input_width, output_width)? {
-        let mut workspace = InferenceWorkspace::new(input_width);
         return matmul_rhs_transposed_q8_0_block_reader(
             input,
             backing,
             Q8BlockReader::new(backing.absolute_offset, backing.num_blocks),
             output_width,
             name,
-            &mut workspace,
         );
     }
     let mut output = vec![0.0; rows * output_width];
@@ -5938,7 +5934,6 @@ fn matmul_rhs_transposed_q8_0_block_reader(
     reader: Q8BlockReader,
     output_width: usize,
     name: impl Into<String>,
-    _workspace: &mut InferenceWorkspace,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
     let input_width = input.dim(1)?;
@@ -5971,7 +5966,8 @@ fn matmul_rhs_transposed_q8_0_block_reader(
         return CpuTensor::from_f32(name, vec![rows, output_width], Vec::new());
     }
     let mut output = vec![0.0_f32; output_len];
-    let parallelize_output = should_parallelize_q8_0_file_reader_output(output_width);
+    let parallelize_output =
+        should_use_q8_0_file_reader_parallel_output(row_bytes_len, output_width, rows)?;
     let use_q8_0_block_dot = q8_0_file_reader_block_dot_enabled();
     let chunk_rows = q8_0_file_reader_chunk_rows_for_batch(
         row_bytes_len,
@@ -6945,6 +6941,34 @@ fn should_parallelize_q8_0_file_reader_output(output_width: usize) -> bool {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_Q8_0_FILE_READER_PARALLEL_MIN_OUTPUTS);
     output_width >= min_outputs
+}
+
+fn should_use_q8_0_file_reader_parallel_output(
+    row_bytes_len: usize,
+    output_width: usize,
+    input_rows: usize,
+) -> Result<bool> {
+    let parallelize_output = should_parallelize_q8_0_file_reader_output(output_width);
+    if !parallelize_output || input_rows <= 1 || output_width == 0 {
+        return Ok(parallelize_output);
+    }
+    if env::var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES").is_ok() {
+        return Ok(parallelize_output);
+    }
+
+    let weight_chunk_rows = q8_0_file_reader_chunk_rows(row_bytes_len, output_width)?;
+    if weight_chunk_rows < output_width {
+        return Ok(parallelize_output);
+    }
+    let scratch_chunk_rows = q8_0_file_reader_output_scratch_chunk_rows(input_rows, output_width)?;
+    if scratch_chunk_rows < weight_chunk_rows {
+        // With the default scratch budget, prefer the existing no-scratch traversal when a
+        // whole file-backed Q8 tensor can otherwise be read as one coalesced burst. This keeps
+        // long-prefill/full-prompt probes from fragmenting 8B FFN reads solely to feed the
+        // parallel output scratch path, while explicit scratch-budget overrides still win.
+        return Ok(false);
+    }
+    Ok(parallelize_output)
 }
 
 fn q8_0_file_reader_chunk_rows(row_bytes_len: usize, output_width: usize) -> Result<usize> {
@@ -8823,6 +8847,38 @@ mod tests {
     }
 
     #[test]
+    fn q8_file_reader_parallel_output_falls_back_when_default_scratch_fragments_full_tensor_read() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_PARALLEL_LINEAR", "on");
+        std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", "1");
+        std::env::set_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES", "4096");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES");
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            assert!(should_parallelize_q8_0_file_reader_output(100));
+            assert_eq!(q8_0_file_reader_chunk_rows(32, 100).unwrap(), 100);
+            assert_eq!(
+                q8_0_file_reader_output_scratch_chunk_rows(1_000_000, 100).unwrap(),
+                16
+            );
+            assert!(!should_use_q8_0_file_reader_parallel_output(32, 100, 1_000_000).unwrap());
+
+            std::env::set_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES", "64");
+            assert!(should_use_q8_0_file_reader_parallel_output(32, 100, 8).unwrap());
+        });
+
+        std::env::remove_var("CAMELID_PARALLEL_LINEAR");
+        std::env::remove_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_CHUNK_BYTES");
+        std::env::remove_var("CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES");
+    }
+
+    #[test]
     fn q8_file_reader_default_coalesces_llama3_8b_ffn_q8_shapes() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
@@ -9753,16 +9809,8 @@ mod tests {
         let expected = matmul_rhs_transposed_with_precision(&input, &weight, "expected").unwrap();
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 2);
         let reader = Q8BlockReader::new(0, 2);
-        let mut workspace = InferenceWorkspace::new(32);
-        let actual = matmul_rhs_transposed_q8_0_block_reader(
-            &input,
-            &backing,
-            reader,
-            2,
-            "actual",
-            &mut workspace,
-        )
-        .unwrap();
+        let actual =
+            matmul_rhs_transposed_q8_0_block_reader(&input, &backing, reader, 2, "actual").unwrap();
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close(&actual.data, &expected.data);
@@ -9819,7 +9867,6 @@ mod tests {
 
         let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 5);
         let reader = Q8BlockReader::new(0, 5);
-        let mut workspace = InferenceWorkspace::new(32);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
@@ -9827,14 +9874,7 @@ mod tests {
         let actual = pool
             .install(|| {
                 assert!(should_parallelize_linear_output(5));
-                matmul_rhs_transposed_q8_0_block_reader(
-                    &input,
-                    &backing,
-                    reader,
-                    5,
-                    "actual",
-                    &mut workspace,
-                )
+                matmul_rhs_transposed_q8_0_block_reader(&input, &backing, reader, 5, "actual")
             })
             .unwrap();
 
@@ -10138,7 +10178,6 @@ mod tests {
             Q8BlockReader::new(0, rows.len()),
             rows.len(),
             "actual",
-            &mut InferenceWorkspace::new(32),
         )
         .unwrap();
         let reads = q8_0_file_read_stats().saturating_delta_since(start);
@@ -10196,7 +10235,6 @@ mod tests {
             Q8BlockReader::new(0, rows.len()),
             rows.len(),
             "actual",
-            &mut InferenceWorkspace::new(32),
         )
         .unwrap();
 
@@ -10253,7 +10291,6 @@ mod tests {
             Q8BlockReader::new(0, rows.len()),
             rows.len(),
             "first",
-            &mut InferenceWorkspace::new(32),
         )
         .unwrap();
         let after_first = q8_0_file_read_stats();
@@ -10265,7 +10302,6 @@ mod tests {
             Q8BlockReader::new(0, rows.len()),
             rows.len(),
             "second",
-            &mut InferenceWorkspace::new(32),
         )
         .unwrap();
         let second_reads = q8_0_file_read_stats().saturating_delta_since(after_first);
