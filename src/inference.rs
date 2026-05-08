@@ -5760,6 +5760,7 @@ fn matmul_rhs_transposed_q8_0_block_reader(
     })?;
     let mut output = vec![0.0_f32; output_len];
     let parallelize_output = should_parallelize_q8_0_file_reader_output(output_width);
+    let use_q8_0_block_dot = q8_0_block_dot_enabled();
     let chunk_rows = q8_0_file_reader_chunk_rows_for_batch(
         row_bytes_len,
         output_width,
@@ -5774,6 +5775,18 @@ fn matmul_rhs_transposed_q8_0_block_reader(
     with_q8_0_file_reader_row_chunk(row_chunk_len, |row_chunk| {
         with_q8_0_file_reader_quantized_inputs(|quantized_input_blocks| {
             quantized_input_blocks.clear();
+            if use_q8_0_block_dot {
+                let quantized_input_block_count =
+                    rows.checked_mul(blocks_per_row).ok_or_else(|| {
+                        BackendError::RuntimeShapeMismatch(
+                            "q8_0 block-reader quantized input block count overflow".to_string(),
+                        )
+                    })?;
+                quantized_input_blocks.reserve(quantized_input_block_count);
+                for row in input.data.chunks_exact(input_width) {
+                    quantize_q8_0_blocks_into(row, quantized_input_blocks);
+                }
+            }
             if rows == 1 {
                 let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
                     BackendError::RuntimeShapeMismatch(
@@ -5781,6 +5794,11 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                     )
                 })?;
                 return with_q8_0_file_reader_chunk_scales(chunk_scales_len, |chunk_scales| {
+                    let quantized_input = if use_q8_0_block_dot {
+                        Some(&quantized_input_blocks[..blocks_per_row])
+                    } else {
+                        None
+                    };
                     let mut output_idx = 0usize;
                     while output_idx < output_width {
                         let rows_this_chunk = chunk_rows.min(output_width - output_idx);
@@ -5810,11 +5828,19 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                 .zip(chunk.par_chunks_exact(row_bytes_len))
                                 .zip(scales.par_chunks_exact(blocks_per_row))
                                 .for_each(|((out_value, row_bytes), row_scales)| {
-                                    *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
-                                        &input.data[..input_width],
-                                        row_bytes,
-                                        row_scales,
-                                    );
+                                    *out_value = if let Some(quantized_input) = quantized_input {
+                                        dot_q8_0_encoded_row_quantized_input_with_scales(
+                                            quantized_input,
+                                            row_bytes,
+                                            row_scales,
+                                        )
+                                    } else {
+                                        dot_q8_0_encoded_row_f32_input_with_scales(
+                                            &input.data[..input_width],
+                                            row_bytes,
+                                            row_scales,
+                                        )
+                                    };
                                 });
                         } else {
                             for ((out_value, row_bytes), row_scales) in output_chunk
@@ -5822,11 +5848,19 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                 .zip(chunk.chunks_exact(row_bytes_len))
                                 .zip(scales.chunks_exact(blocks_per_row))
                             {
-                                *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
-                                    &input.data[..input_width],
-                                    row_bytes,
-                                    row_scales,
-                                );
+                                *out_value = if let Some(quantized_input) = quantized_input {
+                                    dot_q8_0_encoded_row_quantized_input_with_scales(
+                                        quantized_input,
+                                        row_bytes,
+                                        row_scales,
+                                    )
+                                } else {
+                                    dot_q8_0_encoded_row_f32_input_with_scales(
+                                        &input.data[..input_width],
+                                        row_bytes,
+                                        row_scales,
+                                    )
+                                };
                             }
                         }
                         output_idx += rows_this_chunk;
@@ -5887,11 +5921,21 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                     {
                                         let row_start = row_idx * input_width;
                                         let row_end = row_start + input_width;
-                                        *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
-                                            &input.data[row_start..row_end],
-                                            row_bytes,
-                                            row_scales,
-                                        );
+                                        *out_value = if use_q8_0_block_dot {
+                                            let block_start = row_idx * blocks_per_row;
+                                            let block_end = block_start + blocks_per_row;
+                                            dot_q8_0_encoded_row_quantized_input_with_scales(
+                                                &quantized_input_blocks[block_start..block_end],
+                                                row_bytes,
+                                                row_scales,
+                                            )
+                                        } else {
+                                            dot_q8_0_encoded_row_f32_input_with_scales(
+                                                &input.data[row_start..row_end],
+                                                row_bytes,
+                                                row_scales,
+                                            )
+                                        };
                                     }
                                 });
                             for (row, output_row) in
@@ -5916,11 +5960,21 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                                 let row_start = row * input_width;
                                 let row_end = row_start + input_width;
                                 output_rows[row * output_width + absolute_col] =
-                                    dot_q8_0_encoded_row_f32_input_with_scales(
-                                        &input.data[row_start..row_end],
-                                        row_bytes,
-                                        row_scales,
-                                    );
+                                    if use_q8_0_block_dot {
+                                        let block_start = row * blocks_per_row;
+                                        let block_end = block_start + blocks_per_row;
+                                        dot_q8_0_encoded_row_quantized_input_with_scales(
+                                            &quantized_input_blocks[block_start..block_end],
+                                            row_bytes,
+                                            row_scales,
+                                        )
+                                    } else {
+                                        dot_q8_0_encoded_row_f32_input_with_scales(
+                                            &input.data[row_start..row_end],
+                                            row_bytes,
+                                            row_scales,
+                                        )
+                                    };
                             }
                         }
                     }
@@ -5960,7 +6014,6 @@ fn decode_q8_0_encoded_row_scales(row_bytes: &[u8], scales: &mut [f32]) {
     }
 }
 
-#[cfg(test)]
 fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scales: &[f32]) -> f32 {
     debug_assert_eq!(input.len(), scales.len());
     let mut sum = 0.0_f32;
@@ -5973,6 +6026,14 @@ fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scale
         sum += int_sum as f32 * *scale * input_block.scale;
     }
     sum
+}
+
+fn dot_q8_0_encoded_row_quantized_input_with_scales(
+    input: &[Q8_0Block],
+    row_bytes: &[u8],
+    scales: &[f32],
+) -> f32 {
+    dot_q8_0_encoded_row_with_scales(input, row_bytes, scales)
 }
 
 fn dot_q8_0_encoded_row_f32_input_with_scales(
@@ -5994,7 +6055,6 @@ fn dot_q8_0_encoded_row_f32_input_with_scales(
     sum
 }
 
-#[cfg(test)]
 fn q8_0_block_int_dot_horizontal_sum_encoded(
     weight: &[u8],
     input: &[i8; Q8_0_BLOCK_VALUES],
@@ -6037,7 +6097,6 @@ fn q8_0_dot_group4(
         + i32::from(weight[start + 3]) * i32::from(input[start + 3])
 }
 
-#[cfg(test)]
 fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start: usize) -> i32 {
     i32::from(weight[start] as i8) * i32::from(input[start])
         + i32::from(weight[start + 1] as i8) * i32::from(input[start + 1])
@@ -6252,15 +6311,24 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
         )
     })?;
     let output_width = output.len();
+    let use_q8_0_block_dot = q8_0_block_dot_enabled();
     with_q8_0_file_reader_row_chunk(row_chunk_len, |row_chunk| {
         with_q8_0_file_reader_quantized_inputs(|quantized_input_blocks| {
             quantized_input_blocks.clear();
+            if use_q8_0_block_dot {
+                quantize_q8_0_blocks_into(input_row, quantized_input_blocks);
+            }
             let chunk_scales_len = chunk_rows.checked_mul(blocks_per_row).ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch(
                     "q8_0 borrowed block-reader chunk scale count overflow".to_string(),
                 )
             })?;
             with_q8_0_file_reader_chunk_scales(chunk_scales_len, |chunk_scales| {
+                let quantized_input = if use_q8_0_block_dot {
+                    Some(&quantized_input_blocks[..blocks_per_row])
+                } else {
+                    None
+                };
                 let mut output_start = 0usize;
                 while output_start < output_width {
                     let rows_this_chunk = chunk_rows.min(output_width - output_start);
@@ -6290,9 +6358,17 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
                             .zip(chunk.par_chunks_exact(row_bytes_len))
                             .zip(scales.par_chunks_exact(blocks_per_row))
                             .for_each(|((out_value, row_bytes), row_scales)| {
-                                *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
-                                    input_row, row_bytes, row_scales,
-                                );
+                                *out_value = if let Some(quantized_input) = quantized_input {
+                                    dot_q8_0_encoded_row_quantized_input_with_scales(
+                                        quantized_input,
+                                        row_bytes,
+                                        row_scales,
+                                    )
+                                } else {
+                                    dot_q8_0_encoded_row_f32_input_with_scales(
+                                        input_row, row_bytes, row_scales,
+                                    )
+                                };
                             });
                     } else {
                         for ((out_value, row_bytes), row_scales) in output_chunk
@@ -6300,9 +6376,17 @@ fn accumulate_transposed_linear_row_q8_0_file_reader(
                             .zip(chunk.chunks_exact(row_bytes_len))
                             .zip(scales.chunks_exact(blocks_per_row))
                         {
-                            *out_value = dot_q8_0_encoded_row_f32_input_with_scales(
-                                input_row, row_bytes, row_scales,
-                            );
+                            *out_value = if let Some(quantized_input) = quantized_input {
+                                dot_q8_0_encoded_row_quantized_input_with_scales(
+                                    quantized_input,
+                                    row_bytes,
+                                    row_scales,
+                                )
+                            } else {
+                                dot_q8_0_encoded_row_f32_input_with_scales(
+                                    input_row, row_bytes, row_scales,
+                                )
+                            };
                         }
                     }
                     output_start += rows_this_chunk;
@@ -9076,6 +9160,48 @@ mod tests {
     }
 
     #[test]
+    fn q8_0_file_backed_accumulate_can_use_quantized_input_block_dot() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+
+        let rows: Vec<Q8_0Block> = (0..3)
+            .map(|row| Q8_0Block {
+                scale: f16_bits_to_f32(f32_to_f16_bits(0.125 + row as f32 * 0.0625)),
+                quants: std::array::from_fn(|idx| idx as i8 - 9 + row as i8),
+            })
+            .collect();
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        for block in &rows {
+            temp_file
+                .write_all(&f32_to_f16_bits(block.scale).to_le_bytes())
+                .unwrap();
+            temp_file
+                .write_all(&block.quants.iter().map(|q| *q as u8).collect::<Vec<_>>())
+                .unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let input_values = (0..32)
+            .map(|idx| ((idx % 7) as f32 - 3.0) * 0.37)
+            .collect::<Vec<_>>();
+        let quantized_input = quantize_q8_0_row(&input_values);
+        let expected = rows
+            .iter()
+            .map(|row| q8_0_dot_rows(std::slice::from_ref(row), &quantized_input.blocks))
+            .collect::<Vec<_>>();
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
+        let mut actual = vec![0.0; rows.len()];
+
+        accumulate_transposed_linear_row_q8_0_file_reader(&input_values, &backing, &mut actual)
+            .unwrap();
+
+        assert_slice_close(&actual, &expected);
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT");
+    }
+
+    #[test]
     fn q8_0_file_backed_accumulate_rejects_unaligned_input_width() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
@@ -9153,6 +9279,58 @@ mod tests {
             (Q8BlockReader::BLOCK_SIZE_BYTES * rows.len()) as u64
         );
         std::env::remove_var("BACKENDINFERENCE_Q8_0_FILE_READER_CHUNK_BYTES");
+    }
+
+    #[test]
+    fn q8_0_file_backed_batch_matmul_can_use_quantized_input_block_dot() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT", "on");
+
+        let rows: Vec<Q8_0Block> = (0..4)
+            .map(|row| Q8_0Block {
+                scale: f16_bits_to_f32(f32_to_f16_bits(0.1875 + row as f32 * 0.03125)),
+                quants: std::array::from_fn(|idx| idx as i8 - 11 + row as i8),
+            })
+            .collect();
+        let mut temp_file = tempfile::NamedTempFile::new().unwrap();
+        for block in &rows {
+            temp_file
+                .write_all(&f32_to_f16_bits(block.scale).to_le_bytes())
+                .unwrap();
+            temp_file
+                .write_all(&block.quants.iter().map(|q| *q as u8).collect::<Vec<_>>())
+                .unwrap();
+        }
+        temp_file.flush().unwrap();
+
+        let input_values = (0..64)
+            .map(|idx| ((idx % 11) as f32 - 5.0) * 0.21)
+            .collect::<Vec<_>>();
+        let input = CpuTensor::from_f32("input", vec![2, 32], input_values.clone()).unwrap();
+        let mut expected = Vec::new();
+        for input_row in input_values.chunks_exact(32) {
+            let quantized_input = quantize_q8_0_row(input_row);
+            expected.extend(
+                rows.iter()
+                    .map(|row| q8_0_dot_rows(std::slice::from_ref(row), &quantized_input.blocks)),
+            );
+        }
+        let backing = Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, rows.len());
+
+        let actual = matmul_rhs_transposed_q8_0_block_reader(
+            &input,
+            &backing,
+            Q8BlockReader::new(0, rows.len()),
+            rows.len(),
+            "actual",
+            &mut InferenceWorkspace::new(32),
+        )
+        .unwrap();
+
+        assert_slice_close(&actual.data, &expected);
+        std::env::remove_var("BACKENDINFERENCE_Q8_0_BLOCK_DOT");
     }
 
     #[test]
