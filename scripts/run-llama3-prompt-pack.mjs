@@ -15,7 +15,7 @@ const chatParityScript = resolve(args.get('chat-parity-script') || process.env.C
 const backendBase = (args.get('backend') || process.env.BACKENDINFERENCE_API_BASE || 'http://127.0.0.1:8181').replace(/\/$/, '')
 const llamaBase = (args.get('llama-url') || process.env.LLAMA3_LLAMA_SERVER_URL || 'http://127.0.0.1:8183').replace(/\/$/, '')
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
-const llamaFlashAttn = args.get('llama-flash-attn') || process.env.LLAMA3_LLAMA_FLASH_ATTN || 'auto'
+const llamaFlashAttn = args.get('llama-flash-attn') || process.env.LLAMA3_LLAMA_FLASH_ATTN || 'off'
 validateLlamaFlashAttn(llamaFlashAttn)
 const requirePromptMatch = args.has('require-prompt-match') || process.env.LLAMA3_CHAT_REQUIRE_PROMPT_MATCH === '1'
 const requireGeneratedMatch = args.has('require-generated-match') || process.env.LLAMA3_CHAT_REQUIRE_GENERATED_MATCH === '1'

@@ -25,7 +25,7 @@ const requireGeneratedMatch = args.has('require-generated-match') || process.env
 const collectBackendDenseDiagnostics = args.has('backend-dense-diagnostics') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTICS === '1'
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
 const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') || process.env.LLAMA3_LLAMA_CONTEXT, 'llama-context')
-const llamaFlashAttn = args.get('llama-flash-attn') || process.env.LLAMA3_LLAMA_FLASH_ATTN || 'auto'
+const llamaFlashAttn = args.get('llama-flash-attn') || process.env.LLAMA3_LLAMA_FLASH_ATTN || 'off'
 validateLlamaFlashAttn(llamaFlashAttn)
 
 if (!Number.isInteger(maxTokens) || maxTokens < 1) {
