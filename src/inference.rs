@@ -5567,11 +5567,13 @@ struct QuantizedQ8_0Row {
     blocks: Vec<Q8_0Block>,
 }
 
+#[cfg(test)]
 struct BorrowedQuantizedQ8_0Rows<'a> {
     blocks_per_row: usize,
     blocks: &'a [Q8_0Block],
 }
 
+#[cfg(test)]
 impl BorrowedQuantizedQ8_0Rows<'_> {
     fn row(&self, row: usize) -> &[Q8_0Block] {
         let start = row * self.blocks_per_row;
@@ -5638,6 +5640,7 @@ fn quantize_q8_0_row(input: &[f32]) -> QuantizedQ8_0Row {
     }
 }
 
+#[cfg(test)]
 fn quantize_q8_0_rows_into<'a>(
     input: &CpuTensor,
     input_width: usize,
@@ -5930,6 +5933,7 @@ fn matmul_rhs_transposed_q8_0_block_reader(
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
+#[cfg(test)]
 fn dot_q8_0_encoded_row(input: &[Q8_0Block], row_bytes: &[u8]) -> f32 {
     let mut sum = 0.0_f32;
     for (input_block, block) in input
@@ -5956,6 +5960,7 @@ fn decode_q8_0_encoded_row_scales(row_bytes: &[u8], scales: &mut [f32]) {
     }
 }
 
+#[cfg(test)]
 fn dot_q8_0_encoded_row_with_scales(input: &[Q8_0Block], row_bytes: &[u8], scales: &[f32]) -> f32 {
     debug_assert_eq!(input.len(), scales.len());
     let mut sum = 0.0_f32;
@@ -5989,6 +5994,7 @@ fn dot_q8_0_encoded_row_f32_input_with_scales(
     sum
 }
 
+#[cfg(test)]
 fn q8_0_block_int_dot_horizontal_sum_encoded(
     weight: &[u8],
     input: &[i8; Q8_0_BLOCK_VALUES],
@@ -6031,6 +6037,7 @@ fn q8_0_dot_group4(
         + i32::from(weight[start + 3]) * i32::from(input[start + 3])
 }
 
+#[cfg(test)]
 fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start: usize) -> i32 {
     i32::from(weight[start] as i8) * i32::from(input[start])
         + i32::from(weight[start + 1] as i8) * i32::from(input[start + 1])
