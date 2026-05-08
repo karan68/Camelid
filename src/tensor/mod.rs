@@ -1181,9 +1181,9 @@ fn q8_file_cache_copy_decoded_scales(
     len: usize,
     out_scales: &mut [f32],
 ) -> bool {
-    if entry_start % Q8_0_BLOCK_BYTES != 0
-        || out_start % Q8_0_BLOCK_BYTES != 0
-        || len % Q8_0_BLOCK_BYTES != 0
+    if !entry_start.is_multiple_of(Q8_0_BLOCK_BYTES)
+        || !out_start.is_multiple_of(Q8_0_BLOCK_BYTES)
+        || !len.is_multiple_of(Q8_0_BLOCK_BYTES)
     {
         return false;
     }
@@ -1239,7 +1239,7 @@ fn q8_file_cache_store_decoded_scales(path: &Path, offset: u64, scales: &[f32]) 
     let Ok(relative_start) = usize::try_from(relative_start) else {
         return;
     };
-    if relative_start % Q8_0_BLOCK_BYTES != 0 {
+    if !relative_start.is_multiple_of(Q8_0_BLOCK_BYTES) {
         return;
     }
     let scale_start = relative_start / Q8_0_BLOCK_BYTES;
@@ -1272,8 +1272,8 @@ fn q8_file_cache_merge_decoded_scales(
     right_start: usize,
 ) -> Option<Vec<f32>> {
     if !merged_len.is_multiple_of(Q8_0_BLOCK_BYTES)
-        || left_start % Q8_0_BLOCK_BYTES != 0
-        || right_start % Q8_0_BLOCK_BYTES != 0
+        || !left_start.is_multiple_of(Q8_0_BLOCK_BYTES)
+        || !right_start.is_multiple_of(Q8_0_BLOCK_BYTES)
         || !left.bytes.len().is_multiple_of(Q8_0_BLOCK_BYTES)
         || !right.bytes.len().is_multiple_of(Q8_0_BLOCK_BYTES)
     {
@@ -1302,7 +1302,7 @@ fn q8_file_cache_trim_decoded_scales(
     trim_start: usize,
     trim_end: usize,
 ) -> Option<Vec<f32>> {
-    if trim_start % Q8_0_BLOCK_BYTES != 0 || trim_end % Q8_0_BLOCK_BYTES != 0 {
+    if !trim_start.is_multiple_of(Q8_0_BLOCK_BYTES) || !trim_end.is_multiple_of(Q8_0_BLOCK_BYTES) {
         return None;
     }
     let scales = entry.decoded_q8_0_scales.as_ref()?;
@@ -2311,9 +2311,9 @@ mod tests {
         ));
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x3c00_u16.to_le_bytes());
-        bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+        bytes.extend(std::iter::repeat_n(0_u8, Q8_0_BLOCK_BYTES - 2));
         bytes.extend_from_slice(&0x4000_u16.to_le_bytes());
-        bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+        bytes.extend(std::iter::repeat_n(0_u8, Q8_0_BLOCK_BYTES - 2));
         std::fs::write(&path, &bytes).unwrap();
         let backing = Q8_0FileBacking::new(path.clone(), 0, 2);
 
@@ -2366,7 +2366,7 @@ mod tests {
         let mut bytes = Vec::new();
         for scale_bits in [0x3c00_u16, 0x4000, 0x4200, 0x4400] {
             bytes.extend_from_slice(&scale_bits.to_le_bytes());
-            bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+            bytes.extend(std::iter::repeat_n(0_u8, Q8_0_BLOCK_BYTES - 2));
         }
         std::fs::write(&path, &bytes).unwrap();
         let backing = Q8_0FileBacking::new(path.clone(), 0, 4);
@@ -2432,9 +2432,9 @@ mod tests {
         ));
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x3c00_u16.to_le_bytes());
-        bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+        bytes.extend(std::iter::repeat_n(0_u8, Q8_0_BLOCK_BYTES - 2));
         bytes.extend_from_slice(&0x4000_u16.to_le_bytes());
-        bytes.extend(std::iter::repeat(0_u8).take(Q8_0_BLOCK_BYTES - 2));
+        bytes.extend(std::iter::repeat_n(0_u8, Q8_0_BLOCK_BYTES - 2));
         std::fs::write(&path, &bytes).unwrap();
         let backing = Q8_0FileBacking::new(path.clone(), 0, 2);
 

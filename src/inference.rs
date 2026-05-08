@@ -8226,7 +8226,7 @@ mod tests {
             first_row[idx] = (idx as i8 % 7) - 3;
             second_row[idx] = 4 - (idx as i8 % 9);
         }
-        let weight_blocks = vec![
+        let weight_blocks = [
             write_q8_0_test_block(&mut temp_file, 0.5, first_row),
             write_q8_0_test_block(&mut temp_file, 0.25, second_row),
         ];
