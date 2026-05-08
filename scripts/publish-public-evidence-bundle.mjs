@@ -65,8 +65,9 @@ function sanitizeText(input) {
     .replace(/\/home\/[^/]+\/work\/Camelid[^\s"]*/g, '$CAMELID_WORKTREE')
     .replace(/\/home\/[^/]+\/\.nvm\/versions\/node\/[^/]+\/bin\/node/g, 'node')
     .replace(/\/home\/[^/]+\/models\//g, '$CAMELID_MODEL_DIR/')
-    .replace(/(?:\d{1,3}\.){3}\d{1,3}/g, 'canonical-private-ubuntu-validation-host')
-    .replace(/ip-(?:\d+-){3}\d+/g, 'canonical-private-ubuntu-validation-host')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, 'canonical-private-ubuntu-validation-host')
+    .replace(/\bip-(?:\d+-){3}\d+\b/g, 'canonical-private-ubuntu-validation-host')
+    .replace(/[ \t]+$/gm, '')
 }
 
 function isSanitizedTextExtension(ext) {
