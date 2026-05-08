@@ -104,6 +104,9 @@ async function readStreamingChatCompletion(response, onDelta) {
   let buffer = ''
   let content = ''
   let finishReason = null
+  let completionTokens = 0
+  const streamStartedAt = performance.now()
+  let firstContentMs = null
 
   const consumeEvent = (eventText) => {
     const dataLines = eventText
@@ -121,8 +124,14 @@ async function readStreamingChatCompletion(response, onDelta) {
       const choice = chunk?.choices?.[0]
       const delta = choice?.delta?.content ?? choice?.text ?? ''
       if (delta) {
+        completionTokens += 1
+        if (firstContentMs === null) firstContentMs = performance.now() - streamStartedAt
         content += delta
-        onDelta(delta, content)
+        onDelta(delta, content, {
+          completionTokens,
+          elapsedMs: performance.now() - streamStartedAt,
+          firstContentMs,
+        })
       }
       if (choice?.finish_reason) finishReason = choice.finish_reason
     }
@@ -142,7 +151,27 @@ async function readStreamingChatCompletion(response, onDelta) {
   }
   buffer += decoder.decode()
   if (buffer.trim()) consumeEvent(buffer)
-  return { content, finishReason }
+  return { content, finishReason, completionTokens, firstContentMs }
+}
+
+function estimateTokenCount(value) {
+  const text = String(value || '').trim()
+  if (!text) return 0
+  const wordPieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
+  return Math.max(1, Math.round(Math.max(wordPieces.length, text.length / 4)))
+}
+
+function estimateChatTokenCount(messages) {
+  return (messages || []).reduce((total, message) => (
+    total + estimateTokenCount(message?.role) + estimateTokenCount(message?.content) + 3
+  ), 0)
+}
+
+function tokensPerSecond(tokens, elapsedMs) {
+  const tokenCount = Number(tokens)
+  const duration = Number(elapsedMs)
+  if (!Number.isFinite(tokenCount) || !Number.isFinite(duration) || tokenCount <= 0 || duration <= 0) return null
+  return tokenCount / (duration / 1000)
 }
 
 function isLoadedModelGenerationReady(model) {
@@ -635,6 +664,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .filter((message) => !message.content.startsWith('Conversation created.'))
         .map(({ role, content }) => ({ role, content }))
+      const promptTokenEstimate = estimateChatTokenCount(history)
 
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -671,12 +701,21 @@ export function useDashboardData({ showNotice, clearNotice }) {
         body: JSON.stringify({ model: selectedModelId, messages: history, temperature: 0, stream: true }),
       })
       const streamed = await readStreamingChatCompletion(response, (_delta, fullContent) => {
+        const liveElapsedMs = performance.now() - requestStartedAt
+        const liveCompletionTokens = estimateTokenCount(fullContent)
         persistConversations((current) => current.map((item) => (
           item.id === conversation.id
             ? {
                 ...item,
                 messages: (item.messages || []).map((message) => (
-                  message.id === assistantId ? { ...message, content: fullContent || '…' } : message
+                  message.id === assistantId
+                    ? {
+                        ...message,
+                        content: fullContent || '…',
+                        tokens_in_per_sec: null,
+                        tokens_out_per_sec: tokensPerSecond(liveCompletionTokens, liveElapsedMs),
+                      }
+                    : message
                 )),
                 updated_at: nowIso(),
               }
@@ -687,9 +726,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const assistantMessage = {
         ...assistantMessageBase,
         content: streamed.content || '(empty response)',
-        tokens_out_per_sec: null,
+        tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, streamed.firstContentMs),
+        tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
+        usage: {
+          prompt_tokens: promptTokenEstimate,
+          completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
+          total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
+        },
         streaming: false,
       }
       persistConversations((current) => current.map((item) => (

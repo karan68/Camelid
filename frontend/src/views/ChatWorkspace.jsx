@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
-import { clampText, formatDate } from '../lib/formatters'
+import { clampText, formatDate, formatRate } from '../lib/formatters'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel, isRunnableInCurrentRuntime } from '../lib/modelState'
 
@@ -417,11 +417,21 @@ export default function ChatWorkspace({
               {visibleMessages.length === 0 && !awaitingAssistant && <div className="empty-state empty-state-chat">Pick a ready model, then send the first message when you’re ready.</div>}
               {visibleMessages.map((message) => {
                 const messageContent = cleanLegacyDemoCapCopy(message.content)
+                const hasTokenMetrics = message.role === 'assistant' && (
+                  message.tokens_in_per_sec !== null && message.tokens_in_per_sec !== undefined ||
+                  message.tokens_out_per_sec !== null && message.tokens_out_per_sec !== undefined
+                )
 
                 return (
                   <article key={message.id} className={`message-row message-row-gemini ${message.role}`}>
                     <div className={`message-bubble message-bubble-gemini ${message.role}`}>
                       {message.role === 'assistant' ? <AssistantMarkdown content={messageContent} /> : <p>{messageContent}</p>}
+                      {hasTokenMetrics && (
+                        <div className="message-token-metrics" aria-label="Generation speed">
+                          <span>In {formatRate(message.tokens_in_per_sec)}</span>
+                          <span>Out {formatRate(message.tokens_out_per_sec)}</span>
+                        </div>
+                      )}
                     </div>
                   </article>
                 )

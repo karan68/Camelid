@@ -5696,3 +5696,24 @@ textarea.composer-input-gemini {
     width: min(100%, calc(100vw - 48px));
   }
 }
+
+.message-token-metrics {
+  width: fit-content;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 18px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 42%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 36%, transparent);
+  color: color-mix(in srgb, var(--color-text-muted) 88%, var(--color-text) 12%);
+  font-size: 0.76rem;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+}
+
+.message-token-metrics span + span {
+  padding-left: 10px;
+  border-left: 1px solid color-mix(in srgb, var(--color-border-soft) 48%, transparent);
+}
