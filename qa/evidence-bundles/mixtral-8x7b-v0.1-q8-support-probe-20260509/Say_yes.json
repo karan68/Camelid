@@ -1,7 +1,7 @@
 {
   "backend": "http://127.0.0.1:8187",
   "llama_server": "http://127.0.0.1:8188",
-  "model": "/home/ubuntu/work/Camelid-mixtral-20260509/models/mixtral-8x7b-instruct-v0.1-q8_0.gguf",
+  "model": "models/mixtral-8x7b-instruct-v0.1-q8_0.gguf",
   "model_id": "mixtral-probe",
   "message": "Say yes.",
   "messages": [
