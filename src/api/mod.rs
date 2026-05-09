@@ -711,7 +711,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 have checked bounded 512/1024/2048 packs; Llama 3 8B Q8_0 is checked only through the bounded 512 pack on current main. 8B 1024/2048 remain not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment exist. These are exact bounded-pack lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -734,7 +734,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Q8_0 rows have checked bounded 512/1024/2048-context packs, while the exact Llama 3 8B Q8_0 row is checked only through the bounded 512-context pack on current main. 8B 1024/2048 remain not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
         ],
         planned_quantization: vec![
@@ -758,7 +758,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs, while exact Llama 3 8B Instruct Q8_0 is checked only through the bounded 512-context pack on current main; 8B 1024/2048 remain not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment exist. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. Broader 50-token, compact chat-template-shapes, retained-block lazy-Q8 hot-path evidence, and the 8B 1024/2048 current-head bundle remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
         ],
         planned_model_families: vec![
@@ -906,7 +906,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "8B 1024/2048 require fresh current-head PASS artifacts plus docs/API/frontend alignment; model-native/larger context beyond the checked 512 pack, arbitrary templates, throughput, portability, repeated current-head evidence, and durable normalized full-support bundles remain missing",
+                full_support_blockers: "model-native/larger context beyond the checked 512/1024/2048 packs, arbitrary templates, throughput, portability, repeated current-head evidence, and durable normalized full-support bundles remain missing",
                 metadata_parses: "real_artifact_inspected_and_config_guarded",
                 tokenizer_works: "validated_for_compact_llama3_bpe",
                 tensors_load: "validated_for_lazy_file_backed_q8_backend_runs",
@@ -915,24 +915,24 @@ fn capabilities_response() -> CapabilitiesResponse {
                 performance_measured: "bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs",
                 frontend_load_path_verified: "validated",
                 frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
-                tested_context: "short_api_webui_smoke_with_broader_50_token_plus_checked_512_context_pack",
+                tested_context: "short_api_webui_smoke_with_broader_50_token_plus_checked_512_1024_2048_context_packs",
                 chat_template_renderer: "compact",
                 chat_template_shape_pack: "validated_compact_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_first_pack",
                 bounded_context_512_pack_id: "llama3-context-512-smoke-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_promoted_current_head",
+                bounded_context_1024_pack: "validated_second_pack",
                 bounded_context_1024_pack_id: "llama3-context-1024-smoke-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "not_promoted_current_head",
+                bounded_context_2048_pack: "validated_third_pack",
                 bounded_context_2048_pack_id: "llama3-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "llama3-context-512-smoke-v1",
+                latest_checked_bucket: "llama3-context-2048-smoke-v1",
                 latest_checked_result: "pass",
-                latest_checked_output: "CMLD-512",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, one checked 512-context pack, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes. Existing 8B 1024/2048 bundles are historical/source-head evidence only after later commits; Camelid keeps those buckets not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment land. Camelid supports exact-row smoke plus the checked 512 pack for this row only; no model-native/larger context or broader/full support is implied",
-                next_step: "preserve exact-row smoke plus checked 512 context support while rerunning 8B 1024/2048 on current main and synchronizing docs/API/frontend before any long-context promotion; continue collecting model-native/larger-context proof, broader/full-support, production-throughput, portability, arbitrary-template evidence, and repeated current-head evidence before any wider 8B claim",
+                latest_checked_output: "CMLD-204",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes. The current-head 1024/2048 pass is recorded at qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T002636Z-head-9e3c64f2cfab/manifest.json with prompt-token, generated-token, and generated-text parity for CMLD-102 and CMLD-204. Camelid supports exact-row smoke plus the checked bounded packs for this row only; no model-native/larger context or broader/full support is implied",
+                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while collecting model-native/larger-context proof, broader/full-support, production-throughput, portability, arbitrary-template evidence, and repeated current-head evidence before any wider 8B claim",
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
@@ -3577,39 +3577,41 @@ mod tests {
             eight_b.bounded_context_512_pack_id,
             "llama3-context-512-smoke-v1"
         );
-        assert_eq!(
-            eight_b.bounded_context_1024_pack,
-            "not_promoted_current_head"
-        );
+        assert_eq!(eight_b.bounded_context_1024_pack, "validated_second_pack");
         assert_eq!(
             eight_b.bounded_context_1024_pack_id,
             "llama3-context-1024-smoke-v1"
         );
-        assert_eq!(
-            eight_b.bounded_context_2048_pack,
-            "not_promoted_current_head"
-        );
+        assert_eq!(eight_b.bounded_context_2048_pack, "validated_third_pack");
         assert_eq!(
             eight_b.bounded_context_2048_pack_id,
             "llama3-context-2048-smoke-v1"
         );
-        assert_eq!(eight_b.latest_checked_bucket, "llama3-context-512-smoke-v1");
-        assert_eq!(eight_b.latest_checked_output, "CMLD-512");
-        assert!(eight_b.evidence.contains("one checked 512-context pack"));
+        assert_eq!(
+            eight_b.latest_checked_bucket,
+            "llama3-context-2048-smoke-v1"
+        );
+        assert_eq!(eight_b.latest_checked_output, "CMLD-204");
         assert!(eight_b
             .evidence
-            .contains("1024/2048 bundles are historical/source-head evidence only"));
+            .contains("checked 512/1024/2048-context packs"));
+        assert!(eight_b.evidence.contains("current-head 1024/2048 pass"));
     }
 
     #[test]
-    fn capabilities_keep_8b_1024_2048_not_promoted_without_current_head_alignment() {
+    fn capabilities_promote_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
         assert!(response.support_contract.current_gate.contains(
-            "Llama 3.2 1B/3B Q8_0 have checked bounded 512/1024/2048 packs; Llama 3 8B Q8_0 is checked only through the bounded 512 pack"
+            "Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs"
         ));
-        assert!(response.support_contract.current_gate.contains(
-            "8B 1024/2048 remain not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment exist"
-        ));
+        assert!(response
+            .support_contract
+            .current_gate
+            .contains("where row-specific PASS artifacts exist"));
+        assert!(!response
+            .support_contract
+            .current_gate
+            .contains("8B 1024/2048 remain not promoted"));
         assert!(response
             .support_contract
             .current_gate
@@ -3621,11 +3623,10 @@ mod tests {
             .find(|item| item.id == "Q8_0")
             .expect("Q8_0 row should stay advertised");
         assert!(q8.notes.contains(
-            "exact Llama 3 8B Q8_0 row is checked only through the bounded 512-context pack"
+            "exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs"
         ));
-        assert!(q8.notes.contains(
-            "8B 1024/2048 remain not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment exist"
-        ));
+        assert!(q8.notes.contains("where row-specific PASS artifacts exist"));
+        assert!(!q8.notes.contains("8B 1024/2048 remain not promoted"));
 
         let llama_bpe = response
             .supported_model_families
@@ -3633,11 +3634,10 @@ mod tests {
             .find(|item| item.id == "llama_bpe_decoder_exact_1b_3b_8b_q8_0")
             .expect("Llama BPE exact-row family should stay advertised");
         assert!(llama_bpe.notes.contains(
-            "exact Llama 3 8B Instruct Q8_0 is checked only through the bounded 512-context pack"
+            "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs"
         ));
-        assert!(llama_bpe.notes.contains(
-            "8B 1024/2048 remain not promoted until fresh current-head PASS artifacts plus docs/API/frontend alignment exist"
-        ));
+        assert!(llama_bpe.notes.contains("8B 1024/2048 current-head bundle"));
+        assert!(!llama_bpe.notes.contains("8B 1024/2048 remain not promoted"));
 
         let eight_b = response
             .model_compatibility
@@ -3646,14 +3646,8 @@ mod tests {
             .expect("8B row should stay advertised");
 
         assert_eq!(eight_b.bounded_context_512_pack, "validated_first_pack");
-        assert_eq!(
-            eight_b.bounded_context_1024_pack,
-            "not_promoted_current_head"
-        );
-        assert_eq!(
-            eight_b.bounded_context_2048_pack,
-            "not_promoted_current_head"
-        );
+        assert_eq!(eight_b.bounded_context_1024_pack, "validated_second_pack");
+        assert_eq!(eight_b.bounded_context_2048_pack, "validated_third_pack");
         assert_eq!(
             eight_b.bounded_context_1024_pack_id,
             "llama3-context-1024-smoke-v1"
@@ -3662,9 +3656,12 @@ mod tests {
             eight_b.bounded_context_2048_pack_id,
             "llama3-context-2048-smoke-v1"
         );
-        assert!(eight_b.tested_context.contains("checked_512_context_pack"));
-        assert!(eight_b.next_step.contains("rerunning 8B 1024/2048"));
-        assert!(eight_b.next_step.contains("docs/API/frontend"));
+        assert!(eight_b
+            .tested_context
+            .contains("checked_512_1024_2048_context_packs"));
+        assert!(eight_b
+            .next_step
+            .contains("checked 512/1024/2048 context support"));
     }
 
     #[test]
