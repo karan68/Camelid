@@ -1503,6 +1503,9 @@
 
 .message-code-card-status {
   margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 4px 9px;
   border: 1px solid rgba(255, 216, 77, 0.28);
   border-radius: 999px;
@@ -1511,6 +1514,15 @@
   font-size: 0.68rem;
   font-weight: 820;
   letter-spacing: 0.06em;
+}
+
+.message-code-card-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ffd84d;
+  animation: camelid-live-dot-pulse 1.1s ease-out infinite;
 }
 
 .message-code-card button {

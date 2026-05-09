@@ -97,7 +97,17 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .as_str()
                 .unwrap()
                 .contains("not supported yet")));
-    for id in ["mixtral_moe", "qwen25", "gemma2"] {
+    assert!(body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "mixtral_moe"
+            && item["status"] == "active_validation_unsupported"
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("typed MoE unsupported")));
+    for id in ["qwen25", "gemma2"] {
         assert!(body["planned_model_families"]
             .as_array()
             .unwrap()
@@ -387,11 +397,31 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
     assert!(mistral_next_step.contains("current-head promotion bundle"));
     assert!(mistral_next_step.contains("before any generation, API, or WebUI support claim"));
+    let mixtral = compatibility
+        .iter()
+        .find(|item| item["id"] == "mixtral_8x7b_instruct_v0_1_q8_0")
+        .unwrap();
+    assert_eq!(mixtral["status"], "active_validation_unsupported");
+    assert_eq!(mixtral["support_scope"], "bringup_exact_row_unsupported");
+    assert_eq!(mixtral["generation_runs"], "blocked_typed_unsupported_moe");
+    assert_eq!(
+        mixtral["frontend_load_path_verified"],
+        "fail_closed_unsupported_moe"
+    );
+    assert_eq!(
+        mixtral["latest_checked_result"],
+        "unsupported_moe_typed_guard"
+    );
+    assert!(mixtral["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("llama.expert_count=8"));
+    assert!(mixtral["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("Mixtral-8x7B-Instruct-v0.1-Q8_0-GGUF"));
+
     for (id, filename) in [
-        (
-            "mixtral_8x7b_instruct_v0_1_q8_0",
-            "Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf",
-        ),
         ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
         ("gemma2_9b_it_q8_0", "gemma-2-9b-it-Q8_0.gguf"),
     ] {

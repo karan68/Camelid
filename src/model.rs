@@ -37,6 +37,13 @@ impl LlamaModelConfig {
             }
         };
 
+        if let Some(moe) = MixtralMoeMetadata::from_gguf(gguf, architecture) {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "{} MoE runtime is not implemented: expert_count={}, expert_used_count={}, router tensor pattern blk.N.ffn_gate_inp.weight plus expert tensors blk.N.ffn_{{gate,up,down}}_exps.weight require top-k expert routing; dense LLaMA/Mistral generation is disabled for this exact GGUF until that path has parity evidence",
+                moe.family_label, moe.expert_count, moe.expert_used_count
+            )));
+        }
+
         let attention_head_count = required_u32(
             gguf,
             &architecture_key(architecture, "attention.head_count"),
@@ -93,6 +100,37 @@ impl LlamaModelConfig {
                     )
                 }),
             file_type: gguf.metadata_u32("general.file_type"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct MixtralMoeMetadata {
+    pub family_label: &'static str,
+    pub expert_count: u32,
+    pub expert_used_count: u32,
+}
+
+impl MixtralMoeMetadata {
+    pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Option<Self> {
+        let expert_count = gguf.metadata_u32(&architecture_key(architecture, "expert_count"))?;
+        let expert_used_count =
+            gguf.metadata_u32(&architecture_key(architecture, "expert_used_count"))?;
+        let model_name = gguf.model_name().unwrap_or_default().to_ascii_lowercase();
+        let basename = gguf
+            .metadata_string("general.basename")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let family_label = if model_name.contains("mixtral") || basename.contains("mixtral") {
+            "Mixtral"
+        } else {
+            "MoE"
+        };
+
+        Some(Self {
+            family_label,
+            expert_count,
+            expert_used_count,
         })
     }
 }

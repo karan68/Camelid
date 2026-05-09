@@ -64,7 +64,7 @@ Protect the supported lanes and clear the next blocker before widening claims.
 
 Promote only what can be defended row by row.
 
-- Close the active next-model bring-up set in order: **Mistral 7B Instruct**, then **Mixtral 8x7B Instruct**, then **Qwen 2.5 7B Instruct**, then **Gemma 2 9B Instruct** — always as exact-row evidence lanes first, never as family-wide support claims.
+- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mixtral 8x7B Instruct** is currently active validation unsupported: metadata/tokenizer evidence and a typed MoE guard exist, and the next step is the smallest correct top-k expert-routing implementation before any generation parity attempt.
 - Widen Llama 3.2 3B Q8_0 beyond short-chat smoke only if broader prompt/chat-template, memory/performance, API, and WebUI evidence all land.
 - Broaden quantization support beyond Q8_0 with tests, docs, and exact-row evidence.
 - Expand tokenizer and chat-template coverage for additional supported rows.

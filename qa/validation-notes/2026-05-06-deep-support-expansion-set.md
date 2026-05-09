@@ -37,28 +37,29 @@ huggingface-cli download albertodelazzari/Mistral-7B-Instruct-v0.3-Q8_0-GGUF \
 sha256sum "$CAMELID_MODEL_DIR/mistral-7b-instruct-v0.3-q8_0/mistral-7b-instruct-v0.3-q8_0.gguf"
 ```
 
-## Lane 2: Mixtral first honest plan
+## Lane 2: Mixtral active validation unsupported
 
 - Display candidate row: `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`.
 - Resolved public acquisition candidate: `leserg/Mixtral-8x7B-Instruct-v0.1-Q8_0-GGUF`.
-- Repository SHA observed via Hugging Face API on 2026-05-06: `93c0492d1891b5147f42b2648d9fccc140910a2f`.
+- Repository SHA observed via Hugging Face API and reconfirmed on 2026-05-09: `93c0492d1891b5147f42b2648d9fccc140910a2f`.
 - License metadata observed: `apache-2.0`.
 - Repo rfilename observed: `mixtral-8x7b-instruct-v0.1-q8_0.gguf`.
+- GGUF ETag/size captured on 2026-05-09: `77b8ee314ae3e77cefaba7f33841235da3346c34171547fe10e8a85f127973a7`, `49626319776` bytes.
+- Evidence bundle: `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-metadata-tokenizer-typed-unsupported-20260509/manifest.json`.
+- Tokenizer/reference pack: `fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json`.
 
-Architecture/template risks:
+Architecture/template findings:
 
-- MoE expert routing and tensor naming must be mapped before any generation claim.
-- Load/RSS envelope is materially larger than dense 7B/8B lanes.
-- Template may look Mistral-like, but template parity does not prove MoE execution correctness.
+- Sparse GGUF metadata parses as `general.architecture=llama` with MoE metadata `llama.expert_count=8` and `llama.expert_used_count=2`.
+- Expert tensors use `blk.N.ffn_gate_inp.weight` plus `blk.N.ffn_{gate,up,down}_exps.weight`; the dense LLaMA/Mistral FFN path must not bind these as ordinary dense tensors.
+- Camelid now returns typed unsupported behavior for this MoE runtime path; `/api/models/load` exposes `unsupported_runtime.code=unsupported_model_architecture`, and generation requests fail closed with the Mixtral MoE routing message.
+- Tokenizer/template prompt IDs match llama.cpp reference captures for the exact sparse GGUF header, but template parity does not prove MoE execution correctness.
 
-Minimum bring-up evidence:
+Remaining bring-up order:
 
-1. Acquisition/SHA/license transcript and GGUF metadata summary.
-2. Typed unsupported behavior if MoE expert routing is not implemented end-to-end.
-3. Tokenizer/chat-template fixtures and independent prompt-token references.
-4. Bounded metadata/tensor-load result with RSS notes.
-5. Deterministic one-prompt parity only after expert routing is known-good.
-6. API/WebUI/bounded context/perf bundles only after the above are green.
+1. Implement and unit-test the smallest correct top-k expert-routing vertical slice.
+2. Attempt deterministic one-prompt generation parity only after expert routing is known-good.
+3. Add full-model bounded load/readiness, API/WebUI, RSS/timing, scrubbed manifest, and checksums only after generation parity exists.
 
 ## Lane 3: Qwen 2.5 first honest plan
 

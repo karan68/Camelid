@@ -76,6 +76,21 @@ fn accepts_mistral_metadata_on_llama_dense_runtime() {
 }
 
 #[test]
+fn rejects_mixtral_moe_metadata_before_dense_tensor_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixtral-moe.gguf");
+    write_mixtral_moe_gguf(&path);
+
+    let gguf = read_metadata(&path).unwrap();
+    let err = LlamaModelConfig::from_gguf(&gguf).unwrap_err().to_string();
+
+    assert!(err.contains("Mixtral MoE runtime is not implemented"));
+    assert!(err.contains("expert_count=8"));
+    assert!(err.contains("expert_used_count=2"));
+    assert!(err.contains("ffn_gate_inp.weight"));
+}
+
+#[test]
 fn accepts_llama3_style_gqa_metadata_and_rope_theta() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("llama3-gqa.gguf");
@@ -249,6 +264,64 @@ fn write_llama_gguf_with_bad_attention_k_shape(path: &Path) {
 
 fn write_mistral_gguf(path: &Path) {
     write_architecture_prefixed_gguf(path, "mistral", 128, 8, 16, 2, Some(1), 4, 10_000.0, 1e-6);
+}
+
+fn write_mixtral_moe_gguf(path: &Path) {
+    let tensors: Vec<(&str, Vec<i64>)> = vec![
+        ("token_embd.weight", vec![8, 4]),
+        ("output_norm.weight", vec![8]),
+        ("blk.0.attn_norm.weight", vec![8]),
+        ("blk.0.attn_q.weight", vec![8, 8]),
+        ("blk.0.attn_k.weight", vec![8, 4]),
+        ("blk.0.attn_v.weight", vec![8, 4]),
+        ("blk.0.attn_output.weight", vec![8, 8]),
+        ("blk.0.ffn_norm.weight", vec![8]),
+        ("blk.0.ffn_gate_inp.weight", vec![8, 8]),
+        ("blk.0.ffn_gate_exps.weight", vec![8, 16, 8]),
+        ("blk.0.ffn_up_exps.weight", vec![8, 16, 8]),
+        ("blk.0.ffn_down_exps.weight", vec![16, 8, 8]),
+        ("output.weight", vec![8, 4]),
+    ];
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_i64(&mut b, tensors.len() as i64);
+    push_i64(&mut b, 15);
+
+    push_kv_string(&mut b, "general.architecture", "llama");
+    push_kv_string(&mut b, "general.name", "Mixtral 8x7B Instruct v0.1");
+    push_kv_string(&mut b, "general.basename", "Mixtral");
+    push_kv_u32(&mut b, "general.file_type", 7);
+    push_kv_u32(&mut b, "llama.context_length", 128);
+    push_kv_u32(&mut b, "llama.embedding_length", 8);
+    push_kv_u32(&mut b, "llama.block_count", 1);
+    push_kv_u32(&mut b, "llama.feed_forward_length", 16);
+    push_kv_u32(&mut b, "llama.attention.head_count", 2);
+    push_kv_u32(&mut b, "llama.attention.head_count_kv", 1);
+    push_kv_u32(&mut b, "llama.rope.dimension_count", 4);
+    push_kv_f32(&mut b, "llama.rope.freq_base", 10_000.0);
+    push_kv_f32(&mut b, "llama.attention.layer_norm_rms_epsilon", 1e-6);
+    push_kv_u32(&mut b, "llama.expert_count", 8);
+    push_kv_u32(&mut b, "llama.expert_used_count", 2);
+
+    let mut relative_offset = 0u64;
+    for (name, dims) in &tensors {
+        push_string(&mut b, name);
+        push_u32(&mut b, dims.len() as u32);
+        for dim in dims {
+            push_i64(&mut b, *dim);
+        }
+        push_i32(&mut b, 0); // f32
+        push_u64(&mut b, relative_offset);
+        relative_offset += dims.iter().product::<i64>() as u64 * 4;
+    }
+
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+    b.extend(vec![0u8; relative_offset as usize]);
+    fs::write(path, b).unwrap();
 }
 
 #[allow(clippy::too_many_arguments)]

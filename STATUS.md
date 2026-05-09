@@ -22,13 +22,13 @@ This is the repo story in one sentence: Camelid expanded from one trusted small-
 Active work now splits into two explicit tracks:
 
 - **Four-row hardening:** keep TinyLlama as the current full gate, keep Llama 3.2 1B/3B and Llama 3 8B labeled as exact-row verified support within validated bounds until they meet the harder normalized bar, and treat CI reliability as a release blocker rather than a best-effort signal.
-- **Active next-model bring-up set:** Camelid is publicly working on four exact next-family rows, with Mistral first but still fail-closed and three follow-on candidates.
+- **Active next-model bring-up set:** Camelid is publicly working on four exact next-family rows, with Mistral and Mixtral still fail-closed and the remaining rows as follow-on candidates.
   - `Mistral-7B-Instruct-v0.3.Q8_0.gguf` — immediate closure lane; tokenizer/template, 1-token generation, broader five-prompt/50-token parity, bounded 512/1024/2048, and checked 4096/8192 context evidence are green, but support remains fail-closed pending row-specific API/WebUI/RSS evidence and synchronized support surfaces.
-  - `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` — planned first MoE exact-row candidate; acquisition/metadata planning is in, but expert routing/load/parity work remains.
+  - `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` — active validation unsupported; source/SHA/license, sparse GGUF metadata, MoE tensor pattern, tokenizer/template reference pack, bounded metadata-load RSS, and typed unsupported MoE guard exist, but MoE routing and generation parity do not.
   - `Qwen2.5-7B-Instruct-Q8_0.gguf` — planned exact-row candidate; tokenizer/template and architecture mapping still need row-specific proof.
   - `gemma-2-9b-it-Q8_0.gguf` — planned exact-row candidate; tokenizer/template and Gemma2 runtime behavior still need row-specific proof.
 
-Public readiness language for these four rows is locked to family-by-family exact-row planning: Mistral may say “in active validation, not supported yet,” while Mixtral, Qwen, and Gemma may say “planned exact-row candidate, not supported yet.” First promotion requires row-specific source/SHA/license, exact tokenizer/template references, 1-token generation parity, bounded load/readiness, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence; Mixtral also needs expert-routing proof or typed unsupported behavior.
+Public readiness language for these four rows is locked to family-by-family exact-row evidence: Mistral and Mixtral may say “in active validation, not supported yet,” with Mixtral explicitly “typed unsupported pending MoE routing”; Qwen and Gemma may say “planned exact-row candidate, not supported yet.” First Mixtral promotion requires implemented top-k expert routing, deterministic generation parity, API/WebUI, full-model RSS/timing, scrubbed manifest, and checksum evidence.
 
 README screenshot note: capture and add a frontend screenshot only after the UI is demo-ready and visibly communicates the exact support contract. It should show truthful runtime/readiness state, not become a substitute for CI or support evidence.
 
@@ -358,7 +358,7 @@ In order of importance:
 4. Preserve the Llama 3 8B exact-row smoke plus checked-512/1024/2048 bounded-pack promotion in docs, API, frontend readiness, and regression evidence; do not lend any result to model-native/larger contexts or neighboring rows.
 5. Harden the supported exact rows toward full support without changing labels until the missing normalized evidence exists: model-native/larger context beyond checked packs, arbitrary/Jinja template coverage, production throughput, portability, and durable repeated current-head bundles.
 6. Advance the first Mistral exact-row bring-up lane without promotion: tokenizer/template, 1-token, broader 50-token, bounded 512/1024/2048, and checked 4096/8192 context evidence are green; keep `Mistral-7B-Instruct-v0.3.Q8_0.gguf` fail-closed until separate API/WebUI/RSS evidence and synchronized support surfaces land.
-7. Define the first honest exact-row support plans for `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`, `Qwen2.5-7B-Instruct-Q8_0.gguf`, and `gemma-2-9b-it-Q8_0.gguf`: acquisition path, architecture/template risks, and minimum bring-up evidence before any runtime-support wording.
+7. Advance `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` only inside the active-validation unsupported lane: metadata/tokenizer evidence and typed MoE guard exist; the next promotable work is MoE top-k expert routing before any generation/API/WebUI support wording.
 8. Keep docs, `/api/capabilities`, frontend readiness copy, and CI gates aligned with the exact-row support contract.
 9. Plan the README frontend screenshot for the UI-demo-ready moment; do not use screenshot polish to block or distract from CI/support hardening.
 
@@ -372,13 +372,10 @@ The current Mistral evidence stack includes sanitized tokenizer/generation/conte
 
 ### Next-family exact-row notes
 
-Mixtral, Qwen, and Gemma are now scoped as first honest support plans, not runtime-support lanes. The first candidate rows are `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`, `Qwen2.5-7B-Instruct-Q8_0.gguf`, and `gemma-2-9b-it-Q8_0.gguf`. Acquisition should prefer reproducible public GGUF sources with captured model SHA, license/access notes, and command transcript before any runtime run is treated as evidence.
+Mixtral is now active validation unsupported, not a runtime-support lane. The first candidate row is `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`; source/SHA/license, sparse GGUF metadata, tokenizer/template reference pack, bounded metadata-load RSS, and typed MoE unsupported behavior are captured, but no generation support exists.
 
-- **Mixtral 8x7B Instruct:** primary risk is MoE architecture/expert routing plus larger load/RSS behavior; support work starts with metadata/tokenizer/template fixtures, typed unsupported MoE behavior if experts are not implemented, bounded metadata/tensor-load evidence, then one deterministic parity prompt only after routing is correct.
-- **Qwen 2.5 7B Instruct:** primary risk is Qwen tokenizer/template semantics and architecture/config mapping; first evidence is exact-row tokenizer/chat-template references, Camelid prompt-token comparison, bounded load/readiness, then deterministic generation/API/WebUI smoke.
-- **Gemma 2 9B Instruct:** primary risk is Gemma/Gemma2 architecture details, tokenizer/control-token behavior, and template formatting; first evidence is exact-row tokenizer/template references, config/tensor metadata acceptance, bounded load/readiness, then parity and API/WebUI smoke.
-
-Until those artifacts exist, these rows stay out of support/readiness language and out of runtime-promotion scheduling. The concrete source/SHA/license acquisition candidates and command order are tracked in `qa/validation-notes/2026-05-06-deep-support-expansion-set.md`.
+- **Mixtral 8x7B Instruct:** evidence bundle `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-metadata-tokenizer-typed-unsupported-20260509/manifest.json` records source/SHA/license, GGUF MoE metadata (`expert_count=8`, `expert_used_count=2`), expert tensor names, tokenizer/template reference pack, bounded metadata-load RSS, and typed unsupported generation. Next work is the smallest correct MoE top-k expert-routing vertical slice; deterministic parity is blocked until routing is implemented and unit-tested.
+Until routing/parity artifacts exist, Mixtral stays out of support/readiness language and out of runtime-promotion scheduling. The original source/SHA/license acquisition candidates and command order are tracked in `qa/validation-notes/2026-05-06-deep-support-expansion-set.md`.
 
 ## Validation note
 

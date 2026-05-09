@@ -215,6 +215,75 @@ fn mistral_reference_pack_records_required_prompt_shapes_and_tokens() {
 }
 
 #[test]
+fn mixtral_reference_pack_records_required_prompt_shapes_and_tokens() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json"
+    ))
+    .unwrap();
+
+    assert_eq!(fixture["status"], "reference_capture");
+    assert_eq!(
+        fixture["expected_artifacts"]["hf_commit_sha"],
+        "93c0492d1891b5147f42b2648d9fccc140910a2f"
+    );
+    assert_eq!(fixture["expected_artifacts"]["license"], "apache-2.0");
+    assert_eq!(
+        fixture["expected_artifacts"]["tokenizer_fixture_id"],
+        "mixtral-instruct-v0.1-tokenizer-v1"
+    );
+    assert_eq!(
+        fixture["expected_artifacts"]["chat_template_fixture_id"],
+        "mixtral-instruct-v0.1-chat-template-pack-v1"
+    );
+    assert_eq!(
+        fixture["expected_artifacts"]["prompt_cases"][1]["rendered_prompt"],
+        "<s> [INST] Hello [/INST]"
+    );
+    assert_eq!(
+        fixture["expected_artifacts"]["prompt_cases"][1]["expected_tokens"],
+        serde_json::json!([1, 733, 16289, 28793, 22557, 733, 28748, 16289, 28793])
+    );
+    assert_eq!(
+        fixture["expected_artifacts"]["prompt_cases"][2]["rendered_prompt"],
+        "<s> [INST] Be brief.\n\nHello there. [/INST]"
+    );
+}
+
+#[test]
+fn encodes_mixtral_real_prompts_like_llama_cpp_when_available() {
+    let Some(tokenizer) = load_real_mixtral_tokenizer() else {
+        return;
+    };
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json"
+    ))
+    .unwrap();
+    let cases = fixture["expected_artifacts"]["prompt_cases"]
+        .as_array()
+        .unwrap();
+
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let text = case["rendered_prompt"].as_str().unwrap();
+        let add_special = case["add_bos"].as_bool().unwrap();
+        let parse_special = case["parse_special"].as_bool().unwrap();
+        let expected: Vec<u32> = case["expected_tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u32)
+            .collect();
+
+        assert_eq!(
+            tokenizer.encode(text, add_special, parse_special).unwrap(),
+            expected,
+            "Mixtral tokenizer parity failed for {name}; expected IDs are from llama.cpp llama-tokenize against the exact Mixtral-8x7B-Instruct-v0.1.Q8_0 GGUF metadata"
+        );
+    }
+}
+
+#[test]
 fn encodes_mistral_real_prompts_like_llama_cpp_when_available() {
     let Some(tokenizer) = load_real_mistral_tokenizer() else {
         return;
@@ -464,6 +533,24 @@ fn load_real_mistral_tokenizer() -> Option<Tokenizer> {
     if !path.exists() {
         eprintln!(
             "skipping real Mistral tokenizer parity; set MISTRAL_GGUF or place the artifact at {}",
+            path.display()
+        );
+        return None;
+    }
+
+    let gguf = read_metadata(&path).unwrap();
+    Some(Tokenizer::from_gguf(&gguf).unwrap())
+}
+
+fn load_real_mixtral_tokenizer() -> Option<Tokenizer> {
+    let path = std::env::var("MIXTRAL_GGUF")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from("models/mixtral-8x7b-instruct-v0.1-q8_0.gguf")
+        });
+    if !path.exists() {
+        eprintln!(
+            "skipping real Mixtral tokenizer parity; set MIXTRAL_GGUF or place the artifact at {}",
             path.display()
         );
         return None;

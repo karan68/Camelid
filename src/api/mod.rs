@@ -78,7 +78,14 @@ pub struct LoadedModel {
     pub gguf: GgufFile,
     pub llama_config: Option<LlamaModelConfig>,
     pub llama_tensors: Option<LlamaTensorBinding>,
+    pub unsupported_runtime: Option<UnsupportedRuntimeSummary>,
     pub tokenizer: TokenizerLoadState,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UnsupportedRuntimeSummary {
+    pub code: &'static str,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -774,8 +781,8 @@ fn capabilities_response() -> CapabilitiesResponse {
             },
             SupportItem {
                 id: "mixtral_moe",
-                status: "planned_exact_row_candidate",
-                notes: "public readiness: planned first MoE row only for Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf; not supported yet. Expert routing, tokenizer/template, bounded load, parity, API/WebUI, RSS, and bundle evidence are missing",
+                status: "active_validation_unsupported",
+                notes: "public readiness: in active validation for Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf only; not supported yet. Source/SHA/license, sparse GGUF metadata, tokenizer/template references, bounded metadata-load RSS, and typed MoE unsupported behavior exist, but expert routing, generation parity, API/WebUI readiness, full-model RSS, and promotion bundle evidence are missing",
             },
             SupportItem {
                 id: "qwen25",
@@ -1043,21 +1050,21 @@ fn capabilities_response() -> CapabilitiesResponse {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
                 family: "mixtral_moe",
                 quantization: "Q8_0",
-                status: "planned_exact_row_candidate",
-                support_scope: "future_exact_row_planning_only",
-                full_support_status: "not_applicable_until_runtime_support",
-                full_support_blockers: "MoE runtime, tokenizer/template parity, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing",
-                metadata_parses: "acquisition_planned",
-                tokenizer_works: "not_started",
-                tensors_load: "not_started",
-                generation_runs: "not_started",
-                parity_audited: "not_started",
-                performance_measured: "not_started",
-                frontend_load_path_verified: "fail_closed_planned",
-                frontend_readiness_gate: "fail-closed until an exact supported row plus runtime readiness exist",
-                tested_context: "not_started",
-                chat_template_renderer: "mixtral_instruct_v0_1_planned",
-                chat_template_shape_pack: "not_started",
+                status: "active_validation_unsupported",
+                support_scope: "bringup_exact_row_unsupported",
+                full_support_status: "blocked_unsupported_moe_runtime",
+                full_support_blockers: "MoE top-k expert routing is not implemented; deterministic generation parity, API/WebUI readiness, and full-model RSS/timing evidence are missing",
+                metadata_parses: "validated_sparse_header",
+                tokenizer_works: "validated_against_llama_cpp_reference",
+                tensors_load: "unsupported_typed_error_before_expert_routing",
+                generation_runs: "blocked_typed_unsupported_moe",
+                parity_audited: "prompt_token_reference_only",
+                performance_measured: "metadata_load_rss_only",
+                frontend_load_path_verified: "fail_closed_unsupported_moe",
+                frontend_readiness_gate: "fail-closed: Mixtral row must remain unsupported until MoE routing plus exact-row generation parity evidence exist",
+                tested_context: "metadata_and_tokenizer_only",
+                chat_template_renderer: "mixtral_instruct_v0_1_metadata_template_validated",
+                chat_template_shape_pack: "validated_reference_pack",
                 chat_template_shape_pack_id: "mixtral-instruct-v0.1-chat-template-pack-v1",
                 bounded_context_512_pack: "not_started",
                 bounded_context_512_pack_id: "mixtral-context-512-smoke-v1",
@@ -1068,11 +1075,11 @@ fn capabilities_response() -> CapabilitiesResponse {
                 bounded_context_2048_pack: "not_started",
                 bounded_context_2048_pack_id: "mixtral-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "candidate_selected",
-                latest_checked_result: "planning_only",
-                latest_checked_output: "not_applicable",
-                evidence: "first Mixtral candidate row selected for planning only: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf; MoE expert routing, acquisition/SHA/license, tokenizer/template references, bounded load, parity, API/WebUI, RSS, and bundle evidence are all still required",
-                next_step: "capture acquisition path, model SHA and license/access notes, then map MoE expert routing or typed unsupported behavior before any generation or readiness claim",
+                latest_checked_bucket: "mixtral_8x7b_q8_metadata_tokenizer_20260509",
+                latest_checked_result: "unsupported_moe_typed_guard",
+                latest_checked_output: "fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json",
+                evidence: "exact row leserg/Mixtral-8x7B-Instruct-v0.1-Q8_0-GGUF at commit 93c0492d1891b5147f42b2648d9fccc140910a2f, license apache-2.0, GGUF ETag 77b8ee314ae3e77cefaba7f33841235da3346c34171547fe10e8a85f127973a7, size 49626319776 bytes; sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus expert tensors, tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; generation remains typed unsupported because MoE routing is absent",
+                next_step: "implement and unit-test the smallest MoE top-k expert-routing vertical slice before attempting deterministic one-prompt generation parity or any API/WebUI support claim",
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
@@ -1187,7 +1194,17 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
                         .map(|s| s.to_string_lossy().to_string())
                 })
                 .unwrap_or_else(|| "loaded-model".to_string());
-            let llama_config = LlamaModelConfig::from_gguf(&gguf).ok();
+            let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+            let unsupported_runtime = match &llama_config_result {
+                Err(BackendError::UnsupportedModelArchitecture(message)) => {
+                    Some(UnsupportedRuntimeSummary {
+                        code: "unsupported_model_architecture",
+                        message: message.clone(),
+                    })
+                }
+                _ => None,
+            };
+            let llama_config = llama_config_result.ok();
             let llama_tensors = llama_config
                 .as_ref()
                 .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
@@ -1198,6 +1215,7 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
                 gguf,
                 llama_config,
                 llama_tensors,
+                unsupported_runtime,
                 tokenizer,
             };
             let body = loaded.clone();
@@ -1899,10 +1917,17 @@ async fn prepare_generation(
     }
 
     let config = model.llama_config.as_ref().ok_or_else(|| {
+        let message = model
+            .unsupported_runtime
+            .as_ref()
+            .map(|unsupported| unsupported.message.clone())
+            .unwrap_or_else(|| {
+                "loaded model does not expose a Camelid-supported dense GGUF config".to_string()
+            });
         api_error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported_model_architecture",
-            "loaded model does not expose a Camelid-supported dense GGUF config".to_string(),
+            message,
             Some("model"),
         )
     })?;
@@ -3589,7 +3614,10 @@ mod tests {
             "llama3-context-2048-smoke-v1"
         );
         assert_eq!(eight_b.bounded_context_2048_window, 2048);
-        assert_eq!(eight_b.latest_checked_bucket, "llama3-context-2048-smoke-v1");
+        assert_eq!(
+            eight_b.latest_checked_bucket,
+            "llama3-context-2048-smoke-v1"
+        );
         assert_eq!(eight_b.latest_checked_output, "CMLD-204");
         assert!(eight_b
             .evidence
@@ -3600,10 +3628,9 @@ mod tests {
     #[test]
     fn capabilities_report_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
-        assert!(response
-            .support_contract
-            .current_gate
-            .contains("Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs"));
+        assert!(response.support_contract.current_gate.contains(
+            "Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs"
+        ));
         assert!(response
             .support_contract
             .current_gate
@@ -3644,8 +3671,14 @@ mod tests {
         assert_eq!(eight_b.bounded_context_512_pack, "validated_first_pack");
         assert_eq!(eight_b.bounded_context_1024_pack, "validated_second_pack");
         assert_eq!(eight_b.bounded_context_2048_pack, "validated_third_pack");
-        assert_eq!(eight_b.bounded_context_1024_pack_id, "llama3-context-1024-smoke-v1");
-        assert_eq!(eight_b.bounded_context_2048_pack_id, "llama3-context-2048-smoke-v1");
+        assert_eq!(
+            eight_b.bounded_context_1024_pack_id,
+            "llama3-context-1024-smoke-v1"
+        );
+        assert_eq!(
+            eight_b.bounded_context_2048_pack_id,
+            "llama3-context-2048-smoke-v1"
+        );
         assert!(eight_b
             .tested_context
             .contains("checked_512_1024_2048_context_packs"));
@@ -3767,11 +3800,31 @@ mod tests {
     #[test]
     fn capabilities_report_next_family_rows_stay_planned_and_fail_closed() {
         let response = capabilities_response();
-        let planned_rows = [
-            "mixtral_8x7b_instruct_v0_1_q8_0",
-            "qwen25_7b_instruct_q8_0",
-            "gemma2_9b_it_q8_0",
-        ];
+        let mixtral = response
+            .model_compatibility
+            .iter()
+            .find(|target| target.id == "mixtral_8x7b_instruct_v0_1_q8_0")
+            .expect("Mixtral exact-row lane should stay visible");
+        assert_eq!(mixtral.status, "active_validation_unsupported");
+        assert_eq!(mixtral.support_scope, "bringup_exact_row_unsupported");
+        assert_eq!(
+            mixtral.full_support_status,
+            "blocked_unsupported_moe_runtime"
+        );
+        assert_eq!(
+            mixtral.tensors_load,
+            "unsupported_typed_error_before_expert_routing"
+        );
+        assert_eq!(mixtral.generation_runs, "blocked_typed_unsupported_moe");
+        assert_eq!(mixtral.parity_audited, "prompt_token_reference_only");
+        assert_eq!(mixtral.latest_checked_result, "unsupported_moe_typed_guard");
+        assert!(mixtral.frontend_readiness_gate.contains("fail-closed"));
+        assert!(mixtral.evidence.contains("llama.expert_count=8"));
+        assert!(mixtral
+            .evidence
+            .contains("generation remains typed unsupported"));
+
+        let planned_rows = ["qwen25_7b_instruct_q8_0", "gemma2_9b_it_q8_0"];
 
         for id in planned_rows {
             let target = response
