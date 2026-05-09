@@ -37,7 +37,9 @@ const visibleUiSources = [
 assert.match(chatWorkspaceSource, /pending is-streaming/, 'pending assistant row should use the same streaming Pac-Man state as live token rows')
 assert.match(chatWorkspaceSource, /splitFenceInfo/, 'streaming/incomplete fenced code blocks should be parsed as code instead of prose')
 assert.match(chatWorkspaceSource, /pushCodeBlock/, 'code block rendering should stay centralized for complete and incomplete fences')
-assert.match(chatWorkspaceSource, /streaming=\{Boolean\(message\.streaming\)\}/, 'assistant markdown should know when a row is still streaming')
+assert.match(chatWorkspaceSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
+assert.match(chatWorkspaceSource, /\$\{assistantStreaming \? 'is-streaming' : ''\}/, 'only assistant rows that are actively streaming should receive the animated streaming class')
+assert.doesNotMatch(chatWorkspaceSource, /\$\{message\.streaming \? 'is-streaming' : ''\}/, 'raw message.streaming should not keep completed/non-assistant rows visually active')
 assert.match(chatWorkspaceSource, /incomplete:\s*incompleteFence,\s*streaming/, 'unclosed streaming fences should reach the code-card renderer as active incomplete code')
 assert.match(chatWorkspaceSource, /aria-busy=\{stillGenerating \? 'true' : undefined\}/, 'incomplete streaming code cards should expose busy state')
 assert.match(chatWorkspaceSource, /hasOpenCodeFence/, 'streaming rows should detect open fenced code so the active state can call that out')
@@ -84,6 +86,7 @@ assert.match(pacmanRule, /filter:\s*none/, 'Pac-Man should not look like it is f
 assert.match(pacmanRule, /position:\s*absolute/, 'Pac-Man should stay anchored rather than float in the text flow')
 const streamingPelletRule = componentCss.match(/\.message-row-gemini\.assistant\.is-streaming::after\s*{[\s\S]*?\n}/)?.[0] || ''
 assert.match(streamingPelletRule, /transform:\s*none/, 'streaming pellets should not bob or float')
+assert.match(streamingPelletRule, /filter:\s*none/, 'streaming pellets should not use a floating glow/drop-shadow')
 assert.match(streamingPelletRule, /width:\s*24px/, 'streaming pellets should stay small and game-like')
 const pelletKeyframes = componentCss.match(/@keyframes camelid-pellets-feed\s*{[\s\S]*?\n}/)?.[0] || ''
 assert.doesNotMatch(pelletKeyframes, /translateY|scale[XY]?\(/, 'pellet animation should stay game-steady without bobbing or scaling')

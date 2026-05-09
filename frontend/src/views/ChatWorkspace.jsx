@@ -525,14 +525,14 @@ export default function ChatWorkspace({
                 return (
                   <article
                     key={message.id}
-                    className={`message-row message-row-gemini ${message.role} ${message.streaming ? 'is-streaming' : ''}`}
+                    className={`message-row message-row-gemini ${message.role} ${assistantStreaming ? 'is-streaming' : ''}`}
                     aria-busy={assistantStreaming ? 'true' : undefined}
                     data-streaming-state={assistantStreaming ? 'active' : undefined}
                     data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
                   >
                     <div className={`message-bubble message-bubble-gemini ${message.role}`}>
                       {assistantStreaming && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
-                      {message.role === 'assistant' ? <AssistantMarkdown content={messageContent} streaming={Boolean(message.streaming)} /> : <p>{messageContent}</p>}
+                      {message.role === 'assistant' ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} /> : <p>{messageContent}</p>}
                       {assistantStreaming && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tail />}
                       {hasTokenMetrics && (
                         <div className="message-token-metrics" aria-label="Generation speed">
