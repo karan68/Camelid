@@ -79,7 +79,9 @@ function findModelMatchingCapabilityRow(models, capabilities, target, runtime, s
 function evidenceTrackTone(value = '') {
   const status = value.toLowerCase()
   if (!status) return ''
-  if (status.includes('validated') || status.includes('measured') || status.includes('supported')) return 'ready'
+  const guardedTone = capabilityStatusTone(status)
+  if (guardedTone) return guardedTone
+  if (status.includes('validated') || status.includes('measured') || status === 'pass') return 'ready'
   return 'warm'
 }
 

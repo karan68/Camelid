@@ -179,7 +179,10 @@ export function capabilityStatusTone(status = '') {
     || value.includes('evidence')
     || value.includes('blocked')
     || value.includes('unsupported')
+    || value.includes('not_promoted')
     || value.includes('future')
+    || value.includes('fail_closed')
+    || value.includes('fail-closed')
     || value.includes('not_started')
   ) return 'warm'
   return ''
