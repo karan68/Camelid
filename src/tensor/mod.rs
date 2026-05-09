@@ -221,9 +221,37 @@ impl Q8_0FileBacking {
             .as_ref()
             .and_then(|scales| scales.len().checked_mul(Q8_0_BLOCK_BYTES))
             .is_some_and(|scale_bytes| out.len() == scale_bytes);
+
+        let cache_capacity = q8_file_cache_capacity_bytes();
+        if cache_capacity == 0 {
+            // The bounded Q8 chunk cache is disabled by default for 8B memory headroom.
+            // Keep the default matmul reader on a straight pread path instead of building
+            // cache-miss range bookkeeping for every streamed weight chunk.
+            q8_file_cache_apply_capacity(0);
+            let file = self.file()?;
+            file.read_exact_at(out, offset)
+                .map_err(|source| BackendError::Io {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            record_q8_0_file_read(out.len());
+            if cache_decoded_q8_0_scales {
+                if let Some(scales) = &mut cached_scales {
+                    decode_q8_0_scales_from_bytes(out, scales);
+                    return Ok(Q8FileReadScaleStatus::DecodedScalesReady);
+                }
+            }
+            return Ok(Q8FileReadScaleStatus::NoScales);
+        }
+
         let (ranges, decoded_scales_reused, decoded_scale_hit_blocks) =
-            match q8_file_cache_prepare_read(&self.path, offset, out, cached_scales.as_deref_mut())
-            {
+            match q8_file_cache_prepare_read(
+                &self.path,
+                offset,
+                out,
+                cached_scales.as_deref_mut(),
+                cache_capacity,
+            ) {
                 Q8FileCacheRead::Hit {
                     decoded_scales_reused,
                     decoded_scale_hit_blocks,
@@ -1135,6 +1163,7 @@ fn q8_file_cache_prepare_read(
     offset: u64,
     out: &mut [u8],
     mut cached_scales: Option<&mut [f32]>,
+    capacity: usize,
 ) -> Q8FileCacheRead {
     let out_len = out.len();
     let mut decoded_scales_reused = cached_scales
@@ -1142,11 +1171,7 @@ fn q8_file_cache_prepare_read(
         .and_then(|scales| scales.len().checked_mul(Q8_0_BLOCK_BYTES))
         .is_some_and(|scale_bytes| out_len == scale_bytes);
     let mut decoded_scale_hit_blocks = 0usize;
-    let capacity = q8_file_cache_capacity_bytes();
-    if capacity == 0 {
-        q8_file_cache_apply_capacity(0);
-        return q8_file_cache_missing_all(out_len);
-    }
+    debug_assert!(capacity > 0);
     let Some(request_end) = offset.checked_add(out_len as u64) else {
         record_q8_file_cache_miss(out_len);
         return q8_file_cache_missing_all(out_len);
@@ -2095,6 +2120,45 @@ mod tests {
         assert_eq!(stats.cache_entries, 0);
         assert_eq!(stats.cache_bytes, 0);
         assert_eq!(stats.cache_capacity_bytes, 0);
+        std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
+    }
+
+    #[test]
+    fn q8_file_cache_disabled_scale_read_decodes_from_direct_read() {
+        let _env_guard = env_lock();
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
+        let _ = q8_0_file_read_stats();
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/camelid-q8-cache-disabled-scale-read-{}",
+            std::process::id()
+        ));
+        let scale_bits = 0x3800_u16;
+        let mut bytes = Vec::with_capacity(Q8_0_BLOCK_BYTES);
+        bytes.extend_from_slice(&scale_bits.to_le_bytes());
+        bytes.extend(0..32_u8);
+        std::fs::write(&path, &bytes).unwrap();
+        let backing = Q8_0FileBacking::new(path.clone(), 0, 1);
+        let mut out = [0_u8; Q8_0_BLOCK_BYTES];
+        let mut scales = [0.0_f32; 1];
+
+        let start = q8_0_file_read_stats();
+        let reused = backing
+            .read_exact_at_cached_with_q8_0_scales(&mut out, 0, &mut scales)
+            .unwrap();
+        let stats = q8_0_file_read_stats().saturating_delta_since(start);
+
+        assert!(!reused);
+        assert_eq!(out.as_slice(), bytes.as_slice());
+        assert_eq!(scales, [f16_bits_to_f32(scale_bits)]);
+        assert_eq!(stats.read_calls, 1);
+        assert_eq!(stats.read_bytes, Q8_0_BLOCK_BYTES as u64);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.cache_misses, 0);
+        assert_eq!(stats.cache_entries, 0);
+        assert_eq!(stats.cache_bytes, 0);
+        assert_eq!(stats.cache_capacity_bytes, 0);
+        let _ = std::fs::remove_file(path);
         std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
     }
 
