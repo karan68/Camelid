@@ -339,37 +339,53 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap();
     assert_eq!(mistral["status"], "active_validation_unsupported");
     assert_eq!(mistral["metadata_parses"], "target_selected");
-    assert_eq!(mistral["tokenizer_works"], "parity_blocked");
+    assert_eq!(mistral["tokenizer_works"], "reference_pack_validated");
     assert_eq!(mistral["tensors_load"], "ubuntu_load_serve_observed");
-    assert_eq!(mistral["generation_runs"], "not_promoted");
+    assert_eq!(
+        mistral["generation_runs"],
+        "one_token_and_bounded_parity_observed_not_promoted"
+    );
     assert_eq!(
         mistral["frontend_load_path_verified"],
         "fail_closed_planned"
     );
-    assert_eq!(mistral["tested_context"], "pre_generation_readiness_only");
     assert_eq!(
-        mistral["chat_template_renderer"],
-        "mistral_instruct_v0_3_planned"
+        mistral["tested_context"],
+        "one_token_plus_bounded_512_1024_2048_pack_evidence_not_promoted"
     );
-    assert_eq!(mistral["chat_template_shape_pack"], "not_started");
+    assert_eq!(mistral["chat_template_renderer"], "mistral_instruct");
+    assert_eq!(
+        mistral["chat_template_shape_pack"],
+        "reference_pack_validated"
+    );
     assert_eq!(
         mistral["chat_template_shape_pack_id"],
         "mistral-instruct-v0.3-chat-template-pack-v1"
     );
-    assert_eq!(mistral["bounded_context_512_pack"], "not_started");
+    assert_eq!(
+        mistral["bounded_context_512_pack"],
+        "validated_bounded_pack_not_promoted"
+    );
     assert_eq!(
         mistral["bounded_context_512_pack_id"],
         "mistral-context-512-smoke-v1"
     );
-    assert_eq!(mistral["latest_checked_bucket"], "ubuntu_load_serve_only");
+    assert_eq!(
+        mistral["latest_checked_bucket"],
+        "broader_50tok_5prompt_ubuntu"
+    );
     assert_eq!(
         mistral["latest_checked_result"],
-        "blocked_on_tokenizer_template_parity"
+        "prompt_generated_text_match_not_promoted"
     );
     let mistral_evidence = mistral["evidence"].as_str().unwrap();
     assert!(mistral_evidence.contains("Mistral-7B-Instruct-v0.3.Q8_0.gguf"));
+    assert!(mistral_evidence
+        .contains("fixtures/tokenizer/mistral-7b-instruct-v0.3-reference-pack.json"));
+    assert!(mistral_evidence.contains("1-token parity"));
+    assert!(mistral_evidence.contains("no Mistral support claim"));
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
-    assert!(mistral_next_step.contains("1-token generation parity"));
+    assert!(mistral_next_step.contains("current-head promotion bundle"));
     assert!(mistral_next_step.contains("before any generation, API, or WebUI support claim"));
     for (id, filename) in [
         (
