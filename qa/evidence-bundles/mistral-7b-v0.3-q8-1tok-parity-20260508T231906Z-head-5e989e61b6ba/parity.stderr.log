@@ -8,7 +8,7 @@ Running without SSL
 init: using 15 threads for HTTP server
 start: binding port with default address family
 [llama-server] main: loading model
-srv    load_model: loading model '/home/ubuntu/models/mistral/Mistral-7B-Instruct-v0.3-Q8_0.gguf'
+srv    load_model: loading model '<Mistral-7B-Instruct-v0.3-Q8_0.gguf>'
 [llama-server] common_init_result: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on
 common_params_fit_impl: getting device memory data for initial parameters:
 [llama-server] common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
@@ -18,7 +18,7 @@ common_memory_breakdown_print: |   - AMX                |                 8056 =
 common_params_fit_impl: will leave 126437 >= 1024 MiB of system memory, no changes needed
 common_fit_params: successfully fit params to free device memory
 common_fit_params: fitting params to free memory took 0.04 seconds
-[llama-server] llama_model_loader: loaded meta data with 29 key-value pairs and 291 tensors from /home/ubuntu/models/mistral/Mistral-7B-Instruct-v0.3-Q8_0.gguf (version GGUF V3 (latest))
+[llama-server] llama_model_loader: loaded meta data with 29 key-value pairs and 291 tensors from <Mistral-7B-Instruct-v0.3-Q8_0.gguf> (version GGUF V3 (latest))
 llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
 llama_model_loader: - kv   0:                       general.architecture str              = llama
 llama_model_loader: - kv   1:                               general.name str              = Mistral-7B-Instruct-v0.3

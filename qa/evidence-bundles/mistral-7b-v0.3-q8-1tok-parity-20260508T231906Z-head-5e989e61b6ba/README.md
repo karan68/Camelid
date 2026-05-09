@@ -3,7 +3,7 @@
 Current-head bounded Ubuntu parity check for the fail-closed Mistral bring-up lane.
 
 - Repo head: `5e989e61b6ba7fd2759f1a68891b9655d449f28d`
-- Remote GGUF: `/home/ubuntu/models/mistral/Mistral-7B-Instruct-v0.3-Q8_0.gguf`
+- Remote GGUF: `<Mistral-7B-Instruct-v0.3-Q8_0.gguf>`
 - Size: `7702565088` bytes
 - SHA-256: `404857e776114baada71a08ebd3bba79d721ec7fca99705e7e7b892ae8bc583f`
 - Prompt: `<s>[INST] hello [/INST]`

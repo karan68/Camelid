@@ -1,7 +1,7 @@
 {
   "backend": "http://127.0.0.1:8831",
   "llama_server": "http://127.0.0.1:8832",
-  "model": "/home/ubuntu/models/mistral/Mistral-7B-Instruct-v0.3-Q8_0.gguf",
+  "model": "<Mistral-7B-Instruct-v0.3-Q8_0.gguf>",
   "model_id": "mistral-7b-v0.3-q8",
   "message": "hello",
   "messages": [
@@ -23,7 +23,7 @@
     "--port",
     "8832",
     "-m",
-    "/home/ubuntu/models/mistral/Mistral-7B-Instruct-v0.3-Q8_0.gguf",
+    "<Mistral-7B-Instruct-v0.3-Q8_0.gguf>",
     "-ngl",
     "0",
     "-c",
