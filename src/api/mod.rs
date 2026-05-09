@@ -1686,7 +1686,7 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
         })?;
         let file_backed_q8_linear = lazy_q8_linear
             && desc.tensor_type == GgufTensorType::Q8_0
-            && desc.dimensions.len() == 2;
+            && matches!(desc.dimensions.len(), 2 | 3);
         let f32_bytes = if file_backed_q8_linear {
             0
         } else {

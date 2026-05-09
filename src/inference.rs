@@ -831,24 +831,65 @@ impl LlamaLoadedWeights {
                 &[dims.embedding_length],
                 &format!("layer {idx} ffn norm"),
             )?;
-            require_matrix_shape(
-                &layer.ffn_gate,
-                dims.embedding_length,
-                dims.feed_forward_length,
-                &format!("layer {idx} ffn gate"),
-            )?;
-            require_matrix_shape(
-                &layer.ffn_up,
-                dims.embedding_length,
-                dims.feed_forward_length,
-                &format!("layer {idx} ffn up"),
-            )?;
-            require_matrix_shape(
-                &layer.ffn_down,
-                dims.feed_forward_length,
-                dims.embedding_length,
-                &format!("layer {idx} ffn down"),
-            )?;
+            if let Some(moe) = &config.moe {
+                let router = layer.moe_router.as_ref().ok_or_else(|| {
+                    BackendError::RuntimeShapeMismatch(format!(
+                        "layer {idx} Mixtral MoE router tensor is missing"
+                    ))
+                })?;
+                require_matrix_shape(
+                    router,
+                    dims.embedding_length,
+                    moe.expert_count as usize,
+                    &format!("layer {idx} ffn router"),
+                )?;
+                require_tensor_shape(
+                    &layer.ffn_gate,
+                    &[
+                        dims.embedding_length,
+                        dims.feed_forward_length,
+                        moe.expert_count as usize,
+                    ],
+                    &format!("layer {idx} ffn gate experts"),
+                )?;
+                require_tensor_shape(
+                    &layer.ffn_up,
+                    &[
+                        dims.embedding_length,
+                        dims.feed_forward_length,
+                        moe.expert_count as usize,
+                    ],
+                    &format!("layer {idx} ffn up experts"),
+                )?;
+                require_tensor_shape(
+                    &layer.ffn_down,
+                    &[
+                        dims.feed_forward_length,
+                        dims.embedding_length,
+                        moe.expert_count as usize,
+                    ],
+                    &format!("layer {idx} ffn down experts"),
+                )?;
+            } else {
+                require_matrix_shape(
+                    &layer.ffn_gate,
+                    dims.embedding_length,
+                    dims.feed_forward_length,
+                    &format!("layer {idx} ffn gate"),
+                )?;
+                require_matrix_shape(
+                    &layer.ffn_up,
+                    dims.embedding_length,
+                    dims.feed_forward_length,
+                    &format!("layer {idx} ffn up"),
+                )?;
+                require_matrix_shape(
+                    &layer.ffn_down,
+                    dims.feed_forward_length,
+                    dims.embedding_length,
+                    &format!("layer {idx} ffn down"),
+                )?;
+            }
         }
 
         Ok(())
@@ -5648,10 +5689,10 @@ fn mixtral_moe_ffn(
     let rows = input.dim(0)?;
     let hidden = input.dim(1)?;
     let ff = gate_experts.dim(1)?;
-    let expert_count = router.dim(0)?.max(router.dim(1)?);
     let router_started = Instant::now();
     let logits = linear_for_role_runtime(input, router, "mixtral_router", "linear", false)?;
     let router_elapsed = router_started.elapsed().as_micros();
+    let expert_count = logits.dim(1)?;
     let mut output = vec![0.0_f32; rows * hidden];
     let mut gate_elapsed = 0;
     let mut up_elapsed = 0;
