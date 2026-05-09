@@ -210,6 +210,8 @@ const splitFenceInfo = (value) => {
   }
 }
 
+const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomplete'
+
 const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
   const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
   const stillGenerating = Boolean(incomplete && streaming)
@@ -222,7 +224,7 @@ const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, 
     >
       <figcaption>
         <span className="message-code-card-title">{language}</span>
-        {stillGenerating && <span className="message-code-card-status" aria-live="polite">Still generating — code block open</span>}
+        {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
         <button type="button" onClick={() => copyText(trimmedCode)} aria-label={`Copy ${language} code`}>Copy</button>
       </figcaption>
       <pre><code>{renderHighlightedCode(trimmedCode, language, keyPrefix)}</code></pre>
