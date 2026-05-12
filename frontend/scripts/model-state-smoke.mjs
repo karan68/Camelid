@@ -18,6 +18,7 @@ import {
   getTrackedCompatibilityTargets,
   guardedCapabilityCopy,
   isCompatibilitySupportedForModel,
+  isExactCompatibilityHint,
   isGuardedCapabilityStatus,
   isSupportedCapabilityStatus,
   quantLabelFromGgufFileType,
@@ -221,6 +222,7 @@ assert.deepEqual(
 const tinyQ8Hint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q8_0' })
 assert.equal(tinyQ8Hint.target.id, 'tinyllama_1_1b_chat_q8_0')
 assert.equal(compatibilityHintLabel(tinyQ8Hint), 'tinyllama_1_1b_chat_q8_0: supported current gate')
+assert.equal(isExactCompatibilityHint(tinyQ8Hint), true, 'TinyLlama support should come from its exact row, not a broad family row')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q8_0' }), true)
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'file_type 7' }), true, 'GGUF file_type labels should map to exact quant rows')
 const tinyNoQuantHint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat' })
@@ -228,9 +230,11 @@ assert.equal(tinyNoQuantHint.kind, 'quant_missing', 'TinyLlama current gate stil
 assert.equal(compatibilityHintLabel(tinyNoQuantHint), 'tinyllama_1_1b_chat_q8_0: quant not verified')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'TinyLlama 1.1B Chat' }), false, 'chat should not unlock from a family/name match without quant evidence')
 const tinyKQuantHint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q4_K_M' })
+assert.equal(tinyKQuantHint.kind, 'family', 'TinyLlama K-quant should be shown as a guarded family row, not exact-row evidence')
 assert.equal(tinyKQuantHint.target.id, 'llama_spm_q4_k_q5_k', 'TinyLlama family names must not inherit Q8 support for a K-quant entry')
 assert.equal(compatibilityHintLabel(tinyKQuantHint), 'llama_spm_q4_k_q5_k: planned phase 10')
-assert.match(compatibilityHintCopy(tinyKQuantHint), /runtime generation still requires loaded_now=true and generation_ready=true/)
+assert.equal(isExactCompatibilityHint(tinyKQuantHint), false)
+assert.match(compatibilityHintCopy(tinyKQuantHint), /not chat-ready support|concrete exact compatibility row/)
 const llama3Q4Hint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'Q4_K_M' })
 assert.equal(llama3Q4Hint.kind, 'quant_mismatch')
 assert.match(compatibilityHintCopy(llama3Q4Hint), /Do not inherit the supported gate|wait for an exact COMPATIBILITY\.md row/)

@@ -1,4 +1,4 @@
-import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, displayCapabilityCopy, displayCapabilityId, findCompatibilityHint, formatCapabilityStatus, guardedCapabilityCopy, isGuardedCapabilityStatus, isSupportedCapabilityStatus, summarizeCapabilityItems } from '../lib/capabilities'
+import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, displayCapabilityCopy, displayCapabilityId, findCompatibilityHint, formatCapabilityStatus, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, summarizeCapabilityItems } from '../lib/capabilities'
 
 function guardedApiFeatures(features = []) {
   return features.filter((feature) => isGuardedCapabilityStatus(feature.status))
@@ -12,7 +12,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
   const apiFeatures = capabilities?.api_features || []
   const guardedFeatures = guardedApiFeatures(apiFeatures)
   const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
-  const selectedCompatibilityTarget = selectedCompatibilityHint?.kind === 'compatibility' ? selectedCompatibilityHint.target : null
+  const selectedCompatibilityTarget = isExactCompatibilityHint(selectedCompatibilityHint) ? selectedCompatibilityHint.target : null
   const selectedCompatibilitySupported = selectedCompatibilityTarget ? isSupportedCapabilityStatus(selectedCompatibilityTarget.status) : false
   const generationReady = Boolean(runtime?.generation_ready)
   const loadedNow = Boolean(runtime?.loaded_now)

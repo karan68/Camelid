@@ -110,23 +110,23 @@ function findLlamaBpeCompatibilityHint(rows, plannedFamilies, quantKey, identity
   const familyRows = rows.filter((row) => row.family === identity.family)
   const exactTarget = familyRows.find((row) => rowMatchesModelSizeAndVersion(row, identity)) || null
   if (exactTarget && quantKey && targetMatchesQuant(exactTarget, quantKey)) {
-    return { kind: 'compatibility', target: exactTarget, confidence: 'exact model-size + quant match' }
+    return { kind: 'compatibility', target: exactTarget, confidence: 'exact model-size + quant match', exact: true }
   }
   if (exactTarget && !quantKey) {
-    return { kind: 'quant_missing', target: exactTarget, confidence: 'exact model-size match without quant evidence' }
+    return { kind: 'quant_missing', target: exactTarget, confidence: 'exact model-size match without quant evidence', exact: true }
   }
   if (exactTarget) {
-    return { kind: 'quant_mismatch', target: exactTarget, observedQuant: quantKey, confidence: 'exact model-size match with different quant' }
+    return { kind: 'quant_mismatch', target: exactTarget, observedQuant: quantKey, confidence: 'exact model-size match with different quant', exact: true }
   }
 
   return null
 }
 
-function quantAwareCompatibilityHint(target, quantKey, confidence) {
+function quantAwareCompatibilityHint(target, quantKey, confidence, { exact = false } = {}) {
   if (!target) return null
-  if (quantKey && targetMatchesQuant(target, quantKey)) return { kind: 'compatibility', target, confidence }
-  if (!quantKey) return { kind: 'quant_missing', target, confidence: `${confidence} without quant evidence` }
-  return { kind: 'quant_mismatch', target, observedQuant: quantKey, confidence: `${confidence} with different quant` }
+  if (quantKey && targetMatchesQuant(target, quantKey)) return { kind: 'compatibility', target, confidence, exact }
+  if (!quantKey) return { kind: 'quant_missing', target, confidence: `${confidence} without quant evidence`, exact }
+  return { kind: 'quant_mismatch', target, observedQuant: quantKey, confidence: `${confidence} with different quant`, exact }
 }
 
 function futureExactRowHint(rows, subject, quantKey) {
@@ -155,7 +155,7 @@ function futureExactRowHint(rows, subject, quantKey) {
 
   const matcher = matchers.find((item) => item.subjectMatches())
   if (!matcher) return null
-  return quantAwareCompatibilityHint(rows.find(matcher.predicate) || null, quantKey, matcher.confidence)
+  return quantAwareCompatibilityHint(rows.find(matcher.predicate) || null, quantKey, matcher.confidence, { exact: true })
 }
 
 export function isSupportedCapabilityStatus(status = '') {
@@ -260,11 +260,11 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
 
   if (subject.includes('tinyllama')) {
     const target = findRow((row) => row.id.includes('tinyllama'))
-    if (target && quantKey && targetMatchesQuant(target, quantKey)) return { kind: 'compatibility', target, confidence: 'name/path + quant match' }
-    if (target && !quantKey) return { kind: 'quant_missing', target, confidence: 'TinyLlama exact-row match without quant evidence' }
+    if (target && quantKey && targetMatchesQuant(target, quantKey)) return { kind: 'compatibility', target, confidence: 'exact TinyLlama row + quant match', exact: true }
+    if (target && !quantKey) return { kind: 'quant_missing', target, confidence: 'TinyLlama exact-row match without quant evidence', exact: true }
     const quantSpecificTarget = findCompatibilityRowForQuant(rows, 'llama_spm_decoder', quantKey)
-    if (quantSpecificTarget) return { kind: 'compatibility', target: quantSpecificTarget, confidence: 'family + quant match' }
-    if (target) return { kind: 'quant_mismatch', target, observedQuant: model?.quant || catalogItem?.quant || quantKey, confidence: 'name/path match with different quant' }
+    if (quantSpecificTarget) return { kind: 'family', target: quantSpecificTarget, observedQuant: model?.quant || catalogItem?.quant || quantKey, confidence: 'family + quant match without exact TinyLlama row' }
+    if (target) return { kind: 'quant_mismatch', target, observedQuant: model?.quant || catalogItem?.quant || quantKey, confidence: 'name/path match with different quant', exact: true }
   }
 
   const llamaBpeIdentity = detectLlamaBpeTarget(subject)
@@ -324,17 +324,23 @@ export function compatibilityHintLabel(hint, fallback = 'No matching compatibili
 
 export function compatibilityHintCopy(hint) {
   if (!hint) return 'No exact COMPATIBILITY.md row matched this model name/path, so the UI will not infer model-family support; load results and typed backend errors remain the source of truth.'
-  if (hint.kind === 'family') return `${hint.target.notes}. This is only a ${hint.confidence}; it is not chat-ready support until a concrete compatibility row is validated.`
+  if (hint.kind === 'family') {
+    const boundary = hint.target?.notes || hint.target?.next_step || `${hint.target?.id || 'This family row'} is ${formatCapabilityStatus(hint.target?.status || 'not_supported')}`
+    return `${boundary}. This is only a ${hint.confidence}; it is not chat-ready support until a concrete exact compatibility row is validated.`
+  }
   if (hint.kind === 'quant_missing') return `${hint.target.id} is the right model-size row, but this local record does not expose a quant label yet. Do not unlock chat from a size/name match alone; wait for GGUF quant evidence from the loaded model metadata plus generation_ready=true.`
   if (hint.kind === 'quant_mismatch') return `${hint.target.id} is scoped to ${hint.target.quantization}, but this entry appears to be ${hint.observedQuant || 'a different quantization'}. Do not inherit the supported gate from a same-family row; wait for an exact COMPATIBILITY.md row plus generation_ready=true.`
   return `${hint.target.family} · ${hint.target.quantization} · ${hint.target.evidence || hint.target.next_step}. Match source: ${hint.confidence}; runtime generation still requires loaded_now=true and generation_ready=true.`
 }
 
+export function isExactCompatibilityHint(hint) {
+  return Boolean(hint?.kind === 'compatibility' && hint.exact === true)
+}
+
 export function isCompatibilitySupportedForModel(capabilities, model, catalogItem) {
   const hint = findCompatibilityHint(capabilities, model, catalogItem)
   return Boolean(
-    hint?.kind === 'compatibility'
-    && isSupportedCapabilityStatus(hint.target?.status)
-    && hint.confidence !== 'name/path match',
+    isExactCompatibilityHint(hint)
+    && isSupportedCapabilityStatus(hint.target?.status),
   )
 }

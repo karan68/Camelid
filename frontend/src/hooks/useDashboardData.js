@@ -93,6 +93,17 @@ function extractSseEvents(buffer) {
   }
 }
 
+function readChatCompletionJsonPayload(payload) {
+  const choice = payload?.choices?.[0]
+  return {
+    content: choice?.message?.content ?? choice?.text ?? '',
+    finishReason: choice?.finish_reason ?? null,
+    completionTokens: payload?.usage?.completion_tokens ?? estimateTokenCount(choice?.message?.content ?? choice?.text ?? ''),
+    firstContentMs: null,
+    usage: payload?.usage || null,
+  }
+}
+
 async function readStreamingChatCompletion(response, onDelta) {
   if (!response.ok) {
     let detail = null
@@ -107,8 +118,16 @@ async function readStreamingChatCompletion(response, onDelta) {
     throw error
   }
 
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('application/json')) {
+    const payload = await response.json()
+    const parsed = readChatCompletionJsonPayload(payload)
+    if (parsed.content) onDelta(parsed.content, parsed.content, { completionTokens: parsed.completionTokens, elapsedMs: 0, firstContentMs: null })
+    return parsed
+  }
+
   const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null }
+  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, usage: null }
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
@@ -156,7 +175,7 @@ async function readStreamingChatCompletion(response, onDelta) {
   }
   buffer += decoder.decode()
   if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
-  return { content, finishReason, completionTokens, firstContentMs }
+  return { content, finishReason, completionTokens, firstContentMs, usage: null }
 }
 
 function estimateTokenCount(value) {
@@ -742,7 +761,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
-        usage: {
+        usage: streamed.usage || {
           prompt_tokens: promptTokenEstimate,
           completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
           total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
