@@ -4,6 +4,13 @@ function guardedApiFeatures(features = []) {
   return features.filter((feature) => isGuardedCapabilityStatus(feature.status))
 }
 
+function summarizeExactRowField(targets = [], field, fallback = 'No exact compatibility rows advertised by this backend.') {
+  const rows = targets
+    .filter((target) => target?.id && target?.[field])
+    .map((target) => `${displayCapabilityCopy(target[field])}: ${formatCapabilityStatus(target.status)} (${target.id})`)
+  return rows.length ? rows.join(' · ') : fallback
+}
+
 export default function ApiView({ runtime, selectedModel, capabilities }) {
   const apiBase = runtime?.api_base || ''
   const modelId = selectedModel?.id || runtime?.active_model_id || '<loaded-model-id>'
@@ -118,20 +125,22 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           </div>
 
           <div className="api-card">
-            <strong>Supported quantization</strong>
-            <p>{summarizeCapabilityItems(capabilities?.supported_quantization, 'Not advertised by this backend.')}</p>
+            <strong>Exact-row quant evidence</strong>
+            <p>{summarizeExactRowField(compatibilityTargets, 'quantization')}</p>
+            <p>Quant labels here come from compatibility rows only; broad quant lists do not unlock chat.</p>
           </div>
 
           <div className="api-card">
-            <strong>Planned quantization</strong>
-            <p>{summarizeCapabilityItems(capabilities?.planned_quantization, 'Not advertised by this backend.')}</p>
-            <p>These lanes must keep returning typed errors until implementation and evidence land.</p>
+            <strong>Exact-row family evidence</strong>
+            <p>{summarizeExactRowField(compatibilityTargets, 'family')}</p>
+            <p>Family names remain row-scoped evidence boundaries, not inherited support for neighboring files.</p>
           </div>
 
           <div className="api-card">
-            <strong>Model family boundaries</strong>
-            <p><b>Supported:</b> {summarizeCapabilityItems(capabilities?.supported_model_families, 'Not advertised by this backend.')}</p>
-            <p><b>Planned:</b> {summarizeCapabilityItems(capabilities?.planned_model_families, 'Not advertised by this backend.')}</p>
+            <strong>Non-row capability lists</strong>
+            <p><b>Quant lists:</b> {summarizeCapabilityItems([...(capabilities?.supported_quantization || []), ...(capabilities?.planned_quantization || [])], 'Not advertised by this backend.')}</p>
+            <p><b>Family lists:</b> {summarizeCapabilityItems([...(capabilities?.supported_model_families || []), ...(capabilities?.planned_model_families || [])], 'Not advertised by this backend.')}</p>
+            <p>These lists are context for backend refusals and planning only; the API UI treats exact compatibility rows as the support evidence.</p>
           </div>
 
           <div className="api-card">
