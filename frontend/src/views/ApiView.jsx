@@ -16,6 +16,23 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
   const selectedCompatibilitySupported = selectedCompatibilityTarget ? isSupportedCapabilityStatus(selectedCompatibilityTarget.status) : false
   const generationReady = Boolean(runtime?.generation_ready)
   const loadedNow = Boolean(runtime?.loaded_now)
+  const selectedRuntimeMatches = Boolean(selectedModel && runtime?.active_model_id === selectedModel.id)
+  const selectedExactRowReady = Boolean(loadedNow && generationReady && selectedRuntimeMatches && selectedCompatibilitySupported)
+  const readinessPillCopy = selectedExactRowReady
+    ? 'Selected exact row ready'
+    : generationReady && selectedModel && !selectedRuntimeMatches
+      ? 'Different loaded model is ready'
+      : generationReady
+        ? 'Generation ready; exact row required'
+        : 'Load a generation-ready exact row'
+  const chatCompletionsCopy = selectedExactRowReady
+    ? 'Runnable now for this selected GGUF because runtime readiness and the exact supported row both match.'
+    : selectedCompatibilityTarget
+      ? 'Keep UX chat gated until this selected exact row is loaded_now=true, generation_ready=true, and active_model_id matches.'
+      : 'Keep UX chat gated; no selected exact compatibility row is available to pair with runtime readiness.'
+  const curlExample = selectedExactRowReady
+    ? `# Selected exact row is runtime-ready now\ncurl ${apiBase}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${modelId}",\n    "messages": [{"role": "user", "content": "Hello from Camelid"}],\n    "temperature": 0\n  }'`
+    : `# Blocked for UX chat until selected exact row evidence and runtime readiness both match\n# loaded_now=${loadedNow ? 'true' : 'false'} generation_ready=${generationReady ? 'true' : 'false'} active_model_id=${runtime?.active_model_id || 'none'}\n# selected_exact_row=${selectedCompatibilityTarget?.id || 'none'}`
 
   return (
     <section className="view-stack view-shell api-view-shell">
@@ -38,14 +55,14 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
             <h2>Standard /v1-compatible surface</h2>
             <p className="hero-summary">Generation endpoints stay useful only when runtime readiness is green and the selected local GGUF has an exact supported compatibility row. Capability rows explain supported and guarded lanes, but they never override loaded_now/generation_ready or active_model_id matching.</p>
           </div>
-          <div className={`status-pill ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Local /v1 generation ready' : 'Load a generation-ready model'}</div>
+          <div className={`status-pill ${selectedExactRowReady ? 'ready' : 'warm'}`}>{readinessPillCopy}</div>
         </div>
 
         <div className="api-grid api-grid-polished">
           <div className="api-card">
             <strong>Chat completions</strong>
             <code>{apiBase ? `${apiBase}/v1/chat/completions` : 'Unavailable until the local API is running'}</code>
-            <p>{generationReady ? 'Runnable now only for the loaded GGUF when /api/capabilities also matches an exact supported row.' : 'Do not call for UX chat yet; Camelid must report loaded_now=true and generation_ready=true for an exact supported row first.'}</p>
+            <p>{chatCompletionsCopy}</p>
           </div>
           <div className="api-card">
             <strong>Model listing</strong>
@@ -64,7 +81,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           </div>
           <div className="api-card wide api-card-code">
             <strong>Readiness-gated curl</strong>
-            <pre>{apiBase ? `# Use after /v1/health returns generation_ready=true\ncurl ${apiBase}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${modelId}",\n    "messages": [{"role": "user", "content": "Hello from Camelid"}],\n    "temperature": 0\n  }'` : 'Start the local runtime to see a ready-to-copy curl example.'}</pre>
+            <pre>{apiBase ? curlExample : 'Start the local runtime to see an exact-row readiness check.'}</pre>
           </div>
         </div>
       </section>
