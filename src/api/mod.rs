@@ -11,7 +11,7 @@ use std::{
 use axum::{
     extract::{rejection::JsonRejection, Path as AxumPath, State},
     http::StatusCode,
-    response::{sse::Event, IntoResponse, Response, Sse},
+    response::{sse::Event, Html, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
@@ -661,6 +661,7 @@ pub struct ErrorBody {
 pub fn router() -> Router {
     let state = AppState::default();
     Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
@@ -688,6 +689,39 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "camelid server listening");
     axum::serve(listener, router()).await
+}
+
+async fn root() -> Html<&'static str> {
+    Html(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Camelid API</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111214; color: #f5f1e8; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(560px, calc(100vw - 40px)); padding: 32px; border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: rgba(255,255,255,.04); box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.03em; }
+    p { margin: 0 0 18px; color: rgba(245,241,232,.74); }
+    a { color: #ffd84d; font-weight: 700; text-decoration: none; }
+    code { color: #fff; background: rgba(255,255,255,.08); padding: 2px 6px; border-radius: 8px; }
+    .row { display: grid; gap: 8px; margin-top: 22px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Camelid API is running</h1>
+    <p>This is the local backend, not the chat UI.</p>
+    <div class="row">
+      <span>Open the WebUI: <a href="http://127.0.0.1:4178/">http://127.0.0.1:4178/</a></span>
+      <span>Health JSON: <a href="/v1/health"><code>/v1/health</code></a></span>
+      <span>Models JSON: <a href="/v1/models"><code>/v1/models</code></a></span>
+    </div>
+  </main>
+</body>
+</html>"#,
+    )
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {

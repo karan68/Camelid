@@ -99,6 +99,23 @@ function estimateChatTokenCount(messages) {
   ), 0)
 }
 
+const CODE_FIRST_SYSTEM_PROMPT = 'You are Camelid local code mode. When the user asks for code, begin immediately with the runnable code. Do not write an introduction, summary, or explanation before the code. For HTML/browser apps, start exactly with ```html followed by <!doctype html>. Stream useful code first; explanation can come only after the code if needed.'
+
+function looksLikeCodePrompt(value) {
+  const text = String(value || '').toLowerCase()
+  return /\b(code|build|create|implement|write|make)\b/.test(text)
+    && /\b(html|html5|css|javascript|js|react|game|pacman|tetris|app|component|page|website)\b/.test(text)
+}
+
+function applyLocalChatPolicy(messages) {
+  const lastUser = [...(messages || [])].reverse().find((message) => message.role === 'user')
+  if (!looksLikeCodePrompt(lastUser?.content)) return messages
+  return [
+    { role: 'system', content: CODE_FIRST_SYSTEM_PROMPT },
+    ...messages,
+  ]
+}
+
 function tokensPerSecond(tokens, elapsedMs) {
   const tokenCount = Number(tokens)
   const duration = Number(elapsedMs)
@@ -598,7 +615,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .filter((message) => !message.content.startsWith('Conversation created.'))
         .map(({ role, content }) => ({ role, content }))
-      const promptTokenEstimate = estimateChatTokenCount(history)
+      const requestMessages = applyLocalChatPolicy(history)
+      const promptTokenEstimate = estimateChatTokenCount(requestMessages)
 
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -636,7 +654,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: selectedModelId, messages: history, temperature: 0, stream: true }),
+        body: JSON.stringify({ model: selectedModelId, messages: requestMessages, temperature: 0, stream: true }),
       })
       const applyAssistantStreamPatch = (patch) => {
         updateConversationsState((current) => current.map((item) => (
