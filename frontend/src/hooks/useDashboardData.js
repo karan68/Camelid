@@ -582,7 +582,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
     const messageContent = composer.trim()
     setSending(true)
-    showNotice('Running Camelid local chat completion…', 'info')
     let activeConversationId = null
     let assistantId = null
     let pendingAssistantPatch = null

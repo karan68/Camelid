@@ -5840,6 +5840,14 @@ textarea.composer-input-gemini {
   }
 }
 
+.message-live-status-minimal {
+  gap: 8px;
+}
+
+.message-live-status-minimal span:nth-child(2) {
+  font-variant-numeric: tabular-nums;
+}
+
 .message-token-metrics {
   width: fit-content;
   display: flex;
@@ -5942,7 +5950,8 @@ textarea.composer-input-gemini {
   margin: 0;
   border: 0;
   border-radius: 50%;
-  background: conic-gradient(from 42deg, transparent 0 78deg, #ffd84d 78deg 360deg);
+  background: #ffd84d;
+  clip-path: polygon(50% 50%, 100% 18%, 100% 82%, 50% 50%, 0 100%, 0 0);
   color: transparent;
   filter: none;
   font-size: 0;
@@ -5951,7 +5960,7 @@ textarea.composer-input-gemini {
   transform: none;
   transform-origin: 50% 50%;
   transition: none;
-  will-change: background;
+  will-change: clip-path;
   z-index: 2;
 }
 
@@ -6011,10 +6020,10 @@ textarea.composer-input-gemini {
 
 @keyframes camelid-pacman-chomp {
   0%, 100% {
-    background: conic-gradient(from 42deg, transparent 0 78deg, #ffd84d 78deg 360deg);
+    clip-path: polygon(50% 50%, 100% 18%, 100% 82%, 50% 50%, 0 100%, 0 0);
   }
   50% {
-    background: conic-gradient(from 22deg, transparent 0 40deg, #ffd84d 40deg 360deg);
+    clip-path: polygon(50% 50%, 100% 35%, 100% 65%, 50% 50%, 0 100%, 0 0);
   }
 }
 

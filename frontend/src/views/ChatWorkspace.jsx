@@ -250,11 +250,11 @@ const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   return FIRST_TOKEN_STREAMING_LABEL
 }
 
-function StreamingStatus({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false, tail = false, phase = 'streaming' }) {
+function StreamingStatus({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false, tail = false, phase = 'streaming', minimal = false }) {
   return (
-    <div className={`message-live-status message-live-status-${phase || 'streaming'} ${compact ? 'message-live-status-compact' : ''} ${tail ? 'message-live-status-tail' : ''}`} role="status" aria-live="polite" aria-label={label} data-live-status="active" data-live-phase={phase || 'streaming'}>
+    <div className={`message-live-status message-live-status-${phase || 'streaming'} ${compact ? 'message-live-status-compact' : ''} ${tail ? 'message-live-status-tail' : ''} ${minimal ? 'message-live-status-minimal' : ''}`} role="status" aria-live="polite" aria-label={label} data-live-status="active" data-live-phase={phase || 'streaming'}>
       <span className="message-live-dot" aria-hidden="true" />
-      <span>{label}</span>
+      {!minimal && <span>{label}</span>}
       <span>{elapsedSeconds}s elapsed</span>
     </div>
   )
@@ -298,10 +298,11 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
   const isOpenStreamingCode = assistantStreaming && hasOpenCodeFence(messageContent)
   const streamingPhase = message.streaming_phase || (messageContent ? 'streaming' : 'generating')
   const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
-  const hasTokenMetrics = message.role === 'assistant' && (
+  const hasTokenMetrics = !assistantStreaming && message.role === 'assistant' && (
     message.tokens_in_per_sec !== null && message.tokens_in_per_sec !== undefined
     || message.tokens_out_per_sec !== null && message.tokens_out_per_sec !== undefined
   )
+  const showStreamingStatus = assistantStreaming && !messageContent
 
   return (
     <article
@@ -311,13 +312,13 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
       <div className={`message-bubble message-bubble-gemini ${message.role}`}>
-        {assistantStreaming && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact phase={streamingPhase} />}
+        {showStreamingStatus && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact phase={streamingPhase} minimal />}
         {message.role === 'assistant'
           ? messageContent || !assistantStreaming
             ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />
             : <p className="message-placeholder-copy">Camelid is connected to the local model. The first token has not arrived yet.</p>
           : <p>{messageContent}</p>}
-        {assistantStreaming && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tail phase={streamingPhase} />}
+        {showStreamingStatus && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tail phase={streamingPhase} minimal />}
         {hasTokenMetrics && (
           <div className="message-token-metrics" aria-label="Generation speed">
             {message.first_byte_ms !== null && message.first_byte_ms !== undefined && <span>TTFB {(Number(message.first_byte_ms) / 1000).toFixed(2)}s</span>}
@@ -355,6 +356,7 @@ export default function ChatWorkspace({
     [selectedConversation?.messages],
   )
   const hasStreamingAssistant = visibleMessages.some((message) => message.role === 'assistant' && message.streaming)
+  const hasStreamingAssistantContent = visibleMessages.some((message) => message.role === 'assistant' && message.streaming && String(message.content || '').trim())
   const generationActive = Boolean(sending || hasStreamingAssistant)
   const pendingPrompt = (pendingConversation?.content || (sending ? composer.trim() : '')).trim()
   const pendingPromptAlreadyVisible = Boolean(
@@ -363,7 +365,7 @@ export default function ChatWorkspace({
   const pendingUserPrompt = pendingPromptAlreadyVisible ? '' : pendingPrompt
   const lastVisibleMessage = visibleMessages.at(-1)
   const lastVisibleMessageIsUser = lastVisibleMessage?.role === 'user'
-  const awaitingAssistant = Boolean(sending && !hasStreamingAssistant && (pendingPrompt || lastVisibleMessageIsUser))
+  const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && (pendingPrompt || lastVisibleMessageIsUser || sending))
 
   useEffect(() => {
     if (!generationActive) {
@@ -378,7 +380,9 @@ export default function ChatWorkspace({
     return () => window.clearInterval(interval)
   }, [generationActive])
 
-  const isFreshThread = selectedConversation ? (visibleMessages.length === 0 && !pendingPrompt) : !pendingPrompt
+  const isFreshThread = selectedConversation
+    ? (visibleMessages.length === 0 && !pendingPrompt && !awaitingAssistant && !hasStreamingAssistant)
+    : (!pendingPrompt && !awaitingAssistant && !hasStreamingAssistant)
   const handleComposerKeyDown = async (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -580,8 +584,8 @@ export default function ChatWorkspace({
                   )}
                   <article className="message-row message-row-gemini assistant pending is-streaming" aria-busy="true" data-streaming-state="active">
                     <div className="message-bubble message-bubble-gemini assistant pending">
-                      <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} phase="preparing" />
-                      <p className="message-placeholder-copy">Camelid is opening the local stream. Tokens will appear as soon as the model emits them.</p>
+                      <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} phase="preparing" minimal />
+                      <p className="message-placeholder-copy">Camelid is opening the local stream.</p>
                     </div>
                   </article>
                 </>
