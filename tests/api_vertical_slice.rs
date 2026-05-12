@@ -1311,7 +1311,7 @@ async fn public_chat_completion_without_max_tokens_uses_demo_safe_default_cap() 
     write_generation_gguf_with_options(
         &path,
         GenerationFixtureOptions {
-            context_length: 512,
+            context_length: 1024,
             include_tokenizer: true,
             truncate_payload: false,
         },
@@ -1356,7 +1356,7 @@ async fn public_chat_completion_without_max_tokens_uses_demo_safe_default_cap() 
         String::from_utf8_lossy(&body_bytes)
     );
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
-    assert_eq!(body["usage"]["completion_tokens"], 220);
+    assert_eq!(body["usage"]["completion_tokens"], 800);
     assert_eq!(body["choices"][0]["finish_reason"], "length");
 }
 
@@ -1418,7 +1418,7 @@ async fn public_completion_without_max_tokens_uses_remaining_context_when_below_
     let prompt_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap();
     let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap();
     assert_eq!(prompt_tokens + completion_tokens, 64);
-    assert!(completion_tokens < 220);
+    assert!(completion_tokens < 800);
     assert_eq!(body["choices"][0]["finish_reason"], "length");
 }
 

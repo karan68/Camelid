@@ -99,8 +99,8 @@ function estimateChatTokenCount(messages) {
   ), 0)
 }
 
-const CODE_FIRST_SYSTEM_PROMPT = 'begin immediately with the runnable code. No intro. For HTML start exactly with ```html followed by <!doctype html>.'
-const LOCAL_CHAT_DEMO_MAX_TOKENS = 220
+const CODE_FIRST_SYSTEM_PROMPT = 'begin immediately with complete runnable code. No intro. For HTML output ONE self-contained file. Never use external files or script src. Include inline <style> and inline <script> with working click/game logic before </body>. Start exactly with ```html then <!doctype html> and close the fence after </html>.'
+const LOCAL_CHAT_DEMO_MAX_TOKENS = 800
 
 function looksLikeCodePrompt(value) {
   const text = String(value || '').toLowerCase()
@@ -757,7 +757,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
           : item
       )))
       setSelectedConversationId(conversation.id)
-      showNotice('Camelid streamed the local reply.', 'success')
     } catch (error) {
       if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(pendingAssistantFrame)
