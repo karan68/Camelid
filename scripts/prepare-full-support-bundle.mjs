@@ -273,6 +273,7 @@ const manifest = {
   validation_host_status: {
     status: validationHostStatus,
     runtime_validation_available: runtimeValidationAvailable,
+    blocked_by_note: runtimeValidationAvailable ? null : validationNotePath,
     blocked_rows: runtimeValidationAvailable ? [] : ['tinyllama_1_1b_chat_q8_0 recency rerun', 'llama32_1b_instruct_q8_0', 'llama32_3b_instruct_q8_0', 'llama3_8b_instruct_q8_0'],
     operator_instruction: runtimeValidationAvailable
       ? 'Runtime tracks were generated as runnable; execute only on the approved validation host or another Tim-authorized runtime lane.'
@@ -440,6 +441,7 @@ function runtimeCommand(command) {
     'cat >&2 <<\'CAMELID_RUNTIME_VALIDATION_BLOCKED\'',
     'Camelid runtime validation is blocked for this generated bundle.',
     'Tim has shut down the Ubuntu validation server; do not SSH to validation hosts and do not substitute local Mac llama-server/reference workloads until Tim explicitly reopens that lane.',
+    `Validation note: ${validationNotePath}`,
     '',
     'Regenerate this bundle with --validation-host-status available only after Tim says the host/runtime lane is back.',
     '',

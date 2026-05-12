@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const repoRoot = process.cwd()
@@ -29,7 +29,19 @@ assert.equal(
   blockedManifest.carry_forward_public_refs.validation_note,
   'qa/validation-notes/2026-05-12-local-only-validation-lane-paused.md',
 )
+assert.equal(
+  blockedManifest.validation_host_status.blocked_by_note,
+  blockedManifest.carry_forward_public_refs.validation_note,
+)
 assert.ok(blockedManifest.validation_host_status.blocked_rows.length >= 4)
+for (const row of blockedManifest.rows) {
+  assert.equal(row.runtime_validation_available, false)
+  assert.ok(row.tracks.length >= 6)
+  for (const track of row.tracks) {
+    if (track.status === 'carry_forward_only') continue
+    assert.match(track.status, /blocked_by_validation_host_shutdown/)
+  }
+}
 
 const blockedReadme = await readFile(join(blockedOut, 'README.md'), 'utf8')
 assert.match(blockedReadme, /Runtime validation available: `false`/)
@@ -40,7 +52,21 @@ const blockedRuntimeScript = await readFile(
   'utf8',
 )
 assert.match(blockedRuntimeScript, /Camelid runtime validation is blocked/)
+assert.match(blockedRuntimeScript, /qa\/validation-notes\/2026-05-12-local-only-validation-lane-paused\.md/)
 assert.match(blockedRuntimeScript, /exit 86/)
+
+const blockedRuntimeScripts = blockedManifest.rows.flatMap(row => row.tracks
+  .filter(track => track.status !== 'carry_forward_only')
+  .map(track => join(blockedOut, row.row_id, 'commands', basename(track.command_file))))
+assert.ok(blockedRuntimeScripts.length >= 23)
+for (const scriptPath of blockedRuntimeScripts) {
+  const script = await readFile(scriptPath, 'utf8')
+  assert.match(script, /Camelid runtime validation is blocked/)
+  assert.match(script, /do not SSH to validation hosts/)
+  assert.match(script, /do not substitute local Mac llama-server\/reference workloads/)
+  assert.match(script, /qa\/validation-notes\/2026-05-12-local-only-validation-lane-paused\.md/)
+  assert.match(script, /exit 86/)
+}
 
 const availableRoot = await mkdtemp(join(tmpdir(), 'camelid-full-support-available-'))
 const availableOut = join(availableRoot, 'bundle')
