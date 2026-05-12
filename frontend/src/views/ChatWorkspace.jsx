@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
@@ -212,23 +212,56 @@ const splitFenceInfo = (value) => {
 
 const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomplete'
 
-const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
-  const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
-  const stillGenerating = Boolean(incomplete && streaming)
-  blocks.push(
+function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
+  const preRef = useRef(null)
+  const autoFollowCodeRef = useRef(true)
+
+  useEffect(() => {
+    if (!stillGenerating) return undefined
+    autoFollowCodeRef.current = true
+    const pre = preRef.current
+    if (!pre) return undefined
+    const updateAutoFollow = () => {
+      const distanceFromBottom = pre.scrollHeight - (pre.scrollTop + pre.clientHeight)
+      autoFollowCodeRef.current = distanceFromBottom < 80
+    }
+    pre.addEventListener('scroll', updateAutoFollow, { passive: true })
+    return () => pre.removeEventListener('scroll', updateAutoFollow)
+  }, [stillGenerating])
+
+  useLayoutEffect(() => {
+    if (!stillGenerating || !autoFollowCodeRef.current) return
+    const pre = preRef.current
+    if (pre) pre.scrollTop = pre.scrollHeight
+  }, [code, stillGenerating])
+
+  return (
     <figure
       className={`message-code-card ${stillGenerating ? 'is-generating' : ''}`}
       aria-busy={stillGenerating ? 'true' : undefined}
       data-code-streaming-state={stillGenerating ? 'open' : undefined}
-      key={`code-${blocks.length}`}
     >
       <figcaption>
         <span className="message-code-card-title">{language}</span>
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
-        <button type="button" onClick={() => copyText(trimmedCode)} aria-label={`Copy ${language} code`}>Copy</button>
+        <button type="button" onClick={() => copyText(code)} aria-label={`Copy ${language} code`}>Copy</button>
       </figcaption>
-      <pre><code>{renderHighlightedCode(trimmedCode, language, keyPrefix)}</code></pre>
-    </figure>,
+      <pre ref={preRef}><code>{renderHighlightedCode(code, language, keyPrefix)}</code></pre>
+    </figure>
+  )
+}
+
+const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
+  const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
+  const stillGenerating = Boolean(incomplete && streaming)
+  blocks.push(
+    <CodeBlockCard
+      key={`code-${blocks.length}`}
+      language={language}
+      code={trimmedCode}
+      keyPrefix={keyPrefix}
+      stillGenerating={stillGenerating}
+    />,
   )
 }
 
@@ -373,6 +406,8 @@ export default function ChatWorkspace({
   setTab,
 }) {
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
+  const chatBottomRef = useRef(null)
+  const autoFollowGenerationRef = useRef(true)
   const rawVisibleMessages = useMemo(
     () => (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message)),
     [selectedConversation?.messages],
@@ -395,6 +430,10 @@ export default function ChatWorkspace({
   const lastVisibleMessage = visibleMessages.at(-1)
   const lastVisibleMessageIsUser = lastVisibleMessage?.role === 'user'
   const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && (pendingPrompt || lastVisibleMessageIsUser || sending))
+  const streamingScrollSignature = useMemo(() => (
+    visibleMessages.map((message) => `${message.id}:${message.streaming ? 'streaming' : 'done'}:${String(message.content || '').length}`).join('|')
+    + `|awaiting:${awaitingAssistant ? '1' : '0'}|active:${generationActive ? '1' : '0'}`
+  ), [awaitingAssistant, generationActive, visibleMessages])
 
   useEffect(() => {
     if (!generationActive) {
@@ -408,6 +447,26 @@ export default function ChatWorkspace({
     }, 1000)
     return () => window.clearInterval(interval)
   }, [generationActive])
+
+  useEffect(() => {
+    if (!generationActive) return undefined
+    autoFollowGenerationRef.current = true
+    const updateAutoFollow = () => {
+      const doc = document.documentElement
+      const distanceFromBottom = doc.scrollHeight - (window.scrollY + window.innerHeight)
+      autoFollowGenerationRef.current = distanceFromBottom < 260
+    }
+    window.addEventListener('scroll', updateAutoFollow, { passive: true })
+    return () => window.removeEventListener('scroll', updateAutoFollow)
+  }, [generationActive, selectedConversation?.id])
+
+  useLayoutEffect(() => {
+    if (!generationActive || !autoFollowGenerationRef.current) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      chatBottomRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [generationActive, streamingScrollSignature])
 
   const isFreshThread = selectedConversation
     ? (visibleMessages.length === 0 && !pendingPrompt && !awaitingAssistant && !hasStreamingAssistant)
@@ -618,6 +677,7 @@ export default function ChatWorkspace({
                   </article>
                 </>
               )}
+              <div className="chat-thread-stream-anchor" ref={chatBottomRef} aria-hidden="true" />
             </div>
           </>
         )}

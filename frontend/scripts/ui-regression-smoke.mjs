@@ -31,6 +31,7 @@ assert.equal(liveStreamingChat.messages[0].streaming, true, 'live in-memory stre
 
 const readmeSource = readFileSync(new URL('../../README.md', import.meta.url), 'utf8')
 assert.match(readmeSource, /docs\/assets\/camelid-readme-chat-surface-dark\.png/, 'README should use the approved dark collapsed-rail chat screenshot')
+assert.doesNotMatch(readmeSource, /assets\/camelid-banner\.png/, 'README should not lead with the disliked first banner image')
 assert.doesNotMatch(readmeSource, /docs\/assets\/ui-screenshot-v2\.png/, 'README must not regress to the retired light screenshot')
 assert.match(readmeSource, /product-forward while still reflecting the local-first runtime contract/i, 'README screenshot caption should preserve the local-first runtime contract')
 
@@ -72,6 +73,15 @@ assert.match(chatWorkspaceSource, /showStreamingStatus && <PacmanLoader/, 'pre-t
 assert.match(chatWorkspaceSource, /function LiveGenerationBadge/, 'post-token streaming rows should keep a visible live generation badge while the backend is still generating')
 assert.match(chatWorkspaceSource, /showLiveGenerationBadge\s*=\s*assistantStreaming\s*&&\s*Boolean\(messageContent\)/, 'streaming assistant rows with visible content should still expose an active generation indicator')
 assert.match(chatWorkspaceSource, /showLiveGenerationBadge && <LiveGenerationBadge/, 'streaming content should render the active generation badge until the backend finishes')
+assert.match(chatWorkspaceSource, /useLayoutEffect/, 'streaming chat should auto-scroll after token renders so growing code stays in view')
+assert.match(chatWorkspaceSource, /autoFollowGenerationRef/, 'streaming auto-scroll should be gated so manual upward scrolling is respected')
+assert.match(chatWorkspaceSource, /distanceFromBottom\s*<\s*260/, 'streaming auto-scroll should only keep following while the user is near the live tail')
+assert.match(chatWorkspaceSource, /scrollIntoView\(\{ block: 'end', behavior: 'auto' \}\)/, 'streaming auto-scroll should pin to the live tail without queuing slow smooth-scroll animations')
+assert.match(chatWorkspaceSource, /chat-thread-stream-anchor/, 'chat thread should expose a bottom anchor for live streaming auto-scroll')
+assert.match(chatWorkspaceSource, /function CodeBlockCard/, 'code cards should own scroll behavior while streaming')
+assert.match(chatWorkspaceSource, /preRef\.current/, 'streaming code cards should keep a ref to the scrollable pre element')
+assert.match(chatWorkspaceSource, /pre\.scrollTop\s*=\s*pre\.scrollHeight/, 'streaming code cards should follow the bottom of growing code')
+assert.match(chatWorkspaceSource, /distanceFromBottom\s*<\s*80/, 'code-card auto-scroll should stop if the user scrolls away from the code tail')
 assert.match(chatWorkspaceSource, /PREPARING_STREAMING_LABEL\s*=\s*'Preparing local response'/, 'pre-token pending rows should keep concise local-stream status copy')
 assert.match(chatWorkspaceSource, /FIRST_TOKEN_STREAMING_LABEL\s*=\s*'Waiting for first token'/, 'pre-token pending rows should keep concise first-token status copy')
 assert.match(chatWorkspaceSource, /LONG_FIRST_TOKEN_STREAMING_LABEL\s*=\s*'Local response is taking a while'/, 'long pre-token waits should keep a concise accessible explanation')

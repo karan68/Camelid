@@ -2,8 +2,6 @@
 
 [![CI][ci-badge]][ci-workflow]
 
-![Camelid banner](assets/camelid-banner.png)
-
 **Camelid is a Rust-native local inference backend for GGUF language models, built for teams that want local performance, clear support boundaries, and evidence they can inspect.**
 
 Many local-model stacks are easy to demo and hard to trust. Camelid closes that gap with disciplined support claims, clear readiness signals, and a product surface that stays aligned across runtime, API, UI, and documentation.
