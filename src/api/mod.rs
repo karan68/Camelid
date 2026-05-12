@@ -16,7 +16,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
@@ -2999,7 +2999,7 @@ fn micros_to_ms(value: u128) -> f64 {
     value as f64 / 1000.0
 }
 
-fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
+fn stream_completion(prepared: PreparedGeneration, chat: bool) -> Response {
     let model_id = prepared.model_id.clone();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
@@ -3025,200 +3025,244 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             yield sse_json_event(&role_chunk);
         }
 
-        let mut input = prepared.token_ids.clone();
-        let mut history = prepared.token_ids.clone();
-        let mut generated = Vec::new();
-        let mut top_logits = Vec::new();
-        let mut output_projection = Vec::new();
-        let mut dense = None;
-        let mut finish_reason = "length";
-        let mut streamed_text = String::new();
-        let mut reused_prompt_prefix = false;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let generation_handle = tokio::task::spawn_blocking({
+            let model_id = model_id.clone();
+            let stream_id = stream_id.clone();
+            move || stream_completion_blocking(prepared, chat, model_id, stream_id, tx)
+        });
 
-        if !prepared.collect_dense_diagnostics {
-            if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
-                prepared.session = cached.session.clone();
-                input.clear();
-                match sample_cached_prompt_prefix(&cached, &history) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        reused_prompt_prefix = true;
-                        prepared.timings.prompt_cache_hit = true;
-                        if let Err(response) = consume_generation_step(
-                            &prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated: &mut generated,
-                                history: &mut history,
-                                top_logits: &mut top_logits,
-                                output_projection: &mut output_projection,
-                                dense: &mut dense,
-                                finish_reason: &mut finish_reason,
-                            },
-                        ) {
-                            yield stream_error_event(*response);
-                            yield Ok(Event::default().data("[DONE]"));
-                            return;
-                        }
-                        if finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
-                    }
-                    Err(response) => {
-                        yield stream_error_event(*response);
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
-                    }
-                }
-            }
+        while let Some(event) = rx.recv().await {
+            yield event;
         }
 
-        for _ in generated.len() as u32..prepared.max_tokens {
-            if finish_reason != "length" {
-                break;
-            }
-            let mut sampling = prepared.sampling.clone();
-            if let Some(seed) = sampling.seed {
-                sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
-            }
-            let sampler = if sampling == SamplingConfig::default() {
-                LlamaSampler::Greedy
-            } else {
-                LlamaSampler::Sampling(sampling)
-            };
-            let step = match prepared
-                .session
-                .generate_next_token_with_history_diagnostics(
-                    &input,
-                    sampler,
-                    &history,
-                    prepared.collect_dense_diagnostics,
-                ) {
-                    Ok(step) => step,
-                    Err(err) => {
-                        yield stream_error_message_event("generation_step_failed", err.to_string());
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
-                    }
-                };
-            if !reused_prompt_prefix
-                && generated.is_empty()
-                && !prepared.collect_dense_diagnostics
-                && step.diagnostics.is_none()
-            {
-                store_prompt_prefix_cache(&prepared, &step);
-            }
-            if generated.is_empty() && !reused_prompt_prefix {
-                prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
-            }
-            if let Err(response) = consume_generation_step(
-                &prepared,
-                step,
-                GenerationStepAccumulator {
-                    generated: &mut generated,
-                    history: &mut history,
-                    top_logits: &mut top_logits,
-                    output_projection: &mut output_projection,
-                    dense: &mut dense,
-                    finish_reason: &mut finish_reason,
-                },
-            ) {
-                yield stream_error_event(*response);
-                yield Ok(Event::default().data("[DONE]"));
-                return;
-            }
-
-            let mut text = match prepared.tokenizer.decode(&generated, true) {
-                Ok(text) => text,
-                Err(err) => {
-                    yield stream_error_message_event("token_decode_failed", err.to_string());
-                    yield Ok(Event::default().data("[DONE]"));
-                    return;
-                }
-            };
-            if finish_reason == "stop" {
-                text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-            }
-            let delta = text
-                .strip_prefix(&streamed_text)
-                .map(str::to_owned)
-                .unwrap_or_else(|| text.clone());
-            streamed_text = text;
-            if !delta.is_empty() {
-                if chat {
-                    let chunk = ChatCompletionStreamChunk {
-                        id: stream_id.clone(),
-                        object: "chat.completion.chunk",
-                        created: 0,
-                        model: model_id.clone(),
-                        choices: vec![ChatCompletionStreamChoice {
-                            index: 0,
-                            delta: ChatCompletionDelta {
-                                role: None,
-                                content: Some(delta),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    yield sse_json_event(&chunk);
-                } else {
-                    let chunk = CompletionStreamChunk {
-                        id: stream_id.clone(),
-                        object: "text_completion",
-                        created: 0,
-                        model: model_id.clone(),
-                        choices: vec![CompletionStreamChoice {
-                            index: 0,
-                            text: delta,
-                            finish_reason: None,
-                        }],
-                    };
-                    yield sse_json_event(&chunk);
-                }
-            }
-            if finish_reason != "length" {
-                break;
-            }
-            input.clear();
-            if let Some(last_token) = generated.last().copied() {
-                input.push(last_token);
-            }
+        if let Err(err) = generation_handle.await {
+            yield stream_error_message_event("stream_worker_failed", err.to_string());
+            yield Ok(Event::default().data("[DONE]"));
         }
-
-        if chat {
-            let final_chunk = ChatCompletionStreamChunk {
-                id: stream_id,
-                object: "chat.completion.chunk",
-                created: 0,
-                model: model_id,
-                choices: vec![ChatCompletionStreamChoice {
-                    index: 0,
-                    delta: ChatCompletionDelta {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some(finish_reason),
-                }],
-            };
-            yield sse_json_event(&final_chunk);
-        } else {
-            let final_chunk = CompletionStreamChunk {
-                id: stream_id,
-                object: "text_completion",
-                created: 0,
-                model: model_id,
-                choices: vec![CompletionStreamChoice {
-                    index: 0,
-                    text: String::new(),
-                    finish_reason: Some(finish_reason),
-                }],
-            };
-            yield sse_json_event(&final_chunk);
-        }
-        yield Ok(Event::default().data("[DONE]"));
     };
 
     Sse::new(events).into_response()
+}
+
+fn send_stream_event(
+    tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
+    event: Result<Event, Infallible>,
+) -> bool {
+    tx.send(event).is_ok()
+}
+
+fn stream_completion_blocking(
+    mut prepared: PreparedGeneration,
+    chat: bool,
+    model_id: String,
+    stream_id: String,
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
+) {
+    let mut input = prepared.token_ids.clone();
+    let mut history = prepared.token_ids.clone();
+    let mut generated = Vec::new();
+    let mut top_logits = Vec::new();
+    let mut output_projection = Vec::new();
+    let mut dense = None;
+    let mut finish_reason = "length";
+    let mut streamed_text = String::new();
+    let mut reused_prompt_prefix = false;
+
+    if !prepared.collect_dense_diagnostics {
+        if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
+            prepared.session = cached.session.clone();
+            input.clear();
+            match sample_cached_prompt_prefix(&cached, &history) {
+                Ok(first_step) => {
+                    let cached_next_token = first_step.next_token_id;
+                    reused_prompt_prefix = true;
+                    prepared.timings.prompt_cache_hit = true;
+                    if let Err(response) = consume_generation_step(
+                        &prepared,
+                        first_step,
+                        GenerationStepAccumulator {
+                            generated: &mut generated,
+                            history: &mut history,
+                            top_logits: &mut top_logits,
+                            output_projection: &mut output_projection,
+                            dense: &mut dense,
+                            finish_reason: &mut finish_reason,
+                        },
+                    ) {
+                        send_stream_event(&tx, stream_error_event(*response));
+                        send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
+                        return;
+                    }
+                    if finish_reason == "length" {
+                        input.push(cached_next_token);
+                    }
+                }
+                Err(response) => {
+                    send_stream_event(&tx, stream_error_event(*response));
+                    send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
+                    return;
+                }
+            }
+        }
+    }
+
+    for _ in generated.len() as u32..prepared.max_tokens {
+        if finish_reason != "length" {
+            break;
+        }
+        let mut sampling = prepared.sampling.clone();
+        if let Some(seed) = sampling.seed {
+            sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
+        }
+        let sampler = if sampling == SamplingConfig::default() {
+            LlamaSampler::Greedy
+        } else {
+            LlamaSampler::Sampling(sampling)
+        };
+        let step = match prepared
+            .session
+            .generate_next_token_with_history_diagnostics(
+                &input,
+                sampler,
+                &history,
+                prepared.collect_dense_diagnostics,
+            ) {
+            Ok(step) => step,
+            Err(err) => {
+                send_stream_event(
+                    &tx,
+                    stream_error_message_event("generation_step_failed", err.to_string()),
+                );
+                send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
+                return;
+            }
+        };
+        if !reused_prompt_prefix
+            && generated.is_empty()
+            && !prepared.collect_dense_diagnostics
+            && step.diagnostics.is_none()
+        {
+            store_prompt_prefix_cache(&prepared, &step);
+        }
+        if generated.is_empty() && !reused_prompt_prefix {
+            prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        }
+        if let Err(response) = consume_generation_step(
+            &prepared,
+            step,
+            GenerationStepAccumulator {
+                generated: &mut generated,
+                history: &mut history,
+                top_logits: &mut top_logits,
+                output_projection: &mut output_projection,
+                dense: &mut dense,
+                finish_reason: &mut finish_reason,
+            },
+        ) {
+            send_stream_event(&tx, stream_error_event(*response));
+            send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
+            return;
+        }
+
+        let mut text = match prepared.tokenizer.decode(&generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                send_stream_event(
+                    &tx,
+                    stream_error_message_event("token_decode_failed", err.to_string()),
+                );
+                send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
+                return;
+            }
+        };
+        if finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+        }
+        let delta = text
+            .strip_prefix(&streamed_text)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        streamed_text = text;
+        if !delta.is_empty() {
+            let sent = if chat {
+                let chunk = ChatCompletionStreamChunk {
+                    id: stream_id.clone(),
+                    object: "chat.completion.chunk",
+                    created: 0,
+                    model: model_id.clone(),
+                    choices: vec![ChatCompletionStreamChoice {
+                        index: 0,
+                        delta: ChatCompletionDelta {
+                            role: None,
+                            content: Some(delta),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                send_stream_event(&tx, sse_json_event(&chunk))
+            } else {
+                let chunk = CompletionStreamChunk {
+                    id: stream_id.clone(),
+                    object: "text_completion",
+                    created: 0,
+                    model: model_id.clone(),
+                    choices: vec![CompletionStreamChoice {
+                        index: 0,
+                        text: delta,
+                        finish_reason: None,
+                    }],
+                };
+                send_stream_event(&tx, sse_json_event(&chunk))
+            };
+            if !sent {
+                return;
+            }
+        }
+        if finish_reason != "length" {
+            break;
+        }
+        input.clear();
+        if let Some(last_token) = generated.last().copied() {
+            input.push(last_token);
+        }
+    }
+
+    if chat {
+        let final_chunk = ChatCompletionStreamChunk {
+            id: stream_id,
+            object: "chat.completion.chunk",
+            created: 0,
+            model: model_id,
+            choices: vec![ChatCompletionStreamChoice {
+                index: 0,
+                delta: ChatCompletionDelta {
+                    role: None,
+                    content: None,
+                },
+                finish_reason: Some(finish_reason),
+            }],
+        };
+        if !send_stream_event(&tx, sse_json_event(&final_chunk)) {
+            return;
+        }
+    } else {
+        let final_chunk = CompletionStreamChunk {
+            id: stream_id,
+            object: "text_completion",
+            created: 0,
+            model: model_id,
+            choices: vec![CompletionStreamChoice {
+                index: 0,
+                text: String::new(),
+                finish_reason: Some(finish_reason),
+            }],
+        };
+        if !send_stream_event(&tx, sse_json_event(&final_chunk)) {
+            return;
+        }
+    }
+    send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
 }
 
 fn stream_error_event(response: Response) -> Result<Event, Infallible> {
