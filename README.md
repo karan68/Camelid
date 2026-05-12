@@ -107,6 +107,8 @@ Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The curren
 
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support matrix and promotion rules
 - [`STATUS.md`](STATUS.md) — current evidence boundary, recent moves, and blockers
+- [`BENCHMARKS.md`](BENCHMARKS.md) — public performance snapshot and benchmark-claim rules
+- [`PARITY.md`](PARITY.md) — audit path for Camelid's exact-row llama.cpp parity claims
 - [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) — shortest safe local path
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change type
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution expectations and PR guidance
@@ -170,6 +172,15 @@ By default, the UI talks to `http://127.0.0.1:8181` and only unlocks local chat 
 
 See [`frontend/README.md`](frontend/README.md) for frontend-specific details.
 
+## Why the proof story matters
+
+Camelid's strongest technical proof points are now separated so reviewers can audit them quickly:
+
+- [`PARITY.md`](PARITY.md) shows where exact-row prompt-token, generated-token, and generated-text agreement with llama.cpp is proved.
+- [`BENCHMARKS.md`](BENCHMARKS.md) shows the current public runtime snapshots and makes the benchmark-claim boundary explicit.
+
+That split is intentional: parity is Camelid's trust foundation, and performance claims should only ride on top of evidence that is already row-scoped and reproducible.
+
 ## How support moves
 
 A row is promoted only when all of these agree for the exact lane being claimed:
@@ -227,6 +238,8 @@ npm run build
 - [`DOCS.md`](DOCS.md) — full documentation index
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — support ledger
 - [`STATUS.md`](STATUS.md) — current evidence snapshot
+- [`BENCHMARKS.md`](BENCHMARKS.md) — public performance snapshot and benchmark policy
+- [`PARITY.md`](PARITY.md) — exact-row parity proof map
 - [`ROADMAP.md`](ROADMAP.md) — delivery plan of record
 - [`FULL_SUPPORT_BLOCKER_MATRIX.md`](FULL_SUPPORT_BLOCKER_MATRIX.md) — row-by-row missing evidence for broader promotion
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — architecture and module planning
