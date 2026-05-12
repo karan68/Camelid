@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
+import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { isExternalModel, isRunnableModel } from '../lib/modelState'
 
@@ -82,100 +83,6 @@ function getLoadedModelQuantLabel(model) {
   const fileType = getLoadedModelFileType(model)
   if (fileType === null || fileType === undefined) return null
   return quantLabelFromGgufFileType(fileType) || `file_type ${fileType}`
-}
-
-function extractSseEvents(buffer) {
-  const normalized = String(buffer || '').replace(/\r\n/g, '\n')
-  const parts = normalized.split('\n\n')
-  return {
-    events: parts.slice(0, -1),
-    remainder: parts.at(-1) || '',
-  }
-}
-
-function readChatCompletionJsonPayload(payload) {
-  const choice = payload?.choices?.[0]
-  return {
-    content: choice?.message?.content ?? choice?.text ?? '',
-    finishReason: choice?.finish_reason ?? null,
-    completionTokens: payload?.usage?.completion_tokens ?? estimateTokenCount(choice?.message?.content ?? choice?.text ?? ''),
-    firstContentMs: null,
-    usage: payload?.usage || null,
-  }
-}
-
-async function readStreamingChatCompletion(response, onDelta) {
-  if (!response.ok) {
-    let detail = null
-    try {
-      detail = await response.json()
-    } catch {
-      // Fall through to generic response status below.
-    }
-    const message = detail?.error?.message || detail?.message || `Request failed with HTTP ${response.status}`
-    const error = new Error(message)
-    error.payload = detail
-    throw error
-  }
-
-  const contentType = response.headers.get('content-type') || ''
-  if (contentType.includes('application/json')) {
-    const payload = await response.json()
-    const parsed = readChatCompletionJsonPayload(payload)
-    if (parsed.content) onDelta(parsed.content, parsed.content, { completionTokens: parsed.completionTokens, elapsedMs: 0, firstContentMs: null })
-    return parsed
-  }
-
-  const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, usage: null }
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let content = ''
-  let finishReason = null
-  let completionTokens = 0
-  const streamStartedAt = performance.now()
-  let firstContentMs = null
-
-  const consumeEvent = (eventText) => {
-    const dataLines = eventText
-      .split('\n')
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trimStart())
-    for (const data of dataLines) {
-      if (!data || data === '[DONE]') continue
-      let chunk = null
-      try {
-        chunk = JSON.parse(data)
-      } catch {
-        continue
-      }
-      const choice = chunk?.choices?.[0]
-      const delta = choice?.delta?.content ?? choice?.text ?? ''
-      if (delta) {
-        completionTokens += 1
-        if (firstContentMs === null) firstContentMs = performance.now() - streamStartedAt
-        content += delta
-        onDelta(delta, content, {
-          completionTokens,
-          elapsedMs: performance.now() - streamStartedAt,
-          firstContentMs,
-        })
-      }
-      if (choice?.finish_reason) finishReason = choice.finish_reason
-    }
-  }
-
-  for (;;) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const { events, remainder } = extractSseEvents(buffer)
-    events.forEach(consumeEvent)
-    buffer = remainder
-  }
-  buffer += decoder.decode()
-  if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
-  return { content, finishReason, completionTokens, firstContentMs, usage: null }
 }
 
 function estimateTokenCount(value) {
@@ -752,7 +659,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
               }
             : item
         )))
-      })
+      }, { estimateTokenCount })
       const elapsedMs = performance.now() - requestStartedAt
       const assistantMessage = {
         ...assistantMessageBase,

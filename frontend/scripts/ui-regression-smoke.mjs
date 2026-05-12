@@ -31,6 +31,7 @@ const apiViewSource = readFileSync(new URL('../src/views/ApiView.jsx', import.me
 const systemViewSource = readFileSync(new URL('../src/views/SystemView.jsx', import.meta.url), 'utf8')
 const analyticsViewSource = readFileSync(new URL('../src/views/AnalyticsView.jsx', import.meta.url), 'utf8')
 const capabilitiesSource = readFileSync(new URL('../src/lib/capabilities.js', import.meta.url), 'utf8')
+const streamParserSource = readFileSync(new URL('../src/lib/chatCompletionStream.js', import.meta.url), 'utf8')
 const visibleUiSources = [
   '../src/views/ChatWorkspace.jsx',
   '../src/views/ApiView.jsx',
@@ -63,9 +64,12 @@ assert.match(chatWorkspaceSource, /assistantStreaming && <StreamingStatus[^\n]*t
 assert.match(chatWorkspaceSource, /CODE_CARD_STREAMING_LABEL\s*=\s*'Still generating — code block incomplete'/, 'incomplete streaming code blocks should visibly say the code is still incomplete')
 assert.match(chatWorkspaceSource, /data-code-streaming-state=\{stillGenerating \? 'open' : undefined\}/, 'open streaming code fences should expose an active code state marker')
 assert.match(chatWorkspaceSource, /message-code-card-status[^>]*aria-live="polite"[^>]*data-live-status="active"[^>]*>\{CODE_CARD_STREAMING_LABEL\}</, 'incomplete streaming code blocks should show a live active still-generating badge')
-assert.match(dashboardHookSource, /function extractSseEvents/, 'stream parser should keep SSE boundary handling centralized')
-assert.match(dashboardHookSource, /replace\(/, 'stream parser should normalize line endings before splitting SSE events')
-assert.match(dashboardHookSource, /split\('\\n\\n'\)/, 'stream parser should split normalized SSE events on blank lines for partial rendering')
+assert.match(dashboardHookSource, /readStreamingChatCompletion\(response/, 'dashboard chat send should use the centralized stream parser')
+assert.match(streamParserSource, /function defaultEstimateTokenCount/, 'central stream parser should keep a JSON fallback token estimator')
+assert.match(streamParserSource, /function readSseDataLines/, 'central stream parser should isolate SSE data-line handling')
+assert.match(streamParserSource, /export function extractSseEvents/, 'stream parser should keep SSE boundary handling centralized')
+assert.match(streamParserSource, /replace\(/, 'stream parser should normalize line endings before splitting SSE events')
+assert.match(streamParserSource, /split\('\\n\\n'\)/, 'stream parser should split normalized SSE events on blank lines for partial rendering')
 assert.match(dashboardHookSource, /finish_reason:\s*'error',[\s\S]*streaming:\s*false/, 'failed generations should clear streaming state instead of leaving active pellets/status forever')
 assert.match(apiViewSource, /Selected exact-row evidence/, 'API support view should show selected exact-row evidence instead of a broad validated-target claim')
 assert.match(apiViewSource, /selectedCompatibilityTarget\.frontend_readiness_gate/, 'API support view should surface the selected row readiness gate verbatim from /api/capabilities')
