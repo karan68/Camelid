@@ -13,6 +13,7 @@ for (const manifestPath of manifestPaths) {
   checkedBundles += 1
   await validateBundle(manifestPath)
 }
+await validateMixtralBlockerReconciliation(rootDir, manifestPaths)
 
 if (failures.length > 0) {
   console.error(`public evidence claim check failed with ${failures.length} finding(s):`)
@@ -61,6 +62,80 @@ async function validateBundle(manifestPath) {
 
   const legacyPublicContext = legacyPublicContextSchema(manifest)
   if (legacyPublicContext) validateLegacyPublicContextBundle(bundleRel, manifest, legacyPublicContext)
+}
+
+async function validateMixtralBlockerReconciliation(root, manifestPaths) {
+  const summaryPaths = await findSummaryPaths(root)
+  const manifests = []
+  for (const manifestPath of manifestPaths) manifests.push({ path: manifestPath, json: await readJson(manifestPath) })
+  const summaries = []
+  for (const summaryPath of summaryPaths) summaries.push({ path: summaryPath, json: await readJson(summaryPath) })
+
+  const promotionClaimPaths = [
+    ...manifests
+      .filter(({ json }) => json?.schema === 'camelid.mixtral_exact_row_manifest.v1')
+      .map(({ path }) => path),
+    ...summaries
+      .filter(({ json }) => json?.schema === 'camelid.mixtral_exact_row_promotion_sync.v1' || json?.support_label === 'supported_exact_row_smoke')
+      .map(({ path }) => path),
+  ]
+  const blockerPaths = summaries
+    .filter(({ json }) => mixtralSummaryRecordsBlocker(json))
+    .map(({ path }) => path)
+  if (promotionClaimPaths.length === 0 || blockerPaths.length === 0) return
+
+  const reconciliation = manifests.find(({ json }) => json?.schema === 'camelid.mixtral_blocker_reconciliation.v1')
+  if (!reconciliation) {
+    fail(relative(process.cwd(), root) || '.', 'Mixtral promotion claims conflict with later long-output blocker evidence; add a camelid.mixtral_blocker_reconciliation.v1 manifest before public claim checks can pass')
+    return
+  }
+  validateMixtralReconciliationManifest(relative(process.cwd(), reconciliation.path), reconciliation.json, promotionClaimPaths, blockerPaths)
+}
+
+function mixtralSummaryRecordsBlocker(summary) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return false
+  if (summary.schema === 'camelid.mixtral_gate9a_long_output.v1') {
+    return summary.all_token_parity === false || summary.all_completed === false || /diverg/i.test(String(summary.stop_reason || ''))
+  }
+  if (summary.schema === 'camelid.mixtral_longgen_continuation.summary.v1') {
+    return summary.status === 'partial_failure' || /hung|diverg/i.test(String(summary.runner_stop_reason || ''))
+  }
+  if (summary.schema === 'camelid.mixtral_backend_hang_guard.v1') {
+    return /blocked|hang|partial/i.test(String(summary.status || summary.result || ''))
+  }
+  return false
+}
+
+function validateMixtralReconciliationManifest(bundleRel, manifest, promotionClaimPaths, blockerPaths) {
+  const boundary = String(manifest.support_boundary || manifest.claim_boundary || '')
+  if (manifest.current_status !== 'active_validation_partial_runtime') {
+    fail(bundleRel, 'Mixtral blocker reconciliation current_status must be active_validation_partial_runtime')
+  }
+  if (manifest.support_label !== 'unsupported_bounded_one_token_runtime_only') {
+    fail(bundleRel, 'Mixtral blocker reconciliation support_label must be unsupported_bounded_one_token_runtime_only')
+  }
+  if (!/one-token/i.test(boundary) || !/unsupported|blocked/i.test(boundary) || !/no broad Mixtral/i.test(boundary)) {
+    fail(bundleRel, 'Mixtral blocker reconciliation support_boundary must say one-token evidence is unsupported/blocked and no broad Mixtral support is claimed')
+  }
+  const supersedes = new Set(Array.isArray(manifest.supersedes) ? manifest.supersedes : [])
+  const blockers = new Set(Array.isArray(manifest.blocker_evidence) ? manifest.blocker_evidence : [])
+  for (const path of promotionClaimPaths) {
+    const bundlePath = evidenceBundlePath(path)
+    if (!supersedes.has(bundlePath)) fail(bundleRel, `Mixtral blocker reconciliation supersedes must include ${bundlePath}`)
+  }
+  for (const path of blockerPaths) {
+    const bundlePath = evidenceBundlePath(path)
+    if (!blockers.has(bundlePath)) fail(bundleRel, `Mixtral blocker reconciliation blocker_evidence must include ${bundlePath}`)
+  }
+}
+
+function evidenceBundlePath(path) {
+  const rel = relative(process.cwd(), path)
+  const marker = '/manifest.json'
+  if (rel.endsWith(marker)) return rel.slice(0, -marker.length)
+  const summaryMarker = '/summary.json'
+  if (rel.endsWith(summaryMarker)) return rel.slice(0, -summaryMarker.length)
+  return rel
 }
 
 function validateSummaryAgreement(bundleRel, manifest, summary) {
@@ -528,6 +603,24 @@ async function findManifestPaths(root) {
       if (entry.isDirectory()) {
         await walk(fullPath)
       } else if (entry.isFile() && entry.name === 'manifest.json') {
+        paths.push(fullPath)
+      }
+    }
+  }
+}
+
+async function findSummaryPaths(root) {
+  const paths = []
+  await walk(root)
+  return paths.sort()
+
+  async function walk(currentDir) {
+    const entries = await readdir(currentDir, { withFileTypes: true })
+    for (const entry of entries) {
+      const fullPath = join(currentDir, entry.name)
+      if (entry.isDirectory()) {
+        await walk(fullPath)
+      } else if (entry.isFile() && entry.name === 'summary.json') {
         paths.push(fullPath)
       }
     }

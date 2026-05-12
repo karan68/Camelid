@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { spawnSync } from 'node:child_process'
 
 const tempRoot = await mkdtemp(join(tmpdir(), 'camelid-evidence-claims-'))
@@ -14,11 +14,13 @@ await writeSingleRowContextBundle(goodRoot, { mutate: false })
 await writeEightBContextBundle(goodRoot, { mutate: false })
 await writeEightBContext1024And2048Bundle(goodRoot, { mutate: false })
 await writeLegacyPublicContextBundle(goodRoot, { mutate: false })
+await writeMixtralPromotionAndBlockerEvidence(goodRoot, { reconciled: true })
 await writeBundle(badRoot, { mutate: true })
 await writeSingleRowContextBundle(badRoot, { mutate: true })
 await writeEightBContextBundle(badRoot, { mutate: true })
 await writeEightBContext1024And2048Bundle(badRoot, { mutate: true })
 await writeLegacyPublicContextBundle(badRoot, { mutate: true })
+await writeMixtralPromotionAndBlockerEvidence(badRoot, { reconciled: false })
 
 const good = spawnSync(process.execPath, ['scripts/check-public-evidence-claims.mjs', '--root', goodRoot], {
   cwd: process.cwd(),
@@ -38,6 +40,53 @@ assert.match(bad.stderr, /q8_file_reads\.read_bytes mismatch/)
 assert.match(bad.stderr, /prefill_q8_file_reads\.read_calls mismatch/)
 assert.match(bad.stderr, /summary head mismatch/)
 assert.match(bad.stderr, /backend_generated_tokens must stay \[34,2735,35,12,7854\]/)
+assert.match(bad.stderr, /Mixtral promotion claims conflict with later long-output blocker evidence/)
+
+async function writeMixtralPromotionAndBlockerEvidence(root, { reconciled }) {
+  const promotionDir = join(root, 'mixtral-8x7b-v0.1-q8-manifest-checksum-test')
+  const syncDir = join(root, 'mixtral-8x7b-v0.1-q8-promotion-sync-test')
+  const gate9Dir = join(root, 'mixtral-8x7b-v0.1-q8-gate9a-50tok-test')
+  const reconcileDir = join(root, 'mixtral-8x7b-v0.1-q8-blocker-reconciliation-test')
+  await mkdir(promotionDir, { recursive: true })
+  await mkdir(syncDir, { recursive: true })
+  await mkdir(gate9Dir, { recursive: true })
+  const promotionManifest = {
+    schema: 'camelid.mixtral_exact_row_manifest.v1',
+    model: { filename: 'Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf', sha256: 'c'.repeat(64) },
+    scope: 'validated exact row only; no broad Mixtral-family support claim',
+    promotion_gate_artifacts: [],
+  }
+  const promotionSync = {
+    schema: 'camelid.mixtral_exact_row_promotion_sync.v1',
+    support_label: 'supported_exact_row_smoke',
+    scope: 'validated exact row only; checked short-prompt envelope only',
+  }
+  const gate9Summary = {
+    schema: 'camelid.mixtral_gate9a_long_output.v1',
+    model: 'Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf',
+    scope: 'exact row only; no support claim change',
+    all_completed: false,
+    all_token_parity: false,
+    stop_reason: 'stopped_on_error_or_divergence_before_50',
+  }
+  await writeFile(join(promotionDir, 'manifest.json'), `${JSON.stringify(promotionManifest, null, 2)}\n`)
+  await writeFile(join(syncDir, 'summary.json'), `${JSON.stringify(promotionSync, null, 2)}\n`)
+  await writeFile(join(gate9Dir, 'summary.json'), `${JSON.stringify(gate9Summary, null, 2)}\n`)
+  if (!reconciled) return
+  await mkdir(reconcileDir, { recursive: true })
+  const reconciliation = {
+    schema: 'camelid.mixtral_blocker_reconciliation.v1',
+    current_status: 'active_validation_partial_runtime',
+    support_label: 'unsupported_bounded_one_token_runtime_only',
+    support_boundary: 'Mixtral remains unsupported/blocked beyond bounded one-token runtime evidence; no broad Mixtral support is claimed.',
+    supersedes: [
+      'mixtral-8x7b-v0.1-q8-manifest-checksum-test',
+      'mixtral-8x7b-v0.1-q8-promotion-sync-test',
+    ].map((name) => relative(process.cwd(), join(root, name))),
+    blocker_evidence: [relative(process.cwd(), join(root, 'mixtral-8x7b-v0.1-q8-gate9a-50tok-test'))],
+  }
+  await writeFile(join(reconcileDir, 'manifest.json'), `${JSON.stringify(reconciliation, null, 2)}\n`)
+}
 
 async function writeBundle(root, { mutate }) {
   const dir = join(root, 'four-row-context-512-test')
