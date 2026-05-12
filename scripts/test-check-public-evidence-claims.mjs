@@ -13,12 +13,14 @@ await writeBundle(goodRoot, { mutate: false })
 await writeSingleRowContextBundle(goodRoot, { mutate: false })
 await writeEightBContextBundle(goodRoot, { mutate: false })
 await writeEightBContext1024And2048Bundle(goodRoot, { mutate: false })
+await writeMistralContext51210242048Bundle(goodRoot, { mutate: false })
 await writeLegacyPublicContextBundle(goodRoot, { mutate: false })
 await writeMixtralPromotionAndBlockerEvidence(goodRoot, { reconciled: true })
 await writeBundle(badRoot, { mutate: true })
 await writeSingleRowContextBundle(badRoot, { mutate: true })
 await writeEightBContextBundle(badRoot, { mutate: true })
 await writeEightBContext1024And2048Bundle(badRoot, { mutate: true })
+await writeMistralContext51210242048Bundle(badRoot, { mutate: true })
 await writeLegacyPublicContextBundle(badRoot, { mutate: true })
 await writeMixtralPromotionAndBlockerEvidence(badRoot, { reconciled: false })
 
@@ -39,6 +41,8 @@ assert.match(bad.stderr, /source_prompt_pack must be qa\/prompt-packs\/llama3-co
 assert.match(bad.stderr, /q8_file_reads\.read_bytes mismatch/)
 assert.match(bad.stderr, /prefill_q8_file_reads\.read_calls mismatch/)
 assert.match(bad.stderr, /summary head mismatch/)
+assert.match(bad.stderr, /row_id must be mistral_7b_instruct_v0_3_q8_0/)
+assert.match(bad.stderr, /raw_artifact must be a safe relative path/)
 assert.match(bad.stderr, /backend_generated_tokens must stay \[34,2735,35,12,7854\]/)
 assert.match(bad.stderr, /Mixtral promotion claims conflict with later long-output blocker evidence/)
 
@@ -286,6 +290,93 @@ async function writeEightBContext1024And2048Bundle(root, { mutate }) {
   }
   await writeFile(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
   await writeFile(join(dir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`)
+}
+
+async function writeMistralContext51210242048Bundle(root, { mutate }) {
+  const dir = join(root, 'mistral-7b-context-512-1024-2048-test')
+  await mkdir(dir, { recursive: true })
+  const boundary = 'Promotes only exact mistral_7b_instruct_v0_3_q8_0 bounded 512/1024/2048 prompt packs. It does not promote neighboring rows, other quantizations, model-native/larger context buckets, arbitrary templates, Mistral-family support, production throughput, or portability support.'
+  const rows = [
+    mistralContextRow({
+      contextWindow: 512,
+      promptId: 'mistral-roughly-512-token-recall',
+      referencePromptTokenCount: 315,
+      rawArtifact: 'target/mistral-7b-context-512-1024-2048-test/pack-512/report.json',
+    }),
+    mistralContextRow({
+      contextWindow: 1024,
+      promptId: 'mistral-roughly-1024-token-recall',
+      referencePromptTokenCount: 721,
+      rawArtifact: 'target/mistral-7b-context-512-1024-2048-test/pack-1024/report.json',
+    }),
+    mistralContextRow({
+      contextWindow: 2048,
+      promptId: 'mistral-roughly-2048-token-recall',
+      referencePromptTokenCount: 1498,
+      rawArtifact: mutate
+        ? '/redacted/private/mistral-7b-context-512-1024-2048-test/pack-2048/report.json'
+        : 'target/mistral-7b-context-512-1024-2048-test/pack-2048/report.json',
+    }),
+  ]
+  if (mutate) rows[1].row_id = 'mistral_7b_instruct_v0_2_q8_0'
+  const manifest = {
+    schema: 'camelid.mistral_7b_context_512_1024_2048_current_head_public_evidence.v1',
+    passed: true,
+    pack: {
+      max_tokens: 5,
+      ids: ['mistral-context-512-smoke-v1', 'mistral-context-1024-smoke-v1', 'mistral-context-2048-smoke-v1'],
+      source_prompt_packs: ['qa/prompt-packs/mistral-context-512-smoke.json', 'qa/prompt-packs/mistral-context-1024-smoke.json', 'qa/prompt-packs/mistral-context-2048-smoke.json'],
+    },
+    checks: {
+      prompt_tokens_all_match: true,
+      generated_tokens_all_match: true,
+      generated_text_all_match: true,
+      api_health_loaded_generation_ready: true,
+      v1_completions_passed: true,
+      v1_chat_completions_passed: true,
+      privacy_scrub_required: true,
+    },
+    rows,
+    claim_boundary: boundary,
+  }
+  const summary = {
+    schema: 'camelid.mistral_7b_context_512_1024_2048_current_head_summary.v1',
+    source_manifest: 'manifest.json',
+    passed: true,
+    rows: rows.map((row) => ({
+      row_id: row.row_id,
+      context_window: row.context_window,
+      reference_prompt_token_count: row.reference_prompt_token_count,
+      max_tokens: row.max_tokens,
+      max_resident_set_kib: row.max_resident_set_kib,
+      passed: row.passed,
+    })),
+    claim_boundary: boundary,
+  }
+  await writeFile(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+  await writeFile(join(dir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`)
+}
+
+function mistralContextRow({ contextWindow, promptId, referencePromptTokenCount, rawArtifact }) {
+  return {
+    row_id: 'mistral_7b_instruct_v0_3_q8_0',
+    context_window: contextWindow,
+    max_tokens: 5,
+    prompt_id: promptId,
+    reference_prompt_token_count: referencePromptTokenCount,
+    prompt_tokens_match: true,
+    generated_tokens_match: true,
+    generated_text_match: true,
+    first_generated_token_diff_index: -1,
+    generated_text: ' The repeat marker is "',
+    llama_text: ' The repeat marker is "',
+    backend_generated_tokens: [1183, 14518, 19612, 1117, 1113],
+    llama_generated_tokens: [1183, 14518, 19612, 1117, 1113],
+    max_resident_set_kib: 6742016,
+    model_sha256: 'd'.repeat(64),
+    raw_artifact: rawArtifact,
+    passed: true,
+  }
 }
 
 function contextRow({ rowId, contextWindow, promptId, generatedText, rawArtifact, q8FileReads, prefillQ8FileReads }) {
