@@ -20,8 +20,8 @@ Remote smoke before trace:
 
 Clean 2048-context reproduction (no dense diagnostics):
 
-- Command artifact: `/tmp/camelid-q8-trace-20260505T225110Z/target/llama32-1b-context-2048-clean-repro-20260505T225933Z/pack/llama32-1b-q8-roughly-2048-token-recall/command.txt`
-- Summary: `/tmp/camelid-q8-trace-20260505T225110Z/target/llama32-1b-context-2048-clean-repro-20260505T225933Z/pack/summary.json`
+- Command artifact: `target/llama32-1b-context-2048-clean-repro-20260505T225933Z/pack/llama32-1b-q8-roughly-2048-token-recall/command.txt`
+- Summary: `target/llama32-1b-context-2048-clean-repro-20260505T225933Z/pack/summary.json`
 - Prompt-token parity: PASS (`1910` reference prompt tokens)
 - Generated-token parity: FAIL at token index `0`
 - Backend generated tokens/text: `[11, 11, 11, 315, 315]` / `",,, of of"`
@@ -35,8 +35,8 @@ Clean 2048-context reproduction (no dense diagnostics):
 
 Dense output-projection trace:
 
-- Command artifact: `/tmp/camelid-q8-trace-20260505T225110Z/target/llama32-1b-context-2048-dense-trace-20260505T225314Z/pack/llama32-1b-q8-roughly-2048-token-recall/command.txt`
-- Summary: `/tmp/camelid-q8-trace-20260505T225110Z/target/llama32-1b-context-2048-dense-trace-20260505T225314Z/pack/summary.json`
+- Command artifact: `target/llama32-1b-context-2048-dense-trace-20260505T225314Z/pack/llama32-1b-q8-roughly-2048-token-recall/command.txt`
+- Summary: `target/llama32-1b-context-2048-dense-trace-20260505T225314Z/pack/summary.json`
 - Prompt-token parity: PASS (`1910` reference prompt tokens)
 - Generated-token parity: FAIL with the same backend/reference token sequence as the clean reproduction.
 - Dense diagnostics present: yes; output projection diagnostics count `24`.

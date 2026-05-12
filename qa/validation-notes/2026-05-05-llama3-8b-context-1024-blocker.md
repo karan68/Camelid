@@ -17,9 +17,9 @@ Observed outcome:
 - llama.cpp reference timing: `881` prompt tokens in `12340.33 ms`, `5` predicted tokens in `702.43 ms`, total `13042.76 ms`
 - Camelid backend result: no parity report was produced because `/v1/chat/completions` timed out after the configured `900000 ms` wait
 - Summary outcome: `prompt_tokens_all_match=false`, `generated_tokens_all_match=false`, `generated_text_all_match=false`, prompt exit code `1`
-- Remote isolated work dir: `/tmp/camelid-8b-context-1024-20260505T171420Z`
-- Remote artifact dir: `/tmp/camelid-8b-context-1024-20260505T171420Z/artifact`
-- Model SHA256: `583c616da14b82930f887f991ab446711da0b029166200b67892d7c9f8f45958  /home/ubuntu/models/Meta-Llama-3-8B-Instruct-Q8_0.gguf`
+- Remote isolated work dir: scrubbed private temp checkout path
+- Remote artifact dir: scrubbed private temp artifact path
+- Model SHA256: `583c616da14b82930f887f991ab446711da0b029166200b67892d7c9f8f45958  Meta-Llama-3-8B-Instruct-Q8_0.gguf`
 - `summary.json` SHA256: `c7476c550699acfc7bf1771a37087ff0f29d1ee602c62cb30ca2f1ab49a15651`
 - `command.txt` SHA256: `a20fda069511305b6000132e75c7d03dc21231d708ef898553c41efbddd8f948`
 - `stderr.log` SHA256: `ce74eff326c1b6789f9432c8c2ff34c6507cddd32acb54b16e8f9acf98d07953`

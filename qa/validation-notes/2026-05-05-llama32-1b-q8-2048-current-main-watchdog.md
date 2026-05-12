@@ -23,9 +23,9 @@ Remote guardrail before repro:
 
 Current-main 2048-context blocker confirmation:
 
-- Artifact dir: `/tmp/camelid-current-main-q8-watchdog-20260505T231544Z/target/current-main-llama32-1b-2048-watchdog-20260505T231735Z/`
-- Report: `/tmp/camelid-current-main-q8-watchdog-20260505T231544Z/target/current-main-llama32-1b-2048-watchdog-20260505T231735Z/pack/llama32-1b-q8-watchdog-roughly-2048-token-recall/report.json`
-- Summary: `/tmp/camelid-current-main-q8-watchdog-20260505T231544Z/target/current-main-llama32-1b-2048-watchdog-20260505T231735Z/pack/summary.json`
+- Artifact dir: `target/current-main-llama32-1b-2048-watchdog-20260505T231735Z/`
+- Report: `target/current-main-llama32-1b-2048-watchdog-20260505T231735Z/pack/llama32-1b-q8-watchdog-roughly-2048-token-recall/report.json`
+- Summary: `target/current-main-llama32-1b-2048-watchdog-20260505T231735Z/pack/summary.json`
 - Prompt-token parity: PASS (`1910` reference prompt tokens)
 - Generated-token/text parity: FAIL at generated token index `0`
 - Backend generated tokens/text: `[11, 11, 11, 315, 315]` / `",,, of of"`
