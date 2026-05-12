@@ -123,8 +123,12 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
               <>
                 <code>{selectedCompatibilityTarget.id}</code>
                 <p>{formatCapabilityStatus(selectedCompatibilityTarget.status)} · {selectedCompatibilityTarget.family} · {selectedCompatibilityTarget.quantization}</p>
+                <p><b>Scope:</b> {displayCapabilityCopy(selectedCompatibilityTarget.support_scope || 'not advertised')}</p>
                 <p><b>Readiness gate:</b> {displayCapabilityCopy(selectedCompatibilityTarget.frontend_readiness_gate)}</p>
                 <p><b>Latest checked:</b> {formatCapabilityStatus(selectedCompatibilityTarget.latest_checked_bucket)} · {formatCapabilityStatus(selectedCompatibilityTarget.latest_checked_result)}</p>
+                <p><b>Latest output:</b> {displayCapabilityCopy(selectedCompatibilityTarget.latest_checked_output || 'not advertised')}</p>
+                <p><b>Full-support status:</b> {formatCapabilityStatus(selectedCompatibilityTarget.full_support_status || 'not advertised')}</p>
+                <p><b>Remaining blockers:</b> {displayCapabilityCopy(selectedCompatibilityTarget.full_support_blockers || 'No blockers advertised for this exact row.')}</p>
                 <p>{displayCapabilityCopy(selectedCompatibilityTarget.evidence)}</p>
               </>
             ) : (
