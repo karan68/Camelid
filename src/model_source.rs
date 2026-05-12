@@ -302,15 +302,15 @@ fn hf_shard_index_weight_map_ready(
         .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
         .collect::<BTreeSet<_>>();
     let mut missing = BTreeSet::new();
-    let mut invalid = Vec::new();
-    let mut invalid_filenames = Vec::new();
+    let mut invalid = BTreeSet::new();
+    let mut invalid_filenames = BTreeSet::new();
     for (tensor_name, shard_name) in weight_map {
         let Some(shard_name) = shard_name.as_str() else {
-            invalid.push(tensor_name.as_str());
+            invalid.insert(tensor_name.as_str());
             continue;
         };
         if !is_plain_safetensors_shard_filename(shard_name) {
-            invalid_filenames.push(tensor_name.as_str());
+            invalid_filenames.insert(tensor_name.as_str());
             continue;
         }
         if !available.contains(shard_name) {
@@ -323,7 +323,7 @@ fn hf_shard_index_weight_map_ready(
             "invalid_shard_index_weight_map",
             format!(
                 "model.safetensors.index.json weight_map entries must map tensor names to shard filenames; invalid entries: {}",
-                invalid.join(", ")
+                invalid.into_iter().collect::<Vec<_>>().join(", ")
             ),
         ));
         return false;
@@ -333,7 +333,7 @@ fn hf_shard_index_weight_map_ready(
             "invalid_shard_index_shard_filename",
             format!(
                 "model.safetensors.index.json weight_map shard values must be local shard filenames, not paths; invalid tensor entries: {}",
-                invalid_filenames.join(", ")
+                invalid_filenames.into_iter().collect::<Vec<_>>().join(", ")
             ),
         ));
         return false;
@@ -589,6 +589,30 @@ mod tests {
         assert!(!message.contains("C:"));
         assert!(!message.contains("model-00001-of-00002.safetensors"));
         assert!(!message.contains("model-00002-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn shard_index_invalid_entries_are_reported_in_stable_tensor_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
+        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"z.weight":42,"a.weight":false}}"#,
+        )
+        .unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_shard_index_weight_map", "generation_disabled"],
+        );
+        let message = &inspection.readiness.blockers[0].message;
+        assert!(message.ends_with("invalid entries: a.weight, z.weight"));
     }
 
     fn write_llama_config(root: &Path) {
