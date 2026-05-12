@@ -160,7 +160,13 @@ function futureExactRowHint(rows, subject, quantKey) {
 
 export function isSupportedCapabilityStatus(status = '') {
   const value = status.toLowerCase()
-  return value === 'supported' || value.startsWith('supported_') || value === 'validated' || value === 'measured'
+  return value === 'supported' || value.startsWith('supported_')
+}
+
+function isReadyEvidenceStatus(status = '') {
+  const value = status.toLowerCase()
+  if (value.includes('not_promoted') || value.includes('fail_closed') || value.includes('fail-closed')) return false
+  return value === 'validated' || value.startsWith('validated_') || value === 'measured' || value.startsWith('measured_') || value === 'pass' || value.startsWith('pass_')
 }
 
 export function isGuardedCapabilityStatus(status = '') {
@@ -170,6 +176,7 @@ export function isGuardedCapabilityStatus(status = '') {
 export function capabilityStatusTone(status = '') {
   const value = status.toLowerCase()
   if (isSupportedCapabilityStatus(value)) return 'ready'
+  if (isReadyEvidenceStatus(value)) return 'ready'
   if (
     value.includes('planned')
     || value.includes('partial')

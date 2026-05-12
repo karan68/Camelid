@@ -128,10 +128,13 @@ assert.equal(quantLabelFromGgufFileType('15'), 'Q4_K_M')
 assert.equal(quantLabelFromGgufFileType(32), 'BF16')
 assert.equal(quantLabelFromGgufFileType('unknown'), null)
 assert.equal(isSupportedCapabilityStatus('supported_current_gate'), true)
+assert.equal(isSupportedCapabilityStatus('validated'), false, 'validated evidence must not be treated as a support status')
+assert.equal(isSupportedCapabilityStatus('measured'), false, 'measurement evidence must not be treated as a support status')
 assert.equal(isGuardedCapabilityStatus('future'), true)
 assert.equal(capabilityStatusTone('blocked_until_tensor_load_and_parity'), 'warm')
 assert.equal(capabilityStatusTone('groundwork_backend_evidence_only'), 'warm')
 assert.equal(capabilityStatusTone('blocked_unsupported_bringup'), 'warm')
+assert.equal(capabilityStatusTone('validated_second_pack'), 'ready')
 assert.equal(capabilityStatusTone('validated_bounded_pack_not_promoted'), 'warm')
 assert.equal(capabilityStatusTone('fail-closed_until_promotion'), 'warm')
 assert.equal(capabilityStatusTone('supported_exact_row_smoke'), 'ready')
@@ -311,6 +314,13 @@ const evidenceOnly1BGate = getChatGateState(evidenceOnly1BFixture, { ...localLoa
 assert.equal(evidenceOnly1BGate.runtimeReady, true, 'runtime readiness should be visible even for evidence-only rows')
 assert.equal(evidenceOnly1BGate.contractSupported, false, 'evidence-only rows are not exact supported rows')
 assert.equal(evidenceOnly1BGate.chatUnlocked, false, 'WebUI chat must remain blocked unless runtime readiness and an exact supported compatibility row both pass')
+const validatedOnly1BFixture = {
+  ...capabilityFixture,
+  model_compatibility: capabilityFixture.model_compatibility.map((row) => row.id === 'llama32_1b_instruct_q8_0' ? { ...row, status: 'validated' } : row),
+}
+const validatedOnly1BGate = getChatGateState(validatedOnly1BFixture, { ...localLoadedReady, id: 'llama32-1b', name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' }, { active_model_id: 'llama32-1b', loaded_now: true, generation_ready: true })
+assert.equal(validatedOnly1BGate.contractSupported, false, 'validated rows are evidence boundaries only, not support statuses')
+assert.equal(validatedOnly1BGate.chatUnlocked, false, 'WebUI chat must not unlock from a generic validated row status')
 const mistralExactHint = findCompatibilityHint(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' })
 assert.equal(mistralExactHint.kind, 'compatibility', 'the future Mistral lane should identify only the exact v0.3 7B Instruct Q8_0 row')
 assert.equal(mistralExactHint.target.id, 'mistral_7b_instruct_v0_3_q8_0')
