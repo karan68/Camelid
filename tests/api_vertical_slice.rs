@@ -45,7 +45,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist; Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied."
+        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only and remains unsupported for broad/API/WebUI/frontend readiness while later generation diverges. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -102,11 +102,11 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .iter()
         .any(|item| item["id"] == "mixtral_moe"
-            && item["status"] == "supported_exact_row_smoke_lane"
+            && item["status"] == "active_validation_partial_runtime"
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("exact-row supported")));
+                .contains("bounded one-token exact-row MoE runtime evidence")));
     for id in ["qwen25", "gemma2"] {
         assert!(body["planned_model_families"]
             .as_array()
@@ -401,19 +401,22 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "mixtral_8x7b_instruct_v0_1_q8_0")
         .unwrap();
-    assert_eq!(mixtral["status"], "supported_exact_row_smoke");
+    assert_eq!(mixtral["status"], "active_validation_partial_runtime");
     assert_eq!(
         mixtral["support_scope"],
-        "validated_exact_row_short_prompt_moe_api_webui_runtime_only"
+        "exact_row_bounded_moe_runtime_only"
     );
     assert_eq!(
         mixtral["generation_runs"],
-        "api_completion_and_chat_smoke_plus_6prompt_5token_parity"
+        "bounded_one_token_runtime_smoke_observed"
     );
-    assert_eq!(mixtral["frontend_load_path_verified"], "validated");
+    assert_eq!(
+        mixtral["frontend_load_path_verified"],
+        "fail_closed_partial_runtime_only"
+    );
     assert_eq!(
         mixtral["latest_checked_result"],
-        "pass_exact_row_short_prompt_api_webui_rss_manifest"
+        "partial_one_token_pass_later_generation_diverges"
     );
     assert!(mixtral["evidence"]
         .as_str()
@@ -422,11 +425,11 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
-        .contains("Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf"));
+        .contains("later short-prompt generation still diverges"));
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
-        .contains("mixtral-8x7b-v0.1-q8-manifest-checksum-20260511"));
+        .contains("No broad Mixtral"));
 
     for (id, filename) in [
         ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
