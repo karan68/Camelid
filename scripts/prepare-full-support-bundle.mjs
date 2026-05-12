@@ -269,7 +269,9 @@ const manifest = {
     arch: os.arch(),
     node: process.version,
   },
-  ubuntu_validation_guardrail: 'Use the canonical Ubuntu validation host for promotion-grade Llama runtime evidence. Local Mac work is for docs/recon/light prep only.',
+  ubuntu_validation_guardrail: runtimeValidationAvailable
+    ? 'Runtime tracks are runnable only on an approved Tim-authorized validation/runtime lane; keep Local Mac work to docs/recon/light prep unless Tim explicitly authorizes otherwise.'
+    : 'Validation lane paused by operator instruction: do not SSH to validation hosts, do not substitute a local Mac runtime rerun, and keep this scaffold blocked until Tim explicitly reopens an approved lane.',
   validation_host_status: {
     status: validationHostStatus,
     runtime_validation_available: runtimeValidationAvailable,

@@ -25,6 +25,8 @@ assert.equal(blocked.status, 0, blocked.stderr || blocked.stdout)
 const blockedManifest = JSON.parse(await readFile(join(blockedOut, 'manifest.json'), 'utf8'))
 assert.equal(blockedManifest.validation_host_status.status, 'blocked_by_operator_shutdown')
 assert.equal(blockedManifest.validation_host_status.runtime_validation_available, false)
+assert.match(blockedManifest.ubuntu_validation_guardrail, /Validation lane paused by operator instruction/)
+assert.doesNotMatch(blockedManifest.ubuntu_validation_guardrail, /Use the canonical Ubuntu validation host/)
 assert.equal(
   blockedManifest.carry_forward_public_refs.validation_note,
   'qa/validation-notes/2026-05-12-local-only-validation-lane-paused.md',
@@ -80,6 +82,7 @@ assert.equal(available.status, 0, available.stderr || available.stdout)
 const availableManifest = JSON.parse(await readFile(join(availableOut, 'manifest.json'), 'utf8'))
 assert.equal(availableManifest.validation_host_status.status, 'available')
 assert.equal(availableManifest.validation_host_status.runtime_validation_available, true)
+assert.match(availableManifest.ubuntu_validation_guardrail, /approved Tim-authorized validation\/runtime lane/)
 
 const availableRuntimeScript = await readFile(
   join(availableOut, 'llama3_8b_instruct_q8_0', 'commands', '01-compact-parity.sh'),
