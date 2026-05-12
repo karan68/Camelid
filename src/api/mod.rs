@@ -3990,6 +3990,47 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_capability_rows_do_not_advertise_api_or_frontend_readiness() {
+        let response = capabilities_response();
+
+        for target in response
+            .model_compatibility
+            .iter()
+            .filter(|target| !target.status.starts_with("supported"))
+        {
+            assert_ne!(
+                target.frontend_load_path_verified, "validated",
+                "{} must not report a validated frontend load path while unsupported/planned",
+                target.id
+            );
+            assert!(
+                target.frontend_readiness_gate.contains("fail-closed"),
+                "{} must keep frontend readiness fail-closed while unsupported/planned",
+                target.id
+            );
+            assert!(
+                !target.generation_runs.contains("api_completion")
+                    && !target.generation_runs.contains("chat_smoke")
+                    && !target.generation_runs.contains("frontend"),
+                "{} must not advertise API/WebUI generation readiness while unsupported/planned: {}",
+                target.id,
+                target.generation_runs
+            );
+            let evidence = target.evidence.to_ascii_lowercase();
+            assert!(
+                evidence.contains("not supported")
+                    || evidence.contains("no broad")
+                    || evidence.contains("planned")
+                    || evidence.contains("planning")
+                    || evidence.contains("unsupported"),
+                "{} evidence must carry an explicit unsupported/planning boundary: {}",
+                target.id,
+                target.evidence
+            );
+        }
+    }
+
+    #[test]
     fn capabilities_public_strings_do_not_expose_local_operator_paths() {
         let response = capabilities_response();
         let value = serde_json::to_value(response).expect("capabilities response should serialize");
