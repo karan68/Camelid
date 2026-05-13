@@ -24,7 +24,7 @@ const navItems = [
   { id: 'system', label: 'System' },
 ]
 
-function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, theme, setTheme, selectedModelId, setSelectedModelId, models }) {
+function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, selectedModelId, setSelectedModelId, models }) {
   const rawConversationTitle = selectedConversationTitle?.trim()
   const hasCustomConversationTitle = Boolean(rawConversationTitle && rawConversationTitle.toLowerCase() !== 'new conversation')
   const activeModel = models.find((model) => model.id === runtime?.active_model_id)
@@ -57,11 +57,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
           <div className="topbar-chat-center" title={hasCustomConversationTitle ? rawConversationTitle : untitledConversationLabel}>
             {hasCustomConversationTitle ? clampText(rawConversationTitle, 64) : untitledConversationLabel}
           </div>
-          <div className="topbar-chat-actions">
-            <button className="topbar-chat-icon" aria-label="Toggle color theme" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>
-              {theme === 'dark' ? '◐' : '◑'}
-            </button>
-          </div>
+          <div className="topbar-chat-actions" />
         </div>
         <div className="mobile-nav" aria-label="Primary navigation">
           {navItems.map((item) => (
@@ -92,9 +88,6 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
               })}
             </select>
           </label>
-          <button className="topbar-chat-icon" aria-label="Toggle color theme" onClick={() => setTheme((current) => current === 'dark' ? 'light' : 'dark')}>
-            {theme === 'dark' ? '◐' : '◑'}
-          </button>
         </div>
       </div>
       {tab !== 'library' && (

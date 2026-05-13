@@ -282,8 +282,6 @@ const DEMO_PROMPTS = [
   'Write a compact Python snake game using tkinter',
 ]
 
-const looksLikePacmanPrompt = (value) => /\bpac[ -]?m[ae]n\b|\bpacmac\b/i.test(String(value || ''))
-
 const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   if (phase === 'preparing') return PREPARING_STREAMING_LABEL
   if (phase === 'streaming') return isOpenCode ? OPEN_CODE_STREAMING_LABEL : ACTIVE_STREAMING_LABEL
@@ -291,17 +289,13 @@ const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   return FIRST_TOKEN_STREAMING_LABEL
 }
 
-function PacmanLoader({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false, variant = 'arcade' }) {
-  const neutral = variant === 'neutral'
+function StreamingLoader({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false }) {
   return (
-    <div className={`pacman-loader ${compact ? 'pacman-loader-compact' : ''} ${neutral ? 'pacman-loader-neutral' : 'pacman-loader-arcade'}`} role="status" aria-live="polite" aria-label={`${label}. ${elapsedSeconds} seconds elapsed.`}>
-      <div className="pacman-loader-track" aria-hidden="true">
-        <span className="pacman-loader-mouth" />
-        <span className="pacman-loader-pellet pacman-loader-pellet-1" />
-        <span className="pacman-loader-pellet pacman-loader-pellet-2" />
-        <span className="pacman-loader-pellet pacman-loader-pellet-3" />
-        <span className="pacman-loader-pellet pacman-loader-pellet-4" />
-        <span className="pacman-loader-pellet pacman-loader-pellet-5" />
+    <div className={`streaming-loader ${compact ? 'streaming-loader-compact' : ''}`} role="status" aria-live="polite" aria-label={`${label}. ${elapsedSeconds} seconds elapsed.`}>
+      <div className="streaming-loader-track" aria-hidden="true">
+        <span className="streaming-loader-dot streaming-loader-dot-1" />
+        <span className="streaming-loader-dot streaming-loader-dot-2" />
+        <span className="streaming-loader-dot streaming-loader-dot-3" />
       </div>
     </div>
   )
@@ -361,7 +355,6 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
   const isOpenStreamingCode = assistantStreaming && hasOpenCodeFence(messageContent)
   const streamingPhase = message.streaming_phase || (messageContent ? 'streaming' : 'generating')
   const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
-  const loaderVariant = looksLikePacmanPrompt(priorUserPrompt) ? 'neutral' : 'arcade'
   const hasTokenMetrics = false
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
@@ -374,7 +367,7 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
       <div className={`message-bubble message-bubble-gemini ${message.role}`}>
-        {showStreamingStatus && <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact variant={loaderVariant} />}
+        {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {message.role === 'assistant'
           ? messageContent || !assistantStreaming
             ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />
@@ -699,7 +692,7 @@ export default function ChatWorkspace({
                   )}
                   <article className="message-row message-row-gemini assistant pending is-streaming" aria-busy="true" data-streaming-state="active">
                     <div className="message-bubble message-bubble-gemini assistant pending">
-                      <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} variant={looksLikePacmanPrompt(pendingPrompt) ? 'neutral' : 'arcade'} />
+                      <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} />
                     </div>
                   </article>
                 </>

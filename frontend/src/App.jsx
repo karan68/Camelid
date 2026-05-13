@@ -24,7 +24,7 @@ const clampSidebarWidth = (value) => Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBA
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
-  const { theme, setTheme } = useTheme()
+  useTheme()
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     if (typeof window === 'undefined') return SIDEBAR_DEFAULT_WIDTH
     const saved = Number.parseInt(window.localStorage.getItem('camelid.sidebarWidth') || '', 10)
@@ -243,8 +243,6 @@ function App() {
           selectedConversationPreview={selectedConversationPreview}
           runtime={runtime}
           capabilities={dashboard?.capabilities}
-          theme={theme}
-          setTheme={setTheme}
           selectedModelId={selectedModelId}
           setSelectedModelId={setSelectedModelId}
           models={models}

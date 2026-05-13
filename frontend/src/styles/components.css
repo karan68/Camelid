@@ -5908,7 +5908,7 @@ textarea.composer-input-gemini {
   border-left: 1px solid color-mix(in srgb, var(--color-border-soft) 48%, transparent);
 }
 
-.pacman-loader {
+.streaming-loader {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -5916,52 +5916,31 @@ textarea.composer-input-gemini {
   padding: 8px 0 10px;
 }
 
-.pacman-loader-compact {
+.streaming-loader-compact {
   padding: 0 0 8px;
 }
 
-.pacman-loader-track {
-  position: relative;
-  --pacman-pellet-travel: -314px;
-  width: 340px;
-  max-width: 100%;
-  height: 64px;
-  overflow: hidden;
+.streaming-loader-track {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-width: 64px;
+  min-height: 20px;
 }
 
-.pacman-loader-mouth {
-  position: absolute;
-  z-index: 2;
-  left: 0;
-  top: 2px;
-  width: 60px;
-  height: 60px;
-  border-radius: 50%;
-  background: #ffef00;
-  clip-path: polygon(0 0, 100% 0, 100% 22%, 53% 50%, 100% 78%, 100% 100%, 0 100%);
-  animation: camelid-pacman-chomp 340ms ease-in-out infinite;
-  will-change: clip-path;
-}
-
-.pacman-loader-pellet {
-  position: absolute;
-  z-index: 1;
-  right: -16px;
-  top: 27px;
+.streaming-loader-dot {
   width: 10px;
   height: 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 245, 0.98);
-  box-shadow: 0 0 0 1px rgba(255, 239, 190, 0.14);
-  animation: camelid-pellet-slide 1.6s linear infinite;
-  will-change: transform, opacity;
+  background: color-mix(in srgb, var(--color-info) 78%, white 22%);
+  box-shadow: 0 0 16px color-mix(in srgb, var(--color-info) 24%, transparent);
+  animation: camelid-streaming-dot-bounce 1s ease-in-out infinite;
 }
 
-.pacman-loader-pellet-1 { animation-delay: 0ms; }
-.pacman-loader-pellet-2 { animation-delay: -320ms; }
-.pacman-loader-pellet-3 { animation-delay: -640ms; }
-.pacman-loader-pellet-4 { animation-delay: -960ms; }
-.pacman-loader-pellet-5 { animation-delay: -1280ms; }
+.streaming-loader-dot-1 { animation-delay: 0ms; }
+.streaming-loader-dot-2 { animation-delay: 120ms; }
+.streaming-loader-dot-3 { animation-delay: 240ms; }
 
 .message-row-gemini.assistant::before,
 .message-row-gemini.assistant::after {
@@ -5970,21 +5949,12 @@ textarea.composer-input-gemini {
 }
 
 @media (max-width: 860px) {
-  .pacman-loader-track {
-    --pacman-pellet-travel: -228px;
-    width: 250px;
-    height: 54px;
+  .streaming-loader-track {
+    gap: 8px;
+    min-width: 56px;
   }
 
-  .pacman-loader-mouth {
-    width: 48px;
-    height: 48px;
-    top: 3px;
-  }
-
-  .pacman-loader-pellet {
-    right: -14px;
-    top: 23px;
+  .streaming-loader-dot {
     width: 8px;
     height: 8px;
   }
@@ -6005,38 +5975,18 @@ textarea.composer-input-gemini {
   }
 }
 
-@keyframes camelid-pacman-chomp {
-  0%, 100% {
-    clip-path: polygon(0 0, 100% 0, 100% 16%, 53% 50%, 100% 84%, 100% 100%, 0 100%);
+@keyframes camelid-streaming-dot-bounce {
+  0%, 80%, 100% {
+    transform: translateY(0) scale(0.9);
+    opacity: 0.48;
   }
-  50% {
-    clip-path: polygon(0 0, 100% 0, 100% 48%, 53% 50%, 100% 52%, 100% 100%, 0 100%);
+  40% {
+    transform: translateY(-3px) scale(1);
+    opacity: 1;
   }
 }
 
-@keyframes camelid-pellet-slide {
-  0% {
-    transform: translateX(0);
-    opacity: 0;
-  }
-  6% {
-    opacity: 1;
-  }
-  86% {
-    opacity: 1;
-    transform: translateX(calc(var(--pacman-pellet-travel) + 18px));
-  }
-  92% {
-    opacity: 0;
-    transform: translateX(var(--pacman-pellet-travel));
-  }
-  100% {
-    transform: translateX(var(--pacman-pellet-travel));
-    opacity: 0;
-  }
-}
-
-/* Demo polish: starter prompts and a neutral loader path keep videos clean even for Pac-Man prompts. */
+/* Demo polish: starter prompts and a clean neutral loader keep videos focused on the output. */
 .demo-prompt-panel {
   width: min(100%, 980px);
   display: grid;
@@ -6092,43 +6042,6 @@ textarea.composer-input-gemini {
   cursor: not-allowed;
   opacity: 0.55;
   transform: none;
-}
-
-.pacman-loader-neutral .pacman-loader-track {
-  --pacman-pellet-travel: -300px;
-}
-
-.pacman-loader-neutral .pacman-loader-mouth {
-  width: 22px;
-  height: 22px;
-  top: 21px;
-  left: 6px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--color-info) 82%, white 18%);
-  clip-path: none;
-  box-shadow:
-    0 0 0 8px color-mix(in srgb, var(--color-info) 13%, transparent),
-    0 0 30px color-mix(in srgb, var(--color-info) 42%, transparent);
-  animation: camelid-neutral-core 1.3s ease-in-out infinite;
-}
-
-.pacman-loader-neutral .pacman-loader-pellet {
-  top: 29px;
-  width: 8px;
-  height: 8px;
-  background: color-mix(in srgb, var(--color-ready) 70%, white 30%);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--color-ready) 32%, transparent);
-}
-
-@keyframes camelid-neutral-core {
-  0%, 100% {
-    transform: translateX(0) scale(0.9);
-    opacity: 0.82;
-  }
-  50% {
-    transform: translateX(10px) scale(1.18);
-    opacity: 1;
-  }
 }
 
 @media (max-width: 760px) {
