@@ -28,6 +28,41 @@ async fn health_reports_not_generation_ready() {
 }
 
 #[tokio::test]
+async fn capabilities_public_contract_omits_local_private_paths() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let serialized = body.to_string();
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "file://",
+        "file:\\",
+        "/Volumes/",
+        "/private/tmp/",
+        "C:\\Users\\",
+        "C:/Users/",
+        "\\Users\\",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "/api/capabilities must not expose local/private path marker {forbidden:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn capabilities_report_support_contract_and_planned_lanes() {
     let app = camelid::api::router();
     let response = app
