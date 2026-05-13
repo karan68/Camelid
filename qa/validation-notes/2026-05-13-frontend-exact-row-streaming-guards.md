@@ -22,6 +22,11 @@ Validation run on this checkout:
 - `cd frontend && npm run smoke:streaming` — PASS
 - `cd frontend && npm run smoke:ui` — PASS
 
+Follow-up clean-head refresh:
+- `main` at `2a72f75` (`Keep frontend streaming visibly active`) is a frontend presentation/test follow-up to this streaming guardrail lane.
+- Clean-head frontend smokes passed: `cd frontend && npm run smoke:integration`, `npm run smoke:streaming`, and `npm run smoke:ui`.
+- The refresh is UI reliability evidence only; it does not add row-specific parity, API/WebUI/RSS readiness, context, production-throughput, portability, or support-promotion evidence.
+
 Claim boundary:
 - This is frontend/UI reliability evidence for exact-row gating and streaming presentation.
 - It does not widen Llama, Mistral, Mixtral, Qwen, Gemma, or arbitrary-GGUF support.
