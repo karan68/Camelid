@@ -723,7 +723,7 @@ function findLocalPathStrings(value, location = '$') {
 }
 
 function localPathPattern() {
-  return /(?:^|[\s"'])(?:file:\/\/)?(?:\/Users\/[^\s"']+|\/home\/[^\s"']+|\/private\/var\/[^\s"']+|\/var\/folders\/[^\s"']+|\/tmp\/[^\s"']+|[A-Za-z]:\\Users\\[^\s"']+)/
+  return /(?:^|[\s"'])(?:(?:file:\/\/(?:localhost)?)?(?:\/Users\/[^\s"']+|\/home\/[^\s"']+|\/private\/(?:tmp|var)\/[^\s"']+|\/var\/folders\/[^\s"']+|\/tmp\/[^\s"']+|\/Volumes\/[^\s"']+)|(?:file:\/\/\/)?[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s"']+)/i
 }
 
 async function readJson(path) {

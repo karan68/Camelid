@@ -68,7 +68,10 @@ const privatePath = spawnSync(process.execPath, ['scripts/check-public-evidence-
 })
 assert.notEqual(privatePath.status, 0, 'public evidence manifests must not expose local/private paths')
 assert.match(privatePath.stderr, /must not expose local\/private path .*\/Users\/timtoole\/\.openclaw\/workspace\/projects\/Camelid\/target\/private\/report\.json/)
-assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/\/home\/tim\/\.cache\/camelid\/model\.gguf/)
+assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/localhost\/home\/tim\/\.cache\/camelid\/model\.gguf/)
+assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/localhost\/Volumes\/private-models\/llama\.gguf/)
+assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/\/C:\/Users\/tim\/AppData\/Local\/camelid\/model\.gguf/)
+assert.match(privatePath.stderr, /must not expose local\/private path .*\/private\/tmp\/camelid\/report\.json/)
 
 async function writePrivatePathEvidence(root) {
   const dir = join(root, 'private-path-test')
@@ -77,7 +80,10 @@ async function writePrivatePathEvidence(root) {
   await writeFile(join(dir, 'manifest.json'), `${JSON.stringify({
     schema: 'camelid.private_path_guard_test.v1',
     raw_artifact: privateMacPath,
-    nested: { model_uri: 'file:///home/tim/.cache/camelid/model.gguf' },
+    nested: { model_uri: 'file://localhost/home/tim/.cache/camelid/model.gguf' },
+    mounted_model: 'file://localhost/Volumes/private-models/llama.gguf',
+    windows_cache: 'file:///C:/Users/tim/AppData/Local/camelid/model.gguf',
+    private_tmp: '/private/tmp/camelid/report.json',
   }, null, 2)}\n`)
 }
 
