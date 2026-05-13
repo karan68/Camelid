@@ -310,6 +310,47 @@ try {
   assert.match(plannedExactMarkup, /Planned exact-row placeholder, not runnable support\./, 'API view should render the exact row evidence without broad-family inference')
   assert.doesNotMatch(plannedExactMarkup, /Selected exact row ready/, 'planned exact rows must not claim selected exact-row readiness even when runtime health is green')
 
+  const genericExactModel = {
+    id: 'custom-exact-row-q8-0',
+    name: 'Custom exact row Q8_0',
+    provider_kind: 'local',
+    status: 'ready',
+    loaded_now: true,
+    generation_ready: true,
+    quant: 'Q8_0',
+  }
+  const genericExactCapabilities = {
+    support_contract: capabilities.support_contract,
+    model_compatibility: [
+      {
+        id: 'custom_exact_row_q8_0',
+        status: 'supported_exact_row_smoke',
+        family: 'custom_decoder',
+        quantization: 'Q8_0',
+        support_scope: 'exact custom row only',
+        frontend_readiness_gate: 'green only when this exact custom row is selected and loaded',
+        latest_checked_bucket: 'frontend_fixture',
+        latest_checked_result: 'pass',
+        latest_checked_output: 'custom exact row fixture output',
+        full_support_status: 'blocked_pending_normalized_full_support',
+        full_support_blockers: 'no neighboring custom rows inherit support',
+        evidence: 'Custom exact row evidence from /api/capabilities.',
+        next_step: 'Keep row-id scoped.',
+      },
+    ],
+    api_features: [],
+  }
+  const genericExactMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: { ...readyRuntime, active_model_id: genericExactModel.id },
+    selectedModel: genericExactModel,
+    capabilities: genericExactCapabilities,
+  }))
+
+  assert.match(genericExactMarkup, /Selected exact row ready/, 'API view should support generic exact compatibility row ids without family-specific frontend matchers')
+  assert.match(genericExactMarkup, /custom_exact_row_q8_0/, 'API view should render generic selected exact-row ids from capabilities')
+  assert.match(genericExactMarkup, /Custom exact row evidence from \/api\/capabilities\./, 'API view should render generic exact-row evidence text')
+  assert.doesNotMatch(genericExactMarkup, /No selected model exact row matched/, 'generic exact row-id matches should not fall through to broad or missing support copy')
+
   console.log('Frontend integration smoke passed')
 } finally {
   await server.close()

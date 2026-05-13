@@ -177,6 +177,24 @@ assert.doesNotMatch(
   'ModelsView must not keep stale warm 8B 1024/2048 copy after fresh current-head PASS and alignment land',
 )
 
+const genericExactRowFixture = {
+  model_compatibility: [
+    {
+      id: 'custom_exact_row_q8_0',
+      family: 'custom_decoder',
+      quantization: 'Q8_0',
+      status: 'supported_exact_row_smoke',
+      frontend_readiness_gate: 'green only for this exact custom row id plus runtime readiness',
+      evidence: 'custom row id fixture evidence',
+    },
+  ],
+}
+const genericExactRowHint = findCompatibilityHint(genericExactRowFixture, { id: 'custom-exact-row-q8-0', name: 'Custom exact row Q8_0', quant: 'Q8_0' })
+assert.equal(genericExactRowHint.target.id, 'custom_exact_row_q8_0', 'generic backend compatibility row ids should be visible as exact evidence without adding a family-specific matcher')
+assert.equal(isExactCompatibilityHint(genericExactRowHint), true, 'generic row-id matches should stay exact-row scoped')
+assert.equal(isCompatibilitySupportedForModel(genericExactRowFixture, { id: 'custom-exact-row-q8-0', quant: 'Q8_0' }), true, 'supported generic exact rows should unlock only through the exact row id and quant evidence')
+assert.equal(isCompatibilitySupportedForModel(genericExactRowFixture, { id: 'custom-exact-row-q4-0', quant: 'Q4_0' }), false, 'generic exact rows should not unlock neighboring quantized filenames')
+
 const trackedTargets = getTrackedCompatibilityTargets(capabilityFixture)
 assert.deepEqual(
   trackedTargets.map((target) => target.id),

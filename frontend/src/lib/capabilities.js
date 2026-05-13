@@ -253,18 +253,32 @@ export function getTrackedCompatibilityTargets(capabilities, ids = TRACKED_FULL_
   return ids.map((id) => targets.find((target) => target.id === id) || null).filter(Boolean)
 }
 
-function getModelCapabilitySubject(model, catalogItem) {
+function getModelCapabilityFields(model, catalogItem) {
   return [
     model?.id,
-    model?.name,
     model?.runtime_model_name,
+    model?.name,
     model?.hf_repo,
     model?.hf_filename,
     model?.model_path,
     catalogItem?.name,
     catalogItem?.repo_id,
     catalogItem?.filename,
-  ].filter(Boolean).join(' ').toLowerCase()
+  ].filter(Boolean).map((value) => String(value))
+}
+
+function getModelCapabilitySubject(model, catalogItem) {
+  return getModelCapabilityFields(model, catalogItem).join(' ').toLowerCase()
+}
+
+function normalizeExactRowIdentity(value) {
+  return String(value || '').trim().toLowerCase().replace(/\.gguf$/i, '').replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+}
+
+function findExactCompatibilityRowByIdentity(rows, model, catalogItem) {
+  const identities = new Set(getModelCapabilityFields(model, catalogItem).map(normalizeExactRowIdentity).filter(Boolean))
+  if (!identities.size) return null
+  return rows.find((row) => row?.id && identities.has(normalizeExactRowIdentity(row.id))) || null
 }
 
 export function findCompatibilityHint(capabilities, model, catalogItem) {
@@ -276,6 +290,8 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
 
   const findRow = (predicate) => rows.find(predicate) || null
   const findFamily = (predicate) => plannedFamilies.find(predicate) || null
+  const exactIdentityTarget = findExactCompatibilityRowByIdentity(rows, model, catalogItem)
+  if (exactIdentityTarget) return quantAwareCompatibilityHint(exactIdentityTarget, quantKey, 'exact /api/capabilities row id match', { exact: true })
 
   if (subject.includes('tinyllama')) {
     const target = findRow((row) => row.id.includes('tinyllama'))
