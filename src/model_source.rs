@@ -393,9 +393,12 @@ fn has_extension(path: &Path, extension: &str) -> bool {
 }
 
 fn source_id(path: &Path) -> String {
-    path.file_stem()
-        .or_else(|| path.file_name())
-        .and_then(|value| value.to_str())
+    let name = if has_extension(path, "gguf") {
+        path.file_stem().or_else(|| path.file_name())
+    } else {
+        path.file_name()
+    };
+    name.and_then(|value| value.to_str())
         .unwrap_or("model")
         .to_string()
 }
@@ -613,6 +616,31 @@ mod tests {
         );
         let message = &inspection.readiness.blockers[0].message;
         assert!(message.ends_with("invalid entries: a.weight, z.weight"));
+    }
+
+    #[test]
+    fn hf_directory_source_id_preserves_dotted_model_name() {
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("Meta-Llama-3.1-8B-Instruct");
+        fs::create_dir(&model_dir).unwrap();
+        write_llama_config(&model_dir);
+        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        fs::write(model_dir.join("model.safetensors"), b"").unwrap();
+
+        let inspection = inspect_model_source(&model_dir).unwrap();
+
+        assert_eq!(inspection.manifest.id, "Meta-Llama-3.1-8B-Instruct");
+    }
+
+    #[test]
+    fn gguf_file_source_id_strips_only_gguf_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("TinyLlama-1.1B-Chat-v1.0.Q8_0.gguf");
+        fs::write(&path, b"").unwrap();
+
+        let inspection = inspect_model_source(&path).unwrap();
+
+        assert_eq!(inspection.manifest.id, "TinyLlama-1.1B-Chat-v1.0.Q8_0");
     }
 
     fn write_llama_config(root: &Path) {
