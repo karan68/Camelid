@@ -37,6 +37,9 @@ enum Command {
         /// Enable the experimental Metal dense linear-row path on macOS.
         #[arg(long, env = "CAMELID_METAL_LINEAR", default_value_t = false)]
         metal_linear: bool,
+        /// Enable the experimental Metal Q8_0 encoded row-dot path on macOS.
+        #[arg(long, env = "CAMELID_METAL_Q8", default_value_t = false)]
+        metal_q8: bool,
         /// Log the current acceleration/runtime discovery state at startup.
         #[arg(long, default_value_t = true)]
         log_acceleration: bool,
@@ -125,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
             parallel_linear_min_outputs,
             apple_accelerate_min_elements,
             metal_linear,
+            metal_q8,
             log_acceleration,
         } => {
             configure_rayon_threads(threads)?;
@@ -132,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
                 parallel_linear_min_outputs,
                 apple_accelerate_min_elements,
                 metal_linear,
+                metal_q8,
             );
             if log_acceleration {
                 log_acceleration_state();
@@ -667,6 +672,7 @@ fn apply_runtime_tuning_env(
     parallel_linear_min_outputs: Option<usize>,
     apple_accelerate_min_elements: Option<usize>,
     metal_linear: bool,
+    metal_q8: bool,
 ) {
     if let Some(value) = parallel_linear_min_outputs.filter(|value| *value > 0) {
         std::env::set_var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS", value.to_string());
@@ -676,6 +682,9 @@ fn apply_runtime_tuning_env(
     }
     if metal_linear {
         std::env::set_var("CAMELID_METAL_LINEAR", "1");
+    }
+    if metal_q8 {
+        std::env::set_var("CAMELID_METAL_Q8", "1");
     }
 }
 
@@ -693,6 +702,14 @@ fn log_acceleration_state() {
             .unwrap_or("default(262144 on macOS)"),
         apple_accelerate = cfg!(target_os = "macos"),
         metal_linear = std::env::var("CAMELID_METAL_LINEAR")
+            .ok()
+            .as_deref()
+            .unwrap_or("off"),
+        metal_q8 = std::env::var("CAMELID_METAL_Q8")
+            .ok()
+            .as_deref()
+            .unwrap_or("off"),
+        metal_q8_retained = std::env::var("CAMELID_METAL_Q8_RETAINED")
             .ok()
             .as_deref()
             .unwrap_or("off"),

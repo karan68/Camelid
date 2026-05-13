@@ -95,6 +95,9 @@ Backend runtime knobs used during performance work:
 - `CAMELID_Q8_0_FILE_READER_CHUNK_BYTES` controls the target Q8_0 row-read chunk size for borrowed/file-backed row readers. Default: `33554432` (32 MiB). This is a read-pattern/performance knob only.
 - `CAMELID_Q8_0_FILE_READER_OUTPUT_SCRATCH_BYTES` caps reusable f32 output scratch for multi-row lazy-Q8 file-backed matmuls. Default: `67108864` (64 MiB). This is an RSS/read-reuse tuning knob only.
 - `CAMELID_Q8_0_FILE_READER_RETAINED_SCRATCH_BYTES` caps how much per-thread Q8 file-reader scratch capacity is retained after oversized row, scale, quantized-input, and output chunks. Default: `67108864` (64 MiB). This is an RSS headroom knob only; it does not promote 8B 1024/2048 support by itself.
+- `CAMELID_KV_CACHE_GROW_TOKENS` controls KV-cache allocation growth for model-sized contexts. Default: `256` positions when context length is at least 512; tiny diagnostic/test contexts keep exact one-position growth. This reduces repeated realloc/copy churn during decode and is a runtime performance knob only.
+- `CAMELID_METAL_Q8` / `--metal-q8` enables the experimental macOS Metal Q8_0 encoded file-backed row-dot path. It is opt-in, falls back to CPU when unavailable, and is not support evidence by itself.
+- `CAMELID_METAL_Q8_RETAINED` enables an even narrower retained-Q8 Metal experiment. Current local 3B profiling showed this retained path is slower than CPU, so it is intentionally separate from `--metal-q8` and should be used only for kernel experiments.
 
 If a command depends on more than that, document the requirement in the same PR.
 

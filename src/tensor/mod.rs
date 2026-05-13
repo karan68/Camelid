@@ -79,6 +79,7 @@ pub enum RuntimeDType {
     F32,
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Q8_0Block {
     pub scale: f32,

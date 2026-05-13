@@ -14,7 +14,6 @@ use std::{
 use rayon::prelude::*;
 use serde::Serialize;
 
-#[cfg(target_os = "macos")]
 use crate::metal;
 
 use crate::{
@@ -96,7 +95,8 @@ impl LlamaKvCache {
         if required_sequence_length <= self.allocated_sequence_length {
             return Ok(());
         }
-        let values = required_sequence_length
+        let target_sequence_length = self.grow_sequence_length(required_sequence_length);
+        let values = target_sequence_length
             .checked_mul(self.plan.layer_count)
             .and_then(|value| value.checked_mul(self.plan.kv_head_count))
             .and_then(|value| value.checked_mul(self.plan.head_dim))
@@ -105,8 +105,19 @@ impl LlamaKvCache {
             })?;
         self.keys.resize(values, 0.0);
         self.values.resize(values, 0.0);
-        self.allocated_sequence_length = required_sequence_length;
+        self.allocated_sequence_length = target_sequence_length;
         Ok(())
+    }
+
+    fn grow_sequence_length(&self, required_sequence_length: usize) -> usize {
+        let grow_tokens = kv_cache_grow_tokens(self.plan.max_sequence_length);
+        if grow_tokens <= 1 {
+            return required_sequence_length;
+        }
+        required_sequence_length
+            .div_ceil(grow_tokens)
+            .saturating_mul(grow_tokens)
+            .min(self.plan.max_sequence_length)
     }
 
     pub fn allocated_elements(&self) -> usize {
@@ -116,6 +127,17 @@ impl LlamaKvCache {
     pub fn allocated_bytes(&self) -> u64 {
         (self.allocated_elements() as u64) * (std::mem::size_of::<f32>() as u64)
     }
+}
+
+fn kv_cache_grow_tokens(max_sequence_length: usize) -> usize {
+    if max_sequence_length < 512 {
+        return 1;
+    }
+    env::var("CAMELID_KV_CACHE_GROW_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(256)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -5493,19 +5515,58 @@ fn gated_ffn_activation(
     let mut gate = vec![0.0; gate_width];
     let mut up = vec![0.0; up_width];
 
-    let started = Instant::now();
-    accumulate_linear_row(
-        input_row,
-        gate_weight,
-        &mut gate,
-        "ffn gate",
-        collect_diagnostics,
-    )?;
-    let gate_elapsed = started.elapsed().as_micros();
+    let shared_q8_gate_up = if collect_diagnostics {
+        None
+    } else {
+        match (
+            borrowed_linear_weight_as_transposed(gate_weight, input_width),
+            borrowed_linear_weight_as_transposed(up_weight, input_width),
+        ) {
+            (Ok(gate_transposed), Ok(up_transposed))
+                if gate_transposed.rows == gate_width
+                    && up_transposed.rows == up_width
+                    && should_use_borrowed_q8_0_block_dot(gate_transposed, input_width)
+                    && should_use_borrowed_q8_0_block_dot(up_transposed, input_width) =>
+            {
+                Some((gate_transposed, up_transposed))
+            }
+            _ => None,
+        }
+    };
 
-    let started = Instant::now();
-    accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", collect_diagnostics)?;
-    let up_elapsed = started.elapsed().as_micros();
+    let (gate_elapsed, up_elapsed) =
+        if let Some((gate_transposed, up_transposed)) = shared_q8_gate_up {
+            let started = Instant::now();
+            let quantized_input = quantize_q8_0_row(input_row);
+            accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+                &quantized_input.blocks,
+                gate_transposed,
+                &mut gate,
+            );
+            let gate_elapsed = started.elapsed().as_micros();
+
+            let started = Instant::now();
+            accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+                &quantized_input.blocks,
+                up_transposed,
+                &mut up,
+            );
+            (gate_elapsed, started.elapsed().as_micros())
+        } else {
+            let started = Instant::now();
+            accumulate_linear_row(
+                input_row,
+                gate_weight,
+                &mut gate,
+                "ffn gate",
+                collect_diagnostics,
+            )?;
+            let gate_elapsed = started.elapsed().as_micros();
+
+            let started = Instant::now();
+            accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", collect_diagnostics)?;
+            (gate_elapsed, started.elapsed().as_micros())
+        };
 
     let gate_projection = collect_diagnostics
         .then(|| CpuTensor::from_f32("ffn_gate_diagnostic", vec![1, gate_width], gate.clone()))
@@ -6029,6 +6090,30 @@ fn q8_0_file_reader_block_dot_enabled() -> bool {
     !q8_0_env_flag_disabled("CAMELID_Q8_0_FILE_READER_BLOCK_DOT")
 }
 
+fn q8_0_metal_enabled() -> bool {
+    env::var("CAMELID_METAL_Q8")
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("enabled")
+        })
+        .unwrap_or(false)
+}
+
+fn q8_0_metal_retained_enabled() -> bool {
+    env::var("CAMELID_METAL_Q8_RETAINED")
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("enabled")
+        })
+        .unwrap_or(false)
+}
+
 fn auto_retain_q8_0_blocks_for_fast_local_chat(binding: &LlamaTensorBinding) -> bool {
     const DEFAULT_FAST_RETAINED_Q8_0_MAX_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
@@ -6203,6 +6288,21 @@ fn matmul_rhs_transposed_q8_0_block_dot(
             quantize_q8_0_row(&input.data[input_start..input_start + input_width]);
         let out_start = row * output_width;
         let output_row = &mut output[out_start..out_start + output_width];
+        if q8_0_metal_retained_enabled() {
+            let (input_scales, input_quants) =
+                q8_0_block_scales_and_quants(&quantized_input.blocks);
+            let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
+            if metal::try_q8_0_block_linear_row(
+                &input_scales,
+                &input_quants,
+                weight_bytes,
+                output_width,
+                blocks_per_row,
+                output_row,
+            ) {
+                continue;
+            }
+        }
         if should_parallelize_q8_0_file_reader_output(output_width) {
             output_row
                 .par_iter_mut()
@@ -6299,6 +6399,25 @@ fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
             int_sum as f32 * weight_block.scale * input_block.scale
         })
         .sum()
+}
+
+fn q8_0_block_scales_and_quants(blocks: &[Q8_0Block]) -> (Vec<f32>, Vec<i8>) {
+    let mut scales = Vec::with_capacity(blocks.len());
+    let mut quants = Vec::with_capacity(blocks.len() * Q8_0_BLOCK_VALUES);
+    for block in blocks {
+        scales.push(block.scale);
+        quants.extend_from_slice(&block.quants);
+    }
+    (scales, quants)
+}
+
+fn q8_0_blocks_as_bytes(blocks: &[Q8_0Block]) -> &[u8] {
+    debug_assert_eq!(mem::size_of::<Q8_0Block>(), 36);
+    // SAFETY: Q8_0Block is #[repr(C)] with f32 scale followed by 32 i8 quants.
+    // The Metal retained-Q8 kernel treats this exact byte layout as immutable input.
+    unsafe {
+        std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), std::mem::size_of_val(blocks))
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -6446,7 +6565,25 @@ fn matmul_rhs_transposed_q8_0_block_reader(
                             scales,
                         )?;
                         let output_chunk = &mut output[output_idx..output_idx + rows_this_chunk];
-                        if parallelize_output {
+                        let completed_with_metal = if use_q8_0_block_dot && q8_0_metal_enabled() {
+                            let (input_scales, input_quants) = q8_0_block_scales_and_quants(
+                                &quantized_input_blocks[..blocks_per_row],
+                            );
+                            metal::try_q8_0_encoded_linear_row(
+                                &input_scales,
+                                &input_quants,
+                                chunk,
+                                scales,
+                                rows_this_chunk,
+                                blocks_per_row,
+                                output_chunk,
+                            )
+                        } else {
+                            false
+                        };
+                        if completed_with_metal {
+                            // Opt-in experimental Metal Q8 path completed this chunk.
+                        } else if parallelize_output {
                             output_chunk
                                 .par_iter_mut()
                                 .zip(chunk.par_chunks_exact(row_bytes_len))
@@ -7551,12 +7688,24 @@ fn accumulate_transposed_linear_row_q8_0_block_dot(
     weight: BorrowedLinearWeight<'_>,
     output: &mut [f32],
 ) {
-    let blocks_per_row = input_row.len() / Q8_0_BLOCK_VALUES;
+    let quantized_input = quantize_q8_0_row(input_row);
+    accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+        &quantized_input.blocks,
+        weight,
+        output,
+    );
+}
+
+fn accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+    quantized_input: &[Q8_0Block],
+    weight: BorrowedLinearWeight<'_>,
+    output: &mut [f32],
+) {
+    let blocks_per_row = quantized_input.len();
     let weight_blocks = weight
         .q8_0_blocks
         .expect("q8_0 block-dot precondition checked");
     debug_assert_eq!(weight_blocks.len(), output.len() * blocks_per_row);
-    let quantized_input = quantize_q8_0_row(input_row);
     if should_parallelize_linear_output(output.len()) {
         output
             .par_iter_mut()
@@ -7565,7 +7714,7 @@ fn accumulate_transposed_linear_row_q8_0_block_dot(
                 let weight_start = out_idx * blocks_per_row;
                 *out_value = q8_0_dot_rows(
                     &weight_blocks[weight_start..weight_start + blocks_per_row],
-                    &quantized_input.blocks,
+                    quantized_input,
                 );
             });
         return;
@@ -7574,7 +7723,7 @@ fn accumulate_transposed_linear_row_q8_0_block_dot(
         let weight_start = out_idx * blocks_per_row;
         *out_value = q8_0_dot_rows(
             &weight_blocks[weight_start..weight_start + blocks_per_row],
-            &quantized_input.blocks,
+            quantized_input,
         );
     }
 }
@@ -13504,6 +13653,27 @@ mod tests {
             &kv_cache.values[prior_layer1_start..prior_layer1_start + 2],
             &[7.0, 8.0]
         );
+    }
+
+    #[test]
+    fn kv_cache_uses_paged_growth_for_model_sized_contexts() {
+        let plan = LlamaKvCachePlan {
+            max_sequence_length: 1024,
+            layer_count: 2,
+            kv_head_count: 1,
+            head_dim: 2,
+            key_shape: vec![2, 1024, 1, 2],
+            value_shape: vec![2, 1024, 1, 2],
+        };
+        let mut kv_cache = LlamaKvCache::new(plan).expect("KV cache");
+        let key = CpuTensor::from_f32("key", vec![1, 2], vec![1.0, 2.0]).unwrap();
+        let value = CpuTensor::from_f32("value", vec![1, 2], vec![3.0, 4.0]).unwrap();
+
+        write_kv_cache(&mut kv_cache, 0, &key, &value).unwrap();
+
+        assert_eq!(kv_cache.allocated_sequence_length, 256);
+        assert_eq!(kv_cache.keys.len(), 1024);
+        assert_eq!(kv_cache.values.len(), 1024);
     }
 
     #[test]
