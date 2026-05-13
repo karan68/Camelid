@@ -436,7 +436,7 @@ export default function ChatWorkspace({
   const pendingUserPrompt = pendingPromptAlreadyVisible ? '' : pendingPrompt
   const lastVisibleMessage = visibleMessages.at(-1)
   const lastVisibleMessageIsUser = lastVisibleMessage?.role === 'user'
-  const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && (pendingPrompt || lastVisibleMessageIsUser || sending))
+  const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && !hasStreamingAssistant && (pendingPrompt || lastVisibleMessageIsUser || sending))
   const streamingScrollSignature = useMemo(() => (
     visibleMessages.map((message) => `${message.id}:${message.streaming ? 'streaming' : 'done'}:${String(message.content || '').length}`).join('|')
     + `|awaiting:${awaitingAssistant ? '1' : '0'}|active:${generationActive ? '1' : '0'}`

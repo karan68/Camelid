@@ -148,6 +148,35 @@ try {
   assert.match(preTokenMarkup, /Waiting for first token/, 'pre-token streaming should render the first-token live status')
   assert.match(preTokenMarkup, /pacman-loader-mouth/, 'pre-token streaming should render the active loader, not a static placeholder')
 
+  const preTokenSendingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: {
+      id: 'conversation-pre-token-active-send',
+      title: 'Pre-token active send',
+      updated_at: '2026-05-13T04:21:00.000Z',
+      messages: [
+        { id: 'user-3', role: 'user', content: 'Say hello', created_at: '2026-05-13T04:21:00.000Z' },
+        { id: 'assistant-3', role: 'assistant', content: '', streaming: true, streaming_phase: 'generating', created_at: '2026-05-13T04:21:01.000Z' },
+      ],
+    },
+    selectedModel,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+    runtime: readyRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: '',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: true,
+    selectedModelRunnable: true,
+    setTab: noop,
+  }))
+
+  assert.equal((preTokenSendingMarkup.match(/data-streaming-state="active"/g) || []).length, 1, 'active send with an inserted pre-token assistant row should not render a duplicate pending assistant loader')
+  assert.equal((preTokenSendingMarkup.match(/pacman-loader-track/g) || []).length, 1, 'pre-token active send should keep exactly one visible live loader for the backend generation')
+
   const exactReadyMarkup = renderToStaticMarkup(React.createElement(ApiView, {
     runtime: readyRuntime,
     selectedModel,
