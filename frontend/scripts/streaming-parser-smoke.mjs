@@ -59,4 +59,33 @@ assert.ok(streamEvents.includes('bytes'), 'stream parser should expose first-byt
 assert.ok(streamEvents.includes('role'), 'stream parser should expose role-only chunks while waiting for first content token')
 assert.ok(streamEvents.includes('usage'), 'stream parser should expose backend usage chunks before finalizing the assistant row')
 
+const partialBeforeError = []
+const errorEvents = []
+await assert.rejects(
+  () => readStreamingChatCompletion(new Response(streamFromChunks([
+    'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n',
+    'event: error\n',
+    'data: {"error":{"code":"generation_step_failed","message":"backend failed after headers"}}\n\n',
+    'data: [DONE]\n\n',
+  ]), {
+    status: 200,
+    headers: { 'content-type': 'text/event-stream' },
+  }), (_delta, fullContent) => {
+    partialBeforeError.push(fullContent)
+  }, {
+    onStreamEvent(event) {
+      errorEvents.push(event.type)
+    },
+  }),
+  (error) => {
+    assert.equal(error.message, 'backend failed after headers')
+    assert.equal(error.code, 'generation_step_failed')
+    assert.deepEqual(error.payload, { error: { code: 'generation_step_failed', message: 'backend failed after headers' } })
+    return true
+  },
+  'SSE error events sent after streaming headers should reject instead of becoming an empty assistant reply',
+)
+assert.deepEqual(partialBeforeError, ['partial'], 'stream parser should expose visible partial content before a later SSE error')
+assert.ok(errorEvents.includes('error'), 'stream parser should surface structured SSE error events to callers')
+
 console.log('Streaming parser smoke passed')

@@ -280,7 +280,7 @@ function getErrorMessage(error, fallback = 'Request failed.') {
 }
 
 function getBackendErrorCode(error) {
-  return error?.body?.error?.code || error?.error?.code || ''
+  return error?.body?.error?.code || error?.payload?.error?.code || error?.error?.code || error?.code || ''
 }
 
 function isTypedUnsupportedBackendError(code, message) {
@@ -758,6 +758,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
       setSelectedConversationId(conversation.id)
     } catch (error) {
+      const pendingPatchAtFailure = pendingAssistantPatch
       if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(pendingAssistantFrame)
         pendingAssistantFrame = null
@@ -771,13 +772,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 ...item,
                 messages: (item.messages || []).map((message) => (
                   message.id === assistantId
-                    ? {
-                        ...message,
-                        content: message.content && message.content !== '…' ? message.content : '(generation stopped)',
-                        finish_reason: 'error',
-                        streaming: false,
-                        streaming_phase: null,
-                      }
+                    ? (() => {
+                        const patchedMessage = { ...message, ...(pendingPatchAtFailure || {}) }
+                        return {
+                          ...patchedMessage,
+                          content: patchedMessage.content && patchedMessage.content !== '…' ? patchedMessage.content : '(generation stopped)',
+                          finish_reason: 'error',
+                          streaming: false,
+                          streaming_phase: null,
+                        }
+                      })()
                     : message
                 )),
                 updated_at: nowIso(),

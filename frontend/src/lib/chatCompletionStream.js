@@ -22,6 +22,21 @@ function readSseDataLines(eventText) {
     .map((line) => line.slice(5).trimStart())
 }
 
+function isSseErrorEvent(eventText) {
+  return String(eventText || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .some((line) => line.trim().toLowerCase() === 'event: error')
+}
+
+function makeStreamPayloadError(payload, fallback = 'Streaming response failed.') {
+  const message = payload?.error?.message || payload?.message || fallback
+  const error = new Error(message)
+  error.payload = payload
+  error.code = payload?.error?.code || payload?.code || ''
+  return error
+}
+
 export function readChatCompletionJsonPayload(payload, { estimateTokenCount = defaultEstimateTokenCount } = {}) {
   const choice = payload?.choices?.[0]
   const content = choice?.message?.content ?? choice?.text ?? ''
@@ -80,6 +95,7 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
 
   const consumeEvent = (eventText) => {
     const dataLines = readSseDataLines(eventText)
+    const errorEvent = isSseErrorEvent(eventText)
     if (dataLines.length && firstEventMs === null) firstEventMs = performance.now() - streamStartedAt
     for (const data of dataLines) {
       if (!data) continue
@@ -91,7 +107,12 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
       try {
         chunk = JSON.parse(data)
       } catch {
+        if (errorEvent) throw makeStreamPayloadError(null, data || 'Streaming response failed.')
         continue
+      }
+      if (chunk?.error || errorEvent) {
+        onStreamEvent?.({ type: 'error', error: chunk?.error || chunk, ...streamMetrics() })
+        throw makeStreamPayloadError(chunk)
       }
       if (chunk?.usage && typeof chunk.usage === 'object') {
         usage = chunk.usage
