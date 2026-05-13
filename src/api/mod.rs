@@ -273,6 +273,7 @@ pub struct CompletionRequest {
     pub best_of: Option<u32>,
     pub logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
 }
 
@@ -292,6 +293,7 @@ pub struct ChatMessage {
 enum PromptInput {
     Text(String),
     Chat(Vec<ChatMessage>),
+    TokenIds(Vec<u32>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -340,6 +342,7 @@ pub struct GenerationSessionRequest {
     pub chat_logprobs: Option<bool>,
     pub top_logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
 }
 
@@ -1479,6 +1482,7 @@ async fn completions(
         chat_logprobs: None,
         top_logprobs: None,
         camelid_logit_token_ids: req.camelid_logit_token_ids,
+        camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
     };
     let stream = req.stream.unwrap_or(false);
@@ -1570,6 +1574,7 @@ async fn chat_completions(
         chat_logprobs: req.logprobs,
         top_logprobs: req.top_logprobs,
         camelid_logit_token_ids: req.camelid_logit_token_ids,
+        camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
     };
     let stream = req.stream.unwrap_or(false);
@@ -1861,17 +1866,18 @@ async fn prepare_generation(
         ));
     }
 
-    let input = match (req.prompt, req.messages) {
-        (Some(prompt), None) if !prompt.is_empty() => PromptInput::Text(prompt),
-        (None, Some(messages)) if !messages.is_empty() => {
+    let input = match (req.prompt, req.messages, req.camelid_prompt_token_ids) {
+        (Some(prompt), None, None) if !prompt.is_empty() => PromptInput::Text(prompt),
+        (None, Some(messages), None) if !messages.is_empty() => {
             validate_chat_messages(&messages).map_err(|response| *response)?;
             PromptInput::Chat(messages)
         }
-        (Some(_), Some(_)) => {
+        (None, None, Some(token_ids)) if !token_ids.is_empty() => PromptInput::TokenIds(token_ids),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "ambiguous_generation_input",
-                "send either prompt or messages, not both".to_string(),
+                "send exactly one of prompt, messages, or camelid_prompt_token_ids".to_string(),
                 None,
             ))
         }
@@ -1879,7 +1885,7 @@ async fn prepare_generation(
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "missing_generation_input",
-                "generation requires a non-empty prompt or messages array".to_string(),
+                "generation requires a non-empty prompt, messages array, or camelid_prompt_token_ids array".to_string(),
                 None,
             ))
         }
@@ -1924,29 +1930,59 @@ async fn prepare_generation(
             None,
         )
     })?;
-    let rendered_prompt = match input {
-        PromptInput::Text(prompt) => RenderedPrompt {
-            text: prompt,
-            add_special: true,
-            parse_special: false,
-        },
-        PromptInput::Chat(messages) => render_chat_prompt_for_tokenization(&messages, &tokenizer),
+    let token_ids = match input {
+        PromptInput::Text(prompt) => {
+            let rendered_prompt = RenderedPrompt {
+                text: prompt,
+                add_special: true,
+                parse_special: false,
+            };
+            let mut token_ids = tokenizer
+                .encode(
+                    &rendered_prompt.text,
+                    rendered_prompt.add_special,
+                    rendered_prompt.parse_special,
+                )
+                .map_err(|err| {
+                    api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "tokenization_failed",
+                        err.to_string(),
+                        Some("prompt"),
+                    )
+                })?;
+            normalize_mistral_instruct_bos_prefix_tokens(
+                &mut token_ids,
+                &rendered_prompt,
+                &tokenizer,
+            );
+            token_ids
+        }
+        PromptInput::Chat(messages) => {
+            let rendered_prompt = render_chat_prompt_for_tokenization(&messages, &tokenizer);
+            let mut token_ids = tokenizer
+                .encode(
+                    &rendered_prompt.text,
+                    rendered_prompt.add_special,
+                    rendered_prompt.parse_special,
+                )
+                .map_err(|err| {
+                    api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "tokenization_failed",
+                        err.to_string(),
+                        Some("messages"),
+                    )
+                })?;
+            normalize_mistral_instruct_bos_prefix_tokens(
+                &mut token_ids,
+                &rendered_prompt,
+                &tokenizer,
+            );
+            token_ids
+        }
+        PromptInput::TokenIds(token_ids) => token_ids,
     };
-    let mut token_ids = tokenizer
-        .encode(
-            &rendered_prompt.text,
-            rendered_prompt.add_special,
-            rendered_prompt.parse_special,
-        )
-        .map_err(|err| {
-            api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "tokenization_failed",
-                err.to_string(),
-                Some("prompt"),
-            )
-        })?;
-    normalize_mistral_instruct_bos_prefix_tokens(&mut token_ids, &rendered_prompt, &tokenizer);
     timings.tokenize = tokenization_started.elapsed().as_millis();
     if token_ids.is_empty() {
         return Err(api_error(
