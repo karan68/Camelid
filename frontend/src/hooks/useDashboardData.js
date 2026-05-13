@@ -716,7 +716,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       }, {
         estimateTokenCount,
         onStreamEvent(event) {
-          if (event.type === 'bytes' || event.type === 'role') {
+          if (event.type === 'bytes' || event.type === 'role' || event.type === 'json_fallback') {
             markAssistantStreamState({
               streaming_phase: 'generating',
               first_byte_ms: event.firstByteMs ?? null,

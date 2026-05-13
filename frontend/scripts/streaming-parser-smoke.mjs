@@ -27,6 +27,28 @@ function streamFromChunks(chunks) {
   })
 }
 
+const fallbackEvents = []
+const fallbackDeltas = []
+const fallback = await readStreamingChatCompletion(new Response(JSON.stringify({
+  choices: [{ message: { content: 'json fallback reply' }, finish_reason: 'stop' }],
+  usage: { completion_tokens: 3 },
+}), {
+  status: 200,
+  headers: { 'content-type': 'application/json' },
+}), (delta, fullContent, metrics) => {
+  fallbackDeltas.push({ delta, fullContent, firstByteMs: metrics.firstByteMs, firstContentMs: metrics.firstContentMs })
+}, {
+  onStreamEvent(event) {
+    fallbackEvents.push(event.type)
+  },
+})
+assert.equal(fallback.content, 'json fallback reply', 'JSON fallback should preserve assistant content through the streaming reader')
+assert.equal(fallback.completionTokens, 3, 'JSON fallback should preserve exact backend completion-token usage')
+assert.equal(fallback.firstByteMs, 0, 'JSON fallback should expose response-header progress so the UI can stay visibly active')
+assert.ok(fallback.firstContentMs >= 0, 'JSON fallback should expose first-content timing once the body is parsed')
+assert.deepEqual(fallbackEvents, ['json_fallback'], 'JSON fallback should notify callers before the final assistant content is available')
+assert.deepEqual(fallbackDeltas.map((item) => item.fullContent), ['json fallback reply'], 'JSON fallback should still deliver one visible content update')
+
 const response = new Response(streamFromChunks([
   'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
   'data: {"choices":[{"delta":{"content":"```js\\nconst"}}]}\n\n',

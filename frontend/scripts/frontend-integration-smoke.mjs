@@ -175,7 +175,7 @@ try {
   }))
 
   assert.match(preTokenMarkup, /data-streaming-state="active"/, 'pre-token assistant rows should remain visibly active while the backend is generating')
-  assert.match(preTokenMarkup, /Waiting for first token/, 'pre-token streaming should render the first-token live status')
+  assert.match(preTokenMarkup, /Backend is generating/, 'pre-token streaming should render the active backend-generation live status')
   assert.match(preTokenMarkup, /pacman-loader-mouth/, 'pre-token streaming should render the active loader, not a static placeholder')
 
   const completedUnclosedFenceMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {

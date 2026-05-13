@@ -65,11 +65,13 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
 
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('application/json')) {
+    const responseStartedAt = performance.now()
+    onStreamEvent?.({ type: 'json_fallback', elapsedMs: 0, firstByteMs: 0, firstEventMs: null, firstContentMs: null })
     const payload = await response.json()
     const parsed = readChatCompletionJsonPayload(payload, { estimateTokenCount })
-    onStreamEvent?.({ type: 'json_fallback', elapsedMs: 0, firstByteMs: null, firstContentMs: null })
-    if (parsed.content) onDelta(parsed.content, parsed.content, { completionTokens: parsed.completionTokens, elapsedMs: 0, firstContentMs: null })
-    return parsed
+    const elapsedMs = performance.now() - responseStartedAt
+    if (parsed.content) onDelta(parsed.content, parsed.content, { completionTokens: parsed.completionTokens, elapsedMs, firstByteMs: 0, firstEventMs: null, firstContentMs: elapsedMs })
+    return { ...parsed, firstByteMs: 0, firstEventMs: null, firstContentMs: parsed.content ? elapsedMs : null }
   }
 
   const reader = response.body?.getReader()

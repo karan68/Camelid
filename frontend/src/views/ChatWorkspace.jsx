@@ -271,7 +271,7 @@ const hasOpenCodeFence = (content) => {
 }
 
 const PREPARING_STREAMING_LABEL = 'Preparing local response'
-const FIRST_TOKEN_STREAMING_LABEL = 'Waiting for first token'
+const FIRST_TOKEN_STREAMING_LABEL = 'Backend is generating'
 const LONG_FIRST_TOKEN_STREAMING_LABEL = 'Local response is taking a while'
 const ACTIVE_STREAMING_LABEL = 'Streaming response'
 const OPEN_CODE_STREAMING_LABEL = 'Streaming code response'
