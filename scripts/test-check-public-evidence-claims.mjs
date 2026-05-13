@@ -9,6 +9,7 @@ const tempRoot = await mkdtemp(join(tmpdir(), 'camelid-evidence-claims-'))
 const goodRoot = join(tempRoot, 'good')
 const badRoot = join(tempRoot, 'bad')
 const staleMixtralRoot = join(tempRoot, 'stale-mixtral')
+const privatePathRoot = join(tempRoot, 'private-path')
 
 await writeBundle(goodRoot, { mutate: false })
 await writeSingleRowContextBundle(goodRoot, { mutate: false })
@@ -25,6 +26,7 @@ await writeMistralContext51210242048Bundle(badRoot, { mutate: true })
 await writeLegacyPublicContextBundle(badRoot, { mutate: true })
 await writeMixtralPromotionAndBlockerEvidence(badRoot, { reconciled: false })
 await writeMixtralPromotionAndBlockerEvidence(staleMixtralRoot, { reconciled: true, omitDependencySupersedes: true })
+await writePrivatePathEvidence(privatePathRoot)
 
 const good = spawnSync(process.execPath, ['scripts/check-public-evidence-claims.mjs', '--root', goodRoot], {
   cwd: process.cwd(),
@@ -54,6 +56,24 @@ const staleMixtral = spawnSync(process.execPath, ['scripts/check-public-evidence
 })
 assert.notEqual(staleMixtral.status, 0, 'Mixtral reconciliation must supersede promotion dependency bundles')
 assert.match(staleMixtral.stderr, /supersedes must include .*mixtral-8x7b-v0\.1-q8-api-smoke-test/)
+
+const privatePath = spawnSync(process.execPath, ['scripts/check-public-evidence-claims.mjs', '--root', privatePathRoot], {
+  cwd: process.cwd(),
+  encoding: 'utf8',
+})
+assert.notEqual(privatePath.status, 0, 'public evidence manifests must not expose local/private paths')
+assert.match(privatePath.stderr, /must not expose local\/private path .*\/Users\/timtoole\/\.openclaw\/workspace\/projects\/Camelid\/target\/private\/report\.json/)
+assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/\/home\/tim\/\.cache\/camelid\/model\.gguf/)
+
+async function writePrivatePathEvidence(root) {
+  const dir = join(root, 'private-path-test')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'manifest.json'), `${JSON.stringify({
+    schema: 'camelid.private_path_guard_test.v1',
+    raw_artifact: '/Users/timtoole/.openclaw/workspace/projects/Camelid/target/private/report.json',
+    nested: { model_uri: 'file:///home/tim/.cache/camelid/model.gguf' },
+  }, null, 2)}\n`)
+}
 
 async function writeMixtralPromotionAndBlockerEvidence(root, { reconciled, omitDependencySupersedes = false }) {
   const promotionDir = join(root, 'mixtral-8x7b-v0.1-q8-manifest-checksum-test')

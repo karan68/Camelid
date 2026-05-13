@@ -5,6 +5,7 @@ import { join, relative, resolve } from 'node:path'
 const args = parseArgs(process.argv.slice(2))
 const rootDir = resolve(args.get('root') || 'qa/evidence-bundles')
 const failures = []
+const privacyScannedPaths = new Set()
 let checkedBundles = 0
 let checkedSummaries = 0
 
@@ -27,6 +28,7 @@ async function validateBundle(manifestPath) {
   const bundleDir = manifestPath.slice(0, -'/manifest.json'.length)
   const bundleRel = relative(process.cwd(), bundleDir) || '.'
   const manifest = await readJson(manifestPath)
+  validatePublicJsonNoLocalPaths(manifestPath, manifest)
 
   if (!manifest || typeof manifest !== 'object') {
     fail(bundleRel, 'manifest.json is not a JSON object')
@@ -39,6 +41,7 @@ async function validateBundle(manifestPath) {
   if (summaryExists) {
     checkedSummaries += 1
     const summary = await readJson(summaryPath)
+    validatePublicJsonNoLocalPaths(summaryPath, summary)
     validateSummaryAgreement(bundleRel, manifest, summary)
   }
 
@@ -69,7 +72,11 @@ async function validateMixtralBlockerReconciliation(root, manifestPaths) {
   const manifests = []
   for (const manifestPath of manifestPaths) manifests.push({ path: manifestPath, json: await readJson(manifestPath) })
   const summaries = []
-  for (const summaryPath of summaryPaths) summaries.push({ path: summaryPath, json: await readJson(summaryPath) })
+  for (const summaryPath of summaryPaths) {
+    const json = await readJson(summaryPath)
+    validatePublicJsonNoLocalPaths(summaryPath, json)
+    summaries.push({ path: summaryPath, json })
+  }
 
   const promotionClaimPaths = new Set()
   for (const { path, json } of manifests) {
@@ -652,6 +659,28 @@ async function findSummaryPaths(root) {
       }
     }
   }
+}
+
+function validatePublicJsonNoLocalPaths(path, value) {
+  if (privacyScannedPaths.has(path)) return
+  privacyScannedPaths.add(path)
+  const rel = relative(process.cwd(), path)
+  for (const finding of findLocalPathStrings(value)) {
+    fail(rel, `${finding.location} must not expose local/private path ${JSON.stringify(finding.value)}`)
+  }
+}
+
+function findLocalPathStrings(value, location = '$') {
+  if (typeof value === 'string') {
+    return localPathPattern().test(value) ? [{ location, value }] : []
+  }
+  if (!value || typeof value !== 'object') return []
+  if (Array.isArray(value)) return value.flatMap((item, index) => findLocalPathStrings(item, `${location}[${index}]`))
+  return Object.entries(value).flatMap(([key, item]) => findLocalPathStrings(item, `${location}.${key}`))
+}
+
+function localPathPattern() {
+  return /(?:^|[\s"'])(?:file:\/\/)?(?:\/Users\/[^\s"']+|\/home\/[^\s"']+|\/private\/var\/[^\s"']+|\/var\/folders\/[^\s"']+|\/tmp\/[^\s"']+|[A-Za-z]:\\Users\\[^\s"']+)/
 }
 
 async function readJson(path) {
