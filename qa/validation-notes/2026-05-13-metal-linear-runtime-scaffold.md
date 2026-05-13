@@ -18,7 +18,7 @@ Local macOS validation on source head `9630e359bf858b108eab62791dec87a8d1c5ff7a`
 - `target/cron-0719640b-20260513T1827Z-tpm-metal-runtime-final-local/cargo-clippy.status` = `0`
 - `target/cron-0719640b-20260513T1827Z-tpm-metal-runtime-final-local/cargo-test-all.log` includes passing macOS Metal descriptor and transposed kernel unit tests against this Mac's Metal device.
 
-Canonical Ubuntu validation host (`ssh -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@54.186.43.33`) on the same dirty patch:
+Canonical Ubuntu validation host (redacted SSH endpoint) on the same dirty patch:
 
 - Remote artifact: `target/cron-0719640b-20260513T1827Z-tpm-metal-runtime-final-ubuntu/`
 - `ssh-mkdir.status` = `0`
