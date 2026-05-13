@@ -276,6 +276,14 @@ const LONG_FIRST_TOKEN_STREAMING_LABEL = 'Local response is taking a while'
 const ACTIVE_STREAMING_LABEL = 'Streaming response'
 const OPEN_CODE_STREAMING_LABEL = 'Streaming code response'
 
+const DEMO_PROMPTS = [
+  'Build a tiny arcade maze game in one self-contained HTML file',
+  'Create a glassy launch page with animated CSS and one working button',
+  'Write a compact Python snake game using tkinter',
+]
+
+const looksLikePacmanPrompt = (value) => /\bpac[ -]?m[ae]n\b|\bpacmac\b/i.test(String(value || ''))
+
 const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   if (phase === 'preparing') return PREPARING_STREAMING_LABEL
   if (phase === 'streaming') return isOpenCode ? OPEN_CODE_STREAMING_LABEL : ACTIVE_STREAMING_LABEL
@@ -283,9 +291,10 @@ const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   return FIRST_TOKEN_STREAMING_LABEL
 }
 
-function PacmanLoader({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false }) {
+function PacmanLoader({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false, variant = 'arcade' }) {
+  const neutral = variant === 'neutral'
   return (
-    <div className={`pacman-loader ${compact ? 'pacman-loader-compact' : ''}`} role="status" aria-live="polite" aria-label={`${label}. ${elapsedSeconds} seconds elapsed.`}>
+    <div className={`pacman-loader ${compact ? 'pacman-loader-compact' : ''} ${neutral ? 'pacman-loader-neutral' : 'pacman-loader-arcade'}`} role="status" aria-live="polite" aria-label={`${label}. ${elapsedSeconds} seconds elapsed.`}>
       <div className="pacman-loader-track" aria-hidden="true">
         <span className="pacman-loader-mouth" />
         <span className="pacman-loader-pellet pacman-loader-pellet-1" />
@@ -346,16 +355,14 @@ const isInterruptedPlaceholderMessage = (message) => {
   return content === '(generation interrupted)' || content === '(generation stopped)'
 }
 
-const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsedSeconds }) {
+const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsedSeconds, priorUserPrompt }) {
   const messageContent = cleanLegacyDemoCapCopy(message.content)
   const assistantStreaming = message.role === 'assistant' && Boolean(message.streaming)
   const isOpenStreamingCode = assistantStreaming && hasOpenCodeFence(messageContent)
   const streamingPhase = message.streaming_phase || (messageContent ? 'streaming' : 'generating')
   const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
-  const hasTokenMetrics = !assistantStreaming && message.role === 'assistant' && (
-    message.tokens_in_per_sec !== null && message.tokens_in_per_sec !== undefined
-    || message.tokens_out_per_sec !== null && message.tokens_out_per_sec !== undefined
-  )
+  const loaderVariant = looksLikePacmanPrompt(priorUserPrompt) ? 'neutral' : 'arcade'
+  const hasTokenMetrics = false
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
 
@@ -367,7 +374,7 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
       <div className={`message-bubble message-bubble-gemini ${message.role}`}>
-        {showStreamingStatus && <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
+        {showStreamingStatus && <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact variant={loaderVariant} />}
         {message.role === 'assistant'
           ? messageContent || !assistantStreaming
             ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />
@@ -549,10 +556,14 @@ export default function ChatWorkspace({
       ? 'Choose a supported model.'
       : 'Load a model to begin.'
   const productHeroSummary = selectedModelRunnable
-    ? ''
+    ? 'Pick a polished demo prompt or ask anything — Camelid is running the selected exact row locally.'
     : supportBlocked
-      ? ''
-      : ''
+      ? 'Camelid keeps demos honest: chat unlocks only for exact supported model rows.'
+      : 'Load a generation-ready GGUF model, then run a clean local demo without cloud handoffs.'
+  const handleDemoPrompt = (prompt) => {
+    if (generationActive || !selectedModelRunnable) return
+    setComposer(prompt)
+  }
   const renderModelPicker = () => {
     if (!hasRunnableChoices) {
       return (
@@ -620,6 +631,19 @@ export default function ChatWorkspace({
                 </div>
               </div>
 
+              {selectedModelRunnable && (
+                <div className="demo-prompt-panel" aria-label="Polished demo prompts">
+                  <span>Demo starters</span>
+                  <div className="demo-prompt-strip">
+                    {DEMO_PROMPTS.map((prompt) => (
+                      <button key={prompt} type="button" className="demo-prompt-chip" onClick={() => handleDemoPrompt(prompt)} disabled={generationActive}>
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="composer composer-gemini composer-gemini-stage composer-gemini-stage-clean composer-gemini-product">
                 <textarea className="composer-input composer-input-gemini composer-input-gemini-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
                 <div className="composer-gemini-footer composer-gemini-footer-stage composer-gemini-footer-stage-clean">
@@ -658,9 +682,12 @@ export default function ChatWorkspace({
 
             <div className="chat-thread chat-thread-gemini">
               {visibleMessages.length === 0 && !awaitingAssistant && <div className="empty-state empty-state-chat">Pick a ready model, then send the first message when you’re ready.</div>}
-              {visibleMessages.map((message) => (
-                <ChatMessageRow key={message.id} message={message} generationElapsedSeconds={generationElapsedSeconds} />
-              ))}
+              {visibleMessages.map((message, index) => {
+                const priorUserPrompt = message.role === 'assistant'
+                  ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')?.content
+                  : null
+                return <ChatMessageRow key={message.id} message={message} generationElapsedSeconds={generationElapsedSeconds} priorUserPrompt={priorUserPrompt} />
+              })}
               {awaitingAssistant && (
                 <>
                   {pendingUserPrompt && (
@@ -672,7 +699,7 @@ export default function ChatWorkspace({
                   )}
                   <article className="message-row message-row-gemini assistant pending is-streaming" aria-busy="true" data-streaming-state="active">
                     <div className="message-bubble message-bubble-gemini assistant pending">
-                      <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} />
+                      <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} variant={looksLikePacmanPrompt(pendingPrompt) ? 'neutral' : 'arcade'} />
                     </div>
                   </article>
                 </>

@@ -6035,3 +6035,115 @@ textarea.composer-input-gemini {
     opacity: 0;
   }
 }
+
+/* Demo polish: starter prompts and a neutral loader path keep videos clean even for Pac-Man prompts. */
+.demo-prompt-panel {
+  width: min(100%, 980px);
+  display: grid;
+  gap: 10px;
+  margin: 0 auto 2px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 46%, transparent);
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--color-info) 12%, transparent), transparent 42%),
+    color-mix(in srgb, var(--color-bg-elevated) 50%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+
+.demo-prompt-panel > span {
+  color: color-mix(in srgb, var(--color-text-muted) 86%, var(--color-text) 14%);
+  font-size: 0.68rem;
+  font-weight: 820;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.demo-prompt-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.demo-prompt-chip {
+  flex: 1 1 210px;
+  min-height: 46px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 66%, rgba(255, 255, 255, 0.035));
+  color: color-mix(in srgb, var(--color-text) 88%, var(--color-text-muted) 12%);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 650;
+  text-align: left;
+  transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, color 150ms ease;
+}
+
+.demo-prompt-chip:hover,
+.demo-prompt-chip:focus-visible {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--color-info) 44%, var(--color-border-strong));
+  background: color-mix(in srgb, var(--color-selected-row) 52%, rgba(255, 255, 255, 0.05));
+  color: var(--color-text);
+}
+
+.demo-prompt-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.pacman-loader-neutral .pacman-loader-track {
+  --pacman-pellet-travel: -300px;
+}
+
+.pacman-loader-neutral .pacman-loader-mouth {
+  width: 22px;
+  height: 22px;
+  top: 21px;
+  left: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-info) 82%, white 18%);
+  clip-path: none;
+  box-shadow:
+    0 0 0 8px color-mix(in srgb, var(--color-info) 13%, transparent),
+    0 0 30px color-mix(in srgb, var(--color-info) 42%, transparent);
+  animation: camelid-neutral-core 1.3s ease-in-out infinite;
+}
+
+.pacman-loader-neutral .pacman-loader-pellet {
+  top: 29px;
+  width: 8px;
+  height: 8px;
+  background: color-mix(in srgb, var(--color-ready) 70%, white 30%);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--color-ready) 32%, transparent);
+}
+
+@keyframes camelid-neutral-core {
+  0%, 100% {
+    transform: translateX(0) scale(0.9);
+    opacity: 0.82;
+  }
+  50% {
+    transform: translateX(10px) scale(1.18);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 760px) {
+  .demo-prompt-panel {
+    padding: 12px;
+  }
+
+  .demo-prompt-chip {
+    flex-basis: 100%;
+  }
+}
+
+/* Postable demo code cards: wrap long generated lines so captures never look horizontally clipped. */
+.chat-layout-gemini .message-code-card code {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
