@@ -5623,10 +5623,12 @@ fn softmax_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     scored.truncate(k);
-    let selected_sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
-    if selected_sum > 0.0 {
-        for (_, value) in &mut scored {
-            *value /= selected_sum;
+    if env_flag_enabled("CAMELID_MOE_RENORMALIZE_TOP_K") {
+        let selected_sum = scored.iter().map(|(_, value)| *value).sum::<f32>();
+        if selected_sum > 0.0 {
+            for (_, value) in &mut scored {
+                *value /= selected_sum;
+            }
         }
     }
     scored
@@ -13864,13 +13866,14 @@ mod tests {
     }
 
     #[test]
-    fn softmax_top_k_renormalizes_selected_experts() {
+    fn softmax_top_k_preserves_full_router_softmax_weights() {
         let top = softmax_top_k(&[0.0, 1.0, 2.0], 2);
         assert_eq!(top[0].0, 2);
         assert_eq!(top[1].0, 1);
         let selected_sum = top.iter().map(|(_, weight)| *weight).sum::<f32>();
-        assert!((selected_sum - 1.0).abs() < 1.0e-6, "{top:?}");
-        let expected_first = 2.0_f32.exp() / (2.0_f32.exp() + 1.0_f32.exp());
+        assert!(selected_sum < 1.0, "{top:?}");
+        let full_sum = 0.0_f32.exp() + 1.0_f32.exp() + 2.0_f32.exp();
+        let expected_first = 2.0_f32.exp() / full_sum;
         assert!((top[0].1 - expected_first).abs() < 1.0e-6, "{top:?}");
     }
 

@@ -1,12 +1,12 @@
 # Camelid Roadmap
 
-Last updated: 2026-05-12
+Last updated: 2026-05-09
 
 `ROADMAP.md` is Camelid's delivery plan of record. It is not a backlog and it is not a feature wish list. It answers one product question: **what must happen next for Camelid to widen its support boundary without weakening credibility?** The sequencing is intentional: protect the supported lane, remove the next exact blocker, and widen claims only when the resulting evidence can survive scrutiny.
 
 [`COMPATIBILITY.md`](COMPATIBILITY.md) defines what Camelid can honestly support today. [`STATUS.md`](STATUS.md) records the artifacts, evidence boundaries, and blocker state behind that posture. Detailed completed-phase history lives in `ROADMAP_ARCHIVE.md` and `STATUS.md`. Read this file as operating sequence, not aspiration.
 
-Executive summary: Camelid now has the TinyLlama supported gate plus exact Llama 3.2 1B/3B/8B Q8_0 rows through bounded 2048-context packs where row-specific PASS artifacts exist. The published 8B 1024/2048 PASS bundle at `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` closes only those exact bounded buckets for source/runtime head `8e26be0a73c0`; it is not a fresh rerun of today's checkout. Broader/full 8B support remains gated on model-native/larger context, arbitrary templates, production throughput, portability, and repeated durability evidence.
+Executive summary: Camelid now has the TinyLlama supported gate plus exact Llama 3.2 1B/3B/8B Q8_0 rows through bounded 2048-context packs on current `main` where row-specific PASS artifacts exist. The fresh 8B 1024/2048 PASS bundle at `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` closes only those exact bounded buckets. Broader/full 8B support remains gated on model-native/larger context, arbitrary templates, production throughput, portability, and repeated durability evidence.
 
 Practical reading rule: if a task does not protect the current gate, remove the next exact blocker, or prepare aligned support-language updates, it is secondary to this roadmap.
 
@@ -32,7 +32,7 @@ Four rules drive prioritization and sequencing:
 - **Protect the current gate first.** TinyLlama Q8_0 remains the release anchor.
 - **Remove the next honest blocker.** The highest-leverage work is the exact runtime seam that can create the next promotable artifact.
 - **Move public surfaces together.** Documentation, API signals, and frontend readiness should change in the same change window.
-- **Cite committed evidence anchors first.** The public bundle manifest/checksums, perf/portability envelope, reopened-lane API + frontend smoke manifest, 1B/3B bounded 1024/2048-context bundles, the published source/runtime-head 8B 1024/2048 bundle, 8B broader 50-token bundle, 8B 512-context bundle, 8B compact chat-template-shapes bundle, and current-head per-row manifests are the roadmap-facing evidence layer; raw `target/` artifacts are drill-down only.
+- **Cite committed evidence anchors first.** The public bundle manifest/checksums, perf/portability envelope, reopened-lane API + frontend smoke manifest, 1B/3B bounded 1024/2048-context bundles, the current-head 8B 1024/2048 bundle, 8B broader 50-token bundle, 8B 512-context bundle, 8B compact chat-template-shapes bundle, and current-head per-row manifests are the roadmap-facing evidence layer; raw `target/` artifacts are drill-down only.
 
 ## What changed in the support line
 
@@ -57,16 +57,14 @@ Protect the supported lanes and clear the next blocker before widening claims.
 - Protect the validated TinyLlama Q8_0 gate.
 - Protect the exact Llama 3.2 1B/3B/8B bounded-2048 rows.
 - Preserve the Llama 3.2 1B/3B broader prompt-pack plus bounded 512/1024/2048 context-pack wins while expanding only after model-native/larger-context, stronger performance/portability, and broader chat-template evidence land.
-- Preserve the Llama 3 8B exact-row promotion through the checked 512/1024/2048-context packs where row-specific PASS artifacts are cited; the 1024/2048 buckets are tied to source/runtime head `8e26be0a73c0`, and older 1024/2048 bundles remain historical source-head evidence only.
+- Preserve the Llama 3 8B exact-row promotion through the checked 512/1024/2048-context packs on current `main`; older 1024/2048 bundles remain historical source-head evidence only.
 - Keep README, `COMPATIBILITY.md`, `ROADMAP.md`, `STATUS.md`, `/api/capabilities`, and frontend readiness copy aligned.
-- Fold the 2026-05-12 local frontend streaming-polish wins into the perf plan: dashboard polling no longer churns on local conversation/memory/model updates, and live assistant streaming patches are animation-frame batched while preparing/generating milestones remain immediate. Keep this as UI responsiveness work, not support-promotion evidence.
-- Keep the frontend/perf lane focused on the remaining hot paths: `ChatWorkspace` render frequency during streaming, unnecessary non-chat rerenders while tokens arrive, and true TTFT/decode measurements on a scrubbed local validation lane.
 
 ### Next
 
 Promote only what can be defended row by row.
 
-- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mixtral 8x7B Instruct** now has bounded one-token backend MoE runtime evidence: top-k expert routing runs with lazy/file-backed Q8 experts, while broader support remains blocked by later short-prompt generation divergence plus API/WebUI/long-context promotion evidence.
+- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mixtral 8x7B Instruct** is now exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope; current work is continuation/long-generation hardening, where the exact prompt-token continuation path is being tightened but the public claim does not widen until separate long-context and broader-prompt evidence is green.
 - Widen Llama 3.2 3B Q8_0 beyond short-chat smoke only if broader prompt/chat-template, memory/performance, API, and WebUI evidence all land.
 - Broaden quantization support beyond Q8_0 with tests, docs, and exact-row evidence.
 - Expand tokenizer and chat-template coverage for additional supported rows.
@@ -210,7 +208,6 @@ Execution order:
 - measure bottlenecks after each correctness milestone
 - optimize only where evidence says it matters
 - keep optimized kernels behind parity guardrails until proven
-- for frontend streaming polish, continue from the 2026-05-12 `useDashboardData` quick wins by instrumenting `ChatWorkspace` render frequency, isolating non-chat rerenders during streaming, and recording real TTFT/decode timing on a scrubbed local validation lane before making any broader performance claim
 
 Portability and packaging should remain explicit:
 

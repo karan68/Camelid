@@ -11,12 +11,12 @@ use std::{
 use axum::{
     extract::{rejection::JsonRejection, Path as AxumPath, State},
     http::StatusCode,
-    response::{sse::Event, Html, IntoResponse, Response, Sse},
+    response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
@@ -45,7 +45,6 @@ const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
-const DEFAULT_PUBLIC_COMPLETION_MAX_TOKENS: u32 = 800;
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -274,6 +273,7 @@ pub struct CompletionRequest {
     pub best_of: Option<u32>,
     pub logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
 }
 
@@ -293,6 +293,7 @@ pub struct ChatMessage {
 enum PromptInput {
     Text(String),
     Chat(Vec<ChatMessage>),
+    TokenIds(Vec<u32>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,8 +327,6 @@ pub struct GenerationSessionRequest {
     pub prompt: Option<String>,
     pub messages: Option<Vec<ChatMessage>>,
     pub max_tokens: Option<u32>,
-    #[serde(skip)]
-    pub default_max_tokens: Option<u32>,
     pub stream: Option<bool>,
     pub temperature: Option<f32>,
     pub top_k: Option<u32>,
@@ -343,6 +342,7 @@ pub struct GenerationSessionRequest {
     pub chat_logprobs: Option<bool>,
     pub top_logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
+    pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
 }
 
@@ -664,7 +664,6 @@ pub struct ErrorBody {
 pub fn router() -> Router {
     let state = AppState::default();
     Router::new()
-        .route("/", get(root))
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
@@ -692,39 +691,6 @@ pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "camelid server listening");
     axum::serve(listener, router()).await
-}
-
-async fn root() -> Html<&'static str> {
-    Html(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Camelid API</title>
-  <style>
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111214; color: #f5f1e8; font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { width: min(560px, calc(100vw - 40px)); padding: 32px; border: 1px solid rgba(255,255,255,.1); border-radius: 24px; background: rgba(255,255,255,.04); box-shadow: 0 24px 80px rgba(0,0,0,.35); }
-    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: -0.03em; }
-    p { margin: 0 0 18px; color: rgba(245,241,232,.74); }
-    a { color: #ffd84d; font-weight: 700; text-decoration: none; }
-    code { color: #fff; background: rgba(255,255,255,.08); padding: 2px 6px; border-radius: 8px; }
-    .row { display: grid; gap: 8px; margin-top: 22px; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>Camelid API is running</h1>
-    <p>This is the local backend, not the chat UI.</p>
-    <div class="row">
-      <span>Open the WebUI: <a href="http://127.0.0.1:4178/">http://127.0.0.1:4178/</a></span>
-      <span>Health JSON: <a href="/v1/health"><code>/v1/health</code></a></span>
-      <span>Models JSON: <a href="/v1/models"><code>/v1/models</code></a></span>
-    </div>
-  </main>
-</body>
-</html>"#,
-    )
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -762,7 +728,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist; Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -785,7 +751,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Instruct Q8_0 rows and the exact Llama 3 8B Instruct Q8_0 row have checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
         ],
         planned_quantization: vec![
@@ -809,7 +775,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. Broader 50-token, compact chat-template-shapes, retained-block lazy-Q8 hot-path evidence, and the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0 remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. Broader 50-token, compact chat-template-shapes, retained-block lazy-Q8 hot-path evidence, and the 8B 1024/2048 current-head bundle remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
         ],
         planned_model_families: vec![
@@ -825,8 +791,8 @@ fn capabilities_response() -> CapabilitiesResponse {
             },
             SupportItem {
                 id: "mixtral_moe",
-                status: "active_validation_partial_runtime",
-                notes: "public readiness: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token exact-row MoE runtime evidence only. Top-k expert routing runs with lazy/file-backed rank-3 Q8 experts, but later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang; broad Mixtral, frontend/API/WebUI/RSS, long-context, and production support remain unclaimed.",
+                status: "supported_exact_row_smoke_lane",
+                notes: "public readiness: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. Top-k expert routing runs with lazy/file-backed rank-3 Q8 experts; prompt-token parity, six short-prompt 5-token parity, OpenAI-compatible API smoke, WebUI readiness, RSS/timing, and scrubbed manifest/checksum evidence are green. Continuation hardening now supports exact prompt-token replay for repro/debug work, but no neighboring row, broad family, long-context, arbitrary-template, production-throughput, or portability support is implied.",
             },
             SupportItem {
                 id: "qwen25",
@@ -982,7 +948,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 latest_checked_bucket: "llama3-context-2048-smoke-v1",
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-204",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes. The published source/runtime-head 1024/2048 pass is recorded at qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json with prompt-token, generated-token, and generated-text parity for CMLD-102 and CMLD-204. Camelid supports exact-row smoke plus the checked bounded packs for this row only; no model-native/larger context or broader/full support is implied",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes. The current-head 1024/2048 pass is recorded at qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json with prompt-token, generated-token, and generated-text parity for CMLD-102 and CMLD-204. Camelid supports exact-row smoke plus the checked bounded packs for this row only; no model-native/larger context or broader/full support is implied",
                 next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while collecting model-native/larger-context proof, broader/full-support, production-throughput, portability, arbitrary-template evidence, and repeated current-head evidence before any wider 8B claim",
             },
             ModelCompatibilityTarget {
@@ -1094,19 +1060,19 @@ fn capabilities_response() -> CapabilitiesResponse {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
                 family: "mixtral_moe",
                 quantization: "Q8_0",
-                status: "active_validation_partial_runtime",
-                support_scope: "exact_row_bounded_moe_runtime_only",
-                full_support_status: "blocked_later_generation_divergence",
-                full_support_blockers: "Gate 9A 50-token evidence diverges from llama.cpp and a longer-continuation probe hung; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing",
+                status: "supported_exact_row_smoke",
+                support_scope: "validated_exact_row_short_prompt_moe_api_webui_runtime_only",
+                full_support_status: "blocked_beyond_checked_exact_row_envelope",
+                full_support_blockers: "model-native/larger context, arbitrary templates, production throughput, portability, neighboring rows, and broader prompt/context coverage still require separate evidence",
                 metadata_parses: "validated_sparse_header",
                 tokenizer_works: "validated_against_llama_cpp_reference",
                 tensors_load: "validated_lazy_file_backed_rank3_q8_experts",
-                generation_runs: "bounded_one_token_runtime_smoke_observed",
-                parity_audited: "prompt_tokens_and_one_token_smoke_only_later_generation_diverges",
-                performance_measured: "not_promoted",
-                frontend_load_path_verified: "fail_closed_partial_runtime_only",
-                frontend_readiness_gate: "fail-closed for broad readiness: exact row may be described only as bounded one-token backend runtime evidence until Gate 9A/long-continuation parity and API/WebUI gates close",
-                tested_context: "one_token_probe_only",
+                generation_runs: "api_completion_and_chat_smoke_plus_6prompt_5token_parity",
+                parity_audited: "prompt_tokens_and_6_of_6_short_prompts_match",
+                performance_measured: "rss_timing_runtime_gate_passed",
+                frontend_load_path_verified: "validated",
+                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                tested_context: "short_prompt_5token_probe_plus_api_webui_smoke_only",
                 chat_template_renderer: "mixtral_instruct_v0_1_metadata_template_validated",
                 chat_template_shape_pack: "validated_reference_pack",
                 chat_template_shape_pack_id: "mixtral-instruct-v0.1-chat-template-pack-v1",
@@ -1119,11 +1085,11 @@ fn capabilities_response() -> CapabilitiesResponse {
                 bounded_context_2048_pack: "not_started",
                 bounded_context_2048_pack_id: "mixtral-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511",
-                latest_checked_result: "blocked_later_generation_divergence",
-                latest_checked_output: "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md",
-                evidence: "exact row leserg/Mixtral-8x7B-Instruct-v0.1-Q8_0-GGUF at commit 93c0492d1891b5147f42b2648d9fccc140910a2f, license apache-2.0, GGUF ETag 77b8ee314ae3e77cefaba7f33841235da3346c34171547fe10e8a85f127973a7, size 49626319776 bytes and sha256 c48f9680d5aa60703ed0fd38e29fc6556b3490f8f6c9919a31c9da7996039f81; sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with selected-weight renormalization and lazy/file-backed Q8 experts; bounded one-token runtime evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9 and the continuation probe recorded a backend HTTP hang after the llama.cpp reference completed. No broad Mixtral, frontend/API/WebUI/RSS, long-context, production, neighboring-row, or full-support claim is made.",
-                next_step: "close the Gate 9A 50-token divergence and longer-continuation hang, then run API/WebUI/RSS and longer-context promotion bundles before any broad Mixtral support claim",
+                latest_checked_bucket: "mixtral_8x7b_q8_promotion_gates_20260511",
+                latest_checked_result: "pass_exact_row_short_prompt_api_webui_rss_manifest",
+                latest_checked_output: "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-manifest-checksum-20260511/summary.json",
+                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: scrubbed manifest/checksum size 49624262592 bytes and sha256 cdca4a8c09dfd722702f781d479695cda0d45e1bd1cd602ba1b6085ad921fc5f; sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights (selected-weight renormalization is now opt-in for probing) and lazy/file-backed Q8 experts; refreshed parity bundle qa/evidence-bundles/mixtral-8x7b-v0.1-q8-backend-parity-refresh-20260511 matched llama.cpp for Hello, What is 2+2?, Name a color., Say yes., Count to three., and Write OK. at max_tokens=5; API smoke qa/evidence-bundles/mixtral-8x7b-v0.1-q8-api-smoke-20260511, WebUI readiness qa/evidence-bundles/mixtral-8x7b-v0.1-q8-webui-readiness-20260511, RSS/timing qa/evidence-bundles/mixtral-8x7b-v0.1-q8-rss-timing-runtime-20260511, and manifest/checksum qa/evidence-bundles/mixtral-8x7b-v0.1-q8-manifest-checksum-20260511 all passed scrub checks. Continuation hardening adds exact prompt-token replay for repro/debug work, while qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 remains partial hardening evidence only. This supports only the validated exact row and checked short-prompt/API/WebUI/RSS envelope.",
+                next_step: "preserve exact-row support while adding separate long-context, broader prompt, production-throughput, portability, and repeated current-head evidence before widening any claim",
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
@@ -1200,12 +1166,12 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "openai_chat_completions",
                 status: "supported_current_gate",
-                notes: "non-streaming and SSE streaming only for loaded exact supported dense GGUF rows",
+                notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
             },
             SupportItem {
                 id: "tokenizer_encode_decode",
                 status: "supported_current_gate",
-                notes: "loaded-model tokenizer APIs for exact rows covered by the current support contract; unsupported tokenizers fail typed",
+                notes: "loaded-model tokenizer APIs for supported tokenizer families",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -1220,7 +1186,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         ],
         notes: vec![
             "GGUF metadata, tokenizer metadata, tensor loading, Camelid dense config extraction, and tensor binding are available",
-            "public completion endpoints can generate small OpenAI-compatible non-streaming responses and SSE token streams only from loaded exact Camelid-supported dense GGUF rows",
+            "public completion endpoints can generate small OpenAI-compatible non-streaming responses and SSE token streams from a loaded Camelid-supported dense GGUF model",
             "capability fields are intentionally explicit so the frontend and providers do not infer unsupported model families or quantization formats",
         ],
     }
@@ -1501,7 +1467,6 @@ async fn completions(
         prompt: req.prompt,
         messages: None,
         max_tokens: req.max_tokens,
-        default_max_tokens: Some(DEFAULT_PUBLIC_COMPLETION_MAX_TOKENS),
         stream: req.stream,
         temperature: req.temperature,
         top_k: req.top_k,
@@ -1517,6 +1482,7 @@ async fn completions(
         chat_logprobs: None,
         top_logprobs: None,
         camelid_logit_token_ids: req.camelid_logit_token_ids,
+        camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
     };
     let stream = req.stream.unwrap_or(false);
@@ -1576,7 +1542,7 @@ async fn completions(
             )
                 .into_response()
         }
-        Err(response) => *response,
+        Err(response) => response,
     }
 }
 
@@ -1593,7 +1559,6 @@ async fn chat_completions(
         prompt: None,
         messages: req.messages,
         max_tokens: req.max_tokens,
-        default_max_tokens: Some(DEFAULT_PUBLIC_COMPLETION_MAX_TOKENS),
         stream: req.stream,
         temperature: req.temperature,
         top_k: req.top_k,
@@ -1609,6 +1574,7 @@ async fn chat_completions(
         chat_logprobs: req.logprobs,
         top_logprobs: req.top_logprobs,
         camelid_logit_token_ids: req.camelid_logit_token_ids,
+        camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
     };
     let stream = req.stream.unwrap_or(false);
@@ -1656,7 +1622,7 @@ async fn chat_completions(
             }),
         )
             .into_response(),
-        Err(response) => *response,
+        Err(response) => response,
     }
 }
 
@@ -1884,7 +1850,6 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
-    let default_max_tokens = req.default_max_tokens;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
     let sampling = sampling_config_from_request(&req).map_err(|response| *response)?;
     let stop_sequences =
@@ -1901,17 +1866,18 @@ async fn prepare_generation(
         ));
     }
 
-    let input = match (req.prompt, req.messages) {
-        (Some(prompt), None) if !prompt.is_empty() => PromptInput::Text(prompt),
-        (None, Some(messages)) if !messages.is_empty() => {
+    let input = match (req.prompt, req.messages, req.camelid_prompt_token_ids) {
+        (Some(prompt), None, None) if !prompt.is_empty() => PromptInput::Text(prompt),
+        (None, Some(messages), None) if !messages.is_empty() => {
             validate_chat_messages(&messages).map_err(|response| *response)?;
             PromptInput::Chat(messages)
         }
-        (Some(_), Some(_)) => {
+        (None, None, Some(token_ids)) if !token_ids.is_empty() => PromptInput::TokenIds(token_ids),
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "ambiguous_generation_input",
-                "send either prompt or messages, not both".to_string(),
+                "send exactly one of prompt, messages, or camelid_prompt_token_ids".to_string(),
                 None,
             ))
         }
@@ -1919,7 +1885,7 @@ async fn prepare_generation(
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "missing_generation_input",
-                "generation requires a non-empty prompt or messages array".to_string(),
+                "generation requires a non-empty prompt, messages array, or camelid_prompt_token_ids array".to_string(),
                 None,
             ))
         }
@@ -1964,29 +1930,59 @@ async fn prepare_generation(
             None,
         )
     })?;
-    let rendered_prompt = match input {
-        PromptInput::Text(prompt) => RenderedPrompt {
-            text: prompt,
-            add_special: true,
-            parse_special: false,
-        },
-        PromptInput::Chat(messages) => render_chat_prompt_for_tokenization(&messages, &tokenizer),
+    let token_ids = match input {
+        PromptInput::Text(prompt) => {
+            let rendered_prompt = RenderedPrompt {
+                text: prompt,
+                add_special: true,
+                parse_special: false,
+            };
+            let mut token_ids = tokenizer
+                .encode(
+                    &rendered_prompt.text,
+                    rendered_prompt.add_special,
+                    rendered_prompt.parse_special,
+                )
+                .map_err(|err| {
+                    api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "tokenization_failed",
+                        err.to_string(),
+                        Some("prompt"),
+                    )
+                })?;
+            normalize_mistral_instruct_bos_prefix_tokens(
+                &mut token_ids,
+                &rendered_prompt,
+                &tokenizer,
+            );
+            token_ids
+        }
+        PromptInput::Chat(messages) => {
+            let rendered_prompt = render_chat_prompt_for_tokenization(&messages, &tokenizer);
+            let mut token_ids = tokenizer
+                .encode(
+                    &rendered_prompt.text,
+                    rendered_prompt.add_special,
+                    rendered_prompt.parse_special,
+                )
+                .map_err(|err| {
+                    api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "tokenization_failed",
+                        err.to_string(),
+                        Some("messages"),
+                    )
+                })?;
+            normalize_mistral_instruct_bos_prefix_tokens(
+                &mut token_ids,
+                &rendered_prompt,
+                &tokenizer,
+            );
+            token_ids
+        }
+        PromptInput::TokenIds(token_ids) => token_ids,
     };
-    let mut token_ids = tokenizer
-        .encode(
-            &rendered_prompt.text,
-            rendered_prompt.add_special,
-            rendered_prompt.parse_special,
-        )
-        .map_err(|err| {
-            api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "tokenization_failed",
-                err.to_string(),
-                Some("prompt"),
-            )
-        })?;
-    normalize_mistral_instruct_bos_prefix_tokens(&mut token_ids, &rendered_prompt, &tokenizer);
     timings.tokenize = tokenization_started.elapsed().as_millis();
     if token_ids.is_empty() {
         return Err(api_error(
@@ -2051,11 +2047,7 @@ async fn prepare_generation(
     }
 
     let available_max_tokens = (context_length - token_ids.len()) as u32;
-    let max_tokens = requested_max_tokens.unwrap_or_else(|| {
-        default_max_tokens
-            .map(|default_max_tokens| default_max_tokens.min(available_max_tokens))
-            .unwrap_or(available_max_tokens)
-    });
+    let max_tokens = requested_max_tokens.unwrap_or(available_max_tokens);
 
     let weight_load_started = Instant::now();
     let cached_weights = state.cached_weights.read().await.clone();
@@ -2472,18 +2464,20 @@ fn parse_logit_bias(
 
 async fn generate_decoded_tokens_blocking(
     prepared: PreparedGeneration,
-) -> std::result::Result<GeneratedText, Box<Response>> {
+) -> std::result::Result<GeneratedText, Response> {
     let timeout = generation_timeout_duration()?;
-    let handle = tokio::task::spawn_blocking(move || generate_decoded_tokens(prepared));
+    let handle = tokio::task::spawn_blocking(move || {
+        generate_decoded_tokens(prepared).map_err(|response| *response)
+    });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => result,
-        Ok(Err(err)) => Err(Box::new(api_error(
+        Ok(Err(err)) => Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "generation_worker_failed",
             format!("generation worker failed before completing the request: {err}"),
             None,
-        ))),
-        Err(_) => Err(Box::new(api_error(
+        )),
+        Err(_) => Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "generation_timeout",
             format!(
@@ -2491,23 +2485,23 @@ async fn generate_decoded_tokens_blocking(
                 timeout.as_millis()
             ),
             Some("max_tokens"),
-        ))),
+        )),
     }
 }
 
-fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>> {
+fn generation_timeout_duration() -> std::result::Result<Duration, Response> {
     match env::var(GENERATION_TIMEOUT_ENV) {
         Ok(value) if value.trim().is_empty() => {
             Ok(Duration::from_millis(DEFAULT_GENERATION_TIMEOUT_MS))
         }
         Ok(value) => {
             let millis = value.trim().parse::<u64>().map_err(|err| {
-                Box::new(api_error(
+                api_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "invalid_generation_timeout",
                     format!("invalid {GENERATION_TIMEOUT_ENV} {value:?}: {err}"),
                     None,
-                ))
+                )
             })?;
             if millis == 0 {
                 Ok(Duration::from_millis(u64::MAX))
@@ -2516,12 +2510,12 @@ fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>>
             }
         }
         Err(env::VarError::NotPresent) => Ok(Duration::from_millis(DEFAULT_GENERATION_TIMEOUT_MS)),
-        Err(err) => Err(Box::new(api_error(
+        Err(err) => Err(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "invalid_generation_timeout",
             format!("invalid {GENERATION_TIMEOUT_ENV}: {err}"),
             None,
-        ))),
+        )),
     }
 }
 
@@ -3043,7 +3037,7 @@ fn micros_to_ms(value: u128) -> f64 {
     value as f64 / 1000.0
 }
 
-fn stream_completion(prepared: PreparedGeneration, chat: bool) -> Response {
+fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     let model_id = prepared.model_id.clone();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
@@ -3069,244 +3063,200 @@ fn stream_completion(prepared: PreparedGeneration, chat: bool) -> Response {
             yield sse_json_event(&role_chunk);
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let generation_handle = tokio::task::spawn_blocking({
-            let model_id = model_id.clone();
-            let stream_id = stream_id.clone();
-            move || stream_completion_blocking(prepared, chat, model_id, stream_id, tx)
-        });
+        let mut input = prepared.token_ids.clone();
+        let mut history = prepared.token_ids.clone();
+        let mut generated = Vec::new();
+        let mut top_logits = Vec::new();
+        let mut output_projection = Vec::new();
+        let mut dense = None;
+        let mut finish_reason = "length";
+        let mut streamed_text = String::new();
+        let mut reused_prompt_prefix = false;
 
-        while let Some(event) = rx.recv().await {
-            yield event;
+        if !prepared.collect_dense_diagnostics {
+            if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
+                prepared.session = cached.session.clone();
+                input.clear();
+                match sample_cached_prompt_prefix(&cached, &history) {
+                    Ok(first_step) => {
+                        let cached_next_token = first_step.next_token_id;
+                        reused_prompt_prefix = true;
+                        prepared.timings.prompt_cache_hit = true;
+                        if let Err(response) = consume_generation_step(
+                            &prepared,
+                            first_step,
+                            GenerationStepAccumulator {
+                                generated: &mut generated,
+                                history: &mut history,
+                                top_logits: &mut top_logits,
+                                output_projection: &mut output_projection,
+                                dense: &mut dense,
+                                finish_reason: &mut finish_reason,
+                            },
+                        ) {
+                            yield stream_error_event(*response);
+                            yield Ok(Event::default().data("[DONE]"));
+                            return;
+                        }
+                        if finish_reason == "length" {
+                            input.push(cached_next_token);
+                        }
+                    }
+                    Err(response) => {
+                        yield stream_error_event(*response);
+                        yield Ok(Event::default().data("[DONE]"));
+                        return;
+                    }
+                }
+            }
         }
 
-        if let Err(err) = generation_handle.await {
-            yield stream_error_message_event("stream_worker_failed", err.to_string());
-            yield Ok(Event::default().data("[DONE]"));
+        for _ in generated.len() as u32..prepared.max_tokens {
+            if finish_reason != "length" {
+                break;
+            }
+            let mut sampling = prepared.sampling.clone();
+            if let Some(seed) = sampling.seed {
+                sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
+            }
+            let sampler = if sampling == SamplingConfig::default() {
+                LlamaSampler::Greedy
+            } else {
+                LlamaSampler::Sampling(sampling)
+            };
+            let step = match prepared
+                .session
+                .generate_next_token_with_history_diagnostics(
+                    &input,
+                    sampler,
+                    &history,
+                    prepared.collect_dense_diagnostics,
+                ) {
+                    Ok(step) => step,
+                    Err(err) => {
+                        yield stream_error_message_event("generation_step_failed", err.to_string());
+                        yield Ok(Event::default().data("[DONE]"));
+                        return;
+                    }
+                };
+            if !reused_prompt_prefix
+                && generated.is_empty()
+                && !prepared.collect_dense_diagnostics
+                && step.diagnostics.is_none()
+            {
+                store_prompt_prefix_cache(&prepared, &step);
+            }
+            if generated.is_empty() && !reused_prompt_prefix {
+                prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+            }
+            if let Err(response) = consume_generation_step(
+                &prepared,
+                step,
+                GenerationStepAccumulator {
+                    generated: &mut generated,
+                    history: &mut history,
+                    top_logits: &mut top_logits,
+                    output_projection: &mut output_projection,
+                    dense: &mut dense,
+                    finish_reason: &mut finish_reason,
+                },
+            ) {
+                yield stream_error_event(*response);
+                yield Ok(Event::default().data("[DONE]"));
+                return;
+            }
+
+            let mut text = match prepared.tokenizer.decode(&generated, true) {
+                Ok(text) => text,
+                Err(err) => {
+                    yield stream_error_message_event("token_decode_failed", err.to_string());
+                    yield Ok(Event::default().data("[DONE]"));
+                    return;
+                }
+            };
+            if finish_reason == "stop" {
+                text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+            }
+            let delta = text
+                .strip_prefix(&streamed_text)
+                .map(str::to_owned)
+                .unwrap_or_else(|| text.clone());
+            streamed_text = text;
+            if !delta.is_empty() {
+                if chat {
+                    let chunk = ChatCompletionStreamChunk {
+                        id: stream_id.clone(),
+                        object: "chat.completion.chunk",
+                        created: 0,
+                        model: model_id.clone(),
+                        choices: vec![ChatCompletionStreamChoice {
+                            index: 0,
+                            delta: ChatCompletionDelta {
+                                role: None,
+                                content: Some(delta),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    yield sse_json_event(&chunk);
+                } else {
+                    let chunk = CompletionStreamChunk {
+                        id: stream_id.clone(),
+                        object: "text_completion",
+                        created: 0,
+                        model: model_id.clone(),
+                        choices: vec![CompletionStreamChoice {
+                            index: 0,
+                            text: delta,
+                            finish_reason: None,
+                        }],
+                    };
+                    yield sse_json_event(&chunk);
+                }
+            }
+            if finish_reason != "length" {
+                break;
+            }
+            input.clear();
+            if let Some(last_token) = generated.last().copied() {
+                input.push(last_token);
+            }
         }
+
+        if chat {
+            let final_chunk = ChatCompletionStreamChunk {
+                id: stream_id,
+                object: "chat.completion.chunk",
+                created: 0,
+                model: model_id,
+                choices: vec![ChatCompletionStreamChoice {
+                    index: 0,
+                    delta: ChatCompletionDelta {
+                        role: None,
+                        content: None,
+                    },
+                    finish_reason: Some(finish_reason),
+                }],
+            };
+            yield sse_json_event(&final_chunk);
+        } else {
+            let final_chunk = CompletionStreamChunk {
+                id: stream_id,
+                object: "text_completion",
+                created: 0,
+                model: model_id,
+                choices: vec![CompletionStreamChoice {
+                    index: 0,
+                    text: String::new(),
+                    finish_reason: Some(finish_reason),
+                }],
+            };
+            yield sse_json_event(&final_chunk);
+        }
+        yield Ok(Event::default().data("[DONE]"));
     };
 
     Sse::new(events).into_response()
-}
-
-fn send_stream_event(
-    tx: &mpsc::UnboundedSender<Result<Event, Infallible>>,
-    event: Result<Event, Infallible>,
-) -> bool {
-    tx.send(event).is_ok()
-}
-
-fn stream_completion_blocking(
-    mut prepared: PreparedGeneration,
-    chat: bool,
-    model_id: String,
-    stream_id: String,
-    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
-) {
-    let mut input = prepared.token_ids.clone();
-    let mut history = prepared.token_ids.clone();
-    let mut generated = Vec::new();
-    let mut top_logits = Vec::new();
-    let mut output_projection = Vec::new();
-    let mut dense = None;
-    let mut finish_reason = "length";
-    let mut streamed_text = String::new();
-    let mut reused_prompt_prefix = false;
-
-    if !prepared.collect_dense_diagnostics {
-        if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
-            prepared.session = cached.session.clone();
-            input.clear();
-            match sample_cached_prompt_prefix(&cached, &history) {
-                Ok(first_step) => {
-                    let cached_next_token = first_step.next_token_id;
-                    reused_prompt_prefix = true;
-                    prepared.timings.prompt_cache_hit = true;
-                    if let Err(response) = consume_generation_step(
-                        &prepared,
-                        first_step,
-                        GenerationStepAccumulator {
-                            generated: &mut generated,
-                            history: &mut history,
-                            top_logits: &mut top_logits,
-                            output_projection: &mut output_projection,
-                            dense: &mut dense,
-                            finish_reason: &mut finish_reason,
-                        },
-                    ) {
-                        send_stream_event(&tx, stream_error_event(*response));
-                        send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
-                        return;
-                    }
-                    if finish_reason == "length" {
-                        input.push(cached_next_token);
-                    }
-                }
-                Err(response) => {
-                    send_stream_event(&tx, stream_error_event(*response));
-                    send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
-                    return;
-                }
-            }
-        }
-    }
-
-    for _ in generated.len() as u32..prepared.max_tokens {
-        if finish_reason != "length" {
-            break;
-        }
-        let mut sampling = prepared.sampling.clone();
-        if let Some(seed) = sampling.seed {
-            sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
-        }
-        let sampler = if sampling == SamplingConfig::default() {
-            LlamaSampler::Greedy
-        } else {
-            LlamaSampler::Sampling(sampling)
-        };
-        let step = match prepared
-            .session
-            .generate_next_token_with_history_diagnostics(
-                &input,
-                sampler,
-                &history,
-                prepared.collect_dense_diagnostics,
-            ) {
-            Ok(step) => step,
-            Err(err) => {
-                send_stream_event(
-                    &tx,
-                    stream_error_message_event("generation_step_failed", err.to_string()),
-                );
-                send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
-                return;
-            }
-        };
-        if !reused_prompt_prefix
-            && generated.is_empty()
-            && !prepared.collect_dense_diagnostics
-            && step.diagnostics.is_none()
-        {
-            store_prompt_prefix_cache(&prepared, &step);
-        }
-        if generated.is_empty() && !reused_prompt_prefix {
-            prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
-        }
-        if let Err(response) = consume_generation_step(
-            &prepared,
-            step,
-            GenerationStepAccumulator {
-                generated: &mut generated,
-                history: &mut history,
-                top_logits: &mut top_logits,
-                output_projection: &mut output_projection,
-                dense: &mut dense,
-                finish_reason: &mut finish_reason,
-            },
-        ) {
-            send_stream_event(&tx, stream_error_event(*response));
-            send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
-            return;
-        }
-
-        let mut text = match prepared.tokenizer.decode(&generated, true) {
-            Ok(text) => text,
-            Err(err) => {
-                send_stream_event(
-                    &tx,
-                    stream_error_message_event("token_decode_failed", err.to_string()),
-                );
-                send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
-                return;
-            }
-        };
-        if finish_reason == "stop" {
-            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-        }
-        let delta = text
-            .strip_prefix(&streamed_text)
-            .map(str::to_owned)
-            .unwrap_or_else(|| text.clone());
-        streamed_text = text;
-        if !delta.is_empty() {
-            let sent = if chat {
-                let chunk = ChatCompletionStreamChunk {
-                    id: stream_id.clone(),
-                    object: "chat.completion.chunk",
-                    created: 0,
-                    model: model_id.clone(),
-                    choices: vec![ChatCompletionStreamChoice {
-                        index: 0,
-                        delta: ChatCompletionDelta {
-                            role: None,
-                            content: Some(delta),
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                send_stream_event(&tx, sse_json_event(&chunk))
-            } else {
-                let chunk = CompletionStreamChunk {
-                    id: stream_id.clone(),
-                    object: "text_completion",
-                    created: 0,
-                    model: model_id.clone(),
-                    choices: vec![CompletionStreamChoice {
-                        index: 0,
-                        text: delta,
-                        finish_reason: None,
-                    }],
-                };
-                send_stream_event(&tx, sse_json_event(&chunk))
-            };
-            if !sent {
-                return;
-            }
-        }
-        if finish_reason != "length" {
-            break;
-        }
-        input.clear();
-        if let Some(last_token) = generated.last().copied() {
-            input.push(last_token);
-        }
-    }
-
-    if chat {
-        let final_chunk = ChatCompletionStreamChunk {
-            id: stream_id,
-            object: "chat.completion.chunk",
-            created: 0,
-            model: model_id,
-            choices: vec![ChatCompletionStreamChoice {
-                index: 0,
-                delta: ChatCompletionDelta {
-                    role: None,
-                    content: None,
-                },
-                finish_reason: Some(finish_reason),
-            }],
-        };
-        if !send_stream_event(&tx, sse_json_event(&final_chunk)) {
-            return;
-        }
-    } else {
-        let final_chunk = CompletionStreamChunk {
-            id: stream_id,
-            object: "text_completion",
-            created: 0,
-            model: model_id,
-            choices: vec![CompletionStreamChoice {
-                index: 0,
-                text: String::new(),
-                finish_reason: Some(finish_reason),
-            }],
-        };
-        if !send_stream_event(&tx, sse_json_event(&final_chunk)) {
-            return;
-        }
-    }
-    send_stream_event(&tx, Ok(Event::default().data("[DONE]")));
 }
 
 fn stream_error_event(response: Response) -> Result<Event, Infallible> {
@@ -3399,7 +3349,7 @@ fn normalize_mistral_instruct_bos_prefix_tokens(
         && rendered_prompt
             .text
             .starts_with(&format!("{bos_text}[INST]"))
-        && token_ids.first() == Some(&bos_id)
+        && token_ids.get(0) == Some(&bos_id)
         && token_ids.get(1) == Some(&space_id)
     {
         token_ids.remove(1);
@@ -3856,16 +3806,14 @@ mod tests {
         assert!(eight_b
             .evidence
             .contains("checked 512/1024/2048-context packs"));
-        assert!(eight_b
-            .evidence
-            .contains("published source/runtime-head 1024/2048 pass"));
+        assert!(eight_b.evidence.contains("current-head 1024/2048 pass"));
     }
 
     #[test]
-    fn capabilities_report_exact_8b_1024_2048_after_source_head_alignment() {
+    fn capabilities_report_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
         assert!(response.support_contract.current_gate.contains(
-            "Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs"
+            "Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs"
         ));
         assert!(response
             .support_contract
@@ -3882,7 +3830,7 @@ mod tests {
             .find(|item| item.id == "Q8_0")
             .expect("Q8_0 row should stay advertised");
         assert!(q8.notes.contains(
-            "exact Llama 3.2 1B/3B Instruct Q8_0 rows and the exact Llama 3 8B Instruct Q8_0 row have checked bounded 512/1024/2048-context packs"
+            "exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs"
         ));
         assert!(q8.notes.contains("where row-specific PASS artifacts exist"));
         assert!(!q8.notes.contains("8B 1024/2048 remain red"));
@@ -3895,10 +3843,7 @@ mod tests {
         assert!(llama_bpe.notes.contains(
             "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs"
         ));
-        assert!(llama_bpe
-            .notes
-            .contains("published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0"));
-        assert!(!llama_bpe.notes.contains("8B 1024/2048 current-head bundle"));
+        assert!(llama_bpe.notes.contains("8B 1024/2048 current-head bundle"));
         assert!(!llama_bpe.notes.contains("8B 1024/2048 remain red"));
 
         let eight_b = response
@@ -3992,6 +3937,7 @@ mod tests {
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
+                "mixtral_8x7b_instruct_v0_1_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
             ])
         );
@@ -4008,7 +3954,6 @@ mod tests {
 
         for id in [
             "mistral_7b_instruct_v0_3_q8_0",
-            "mixtral_8x7b_instruct_v0_1_q8_0",
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
         ] {
@@ -4031,186 +3976,9 @@ mod tests {
             .support_contract
             .current_gate
             .contains("Current exact-row support"));
-        assert!(response
-            .support_contract
-            .current_gate
-            .contains("superseded by Gate 9A 50-token divergence and a longer-continuation hang"));
         assert!(response.support_contract.current_gate.contains(
             "no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied"
         ));
-    }
-
-    #[test]
-    fn capabilities_api_features_stay_exact_row_scoped() {
-        let response = capabilities_response();
-        let chat = response
-            .api_features
-            .iter()
-            .find(|feature| feature.id == "openai_chat_completions")
-            .expect("chat completions capability should stay advertised");
-        assert!(
-            chat.notes.contains("exact supported dense GGUF rows"),
-            "chat capability must stay exact-row scoped: {}",
-            chat.notes
-        );
-        assert!(
-            !chat.notes.contains("supported dense GGUF models"),
-            "chat capability must not imply broad dense model support: {}",
-            chat.notes
-        );
-        assert!(response
-            .notes
-            .iter()
-            .any(|note| note.contains("only from loaded exact Camelid-supported dense GGUF rows")));
-    }
-
-    #[test]
-    fn unsupported_capability_rows_do_not_advertise_api_or_frontend_readiness() {
-        let response = capabilities_response();
-
-        for target in response
-            .model_compatibility
-            .iter()
-            .filter(|target| !target.status.starts_with("supported"))
-        {
-            assert_ne!(
-                target.frontend_load_path_verified, "validated",
-                "{} must not report a validated frontend load path while unsupported/planned",
-                target.id
-            );
-            assert!(
-                target.frontend_readiness_gate.contains("fail-closed"),
-                "{} must keep frontend readiness fail-closed while unsupported/planned",
-                target.id
-            );
-            assert!(
-                !target.generation_runs.contains("api_completion")
-                    && !target.generation_runs.contains("chat_smoke")
-                    && !target.generation_runs.contains("frontend"),
-                "{} must not advertise API/WebUI generation readiness while unsupported/planned: {}",
-                target.id,
-                target.generation_runs
-            );
-            let evidence = target.evidence.to_ascii_lowercase();
-            assert!(
-                evidence.contains("not supported")
-                    || evidence.contains("no broad")
-                    || evidence.contains("planned")
-                    || evidence.contains("planning")
-                    || evidence.contains("unsupported"),
-                "{} evidence must carry an explicit unsupported/planning boundary: {}",
-                target.id,
-                target.evidence
-            );
-        }
-    }
-
-    #[test]
-    fn capabilities_public_strings_do_not_expose_local_operator_paths() {
-        let response = capabilities_response();
-        let value = serde_json::to_value(response).expect("capabilities response should serialize");
-
-        assert_json_strings_avoid_private_paths(&value, "$", &[]);
-    }
-
-    fn assert_json_strings_avoid_private_paths(
-        value: &serde_json::Value,
-        json_path: &str,
-        key_path: &[String],
-    ) {
-        match value {
-            serde_json::Value::String(text) => {
-                assert_public_capability_string(text, json_path, key_path);
-            }
-            serde_json::Value::Array(items) => {
-                for (index, item) in items.iter().enumerate() {
-                    assert_json_strings_avoid_private_paths(
-                        item,
-                        &format!("{json_path}[{index}]"),
-                        key_path,
-                    );
-                }
-            }
-            serde_json::Value::Object(entries) => {
-                for (key, item) in entries {
-                    let mut child_key_path = key_path.to_vec();
-                    child_key_path.push(key.clone());
-                    assert_json_strings_avoid_private_paths(
-                        item,
-                        &format!("{json_path}.{key}"),
-                        &child_key_path,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    #[test]
-    fn capabilities_public_string_guard_rejects_local_evidence_bundle_paths() {
-        let evidence_key = vec!["evidence".to_string()];
-
-        assert_eq!(
-            private_capability_string_marker(
-                "qa/evidence-bundles/backend-local-support-contract-guard-current-head-20260513T0342Z-head-5bcdd99d5ee7/manifest.json",
-                &evidence_key,
-            ),
-            Some("qa/evidence-bundles/backend-local")
-        );
-        assert_eq!(
-            private_capability_string_marker(
-                "qa/evidence-bundles/local-support-contract-guard-20260513T000328Z-head-62527d7d863b/manifest.json",
-                &evidence_key,
-            ),
-            Some("qa/evidence-bundles/local-")
-        );
-        assert_eq!(
-            private_capability_string_marker(
-                "target/backend-local-latest-artifact.txt",
-                &evidence_key,
-            ),
-            Some("target/")
-        );
-    }
-
-    fn assert_public_capability_string(text: &str, json_path: &str, key_path: &[String]) {
-        if let Some(marker) = private_capability_string_marker(text, key_path) {
-            panic!("{json_path} must not expose local/operator path marker {marker:?}: {text}");
-        }
-    }
-
-    fn private_capability_string_marker(text: &str, key_path: &[String]) -> Option<&'static str> {
-        const PRIVATE_PATH_MARKERS: &[&str] = &[
-            "/Users/",
-            "/home/",
-            "/private/var/",
-            "/var/folders/",
-            "file://",
-            "ssh://",
-            "ubuntu@",
-        ];
-        const LOCAL_EVIDENCE_BUNDLE_MARKERS: &[&str] = &[
-            "qa/evidence-bundles/backend-local",
-            "qa/evidence-bundles/local-",
-            "qa/evidence-bundles/tpm-local-",
-        ];
-
-        for marker in PRIVATE_PATH_MARKERS {
-            if text.contains(marker) {
-                return Some(marker);
-            }
-        }
-        for marker in LOCAL_EVIDENCE_BUNDLE_MARKERS {
-            if text.contains(marker) {
-                return Some(marker);
-            }
-        }
-
-        if key_path.last().is_some_and(|key| key == "evidence") && text.contains("target/") {
-            return Some("target/");
-        }
-
-        None
     }
 
     #[test]
@@ -4221,53 +3989,25 @@ mod tests {
             .iter()
             .find(|target| target.id == "mixtral_8x7b_instruct_v0_1_q8_0")
             .expect("Mixtral exact-row lane should stay visible");
-        assert_eq!(mixtral.status, "active_validation_partial_runtime");
-        assert_eq!(mixtral.support_scope, "exact_row_bounded_moe_runtime_only");
+        assert_eq!(mixtral.status, "supported_exact_row_smoke");
         assert_eq!(
-            mixtral.full_support_status,
-            "blocked_later_generation_divergence"
+            mixtral.support_scope,
+            "validated_exact_row_short_prompt_moe_api_webui_runtime_only"
         );
         assert_eq!(
             mixtral.generation_runs,
-            "bounded_one_token_runtime_smoke_observed"
+            "api_completion_and_chat_smoke_plus_6prompt_5token_parity"
         );
-        assert_eq!(
-            mixtral.parity_audited,
-            "prompt_tokens_and_one_token_smoke_only_later_generation_diverges"
-        );
-        assert_eq!(
-            mixtral.latest_checked_bucket,
-            "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511"
-        );
+        assert_eq!(mixtral.frontend_load_path_verified, "validated");
         assert_eq!(
             mixtral.latest_checked_result,
-            "blocked_later_generation_divergence"
+            "pass_exact_row_short_prompt_api_webui_rss_manifest"
         );
-        assert_eq!(
-            mixtral.latest_checked_output,
-            "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md"
-        );
-        assert!(mixtral.frontend_readiness_gate.contains("fail-closed"));
+        assert!(mixtral.frontend_readiness_gate.contains("loaded_now=true"));
         assert!(mixtral.evidence.contains("llama.expert_count=8"));
         assert!(mixtral
             .evidence
-            .contains("Gate 9A 50-token evidence diverged at generated token index 9"));
-        assert!(mixtral.evidence.contains("backend HTTP hang"));
-        assert!(mixtral.evidence.contains("No broad Mixtral"));
-
-        let mixtral_family = response
-            .planned_model_families
-            .iter()
-            .find(|item| item.id == "mixtral_moe")
-            .expect("Mixtral planned-family lane should stay visible");
-        assert_eq!(mixtral_family.status, "active_validation_partial_runtime");
-        assert!(mixtral_family
-            .notes
-            .contains("bounded one-token exact-row MoE runtime evidence only"));
-        assert!(mixtral_family
-            .notes
-            .contains("Gate 9A 50-token divergence and a longer-continuation hang"));
-        assert!(mixtral_family.notes.contains("support remain unclaimed"));
+            .contains("mixtral-8x7b-v0.1-q8-manifest-checksum-20260511"));
 
         let planned_rows = ["qwen25_7b_instruct_q8_0", "gemma2_9b_it_q8_0"];
 

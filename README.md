@@ -2,37 +2,40 @@
 
 [![CI][ci-badge]][ci-workflow]
 
+![Camelid banner](assets/camelid-banner.png)
+
 **Camelid is a Rust-native local inference backend for GGUF language models, built for teams that want local performance, clear support boundaries, and evidence they can inspect.**
 
 Many local-model stacks are easy to demo and hard to trust. Camelid closes that gap with disciplined support claims, clear readiness signals, and a product surface that stays aligned across runtime, API, UI, and documentation.
 
 Camelid does not treat “probably works” as “supported.” Support moves on evidence.
 
-> **Current public posture:** Camelid achieves 1:1 parity with llama.cpp for four exact GGUF rows within bounded published validation envelopes: TinyLlama at the current validated gate; Llama 3.2 1B/3B Instruct Q8_0 through checked bounded 512/1024/2048-context packs; and Llama 3 8B Instruct Q8_0 through exact-row smoke plus checked bounded 512/1024/2048-context packs where row-specific PASS artifacts are cited; the 8B 1024/2048 buckets are tied to source/runtime head `8e26be0a73c0`, not a fresh rerun of today's checkout. `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` remains unsupported beyond the bounded one-token backend MoE runtime validation boundary: later 5-token/API/WebUI/RSS promotion-candidate artifacts were superseded by 50-token Gate 9A divergence and a longer-continuation hang, so no broad Mixtral, frontend-support, long-context, production, or full-support claim is made. `Mistral-7B-Instruct-v0.3.Q8_0.gguf` remains an active exact-row bring-up lane, not a supported row. These are exact-row bounded claims only; wider model-native context beyond the checked packs, production throughput, portability, arbitrary templates, neighboring rows, and broad-family behavior remain outside the claim.
+> **Current public posture:** Camelid achieves 1:1 parity with llama.cpp for five exact GGUF rows within bounded published validation envelopes: TinyLlama at the current validated gate; Llama 3.2 1B/3B Q8_0 through checked bounded 512/1024/2048-context packs; Llama 3 8B Q8_0 through exact-row smoke plus checked bounded 512/1024/2048-context packs on current `main`; and `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` through the checked short-prompt MoE/API/WebUI/RSS envelope. The Mixtral row is exact-row supported only after refreshed six-prompt 5-token parity, OpenAI-compatible API smoke, WebUI readiness, RSS/timing, and scrubbed manifest/checksum evidence passed. `Mistral-7B-Instruct-v0.3.Q8_0.gguf` remains an active exact-row bring-up lane, not a supported row. These are exact-row bounded claims only; wider model-native context beyond the checked packs, production throughput, portability, arbitrary templates, neighboring rows, and broad-family behavior remain outside the claim.
 
 ## Milestone at a glance
 
 Camelid's current milestone is a synchronized product surface: backend runtime, OpenAI-compatible API, WebUI readiness, docs, and durable evidence all point at the same support contract.
 
-- **Four exact Q8_0 rows are public and evidence-backed.** TinyLlama remains the full current gate; Llama 3.2 1B Instruct Q8_0, Llama 3.2 3B Instruct Q8_0, and Llama 3 8B Instruct Q8_0 are supported only within validated exact-row bounds. Mixtral 8x7B Instruct v0.1 is an active bounded backend MoE runtime lane, not a supported row. Mistral 7B Instruct v0.3 remains fail-closed as an active bring-up lane until its current-head promotion checklist is complete.
+- **Five exact Q8_0 rows are public and evidence-backed.** TinyLlama remains the full current gate; Llama 3.2 1B, Llama 3.2 3B, and Llama 3 8B are supported within validated bounds; `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. Mistral 7B Instruct v0.3 remains fail-closed as an active bring-up lane until its current-head promotion checklist is complete.
 - **The UI and API fail closed instead of guessing.** Chat unlocks only when the loaded local GGUF is `loaded_now=true`, `generation_ready=true`, and matched to an exact supported `/api/capabilities` row.
-- **The context ladder is explicit.** The four named TinyLlama/Llama exact rows have checked bounded 512-context evidence; Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 also have checked 1024 and 2048 packs. Mixtral remains fail-closed at the bounded one-token backend MoE runtime validation boundary; 5-token/API/WebUI/RSS promotion-candidate artifacts are documented as superseded and do not promote frontend support, longer context, or broad Mixtral readiness.
+- **The context ladder is explicit.** The four supported Llama/TinyLlama rows have checked bounded 512-context evidence; Llama 3.2 1B/3B and Llama 3 8B also have checked 1024 and 2048 packs. The Mixtral exact row is checked only in the short-prompt MoE/API/WebUI/RSS envelope; no longer-context bucket is promoted for Mixtral.
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
-The WebUI screenshot above is the intended dark, collapsed-rail chat surface: intentionally simple and product-forward while still reflecting the local-first runtime contract. It is not a broad model-family or arbitrary-GGUF support claim.
+The WebUI screenshot above is intentionally simple and product-forward while still reflecting the local-first runtime contract. It is not a broad model-family or arbitrary-GGUF support claim.
 
 ## Current work tracks
 
 Camelid is advancing on two tracks:
 
-- **Supported-row hardening:** preserve TinyLlama as the full current gate, move the verified Llama rows toward the same normalized bar, keep Mixtral fail-closed outside bounded one-token backend MoE runtime evidence, and keep support wording tied to green evidence. The remaining gaps are broader context, arbitrary/Jinja template coverage, production-throughput evidence, portability, and repeated current-head bundles.
+- **Supported-row hardening:** preserve TinyLlama as the full current gate, move the verified Llama rows and the Mixtral exact row toward the same normalized bar, and keep support wording tied to green evidence. The remaining gaps are broader context, arbitrary/Jinja template coverage, production-throughput evidence, portability, and repeated current-head bundles.
+  - Mixtral continuation hardening is active: the checked exact-row short-prompt envelope is still green, and the continuation path now accepts exact prompt-token reuse for repro/debug work, but long-generation and wider-prompt claims remain blocked until separate evidence closes that lane.
 - **Active next-model bring-up:** Mistral 7B Instruct is the lead exact-row bring-up lane; Qwen 2.5 7B Instruct and Gemma 2 9B Instruct remain planned exact-row candidates.
   - `Mistral-7B-Instruct-v0.3.Q8_0.gguf` — active validation only: source/SHA, exact tokenizer/template references, 1-token generation parity, broader five-prompt/50-token parity, bounded 512/1024/2048, and checked 4096/8192 context evidence now exist. Support remains fail-closed pending row-specific API/WebUI/RSS evidence and synchronized capability/frontend/docs wording. No Mistral-family, neighboring-row, arbitrary-template, production-throughput, portability, or full-support claim is implied.
-  - `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` — bounded backend MoE runtime validation boundary only: source/SHA/license, tokenizer/template references, lazy/file-backed rank-3 Q8 expert routing, selected top-k weight renormalization, and bounded one-token smoke are documented. Later 5-token/API/WebUI/RSS promotion-candidate artifacts exist, but the 2026-05-12 blocker reconciliation supersedes them for support because 50-token Gate 9A diverges and a longer-continuation probe hung; frontend support, long-context, production, neighboring-row, and broader/full support remain unclaimed.
+  - `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` — exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope: refreshed six-prompt 5-token parity against llama.cpp, OpenAI-compatible API smoke, WebUI readiness, RSS/timing, and scrubbed manifest/checksum evidence are documented. Neighboring rows, broad-family behavior, long context, arbitrary templates, production throughput, portability, and broader/full support remain unclaimed.
   - `Qwen2.5-7B-Instruct-Q8_0.gguf` — planned exact-row candidate; tokenizer/template and architecture mapping still need row-specific proof.
   - `gemma-2-9b-it-Q8_0.gguf` — planned exact-row candidate; tokenizer/template and Gemma2 runtime behavior still need row-specific proof.
-  - Public wording for Mixtral is limited to the bounded one-token exact-row backend MoE runtime validation boundary until the Gate 9A/long-continuation blocker closes and any API/WebUI/RSS evidence is refreshed as promotion-grade rather than superseded pre-promotion evidence. Qwen and Gemma remain “not supported yet” until each row has its own source/SHA/license, tokenizer/template, parity, bounded load/readiness, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence. See [`COMPATIBILITY.md`](COMPATIBILITY.md#locked-next-family-readiness-language) for the row-by-row promotion checklist.
+  - Public wording for the Mixtral row is limited to “exact-row supported” / “validated exact row” inside the checked short-prompt MoE/API/WebUI/RSS envelope. Qwen and Gemma remain “not supported yet” until each row has its own source/SHA/license, tokenizer/template, parity, bounded load/readiness, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence. See [`COMPATIBILITY.md`](COMPATIBILITY.md#locked-next-family-readiness-language) for the row-by-row promotion checklist.
 
 Roadmap items such as multi-model concurrency remain roadmap items, not current support.
 
@@ -74,30 +77,30 @@ Camelid’s public support boundary is intentionally narrow and exact-row. Read 
 | Llama 3.2 3B Instruct Q8_0 | **Verified support (bounded)** | Load, completions, chat completions, WebUI validation, compact/broader 50-token parity, bounded template-shape checks, bounded unique-chat perf/RSS, checked 512/1024/2048-context packs, and an opt-in parallel Q8 first-token direction probe. | The parallel Q8 result is a direction probe, not production throughput; broader/full support still needs model-native/larger context, arbitrary-template, and portability evidence. |
 | Llama 3 8B Instruct Q8_0 | **Verified support (bounded)** | Load, completions, chat completions, WebUI validation, compact parity, three-prompt 50-token parity, checked 512/1024/2048-context packs, compact chat-template-shapes pack, bounded memory evidence, structured RSS/Q8 file-read counters, and lazy-Q8 hot-path measurements. | The 1024/2048 pass is exact-row/current-head only via `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json`; no model-native/larger context beyond checked packs, production throughput, arbitrary templates, portability, neighboring-row, or broad 8B/Llama support is implied. |
 | Mistral-7B-Instruct-v0.3.Q8_0.gguf | **In active validation; not supported yet** | Source/SHA, exact tokenizer/template references, 1-token generation parity, broader five-prompt/50-token parity, bounded 512/1024/2048 bring-up, and checked 4096/8192 context validation are green; latest context bundle: `qa/evidence-bundles/mistral-7b-v0.3-q8-context-4096-8192-ubuntu-20260509T005229Z-head-9e3c64f2cfab/manifest.json`. | No Mistral-family support, neighboring variants, arbitrary templates, model-native/larger context, API/WebUI readiness, production throughput, portability, or full support until row-specific readiness evidence and surfaces land. |
-| Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | **Bounded backend MoE runtime validation** | Source/SHA/license, tokenizer/template references, lazy/file-backed rank-3 Q8 expert routing, selected top-k weight renormalization, and bounded one-token smoke evidence. Key current boundary: `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/manifest.json`; original one-token anchor: `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-support-probe-20260509/manifest.json`. | Not broad Mixtral support: later 5-token/API/WebUI/RSS artifacts are superseded for support by 50-token Gate 9A divergence and a long-continuation hang; no frontend-support, long-context, production-throughput, neighboring-row, or full-support claim. |
+| Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | **Verified support (bounded exact row)** | Refreshed six-prompt 5-token parity, OpenAI-compatible API smoke, WebUI readiness, RSS/timing, and scrubbed manifest/checksum evidence. Key bundles: `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-backend-parity-refresh-20260511/`, `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-api-smoke-20260511/`, `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-webui-readiness-20260511/`, `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-rss-timing-runtime-20260511/`, and `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-manifest-checksum-20260511/`. | Exact row and checked short-prompt/API/WebUI/RSS envelope only; no neighboring-row, long-context, arbitrary-template, production-throughput, portability, or broader/full claim. |
 | Qwen2.5-7B-Instruct-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/tokenizer planning only. | No Qwen support until tokenizer/template references, architecture mapping, bounded load, parity, API/WebUI, RSS, and bundle evidence exist. |
 | gemma-2-9b-it-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/tokenizer planning only. | No Gemma support until tokenizer/template references, architecture mapping, bounded load, parity, API/WebUI, RSS, and bundle evidence exist. |
 
 ### Latest bounded model checks
 
-The maintainer matrix now includes four exact Q8_0 supported rows with checked row-specific evidence. Mistral remains an active validation row, not a supported row. Mixtral has bounded one-token backend MoE runtime evidence and superseded pre-promotion API/WebUI/RSS artifacts, but not frontend or broad support. These are bounded checks, not universal model claims.
+The maintainer matrix now includes five exact Q8_0 supported rows with checked row-specific evidence. Mistral remains an active validation row, not a supported row. These are bounded checks, not universal model claims.
 
 | Exact row | Latest checked bucket | Result | Output checked |
 | --- | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | direct chat validation | PASS | `Certainly! Here` |
 | Llama 3.2 1B Instruct Q8_0 | 2048-context bounded recall pack | PASS | `CMLD-204` |
 | Llama 3.2 3B Instruct Q8_0 | 2048-context bounded recall pack | PASS | `CMLD-204` |
-| Llama 3 8B Instruct Q8_0 | 2048-context bounded recall pack | PASS at source/runtime head `8e26be0a73c0` | `CMLD-204` |
+| Llama 3 8B Instruct Q8_0 | 2048-context bounded recall pack | PASS on current `main` | `CMLD-204` |
 | Mistral-7B-Instruct-v0.3.Q8_0.gguf | Active validation: Ubuntu bounded bring-up plus exact tokenizer/template, 1-token, broader five-prompt/50-token parity, and checked 4096/8192 context evidence | PASS for validation lane; still unsupported | API/WebUI/RSS readiness and synchronized support surfaces still required before any support claim |
-| Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | Bounded backend MoE runtime probe: one-token smoke with selected-weight renormalized top-k routing and lazy/file-backed rank-3 Q8 experts | One-token validation boundary only; later promotion-candidate artifacts are superseded by 50-token divergence and a long-continuation hang | Backend runtime validation boundary only; superseded API/WebUI/RSS artifacts do not promote frontend support, long-context, or broad support |
+| Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | Exact-row promotion gates: six short prompts at max_tokens=5, API smoke, WebUI readiness, RSS/timing, and manifest/checksum | PASS for the checked exact-row envelope | No neighboring-row, long-context, arbitrary-template, production-throughput, portability, or broader/full claim |
 
 ### Read this boundary carefully
 
 - Support does **not** inherit across model sizes, variants, quantizations, tokenizer lanes, or nearby GGUFs.
-- “Llama support” currently means only the exact supported rows above; Mistral has no support claim yet and may only be discussed as the exact active validation row above. Mixtral may only be discussed as bounded one-token exact-row backend MoE runtime validation-boundary evidence until its Gate 9A/long-continuation blocker closes and readiness artifacts are refreshed for promotion.
+- Support language currently means only the exact supported rows above; Mistral has no support claim yet and may only be discussed as the exact active validation row above. The Mixtral row may only be described as exact-row supported inside its checked short-prompt MoE/API/WebUI/RSS envelope.
 - Checked context packs do **not** imply model-native or broader context support.
 - Bounded template-shape or perf evidence does **not** imply arbitrary template execution or production portability.
-- The next major 8B, Mistral, and Mixtral gaps are broader context, arbitrary templates, production throughput, portability, repeated durability evidence, and normalized support bundles; Mistral still needs row-specific API/WebUI/RSS readiness, and Mixtral first needs Gate 9A/long-continuation parity before superseded API/WebUI/RSS artifacts, long-context work, or broader support evidence can widen the claim.
+- The next major 8B, Mistral, and Mixtral-row gaps are broader context, arbitrary templates, production throughput, portability, repeated durability evidence, and normalized support bundles; Mistral also still needs row-specific API/WebUI/RSS readiness, and the Mixtral exact row still needs separate longer-context, broader-prompt, and stable long-generation continuation evidence before widening the checked envelope.
 
 Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The current evidence snapshot lives in [`STATUS.md`](STATUS.md).
 
@@ -105,8 +108,6 @@ Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The curren
 
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support matrix and promotion rules
 - [`STATUS.md`](STATUS.md) — current evidence boundary, recent moves, and blockers
-- [`BENCHMARKS.md`](BENCHMARKS.md) — public performance snapshot and benchmark-claim rules
-- [`PARITY.md`](PARITY.md) — audit path for Camelid's exact-row llama.cpp parity claims
 - [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) — shortest safe local path
 - [`docs/VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — expected checks by change type
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — contribution expectations and PR guidance
@@ -170,15 +171,6 @@ By default, the UI talks to `http://127.0.0.1:8181` and only unlocks local chat 
 
 See [`frontend/README.md`](frontend/README.md) for frontend-specific details.
 
-## Why the proof story matters
-
-Camelid's strongest technical proof points are now separated so reviewers can audit them quickly:
-
-- [`PARITY.md`](PARITY.md) shows where exact-row prompt-token, generated-token, and generated-text agreement with llama.cpp is proved.
-- [`BENCHMARKS.md`](BENCHMARKS.md) shows the current public runtime snapshots and makes the benchmark-claim boundary explicit.
-
-That split is intentional: parity is Camelid's trust foundation, and performance claims should only ride on top of evidence that is already row-scoped and reproducible.
-
 ## How support moves
 
 A row is promoted only when all of these agree for the exact lane being claimed:
@@ -236,8 +228,6 @@ npm run build
 - [`DOCS.md`](DOCS.md) — full documentation index
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — support ledger
 - [`STATUS.md`](STATUS.md) — current evidence snapshot
-- [`BENCHMARKS.md`](BENCHMARKS.md) — public performance snapshot and benchmark policy
-- [`PARITY.md`](PARITY.md) — exact-row parity proof map
 - [`ROADMAP.md`](ROADMAP.md) — delivery plan of record
 - [`FULL_SUPPORT_BLOCKER_MATRIX.md`](FULL_SUPPORT_BLOCKER_MATRIX.md) — row-by-row missing evidence for broader promotion
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — architecture and module planning

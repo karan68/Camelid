@@ -539,6 +539,52 @@ async fn chat_completion_validates_generation_input_before_runtime() {
 }
 
 #[tokio::test]
+async fn completion_accepts_prompt_token_ids_before_runtime() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","camelid_prompt_token_ids":[1,2,3],"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "model_not_loaded");
+}
+
+#[tokio::test]
+async fn completion_rejects_ambiguous_prompt_and_prompt_token_ids() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","prompt":"hello","camelid_prompt_token_ids":[1,2,3],"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "ambiguous_generation_input");
+}
+
+#[tokio::test]
 async fn chat_completion_requires_loaded_model_after_valid_input() {
     let app = camelid::api::router();
     let response = app
