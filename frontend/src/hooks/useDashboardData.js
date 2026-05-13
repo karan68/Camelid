@@ -355,7 +355,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [dashboard, setDashboard] = useState(null)
   const [apiBase, setApiBaseState] = useState(getApiBase)
   const [tab, setTab] = useState(getInitialTab)
-  const [selectedConversationId, setSelectedConversationId] = useState(getInitialConversationId)
+  const [selectedConversationId, setSelectedConversationIdState] = useState(getInitialConversationId)
   const [selectedModelId, setSelectedModelId] = useState(getInitialModelId)
   const [search, setSearch] = useState('')
   const [memorySearch, setMemorySearch] = useState('')
@@ -373,6 +373,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const localModelsRef = useRef(localModels)
   const localConversationsRef = useRef(localConversations)
   const localMemoriesRef = useRef(localMemories)
+  const selectedConversationIdRef = useRef(selectedConversationId)
 
   useEffect(() => {
     localModelsRef.current = localModels
@@ -386,14 +387,32 @@ export function useDashboardData({ showNotice, clearNotice }) {
     localMemoriesRef.current = localMemories
   }, [localMemories])
 
+  useEffect(() => {
+    selectedConversationIdRef.current = selectedConversationId
+  }, [selectedConversationId])
+
+  const setSelectedConversationId = (valueOrUpdater) => {
+    const next = typeof valueOrUpdater === 'function'
+      ? valueOrUpdater(selectedConversationIdRef.current)
+      : valueOrUpdater
+    selectedConversationIdRef.current = next
+    setSelectedConversationIdState(next)
+    return next
+  }
+
   const normalizedApiBase = normalizeApiBase(apiBase)
   const updateConversationsState = (updater) => {
-    setLocalConversations((current) => normalizeStoredConversations(typeof updater === 'function' ? updater(current) : updater))
+    setLocalConversations((current) => {
+      const next = normalizeStoredConversations(typeof updater === 'function' ? updater(current) : updater)
+      localConversationsRef.current = next
+      return next
+    })
   }
 
   const persistConversations = (updater) => {
     setLocalConversations((current) => {
       const next = normalizeStoredConversations(typeof updater === 'function' ? updater(current) : updater)
+      localConversationsRef.current = next
       writeJsonStorage(CONVERSATIONS_STORAGE_KEY, next)
       return next
     })
@@ -402,16 +421,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const persistMemories = (updater) => {
     setLocalMemories((current) => {
       const next = typeof updater === 'function' ? updater(current) : updater
+      localMemoriesRef.current = next
       writeJsonStorage(MEMORIES_STORAGE_KEY, next)
       return next
     })
   }
 
   const persistLocalModels = (updater) => {
-    const nextModels = (typeof updater === 'function' ? updater(localModels) : updater)
+    const nextModels = (typeof updater === 'function' ? updater(localModelsRef.current) : updater)
       .map(normalizeLocalModelRecord)
       .filter(Boolean)
       .sort(compareModelsByName)
+    localModelsRef.current = nextModels
     writeJsonStorage(LOCAL_MODELS_STORAGE_KEY, nextModels)
     setLocalModels(nextModels)
     return nextModels

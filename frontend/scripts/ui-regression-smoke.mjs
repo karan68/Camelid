@@ -14,8 +14,8 @@ const newerChat = { id: 'newer-chat', title: 'Newer chat', messages: [{ role: 'u
 const conversations = [newerChat, oldChat]
 
 assert.equal(resolveSelectedConversation(conversations, NEW_CHAT_SENTINEL), null, 'new-chat sentinel must render an empty landing, not the newest old chat')
-assert.equal(resolveSelectedConversation(conversations, null), null, 'null selection must not silently fall back to an old chat')
-assert.equal(resolveSelectedConversation(conversations, 'missing-chat'), null, 'missing selection must not silently fall back to an old chat')
+assert.equal(resolveSelectedConversation(conversations, null), newerChat, 'null selection should recover to the newest available chat so the main pane does not blank during streaming')
+assert.equal(resolveSelectedConversation(conversations, 'missing-chat'), newerChat, 'missing selection should recover to the newest available chat so streaming stays attached to a visible thread')
 assert.equal(resolveSelectedConversation(conversations, 'old-chat'), oldChat, 'explicit old-chat selection should still open that chat')
 assert.equal(shouldCreateConversationForSend(null, NEW_CHAT_SENTINEL), true, 'sending from new-chat landing should create a fresh conversation')
 assert.equal(shouldCreateConversationForSend(oldChat, NEW_CHAT_SENTINEL), true, 'the sentinel must win even if a stale selectedConversation prop exists')
@@ -96,6 +96,8 @@ assert.match(chatWorkspaceSource, /data-code-streaming-state=\{stillGenerating \
 assert.match(chatWorkspaceSource, /message-code-card-status[^>]*aria-live="polite"[^>]*data-live-status="active"[^>]*>\{CODE_CARD_STREAMING_LABEL\}</, 'incomplete streaming code blocks should show a live active still-generating badge')
 assert.match(dashboardHookSource, /const conversations = localConversations\.length \? localConversations : dashboard\?\.conversations \|\| \[\]/, 'main chat should resolve selectedConversation from live local conversation state before stale dashboard snapshots')
 assert.match(dashboardHookSource, /currentLocalConversations\.some\(\(conversation\) => conversation\.id === current\)/, 'dashboard refresh should validate selected conversation against the same current local conversation snapshot it renders')
+assert.match(dashboardHookSource, /const selectedConversationIdRef = useRef\(selectedConversationId\)/, 'conversation selection should keep an immediate ref so background refreshes do not lose the active thread between state commits')
+assert.match(dashboardHookSource, /selectedConversationIdRef\.current = next[\s\S]*setSelectedConversationIdState\(next\)/, 'conversation selection updates should write the ref immediately before the async state commit')
 assert.match(dashboardHookSource, /activeModelRunnable && current !== activeModel\.id/, 'browser-selected model should snap back to the backend active model when the runtime changes')
 assert.match(dashboardHookSource, /const conversation = await ensureConversation\(\)[\s\S]*?setSelectedConversationId\(conversation\.id\)[\s\S]*?fetch\(`\$\{normalizedApiBase\}\/v1\/chat\/completions`/, 'fresh-chat sends must select the real conversation before streaming starts so the main pane updates with sidebar previews')
 assert.match(dashboardHookSource, /applyLocalChatPolicy\(history\)/, 'code/html prompts should use the local code-first request policy')
