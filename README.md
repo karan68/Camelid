@@ -47,6 +47,18 @@ Today, four exact Q8_0 rows are public and evidence-backed:
 
 Mixtral has one-token backend MoE runtime evidence but is not yet promoted to API/WebUI/frontend readiness. Mistral 7B Instruct is the active next exact-row bring-up lane.
 
+## Why this becomes a company
+
+Camelid is not trying to be another thin local-model wrapper. The wedge is operational trust.
+
+Teams adopting local AI for product, agent, or regulated workloads need more than raw inference. They need a runtime that tells the truth about what is actually ready, keeps the API and UI aligned with that truth, and expands support without breaking confidence. Camelid turns that requirement into product behavior.
+
+That creates a real commercial path:
+
+- **Enterprise local AI** that needs auditable support boundaries
+- **Agent and developer platforms** that want an OpenAI-compatible local runtime without hand-wavy readiness claims
+- **Regulated or privacy-sensitive deployments** where fail-closed behavior matters more than broad demo compatibility
+
 > **Support boundary:** Camelid makes exact-row claims only. Wider model-native context, arbitrary templates, production throughput, portability, neighboring rows, and broad-family behavior move only when the matching evidence is green.
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
@@ -89,7 +101,7 @@ Camelid’s public support boundary is intentionally narrow and exact-row. Read 
 | Exact lane | Public status | Green evidence today |
 | --- | --- | --- |
 | TinyLlama 1.1B Chat Q8_0 | **Verified support** | End-to-end generation, broader five-prompt/50-token parity, template-shape checks, 512-context coverage, and backend RSS/perf sampling. |
-| Llama 3.2 1B Instruct Q8_0 | **Verified bounded exact-row support** | Load, completions, chat completions, WebUI validation, compact/broader parity, template-shape checks, unique-chat perf/RSS sampling, and checked 512/1024/2048/4096/8192-context packs. |
+| Llama 3.2 1B Instruct Q8_0 | **Verified end-to-end support** | Load, completions, chat completions, WebUI validation, compact/broader parity, template-shape checks, unique-chat perf/RSS sampling, and checked 512/1024/2048/4096/8192-context packs. |
 | Llama 3.2 3B Instruct Q8_0 | **Verified support** | Load, completions, chat completions, WebUI validation, compact/broader 50-token parity, template-shape checks, unique-chat perf/RSS, checked 512/1024/2048-context packs, and an opt-in parallel Q8 first-token direction probe. |
 | Llama 3 8B Instruct Q8_0 | **Verified support** | Load, completions, chat completions, WebUI validation, compact parity, three-prompt 50-token parity, checked 512/1024/2048-context packs, compact chat-template-shapes pack, memory evidence, structured RSS/Q8 file-read counters, and lazy-Q8 hot-path measurements. |
 | Mistral-7B-Instruct-v0.3.Q8_0.gguf | **In active validation; not supported yet** | Source/SHA, exact tokenizer/template references, 1-token generation parity, broader five-prompt/50-token parity, checked 512/1024/2048 bring-up, checked 4096/8192 context validation, and fail-closed API/WebUI/RSS evidence are green; latest context bundle: `qa/evidence-bundles/mistral-7b-v0.3-q8-context-4096-8192-ubuntu-20260509T005229Z-head-9e3c64f2cfab/manifest.json`. |
@@ -131,7 +143,7 @@ Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The curren
 
 ## Quickstart
 
-This quickstart verifies that Camelid builds and the backend starts on your machine. It is **not** a one-command chat demo: the repository does not bundle supported GGUF model files, and end-to-end local chat requires additional setup.
+This quickstart verifies that Camelid builds cleanly, starts the backend, and returns a live API response. It is intentionally simple and honest: the repository does not bundle supported GGUF model files, so full local chat requires one additional setup step after the server is running.
 
 ### 1) Build and run the server
 
@@ -152,7 +164,7 @@ From another shell:
 curl -s http://127.0.0.1:8181/api/capabilities
 ```
 
-That confirms the backend is responding.
+Success looks like a live JSON capability response from Camelid. That confirms the backend is up and the product surface is reachable.
 
 ### 3) Before you expect local chat to work
 
@@ -162,7 +174,7 @@ You will need:
 - the model path wired into a load request you control
 - any extra contributor setup described in [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)
 
-For a first supported local run, TinyLlama is the clearest path — but it is **not bundled** in this repository, and this README is not a copy-paste chat demo.
+For a first supported local run, TinyLlama is the clearest path. It is **not bundled** in this repository, but once you have a supported GGUF locally and a load request wired in, Camelid is designed to make the readiness boundary explicit instead of guessing.
 
 ## Frontend
 
