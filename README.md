@@ -61,7 +61,7 @@ That creates a real commercial path:
 - **Agent and developer platforms** that want an OpenAI-compatible local runtime without hand-wavy readiness claims
 - **Regulated or privacy-sensitive deployments** where fail-closed behavior matters more than broad demo compatibility
 
-> **Support boundary:** Camelid makes exact-row claims only. The current supported rows have green row-scoped template/Jinja and production-throughput evidence; wider model-native context, portability, neighboring rows, and broad-family behavior still move only when matching evidence is green.
+> **Support boundary:** Camelid makes exact-row claims only. Current supported rows have row-scoped or bounded template/perf evidence where cited, but broad arbitrary/Jinja-template behavior, production throughput, wider model-native context, portability, neighboring rows, and broad-family behavior still move only when matching evidence is green.
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
@@ -129,7 +129,7 @@ The maintainer matrix now includes four exact Q8_0 supported rows with checked r
 - Support does **not** inherit across model sizes, variants, quantizations, tokenizer lanes, or nearby GGUFs.
 - Support language currently means only the exact supported rows above; Mistral has no support claim yet and may only be discussed as the exact active validation row above. The Mixtral row may only be described as one-token backend MoE runtime evidence with later-generation/API/WebUI/frontend readiness blocked.
 - Checked context packs do **not** imply model-native or broader context support.
-- Template/Jinja and production-throughput evidence for current supported rows is exact-row scoped; it does **not** imply neighboring GGUFs, portability, or broader context support.
+- Template and bounded perf/RSS evidence for current supported rows is exact-row scoped; it does **not** imply broad arbitrary/Jinja-template behavior, production throughput, neighboring GGUFs, portability, or broader context support.
 - The next major 8B, Mistral, and Mixtral-row gaps are broader context, portability, repeated durability evidence, and normalized support bundles; Mistral also still needs explicit contract promotion after fail-closed API/WebUI/RSS readiness, and Mixtral must first fix later-generation divergence and the continuation hang before any API/WebUI/frontend support claim.
 
 Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The current evidence snapshot lives in [`STATUS.md`](STATUS.md).

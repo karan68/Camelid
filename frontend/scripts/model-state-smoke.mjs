@@ -168,7 +168,7 @@ const capabilityFixture = {
     { id: 'gemma2_9b_it_q8_0', family: 'gemma2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Gemma 2 planning row only; no support evidence exists' },
   ],
 }
-const greenSupportFixture = {
+const boundedOnlySupportFixture = {
   support_contract: {
     current_gate: 'Current exact-row support: These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.',
   },
@@ -178,10 +178,20 @@ const greenSupportFixture = {
     { id: 'supported_two', status: 'supported_current_gate', chat_template_renderer: 'tinyllama-marker', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'measured', full_support_blockers: 'arbitrary-template behavior and production throughput remain outside this gate unless separately validated' },
   ],
 }
-const supportLanes = exactRowSupportLanes(greenSupportFixture.model_compatibility[0], greenSupportFixture.api_features)
-assert.deepEqual(supportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', true]], 'current supported rows should render template/Jinja and throughput as green readiness lanes')
-assert.doesNotMatch(rowSupportBoundaryCopy(greenSupportFixture.model_compatibility[0], greenSupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'resolved template/Jinja and production-throughput blockers should not remain in exact-row boundary copy')
-assert.doesNotMatch(frontendSupportContractCopy(greenSupportFixture), /arbitrary-template behavior|throughput/i, 'support contract copy should stop repeating resolved template/Jinja and throughput caveats for green current rows')
+const boundedOnlySupportLanes = exactRowSupportLanes(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features)
+assert.deepEqual(boundedOnlySupportLanes.map((lane) => [lane.key, lane.ready]), [['template', false], ['throughput', false]], 'bounded template/perf evidence must not become broad arbitrary-template or production-throughput readiness')
+assert.match(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'unresolved template/Jinja and production-throughput blockers should remain in exact-row boundary copy')
+assert.match(frontendSupportContractCopy(boundedOnlySupportFixture), /arbitrary-template behavior|throughput/i, 'support contract copy should keep unresolved template/Jinja and throughput caveats for bounded-only current rows')
+const promotedSupportFixture = {
+  support_contract: boundedOnlySupportFixture.support_contract,
+  api_features: [{ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: 'explicit production-throughput lane' }],
+  model_compatibility: [
+    { id: 'supported_one', status: 'supported_exact_row_smoke', chat_template_renderer: 'arbitrary_jinja_supported', performance_measured: 'production_throughput_validated', full_support_blockers: 'model-native/larger context, arbitrary/Jinja templates, production throughput, portability' },
+  ],
+}
+const promotedSupportLanes = exactRowSupportLanes(promotedSupportFixture.model_compatibility[0], promotedSupportFixture.api_features)
+assert.deepEqual(promotedSupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', true]], 'explicit broad template and production-throughput evidence may clear those readiness lanes')
+assert.doesNotMatch(rowSupportBoundaryCopy(promotedSupportFixture.model_compatibility[0], promotedSupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'resolved template/Jinja and production-throughput blockers should not remain in exact-row boundary copy')
 const modelsViewSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
 assert.match(
   modelsViewSource,

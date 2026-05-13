@@ -179,6 +179,23 @@ function findSupportedFeature(features = [], pattern) {
   return features.find((feature) => pattern.test(String(feature?.id || '')) && isSupportedCapabilityStatus(feature?.status || '')) || null
 }
 
+function hasPromotedArbitraryTemplateSupport(target) {
+  const renderer = String(target?.chat_template_renderer || '').toLowerCase()
+  return isSupportedCapabilityStatus(target?.status || '')
+    && /(?:arbitrary|broad).*jinja|jinja.*(?:arbitrary|broad)/i.test(renderer)
+    && !renderer.includes('exact_row')
+    && !renderer.includes('bounded')
+}
+
+function hasPromotedProductionThroughput(target) {
+  const performance = String(target?.performance_measured || '').toLowerCase()
+  return isSupportedCapabilityStatus(target?.status || '')
+    && /production[_-]?throughput/.test(performance)
+    && !performance.includes('bounded')
+    && !performance.includes('not_promoted')
+    && !performance.includes('fail_closed')
+}
+
 export function describeTemplateReadiness(target) {
   if (!target) {
     return { key: 'template', label: 'Template/Jinja', status: 'No exact row selected', tone: '', ready: false, copy: 'Choose an exact compatibility row before treating template behavior as supported.' }
@@ -186,15 +203,12 @@ export function describeTemplateReadiness(target) {
 
   const renderer = target.chat_template_renderer || ''
   const shapePack = target.chat_template_shape_pack || ''
-  const rendererReady = statusContainsSupportedEvidence(renderer)
-  const shapeReady = statusContainsSupportedEvidence(shapePack)
-  const rowSupported = isSupportedCapabilityStatus(target.status)
-  const jinjaReady = /jinja/i.test(renderer) && rendererReady
-  const ready = Boolean(rowSupported && (rendererReady || shapeReady))
+  const exactRendererReady = statusContainsSupportedEvidence(renderer) || statusContainsSupportedEvidence(shapePack)
+  const ready = hasPromotedArbitraryTemplateSupport(target)
   const label = ready
     ? 'Arbitrary/Jinja templates supported for this exact row'
-    : jinjaReady
-      ? 'Jinja renderer validated but row is not promoted'
+    : exactRendererReady
+      ? 'Exact-row template evidence only; arbitrary/Jinja still blocked'
       : 'Template support not promoted'
 
   return {
@@ -204,8 +218,8 @@ export function describeTemplateReadiness(target) {
     tone: ready ? 'ready' : 'warm',
     ready,
     copy: ready
-      ? `Arbitrary/Jinja-template readiness is green for this supported exact row: renderer ${formatCapabilityStatus(renderer || 'not advertised')} and shape pack ${formatCapabilityStatus(shapePack || 'not advertised')}.`
-      : 'Template/Jinja evidence is not promoted for this exact row yet.',
+      ? `Arbitrary/Jinja-template readiness is green for this supported exact row: renderer ${formatCapabilityStatus(renderer || 'not advertised')}.`
+      : 'Template/Jinja evidence remains exact-row or bounded-only; broad arbitrary-template support is not promoted yet.',
   }
 }
 
@@ -214,10 +228,9 @@ export function describeThroughputReadiness(target, apiFeatures = []) {
     return { key: 'throughput', label: 'Throughput', status: 'No exact row selected', tone: '', ready: false, copy: 'Choose an exact compatibility row before treating throughput behavior as supported.' }
   }
 
-  const feature = findSupportedFeature(apiFeatures, /(?:^|[_-])(production[_-]?throughput|throughput)(?:$|[_-])/i)
+  const feature = findSupportedFeature(apiFeatures, /(?:^|[_-])production[_-]?throughput(?:$|[_-])/i)
   const performance = target.performance_measured || ''
-  const rowSupported = isSupportedCapabilityStatus(target.status)
-  const rowThroughputReady = rowSupported && statusContainsSupportedEvidence(performance)
+  const rowThroughputReady = hasPromotedProductionThroughput(target)
   const ready = Boolean(feature || rowThroughputReady)
   const label = ready ? 'Production throughput supported for this exact row' : 'Throughput not promoted'
 
@@ -231,7 +244,7 @@ export function describeThroughputReadiness(target, apiFeatures = []) {
       ? `Production-throughput support is advertised by /api/capabilities as ${formatCapabilityStatus(feature.status)}: ${displayCapabilityCopy(feature.notes || 'No notes advertised.')}`
       : rowThroughputReady
         ? `Production-throughput readiness is green for this supported exact row from ${formatCapabilityStatus(performance)} performance evidence.`
-        : 'Throughput evidence is not promoted for this exact row yet.',
+        : 'Bounded perf/RSS evidence is not production-throughput support; throughput remains unpromoted for this exact row.',
   }
 }
 
