@@ -2796,6 +2796,7 @@ impl LlamaLayerMemoryTimings {
 
     fn record_end(&mut self) {
         self.q8_file_reads = q8_0_file_read_stats().saturating_delta_since(self.q8_file_read_start);
+        self.record_q8_file_read_phase("layer_end");
     }
 
     fn record(
@@ -9701,6 +9702,27 @@ mod tests {
         assert_eq!(target.cache_entries, 4);
         assert_eq!(target.cache_bytes, 1024);
         assert_eq!(target.cache_capacity_bytes, 2048);
+    }
+
+    #[test]
+    fn layer_memory_record_end_captures_tail_q8_file_read_phase() {
+        let _q8_guard = crate::test_support::q8_file_state_lock();
+        let mut memory = LlamaLayerMemoryTimings::new(7, memory_sample(100, 0, 0));
+
+        record_q8_0_file_read(32);
+        memory.record_after_attention_q(memory_sample(110, 0, 0));
+        record_q8_0_file_read(64);
+        memory.record_end();
+
+        assert_eq!(memory.q8_file_reads.read_calls, 2);
+        assert_eq!(memory.q8_file_reads.read_bytes, 96);
+        assert_eq!(memory.q8_file_read_phases.len(), 2);
+        assert_eq!(memory.q8_file_read_phases[0].phase, "attention_q_done");
+        assert_eq!(memory.q8_file_read_phases[0].q8_file_reads.read_calls, 1);
+        assert_eq!(memory.q8_file_read_phases[0].q8_file_reads.read_bytes, 32);
+        assert_eq!(memory.q8_file_read_phases[1].phase, "layer_end");
+        assert_eq!(memory.q8_file_read_phases[1].q8_file_reads.read_calls, 1);
+        assert_eq!(memory.q8_file_read_phases[1].q8_file_reads.read_bytes, 64);
     }
 
     #[test]
