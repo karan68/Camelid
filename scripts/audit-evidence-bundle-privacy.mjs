@@ -13,9 +13,9 @@ const findings = []
 
 const patterns = [
   {
-    id: 'ubuntu_home_path',
-    description: 'Ubuntu home/work path leaked into durable bundle content',
-    regex: /\/home\/[^/\n]+\/(?:work\/Camelid(?:-public-[^/\n]+)?|\.nvm\/versions\/node\/[^/\n]+\/bin\/node|models)\S*/g,
+    id: 'linux_home_path',
+    description: 'Linux home path leaked into durable bundle content',
+    regex: /(?:file:\/\/)?\/home\/[^/\s"']+\/[^\s"']*/g,
   },
   {
     id: 'mac_home_path',
