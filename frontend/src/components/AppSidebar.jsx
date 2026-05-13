@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
 
 const tabs = [
@@ -59,7 +59,7 @@ function DeleteIcon() {
   )
 }
 
-export default function AppSidebar({
+function AppSidebar({
   collapsed,
   dragging,
   onResizeStart,
@@ -73,7 +73,7 @@ export default function AppSidebar({
   tab,
   setTab,
   filteredConversations,
-  selectedConversation,
+  selectedConversationId,
   setSelectedConversationId,
   deleteConversation,
   renameConversation,
@@ -134,7 +134,7 @@ export default function AppSidebar({
     setOpenMenuId(null)
     setEditingConversationId(null)
     setEditingTitle('')
-  }, [collapsed, selectedConversation?.id, tab])
+  }, [collapsed, selectedConversationId, tab])
 
   const startRename = (conversation) => {
     setSelectedConversationId(conversation.id)
@@ -284,98 +284,25 @@ export default function AppSidebar({
                     <div className="conversation-group-items">
                       {group.items.map((conversation) => {
                         const rawTitle = conversation.title || 'Untitled conversation'
-                        const conversationTitle = clampText(rawTitle, 58) || 'Untitled conversation'
                         const normalizedTitle = rawTitle.trim().toLowerCase()
-                        const hasDuplicateTitle = (titleCounts.get(normalizedTitle) || 0) > 1
-                        const latestMessage = [...(conversation.messages || [])].reverse().find((message) => isMeaningfulConversationMessage(message))
-                        const preview = formatPreview(latestMessage?.content, 42) || 'New chat'
-                        const timeLabel = formatSidebarDate(conversation.updated_at)
-                        const subtitle = hasDuplicateTitle || normalizedTitle === 'untitled conversation'
-                          ? `${preview} · ${timeLabel}`
-                          : preview
-                        const menuOpen = openMenuId === conversation.id
-                        const selected = conversation.id === selectedConversation?.id
-                        const editing = editingConversationId === conversation.id
-
                         return (
-                          <div key={conversation.id} className={`conversation-item-row conversation-item-row-flat ${selected ? 'selected' : ''} ${menuOpen ? 'has-open-menu' : ''}`}>
-                            <button
-                              className={`conversation-item conversation-item-flat ${selected ? 'selected' : ''}`}
-                              aria-current={selected ? 'true' : undefined}
-                              onClick={() => {
-                                if (editing) return
-                                setSelectedConversationId(conversation.id)
-                                setTab('chat')
-                              }}
-                            >
-                              <div className="conversation-item-flat-main">
-                                {editing ? (
-                                  <input
-                                    className="conversation-rename-input"
-                                    value={editingTitle}
-                                    onChange={(event) => setEditingTitle(event.target.value)}
-                                    onClick={(event) => event.stopPropagation()}
-                                    onBlur={submitRename}
-                                    onKeyDown={(event) => {
-                                      if (event.key === 'Enter') {
-                                        event.preventDefault()
-                                        void submitRename()
-                                      }
-                                      if (event.key === 'Escape') {
-                                        event.preventDefault()
-                                        cancelRename()
-                                      }
-                                    }}
-                                    autoFocus
-                                    aria-label={`Rename ${rawTitle}`}
-                                  />
-                                ) : (
-                                  <>
-                                    <strong title={rawTitle}>{conversationTitle}</strong>
-                                    <span className="conversation-item-subtitle" title={subtitle}>{subtitle}</span>
-                                  </>
-                                )}
-                              </div>
-                            </button>
-                            {!editing && (
-                              <div className={`conversation-row-actions ${menuOpen ? 'is-open' : ''}`} data-conversation-menu-root="true">
-                                <button
-                                  type="button"
-                                  className="conversation-menu-button"
-                                  aria-label={`Open chat menu for ${conversationTitle}`}
-                                  aria-haspopup="menu"
-                                  aria-expanded={menuOpen ? 'true' : 'false'}
-                                  onClick={(event) => {
-                                    event.stopPropagation()
-                                    setOpenMenuId((current) => (current === conversation.id ? null : conversation.id))
-                                  }}
-                                >
-                                  <MenuDotsIcon />
-                                </button>
-                                {menuOpen && (
-                                  <div className="conversation-menu-popover" role="menu" aria-label={`Actions for ${conversationTitle}`}>
-                                    <button type="button" role="menuitem" className="conversation-menu-item" onClick={() => startRename(conversation)}>
-                                      <span className="conversation-menu-item-icon"><RenameIcon /></span>
-                                      <span>Rename</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      role="menuitem"
-                                      className="conversation-menu-item conversation-menu-item-danger"
-                                      onClick={(event) => {
-                                        event.stopPropagation()
-                                        setOpenMenuId(null)
-                                        deleteConversation(conversation.id)
-                                      }}
-                                    >
-                                      <span className="conversation-menu-item-icon"><DeleteIcon /></span>
-                                      <span>Delete</span>
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </div>
+                          <ConversationListItem
+                            key={conversation.id}
+                            conversation={conversation}
+                            hasDuplicateTitle={(titleCounts.get(normalizedTitle) || 0) > 1}
+                            selected={conversation.id === selectedConversationId}
+                            menuOpen={openMenuId === conversation.id}
+                            editing={editingConversationId === conversation.id}
+                            editingTitle={editingTitle}
+                            setEditingTitle={setEditingTitle}
+                            submitRename={submitRename}
+                            cancelRename={cancelRename}
+                            setSelectedConversationId={setSelectedConversationId}
+                            setTab={setTab}
+                            setOpenMenuId={setOpenMenuId}
+                            startRename={startRename}
+                            deleteConversation={deleteConversation}
+                          />
                         )
                       })}
                     </div>
@@ -409,3 +336,113 @@ export default function AppSidebar({
     </>
   )
 }
+
+const ConversationListItem = memo(function ConversationListItem({
+  conversation,
+  hasDuplicateTitle,
+  selected,
+  menuOpen,
+  editing,
+  editingTitle,
+  setEditingTitle,
+  submitRename,
+  cancelRename,
+  setSelectedConversationId,
+  setTab,
+  setOpenMenuId,
+  startRename,
+  deleteConversation,
+}) {
+  const rawTitle = conversation.title || 'Untitled conversation'
+  const conversationTitle = clampText(rawTitle, 58) || 'Untitled conversation'
+  const normalizedTitle = rawTitle.trim().toLowerCase()
+  const latestMessage = [...(conversation.messages || [])].reverse().find((message) => isMeaningfulConversationMessage(message))
+  const preview = formatPreview(latestMessage?.content, 42) || 'New chat'
+  const timeLabel = formatSidebarDate(conversation.updated_at)
+  const subtitle = hasDuplicateTitle || normalizedTitle === 'untitled conversation'
+    ? `${preview} · ${timeLabel}`
+    : preview
+
+  return (
+    <div className={`conversation-item-row conversation-item-row-flat ${selected ? 'selected' : ''} ${menuOpen ? 'has-open-menu' : ''}`}>
+      <button
+        className={`conversation-item conversation-item-flat ${selected ? 'selected' : ''}`}
+        aria-current={selected ? 'true' : undefined}
+        onClick={() => {
+          if (editing) return
+          setSelectedConversationId(conversation.id)
+          setTab('chat')
+        }}
+      >
+        <div className="conversation-item-flat-main">
+          {editing ? (
+            <input
+              className="conversation-rename-input"
+              value={editingTitle}
+              onChange={(event) => setEditingTitle(event.target.value)}
+              onClick={(event) => event.stopPropagation()}
+              onBlur={submitRename}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  void submitRename()
+                }
+                if (event.key === 'Escape') {
+                  event.preventDefault()
+                  cancelRename()
+                }
+              }}
+              autoFocus
+              aria-label={`Rename ${rawTitle}`}
+            />
+          ) : (
+            <>
+              <strong title={rawTitle}>{conversationTitle}</strong>
+              <span className="conversation-item-subtitle" title={subtitle}>{subtitle}</span>
+            </>
+          )}
+        </div>
+      </button>
+      {!editing && (
+        <div className={`conversation-row-actions ${menuOpen ? 'is-open' : ''}`} data-conversation-menu-root="true">
+          <button
+            type="button"
+            className="conversation-menu-button"
+            aria-label={`Open chat menu for ${conversationTitle}`}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen ? 'true' : 'false'}
+            onClick={(event) => {
+              event.stopPropagation()
+              setOpenMenuId((current) => (current === conversation.id ? null : conversation.id))
+            }}
+          >
+            <MenuDotsIcon />
+          </button>
+          {menuOpen && (
+            <div className="conversation-menu-popover" role="menu" aria-label={`Actions for ${conversationTitle}`}>
+              <button type="button" role="menuitem" className="conversation-menu-item" onClick={() => startRename(conversation)}>
+                <span className="conversation-menu-item-icon"><RenameIcon /></span>
+                <span>Rename</span>
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                className="conversation-menu-item conversation-menu-item-danger"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setOpenMenuId(null)
+                  deleteConversation(conversation.id)
+                }}
+              >
+                <span className="conversation-menu-item-icon"><DeleteIcon /></span>
+                <span>Delete</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+})
+
+export default memo(AppSidebar)

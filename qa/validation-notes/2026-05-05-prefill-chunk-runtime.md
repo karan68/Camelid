@@ -54,27 +54,27 @@ Ubuntu follow-up validation:
 - Approved validation target: private maintainer-only Ubuntu validation lane; SSH host/key details intentionally omitted from public notes.
 - Isolated remote checkout base: `c4b51de7e7f7cc1bf16bd77ceded4589246b003e`.
 - Applied patch SHA256: `cc30a2cdcae54ba02c2e82b86089ff7dc99dc834592719ab3ecb1a0cab111c42`.
-- Remote work dir: `/tmp/camelid-prefill-memory-lx1w0o/repo`.
+- Remote work dir: scrubbed private temp checkout path.
 - Remote gates passed: `fmt --check`, focused `chunked_prefill_matches_sequential_prefill_outputs_and_cache`, full `test -q --lib` (`106 passed` on Linux), `clippy -q --lib -- -D warnings`, and `build -q --release --bin camelid`.
 
 Watchdog current-head spot-check:
 
 - Clean public checkout: `ce48e934eec0de1183f2d46c421b1d542ca05f01`.
-- Remote work dir: `/tmp/camelid-watchdog-current-head-20260505T213512Z/repo`.
+- Remote work dir: scrubbed private temp checkout path.
 - Remote gates passed: `fmt --check`, focused `chunked_prefill_matches_sequential_prefill_outputs_and_cache`, focused `q8_0_file_backed_batch_matmul_reuses_chunk_reads_across_input_rows`, `clippy -q --lib -- -D warnings`, and `build -q --release --bin camelid`.
 - Local spot-check gates also passed on the same head: `fmt --check`, the same two focused tests, and `bash scripts/check-public-scrub.sh`.
 
 Watchdog current-main follow-up after this note was committed:
 
 - Clean public checkout: `5a2ad6bde50d3640f0e8d23c9fef3f9fc7942c2f`.
-- Remote work dir: `/tmp/camelid-watchdog-current-head-20260505T2204Z/repo`.
+- Remote work dir: scrubbed private temp checkout path.
 - Remote gates passed: `fmt --check`, focused `chunked_prefill_matches_sequential_prefill_outputs_and_cache`, focused `q8_0_file_backed_batch_matmul_reuses_chunk_reads_across_input_rows`, `clippy -q --lib -- -D warnings`, and `build -q --release --bin camelid`.
 - This remains a current-head architecture/code spot-check only; it is not an 8B 1024/2048-context support artifact.
 
 Watchdog current-main follow-up after the spot-check note landed:
 
 - Clean public checkout: `e90b9973d38afd8da8c016a3381e0215f766ee9a`.
-- Remote work dir: `/tmp/camelid-watchdog-current-main-20260505T223640Z/repo`.
+- Remote work dir: scrubbed private temp checkout path.
 - Local gates passed on the same head: `fmt --check`, focused `chunked_prefill_matches_sequential_prefill_outputs_and_cache`, focused `q8_0_file_backed_batch_matmul_reuses_chunk_reads_across_input_rows`, and `bash scripts/check-public-scrub.sh`.
 - Remote gates passed: `fmt --check`, focused `chunked_prefill_matches_sequential_prefill_outputs_and_cache`, focused `q8_0_file_backed_batch_matmul_reuses_chunk_reads_across_input_rows`, `clippy -q --lib -- -D warnings`, and `build -q --release --bin camelid`.
 - This remains a current-main architecture/code spot-check only; it is not an 8B 1024/2048-context support artifact.

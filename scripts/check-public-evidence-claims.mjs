@@ -5,6 +5,7 @@ import { join, relative, resolve } from 'node:path'
 const args = parseArgs(process.argv.slice(2))
 const rootDir = resolve(args.get('root') || 'qa/evidence-bundles')
 const failures = []
+const privacyScannedPaths = new Set()
 let checkedBundles = 0
 let checkedSummaries = 0
 
@@ -13,6 +14,7 @@ for (const manifestPath of manifestPaths) {
   checkedBundles += 1
   await validateBundle(manifestPath)
 }
+await validateMixtralBlockerReconciliation(rootDir, manifestPaths)
 
 if (failures.length > 0) {
   console.error(`public evidence claim check failed with ${failures.length} finding(s):`)
@@ -26,6 +28,7 @@ async function validateBundle(manifestPath) {
   const bundleDir = manifestPath.slice(0, -'/manifest.json'.length)
   const bundleRel = relative(process.cwd(), bundleDir) || '.'
   const manifest = await readJson(manifestPath)
+  validatePublicJsonNoLocalPaths(manifestPath, manifest)
 
   if (!manifest || typeof manifest !== 'object') {
     fail(bundleRel, 'manifest.json is not a JSON object')
@@ -38,6 +41,7 @@ async function validateBundle(manifestPath) {
   if (summaryExists) {
     checkedSummaries += 1
     const summary = await readJson(summaryPath)
+    validatePublicJsonNoLocalPaths(summaryPath, summary)
     validateSummaryAgreement(bundleRel, manifest, summary)
   }
 
@@ -56,11 +60,159 @@ async function validateBundle(manifestPath) {
     validateMistral7bContext51210242048(bundleRel, manifest)
   }
 
+  if (schema === 'camelid.backend_local_current_head_exact_row_guardrail.v1') {
+    validateBackendLocalCurrentHeadExactRowGuardrail(bundleRel, manifest)
+  }
+
   const singleRowContext = singleRowContextSchema(schema)
   if (singleRowContext) validateSingleRowContextBundle(bundleRel, manifest, singleRowContext)
 
   const legacyPublicContext = legacyPublicContextSchema(manifest)
   if (legacyPublicContext) validateLegacyPublicContextBundle(bundleRel, manifest, legacyPublicContext)
+}
+
+async function validateMixtralBlockerReconciliation(root, manifestPaths) {
+  const summaryPaths = await findSummaryPaths(root)
+  const manifests = []
+  for (const manifestPath of manifestPaths) manifests.push({ path: manifestPath, json: await readJson(manifestPath) })
+  const summaries = []
+  for (const summaryPath of summaryPaths) {
+    const json = await readJson(summaryPath)
+    validatePublicJsonNoLocalPaths(summaryPath, json)
+    summaries.push({ path: summaryPath, json })
+  }
+
+  const promotionClaimPaths = new Set()
+  for (const { path, json } of manifests) {
+    if (json?.schema !== 'camelid.mixtral_exact_row_manifest.v1') continue
+    promotionClaimPaths.add(evidenceBundlePath(path))
+    for (const dependency of mixtralPromotionDependencyBundles(json, root)) promotionClaimPaths.add(dependency)
+  }
+  for (const { path, json } of summaries) {
+    if (json?.schema !== 'camelid.mixtral_exact_row_promotion_sync.v1' && json?.support_label !== 'supported_exact_row_smoke') continue
+    promotionClaimPaths.add(evidenceBundlePath(path))
+    for (const dependency of mixtralPromotionDependencyBundles(json, root)) promotionClaimPaths.add(dependency)
+  }
+  const blockerPaths = summaries
+    .filter(({ json }) => mixtralSummaryRecordsBlocker(json))
+    .map(({ path }) => path)
+  if (promotionClaimPaths.size === 0 || blockerPaths.length === 0) return
+
+  const reconciliation = manifests.find(({ json }) => json?.schema === 'camelid.mixtral_blocker_reconciliation.v1')
+  if (!reconciliation) {
+    fail(relative(process.cwd(), root) || '.', 'Mixtral promotion claims conflict with later long-output blocker evidence; add a camelid.mixtral_blocker_reconciliation.v1 manifest before public claim checks can pass')
+    return
+  }
+  validateMixtralReconciliationManifest(relative(process.cwd(), reconciliation.path), reconciliation.json, [...promotionClaimPaths], blockerPaths)
+}
+
+function mixtralPromotionDependencyBundles(json, root) {
+  const bundles = []
+  for (const value of arrayStrings(json?.required_prior_gates)) bundles.push(normalizeEvidenceBundleRef(value, root))
+  for (const value of arrayStrings(json?.artifact_bundles)) bundles.push(normalizeEvidenceBundleRef(value, root))
+  if (Array.isArray(json?.promotion_gate_artifacts)) {
+    for (const artifact of json.promotion_gate_artifacts) {
+      if (typeof artifact?.bundle === 'string') bundles.push(normalizeEvidenceBundleRef(artifact.bundle, root))
+    }
+  }
+  return bundles.filter(Boolean)
+}
+
+function arrayStrings(value) {
+  return Array.isArray(value) ? value.filter((item) => typeof item === 'string') : []
+}
+
+function normalizeEvidenceBundleRef(value, root) {
+  if (value.startsWith('qa/evidence-bundles/')) return value
+  if (value.startsWith('/')) return relative(process.cwd(), value)
+  const rootRel = relative(process.cwd(), root) || '.'
+  if (value.startsWith(`${rootRel}/`) || value === rootRel) return value
+  return `${rootRel}/${value}`
+}
+
+function mixtralSummaryRecordsBlocker(summary) {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return false
+  if (summary.schema === 'camelid.mixtral_gate9a_long_output.v1') {
+    return summary.all_token_parity === false || summary.all_completed === false || /diverg/i.test(String(summary.stop_reason || ''))
+  }
+  if (summary.schema === 'camelid.mixtral_longgen_continuation.summary.v1') {
+    return summary.status === 'partial_failure' || /hung|diverg/i.test(String(summary.runner_stop_reason || ''))
+  }
+  if (summary.schema === 'camelid.mixtral_backend_hang_guard.v1') {
+    return /blocked|hang|partial/i.test(String(summary.status || summary.result || ''))
+  }
+  return false
+}
+
+function validateMixtralReconciliationManifest(bundleRel, manifest, promotionClaimPaths, blockerPaths) {
+  const boundary = String(manifest.support_boundary || manifest.claim_boundary || '')
+  if (manifest.current_status !== 'active_validation_partial_runtime') {
+    fail(bundleRel, 'Mixtral blocker reconciliation current_status must be active_validation_partial_runtime')
+  }
+  if (manifest.support_label !== 'unsupported_bounded_one_token_runtime_only') {
+    fail(bundleRel, 'Mixtral blocker reconciliation support_label must be unsupported_bounded_one_token_runtime_only')
+  }
+  if (!/one-token/i.test(boundary) || !/unsupported|blocked/i.test(boundary) || !/no broad Mixtral/i.test(boundary)) {
+    fail(bundleRel, 'Mixtral blocker reconciliation support_boundary must say one-token evidence is unsupported/blocked and no broad Mixtral support is claimed')
+  }
+  const supersedes = new Set(Array.isArray(manifest.supersedes) ? manifest.supersedes : [])
+  const blockers = new Set(Array.isArray(manifest.blocker_evidence) ? manifest.blocker_evidence : [])
+  for (const path of promotionClaimPaths) {
+    const bundlePath = evidenceBundlePath(path)
+    if (!supersedes.has(bundlePath)) fail(bundleRel, `Mixtral blocker reconciliation supersedes must include ${bundlePath}`)
+  }
+  for (const path of blockerPaths) {
+    const bundlePath = evidenceBundlePath(path)
+    if (!blockers.has(bundlePath)) fail(bundleRel, `Mixtral blocker reconciliation blocker_evidence must include ${bundlePath}`)
+  }
+}
+
+function validateBackendLocalCurrentHeadExactRowGuardrail(bundleRel, manifest) {
+  if (manifest.local_only !== true) fail(bundleRel, 'backend local guardrail local_only must be true')
+  const noRemoteValidationUsed = manifest.no_remote_validation_used === true || (manifest.remote_ssh_attempted === false && manifest.remote_validation_host_assumed_available === false)
+  if (!noRemoteValidationUsed) fail(bundleRel, 'backend local guardrail no_remote_validation_used must be true')
+  if (manifest.passed !== true && manifest.exit_code !== 0) fail(bundleRel, 'backend local guardrail passed must be true')
+  const head = String(manifest.head || manifest.git?.head || '')
+  if (!/^[0-9a-f]{40}$/.test(head)) {
+    fail(bundleRel, 'backend local guardrail head must be a full 40-character git sha')
+  }
+  const headShort = String(manifest.head_short || manifest.git?.head_short || '')
+  if (!/^[0-9a-f]{7,12}$/.test(headShort)) {
+    fail(bundleRel, 'backend local guardrail head_short must be a 7-12 character git sha prefix')
+  } else if (head && !head.startsWith(headShort)) {
+    fail(bundleRel, 'backend local guardrail head_short must prefix head')
+  }
+  const requiredCommands = ['cargo-test-capabilities', 'public-evidence-claims', 'public-scrub', 'git-diff-check']
+  if (Array.isArray(manifest.commands)) {
+    const commandNames = new Set(manifest.commands.map((command) => String(command?.name || '').replaceAll('_', '-')))
+    const legacyCommandNames = new Map([
+      ['cargo-test-capabilities', 'cargo-capabilities-all-targets'],
+      ['public-evidence-claims', 'public-evidence-claims'],
+      ['public-scrub', 'public-scrub'],
+      ['git-diff-check', 'git-diff-check'],
+    ])
+    for (const command of requiredCommands) {
+      if (!commandNames.has(legacyCommandNames.get(command))) fail(bundleRel, `backend local guardrail command ${command} must be recorded`)
+    }
+  } else {
+    const commands = manifest.commands && typeof manifest.commands === 'object' ? manifest.commands : null
+    for (const command of requiredCommands) {
+      if (commands?.[command] !== 0) fail(bundleRel, `backend local guardrail command ${command} must exit 0`)
+    }
+  }
+  const boundary = typeof manifest.support_boundary === 'string' ? manifest.support_boundary : JSON.stringify(manifest.support_boundary || {})
+  if (!/Mixtral/i.test(boundary) || !/unsupported|blocked|blocker/i.test(boundary) || !/Llama/i.test(boundary) || !/exact-row bounded/i.test(boundary) || !/no broad/i.test(boundary)) {
+    fail(bundleRel, 'backend local guardrail support_boundary must preserve Mixtral blocked, Llama exact-row bounded, and no broad/full-support promotion truth')
+  }
+}
+
+function evidenceBundlePath(path) {
+  const rel = relative(process.cwd(), path)
+  const marker = '/manifest.json'
+  if (rel.endsWith(marker)) return rel.slice(0, -marker.length)
+  const summaryMarker = '/summary.json'
+  if (rel.endsWith(summaryMarker)) return rel.slice(0, -summaryMarker.length)
+  return rel
 }
 
 function validateSummaryAgreement(bundleRel, manifest, summary) {
@@ -532,6 +684,46 @@ async function findManifestPaths(root) {
       }
     }
   }
+}
+
+async function findSummaryPaths(root) {
+  const paths = []
+  await walk(root)
+  return paths.sort()
+
+  async function walk(currentDir) {
+    const entries = await readdir(currentDir, { withFileTypes: true })
+    for (const entry of entries) {
+      const fullPath = join(currentDir, entry.name)
+      if (entry.isDirectory()) {
+        await walk(fullPath)
+      } else if (entry.isFile() && entry.name === 'summary.json') {
+        paths.push(fullPath)
+      }
+    }
+  }
+}
+
+function validatePublicJsonNoLocalPaths(path, value) {
+  if (privacyScannedPaths.has(path)) return
+  privacyScannedPaths.add(path)
+  const rel = relative(process.cwd(), path)
+  for (const finding of findLocalPathStrings(value)) {
+    fail(rel, `${finding.location} must not expose local/private path ${JSON.stringify(finding.value)}`)
+  }
+}
+
+function findLocalPathStrings(value, location = '$') {
+  if (typeof value === 'string') {
+    return localPathPattern().test(value) ? [{ location, value }] : []
+  }
+  if (!value || typeof value !== 'object') return []
+  if (Array.isArray(value)) return value.flatMap((item, index) => findLocalPathStrings(item, `${location}[${index}]`))
+  return Object.entries(value).flatMap(([key, item]) => findLocalPathStrings(item, `${location}.${key}`))
+}
+
+function localPathPattern() {
+  return /(?:^|[\s"'])(?:(?:file:\/\/(?:localhost)?)?(?:\/Users\/[^\s"']+|\/home\/[^\s"']+|\/private\/(?:tmp|var)\/[^\s"']+|\/var\/folders\/[^\s"']+|\/tmp\/[^\s"']+|\/Volumes\/[^\s"']+)|(?:file:\/\/\/)?[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/][^\s"']+)/i
 }
 
 async function readJson(path) {

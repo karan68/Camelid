@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { LLAMA32_3B_ACCEPTANCE_AVAILABILITY, LLAMA32_3B_ACCEPTANCE_GATING_NOTE, LLAMA32_3B_ACCEPTANCE_SUMMARY, LLAMA32_3B_ACCEPTANCE_TARGET } from '../lib/acceptanceTargets'
-import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, formatCapabilityStatus, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isSupportedCapabilityStatus } from '../lib/capabilities'
+import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, formatCapabilityStatus, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { formatBytes, formatCompactNumber } from '../lib/formatters'
 import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, isRunnableModel } from '../lib/modelState'
@@ -99,47 +99,15 @@ function formatCatalogTitle(item) {
   return item.name.endsWith(suffix) ? item.name.slice(0, -suffix.length) : item.name
 }
 
-function normalizeCapabilityKey(value) {
-  return (value || '').toString().trim().toUpperCase().replace(/[^A-Z0-9]+/g, '')
-}
-
-function findSupportItem(items = [], value) {
-  const normalizedValue = normalizeCapabilityKey(value)
-  if (!normalizedValue) return null
-  return items.find((item) => item.id.split('/').some((part) => normalizeCapabilityKey(part) === normalizedValue)) || null
-}
-
-function getQuantCapability(capabilities, quant) {
-  if (!quant) return null
-  const supported = findSupportItem(capabilities?.supported_quantization, quant)
-  if (supported) return { ...supported, lane: 'supported' }
-  const planned = findSupportItem(capabilities?.planned_quantization, quant)
-  if (planned) return { ...planned, lane: 'planned' }
-  return null
-}
-
-function quantCapabilityLabel(capability, quant) {
-  if (!quant) return 'Quant unknown'
-  if (!capability) return `${quant}: not advertised`
-  return `${quant}: ${formatCapabilityStatus(capability.status)}`
-}
-
-function quantCapabilityCopy(capability, quant) {
-  if (!quant) return 'No quantization label was returned for this model, so Camelid will only trust the GGUF load/readiness result.'
-  if (!capability) return `${quant} is not advertised by /api/capabilities; keep it disabled/guarded until COMPATIBILITY.md gains evidence for this lane.`
-  if (capability.lane === 'planned') return `${capability.id} is planned, not supported yet: ${capability.notes}. Expect a typed backend refusal until implementation and evidence land.`
-  return `${capability.id} is advertised as ${formatCapabilityStatus(capability.status)}: ${capability.notes}.`
-}
-
 function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
   const quant = model?.quant || catalogItem?.quant || ''
-  const quantCapability = getQuantCapability(capabilities, quant)
   const compatibilityHint = findCompatibilityHint(capabilities, model, catalogItem)
+  const exactTarget = isExactCompatibilityHint(compatibilityHint) ? compatibilityHint.target : null
 
   return (
     <div className="models-card-copy-stack models-capability-evidence" aria-label="Capability evidence boundary">
-      <p className="model-summary"><b>Quant support:</b> {quantCapabilityLabel(quantCapability, quant)}. {quantCapabilityCopy(quantCapability, quant)}</p>
-      <p className="model-summary"><b>Family support:</b> {compatibilityHintLabel(compatibilityHint, 'Family not matched to a support row')}. {compatibilityHintCopy(compatibilityHint)}</p>
+      <p className="model-summary"><b>Exact-row quant evidence:</b> {exactTarget ? `${exactTarget.id}: ${exactTarget.quantization} · ${formatCapabilityStatus(exactTarget.status)}` : quant ? `${quant}: no exact compatibility row matched; do not infer support from this quant label.` : 'No quant label and no exact compatibility row matched.'}</p>
+      <p className="model-summary"><b>Exact-row support:</b> {compatibilityHintLabel(compatibilityHint, 'No exact compatibility row matched')}. {compatibilityHintCopy(compatibilityHint)}</p>
     </div>
   )
 }
@@ -272,8 +240,8 @@ export default function ModelsView({
   const supportedCompatibilityRows = compatibilityRows.filter((target) => isSupportedCapabilityStatus(target.status))
   const plannedCompatibilityRows = compatibilityRows.filter((target) => !isSupportedCapabilityStatus(target.status))
   const supportedCompatibilitySummary = supportedCompatibilityRows.map((target) => target.id).join(' · ') || (currentCompatibilityTarget ? currentCompatibilityTarget.id : '')
-  const supportedQuantSummary = (capabilities?.supported_quantization || []).map((item) => `${item.id}: ${formatCapabilityStatus(item.status)}`).join(' · ') || 'None advertised'
-  const plannedQuantSummary = (capabilities?.planned_quantization || []).map((item) => `${item.id}: ${formatCapabilityStatus(item.status)}`).join(' · ') || 'None advertised'
+  const exactQuantEvidenceSummary = compatibilityRows.map((target) => `${target.id}: ${target.quantization} (${formatCapabilityStatus(target.status)})`).join(' · ') || 'No exact rows advertised'
+  const guardedCompatibilitySummary = plannedCompatibilityRows.map((target) => `${target.id}: ${formatCapabilityStatus(target.status)}`).join(' · ') || 'No guarded rows advertised'
 
   const refreshRuntime = async () => {
     if (!refreshDashboard || refreshingRuntime) return
@@ -482,7 +450,7 @@ export default function ModelsView({
           <div>
             <span>/api/capabilities</span>
             <strong>{capabilities ? 'Contract live' : 'Not available'}</strong>
-            <small>{capabilities?.support_contract?.current_gate || 'No support contract returned; planned quant/model lanes stay disabled.'}{supportedCompatibilitySummary ? ` Rows: ${supportedCompatibilitySummary}.` : ''}</small>
+            <small>{capabilities?.support_contract?.current_gate || 'No support contract returned; non-matching rows stay disabled.'}{supportedCompatibilitySummary ? ` Rows: ${supportedCompatibilitySummary}.` : ''}</small>
           </div>
           <div>
             <span>Catalog</span>
@@ -502,13 +470,13 @@ export default function ModelsView({
             <small>{supportedCompatibilitySummary ? `Supported rows: ${supportedCompatibilitySummary}. Runtime loaded_now=true and generation_ready=true are still required.` : 'The UI will not infer support beyond loaded/model readiness.'}</small>
           </div>
           <div>
-            <span>Supported quants</span>
-            <strong>{supportedQuantSummary}</strong>
-            <small>These are the only quant lanes the UI should present as validated; filenames and saved paths do not promote support.</small>
+            <span>Exact-row quants</span>
+            <strong>{exactQuantEvidenceSummary}</strong>
+            <small>Quant evidence is row-scoped; filenames and saved paths do not promote support.</small>
           </div>
           <div>
-            <span>Planned / guarded</span>
-            <strong>{plannedQuantSummary}</strong>
+            <span>Guarded rows</span>
+            <strong>{guardedCompatibilitySummary}</strong>
             <small>{plannedCompatibilityRows.length ? `${plannedCompatibilityRows.length} compatibility row${plannedCompatibilityRows.length === 1 ? '' : 's'} remain planned or guarded; backend typed errors are expected until COMPATIBILITY.md records evidence.` : 'No planned compatibility rows advertised.'}</small>
           </div>
         </div>
@@ -833,7 +801,6 @@ export default function ModelsView({
             <div className="models-card-grid models-catalog-grid-clean">
               {discoverCatalogItems.map((item) => {
                 const localMatch = findCatalogMatch(models, item)
-                const quantCapability = getQuantCapability(capabilities, item.quant)
                 const runnable = Boolean(localMatch && (localMatch.status === 'ready' || localMatch.status === 'registered' || localMatch.status === 'failed') && hasLocalModelPath(localMatch))
                 const active = runtime?.active_model_id === localMatch?.id
                 const selected = selectedModelId === localMatch?.id
@@ -853,7 +820,7 @@ export default function ModelsView({
                     <div className="models-card-tags">
                       {active && <div className="pin-badge">Loaded now</div>}
                       {selected && <div className="pin-badge">Next chat</div>}
-                      {item.quant && <div className={`pin-badge ${capabilityStatusTone(quantCapability?.status || '')}`}>{quantCapabilityLabel(quantCapability, item.quant)}</div>}
+                      {item.quant && <div className="pin-badge">Catalog quant: {item.quant}</div>}
                       {hasLocalModelPath(localMatch) && <div className="pin-badge">Saved locally</div>}
                     </div>
 

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -178,14 +179,20 @@ fn hf_config_ready(config_path: &Path, blockers: &mut Vec<ModelSourceBlocker>) -
     let Ok(bytes) = fs::read(config_path) else {
         blockers.push(blocker(
             "config_json_unreadable",
-            format!("could not read {}", config_path.display()),
+            format!(
+                "could not read required Hugging Face config file {}",
+                public_path_label(config_path)
+            ),
         ));
         return false;
     };
     let Ok(config) = serde_json::from_slice::<HfConfigProbe>(&bytes) else {
         blockers.push(blocker(
             "invalid_config_json",
-            format!("{} is not valid JSON", config_path.display()),
+            format!(
+                "required Hugging Face config file {} is not valid JSON",
+                public_path_label(config_path)
+            ),
         ));
         return false;
     };
@@ -261,16 +268,106 @@ fn hf_weights_ready(
             path: shard_index_path.to_path_buf(),
             source,
         })?;
-        if serde_json::from_slice::<Value>(&bytes).is_err() {
+        let Ok(index) = serde_json::from_slice::<Value>(&bytes) else {
             blockers.push(blocker(
                 "invalid_shard_index_json",
-                format!("{} is not valid JSON", shard_index_path.display()),
+                format!(
+                    "SafeTensors shard index file {} is not valid JSON",
+                    public_path_label(shard_index_path)
+                ),
             ));
+            return Ok(false);
+        };
+        if !hf_shard_index_weight_map_ready(&index, weight_files, blockers) {
             return Ok(false);
         }
     }
 
     Ok(true)
+}
+
+fn hf_shard_index_weight_map_ready(
+    index: &Value,
+    weight_files: &[PathBuf],
+    blockers: &mut Vec<ModelSourceBlocker>,
+) -> bool {
+    let Some(weight_map) = index.get("weight_map").and_then(Value::as_object) else {
+        blockers.push(blocker(
+            "missing_shard_index_weight_map",
+            "model.safetensors.index.json must include a weight_map object before sharded weights readiness can be reported",
+        ));
+        return false;
+    };
+    if weight_map.is_empty() {
+        blockers.push(blocker(
+            "empty_shard_index_weight_map",
+            "model.safetensors.index.json weight_map must list at least one tensor shard before sharded weights readiness can be reported",
+        ));
+        return false;
+    }
+
+    let available = weight_files
+        .iter()
+        .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+        .collect::<BTreeSet<_>>();
+    let mut missing = BTreeSet::new();
+    let mut invalid = BTreeSet::new();
+    let mut invalid_filenames = BTreeSet::new();
+    for (tensor_name, shard_name) in weight_map {
+        let Some(shard_name) = shard_name.as_str() else {
+            invalid.insert(tensor_name.as_str());
+            continue;
+        };
+        if !is_plain_safetensors_shard_filename(shard_name) {
+            invalid_filenames.insert(tensor_name.as_str());
+            continue;
+        }
+        if !available.contains(shard_name) {
+            missing.insert(shard_name);
+        }
+    }
+
+    if !invalid.is_empty() {
+        blockers.push(blocker(
+            "invalid_shard_index_weight_map",
+            format!(
+                "model.safetensors.index.json weight_map entries must map tensor names to shard filenames; invalid entries: {}",
+                invalid.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+        return false;
+    }
+    if !invalid_filenames.is_empty() {
+        blockers.push(blocker(
+            "invalid_shard_index_shard_filename",
+            format!(
+                "model.safetensors.index.json weight_map shard values must be local shard filenames, not paths; invalid tensor entries: {}",
+                invalid_filenames.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+        return false;
+    }
+    if !missing.is_empty() {
+        blockers.push(blocker(
+            "missing_sharded_weight_file",
+            format!(
+                "model.safetensors.index.json references shard files that are not present locally: {}",
+                missing.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+        return false;
+    }
+
+    true
+}
+
+fn is_plain_safetensors_shard_filename(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && value != "."
+        && value != ".."
+        && has_extension(Path::new(value), "safetensors")
 }
 
 fn safetensors_files(path: &Path) -> Result<Vec<PathBuf>> {
@@ -305,10 +402,20 @@ fn has_extension(path: &Path, extension: &str) -> bool {
 }
 
 fn source_id(path: &Path) -> String {
-    path.file_stem()
-        .or_else(|| path.file_name())
-        .and_then(|value| value.to_str())
+    let name = if has_extension(path, "gguf") {
+        path.file_stem().or_else(|| path.file_name())
+    } else {
+        path.file_name()
+    };
+    name.and_then(|value| value.to_str())
         .unwrap_or("model")
+        .to_string()
+}
+
+fn public_path_label(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model source file")
         .to_string()
 }
 
@@ -335,7 +442,11 @@ mod tests {
         fs::write(dir.path().join("generation_config.json"), "{}").unwrap();
         fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
         fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"model.embed_tokens.weight":"model-00001-of-00002.safetensors","lm_head.weight":"model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
 
         let inspection = inspect_model_source(dir.path()).unwrap();
 
@@ -403,6 +514,78 @@ mod tests {
             &inspection,
             &["invalid_shard_index_json", "generation_disabled"],
         );
+        assert_public_blocker_message_without_local_path(
+            &inspection.readiness.blockers[0].message,
+            dir.path(),
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("model.safetensors.index.json"));
+    }
+
+    #[test]
+    fn shard_index_without_weight_map_has_precise_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
+        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["missing_shard_index_weight_map", "generation_disabled"],
+        );
+    }
+
+    #[test]
+    fn shard_index_referencing_missing_weight_file_has_precise_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
+        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"model.embed_tokens.weight":"model-00003-of-00003.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["missing_sharded_weight_file", "generation_disabled"],
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("model-00003-of-00003.safetensors"));
+    }
+
+    #[test]
+    fn invalid_config_json_has_sanitized_precise_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "not json").unwrap();
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.metadata_ready);
+        assert!(inspection.readiness.tokenizer_ready);
+        assert!(inspection.readiness.weights_ready);
+        assert_blocker_codes(&inspection, &["invalid_config_json", "generation_disabled"]);
+        assert_public_blocker_message_without_local_path(
+            &inspection.readiness.blockers[0].message,
+            dir.path(),
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("config.json"));
     }
 
     #[test]
@@ -427,6 +610,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shard_index_path_values_have_sanitized_precise_blocker() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
+        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"model.embed_tokens.weight":"../private/model-00001-of-00002.safetensors","lm_head.weight":"C:\\private\\model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_shard_index_shard_filename", "generation_disabled"],
+        );
+        let message = &inspection.readiness.blockers[0].message;
+        assert!(message.contains("model.embed_tokens.weight"));
+        assert!(message.contains("lm_head.weight"));
+        assert!(!message.contains("../private"));
+        assert!(!message.contains("C:"));
+        assert!(!message.contains("model-00001-of-00002.safetensors"));
+        assert!(!message.contains("model-00002-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn shard_index_invalid_entries_are_reported_in_stable_tensor_order() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
+        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"z.weight":42,"a.weight":false}}"#,
+        )
+        .unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_shard_index_weight_map", "generation_disabled"],
+        );
+        let message = &inspection.readiness.blockers[0].message;
+        assert!(message.ends_with("invalid entries: a.weight, z.weight"));
+    }
+
+    #[test]
+    fn hf_directory_source_id_preserves_dotted_model_name() {
+        let root = tempfile::tempdir().unwrap();
+        let model_dir = root.path().join("Meta-Llama-3.1-8B-Instruct");
+        fs::create_dir(&model_dir).unwrap();
+        write_llama_config(&model_dir);
+        fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
+        fs::write(model_dir.join("model.safetensors"), b"").unwrap();
+
+        let inspection = inspect_model_source(&model_dir).unwrap();
+
+        assert_eq!(inspection.manifest.id, "Meta-Llama-3.1-8B-Instruct");
+    }
+
+    #[test]
+    fn gguf_file_source_id_strips_only_gguf_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("TinyLlama-1.1B-Chat-v1.0.Q8_0.gguf");
+        fs::write(&path, b"").unwrap();
+
+        let inspection = inspect_model_source(&path).unwrap();
+
+        assert_eq!(inspection.manifest.id, "TinyLlama-1.1B-Chat-v1.0.Q8_0");
+    }
+
     fn write_llama_config(root: &Path) {
         fs::write(
             root.join("config.json"),
@@ -443,5 +704,17 @@ mod tests {
             .map(|blocker| blocker.code)
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    fn assert_public_blocker_message_without_local_path(message: &str, root: &Path) {
+        let root = root.display().to_string();
+        assert!(
+            !message.contains(&root),
+            "blocker message leaked local path {root:?}: {message}"
+        );
+        assert!(
+            !message.contains("/var/") && !message.contains("/private/"),
+            "blocker message leaked a private temp path: {message}"
+        );
     }
 }

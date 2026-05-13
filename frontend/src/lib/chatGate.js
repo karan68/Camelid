@@ -1,9 +1,9 @@
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from './capabilities.js'
-import { isRunnableInCurrentRuntime } from './modelState.js'
+import { isRunnableInCurrentRuntime, modelRuntimeIdMatches } from './modelState.js'
 
 export function getChatGateState(capabilities, model, runtime) {
-  const runtimeLoaded = Boolean(runtime?.loaded_now && runtime?.active_model_id === model?.id)
-  const runtimeGenerationReady = Boolean(runtime?.generation_ready && runtime?.active_model_id === model?.id)
+  const runtimeLoaded = Boolean(runtime?.loaded_now && modelRuntimeIdMatches(model, runtime))
+  const runtimeGenerationReady = Boolean(runtime?.generation_ready && modelRuntimeIdMatches(model, runtime))
   const runtimeReady = Boolean(isRunnableInCurrentRuntime(model, runtime) && runtimeLoaded && runtimeGenerationReady)
   const hint = findCompatibilityHint(capabilities, model)
   const contractSupported = isCompatibilitySupportedForModel(capabilities, model)

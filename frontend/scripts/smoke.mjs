@@ -6,6 +6,7 @@ import { performance } from 'node:perf_hooks'
 
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../src/lib/capabilities.js'
 import { getChatGateState } from '../src/lib/chatGate.js'
+import { readStreamingChatCompletion } from '../src/lib/chatCompletionStream.js'
 
 const args = new Map()
 for (let i = 2; i < process.argv.length; i += 1) {
@@ -75,6 +76,31 @@ function assertExpected(label, actual, expected) {
   if (actual !== expected) {
     throw new Error(`${label} mismatch: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`)
   }
+}
+
+async function fetchStreamingChatCompletion(url, body) {
+  const streamEvents = []
+  const streamedSnapshots = []
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const contentType = response.headers.get('content-type') || ''
+  if (response.ok && !contentType.includes('text/event-stream')) {
+    throw new Error(`chat stream did not return text/event-stream; got ${contentType || 'no content-type'}`)
+  }
+  const streamed = await readStreamingChatCompletion(response, (_delta, fullContent, metrics) => {
+    streamedSnapshots.push({ fullContent, firstContentMs: metrics.firstContentMs })
+  }, {
+    onStreamEvent(event) {
+      streamEvents.push(event.type)
+    },
+  })
+  if (!streamEvents.includes('bytes')) throw new Error('chat stream did not expose first-byte progress')
+  if (!streamEvents.includes('content')) throw new Error('chat stream completed without any content delta')
+  if (!streamedSnapshots.length) throw new Error('chat stream did not publish visible content before final completion')
+  return { streamed, streamEvents, streamedSnapshots }
 }
 
 function pushU32(bytes, value) {
@@ -293,6 +319,16 @@ if (qaChatBypass) {
 }
 
 if (webuiChatEnabled || qaChatBypass) {
+  const { result: streamingChat, elapsedMs: streamingChatMs } = await timed('chat_completion_stream', () => fetchStreamingChatCompletion(`${apiBase}/v1/chat/completions`, {
+    model: health.active_model_id || modelIds[0],
+    messages: [{ role: 'user', content: 'hello' }],
+    max_tokens: 4,
+    stream: true,
+    temperature: 0,
+  }))
+  console.log(`✓ streaming chat published ${streamingChat.streamedSnapshots.length} visible update(s) before final completion in ${(streamingChatMs / 1000).toFixed(2)}s: ${JSON.stringify(streamingChat.streamed.content)}`)
+  console.log(`  stream_events=${streamingChat.streamEvents.join(',')}`)
+
   const chatTimings = []
   for (let idx = 0; idx < chatRepeats; idx += 1) {
     const repeatLabel = chatRepeats === 1 ? 'chat_completion' : `chat_completion_${idx + 1}`

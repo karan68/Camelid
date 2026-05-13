@@ -1352,6 +1352,14 @@
   opacity: 0.72;
 }
 
+.message-bubble-gemini.assistant.pending {
+  opacity: 1;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
 .message-heading {
   display: flex;
   justify-content: space-between;
@@ -2331,6 +2339,12 @@
   padding: 18px 0 220px;
   background: transparent;
   overflow: visible;
+}
+
+.chat-thread-stream-anchor {
+  width: 100%;
+  height: 1px;
+  scroll-margin-bottom: 190px;
 }
 
 .chat-session-strip {
@@ -5840,6 +5854,39 @@ textarea.composer-input-gemini {
   }
 }
 
+.message-live-status-minimal {
+  gap: 8px;
+}
+
+.message-live-status-minimal span:nth-child(2) {
+  font-variant-numeric: tabular-nums;
+}
+
+.message-live-generation-badge {
+  width: fit-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 6px 10px;
+  border: 1px solid rgba(255, 216, 77, 0.24);
+  border-radius: 999px;
+  background: rgba(255, 216, 77, 0.09);
+  color: color-mix(in srgb, #ffe884 88%, var(--color-text) 12%);
+  font-size: 0.76rem;
+  font-weight: 760;
+  font-variant-numeric: tabular-nums;
+}
+
+.message-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #ffd84d;
+  box-shadow: 0 0 0 0 rgba(255, 216, 77, 0.34);
+  animation: camelid-live-dot-pulse 1.1s ease-out infinite;
+}
+
 .message-token-metrics {
   width: fit-content;
   display: flex;
@@ -5861,156 +5908,242 @@ textarea.composer-input-gemini {
   border-left: 1px solid color-mix(in srgb, var(--color-border-soft) 48%, transparent);
 }
 
-.message-live-status {
-  width: fit-content;
-  display: inline-flex;
+.pacman-loader {
+  display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 16px;
-  padding: 6px 10px;
-  border: 1px solid color-mix(in srgb, #ffd84d 32%, var(--color-border-soft) 68%);
-  border-radius: 999px;
-  background: color-mix(in srgb, #ffd84d 12%, var(--color-chip) 88%);
-  color: color-mix(in srgb, var(--color-text-muted) 76%, #ffe884 24%);
-  font-size: 0.76rem;
-  font-weight: 760;
-  font-variant-numeric: tabular-nums;
-  line-height: 1;
+  justify-content: center;
+  width: 100%;
+  padding: 8px 0 10px;
 }
 
-.message-live-status-compact {
-  margin-top: 0;
-  margin-bottom: 12px;
+.pacman-loader-compact {
+  padding: 0 0 8px;
 }
 
-.message-live-status-tail {
-  margin-top: 12px;
-  margin-bottom: 0;
+.pacman-loader-track {
+  position: relative;
+  --pacman-pellet-travel: -314px;
+  width: 340px;
+  max-width: 100%;
+  height: 64px;
+  overflow: hidden;
 }
 
-.message-live-status span:not(.message-live-dot) + span {
-  padding-left: 8px;
-  border-left: 1px solid color-mix(in srgb, var(--color-border-soft) 42%, transparent);
-}
-
-.message-live-dot {
-  width: 7px;
-  height: 7px;
-  padding-left: 0 !important;
-  border: 0 !important;
-  border-radius: 50%;
-  background: #ffd84d;
-  box-shadow: 0 0 0 0 rgba(255, 216, 77, 0.42);
-  animation: camelid-live-dot-pulse 1.1s ease-out infinite;
-}
-
-/* Tiny Pac-Man assistant marker; game-steady, with pellets only while text streams. */
-.message-row-gemini.assistant {
-  --assistant-pacman-size: 12px;
-  --assistant-pacman-left: -26px;
-  --assistant-pacman-top: 11px;
-  --assistant-pellets-left: -10px;
-  --assistant-pellets-top: 14px;
-}
-
-.message-row-gemini.assistant::before {
-  content: '';
+.pacman-loader-mouth {
   position: absolute;
-  left: var(--assistant-pacman-left);
-  top: var(--assistant-pacman-top);
-  display: block;
-  width: var(--assistant-pacman-size);
-  height: var(--assistant-pacman-size);
-  margin: 0;
-  border: 0;
-  border-radius: 50%;
-  background: conic-gradient(from 42deg, transparent 0 78deg, #ffd84d 78deg 360deg);
-  color: transparent;
-  filter: none;
-  font-size: 0;
-  line-height: 0;
-  text-shadow: none;
-  transform: none;
-  transform-origin: 50% 50%;
-  transition: none;
-  will-change: background;
   z-index: 2;
+  left: 0;
+  top: 2px;
+  width: 60px;
+  height: 60px;
+  border-radius: 50%;
+  background: #ffef00;
+  clip-path: polygon(0 0, 100% 0, 100% 22%, 53% 50%, 100% 78%, 100% 100%, 0 100%);
+  animation: camelid-pacman-chomp 340ms ease-in-out infinite;
+  will-change: clip-path;
 }
 
-.message-row-gemini.assistant.is-streaming::before {
-  animation: camelid-pacman-chomp 260ms steps(2, end) infinite;
-}
-
-.message-row-gemini.assistant:not(.is-streaming)::before {
-  animation: none;
-}
-
-.message-row-gemini.assistant.is-streaming::after {
-  content: '';
+.pacman-loader-pellet {
   position: absolute;
-  left: var(--assistant-pellets-left);
-  top: var(--assistant-pellets-top);
-  width: 24px;
-  height: 4px;
-  pointer-events: none;
-  background: radial-gradient(circle, rgba(255, 232, 132, 0.98) 0 1.2px, transparent 1.55px) 100% 50% / 8px 4px repeat-x;
-  filter: none;
-  opacity: 0.86;
-  transform: none;
-  transition: none;
-  will-change: background-position;
-  animation: camelid-pellets-feed 520ms steps(3, end) infinite;
   z-index: 1;
+  right: -16px;
+  top: 27px;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 245, 0.98);
+  box-shadow: 0 0 0 1px rgba(255, 239, 190, 0.14);
+  animation: camelid-pellet-slide 1.6s linear infinite;
+  will-change: transform, opacity;
 }
 
-.message-row-gemini.assistant.pending.is-streaming::after {
-  width: 28px;
-}
+.pacman-loader-pellet-1 { animation-delay: 0ms; }
+.pacman-loader-pellet-2 { animation-delay: -320ms; }
+.pacman-loader-pellet-3 { animation-delay: -640ms; }
+.pacman-loader-pellet-4 { animation-delay: -960ms; }
+.pacman-loader-pellet-5 { animation-delay: -1280ms; }
 
-.message-row-gemini.assistant:not(.is-streaming)::after {
-  content: none;
-  animation: none;
+.message-row-gemini.assistant::before,
+.message-row-gemini.assistant::after {
+  content: none !important;
+  animation: none !important;
 }
 
 @media (max-width: 860px) {
-  .message-row-gemini.assistant {
-    --assistant-pacman-left: -20px;
-    --assistant-pacman-top: 10px;
-    --assistant-pellets-left: -6px;
-    --assistant-pellets-top: 13px;
-    padding-left: 4px;
+  .pacman-loader-track {
+    --pacman-pellet-travel: -228px;
+    width: 250px;
+    height: 54px;
   }
 
-  .message-row-gemini.assistant::before {
-    position: absolute;
-    float: none;
+  .pacman-loader-mouth {
+    width: 48px;
+    height: 48px;
+    top: 3px;
   }
 
-  .message-row-gemini.assistant.is-streaming::after {
-    width: 20px;
+  .pacman-loader-pellet {
+    right: -14px;
+    top: 23px;
+    width: 8px;
+    height: 8px;
+  }
+}
+
+@keyframes camelid-live-dot-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 216, 77, 0.34);
+    opacity: 1;
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(255, 216, 77, 0);
+    opacity: 0.78;
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 216, 77, 0);
+    opacity: 1;
   }
 }
 
 @keyframes camelid-pacman-chomp {
   0%, 100% {
-    background: conic-gradient(from 42deg, transparent 0 78deg, #ffd84d 78deg 360deg);
+    clip-path: polygon(0 0, 100% 0, 100% 16%, 53% 50%, 100% 84%, 100% 100%, 0 100%);
   }
   50% {
-    background: conic-gradient(from 22deg, transparent 0 40deg, #ffd84d 40deg 360deg);
+    clip-path: polygon(0 0, 100% 0, 100% 48%, 53% 50%, 100% 52%, 100% 100%, 0 100%);
   }
 }
 
-@keyframes camelid-pellets-feed {
+@keyframes camelid-pellet-slide {
   0% {
-    background-position: 100% 50%;
+    transform: translateX(0);
+    opacity: 0;
+  }
+  6% {
+    opacity: 1;
+  }
+  86% {
+    opacity: 1;
+    transform: translateX(calc(var(--pacman-pellet-travel) + 18px));
+  }
+  92% {
+    opacity: 0;
+    transform: translateX(var(--pacman-pellet-travel));
   }
   100% {
-    background-position: 60% 50%;
+    transform: translateX(var(--pacman-pellet-travel));
+    opacity: 0;
   }
 }
 
-@keyframes camelid-live-dot-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(255, 216, 77, 0.42); opacity: 1; }
-  72% { box-shadow: 0 0 0 7px rgba(255, 216, 77, 0); opacity: 0.74; }
-  100% { box-shadow: 0 0 0 0 rgba(255, 216, 77, 0); opacity: 1; }
+/* Demo polish: starter prompts and a neutral loader path keep videos clean even for Pac-Man prompts. */
+.demo-prompt-panel {
+  width: min(100%, 980px);
+  display: grid;
+  gap: 10px;
+  margin: 0 auto 2px;
+  padding: 14px 16px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 46%, transparent);
+  border-radius: 26px;
+  background:
+    radial-gradient(circle at 18% 0%, color-mix(in srgb, var(--color-info) 12%, transparent), transparent 42%),
+    color-mix(in srgb, var(--color-bg-elevated) 50%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+}
+
+.demo-prompt-panel > span {
+  color: color-mix(in srgb, var(--color-text-muted) 86%, var(--color-text) 14%);
+  font-size: 0.68rem;
+  font-weight: 820;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.demo-prompt-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.demo-prompt-chip {
+  flex: 1 1 210px;
+  min-height: 46px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 66%, rgba(255, 255, 255, 0.035));
+  color: color-mix(in srgb, var(--color-text) 88%, var(--color-text-muted) 12%);
+  font: inherit;
+  font-size: 0.9rem;
+  font-weight: 650;
+  text-align: left;
+  transition: transform 150ms ease, border-color 150ms ease, background 150ms ease, color 150ms ease;
+}
+
+.demo-prompt-chip:hover,
+.demo-prompt-chip:focus-visible {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--color-info) 44%, var(--color-border-strong));
+  background: color-mix(in srgb, var(--color-selected-row) 52%, rgba(255, 255, 255, 0.05));
+  color: var(--color-text);
+}
+
+.demo-prompt-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.pacman-loader-neutral .pacman-loader-track {
+  --pacman-pellet-travel: -300px;
+}
+
+.pacman-loader-neutral .pacman-loader-mouth {
+  width: 22px;
+  height: 22px;
+  top: 21px;
+  left: 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-info) 82%, white 18%);
+  clip-path: none;
+  box-shadow:
+    0 0 0 8px color-mix(in srgb, var(--color-info) 13%, transparent),
+    0 0 30px color-mix(in srgb, var(--color-info) 42%, transparent);
+  animation: camelid-neutral-core 1.3s ease-in-out infinite;
+}
+
+.pacman-loader-neutral .pacman-loader-pellet {
+  top: 29px;
+  width: 8px;
+  height: 8px;
+  background: color-mix(in srgb, var(--color-ready) 70%, white 30%);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--color-ready) 32%, transparent);
+}
+
+@keyframes camelid-neutral-core {
+  0%, 100% {
+    transform: translateX(0) scale(0.9);
+    opacity: 0.82;
+  }
+  50% {
+    transform: translateX(10px) scale(1.18);
+    opacity: 1;
+  }
+}
+
+@media (max-width: 760px) {
+  .demo-prompt-panel {
+    padding: 12px;
+  }
+
+  .demo-prompt-chip {
+    flex-basis: 100%;
+  }
+}
+
+/* Postable demo code cards: wrap long generated lines so captures never look horizontally clipped. */
+.chat-layout-gemini .message-code-card code {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

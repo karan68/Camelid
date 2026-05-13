@@ -595,6 +595,36 @@ impl CpuTensor {
         Ok(tensor)
     }
 
+    pub fn from_q8_0_blocks(
+        name: impl Into<String>,
+        shape: TensorShape,
+        q8_0_blocks: Vec<Q8_0Block>,
+    ) -> Result<Self> {
+        let expected_elements = shape.element_count()?;
+        if !expected_elements.is_multiple_of(32) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q8_0 block-backed tensor element count {expected_elements} is not block aligned"
+            )));
+        }
+        let expected_blocks = expected_elements / 32;
+        if q8_0_blocks.len() != expected_blocks {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q8_0 block-backed tensor expected {expected_blocks} blocks, got {}",
+                q8_0_blocks.len()
+            )));
+        }
+        Ok(Self {
+            name: name.into(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(GgufTensorType::Q8_0),
+            q8_0_blocks: Some(q8_0_blocks),
+            q8_0_file_backing: None,
+            q8_0_split_file_backing: None,
+            data: Vec::new(),
+        })
+    }
+
     pub fn with_q8_0_file_backing(mut self, backing: Q8_0FileBacking) -> Self {
         self.q8_0_file_backing = Some(backing);
         self
@@ -863,6 +893,9 @@ impl CpuTensor {
         if let Some(backing) = self.q8_0_file_backing.as_ref() {
             return self.embedding_lookup_q8_0_file_backed(token_ids, name, vocab, width, backing);
         }
+        if let Some(blocks) = self.q8_0_blocks.as_deref() {
+            return self.embedding_lookup_q8_0_block_backed(token_ids, name, vocab, width, blocks);
+        }
         let output_len = token_ids.len().checked_mul(width).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
                 "embedding lookup output element count overflow".to_string(),
@@ -889,6 +922,72 @@ impl CpuTensor {
                 BackendError::RuntimeShapeMismatch("embedding lookup row end overflow".to_string())
             })?;
             out.extend_from_slice(&self.data[start..end]);
+        }
+        Self::from_f32(name, vec![token_ids.len(), width], out)
+    }
+
+    fn embedding_lookup_q8_0_block_backed(
+        &self,
+        token_ids: &[u32],
+        name: impl Into<String>,
+        vocab: usize,
+        width: usize,
+        blocks: &[Q8_0Block],
+    ) -> Result<Self> {
+        const Q8_0_BLOCK_VALUES: usize = 32;
+        if self.source_type != Some(GgufTensorType::Q8_0) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "block-backed embedding {} must come from Q8_0 storage",
+                self.name
+            )));
+        }
+        if !width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "block-backed q8_0 embedding width {width} is not divisible by {Q8_0_BLOCK_VALUES}"
+            )));
+        }
+        let blocks_per_row = width / Q8_0_BLOCK_VALUES;
+        let expected_blocks = vocab.checked_mul(blocks_per_row).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "block-backed q8_0 embedding block count overflow".to_string(),
+            )
+        })?;
+        if blocks.len() != expected_blocks {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "block-backed q8_0 embedding block count {} does not match expected {expected_blocks}",
+                blocks.len()
+            )));
+        }
+        let output_len = token_ids.len().checked_mul(width).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch(
+                "block-backed q8_0 embedding output element count overflow".to_string(),
+            )
+        })?;
+        let mut out = Vec::with_capacity(output_len);
+        for token_id in token_ids {
+            let token_idx = usize::try_from(*token_id).map_err(|_| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} does not fit usize"
+                ))
+            })?;
+            if token_idx >= vocab {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} out of range for vocab size {vocab}"
+                )));
+            }
+            let block_start = token_idx.checked_mul(blocks_per_row).ok_or_else(|| {
+                BackendError::RuntimeShapeMismatch(
+                    "block-backed q8_0 embedding row start overflow".to_string(),
+                )
+            })?;
+            for block in &blocks[block_start..block_start + blocks_per_row] {
+                out.extend(
+                    block
+                        .quants
+                        .iter()
+                        .map(|quant| block.scale * f32::from(*quant)),
+                );
+            }
         }
         Self::from_f32(name, vec![token_ids.len(), width], out)
     }
@@ -1959,6 +2058,21 @@ impl TensorStore {
         self.load_q8_0_file_backed_tensor(name)
     }
 
+    pub fn load_q8_0_block_backed_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        if desc.tensor_type != GgufTensorType::Q8_0 {
+            return self.load_cpu_f32(name);
+        }
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if shape.dims.len() != 2 {
+            return self.load_cpu_f32(name);
+        }
+        let expected_elements = shape.element_count()?;
+        let bytes = self.tensor_bytes(name)?;
+        let blocks = decode_q8_0_blocks(name, &bytes, expected_elements)?;
+        CpuTensor::from_q8_0_blocks(name, shape, blocks)
+    }
+
     pub fn load_q8_0_split_file_backed_tensor(
         &self,
         name: impl Into<String>,
@@ -1980,7 +2094,7 @@ impl TensorStore {
             ));
         }
         let per_expert_elements = expected_elements / expert_count;
-        if per_expert_elements % 32 != 0 {
+        if !per_expert_elements.is_multiple_of(32) {
             return Err(BackendError::InvalidTensorData(
                 "split MoE expert Q8_0 element count is not block aligned".to_string(),
             ));
@@ -2218,8 +2332,8 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::{
         f16_bits_to_f32, parse_byte_count, q8_0_file_read_stats, q8_file_cache_get,
-        q8_file_cache_insert, with_q8_file_cache_capacity_override, CpuTensor, Q8_0FileBacking,
-        TensorShape, Q8_0_BLOCK_BYTES,
+        q8_file_cache_insert, with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block,
+        Q8_0FileBacking, TensorShape, Q8_0_BLOCK_BYTES,
     };
     use crate::test_support::env_lock;
 
@@ -2302,6 +2416,30 @@ mod tests {
                 .contains("file-backed q8_0 embedding absolute row byte offset overflow"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn q8_block_backed_embedding_dequantizes_selected_rows() {
+        let row0 = Q8_0Block {
+            scale: 0.5,
+            quants: [2; 32],
+        };
+        let row1 = Q8_0Block {
+            scale: 0.25,
+            quants: [-4; 32],
+        };
+        let tensor = CpuTensor::from_q8_0_blocks(
+            "token_embd.weight",
+            TensorShape { dims: vec![2, 32] },
+            vec![row0, row1],
+        )
+        .unwrap();
+
+        let embedding = tensor.embedding_lookup(&[1, 0], "embedding").unwrap();
+
+        assert_eq!(embedding.shape.dims, vec![2, 32]);
+        assert_eq!(&embedding.data[..32], &[-1.0; 32]);
+        assert_eq!(&embedding.data[32..], &[1.0; 32]);
     }
 
     #[test]

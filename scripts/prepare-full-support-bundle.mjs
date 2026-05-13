@@ -16,7 +16,7 @@ Options:
   --repo-root <path>                 Repository root (default: current directory)
   --out-dir <path>                   Output bundle root (default: target/full-support-<utc>-head-<sha>)
   --utc <stamp>                      UTC stamp for the default output directory
-  --validation-host-status <status>  available | blocked_by_operator_shutdown (default: available)
+  --validation-host-status <status>  available | blocked_by_operator_shutdown (default: blocked_by_operator_shutdown)
   --help, -h                         Print this help without writing files
 `)
   process.exit(0)
@@ -30,11 +30,15 @@ const originMain = git(['rev-parse', 'origin/main'], repoRoot)
 const branch = git(['branch', '--show-current'], repoRoot)
 const outDir = resolve(args.get('out-dir') || join(repoRoot, 'target', `full-support-${utcStamp}-head-${gitHeadShort}`))
 const outDirRelative = relative(repoRoot, outDir) || '.'
-const validationHostStatus = args.get('validation-host-status') || 'available'
+const validationHostStatus = args.get('validation-host-status') || 'blocked_by_operator_shutdown'
+if (!['available', 'blocked_by_operator_shutdown'].includes(validationHostStatus)) {
+  console.error(`unknown --validation-host-status ${JSON.stringify(validationHostStatus)}; expected available or blocked_by_operator_shutdown`)
+  process.exit(2)
+}
 const runtimeValidationAvailable = validationHostStatus === 'available'
 const qaBundleRoot = 'qa/evidence-bundles/four-row-public-20260503T024327Z'
 const perfEnvelopePath = 'qa/evidence-bundles/four-row-perf-portability-public-20260503T025639Z/compact-perf-portability-envelope.json'
-const validationNotePath = 'qa/validation-notes/2026-05-04-validation-lane-reopened.md'
+const validationNotePath = 'qa/validation-notes/2026-05-12-local-only-validation-lane-paused.md'
 const context512EvidencePath = 'qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json'
 const chatTemplateShapesEvidencePath = 'qa/evidence-bundles/llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/manifest.json'
 const broader50EvidencePath = 'qa/evidence-bundles/llama3-8b-broader-50tok-20260505T005031Z-head-d13541ad8d7e/manifest.json'
@@ -265,10 +269,13 @@ const manifest = {
     arch: os.arch(),
     node: process.version,
   },
-  ubuntu_validation_guardrail: 'Use the canonical Ubuntu validation host for promotion-grade Llama runtime evidence. Local Mac work is for docs/recon/light prep only.',
+  ubuntu_validation_guardrail: runtimeValidationAvailable
+    ? 'Runtime tracks are runnable only on an approved Tim-authorized validation/runtime lane; keep Local Mac work to docs/recon/light prep unless Tim explicitly authorizes otherwise.'
+    : 'Validation lane paused by operator instruction: do not SSH to validation hosts, do not substitute a local Mac runtime rerun, and keep this scaffold blocked until Tim explicitly reopens an approved lane.',
   validation_host_status: {
     status: validationHostStatus,
     runtime_validation_available: runtimeValidationAvailable,
+    blocked_by_note: runtimeValidationAvailable ? null : validationNotePath,
     blocked_rows: runtimeValidationAvailable ? [] : ['tinyllama_1_1b_chat_q8_0 recency rerun', 'llama32_1b_instruct_q8_0', 'llama32_3b_instruct_q8_0', 'llama3_8b_instruct_q8_0'],
     operator_instruction: runtimeValidationAvailable
       ? 'Runtime tracks were generated as runnable; execute only on the approved validation host or another Tim-authorized runtime lane.'
@@ -436,6 +443,7 @@ function runtimeCommand(command) {
     'cat >&2 <<\'CAMELID_RUNTIME_VALIDATION_BLOCKED\'',
     'Camelid runtime validation is blocked for this generated bundle.',
     'Tim has shut down the Ubuntu validation server; do not SSH to validation hosts and do not substitute local Mac llama-server/reference workloads until Tim explicitly reopens that lane.',
+    `Validation note: ${validationNotePath}`,
     '',
     'Regenerate this bundle with --validation-host-status available only after Tim says the host/runtime lane is back.',
     '',

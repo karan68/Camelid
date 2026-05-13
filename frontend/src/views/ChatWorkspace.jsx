@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel } from '../lib/capabilities'
 import { clampText, formatDate, formatRate } from '../lib/formatters'
@@ -212,23 +212,56 @@ const splitFenceInfo = (value) => {
 
 const CODE_CARD_STREAMING_LABEL = 'Still generating — code block incomplete'
 
-const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
-  const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
-  const stillGenerating = Boolean(incomplete && streaming)
-  blocks.push(
+function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
+  const preRef = useRef(null)
+  const autoFollowCodeRef = useRef(true)
+
+  useEffect(() => {
+    if (!stillGenerating) return undefined
+    autoFollowCodeRef.current = true
+    const pre = preRef.current
+    if (!pre) return undefined
+    const updateAutoFollow = () => {
+      const distanceFromBottom = pre.scrollHeight - (pre.scrollTop + pre.clientHeight)
+      autoFollowCodeRef.current = distanceFromBottom < 80
+    }
+    pre.addEventListener('scroll', updateAutoFollow, { passive: true })
+    return () => pre.removeEventListener('scroll', updateAutoFollow)
+  }, [stillGenerating])
+
+  useLayoutEffect(() => {
+    if (!stillGenerating || !autoFollowCodeRef.current) return
+    const pre = preRef.current
+    if (pre) pre.scrollTop = pre.scrollHeight
+  }, [code, stillGenerating])
+
+  return (
     <figure
       className={`message-code-card ${stillGenerating ? 'is-generating' : ''}`}
       aria-busy={stillGenerating ? 'true' : undefined}
       data-code-streaming-state={stillGenerating ? 'open' : undefined}
-      key={`code-${blocks.length}`}
     >
       <figcaption>
         <span className="message-code-card-title">{language}</span>
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
-        <button type="button" onClick={() => copyText(trimmedCode)} aria-label={`Copy ${language} code`}>Copy</button>
+        <button type="button" onClick={() => copyText(code)} aria-label={`Copy ${language} code`}>Copy</button>
       </figcaption>
-      <pre><code>{renderHighlightedCode(trimmedCode, language, keyPrefix)}</code></pre>
-    </figure>,
+      <pre ref={preRef}><code>{renderHighlightedCode(code, language, keyPrefix)}</code></pre>
+    </figure>
+  )
+}
+
+const pushCodeBlock = (blocks, language, code, keyPrefix, { incomplete = false, streaming = false } = {}) => {
+  const trimmedCode = String(code || '').replace(/^\n+|\n+$/g, '')
+  const stillGenerating = Boolean(incomplete && streaming)
+  blocks.push(
+    <CodeBlockCard
+      key={`code-${blocks.length}`}
+      language={language}
+      code={trimmedCode}
+      keyPrefix={keyPrefix}
+      stillGenerating={stillGenerating}
+    />,
   )
 }
 
@@ -237,21 +270,54 @@ const hasOpenCodeFence = (content) => {
   return Boolean(matches && matches.length % 2 === 1)
 }
 
-const ACTIVE_STREAMING_LABEL = 'Still generating — response is active'
-const OPEN_CODE_STREAMING_LABEL = 'Still generating — code block is still open'
-const FIRST_TOKEN_STREAMING_LABEL = 'Still generating; waiting for the first token'
+const PREPARING_STREAMING_LABEL = 'Preparing local response'
+const FIRST_TOKEN_STREAMING_LABEL = 'Backend is generating'
+const LONG_FIRST_TOKEN_STREAMING_LABEL = 'Local response is taking a while'
+const ACTIVE_STREAMING_LABEL = 'Streaming response'
+const OPEN_CODE_STREAMING_LABEL = 'Streaming code response'
 
-function StreamingStatus({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false, tail = false }) {
+const DEMO_PROMPTS = [
+  'Build a tiny arcade maze game in one self-contained HTML file',
+  'Create a glassy launch page with animated CSS and one working button',
+  'Write a compact Python snake game using tkinter',
+]
+
+const looksLikePacmanPrompt = (value) => /\bpac[ -]?m[ae]n\b|\bpacmac\b/i.test(String(value || ''))
+
+const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
+  if (phase === 'preparing') return PREPARING_STREAMING_LABEL
+  if (phase === 'streaming') return isOpenCode ? OPEN_CODE_STREAMING_LABEL : ACTIVE_STREAMING_LABEL
+  if (elapsedSeconds >= 20) return LONG_FIRST_TOKEN_STREAMING_LABEL
+  return FIRST_TOKEN_STREAMING_LABEL
+}
+
+function PacmanLoader({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL, compact = false, variant = 'arcade' }) {
+  const neutral = variant === 'neutral'
   return (
-    <div className={`message-live-status ${compact ? 'message-live-status-compact' : ''} ${tail ? 'message-live-status-tail' : ''}`} role="status" aria-live="polite" aria-label={label} data-live-status="active">
-      <span className="message-live-dot" aria-hidden="true" />
-      <span>{label}</span>
-      <span>{elapsedSeconds}s elapsed</span>
+    <div className={`pacman-loader ${compact ? 'pacman-loader-compact' : ''} ${neutral ? 'pacman-loader-neutral' : 'pacman-loader-arcade'}`} role="status" aria-live="polite" aria-label={`${label}. ${elapsedSeconds} seconds elapsed.`}>
+      <div className="pacman-loader-track" aria-hidden="true">
+        <span className="pacman-loader-mouth" />
+        <span className="pacman-loader-pellet pacman-loader-pellet-1" />
+        <span className="pacman-loader-pellet pacman-loader-pellet-2" />
+        <span className="pacman-loader-pellet pacman-loader-pellet-3" />
+        <span className="pacman-loader-pellet pacman-loader-pellet-4" />
+        <span className="pacman-loader-pellet pacman-loader-pellet-5" />
+      </div>
     </div>
   )
 }
 
-function AssistantMarkdown({ content, streaming = false }) {
+function LiveGenerationBadge({ elapsedSeconds, label = ACTIVE_STREAMING_LABEL }) {
+  return (
+    <div className="message-live-generation-badge" role="status" aria-live="polite" data-live-status="active">
+      <span className="message-live-dot" aria-hidden="true" />
+      <span>{label}</span>
+      <span>{elapsedSeconds}s</span>
+    </div>
+  )
+}
+
+function AssistantMarkdownInner({ content, streaming = false }) {
   const normalized = String(content || '').replace(/\r\n/g, '\n')
   const blocks = []
   let cursor = 0
@@ -281,6 +347,54 @@ function AssistantMarkdown({ content, streaming = false }) {
   return <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
 }
 
+const AssistantMarkdown = memo(AssistantMarkdownInner)
+
+const isInterruptedPlaceholderMessage = (message) => {
+  if (message?.role !== 'assistant') return false
+  const content = String(message?.content || '').trim().toLowerCase()
+  return content === '(generation interrupted)' || content === '(generation stopped)'
+}
+
+const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsedSeconds, priorUserPrompt }) {
+  const messageContent = cleanLegacyDemoCapCopy(message.content)
+  const assistantStreaming = message.role === 'assistant' && Boolean(message.streaming)
+  const isOpenStreamingCode = assistantStreaming && hasOpenCodeFence(messageContent)
+  const streamingPhase = message.streaming_phase || (messageContent ? 'streaming' : 'generating')
+  const liveStatusLabel = streamingStatusLabel(streamingPhase, generationElapsedSeconds, isOpenStreamingCode)
+  const loaderVariant = looksLikePacmanPrompt(priorUserPrompt) ? 'neutral' : 'arcade'
+  const hasTokenMetrics = false
+  const showStreamingStatus = assistantStreaming && !messageContent
+  const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
+
+  return (
+    <article
+      className={`message-row message-row-gemini ${message.role} ${assistantStreaming ? 'is-streaming' : ''}`}
+      aria-busy={assistantStreaming ? 'true' : undefined}
+      data-streaming-state={assistantStreaming ? 'active' : undefined}
+      data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
+    >
+      <div className={`message-bubble message-bubble-gemini ${message.role}`}>
+        {showStreamingStatus && <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact variant={loaderVariant} />}
+        {message.role === 'assistant'
+          ? messageContent || !assistantStreaming
+            ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />
+            : null
+          : <p>{messageContent}</p>}
+        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} />}
+        {hasTokenMetrics && (
+          <div className="message-token-metrics" aria-label="Generation speed">
+            {message.first_byte_ms !== null && message.first_byte_ms !== undefined && <span>TTFB {(Number(message.first_byte_ms) / 1000).toFixed(2)}s</span>}
+            {message.first_event_ms !== null && message.first_event_ms !== undefined && <span>First event {(Number(message.first_event_ms) / 1000).toFixed(2)}s</span>}
+            {message.first_content_ms !== null && message.first_content_ms !== undefined && <span>TTFT {(Number(message.first_content_ms) / 1000).toFixed(2)}s</span>}
+            <span>In {formatRate(message.tokens_in_per_sec)}</span>
+            <span>Decode {formatRate(message.tokens_out_per_sec)}</span>
+          </div>
+        )}
+      </div>
+    </article>
+  )
+})
+
 export default function ChatWorkspace({
   selectedConversation,
   selectedModel,
@@ -299,9 +413,22 @@ export default function ChatWorkspace({
   setTab,
 }) {
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
-  const visibleMessages = (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message))
-  const hasStreamingAssistant = visibleMessages.some((message) => message.role === 'assistant' && message.streaming)
+  const chatBottomRef = useRef(null)
+  const autoFollowGenerationRef = useRef(true)
+  const rawVisibleMessages = useMemo(
+    () => (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message)),
+    [selectedConversation?.messages],
+  )
+  const hasStreamingAssistant = rawVisibleMessages.some((message) => message.role === 'assistant' && message.streaming)
+  const hasStreamingAssistantContent = rawVisibleMessages.some((message) => message.role === 'assistant' && message.streaming && String(message.content || '').trim())
   const generationActive = Boolean(sending || hasStreamingAssistant)
+  const visibleMessages = useMemo(() => {
+    if (!generationActive) return rawVisibleMessages
+    return rawVisibleMessages.filter((message, index, messages) => {
+      const isTrailingInterruptedPlaceholder = index === messages.length - 1 && isInterruptedPlaceholderMessage(message)
+      return !isTrailingInterruptedPlaceholder
+    })
+  }, [generationActive, rawVisibleMessages])
   const pendingPrompt = (pendingConversation?.content || (sending ? composer.trim() : '')).trim()
   const pendingPromptAlreadyVisible = Boolean(
     pendingPrompt && [...visibleMessages].reverse().some((message) => message.role === 'user' && message.content === pendingPrompt),
@@ -309,7 +436,11 @@ export default function ChatWorkspace({
   const pendingUserPrompt = pendingPromptAlreadyVisible ? '' : pendingPrompt
   const lastVisibleMessage = visibleMessages.at(-1)
   const lastVisibleMessageIsUser = lastVisibleMessage?.role === 'user'
-  const awaitingAssistant = Boolean(sending && !hasStreamingAssistant && (pendingPrompt || lastVisibleMessageIsUser))
+  const awaitingAssistant = Boolean(generationActive && !hasStreamingAssistantContent && !hasStreamingAssistant && (pendingPrompt || lastVisibleMessageIsUser || sending))
+  const streamingScrollSignature = useMemo(() => (
+    visibleMessages.map((message) => `${message.id}:${message.streaming ? 'streaming' : 'done'}:${String(message.content || '').length}`).join('|')
+    + `|awaiting:${awaitingAssistant ? '1' : '0'}|active:${generationActive ? '1' : '0'}`
+  ), [awaitingAssistant, generationActive, visibleMessages])
 
   useEffect(() => {
     if (!generationActive) {
@@ -324,7 +455,29 @@ export default function ChatWorkspace({
     return () => window.clearInterval(interval)
   }, [generationActive])
 
-  const isFreshThread = selectedConversation ? (visibleMessages.length === 0 && !pendingPrompt) : !pendingPrompt
+  useEffect(() => {
+    if (!generationActive) return undefined
+    autoFollowGenerationRef.current = true
+    const updateAutoFollow = () => {
+      const doc = document.documentElement
+      const distanceFromBottom = doc.scrollHeight - (window.scrollY + window.innerHeight)
+      autoFollowGenerationRef.current = distanceFromBottom < 260
+    }
+    window.addEventListener('scroll', updateAutoFollow, { passive: true })
+    return () => window.removeEventListener('scroll', updateAutoFollow)
+  }, [generationActive, selectedConversation?.id])
+
+  useLayoutEffect(() => {
+    if (!generationActive || !autoFollowGenerationRef.current) return undefined
+    const frame = window.requestAnimationFrame(() => {
+      chatBottomRef.current?.scrollIntoView({ block: 'end', behavior: 'auto' })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [generationActive, streamingScrollSignature])
+
+  const isFreshThread = selectedConversation
+    ? (visibleMessages.length === 0 && !pendingPrompt && !awaitingAssistant && !hasStreamingAssistant)
+    : (!pendingPrompt && !awaitingAssistant && !hasStreamingAssistant)
   const handleComposerKeyDown = async (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
@@ -403,10 +556,14 @@ export default function ChatWorkspace({
       ? 'Choose a supported model.'
       : 'Load a model to begin.'
   const productHeroSummary = selectedModelRunnable
-    ? ''
+    ? 'Pick a polished demo prompt or ask anything — Camelid is running the selected exact row locally.'
     : supportBlocked
-      ? ''
-      : ''
+      ? 'Camelid keeps demos honest: chat unlocks only for exact supported model rows.'
+      : 'Load a generation-ready GGUF model, then run a clean local demo without cloud handoffs.'
+  const handleDemoPrompt = (prompt) => {
+    if (generationActive || !selectedModelRunnable) return
+    setComposer(prompt)
+  }
   const renderModelPicker = () => {
     if (!hasRunnableChoices) {
       return (
@@ -474,6 +631,19 @@ export default function ChatWorkspace({
                 </div>
               </div>
 
+              {selectedModelRunnable && (
+                <div className="demo-prompt-panel" aria-label="Polished demo prompts">
+                  <span>Demo starters</span>
+                  <div className="demo-prompt-strip">
+                    {DEMO_PROMPTS.map((prompt) => (
+                      <button key={prompt} type="button" className="demo-prompt-chip" onClick={() => handleDemoPrompt(prompt)} disabled={generationActive}>
+                        {prompt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="composer composer-gemini composer-gemini-stage composer-gemini-stage-clean composer-gemini-product">
                 <textarea className="composer-input composer-input-gemini composer-input-gemini-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
                 <div className="composer-gemini-footer composer-gemini-footer-stage composer-gemini-footer-stage-clean">
@@ -512,39 +682,11 @@ export default function ChatWorkspace({
 
             <div className="chat-thread chat-thread-gemini">
               {visibleMessages.length === 0 && !awaitingAssistant && <div className="empty-state empty-state-chat">Pick a ready model, then send the first message when you’re ready.</div>}
-              {visibleMessages.map((message) => {
-                const messageContent = cleanLegacyDemoCapCopy(message.content)
-                const assistantStreaming = message.role === 'assistant' && Boolean(message.streaming)
-                const isOpenStreamingCode = assistantStreaming && hasOpenCodeFence(messageContent)
-                const liveStatusLabel = isOpenStreamingCode
-                  ? OPEN_CODE_STREAMING_LABEL
-                  : ACTIVE_STREAMING_LABEL
-                const hasTokenMetrics = message.role === 'assistant' && (
-                  message.tokens_in_per_sec !== null && message.tokens_in_per_sec !== undefined ||
-                  message.tokens_out_per_sec !== null && message.tokens_out_per_sec !== undefined
-                )
-
-                return (
-                  <article
-                    key={message.id}
-                    className={`message-row message-row-gemini ${message.role} ${assistantStreaming ? 'is-streaming' : ''}`}
-                    aria-busy={assistantStreaming ? 'true' : undefined}
-                    data-streaming-state={assistantStreaming ? 'active' : undefined}
-                    data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
-                  >
-                    <div className={`message-bubble message-bubble-gemini ${message.role}`}>
-                      {assistantStreaming && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
-                      {message.role === 'assistant' ? <AssistantMarkdown content={messageContent} streaming={assistantStreaming} /> : <p>{messageContent}</p>}
-                      {assistantStreaming && <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tail />}
-                      {hasTokenMetrics && (
-                        <div className="message-token-metrics" aria-label="Generation speed">
-                          <span>In {formatRate(message.tokens_in_per_sec)}</span>
-                          <span>Out {formatRate(message.tokens_out_per_sec)}</span>
-                        </div>
-                      )}
-                    </div>
-                  </article>
-                )
+              {visibleMessages.map((message, index) => {
+                const priorUserPrompt = message.role === 'assistant'
+                  ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')?.content
+                  : null
+                return <ChatMessageRow key={message.id} message={message} generationElapsedSeconds={generationElapsedSeconds} priorUserPrompt={priorUserPrompt} />
               })}
               {awaitingAssistant && (
                 <>
@@ -557,12 +699,12 @@ export default function ChatWorkspace({
                   )}
                   <article className="message-row message-row-gemini assistant pending is-streaming" aria-busy="true" data-streaming-state="active">
                     <div className="message-bubble message-bubble-gemini assistant pending">
-                      <StreamingStatus elapsedSeconds={generationElapsedSeconds} label={FIRST_TOKEN_STREAMING_LABEL} />
-                      <p className="message-placeholder-copy">Camelid is running locally. Tokens will appear as they are generated.</p>
+                      <PacmanLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} variant={looksLikePacmanPrompt(pendingPrompt) ? 'neutral' : 'arcade'} />
                     </div>
                   </article>
                 </>
               )}
+              <div className="chat-thread-stream-anchor" ref={chatBottomRef} aria-hidden="true" />
             </div>
           </>
         )}

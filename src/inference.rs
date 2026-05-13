@@ -707,7 +707,7 @@ impl LlamaLoadedWeights {
         let auto_retain_q8_0_blocks = auto_retain_q8_0_blocks_for_fast_local_chat(binding);
         let load_linear = |name: &str| {
             if auto_retain_q8_0_blocks {
-                store.load_cpu_f32_with_q8_0_block_retention(name, true)
+                store.load_q8_0_block_backed_linear(name)
             } else if lazy_q8_0_linear_enabled() {
                 store.load_q8_0_file_backed_linear(name)
             } else {
@@ -6049,6 +6049,10 @@ fn auto_retain_q8_0_blocks_for_fast_local_chat(binding: &LlamaTensorBinding) -> 
         if desc.tensor_type == GgufTensorType::Q8_0 {
             saw_q8_linear = true;
             let block_count = element_count.checked_add(Q8_0_BLOCK_VALUES - 1)? / Q8_0_BLOCK_VALUES;
+            // Fast local chat keeps Q8_0 linear tensors as compact retained blocks and
+            // executes the block-dot path directly. Do not budget a second f32 copy here;
+            // the old f32+Q8 retention shape made 3B fall back to repeated lazy disk reads.
+            estimated_bytes = estimated_bytes.checked_sub(element_count.checked_mul(4)?)?;
             estimated_bytes = estimated_bytes
                 .checked_add(block_count.checked_mul(mem::size_of::<Q8_0Block>())?)?;
         }

@@ -26,7 +26,8 @@ for pattern in "${patterns[@]}"; do
     ':!target' \
     ':!frontend/dist' \
     ':!frontend/node_modules' \
-    ':!scripts/check-public-scrub.sh' || true)
+    ':!scripts/check-public-scrub.sh' \
+    ':!scripts/test-audit-evidence-bundle-privacy.mjs' || true)
   if [[ -n "$matches" ]]; then
     printf 'public scrub guard failed for pattern: %s\n%s\n' "$pattern" "$matches" >&2
     status=1
@@ -45,6 +46,40 @@ branding_matches=$(git grep -n -I -E "$branding_pattern" -- \
   .github || true)
 if [[ -n "$branding_matches" ]]; then
   printf 'public scrub guard failed for legacy backend branding: %s\n%s\n' "$branding_pattern" "$branding_matches" >&2
+  status=1
+fi
+
+stale_validation_lane_pattern='remote validation is available again|remote runtime validation is available again|Current operator update: The approved Ubuntu validation lane is reopened|approved Ubuntu validation lane is reopened for Camelid promotion-grade'
+stale_validation_lane_matches=$(git grep -n -I -E "$stale_validation_lane_pattern" -- \
+  README.md \
+  COMPATIBILITY.md \
+  STATUS.md \
+  ROADMAP.md \
+  FULL_SUPPORT_BLOCKER_MATRIX.md \
+  docs \
+  frontend/README.md \
+  qa/validation-notes \
+  scripts ':!scripts/check-public-scrub.sh' || true)
+if [[ -n "$stale_validation_lane_matches" ]]; then
+  printf 'public scrub guard failed for stale validation-lane availability language: %s\n%s\n' "$stale_validation_lane_pattern" "$stale_validation_lane_matches" >&2
+  status=1
+fi
+
+local_bundle_pattern='qa/evidence-bundles/(backend-local|local-|tpm-local-)'
+local_bundle_matches=$(git grep -n -I -E "$local_bundle_pattern" -- \
+  README.md \
+  COMPATIBILITY.md \
+  STATUS.md \
+  ROADMAP.md \
+  FULL_SUPPORT_BLOCKER_MATRIX.md \
+  docs \
+  frontend/README.md \
+  frontend/src \
+  frontend/scripts \
+  qa/validation-notes \
+  scripts ':!scripts/check-public-scrub.sh' ':!scripts/test-audit-evidence-bundle-privacy.mjs' || true)
+if [[ -n "$local_bundle_matches" ]]; then
+  printf 'public scrub guard failed for local-only evidence bundle citation: %s\n%s\n' "$local_bundle_pattern" "$local_bundle_matches" >&2
   status=1
 fi
 

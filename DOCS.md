@@ -6,8 +6,8 @@ This index helps readers navigate the public Markdown set.
 
 ## Fast reader paths
 
-- **Product/reviewer path:** start with `README.md`, then `COMPATIBILITY.md`, then the milestone snapshot in `STATUS.md`.
-- **Evidence auditor path:** start with `qa/evidence-bundles/README.md`, then follow the row-specific manifests linked from `STATUS.md`.
+- **Product/reviewer path:** start with `README.md`, then `COMPATIBILITY.md`, then the milestone snapshot in `STATUS.md`, then `BENCHMARKS.md`.
+- **Evidence auditor path:** start with `PARITY.md`, then `qa/evidence-bundles/README.md`, then follow the row-specific manifests linked from `STATUS.md`.
 - **Contributor path:** start with `docs/CONTRIBUTOR_QUICKSTART.md`, then use `docs/VALIDATION_MATRIX.md` to choose the smallest safe check lane.
 
 ## Public sources of truth
@@ -16,8 +16,10 @@ Read these first:
 
 - [`README.md`](README.md) — product overview, milestone story, and current exact-row support table
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — authoritative support ledger and at-a-glance release contract
-- [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
 - [`STATUS.md`](STATUS.md) — current milestone/evidence snapshot and exact blockers
+- [`BENCHMARKS.md`](BENCHMARKS.md) — public performance snapshot and benchmark-claim rules
+- [`PARITY.md`](PARITY.md) — exact-row parity proof map and audit trail
+- [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
 
 ## Contributor and project policy
 

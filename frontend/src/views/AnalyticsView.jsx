@@ -1,4 +1,4 @@
-import { capabilityStatusTone, formatCapabilityStatus, getCurrentCompatibilityTarget, guardedCapabilityCopy, isGuardedCapabilityStatus } from '../lib/capabilities'
+import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, formatCapabilityStatus, getCurrentCompatibilityTarget, guardedCapabilityCopy, isGuardedCapabilityStatus } from '../lib/capabilities'
 import { formatCompactNumber, formatDate, formatRate } from '../lib/formatters'
 import { isRunnableModel } from '../lib/modelState'
 
@@ -218,7 +218,7 @@ export default function AnalyticsView({ conversations, models, runtime, capabili
                   <div key={target.id}>
                     <span>{target.id}</span>
                     <strong className={capabilityStatusTone(target.status)}>{formatCapabilityStatus(target.status)} · {target.family} · {target.quantization}</strong>
-                    <small>{target.next_step || 'Keep this target guarded until evidence lands.'}</small>
+                    <small>{displayCapabilityCopy(target.next_step || 'Keep this target guarded until evidence lands.')}</small>
                   </div>
                 ))}
               </div>
@@ -232,9 +232,9 @@ export default function AnalyticsView({ conversations, models, runtime, capabili
               <div className="api-feature-list">
                 {guardedFeatures.slice(0, 4).map((feature) => (
                   <div key={feature.id}>
-                    <span>{feature.id}</span>
+                    <span>{displayCapabilityId(feature.id)}</span>
                     <strong className={capabilityStatusTone(feature.status)}>{formatCapabilityStatus(feature.status)}</strong>
-                    <small>{guardedCapabilityCopy(feature, 'Analytics-driven shortcuts and UI controls')}</small>
+                    <small>{displayCapabilityCopy(guardedCapabilityCopy(feature, 'Analytics-driven shortcuts and UI controls'))}</small>
                   </div>
                 ))}
               </div>

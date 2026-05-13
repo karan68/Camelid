@@ -1,7 +1,15 @@
-import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, formatCapabilityStatus, getCurrentCompatibilityTarget, guardedCapabilityCopy, isGuardedCapabilityStatus, isSupportedCapabilityStatus, summarizeCapabilityItems } from '../lib/capabilities'
+import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, findCompatibilityHint, formatCapabilityStatus, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus } from '../lib/capabilities'
+import { modelRuntimeIdMatches } from '../lib/modelState'
 
 function guardedApiFeatures(features = []) {
   return features.filter((feature) => isGuardedCapabilityStatus(feature.status))
+}
+
+function summarizeExactRowField(targets = [], field, fallback = 'No exact compatibility rows advertised by this backend.') {
+  const rows = targets
+    .filter((target) => target?.id && target?.[field])
+    .map((target) => `${displayCapabilityCopy(target[field])}: ${formatCapabilityStatus(target.status)} (${target.id})`)
+  return rows.length ? rows.join(' · ') : fallback
 }
 
 export default function ApiView({ runtime, selectedModel, capabilities }) {
@@ -9,14 +17,30 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
   const modelId = selectedModel?.id || runtime?.active_model_id || '<loaded-model-id>'
   const supportContract = capabilities?.support_contract
   const compatibilityTargets = capabilities?.model_compatibility || []
-  const currentTarget = getCurrentCompatibilityTarget(capabilities)
   const apiFeatures = capabilities?.api_features || []
   const guardedFeatures = guardedApiFeatures(apiFeatures)
   const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
-  const selectedCompatibilityTarget = selectedCompatibilityHint?.kind === 'compatibility' ? selectedCompatibilityHint.target : null
+  const selectedCompatibilityTarget = isExactCompatibilityHint(selectedCompatibilityHint) ? selectedCompatibilityHint.target : null
   const selectedCompatibilitySupported = selectedCompatibilityTarget ? isSupportedCapabilityStatus(selectedCompatibilityTarget.status) : false
   const generationReady = Boolean(runtime?.generation_ready)
   const loadedNow = Boolean(runtime?.loaded_now)
+  const selectedRuntimeMatches = modelRuntimeIdMatches(selectedModel, runtime)
+  const selectedExactRowReady = Boolean(loadedNow && generationReady && selectedRuntimeMatches && selectedCompatibilitySupported)
+  const readinessPillCopy = selectedExactRowReady
+    ? 'Selected exact row ready'
+    : generationReady && selectedModel && !selectedRuntimeMatches
+      ? 'Different loaded model is ready'
+      : generationReady
+        ? 'Generation ready; exact row required'
+        : 'Load a generation-ready exact row'
+  const chatCompletionsCopy = selectedExactRowReady
+    ? 'Runnable now for this selected GGUF because runtime readiness and the exact supported row both match.'
+    : selectedCompatibilityTarget
+      ? 'Keep UX chat gated until this selected exact row is loaded_now=true, generation_ready=true, and active_model_id matches.'
+      : 'Keep UX chat gated; no selected exact compatibility row is available to pair with runtime readiness.'
+  const curlExample = selectedExactRowReady
+    ? `# Selected exact row is runtime-ready now\ncurl ${apiBase}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${modelId}",\n    "messages": [{"role": "user", "content": "Hello from Camelid"}],\n    "temperature": 0\n  }'`
+    : `# Blocked for UX chat until selected exact row evidence and runtime readiness both match\n# loaded_now=${loadedNow ? 'true' : 'false'} generation_ready=${generationReady ? 'true' : 'false'} active_model_id=${runtime?.active_model_id || 'none'}\n# selected_exact_row=${selectedCompatibilityTarget?.id || 'none'}`
 
   return (
     <section className="view-stack view-shell api-view-shell">
@@ -39,14 +63,14 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
             <h2>Standard /v1-compatible surface</h2>
             <p className="hero-summary">Generation endpoints stay useful only when runtime readiness is green and the selected local GGUF has an exact supported compatibility row. Capability rows explain supported and guarded lanes, but they never override loaded_now/generation_ready or active_model_id matching.</p>
           </div>
-          <div className={`status-pill ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Local /v1 generation ready' : 'Load a generation-ready model'}</div>
+          <div className={`status-pill ${selectedExactRowReady ? 'ready' : 'warm'}`}>{readinessPillCopy}</div>
         </div>
 
         <div className="api-grid api-grid-polished">
           <div className="api-card">
             <strong>Chat completions</strong>
             <code>{apiBase ? `${apiBase}/v1/chat/completions` : 'Unavailable until the local API is running'}</code>
-            <p>{generationReady ? 'Runnable now only for the loaded GGUF when /api/capabilities also matches an exact supported row.' : 'Do not call for UX chat yet; Camelid must report loaded_now=true and generation_ready=true for an exact supported row first.'}</p>
+            <p>{chatCompletionsCopy}</p>
           </div>
           <div className="api-card">
             <strong>Model listing</strong>
@@ -61,11 +85,11 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           <div className="api-card">
             <strong>Capabilities</strong>
             <code>{apiBase ? `${apiBase}/api/capabilities` : 'Unavailable until the local API is running'}</code>
-            <p>Support contract for model families, quants, compatibility rows, API feature support, and typed guardrails.</p>
+            <p>Support contract for exact compatibility rows, row-scoped family/quant evidence, API feature support, and typed guardrails.</p>
           </div>
           <div className="api-card wide api-card-code">
             <strong>Readiness-gated curl</strong>
-            <pre>{apiBase ? `# Use after /v1/health returns generation_ready=true\ncurl ${apiBase}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d '{\n    "model": "${modelId}",\n    "messages": [{"role": "user", "content": "Hello from Camelid"}],\n    "temperature": 0\n  }'` : 'Start the local runtime to see a ready-to-copy curl example.'}</pre>
+            <pre>{apiBase ? curlExample : 'Start the local runtime to see an exact-row readiness check.'}</pre>
           </div>
         </div>
       </section>
@@ -102,32 +126,33 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           </div>
 
           <div className="api-card">
-            <strong>Supported quantization</strong>
-            <p>{summarizeCapabilityItems(capabilities?.supported_quantization, 'Not advertised by this backend.')}</p>
+            <strong>Exact-row quant evidence</strong>
+            <p>{summarizeExactRowField(compatibilityTargets, 'quantization')}</p>
+            <p>Quant labels here come from compatibility rows only; broad quant lists do not unlock chat.</p>
           </div>
 
           <div className="api-card">
-            <strong>Planned quantization</strong>
-            <p>{summarizeCapabilityItems(capabilities?.planned_quantization, 'Not advertised by this backend.')}</p>
-            <p>These lanes must keep returning typed errors until implementation and evidence land.</p>
+            <strong>Exact-row family evidence</strong>
+            <p>{summarizeExactRowField(compatibilityTargets, 'family')}</p>
+            <p>Family names remain row-scoped evidence boundaries, not inherited support for neighboring files.</p>
           </div>
 
           <div className="api-card">
-            <strong>Model family boundaries</strong>
-            <p><b>Supported:</b> {summarizeCapabilityItems(capabilities?.supported_model_families, 'Not advertised by this backend.')}</p>
-            <p><b>Planned:</b> {summarizeCapabilityItems(capabilities?.planned_model_families, 'Not advertised by this backend.')}</p>
-          </div>
-
-          <div className="api-card">
-            <strong>Validated target</strong>
-            {currentTarget ? (
+            <strong>Selected exact-row evidence</strong>
+            {selectedCompatibilityTarget ? (
               <>
-                <code>{currentTarget.id}</code>
-                <p>{formatCapabilityStatus(currentTarget.status)} · {currentTarget.family} · {currentTarget.quantization}</p>
-                <p>{currentTarget.evidence}</p>
+                <code>{selectedCompatibilityTarget.id}</code>
+                <p>{formatCapabilityStatus(selectedCompatibilityTarget.status)} · {selectedCompatibilityTarget.family} · {selectedCompatibilityTarget.quantization}</p>
+                <p><b>Scope:</b> {displayCapabilityCopy(selectedCompatibilityTarget.support_scope || 'not advertised')}</p>
+                <p><b>Readiness gate:</b> {displayCapabilityCopy(selectedCompatibilityTarget.frontend_readiness_gate)}</p>
+                <p><b>Latest checked:</b> {formatCapabilityStatus(selectedCompatibilityTarget.latest_checked_bucket)} · {formatCapabilityStatus(selectedCompatibilityTarget.latest_checked_result)}</p>
+                <p><b>Latest output:</b> {displayCapabilityCopy(selectedCompatibilityTarget.latest_checked_output || 'not advertised')}</p>
+                <p><b>Full-support status:</b> {formatCapabilityStatus(selectedCompatibilityTarget.full_support_status || 'not advertised')}</p>
+                <p><b>Remaining blockers:</b> {displayCapabilityCopy(selectedCompatibilityTarget.full_support_blockers || 'No blockers advertised for this exact row.')}</p>
+                <p>{displayCapabilityCopy(selectedCompatibilityTarget.evidence)}</p>
               </>
             ) : (
-              <p>No compatibility rows advertised yet.</p>
+              <p>No selected model exact row matched. This API view will not promote family names, saved paths, or runtime health into a support claim.</p>
             )}
           </div>
 
@@ -136,8 +161,14 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
             {selectedModel ? (
               <>
                 <code>{selectedModel.id}</code>
-                <p><b>{compatibilityHintLabel(selectedCompatibilityHint, 'No matching row')}</b></p>
-                <p>{selectedCompatibilitySupported ? compatibilityHintCopy(selectedCompatibilityHint) : `${compatibilityHintCopy(selectedCompatibilityHint)} Do not treat this selected model as chat-supported unless runtime readiness is also green.`}</p>
+                {selectedCompatibilityTarget ? (
+                  <>
+                    <p><b>{selectedCompatibilityTarget.id}: {formatCapabilityStatus(selectedCompatibilityTarget.status)}</b></p>
+                    <p>{selectedCompatibilitySupported ? 'This selected model has an exact supported compatibility row; runtime readiness must still match before chat unlocks.' : 'An exact row matched, but it is not supported for chat at this gate.'}</p>
+                  </>
+                ) : (
+                  <p>No exact compatibility row matched this selected model, so the API UI will not display family, quant-list, filename, or saved-path guesses as support evidence.</p>
+                )}
               </>
             ) : (
               <p>No selected model. Capability rows remain evidence boundaries, not a catalog of everything on disk.</p>
@@ -154,7 +185,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                     <strong className={capabilityStatusTone(target.status)}>{formatCapabilityStatus(target.status)} · {target.family} · {target.quantization}</strong>
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)} · frontend load: {formatCapabilityStatus(target.frontend_load_path_verified)}</small>
                     <small>Template: {formatCapabilityStatus(target.chat_template_shape_pack || 'not_started')} · 512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')} · 1024-context: {formatCapabilityStatus(target.bounded_context_1024_pack || 'not_started')} · 2048-context: {formatCapabilityStatus(target.bounded_context_2048_pack || 'not_started')} · perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</small>
-                    <small>{target.next_step}</small>
+                    <small>{displayCapabilityCopy(target.next_step)}</small>
                   </div>
                 ))}
               </div>
@@ -169,9 +200,9 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
               <div className="api-feature-list">
                 {guardedFeatures.map((feature) => (
                   <div key={feature.id}>
-                    <span>{feature.id}</span>
+                    <span>{displayCapabilityId(feature.id)}</span>
                     <strong className={capabilityStatusTone(feature.status)}>{formatCapabilityStatus(feature.status)}</strong>
-                    <small>{guardedCapabilityCopy(feature, 'API affordances and frontend controls')}</small>
+                    <small>{displayCapabilityCopy(guardedCapabilityCopy(feature, 'API affordances and frontend controls'))}</small>
                   </div>
                 ))}
               </div>

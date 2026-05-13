@@ -1,3 +1,4 @@
+import { memo } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
 import { formatCapabilityStatus, getCurrentCompatibilityTarget } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
@@ -13,9 +14,6 @@ const titles = {
   system: 'System',
 }
 
-const isMeaningfulConversationMessage = (message) =>
-  typeof message?.content === 'string' && message.content.trim() && !message.content.startsWith('Conversation created.')
-
 const navItems = [
   { id: 'chat', label: 'Chat' },
   { id: 'library', label: 'Models' },
@@ -26,16 +24,15 @@ const navItems = [
   { id: 'system', label: 'System' },
 ]
 
-export default function TopBar({ tab, setTab, selectedConversation, runtime, capabilities, theme, setTheme, selectedModelId, setSelectedModelId, models }) {
-  const rawConversationTitle = selectedConversation?.title?.trim()
+function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, theme, setTheme, selectedModelId, setSelectedModelId, models }) {
+  const rawConversationTitle = selectedConversationTitle?.trim()
   const hasCustomConversationTitle = Boolean(rawConversationTitle && rawConversationTitle.toLowerCase() !== 'new conversation')
-  const latestConversationMessage = [...(selectedConversation?.messages || [])].reverse().find((message) => isMeaningfulConversationMessage(message))
   const activeModel = models.find((model) => model.id === runtime?.active_model_id)
   const selectedModel = models.find((model) => model.id === selectedModelId)
   const activeChatGate = getChatGateState(capabilities, activeModel, runtime)
   const runtimeChatReady = activeChatGate.chatUnlocked
-  const untitledConversationLabel = selectedConversation
-    ? `${formatPreview(latestConversationMessage?.content, 42)} · ${formatSidebarDate(selectedConversation.updated_at) || 'New chat'}`
+  const untitledConversationLabel = selectedConversationTitle
+    ? `${formatPreview(selectedConversationPreview, 42)} · ${formatSidebarDate(selectedConversationUpdatedAt) || 'New chat'}`
     : runtimeChatReady
       ? 'Ready when you are'
       : 'Waiting on model readiness'
@@ -128,3 +125,5 @@ export default function TopBar({ tab, setTab, selectedConversation, runtime, cap
     </header>
   )
 }
+
+export default memo(TopBar)

@@ -1,6 +1,6 @@
 # Validation note — local checkmark lane while Ubuntu runtime is shut down
 
-Superseded operational note: the approved Ubuntu validation lane reopened later on 2026-05-04. Keep this file as historical context for the local-only pause, but use `2026-05-04-validation-lane-reopened.md` for current execution guidance.
+Superseded operational note: the approved Ubuntu validation lane reopened later on 2026-05-04, then Tim paused it again on 2026-05-12. Keep this file as historical context for the earlier local-only pause, but use `2026-05-12-local-only-validation-lane-paused.md` for current execution guidance.
 
 Date: 2026-05-04
 Repo lane: local/repo-safe only

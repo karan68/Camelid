@@ -28,6 +28,41 @@ async fn health_reports_not_generation_ready() {
 }
 
 #[tokio::test]
+async fn capabilities_public_contract_omits_local_private_paths() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let serialized = body.to_string();
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "file://",
+        "file:\\",
+        "/Volumes/",
+        "/private/tmp/",
+        "C:\\Users\\",
+        "C:/Users/",
+        "\\Users\\",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "/api/capabilities must not expose local/private path marker {forbidden:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn capabilities_report_support_contract_and_planned_lanes() {
     let app = camelid::api::router();
     let response = app
@@ -45,7 +80,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist; Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied."
+        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -56,7 +91,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(q8["status"], "supported_current_gate");
     let q8_notes = q8["notes"].as_str().unwrap();
     assert!(q8_notes.contains(
-        "exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs"
+        "exact Llama 3.2 1B/3B Instruct Q8_0 rows and the exact Llama 3 8B Instruct Q8_0 row have checked bounded 512/1024/2048-context packs"
     ));
     assert!(q8_notes.contains("where row-specific PASS artifacts exist"));
     assert!(!q8_notes.contains("8B 1024/2048 remain red"));
@@ -82,7 +117,9 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(llama_bpe_notes.contains(
         "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs"
     ));
-    assert!(llama_bpe_notes.contains("8B 1024/2048 current-head bundle"));
+    assert!(llama_bpe_notes
+        .contains("published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0"));
+    assert!(!llama_bpe_notes.contains("8B 1024/2048 current-head bundle"));
     assert!(!llama_bpe_notes.contains("8B 1024/2048 remain red"));
     assert!(llama_bpe_notes.contains("Broader 50-token"));
     assert!(!llama_bpe_notes.contains("conditional"));
@@ -102,11 +139,11 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .iter()
         .any(|item| item["id"] == "mixtral_moe"
-            && item["status"] == "supported_exact_row_smoke_lane"
+            && item["status"] == "active_validation_partial_runtime"
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("exact-row supported")));
+                .contains("bounded one-token exact-row MoE runtime evidence")));
     for id in ["qwen25", "gemma2"] {
         assert!(body["planned_model_families"]
             .as_array()
@@ -338,7 +375,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(llama3["latest_checked_output"], "CMLD-204");
     let llama3_evidence = llama3["evidence"].as_str().unwrap();
     assert!(llama3_evidence.contains("checked 512/1024/2048-context packs"));
-    assert!(llama3_evidence.contains("current-head 1024/2048 pass"));
+    assert!(llama3_evidence.contains("published source/runtime-head 1024/2048 pass"));
     assert!(llama3_evidence.contains("retained-block lazy-Q8 hot-path cost probes"));
     let llama3_next_step = llama3["next_step"].as_str().unwrap();
     assert!(llama3_next_step.contains("checked 512/1024/2048 context support"));
@@ -401,19 +438,30 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "mixtral_8x7b_instruct_v0_1_q8_0")
         .unwrap();
-    assert_eq!(mixtral["status"], "supported_exact_row_smoke");
+    assert_eq!(mixtral["status"], "active_validation_partial_runtime");
     assert_eq!(
         mixtral["support_scope"],
-        "validated_exact_row_short_prompt_moe_api_webui_runtime_only"
+        "exact_row_bounded_moe_runtime_only"
     );
     assert_eq!(
         mixtral["generation_runs"],
-        "api_completion_and_chat_smoke_plus_6prompt_5token_parity"
+        "bounded_one_token_runtime_smoke_observed"
     );
-    assert_eq!(mixtral["frontend_load_path_verified"], "validated");
+    assert_eq!(
+        mixtral["frontend_load_path_verified"],
+        "fail_closed_partial_runtime_only"
+    );
+    assert_eq!(
+        mixtral["latest_checked_bucket"],
+        "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511"
+    );
     assert_eq!(
         mixtral["latest_checked_result"],
-        "pass_exact_row_short_prompt_api_webui_rss_manifest"
+        "blocked_later_generation_divergence"
+    );
+    assert_eq!(
+        mixtral["latest_checked_output"],
+        "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md"
     );
     assert!(mixtral["evidence"]
         .as_str()
@@ -422,11 +470,15 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
-        .contains("Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf"));
+        .contains("Gate 9A 50-token evidence diverged at generated token index 9"));
     assert!(mixtral["evidence"]
         .as_str()
         .unwrap()
-        .contains("mixtral-8x7b-v0.1-q8-manifest-checksum-20260511"));
+        .contains("backend HTTP hang"));
+    assert!(mixtral["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("No broad Mixtral"));
 
     for (id, filename) in [
         ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
@@ -1333,6 +1385,124 @@ async fn generation_session_without_max_tokens_uses_remaining_context() {
     let max_tokens = body["max_tokens"].as_u64().unwrap();
     assert_eq!(prompt_tokens + max_tokens, 64);
     assert!(max_tokens > 16);
+}
+
+#[tokio::test]
+async fn public_chat_completion_without_max_tokens_uses_demo_safe_default_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-generation-public-default-max.gguf");
+    write_generation_gguf_with_options(
+        &path,
+        GenerationFixtureOptions {
+            context_length: 1024,
+            include_tokenizer: true,
+            truncate_payload: false,
+        },
+    );
+
+    let app = camelid::api::router();
+    let load_body = serde_json::json!({"path": path, "id": "tiny-generation-public-default-max"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-generation-public-default-max","messages":[{"role":"user","content":"hello"}],"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_bytes)
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["usage"]["completion_tokens"], 800);
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
+}
+
+#[tokio::test]
+async fn public_completion_without_max_tokens_uses_remaining_context_when_below_demo_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("tiny-generation-public-short-context-default-max.gguf");
+    write_generation_gguf_with_options(
+        &path,
+        GenerationFixtureOptions {
+            context_length: 64,
+            include_tokenizer: true,
+            truncate_payload: false,
+        },
+    );
+
+    let app = camelid::api::router();
+    let load_body =
+        serde_json::json!({"path": path, "id": "tiny-generation-public-short-context-default-max"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-generation-public-short-context-default-max","prompt":"hello","stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_bytes)
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    let prompt_tokens = body["usage"]["prompt_tokens"].as_u64().unwrap();
+    let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap();
+    assert_eq!(prompt_tokens + completion_tokens, 64);
+    assert!(completion_tokens < 800);
+    assert_eq!(body["choices"][0]["finish_reason"], "length");
 }
 
 #[tokio::test]

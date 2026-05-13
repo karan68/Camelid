@@ -24,10 +24,16 @@ export function isRunnableModel(model) {
   return Boolean(hasLocalModelPath(model) && isModelLoadedNow(model) && isModelGenerationReady(model))
 }
 
+export function modelRuntimeIdMatches(model, runtime) {
+  const activeModelId = runtime?.active_model_id
+  if (!model || !activeModelId) return false
+  return activeModelId === model.id || activeModelId === model.runtime_model_name
+}
+
 export function isRunnableInCurrentRuntime(model, runtime) {
   if (!isRunnableModel(model)) return false
   if (isExternalModel(model)) return Boolean(runtime?.generation_ready)
-  return Boolean(runtime?.generation_ready && runtime?.active_model_id === model.id)
+  return Boolean(runtime?.generation_ready && modelRuntimeIdMatches(model, runtime))
 }
 
 export function canLoadIntoRuntime(model) {

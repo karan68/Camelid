@@ -129,6 +129,11 @@ function App() {
     [conversations, pendingDeleteConversationId],
   )
 
+  const selectedConversationPreview = useMemo(() => {
+    const latestMessage = [...(selectedConversation?.messages || [])].reverse().find((message) => typeof message?.content === 'string' && message.content.trim() && !message.content.startsWith('Conversation created.'))
+    return latestMessage?.content || ''
+  }, [selectedConversation])
+
   const pendingDeleteMessagePreview = useMemo(() => {
     if (!pendingDeleteConversation) return ''
     const latestMessage = [...(pendingDeleteConversation.messages || [])].reverse().find((message) => typeof message?.content === 'string' && message.content.trim())
@@ -223,7 +228,7 @@ function App() {
         tab={tab}
         setTab={setTab}
         filteredConversations={filteredConversations}
-        selectedConversation={selectedConversation}
+        selectedConversationId={selectedConversation?.id || null}
         setSelectedConversationId={setSelectedConversationId}
         deleteConversation={requestDeleteConversation}
         renameConversation={renameConversation}
@@ -233,7 +238,9 @@ function App() {
         <TopBar
           tab={tab}
           setTab={setTab}
-          selectedConversation={selectedConversation}
+          selectedConversationTitle={selectedConversation?.title || ''}
+          selectedConversationUpdatedAt={selectedConversation?.updated_at || ''}
+          selectedConversationPreview={selectedConversationPreview}
           runtime={runtime}
           capabilities={dashboard?.capabilities}
           theme={theme}

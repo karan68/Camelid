@@ -2,14 +2,16 @@
 
 Date: 2026-05-04
 
-The approved Ubuntu validation lane is reopened for Camelid promotion-grade exact-row runtime evidence. Do not publish private host addresses, SSH commands, key paths, or local operator-only details in the public repo.
+Superseded current-operator status: Tim paused the Ubuntu validation lane again on 2026-05-12. Use `qa/validation-notes/2026-05-12-local-only-validation-lane-paused.md` for current execution posture; this file remains historical evidence-lane context only.
+
+The approved Ubuntu validation lane was reopened for Camelid promotion-grade exact-row runtime evidence on 2026-05-04. Do not publish private host addresses, SSH commands, key paths, or local operator-only details in the public repo.
 
 Execution guardrails:
 
 - Use clean public `main` checkouts for new validation runs.
 - Preserve existing dirty remote worktrees; do not reset or overwrite them just to run current-head validation.
 - Use `scripts/with-rustup-cargo.sh` or an equivalent rustup-managed toolchain on Ubuntu hosts whose distro `/usr/bin/cargo` is too old for the checked-in Rust floor.
-- Generate full-support scaffolds on the reopened lane with `node scripts/prepare-full-support-bundle.mjs ...`; if Tim pauses the lane again, pass `--validation-host-status blocked_by_operator_shutdown` so generated runtime commands remain blocked.
+- Generate full-support scaffolds with `node scripts/prepare-full-support-bundle.mjs ...`; while the 2026-05-12 pause is active, keep the default `blocked_by_operator_shutdown` status so generated runtime commands remain blocked.
 - Keep claims exact-row only. A reopened host is not evidence; only passing artifacts can move docs, API, or frontend language.
 
 Current promotion posture:

@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
+import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
+import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { isExternalModel, isRunnableModel } from '../lib/modelState'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
@@ -12,7 +14,7 @@ const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
 const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system'])
-const DEFAULT_API_BASE = import.meta.env.VITE_CAMELID_API_BASE || 'http://127.0.0.1:8181'
+const DEFAULT_API_BASE = import.meta.env?.VITE_CAMELID_API_BASE || 'http://127.0.0.1:8181'
 
 function getInitialTab() {
   if (typeof window === 'undefined') return 'chat'
@@ -84,81 +86,6 @@ function getLoadedModelQuantLabel(model) {
   return quantLabelFromGgufFileType(fileType) || `file_type ${fileType}`
 }
 
-function extractSseEvents(buffer) {
-  const normalized = String(buffer || '').replace(/\r\n/g, '\n')
-  const parts = normalized.split('\n\n')
-  return {
-    events: parts.slice(0, -1),
-    remainder: parts.at(-1) || '',
-  }
-}
-
-async function readStreamingChatCompletion(response, onDelta) {
-  if (!response.ok) {
-    let detail = null
-    try {
-      detail = await response.json()
-    } catch {
-      // Fall through to generic response status below.
-    }
-    const message = detail?.error?.message || detail?.message || `Request failed with HTTP ${response.status}`
-    const error = new Error(message)
-    error.payload = detail
-    throw error
-  }
-
-  const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null }
-  const decoder = new TextDecoder()
-  let buffer = ''
-  let content = ''
-  let finishReason = null
-  let completionTokens = 0
-  const streamStartedAt = performance.now()
-  let firstContentMs = null
-
-  const consumeEvent = (eventText) => {
-    const dataLines = eventText
-      .split('\n')
-      .filter((line) => line.startsWith('data:'))
-      .map((line) => line.slice(5).trimStart())
-    for (const data of dataLines) {
-      if (!data || data === '[DONE]') continue
-      let chunk = null
-      try {
-        chunk = JSON.parse(data)
-      } catch {
-        continue
-      }
-      const choice = chunk?.choices?.[0]
-      const delta = choice?.delta?.content ?? choice?.text ?? ''
-      if (delta) {
-        completionTokens += 1
-        if (firstContentMs === null) firstContentMs = performance.now() - streamStartedAt
-        content += delta
-        onDelta(delta, content, {
-          completionTokens,
-          elapsedMs: performance.now() - streamStartedAt,
-          firstContentMs,
-        })
-      }
-      if (choice?.finish_reason) finishReason = choice.finish_reason
-    }
-  }
-
-  for (;;) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    const { events, remainder } = extractSseEvents(buffer)
-    events.forEach(consumeEvent)
-    buffer = remainder
-  }
-  buffer += decoder.decode()
-  if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
-  return { content, finishReason, completionTokens, firstContentMs }
-}
-
 function estimateTokenCount(value) {
   const text = String(value || '').trim()
   if (!text) return 0
@@ -170,6 +97,24 @@ function estimateChatTokenCount(messages) {
   return (messages || []).reduce((total, message) => (
     total + estimateTokenCount(message?.role) + estimateTokenCount(message?.content) + 3
   ), 0)
+}
+
+const CODE_FIRST_SYSTEM_PROMPT = 'begin immediately with complete runnable code. No intro. Output one self-contained file unless the user asks otherwise. For Python, start exactly with ```python, include imports, and close the fence after the complete script. For Python games, prefer tkinter from the standard library over pygame, keep it compact, and include a complete runnable event loop. For HTML output ONE self-contained file. Never use external files or script src. Include inline <style> and inline <script> with working click/game logic before </body>. Start exactly with ```html then <!doctype html> and close the fence after </html>.'
+const LOCAL_CHAT_DEMO_MAX_TOKENS = 800
+
+function looksLikeCodePrompt(value) {
+  const text = String(value || '').toLowerCase()
+  return /\b(code|build|create|implement|write|make)\b/.test(text)
+    && /\b(html|html5|css|javascript|js|python|py|pygame|game|pacman|pacmac|tetris|app|component|page|website)\b/.test(text)
+}
+
+function applyLocalChatPolicy(messages) {
+  const lastUser = [...(messages || [])].reverse().find((message) => message.role === 'user')
+  if (!looksLikeCodePrompt(lastUser?.content)) return messages
+  return [
+    { role: 'system', content: CODE_FIRST_SYSTEM_PROMPT },
+    ...messages,
+  ]
 }
 
 function tokensPerSecond(tokens, elapsedMs) {
@@ -199,35 +144,6 @@ function normalizeEngineName(value) {
   const engine = optionalString(value)?.toLowerCase()
   if (!engine || engine === 'backendinference' || engine === 'backend inference') return 'camelid'
   return engine
-}
-
-function cleanLegacyDemoCapCopy(value) {
-  if (typeof value !== 'string') return value
-  return value
-    .replace(/\s*\(demo cap\)/gi, '')
-    .replace(/\s*·\s*raw\s+16-token-cap\s+local\s+run;\s*inspect\s+before\s+trusting\s+polish/gi, ' · raw local run')
-    .replace(/\s*Longer-generation\s+polish\s+still\s+needs\s+separate\s+validation\.?/gi, '')
-    .replace(/\s*Longer\s+generation\s+is\s+not\s+polished\s+yet\.?/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
-}
-
-function normalizeStoredMessage(message) {
-  if (!message || typeof message !== 'object') return message
-  const { demo_token_cap: _demoTokenCap, ...rest } = message
-  return {
-    ...rest,
-    content: cleanLegacyDemoCapCopy(rest.content),
-  }
-}
-
-function normalizeStoredConversations(records) {
-  return (Array.isArray(records) ? records : []).map((conversation) => ({
-    ...conversation,
-    messages: Array.isArray(conversation?.messages)
-      ? conversation.messages.map(normalizeStoredMessage)
-      : [],
-  }))
 }
 
 function normalizeLocalModelStatus(status) {
@@ -364,7 +280,7 @@ function getErrorMessage(error, fallback = 'Request failed.') {
 }
 
 function getBackendErrorCode(error) {
-  return error?.body?.error?.code || error?.error?.code || ''
+  return error?.body?.error?.code || error?.payload?.error?.code || error?.error?.code || error?.code || ''
 }
 
 function isTypedUnsupportedBackendError(code, message) {
@@ -451,10 +367,30 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [registerForm, setRegisterForm] = useState({ id: '', name: '', model_path: '', runtime_model_name: '' })
   const [externalForm, setExternalForm] = useState({ id: '', name: '', source: 'Hosted API', api_base: 'https://api.example/v1', api_key: '', model_name: '' })
   const [localModels, setLocalModels] = useState(() => readJsonStorage(LOCAL_MODELS_STORAGE_KEY, []).map(normalizeLocalModelRecord).filter(Boolean))
-  const [localConversations, setLocalConversations] = useState(() => normalizeStoredConversations(readJsonStorage(CONVERSATIONS_STORAGE_KEY, [])))
+  const [localConversations, setLocalConversations] = useState(() => normalizeStoredConversations(readJsonStorage(CONVERSATIONS_STORAGE_KEY, []), { clearStaleStreaming: true }))
   const [localMemories, setLocalMemories] = useState(() => readJsonStorage(MEMORIES_STORAGE_KEY, []))
 
+  const localModelsRef = useRef(localModels)
+  const localConversationsRef = useRef(localConversations)
+  const localMemoriesRef = useRef(localMemories)
+
+  useEffect(() => {
+    localModelsRef.current = localModels
+  }, [localModels])
+
+  useEffect(() => {
+    localConversationsRef.current = localConversations
+  }, [localConversations])
+
+  useEffect(() => {
+    localMemoriesRef.current = localMemories
+  }, [localMemories])
+
   const normalizedApiBase = normalizeApiBase(apiBase)
+  const updateConversationsState = (updater) => {
+    setLocalConversations((current) => normalizeStoredConversations(typeof updater === 'function' ? updater(current) : updater))
+  }
+
   const persistConversations = (updater) => {
     setLocalConversations((current) => {
       const next = normalizeStoredConversations(typeof updater === 'function' ? updater(current) : updater)
@@ -483,6 +419,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   const loadDashboard = async ({ silent = false, localModelsOverride = null } = {}) => {
     try {
+      const currentLocalModels = localModelsOverride || localModelsRef.current
+      const currentLocalConversations = localConversationsRef.current
+      const currentLocalMemories = localMemoriesRef.current
       const [health, modelList, capabilities] = await Promise.all([
         fetchJson(`${normalizedApiBase}/v1/health`),
         fetchJson(`${normalizedApiBase}/v1/models`),
@@ -496,7 +435,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         modelItems,
         health,
         currentModel,
-        localModels: localModelsOverride || localModels,
+        localModels: currentLocalModels,
         apiBase: normalizedApiBase,
       })
       const nextDashboard = makeDashboard({
@@ -504,28 +443,34 @@ export function useDashboardData({ showNotice, clearNotice }) {
         models: nextModels,
         currentModel,
         capabilities,
-        conversations: localConversations,
-        memories: localMemories,
+        conversations: currentLocalConversations,
+        memories: currentLocalMemories,
         apiBase: normalizedApiBase,
       })
       setDashboard(nextDashboard)
       if (!silent) clearNotice()
       setSelectedConversationId((current) => {
         if (current === NEW_CHAT_SENTINEL) return current
-        if (!localConversations.length) return null
-        if (current && localConversations.some((conversation) => conversation.id === current)) return current
-        return localConversations[0]?.id || null
+        if (!currentLocalConversations.length) return null
+        if (current && currentLocalConversations.some((conversation) => conversation.id === current)) return current
+        return currentLocalConversations[0]?.id || null
       })
       setSelectedModelId((current) => {
         if (!nextModels.length) return ''
         const currentModel = current ? nextModels.find((model) => model.id === current) : null
         const activeModel = health?.active_model_id ? nextModels.find((model) => model.id === health.active_model_id) : null
+        const activeModelRunnable = activeModel && isRunnableModel(activeModel)
+        const currentModelRunnable = currentModel && isRunnableModel(currentModel)
         const runnableModel = nextModels.find((model) => isRunnableModel(model)) || null
 
-        if (currentModel && isRunnableModel(currentModel)) return current
-        if (activeModel && currentModel?.id !== activeModel.id) return activeModel.id
+        // The chat API can only use the backend's active model. If a previous browser
+        // selection points at an inactive saved model, snap back to the runtime model
+        // instead of leaving the composer looking ready for the wrong row.
+        if (activeModelRunnable && current !== activeModel.id) return activeModel.id
+        if (currentModelRunnable) return current
+        if (activeModel) return activeModel.id
         if (currentModel) return current
-        return runnableModel?.id || activeModel?.id || nextModels[0]?.id || ''
+        return runnableModel?.id || nextModels[0]?.id || ''
       })
     } catch (error) {
       const fallbackDashboard = makeDashboard({
@@ -534,13 +479,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
           modelItems: [],
           health: { ok: false, engine: 'camelid', generation_ready: false, active_model_id: null },
           currentModel: null,
-          localModels: localModelsOverride || localModels,
+          localModels: localModelsOverride || localModelsRef.current,
           apiBase: normalizedApiBase,
         }),
         currentModel: null,
         capabilities: null,
-        conversations: localConversations,
-        memories: localMemories,
+        conversations: localConversationsRef.current,
+        memories: localMemoriesRef.current,
         apiBase: normalizedApiBase,
       })
       setDashboard(fallbackDashboard)
@@ -553,7 +498,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const interval = setInterval(() => loadDashboard({ silent: true }), 2500)
     return () => clearInterval(interval)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [normalizedApiBase, localConversations, localMemories, localModels])
+  }, [normalizedApiBase])
 
   useEffect(() => {
     if (typeof window === 'undefined' || !VALID_TABS.has(tab)) return
@@ -572,8 +517,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
     else window.localStorage.setItem(SELECTED_MODEL_STORAGE_KEY, selectedModelId)
   }, [selectedModelId])
 
-  const conversations = dashboard?.conversations || localConversations
-  const memories = dashboard?.memories || localMemories
+  const conversations = localConversations.length ? localConversations : dashboard?.conversations || []
+  const memories = localMemories.length ? localMemories : dashboard?.memories || []
   const models = dashboard?.models || []
   const runtime = dashboard?.runtime
 
@@ -661,13 +606,17 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
     const messageContent = composer.trim()
     setSending(true)
-    showNotice('Running Camelid local chat completion…', 'info')
     let activeConversationId = null
     let assistantId = null
+    let pendingAssistantPatch = null
+    let pendingAssistantFrame = null
 
     try {
       const conversation = await ensureConversation()
       activeConversationId = conversation.id
+      // Fresh chats start from the __new__ sentinel. Select the real conversation immediately
+      // so the main thread renders the same streaming message object as the sidebar preview.
+      setSelectedConversationId(conversation.id)
       const userMessage = { id: makeId('message'), role: 'user', content: messageContent, model_id: selectedModelId, created_at: nowIso() }
       setPendingChat({ conversationId: conversation.id, content: messageContent, modelId: selectedModelId })
       setComposer('')
@@ -676,7 +625,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .filter((message) => !message.content.startsWith('Conversation created.'))
         .map(({ role, content }) => ({ role, content }))
-      const promptTokenEstimate = estimateChatTokenCount(history)
+      const requestMessages = applyLocalChatPolicy(history)
+      const promptTokenEstimate = estimateChatTokenCount(requestMessages)
 
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -699,6 +649,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
         timings_ms: null,
         usage: null,
         streaming: true,
+        streaming_phase: 'preparing',
+        first_byte_ms: null,
+        first_event_ms: null,
+        first_content_ms: null,
       }
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -710,30 +664,68 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: selectedModelId, messages: history, temperature: 0, stream: true }),
+        body: JSON.stringify({ model: selectedModelId, messages: requestMessages, temperature: 0, max_tokens: LOCAL_CHAT_DEMO_MAX_TOKENS, stream: true }),
       })
-      const streamed = await readStreamingChatCompletion(response, (_delta, fullContent) => {
-        const liveElapsedMs = performance.now() - requestStartedAt
-        const liveCompletionTokens = estimateTokenCount(fullContent)
-        persistConversations((current) => current.map((item) => (
+      const applyAssistantStreamPatch = (patch) => {
+        updateConversationsState((current) => current.map((item) => (
           item.id === conversation.id
             ? {
                 ...item,
                 messages: (item.messages || []).map((message) => (
-                  message.id === assistantId
-                    ? {
-                        ...message,
-                        content: fullContent || '…',
-                        tokens_in_per_sec: null,
-                        tokens_out_per_sec: tokensPerSecond(liveCompletionTokens, liveElapsedMs),
-                      }
-                    : message
+                  message.id === assistantId ? { ...message, ...patch } : message
                 )),
                 updated_at: nowIso(),
               }
             : item
         )))
+      }
+      const flushAssistantStreamPatch = () => {
+        pendingAssistantFrame = null
+        if (!pendingAssistantPatch) return
+        const patch = pendingAssistantPatch
+        pendingAssistantPatch = null
+        applyAssistantStreamPatch(patch)
+      }
+      const markAssistantStreamState = (patch, { immediate = false } = {}) => {
+        if (immediate) {
+          pendingAssistantPatch = null
+          if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
+            window.cancelAnimationFrame(pendingAssistantFrame)
+            pendingAssistantFrame = null
+          }
+          applyAssistantStreamPatch(patch)
+          return
+        }
+        pendingAssistantPatch = { ...(pendingAssistantPatch || {}), ...patch }
+        if (pendingAssistantFrame === null && typeof window !== 'undefined') {
+          pendingAssistantFrame = window.requestAnimationFrame(flushAssistantStreamPatch)
+        }
+      }
+      if (response.ok && !response.headers.get('content-type')?.includes('application/json')) {
+        markAssistantStreamState({ streaming_phase: 'generating' }, { immediate: true })
+      }
+      const streamed = await readStreamingChatCompletion(response, (_delta, fullContent) => {
+        const liveElapsedMs = performance.now() - requestStartedAt
+        const liveCompletionTokens = estimateTokenCount(fullContent)
+        markAssistantStreamState({
+          content: fullContent || '…',
+          streaming_phase: 'streaming',
+          tokens_in_per_sec: null,
+          tokens_out_per_sec: tokensPerSecond(liveCompletionTokens, liveElapsedMs),
+        })
+      }, {
+        estimateTokenCount,
+        onStreamEvent(event) {
+          if (event.type === 'bytes' || event.type === 'role' || event.type === 'json_fallback') {
+            markAssistantStreamState({
+              streaming_phase: 'generating',
+              first_byte_ms: event.firstByteMs ?? null,
+              first_event_ms: event.firstEventMs ?? null,
+            }, { immediate: true })
+          }
+        },
       })
+      flushAssistantStreamPatch()
       const elapsedMs = performance.now() - requestStartedAt
       const assistantMessage = {
         ...assistantMessageBase,
@@ -742,12 +734,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
         tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
         finish_reason: streamed.finishReason,
         elapsed_ms: elapsedMs,
-        usage: {
+        usage: streamed.usage || {
           prompt_tokens: promptTokenEstimate,
           completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
           total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
         },
         streaming: false,
+        streaming_phase: null,
+        first_byte_ms: streamed.firstByteMs ?? null,
+        first_event_ms: streamed.firstEventMs ?? null,
+        first_content_ms: streamed.firstContentMs ?? null,
       }
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
@@ -761,8 +757,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
           : item
       )))
       setSelectedConversationId(conversation.id)
-      showNotice('Camelid streamed the local reply.', 'success')
     } catch (error) {
+      const pendingPatchAtFailure = pendingAssistantPatch
+      if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
+        window.cancelAnimationFrame(pendingAssistantFrame)
+        pendingAssistantFrame = null
+      }
+      pendingAssistantPatch = null
       const errorMessage = getGuardrailErrorMessage(error, 'Local inference failed.')
       if (activeConversationId && assistantId) {
         persistConversations((current) => current.map((item) => (
@@ -771,12 +772,16 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 ...item,
                 messages: (item.messages || []).map((message) => (
                   message.id === assistantId
-                    ? {
-                        ...message,
-                        content: message.content && message.content !== '…' ? message.content : '(generation stopped)',
-                        finish_reason: 'error',
-                        streaming: false,
-                      }
+                    ? (() => {
+                        const patchedMessage = { ...message, ...(pendingPatchAtFailure || {}) }
+                        return {
+                          ...patchedMessage,
+                          content: patchedMessage.content && patchedMessage.content !== '…' ? patchedMessage.content : '(generation stopped)',
+                          finish_reason: 'error',
+                          streaming: false,
+                          streaming_phase: null,
+                        }
+                      })()
                     : message
                 )),
                 updated_at: nowIso(),

@@ -8,18 +8,24 @@ const outPath = args.get('out') ? resolve(args.get('out')) : null
 const strict = args.has('strict')
 
 const textExtensions = new Set(['.json', '.md', '.txt', '.log', '.tsv'])
+const textFilenames = new Set(['SHA256SUMS'])
 const findings = []
 
 const patterns = [
   {
-    id: 'ubuntu_home_path',
-    description: 'Ubuntu home/work path leaked into durable bundle content',
-    regex: /\/home\/[^/\n]+\/(?:work\/Camelid(?:-public-[^/\n]+)?|\.nvm\/versions\/node\/[^/\n]+\/bin\/node|models)\S*/g,
+    id: 'linux_home_path',
+    description: 'Linux home path leaked into durable bundle content',
+    regex: /(?:file:\/\/)?\/home\/[^/\s"']+\/[^\s"']*/g,
   },
   {
     id: 'mac_home_path',
     description: 'macOS home path leaked into durable bundle content',
     regex: /\/Users\/[^/\n]+\/[^"]*/g,
+  },
+  {
+    id: 'mac_mounted_volume_path',
+    description: 'macOS mounted-volume path leaked into durable bundle content',
+    regex: /\/Volumes\/[^/\n]+\/[^"]*/g,
   },
   {
     id: 'ipv4_literal',
@@ -109,6 +115,7 @@ async function scanFile(fullPath) {
 }
 
 function hasTextExtension(name) {
+  if (textFilenames.has(name)) return true
   const dot = name.lastIndexOf('.')
   return dot >= 0 && textExtensions.has(name.slice(dot).toLowerCase())
 }

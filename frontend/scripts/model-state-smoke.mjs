@@ -18,6 +18,7 @@ import {
   getTrackedCompatibilityTargets,
   guardedCapabilityCopy,
   isCompatibilitySupportedForModel,
+  isExactCompatibilityHint,
   isGuardedCapabilityStatus,
   isSupportedCapabilityStatus,
   quantLabelFromGgufFileType,
@@ -35,6 +36,7 @@ import {
   isModelLoadedNow,
   isRunnableInCurrentRuntime,
   isRunnableModel,
+  modelRuntimeIdMatches,
 } from '../src/lib/modelState.js'
 
 import { getChatGateState } from '../src/lib/chatGate.js'
@@ -57,6 +59,10 @@ assert.equal(isRunnableModel(localLoadedReady), true)
 assert.equal(isRunnableInCurrentRuntime(localLoadedReady, { active_model_id: 'tiny-generation', generation_ready: true }), true)
 assert.equal(isRunnableInCurrentRuntime(localLoadedReady, { active_model_id: 'other-model', generation_ready: true }), false, 'a local model is not runnable for chat if a different model is active in Camelid')
 assert.equal(isRunnableInCurrentRuntime(localLoadedReady, { active_model_id: 'tiny-generation', generation_ready: false }), false, 'loaded_now alone is not enough without runtime generation_ready=true')
+const localReadyWithRuntimeName = { ...localLoadedReady, id: 'browser-alias', runtime_model_name: 'backend-runtime-id' }
+assert.equal(modelRuntimeIdMatches(localReadyWithRuntimeName, { active_model_id: 'backend-runtime-id' }), true, 'API/support readiness should accept the backend runtime model id when it differs from the browser alias')
+assert.equal(isRunnableInCurrentRuntime(localReadyWithRuntimeName, { active_model_id: 'backend-runtime-id', generation_ready: true }), true, 'runtime-name matches keep chat/API gating tied to the exact loaded backend row')
+assert.equal(getChatGateState({ model_compatibility: [] }, localReadyWithRuntimeName, { active_model_id: 'backend-runtime-id', loaded_now: true, generation_ready: true }).runtimeReady, true, 'chat gate runtime readiness should use the same runtime id matcher as the API view')
 assert.equal(getModelStatusLabel(localLoadedReady), 'Loaded + generation-ready')
 assert.match(describeModelState(localLoadedReady), /generation_ready=true/)
 
@@ -128,10 +134,13 @@ assert.equal(quantLabelFromGgufFileType('15'), 'Q4_K_M')
 assert.equal(quantLabelFromGgufFileType(32), 'BF16')
 assert.equal(quantLabelFromGgufFileType('unknown'), null)
 assert.equal(isSupportedCapabilityStatus('supported_current_gate'), true)
+assert.equal(isSupportedCapabilityStatus('validated'), false, 'validated evidence must not be treated as a support status')
+assert.equal(isSupportedCapabilityStatus('measured'), false, 'measurement evidence must not be treated as a support status')
 assert.equal(isGuardedCapabilityStatus('future'), true)
 assert.equal(capabilityStatusTone('blocked_until_tensor_load_and_parity'), 'warm')
 assert.equal(capabilityStatusTone('groundwork_backend_evidence_only'), 'warm')
 assert.equal(capabilityStatusTone('blocked_unsupported_bringup'), 'warm')
+assert.equal(capabilityStatusTone('validated_second_pack'), 'ready')
 assert.equal(capabilityStatusTone('validated_bounded_pack_not_promoted'), 'warm')
 assert.equal(capabilityStatusTone('fail-closed_until_promotion'), 'warm')
 assert.equal(capabilityStatusTone('supported_exact_row_smoke'), 'ready')
@@ -150,8 +159,8 @@ const capabilityFixture = {
     { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '1B exact-row load, completion, chat, frontend smoke, second 1024-context evidence, and third 2048-context evidence after the RoPE factor fix' },
     { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, and third 2048-context evidence' },
     { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond the checked 512/1024/2048 packs, arbitrary templates, throughput, portability, repeated current-head evidence, and durable normalized full-support bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', bounded_context_512_pack: 'validated_first_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, checked 512/1024/2048-context packs, compact template-shapes pack evidence, bounded memory/hot-path measurements, and current-head 1024/2048 PASS evidence. No model-native/larger context or broader/full support is implied.' },
-    { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'active_validation_unsupported', support_scope: 'bringup_exact_row_unsupported', full_support_status: 'blocked_unsupported_bringup', full_support_blockers: 'source/SHA/license, exact tokenizer/template references, 1-token generation parity, bounded load/readiness, API/WebUI, RSS/timing, scrubbed manifest, checksums, and durable row-specific bundle evidence are not complete as promotion evidence', evidence: 'Mistral v0.3 active validation only; exact support-promotion evidence remains fail-closed' },
-    { id: 'mixtral_8x7b_instruct_v0_1_q8_0', family: 'mixtral', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'validated_exact_row_short_prompt_moe_api_webui_runtime_only', full_support_status: 'blocked_beyond_checked_exact_row_envelope', full_support_blockers: 'model-native/larger context, arbitrary templates, production throughput, portability, neighboring rows, and broader prompt/context coverage still require separate evidence', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', evidence: 'Mixtral exact-row supported for short-prompt MoE/API/WebUI/RSS envelope; manifest/checksum and scrub checks passed' },
+    { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'active_validation_unsupported', support_scope: 'bringup_exact_row_unsupported', full_support_status: 'blocked_unsupported_bringup', full_support_blockers: 'API/WebUI readiness, RSS/timing, current-head promotion sync, scrubbed manifest posture, support-surface proof, and durable promotion bundle evidence remain incomplete; exact tokenizer/template references plus row-specific 1-token/bounded/broader parity evidence alone do not promote support', evidence: 'Mistral v0.3 active validation only; exact tokenizer/template, 1-token, broader 50-token, and bounded context evidence are green but support-promotion evidence remains fail-closed' },
+    { id: 'mixtral_8x7b_instruct_v0_1_q8_0', family: 'mixtral_moe', quantization: 'Q8_0', status: 'active_validation_partial_runtime', support_scope: 'exact_row_bounded_moe_runtime_only', full_support_status: 'blocked_later_generation_divergence', full_support_blockers: 'later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing', frontend_readiness_gate: 'fail-closed for broad readiness: exact row may be described only as bounded one-token backend runtime evidence until later-generation parity and API/WebUI gates close', evidence: 'Mixtral bounded one-token backend MoE runtime evidence only; later-generation divergence keeps frontend/API/WebUI support blocked' },
     { id: 'qwen25_7b_instruct_q8_0', family: 'qwen2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'qwen2 runtime, tokenizer/pre-tokenizer fixtures, ChatML parity, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Qwen 2.5 planning row only; no support evidence exists' },
     { id: 'gemma2_9b_it_q8_0', family: 'gemma2', quantization: 'Q8_0', status: 'planned_unsupported', support_scope: 'future_exact_row_planning_only', full_support_status: 'not_applicable_until_runtime_support', full_support_blockers: 'gemma2 runtime, control-token/template fixtures, bounded load/readiness, API/WebUI, RSS/timing, context, and durable bundle evidence are missing', evidence: 'Gemma 2 planning row only; no support evidence exists' },
   ],
@@ -218,6 +227,7 @@ assert.deepEqual(
 const tinyQ8Hint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q8_0' })
 assert.equal(tinyQ8Hint.target.id, 'tinyllama_1_1b_chat_q8_0')
 assert.equal(compatibilityHintLabel(tinyQ8Hint), 'tinyllama_1_1b_chat_q8_0: supported current gate')
+assert.equal(isExactCompatibilityHint(tinyQ8Hint), true, 'TinyLlama support should come from its exact row, not a broad family row')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q8_0' }), true)
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'file_type 7' }), true, 'GGUF file_type labels should map to exact quant rows')
 const tinyNoQuantHint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat' })
@@ -225,9 +235,11 @@ assert.equal(tinyNoQuantHint.kind, 'quant_missing', 'TinyLlama current gate stil
 assert.equal(compatibilityHintLabel(tinyNoQuantHint), 'tinyllama_1_1b_chat_q8_0: quant not verified')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'TinyLlama 1.1B Chat' }), false, 'chat should not unlock from a family/name match without quant evidence')
 const tinyKQuantHint = findCompatibilityHint(capabilityFixture, { name: 'TinyLlama 1.1B Chat', quant: 'Q4_K_M' })
+assert.equal(tinyKQuantHint.kind, 'family', 'TinyLlama K-quant should be shown as a guarded family row, not exact-row evidence')
 assert.equal(tinyKQuantHint.target.id, 'llama_spm_q4_k_q5_k', 'TinyLlama family names must not inherit Q8 support for a K-quant entry')
 assert.equal(compatibilityHintLabel(tinyKQuantHint), 'llama_spm_q4_k_q5_k: planned phase 10')
-assert.match(compatibilityHintCopy(tinyKQuantHint), /runtime generation still requires loaded_now=true and generation_ready=true/)
+assert.equal(isExactCompatibilityHint(tinyKQuantHint), false)
+assert.match(compatibilityHintCopy(tinyKQuantHint), /not chat-ready support|concrete exact compatibility row/)
 const llama3Q4Hint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'Q4_K_M' })
 assert.equal(llama3Q4Hint.kind, 'quant_mismatch')
 assert.match(compatibilityHintCopy(llama3Q4Hint), /Do not inherit the supported gate|wait for an exact COMPATIBILITY\.md row/)
@@ -311,12 +323,20 @@ const evidenceOnly1BGate = getChatGateState(evidenceOnly1BFixture, { ...localLoa
 assert.equal(evidenceOnly1BGate.runtimeReady, true, 'runtime readiness should be visible even for evidence-only rows')
 assert.equal(evidenceOnly1BGate.contractSupported, false, 'evidence-only rows are not exact supported rows')
 assert.equal(evidenceOnly1BGate.chatUnlocked, false, 'WebUI chat must remain blocked unless runtime readiness and an exact supported compatibility row both pass')
+const validatedOnly1BFixture = {
+  ...capabilityFixture,
+  model_compatibility: capabilityFixture.model_compatibility.map((row) => row.id === 'llama32_1b_instruct_q8_0' ? { ...row, status: 'validated' } : row),
+}
+const validatedOnly1BGate = getChatGateState(validatedOnly1BFixture, { ...localLoadedReady, id: 'llama32-1b', name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' }, { active_model_id: 'llama32-1b', loaded_now: true, generation_ready: true })
+assert.equal(validatedOnly1BGate.contractSupported, false, 'validated rows are evidence boundaries only, not support statuses')
+assert.equal(validatedOnly1BGate.chatUnlocked, false, 'WebUI chat must not unlock from a generic validated row status')
 const mistralExactHint = findCompatibilityHint(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' })
 assert.equal(mistralExactHint.kind, 'compatibility', 'the future Mistral lane should identify only the exact v0.3 7B Instruct Q8_0 row')
 assert.equal(mistralExactHint.target.id, 'mistral_7b_instruct_v0_3_q8_0')
 assert.equal(mistralExactHint.target.status, 'active_validation_unsupported', 'Mistral exact-row matching must still advertise unsupported active-validation status')
 assert.equal(mistralExactHint.target.full_support_status, 'blocked_unsupported_bringup', 'Mistral exact-row matching must still advertise unsupported bring-up status')
-assert.match(mistralExactHint.target.full_support_blockers, /1-token generation parity|API\/WebUI|durable row-specific bundle/i, 'Mistral exact-row matching must carry its blocking evidence list')
+assert.match(mistralExactHint.target.full_support_blockers, /API\/WebUI readiness|RSS\/timing|current-head promotion sync|durable promotion bundle/i, 'Mistral exact-row matching must carry its remaining blocking evidence list')
+assert.doesNotMatch(mistralExactHint.target.full_support_blockers, /source\/SHA\/license|1-token generation parity .*not complete/i, 'Mistral exact-row matching must not mark already-green row-specific evidence as missing')
 assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' }), false, 'Mistral acceptance-target evidence must not unlock chat')
 assert.equal(
   getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'mistral-v03', name: 'Mistral-7B-Instruct-v0.3 Q8_0', quant: 'Q8_0' }, { active_model_id: 'mistral-v03', loaded_now: true, generation_ready: true }).chatUnlocked,
@@ -329,15 +349,15 @@ const mistralV02Hint = findCompatibilityHint(capabilityFixture, { name: 'Mistral
 assert.equal(mistralV02Hint.kind, 'family', 'Mistral v0.2 must not inherit the v0.3 exact-row lane')
 assert.match(compatibilityHintCopy(mistralV02Hint), /not chat-ready support|not support/i)
 const mixtralHint = findCompatibilityHint(capabilityFixture, { name: 'Mixtral-8x7B-Instruct-v0.1 Q8_0', quant: 'Q8_0' })
-assert.equal(mixtralHint.kind, 'compatibility', 'Mixtral should match only its exact supported row, not a Mistral exact-row match')
+assert.equal(mixtralHint.kind, 'compatibility', 'Mixtral should match only its exact active-validation row, not a Mistral exact-row match')
 assert.equal(mixtralHint.target.id, 'mixtral_8x7b_instruct_v0_1_q8_0')
-assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Mixtral-8x7B-Instruct-v0.1 Q8_0', quant: 'Q8_0' }), true)
+assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Mixtral-8x7B-Instruct-v0.1 Q8_0', quant: 'Q8_0' }), false)
 const mixtralNoQuantHint = findCompatibilityHint(capabilityFixture, { name: 'Mixtral-8x7B-Instruct-v0.1' })
 assert.equal(mixtralNoQuantHint.kind, 'quant_missing', 'Mixtral exact-row support must still require quant evidence')
 assert.equal(
   getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'mixtral-v01', name: 'Mixtral-8x7B-Instruct-v0.1 Q8_0', quant: 'Q8_0' }, { active_model_id: 'mixtral-v01', loaded_now: true, generation_ready: true }).chatUnlocked,
-  true,
-  'runtime-green Mixtral v0.1 exact Q8_0 row unlocks only after /api/capabilities promotes the exact row to supported',
+  false,
+  'runtime-green Mixtral v0.1 exact Q8_0 row stays blocked while /api/capabilities keeps it active-validation unsupported',
 )
 assert.equal(
   getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'mixtral-v01', name: 'Mixtral-8x7B-Instruct-v0.1 Q8_0', quant: 'Q8_0' }, { active_model_id: 'mixtral-v01', loaded_now: true, generation_ready: false }).chatUnlocked,
