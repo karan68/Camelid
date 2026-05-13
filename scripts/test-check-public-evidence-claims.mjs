@@ -10,6 +10,8 @@ const goodRoot = join(tempRoot, 'good')
 const badRoot = join(tempRoot, 'bad')
 const staleMixtralRoot = join(tempRoot, 'stale-mixtral')
 const privatePathRoot = join(tempRoot, 'private-path')
+const privateWindowsCachePath = ['file:///C:', 'Users', 'tim', 'AppData', 'Local', 'camelid', 'model.gguf'].join('/')
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 await writeBundle(goodRoot, { mutate: false })
 await writeSingleRowContextBundle(goodRoot, { mutate: false })
@@ -70,7 +72,10 @@ assert.notEqual(privatePath.status, 0, 'public evidence manifests must not expos
 assert.match(privatePath.stderr, /must not expose local\/private path .*\/Users\/timtoole\/\.openclaw\/workspace\/projects\/Camelid\/target\/private\/report\.json/)
 assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/localhost\/home\/tim\/\.cache\/camelid\/model\.gguf/)
 assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/localhost\/Volumes\/private-models\/llama\.gguf/)
-assert.match(privatePath.stderr, /must not expose local\/private path .*file:\/\/\/C:\/Users\/tim\/AppData\/Local\/camelid\/model\.gguf/)
+assert.match(
+  privatePath.stderr,
+  new RegExp(`must not expose local/private path .*${escapeRegExp(privateWindowsCachePath)}`),
+)
 assert.match(privatePath.stderr, /must not expose local\/private path .*\/private\/tmp\/camelid\/report\.json/)
 
 async function writePrivatePathEvidence(root) {
@@ -82,7 +87,7 @@ async function writePrivatePathEvidence(root) {
     raw_artifact: privateMacPath,
     nested: { model_uri: 'file://localhost/home/tim/.cache/camelid/model.gguf' },
     mounted_model: 'file://localhost/Volumes/private-models/llama.gguf',
-    windows_cache: 'file:///C:/Users/tim/AppData/Local/camelid/model.gguf',
+    windows_cache: privateWindowsCachePath,
     private_tmp: '/private/tmp/camelid/report.json',
   }, null, 2)}\n`)
 }
