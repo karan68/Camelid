@@ -62,6 +62,7 @@ function sanitizeText(input) {
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/target\//g, 'target/')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/frontend\/scripts\/smoke\.mjs/g, 'frontend/scripts/smoke.mjs')
     .replace(/\/home\/[^/]+\/work\/Camelid[^/]*\/scripts\/summarize-generation-timings\.mjs/g, 'scripts/summarize-generation-timings.mjs')
+    .replace(/\/home\/[^/]+\/work\/llama\.cpp\/build\/bin\//g, '$CAMELID_LLAMA_CPP_BIN/')
     .replace(/\/home\/[^/]+\/work\/Camelid[^\s"]*/g, '$CAMELID_WORKTREE')
     .replace(/\/home\/[^/]+\/\.nvm\/versions\/node\/[^/]+\/bin\/node/g, 'node')
     .replace(/\/home\/[^/]+\/models\//g, '$CAMELID_MODEL_DIR/')
@@ -71,7 +72,7 @@ function sanitizeText(input) {
 }
 
 function isSanitizedTextExtension(ext) {
-  return ext === '.md' || ext === '.txt' || ext === '.log' || ext === '.tsv'
+  return ext === '.md' || ext === '.txt' || ext === '.log' || ext === '.tsv' || ext === '.status'
 }
 
 async function writeSha256Sums(rootDir) {
