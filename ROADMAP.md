@@ -64,7 +64,7 @@ Protect the supported lanes and clear the next blocker before widening claims.
 
 Promote only what can be defended row by row.
 
-- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mixtral 8x7B Instruct** is now exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope; current work is continuation/long-generation hardening, where the exact prompt-token continuation path is being tightened but the public claim does not widen until separate long-context and broader-prompt evidence is green.
+- Close the active next-model bring-up set as exact-row evidence lanes first, never as family-wide support claims. **Mixtral 8x7B Instruct** currently has bounded one-token backend MoE runtime evidence only; Gate 9A later-generation divergence and the continuation backend HTTP hang block API/WebUI/frontend readiness and any support promotion until fixed and rerun.
 - Widen Llama 3.2 3B Q8_0 beyond short-chat smoke only if broader prompt/chat-template, memory/performance, API, and WebUI evidence all land.
 - Broaden quantization support beyond Q8_0 with tests, docs, and exact-row evidence.
 - Expand tokenizer and chat-template coverage for additional supported rows.

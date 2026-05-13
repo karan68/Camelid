@@ -728,7 +728,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         inference: true,
         streaming: true,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist; Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -751,7 +751,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B/3B Instruct Q8_0 rows and the exact Llama 3 8B Instruct Q8_0 row have checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
         ],
         planned_quantization: vec![
@@ -775,7 +775,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. Broader 50-token, compact chat-template-shapes, retained-block lazy-Q8 hot-path evidence, and the 8B 1024/2048 current-head bundle remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
         ],
         planned_model_families: vec![
@@ -791,8 +791,8 @@ fn capabilities_response() -> CapabilitiesResponse {
             },
             SupportItem {
                 id: "mixtral_moe",
-                status: "supported_exact_row_smoke_lane",
-                notes: "public readiness: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf is exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope. Top-k expert routing runs with lazy/file-backed rank-3 Q8 experts; prompt-token parity, six short-prompt 5-token parity, OpenAI-compatible API smoke, WebUI readiness, RSS/timing, and scrubbed manifest/checksum evidence are green. Continuation hardening now supports exact prompt-token replay for repro/debug work, but no neighboring row, broad family, long-context, arbitrary-template, production-throughput, or portability support is implied.",
+                status: "active_validation_partial_runtime",
+                notes: "public readiness: Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token exact-row MoE runtime evidence only. Top-k expert routing runs with lazy/file-backed rank-3 Q8 experts, but later Gate 9A 50-token evidence diverged at generated token index 9 and a longer-continuation backend call hung, so API/WebUI/frontend readiness and broad Mixtral support remain unsupported.",
             },
             SupportItem {
                 id: "qwen25",
@@ -948,7 +948,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 latest_checked_bucket: "llama3-context-2048-smoke-v1",
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-204",
-                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes. The current-head 1024/2048 pass is recorded at qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json with prompt-token, generated-token, and generated-text parity for CMLD-102 and CMLD-204. Camelid supports exact-row smoke plus the checked bounded packs for this row only; no model-native/larger context or broader/full support is implied",
+                evidence: "the exact tracked Llama 3 8B Instruct Q8_0 GGUF has compact prompt-token/1-token/5-token/50-token parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded-memory evidence, checked 512/1024/2048-context packs, one compact chat-template-shapes pack, and retained-block lazy-Q8 hot-path cost probes. The published source/runtime-head 1024/2048 pass / current-head 1024/2048 pass is recorded at qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json with prompt-token, generated-token, and generated-text parity for CMLD-102 and CMLD-204. Camelid supports exact-row smoke plus the checked bounded packs for this row only; no model-native/larger context or broader/full support is implied",
                 next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while collecting model-native/larger-context proof, broader/full-support, production-throughput, portability, arbitrary-template evidence, and repeated current-head evidence before any wider 8B claim",
             },
             ModelCompatibilityTarget {
@@ -1060,19 +1060,19 @@ fn capabilities_response() -> CapabilitiesResponse {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
                 family: "mixtral_moe",
                 quantization: "Q8_0",
-                status: "supported_exact_row_smoke",
-                support_scope: "validated_exact_row_short_prompt_moe_api_webui_runtime_only",
-                full_support_status: "blocked_beyond_checked_exact_row_envelope",
-                full_support_blockers: "model-native/larger context, arbitrary templates, production throughput, portability, neighboring rows, and broader prompt/context coverage still require separate evidence",
+                status: "active_validation_partial_runtime",
+                support_scope: "exact_row_bounded_moe_runtime_only",
+                full_support_status: "blocked_later_generation_divergence",
+                full_support_blockers: "later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing",
                 metadata_parses: "validated_sparse_header",
                 tokenizer_works: "validated_against_llama_cpp_reference",
                 tensors_load: "validated_lazy_file_backed_rank3_q8_experts",
-                generation_runs: "api_completion_and_chat_smoke_plus_6prompt_5token_parity",
-                parity_audited: "prompt_tokens_and_6_of_6_short_prompts_match",
-                performance_measured: "rss_timing_runtime_gate_passed",
-                frontend_load_path_verified: "validated",
-                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
-                tested_context: "short_prompt_5token_probe_plus_api_webui_smoke_only",
+                generation_runs: "bounded_one_token_runtime_smoke_observed",
+                parity_audited: "prompt_tokens_and_bounded_one_token_match_only",
+                performance_measured: "not_promoted",
+                frontend_load_path_verified: "fail_closed_partial_runtime_only",
+                frontend_readiness_gate: "fail-closed for broad readiness: exact row may be described only as bounded one-token backend runtime evidence until later-generation parity and API/WebUI gates close",
+                tested_context: "short_prompt_one_token_probe_only",
                 chat_template_renderer: "mixtral_instruct_v0_1_metadata_template_validated",
                 chat_template_shape_pack: "validated_reference_pack",
                 chat_template_shape_pack_id: "mixtral-instruct-v0.1-chat-template-pack-v1",
@@ -1085,11 +1085,11 @@ fn capabilities_response() -> CapabilitiesResponse {
                 bounded_context_2048_pack: "not_started",
                 bounded_context_2048_pack_id: "mixtral-context-2048-smoke-v1",
                 bounded_context_2048_window: 2048,
-                latest_checked_bucket: "mixtral_8x7b_q8_promotion_gates_20260511",
-                latest_checked_result: "pass_exact_row_short_prompt_api_webui_rss_manifest",
-                latest_checked_output: "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-manifest-checksum-20260511/summary.json",
-                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: scrubbed manifest/checksum size 49624262592 bytes and sha256 cdca4a8c09dfd722702f781d479695cda0d45e1bd1cd602ba1b6085ad921fc5f; sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights (selected-weight renormalization is now opt-in for probing) and lazy/file-backed Q8 experts; refreshed parity bundle qa/evidence-bundles/mixtral-8x7b-v0.1-q8-backend-parity-refresh-20260511 matched llama.cpp for Hello, What is 2+2?, Name a color., Say yes., Count to three., and Write OK. at max_tokens=5; API smoke qa/evidence-bundles/mixtral-8x7b-v0.1-q8-api-smoke-20260511, WebUI readiness qa/evidence-bundles/mixtral-8x7b-v0.1-q8-webui-readiness-20260511, RSS/timing qa/evidence-bundles/mixtral-8x7b-v0.1-q8-rss-timing-runtime-20260511, and manifest/checksum qa/evidence-bundles/mixtral-8x7b-v0.1-q8-manifest-checksum-20260511 all passed scrub checks. Continuation hardening adds exact prompt-token replay for repro/debug work, while qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 remains partial hardening evidence only. This supports only the validated exact row and checked short-prompt/API/WebUI/RSS envelope.",
-                next_step: "preserve exact-row support while adding separate long-context, broader prompt, production-throughput, portability, and repeated current-head evidence before widening any claim",
+                latest_checked_bucket: "mixtral_8x7b_q8_gate9a_50tok_divergence_20260511",
+                latest_checked_result: "blocked_later_generation_divergence",
+                latest_checked_output: "qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/README.md",
+                evidence: "exact row Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf: sparse-header metadata parses with llama.expert_count=8 and expert_used_count=2 plus rank-3 expert tensors; tokenizer/template prompts match llama.cpp reference pack fixtures/tokenizer/mixtral-8x7b-instruct-v0.1-reference-pack.json; MoE top-k expert routing runs with default full-router softmax weights and lazy/file-backed Q8 experts; bounded one-token backend MoE runtime evidence exists, but Gate 9A 50-token evidence diverged at generated token index 9 and qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511 records partial_failure plus a backend HTTP hang. No broad Mixtral, API/WebUI/frontend readiness, long-context, production, neighboring-row, or full-support claim is made.",
+                next_step: "fix later-generation divergence and rerun row-specific parity/API/WebUI/RSS evidence before any Mixtral support/readiness promotion",
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
@@ -3813,7 +3813,7 @@ mod tests {
     fn capabilities_report_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
         assert!(response.support_contract.current_gate.contains(
-            "Llama 3.2 1B/3B Q8_0 and Llama 3 8B Q8_0 have checked bounded 512/1024/2048 packs"
+            "Llama 3.2 1B/3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs"
         ));
         assert!(response
             .support_contract
@@ -3830,7 +3830,7 @@ mod tests {
             .find(|item| item.id == "Q8_0")
             .expect("Q8_0 row should stay advertised");
         assert!(q8.notes.contains(
-            "exact Llama 3.2 1B/3B Q8_0 rows and the exact Llama 3 8B Q8_0 row have checked bounded 512/1024/2048-context packs"
+            "exact Llama 3.2 1B/3B Instruct Q8_0 rows and the exact Llama 3 8B Instruct Q8_0 row have checked bounded 512/1024/2048-context packs"
         ));
         assert!(q8.notes.contains("where row-specific PASS artifacts exist"));
         assert!(!q8.notes.contains("8B 1024/2048 remain red"));
@@ -3843,7 +3843,10 @@ mod tests {
         assert!(llama_bpe.notes.contains(
             "exact Llama 3.2 1B/3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs"
         ));
-        assert!(llama_bpe.notes.contains("8B 1024/2048 current-head bundle"));
+        assert!(llama_bpe
+            .notes
+            .contains("published source/runtime-head 8B 1024/2048 PASS bundle"));
+        assert!(!llama_bpe.notes.contains("8B 1024/2048 current-head bundle"));
         assert!(!llama_bpe.notes.contains("8B 1024/2048 remain red"));
 
         let eight_b = response
@@ -3937,7 +3940,6 @@ mod tests {
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
-                "mixtral_8x7b_instruct_v0_1_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
             ])
         );
@@ -3954,6 +3956,7 @@ mod tests {
 
         for id in [
             "mistral_7b_instruct_v0_3_q8_0",
+            "mixtral_8x7b_instruct_v0_1_q8_0",
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
         ] {
@@ -3989,25 +3992,26 @@ mod tests {
             .iter()
             .find(|target| target.id == "mixtral_8x7b_instruct_v0_1_q8_0")
             .expect("Mixtral exact-row lane should stay visible");
-        assert_eq!(mixtral.status, "supported_exact_row_smoke");
-        assert_eq!(
-            mixtral.support_scope,
-            "validated_exact_row_short_prompt_moe_api_webui_runtime_only"
-        );
+        assert_eq!(mixtral.status, "active_validation_partial_runtime");
+        assert_eq!(mixtral.support_scope, "exact_row_bounded_moe_runtime_only");
         assert_eq!(
             mixtral.generation_runs,
-            "api_completion_and_chat_smoke_plus_6prompt_5token_parity"
+            "bounded_one_token_runtime_smoke_observed"
         );
-        assert_eq!(mixtral.frontend_load_path_verified, "validated");
+        assert_eq!(
+            mixtral.frontend_load_path_verified,
+            "fail_closed_partial_runtime_only"
+        );
         assert_eq!(
             mixtral.latest_checked_result,
-            "pass_exact_row_short_prompt_api_webui_rss_manifest"
+            "blocked_later_generation_divergence"
         );
-        assert!(mixtral.frontend_readiness_gate.contains("loaded_now=true"));
+        assert!(mixtral.frontend_readiness_gate.contains("fail-closed"));
         assert!(mixtral.evidence.contains("llama.expert_count=8"));
         assert!(mixtral
             .evidence
-            .contains("mixtral-8x7b-v0.1-q8-manifest-checksum-20260511"));
+            .contains("Gate 9A 50-token evidence diverged at generated token index 9"));
+        assert!(mixtral.evidence.contains("No broad Mixtral"));
 
         let planned_rows = ["qwen25_7b_instruct_q8_0", "gemma2_9b_it_q8_0"];
 

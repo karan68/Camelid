@@ -16,11 +16,11 @@ Every public surface should tell the same four-row story:
 Next-family public language is locked to row-by-row evidence, not family-wide support:
 
 - Mistral 7B Instruct: “In active validation for `Mistral-7B-Instruct-v0.3.Q8_0.gguf`; not supported yet.”
-- Mixtral 8x7B Instruct: “Exact-row supported for the checked short-prompt MoE/API/WebUI/RSS envelope for `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`.”
+- Mixtral 8x7B Instruct: “Bounded one-token backend MoE runtime evidence exists for `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`; later-generation/API/WebUI/frontend readiness is blocked.”
 - Qwen 2.5 7B Instruct: “Planned exact-row candidate for `Qwen2.5-7B-Instruct-Q8_0.gguf`; not supported yet.”
 - Gemma 2 9B Instruct: “Planned exact-row candidate for `gemma-2-9b-it-Q8_0.gguf`; not supported yet.”
 
-First promotion for any unsupported row requires row-specific source/SHA/license, tokenizer/template references, bounded load/readiness, parity, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence. Mixtral has already cleared its checked exact-row short-prompt promotion gates; widening that claim still requires separate long-context, broader-prompt, throughput, portability, and repeated current-head evidence. The current long-generation continuation lane is hardening-only and does not widen support wording yet.
+First promotion for any unsupported row requires row-specific source/SHA/license, tokenizer/template references, bounded load/readiness, parity, API/WebUI, RSS/timing, scrubbed manifest, and checksum evidence. Mixtral has not cleared support promotion under the current blocker record: later-generation divergence and the continuation backend HTTP hang must be fixed before rerunning API/WebUI/RSS/frontend readiness. The current long-generation continuation lane is blocker work and does not widen support wording.
 
 | Change type | Minimum expected checks | Extra checks when relevant | Notes |
 | --- | --- | --- | --- |
