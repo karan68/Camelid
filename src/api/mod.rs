@@ -4130,9 +4130,10 @@ mod tests {
         assert!(response.support_contract.current_gate.contains(
             "Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with current-main API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs"
         ));
-        assert!(response.support_contract.current_gate.contains(
-            "Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs"
-        ));
+        assert!(response
+            .support_contract
+            .current_gate
+            .contains("Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs"));
         assert!(response
             .support_contract
             .current_gate
