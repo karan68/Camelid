@@ -5550,20 +5550,20 @@ fn gated_ffn_activation(
                 let gate_elapsed = total_elapsed / 2;
                 (gate_elapsed, total_elapsed - gate_elapsed)
             } else {
-                accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+                accumulate_two_q8_0_block_dot_quantized_cpu(
                     &quantized_input.blocks,
-                    gate_transposed,
+                    gate_transposed
+                        .q8_0_blocks
+                        .expect("q8_0 gate block-dot precondition checked"),
                     &mut gate,
-                );
-                let gate_elapsed = started.elapsed().as_micros();
-
-                let started = Instant::now();
-                accumulate_transposed_linear_row_q8_0_block_dot_quantized(
-                    &quantized_input.blocks,
-                    up_transposed,
+                    up_transposed
+                        .q8_0_blocks
+                        .expect("q8_0 up block-dot precondition checked"),
                     &mut up,
                 );
-                (gate_elapsed, started.elapsed().as_micros())
+                let total_elapsed = started.elapsed().as_micros();
+                let gate_elapsed = total_elapsed / 2;
+                (gate_elapsed, total_elapsed - gate_elapsed)
             }
         } else {
             let started = Instant::now();
@@ -5682,13 +5682,10 @@ fn try_gated_ffn_gate_up_hybrid_q8_0(
             gate_gpu_output,
             up_gpu_output,
             || {
-                accumulate_q8_0_block_dot_quantized_cpu(
+                accumulate_two_q8_0_block_dot_quantized_cpu(
                     quantized_input,
                     gate_cpu_weight_blocks,
                     gate_cpu_output,
-                );
-                accumulate_q8_0_block_dot_quantized_cpu(
-                    quantized_input,
                     up_cpu_weight_blocks,
                     up_cpu_output,
                 );
@@ -7972,6 +7969,60 @@ fn accumulate_q8_0_block_dot_quantized_cpu(
         let weight_start = out_idx * blocks_per_row;
         *out_value = q8_0_dot_rows(
             &weight_blocks[weight_start..weight_start + blocks_per_row],
+            quantized_input,
+        );
+    }
+}
+
+fn accumulate_two_q8_0_block_dot_quantized_cpu(
+    quantized_input: &[Q8_0Block],
+    first_weight_blocks: &[Q8_0Block],
+    first_output: &mut [f32],
+    second_weight_blocks: &[Q8_0Block],
+    second_output: &mut [f32],
+) {
+    let blocks_per_row = quantized_input.len();
+    debug_assert_eq!(first_output.len(), second_output.len());
+    debug_assert_eq!(
+        first_weight_blocks.len(),
+        first_output.len() * blocks_per_row
+    );
+    debug_assert_eq!(
+        second_weight_blocks.len(),
+        second_output.len() * blocks_per_row
+    );
+    if should_parallelize_linear_output(first_output.len()) {
+        first_output
+            .par_iter_mut()
+            .zip(second_output.par_iter_mut())
+            .enumerate()
+            .for_each(|(out_idx, (first_value, second_value))| {
+                let weight_start = out_idx * blocks_per_row;
+                let weight_end = weight_start + blocks_per_row;
+                *first_value = q8_0_dot_rows(
+                    &first_weight_blocks[weight_start..weight_end],
+                    quantized_input,
+                );
+                *second_value = q8_0_dot_rows(
+                    &second_weight_blocks[weight_start..weight_end],
+                    quantized_input,
+                );
+            });
+        return;
+    }
+    for (out_idx, (first_value, second_value)) in first_output
+        .iter_mut()
+        .zip(second_output.iter_mut())
+        .enumerate()
+    {
+        let weight_start = out_idx * blocks_per_row;
+        let weight_end = weight_start + blocks_per_row;
+        *first_value = q8_0_dot_rows(
+            &first_weight_blocks[weight_start..weight_end],
+            quantized_input,
+        );
+        *second_value = q8_0_dot_rows(
+            &second_weight_blocks[weight_start..weight_end],
             quantized_input,
         );
     }
