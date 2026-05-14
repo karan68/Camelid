@@ -5667,33 +5667,34 @@ fn try_gated_ffn_gate_up_hybrid_q8_0(
     let gate_gpu_weight_blocks = &gate_weight_blocks[gpu_block_start..];
     let up_cpu_weight_blocks = &up_weight_blocks[..gpu_block_start];
     let up_gpu_weight_blocks = &up_weight_blocks[gpu_block_start..];
-    let (input_scales, input_quants) = q8_0_block_scales_and_quants(quantized_input);
     let gate_gpu_weight_bytes = q8_0_blocks_as_bytes(gate_gpu_weight_blocks);
     let up_gpu_weight_bytes = q8_0_blocks_as_bytes(up_gpu_weight_blocks);
 
     let started = Instant::now();
-    if metal::try_q8_0_block_two_linear_rows_with_cpu(
-        &input_scales,
-        &input_quants,
-        gate_gpu_weight_bytes,
-        up_gpu_weight_bytes,
-        gpu_rows,
-        blocks_per_row,
-        gate_gpu_output,
-        up_gpu_output,
-        || {
-            accumulate_q8_0_block_dot_quantized_cpu(
-                quantized_input,
-                gate_cpu_weight_blocks,
-                gate_cpu_output,
-            );
-            accumulate_q8_0_block_dot_quantized_cpu(
-                quantized_input,
-                up_cpu_weight_blocks,
-                up_cpu_output,
-            );
-        },
-    ) {
+    if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
+        metal::try_q8_0_block_two_linear_rows_with_cpu(
+            input_scales,
+            input_quants,
+            gate_gpu_weight_bytes,
+            up_gpu_weight_bytes,
+            gpu_rows,
+            blocks_per_row,
+            gate_gpu_output,
+            up_gpu_output,
+            || {
+                accumulate_q8_0_block_dot_quantized_cpu(
+                    quantized_input,
+                    gate_cpu_weight_blocks,
+                    gate_cpu_output,
+                );
+                accumulate_q8_0_block_dot_quantized_cpu(
+                    quantized_input,
+                    up_cpu_weight_blocks,
+                    up_cpu_output,
+                );
+            },
+        )
+    }) {
         trace_q8_0_hybrid_retained_success(cpu_rows, gpu_rows, blocks_per_row);
         Some(started.elapsed().as_micros())
     } else {
@@ -6433,16 +6434,19 @@ fn matmul_rhs_transposed_q8_0_block_dot(
         let out_start = row * output_width;
         let output_row = &mut output[out_start..out_start + output_width];
         if q8_0_metal_retained_enabled() {
-            let (input_scales, input_quants) =
-                q8_0_block_scales_and_quants(&quantized_input.blocks);
             let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
-            if metal::try_q8_0_block_linear_row(
-                &input_scales,
-                &input_quants,
-                weight_bytes,
-                output_width,
-                blocks_per_row,
-                output_row,
+            if with_q8_0_block_scales_and_quants(
+                &quantized_input.blocks,
+                |input_scales, input_quants| {
+                    metal::try_q8_0_block_linear_row(
+                        input_scales,
+                        input_quants,
+                        weight_bytes,
+                        output_width,
+                        blocks_per_row,
+                        output_row,
+                    )
+                },
             ) {
                 continue;
             }
@@ -6553,6 +6557,30 @@ fn q8_0_block_scales_and_quants(blocks: &[Q8_0Block]) -> (Vec<f32>, Vec<i8>) {
         quants.extend_from_slice(&block.quants);
     }
     (scales, quants)
+}
+
+fn with_q8_0_block_scales_and_quants<T>(
+    blocks: &[Q8_0Block],
+    f: impl FnOnce(&[f32], &[i8]) -> T,
+) -> T {
+    Q8_0_RETAINED_INPUT_SCALES.with(|scales_cell| {
+        Q8_0_RETAINED_INPUT_QUANTS.with(|quants_cell| {
+            let mut scales = scales_cell.borrow_mut();
+            let mut quants = quants_cell.borrow_mut();
+            scales.clear();
+            quants.clear();
+            scales.reserve(blocks.len());
+            quants.reserve(blocks.len() * Q8_0_BLOCK_VALUES);
+            for block in blocks {
+                scales.push(block.scale);
+                quants.extend_from_slice(&block.quants);
+            }
+            let result = f(&scales, &quants);
+            cap_q8_0_file_reader_scratch(&mut scales, 0);
+            cap_q8_0_file_reader_scratch(&mut quants, 0);
+            result
+        })
+    })
 }
 
 fn q8_0_blocks_as_bytes(blocks: &[Q8_0Block]) -> &[u8] {
@@ -7611,6 +7639,8 @@ thread_local! {
     static Q8_0_FILE_READER_CHUNK_SCALES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     static Q8_0_FILE_READER_QUANTIZED_INPUTS: RefCell<Vec<Q8_0Block>> = const { RefCell::new(Vec::new()) };
     static Q8_0_FILE_READER_OUTPUT_CHUNK: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static Q8_0_RETAINED_INPUT_SCALES: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    static Q8_0_RETAINED_INPUT_QUANTS: RefCell<Vec<i8>> = const { RefCell::new(Vec::new()) };
 }
 
 fn q8_0_file_reader_retained_scratch_bytes() -> usize {
@@ -7877,39 +7907,41 @@ fn accumulate_transposed_linear_row_q8_0_block_dot_quantized(
             let (cpu_output, gpu_output) = output.split_at_mut(cpu_rows);
             let cpu_weight_blocks = &weight_blocks[..gpu_block_start];
             let gpu_weight_blocks = &weight_blocks[gpu_block_start..];
-            let (input_scales, input_quants) = q8_0_block_scales_and_quants(quantized_input);
             let gpu_weight_bytes = q8_0_blocks_as_bytes(gpu_weight_blocks);
-            if metal::try_q8_0_block_linear_row_with_cpu(
-                &input_scales,
-                &input_quants,
-                gpu_weight_bytes,
-                gpu_rows,
-                blocks_per_row,
-                gpu_output,
-                || {
-                    accumulate_q8_0_block_dot_quantized_cpu(
-                        quantized_input,
-                        cpu_weight_blocks,
-                        cpu_output,
-                    )
-                },
-            ) {
+            if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
+                metal::try_q8_0_block_linear_row_with_cpu(
+                    input_scales,
+                    input_quants,
+                    gpu_weight_bytes,
+                    gpu_rows,
+                    blocks_per_row,
+                    gpu_output,
+                    || {
+                        accumulate_q8_0_block_dot_quantized_cpu(
+                            quantized_input,
+                            cpu_weight_blocks,
+                            cpu_output,
+                        )
+                    },
+                )
+            }) {
                 trace_q8_0_hybrid_retained_success(cpu_rows, gpu_rows, blocks_per_row);
                 return;
             }
         }
     }
     if q8_0_metal_retained_enabled() {
-        let (input_scales, input_quants) = q8_0_block_scales_and_quants(quantized_input);
         let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
-        if metal::try_q8_0_block_linear_row(
-            &input_scales,
-            &input_quants,
-            weight_bytes,
-            output.len(),
-            blocks_per_row,
-            output,
-        ) {
+        if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
+            metal::try_q8_0_block_linear_row(
+                input_scales,
+                input_quants,
+                weight_bytes,
+                output.len(),
+                blocks_per_row,
+                output,
+            )
+        }) {
             return;
         }
     }
