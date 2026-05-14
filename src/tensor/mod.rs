@@ -2642,6 +2642,47 @@ mod tests {
     }
 
     #[test]
+    fn q8_packed_rows4_sidecars_stay_opt_in_per_layout() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+        let make_weight = || {
+            let rows = 4;
+            let cols = 32;
+            let blocks = (0..rows)
+                .map(|row| Q8_0Block {
+                    scale: 0.25 + row as f32 * 0.125,
+                    quants: std::array::from_fn(|idx| (idx as i8 % 17) - 8),
+                })
+                .collect::<Vec<_>>();
+            let data = blocks
+                .iter()
+                .flat_map(|block| block.quants.iter().map(|q| block.scale * f32::from(*q)))
+                .collect::<Vec<_>>();
+
+            CpuTensor::from_f32_with_q8_0_blocks("weight", vec![rows, cols], data, blocks).unwrap()
+        };
+
+        let default_weight = make_weight();
+        assert!(default_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(default_weight.q8_0_packed_rows4_4x8.is_none());
+
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X4_DOT", "on");
+        let packed_4x4_weight = make_weight();
+        assert!(packed_4x4_weight.q8_0_packed_rows4_4x4.is_some());
+        assert!(packed_4x4_weight.q8_0_packed_rows4_4x8.is_none());
+
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X8_DOT", "on");
+        let packed_4x8_weight = make_weight();
+        assert!(packed_4x8_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(packed_4x8_weight.q8_0_packed_rows4_4x8.is_some());
+
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+    }
+
+    #[test]
     fn q8_file_cache_zero_capacity_clears_retained_entries_on_use() {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
