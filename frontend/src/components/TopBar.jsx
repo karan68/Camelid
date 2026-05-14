@@ -1,6 +1,6 @@
 import { memo } from 'react'
 import { clampText, formatPreview, formatSidebarDate } from '../lib/formatters'
-import { formatCapabilityStatus, getCurrentCompatibilityTarget } from '../lib/capabilities'
+import { formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getModelStatusLabel } from '../lib/modelState'
 
@@ -43,7 +43,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
   const selectedModelLabel = selectedModel?.name || 'Nothing chosen for next chat'
   const selectedModelSummary = selectedModel ? describeModelState(selectedModel) : 'Choose the model you want Camelid to use next.'
   const currentCompatibilityTarget = getCurrentCompatibilityTarget(capabilities)
-  const supportGateLabel = capabilities?.support_contract?.current_gate || 'No /api/capabilities contract'
+  const supportGateLabel = capabilities ? frontendSupportContractCopy(capabilities) : 'No /api/capabilities contract'
   const supportGateDetail = currentCompatibilityTarget
     ? `${currentCompatibilityTarget.id}: ${formatCapabilityStatus(currentCompatibilityTarget.status)}`
     : 'Open the API contract before treating any model family or quant as supported.'

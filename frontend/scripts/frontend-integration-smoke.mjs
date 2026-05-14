@@ -20,6 +20,7 @@ const server = await createServer({
 try {
   const { default: ChatWorkspace } = await server.ssrLoadModule('/src/views/ChatWorkspace.jsx')
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
+  const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
 
   const noop = () => {}
   const readyRuntime = {
@@ -39,7 +40,7 @@ try {
   }
   const capabilities = {
     support_contract: {
-      current_gate: 'Current exact-row support: no model-native/larger context beyond checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.',
+      current_gate: 'Current exact-row support: no model-native/larger context beyond checked packs, arbitrary/Jinja template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.',
       support_policy: 'Only exact rows unlock chat.',
       unsupported_policy: 'Everything else remains guarded.',
     },
@@ -258,6 +259,23 @@ try {
   assert.match(exactReadyMarkup, /Supported API feature rows/, 'API view should render supported feature rows from /api/capabilities')
   assert.match(exactReadyMarkup, /chat completions/, 'API view should display provider-scoped feature ids as neutral capability names')
   assert.match(exactReadyMarkup, /standard-compatible streaming stays enabled\./, 'API view should sanitize provider-specific feature notes before rendering')
+
+  const topBarMarkup = renderToStaticMarkup(React.createElement(TopBar, {
+    tab: 'api',
+    setTab: noop,
+    selectedConversationTitle: '',
+    selectedConversationUpdatedAt: '',
+    selectedConversationPreview: '',
+    runtime: readyRuntime,
+    capabilities,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+  }))
+
+  assert.match(topBarMarkup, /Support contract/, 'TopBar should render the support contract status surface')
+  assert.doesNotMatch(topBarMarkup, /arbitrary|Jinja|production throughput|throughput/s, 'TopBar support contract label should use filtered frontend support copy once template/Jinja and throughput lanes are green')
+
   assert.match(exactReadyMarkup, /responses stream/, 'API view should normalize provider-scoped dotted feature ids before rendering')
   assert.match(exactReadyMarkup, /hosted model-style streamed response compatibility stays provider-neutral/, 'API view should neutralize hosted-brand feature notes before rendering')
   assert.match(exactReadyMarkup, /Guarded feature row; do not label it hosted model or hosted model compatible from API metadata\./, 'API view should also neutralize guarded feature metadata before rendering')

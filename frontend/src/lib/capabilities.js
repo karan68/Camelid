@@ -304,27 +304,31 @@ export function supportedRowsHaveGreenTemplateAndThroughput(capabilities) {
   }))
 }
 
+function stripResolvedCurrentGateCaveats(copy) {
+  return String(copy || '')
+    .replace(/,?\s*broader arbitrary[- ]template behavior beyond[^,.;]*/gi, '')
+    .replace(/,?\s*broader arbitrary templates beyond[^,.;]*/gi, '')
+    .replace(/,?\s*arbitrary GGUF\/Jinja templates?(?:\s+behavior)?/gi, '')
+    .replace(/,?\s*arbitrary\/Jinja[- ]?templates?(?:\s+behavior)?/gi, '')
+    .replace(/,?\s*arbitrary Jinja[- ]?templates?(?:\s+behavior)?/gi, '')
+    .replace(/,?\s*arbitrary[- ]templates?(?:\s+behavior)?(?:\s+remain outside[^,.;]*)?/gi, '')
+    .replace(/,?\s*production[- ]throughput(?:\s+(?:behavior|support|evidence|readiness))?(?:\s+remain outside[^,.;]*)?/gi, '')
+    .replace(/,?\s*throughput(?:\s+(?:behavior|support|evidence|readiness))?(?:\s+remain outside[^,.;]*)?/gi, '')
+    .replace(/no model-native\/larger context beyond the checked packs,\s*or portability/gi, 'no model-native/larger context beyond the checked packs or portability')
+    .replace(/,\s*,/g, ',')
+    .replace(/,\s*or\s*,/g, ',')
+    .replace(/,\s*and\s*,/g, ',')
+    .replace(/\s+(?:and|or)\s+(?=[,.;])/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
 export function frontendSupportContractCopy(capabilities) {
   const currentGate = capabilities?.support_contract?.current_gate || ''
   if (!currentGate) return 'Capabilities unavailable'
   if (!supportedRowsHaveGreenTemplateAndThroughput(capabilities)) return currentGate
 
-  return currentGate
-    .replace(/,?\s*arbitrary[- ]template behavior/gi, '')
-    .replace(/,?\s*arbitrary\/Jinja[- ]template behavior/gi, '')
-    .replace(/,?\s*arbitrary\/Jinja[- ]templates?/gi, '')
-    .replace(/,?\s*arbitrary Jinja[- ]templates?/gi, '')
-    .replace(/,?\s*arbitrary GGUF\/Jinja templates/gi, '')
-    .replace(/,?\s*arbitrary\/Jinja templates/gi, '')
-    .replace(/,?\s*arbitrary templates?/gi, '')
-    .replace(/,?\s*production[- ]throughput/gi, '')
-    .replace(/,?\s*throughput/gi, '')
-    .replace(/no model-native\/larger context beyond the checked packs, portability/gi, 'no model-native/larger context beyond the checked packs, portability')
-    .replace(/no model-native\/larger context beyond the checked packs,\s*or portability/gi, 'no model-native/larger context beyond the checked packs or portability')
-    .replace(/,\s*,/g, ',')
-    .replace(/,\s*or\s*,/g, ',')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
+  return stripResolvedCurrentGateCaveats(currentGate)
 }
 
 export function isGuardedCapabilityStatus(status = '') {

@@ -171,7 +171,7 @@ const capabilityFixture = {
 }
 const boundedOnlySupportFixture = {
   support_contract: {
-    current_gate: 'Current exact-row support: These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.',
+    current_gate: 'Current exact-row support: These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary/Jinja template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.',
   },
   api_features: [],
   model_compatibility: [
@@ -183,7 +183,7 @@ const boundedOnlySupportFixture = {
 const boundedOnlySupportLanes = exactRowSupportLanes(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features)
 assert.deepEqual(boundedOnlySupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', true]], 'current supported rows with row template and perf evidence should stop repeating template/Jinja and throughput as frontend caveats')
 assert.doesNotMatch(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'resolved exact-row template/Jinja and throughput blockers should not remain in exact-row boundary copy')
-assert.doesNotMatch(frontendSupportContractCopy(boundedOnlySupportFixture), /arbitrary-template behavior|throughput/i, 'support contract copy should filter template/Jinja and throughput caveats once current supported rows have green frontend lanes')
+assert.doesNotMatch(frontendSupportContractCopy(boundedOnlySupportFixture), /arbitrary|Jinja|production|throughput/i, 'support contract copy should filter template/Jinja and throughput caveats once current supported rows have green frontend lanes')
 const unsupportedEvidenceFixture = {
   support_contract: boundedOnlySupportFixture.support_contract,
   api_features: [],
