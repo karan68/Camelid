@@ -186,7 +186,14 @@ function hasExactRowTemplateReadiness(target) {
     && (statusContainsSupportedEvidence(renderer) || statusContainsSupportedEvidence(shapePack))
 }
 
-function hasExactRowThroughputReadiness(target) {
+function hasExactRowProductionThroughputReadiness(target) {
+  const performance = String(target?.performance_measured || '').toLowerCase()
+  if (!isSupportedCapabilityStatus(target?.status || '') || !performance) return false
+  if (performance.includes('not_') || performance.includes('unsupported') || performance.includes('blocked') || performance.includes('missing') || performance.includes('planned') || performance.includes('fail_closed') || performance.includes('fail-closed')) return false
+  return performance.includes('production_throughput') || performance.includes('production-throughput')
+}
+
+function hasExactRowBoundedPerformanceEvidence(target) {
   const performance = String(target?.performance_measured || '').toLowerCase()
   if (!isSupportedCapabilityStatus(target?.status || '') || !performance) return false
   if (performance.includes('not_') || performance.includes('unsupported') || performance.includes('blocked') || performance.includes('missing') || performance.includes('planned') || performance.includes('fail_closed') || performance.includes('fail-closed')) return false
@@ -234,21 +241,24 @@ export function describeThroughputReadiness(target, apiFeatures = []) {
 
   const feature = findSupportedFeature(apiFeatures, /(?:^|[_-])production[_-]?throughput(?:$|[_-])/i)
   const performance = target.performance_measured || ''
-  const rowThroughputReady = hasExactRowThroughputReadiness(target)
+  const rowThroughputReady = hasExactRowProductionThroughputReadiness(target)
+  const boundedPerformanceReady = hasExactRowBoundedPerformanceEvidence(target)
   const ready = Boolean(feature || rowThroughputReady)
-  const label = ready ? 'Throughput evidence ready for this exact row' : 'Throughput not promoted'
+  const label = ready ? 'Production throughput ready for this exact row' : 'Production throughput not promoted'
 
   return {
     key: 'throughput',
     label,
     status: feature?.status || performance || 'not advertised',
-    tone: ready ? 'ready' : 'warm',
+    tone: ready ? 'ready' : boundedPerformanceReady ? 'warm' : 'warm',
     ready,
     copy: feature
       ? `Production-throughput support is advertised by /api/capabilities as ${formatCapabilityStatus(feature.status)}: ${displayCapabilityCopy(feature.notes || 'No notes advertised.')}`
       : rowThroughputReady
-        ? `Production-throughput readiness is green for this supported exact row from ${formatCapabilityStatus(performance)} performance evidence reported by /api/capabilities.`
-        : 'Throughput evidence is not promoted for this row; keep readiness guarded until /api/capabilities reports supported row performance evidence.',
+        ? `Production-throughput readiness is green for this supported exact row from ${formatCapabilityStatus(performance)} evidence reported by /api/capabilities.`
+        : boundedPerformanceReady
+          ? `Bounded row-scoped performance/RSS evidence is present as ${formatCapabilityStatus(performance)}, but production throughput is still not promoted for this exact row.`
+          : 'Production throughput evidence is not promoted for this row; keep readiness guarded until /api/capabilities reports explicit production-throughput support.',
   }
 }
 
@@ -264,6 +274,32 @@ function resolvedLaneState(target, apiFeatures = []) {
   }
 }
 
+function removeResolvedTemplateCaveat(part) {
+  return String(part || '')
+    .replace(/\bbroader arbitrary\/Jinja templates? beyond[^,.;]*(?:,?\s*and\s*)?/gi, '')
+    .replace(/\bbroader arbitrary\/Jinja template behavior beyond[^,.;]*(?:,?\s*and\s*)?/gi, '')
+    .replace(/\bbroader arbitrary templates? beyond[^,.;]*(?:,?\s*and\s*)?/gi, '')
+    .replace(/\bbroader arbitrary[- ]template behavior beyond[^,.;]*(?:,?\s*and\s*)?/gi, '')
+    .replace(/\barbitrary\/Jinja[- ]?templates?(?:\s+behavior)?\s+and\s+/gi, '')
+    .replace(/\barbitrary\/Jinja[- ]?templates?(?:\s+behavior)?$/gi, '')
+    .replace(/\barbitrary Jinja[- ]?templates?(?:\s+behavior)?\s+and\s+/gi, '')
+    .replace(/\barbitrary Jinja[- ]?templates?(?:\s+behavior)?$/gi, '')
+    .replace(/\barbitrary[- ]templates?(?:\s+(?:behavior|evidence))?\s+and\s+/gi, '')
+    .replace(/\barbitrary[- ]templates?(?:\s+(?:behavior|evidence))?$/gi, '')
+    .replace(/^\s*(?:and|or)\s+/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+function removeResolvedThroughputCaveat(part) {
+  return String(part || '')
+    .replace(/\bproduction[- ]throughput(?:\s+(?:behavior|support|evidence|readiness))?(?:\s+remain outside[^,.;]*)?/gi, '')
+    .replace(/\bthroughput(?:\s+(?:behavior|support|evidence|readiness))?(?:\s+remain outside[^,.;]*)?/gi, '')
+    .replace(/^\s*(?:and|or)\s+/i, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
 function filterResolvedSupportCaveats(copy, target, apiFeatures = []) {
   const text = String(copy || '').trim()
   if (!text) return ''
@@ -272,8 +308,9 @@ function filterResolvedSupportCaveats(copy, target, apiFeatures = []) {
     .split(/;\s*|,\s+/)
     .map((part) => part.trim())
     .filter(Boolean)
-    .filter((part) => !(templateReady && /\b(?:arbitrary|jinja|template)\b/i.test(part)))
-    .filter((part) => !(throughputReady && /\b(?:production|throughput|perf(?:ormance)?)\b/i.test(part)))
+    .map((part) => templateReady ? removeResolvedTemplateCaveat(part) : part)
+    .map((part) => throughputReady ? removeResolvedThroughputCaveat(part) : part)
+    .filter(Boolean)
     .join('; ')
 }
 

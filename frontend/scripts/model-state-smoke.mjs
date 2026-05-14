@@ -161,7 +161,7 @@ const capabilityFixture = {
     { id: 'tinyllama_1_1b_chat_q8_0', family: 'llama_spm_decoder', quantization: 'Q8_0', status: 'supported_current_gate', support_scope: 'current_full_gate_exact_row', full_support_status: 'current_gate_refresh_under_stricter_bar', full_support_blockers: 'do not widen beyond TinyLlama 1.1B Chat Q8_0 without repeated current-head API/WebUI/parity/RSS/context evidence under the stricter bar; arbitrary/Jinja template behavior and production throughput remain outside this exact current gate unless separately validated', frontend_readiness_gate: 'green only when this exact Q8_0 row is loaded_now=true, generation_ready=true, and selected by active_model_id', chat_template_renderer: 'tinyllama-marker', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'measured', bounded_context_512_pack: 'validated_bounded_pack', bounded_context_1024_pack: 'not_promoted', bounded_context_2048_pack: 'not_promoted', latest_checked_bucket: 'direct_chat_smoke', latest_checked_result: 'pass', latest_checked_output: 'Certainly! Here', evidence: 'TinyLlama Q8_0 evidence', next_step: 'extend to larger contexts and additional LLaMA-family/quant targets before broadening support claims' },
     { id: 'llama_spm_q4_k_q5_k', family: 'llama_spm_decoder', quantization: 'Q4_K_M/Q5_K_M', status: 'planned_phase_10', next_step: 'implement K-quant support' },
     { id: 'llama32_1b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary templates beyond the supported metadata-Jinja Llama 3.2 1B row template, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'metadata_jinja_supported_for_exact_row', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'bounded_unique_chat_perf_rss_validated', bounded_context_512_pack: 'validated_bounded_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', bounded_context_4096_pack: 'validated_fourth_pack', bounded_context_8192_pack: 'validated_fifth_pack', latest_checked_bucket: 'llama3-context-8192-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-819', evidence: '1B exact-row load, completion, chat, frontend smoke, metadata-Jinja row-template parity, checked 512/1024/2048/4096/8192 context evidence, and bounded unique-chat perf/RSS evidence', next_step: 'preserve exact-row smoke plus checked 512/1024/2048/4096/8192 context support while normalizing model-native/larger context beyond checked packs, broader arbitrary-template behavior beyond the supported 1B metadata-Jinja row template, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim' },
-    { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary templates beyond the supported metadata-Jinja Llama 3.2 3B row template, production throughput, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'metadata_jinja_supported_for_exact_row', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'bounded_unique_chat_perf_rss_validated', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, third 2048-context, and metadata-Jinja row-template evidence', next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary-template behavior beyond the supported 3B metadata-Jinja row template, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim' },
+    { id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'metadata_jinja_supported_for_exact_row', chat_template_shape_pack: 'validated_bounded_pack', performance_measured: 'bounded_unique_chat_perf_rss_validated', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '3B exact-row current-main API/WebUI refresh, load, completion, chat, frontend smoke, compact parity, broader prompt-pack, first 512-context, second 1024-context, third 2048-context, and metadata-Jinja row-template evidence', next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim' },
     { id: 'llama3_8b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', support_scope: 'exact_row_smoke_only', full_support_status: 'blocked_pending_normalized_full_support', full_support_blockers: 'model-native/larger context beyond the checked 512/1024/2048 packs, arbitrary templates, throughput, portability, repeated current-head evidence, and durable normalized full-support bundles remain missing', frontend_readiness_gate: 'green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id', chat_template_renderer: 'compact', chat_template_shape_pack: 'validated_compact_pack', performance_measured: 'bounded_ubuntu_backend_memory_gate_plus_lazy_q8_hotpath_costs', bounded_context_512_pack: 'validated_first_pack', bounded_context_1024_pack: 'validated_second_pack', bounded_context_2048_pack: 'validated_third_pack', latest_checked_bucket: 'llama3-context-2048-smoke-v1', latest_checked_result: 'pass', latest_checked_output: 'CMLD-204', evidence: '8B exact-row API/frontend smoke plus compact 50-token, broader 50-token, checked 512/1024/2048-context packs, compact template-shapes pack evidence, bounded memory/hot-path measurements, and current-head 1024/2048 PASS evidence. No model-native/larger context or broader/full support is implied.', next_step: 'preserve exact-row smoke plus checked 512/1024/2048 context support while collecting model-native/larger-context proof, broader/full-support, production-throughput, portability, arbitrary-template evidence, and repeated current-head evidence before any wider 8B claim' },
     { id: 'mistral_7b_instruct_v0_3_q8_0', family: 'mistral', quantization: 'Q8_0', status: 'active_validation_unsupported', support_scope: 'bringup_exact_row_unsupported', full_support_status: 'blocked_unsupported_bringup', full_support_blockers: 'API/WebUI readiness, RSS/timing, current-head promotion sync, scrubbed manifest posture, support-surface proof, and durable promotion bundle evidence remain incomplete; exact tokenizer/template references plus row-specific 1-token/bounded/broader parity evidence alone do not promote support', evidence: 'Mistral v0.3 active validation only; exact tokenizer/template, 1-token, broader 50-token, and bounded context evidence are green but support-promotion evidence remains fail-closed' },
     { id: 'mixtral_8x7b_instruct_v0_1_q8_0', family: 'mixtral_moe', quantization: 'Q8_0', status: 'active_validation_partial_runtime', support_scope: 'exact_row_bounded_moe_runtime_only', full_support_status: 'blocked_later_generation_divergence', full_support_blockers: 'later short-prompt generation still diverges from llama.cpp; API/WebUI readiness, long-context evidence, production throughput, portability, and durable broad prompt coverage are missing', frontend_readiness_gate: 'fail-closed for broad readiness: exact row may be described only as bounded one-token backend runtime evidence until later-generation parity and API/WebUI gates close', evidence: 'Mixtral bounded one-token backend MoE runtime evidence only; later-generation divergence keeps frontend/API/WebUI support blocked' },
@@ -181,9 +181,10 @@ const boundedOnlySupportFixture = {
   ],
 }
 const boundedOnlySupportLanes = exactRowSupportLanes(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features)
-assert.deepEqual(boundedOnlySupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', true]], 'current supported rows with row template and perf evidence should stop repeating template/Jinja and throughput as frontend caveats')
-assert.doesNotMatch(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'resolved exact-row template/Jinja and throughput blockers should not remain in exact-row boundary copy')
-assert.doesNotMatch(frontendSupportContractCopy(boundedOnlySupportFixture), /arbitrary|Jinja|production|throughput/i, 'support contract copy should filter template/Jinja and throughput caveats once current supported rows have green frontend lanes')
+assert.deepEqual(boundedOnlySupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', false]], 'bounded perf/RSS evidence should not promote production-throughput readiness for current supported rows')
+assert.doesNotMatch(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /arbitrary|Jinja/i, 'resolved exact-row template/Jinja blockers should not remain in exact-row boundary copy')
+assert.match(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /production|throughput/i, 'production-throughput blockers must remain until explicit production-throughput evidence is advertised')
+assert.match(frontendSupportContractCopy(boundedOnlySupportFixture), /production|throughput/i, 'support contract copy must keep production-throughput caveats when only bounded perf/RSS evidence exists')
 const unsupportedEvidenceFixture = {
   support_contract: boundedOnlySupportFixture.support_contract,
   api_features: [],
@@ -243,24 +244,38 @@ assert.deepEqual(
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, exactRowSupportLanes(target, capabilityFixture.api_features).map((lane) => [lane.key, lane.ready])]),
   [
-    ['tinyllama_1_1b_chat_q8_0', [['template', true], ['throughput', true]]],
-    ['llama32_1b_instruct_q8_0', [['template', true], ['throughput', true]]],
-    ['llama32_3b_instruct_q8_0', [['template', true], ['throughput', true]]],
-    ['llama3_8b_instruct_q8_0', [['template', true], ['throughput', true]]],
+    ['tinyllama_1_1b_chat_q8_0', [['template', true], ['throughput', false]]],
+    ['llama32_1b_instruct_q8_0', [['template', true], ['throughput', false]]],
+    ['llama32_3b_instruct_q8_0', [['template', true], ['throughput', false]]],
+    ['llama3_8b_instruct_q8_0', [['template', true], ['throughput', false]]],
   ],
-  'current supported rows should expose green row-scoped template/Jinja and production-throughput lanes when /api/capabilities carries row evidence',
+  'current supported rows should expose green template lanes while keeping production-throughput unpromoted without explicit /api/capabilities evidence',
 )
 for (const target of trackedTargets) {
   assert.doesNotMatch(
     rowSupportBoundaryCopy(target, capabilityFixture.api_features),
-    /arbitrary|Jinja|production|throughput/i,
-    `${target.id} remaining support boundary should not repeat resolved template/Jinja or production-throughput caveats`,
+    /arbitrary|Jinja/i,
+    `${target.id} remaining support boundary should not repeat resolved template/Jinja caveats`,
   )
+  if (/production|throughput/i.test(target.full_support_blockers || '')) {
+    assert.match(
+      rowSupportBoundaryCopy(target, capabilityFixture.api_features),
+      /production|throughput/i,
+      `${target.id} remaining support boundary should keep production-throughput caveats until explicit evidence exists`,
+    )
+  }
   assert.doesNotMatch(
     rowSupportNextStepCopy(target, capabilityFixture.api_features),
-    /arbitrary|Jinja|production|throughput/i,
-    `${target.id} next-step copy should not repeat resolved template/Jinja or production-throughput caveats`,
+    /arbitrary|Jinja/i,
+    `${target.id} next-step copy should not repeat resolved template/Jinja caveats`,
   )
+  if (/production|throughput/i.test(target.next_step || '')) {
+    assert.match(
+      rowSupportNextStepCopy(target, capabilityFixture.api_features),
+      /production|throughput/i,
+      `${target.id} next-step copy should keep production-throughput caveats until explicit evidence exists`,
+    )
+  }
 }
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, target.full_support_status, Boolean(target.full_support_blockers), Boolean(target.frontend_readiness_gate)]),
@@ -470,7 +485,8 @@ assert.equal(
 )
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /smoke-supported for local chat/)
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /\/api\/models\/load, \/v1\/completions, \/v1\/chat\/completions, frontend smoke, compact parity/)
-assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /five-prompt API smoke pack, and bounded 512\/1024\/2048-context parity packs/)
+assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /five-prompt API smoke pack, current-main API\/WebUI support-gate refresh, and bounded 512\/1024\/2048-context parity packs/)
+assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /production throughput remains unpromoted/)
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /does not promote neighboring Llama sizes/)
 assert.match(LLAMA32_3B_ACCEPTANCE_SUMMARY, /model-native\/larger contexts beyond the checked packs/)
 assert.match(LLAMA32_3B_ACCEPTANCE_AVAILABILITY, /does not currently show the exact 3B row/)
