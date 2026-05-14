@@ -118,3 +118,24 @@ Recorded gates:
 - Canonical Ubuntu validation host readiness showed `/` at 54% used with ~91G available; focused current working-tree validation using the Rust 1.87 toolchain passed `cargo test exact_llama32_1b --lib -- --nocapture` and `cargo test capabilities_report_support_contract_and_planned_lanes --test api_vertical_slice -- --nocapture`. The temporary remote validation checkout was removed after the run.
 
 Claim boundary: this is a fail-closed prompt-construction/API/runtime guard refresh for the existing exact-row 1B lane. It does not add a new model-runtime 8192 parity bundle and does not promote arbitrary templates beyond the supported row-template path, neighboring rows, model-native/larger contexts beyond checked packs, production throughput, portability, or broad/full support.
+
+## 2026-05-14 12:18 UTC full Llama 3.2 GGUF-template execution refresh
+
+Scope: exact Llama 3.2 1B Instruct Q8_0 metadata-Jinja prompt-construction parity. Added current-code coverage for the archived full Llama 3.2 GGUF `tokenizer.chat_template` shape, not just the compact/subset header template. The new tests exercise full-template parsing/execution with the built-in default date branch, system-message extraction/slicing, user-only/multi-turn rendering, assistant generation-prefix continuation, bracket and dot message access, and BOS de-duplication. The exact 1B Q8_0 model-aware path executes this full metadata template without `CAMELID_METADATA_CHAT_TEMPLATE` env opt-in; non-exact rows remain on the existing compact/fallback contract.
+
+Validation artifact: `target/cron-95495a91-20260514T1218Z-full-llama32-jinja-head-2e77b02/`
+
+Recorded local gates:
+
+- `cargo fmt --check` — passed.
+- `cargo test full_llama32_gguf_template --lib -- --nocapture` — passed.
+- `cargo test metadata_jinja_renderer --lib -- --nocapture` — passed with the new full-template system+user case in the focused renderer suite.
+- `cargo test exact_llama32_1b --lib -- --nocapture` — passed with the new exact-row full-template multi-turn case.
+- `cargo test capabilities_report_support_contract_and_planned_lanes --test api_vertical_slice -- --nocapture` — passed, preserving the exact 1B metadata-Jinja renderer surface and checked 512/1024/2048/4096/8192 bounded-pack fields.
+- Focused runtime/multi-CPU guards passed locally: `q8_0_file_reader_parallelizes_wide_outputs_by_default`, `q8_0_block_reader_linear_matches_q8_path_with_parallel_chunks`, and `batch_attention_parallel_context_matches_serial`.
+- `node scripts/test-chat-parity-harness.mjs` — passed.
+- `cargo test` — full local Rust suite passed.
+- `git diff --check` — passed.
+- `scripts/check-public-scrub.sh` — passed.
+
+Canonical Ubuntu validation was not re-run for this prompt-template-only slice because the added coverage is deterministic metadata rendering and the local full suite plus focused API/runtime guards materially exercise the changed code. No new model-runtime 8192 parity bundle or production-throughput evidence is promoted. This remains exact-row metadata-template support only; arbitrary templates beyond the supported row path, neighboring rows, model-native/larger contexts beyond checked packs, portability, and broad/full support remain unpromoted.
