@@ -39,6 +39,8 @@ struct MetalLinearCache {
     input_capacity_bytes: usize,
     output_buffer: Option<Buffer>,
     output_capacity_bytes: usize,
+    aux_output_buffer: Option<Buffer>,
+    aux_output_capacity_bytes: usize,
     scalar_buffer: Option<Buffer>,
     scalar_capacity_bytes: usize,
     q8_input_scales_buffer: Option<Buffer>,
@@ -61,6 +63,8 @@ impl MetalLinearCache {
             input_capacity_bytes: 0,
             output_buffer: None,
             output_capacity_bytes: 0,
+            aux_output_buffer: None,
+            aux_output_capacity_bytes: 0,
             scalar_buffer: None,
             scalar_capacity_bytes: 0,
             q8_input_scales_buffer: None,
@@ -103,6 +107,15 @@ impl MetalLinearCache {
             device,
             &mut self.output_buffer,
             &mut self.output_capacity_bytes,
+            needed,
+        )
+    }
+
+    fn aux_output_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
+        Self::shared_buffer(
+            device,
+            &mut self.aux_output_buffer,
+            &mut self.aux_output_capacity_bytes,
             needed,
         )
     }
@@ -832,6 +845,103 @@ where
     true
 }
 
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_q8_0_block_two_linear_rows_with_cpu<F>(
+    input_scales: &[f32],
+    input_quants: &[i8],
+    first_weight_blocks: &[u8],
+    second_weight_blocks: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+    first_output: &mut [f32],
+    second_output: &mut [f32],
+    cpu_work: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    const Q8_0_BLOCK_VALUES: usize = 32;
+    const Q8_0_BLOCK_BYTES: usize = 36;
+    if rows == 0 || blocks_per_row == 0 || first_output.len() != rows || second_output.len() != rows
+    {
+        return false;
+    }
+    let expected_weight_bytes = rows
+        .saturating_mul(blocks_per_row)
+        .saturating_mul(Q8_0_BLOCK_BYTES);
+    if input_scales.len() != blocks_per_row
+        || input_quants.len() != blocks_per_row.saturating_mul(Q8_0_BLOCK_VALUES)
+        || first_weight_blocks.len() != expected_weight_bytes
+        || second_weight_blocks.len() != expected_weight_bytes
+    {
+        return false;
+    }
+    let Some(kernel) = metal_linear_kernel() else {
+        return false;
+    };
+    let mut cache = metal_linear_cache()
+        .lock()
+        .expect("metal linear cache poisoned");
+    let input_scales_buffer =
+        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales));
+    let input_quants_buffer =
+        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants));
+    let first_weight_blocks_buffer =
+        cache.q8_block_weight_buffer(&kernel.device, first_weight_blocks);
+    let second_weight_blocks_buffer =
+        cache.q8_block_weight_buffer(&kernel.device, second_weight_blocks);
+    let first_output_buffer =
+        cache.output_buffer(&kernel.device, std::mem::size_of_val(first_output));
+    let second_output_buffer =
+        cache.aux_output_buffer(&kernel.device, std::mem::size_of_val(second_output));
+    let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
+    write_buffer_f32(&input_scales_buffer, input_scales);
+    write_buffer_i8(&input_quants_buffer, input_quants);
+    unsafe {
+        let scalars = scalar_buffer.contents() as *mut u32;
+        *scalars = blocks_per_row as u32;
+        *scalars.add(1) = rows as u32;
+    }
+
+    let width = kernel.q8_0_block_pipeline.thread_execution_width().max(1);
+    let threads_per_group = metal::MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroups = metal::MTLSize {
+        width: (rows as u64).div_ceil(width),
+        height: 1,
+        depth: 1,
+    };
+
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.q8_0_block_pipeline);
+    encoder.set_buffer(0, Some(&input_scales_buffer), 0);
+    encoder.set_buffer(1, Some(&input_quants_buffer), 0);
+    encoder.set_buffer(4, Some(&scalar_buffer), 0);
+    encoder.set_buffer(5, Some(&scalar_buffer), std::mem::size_of::<u32>() as u64);
+
+    encoder.set_buffer(2, Some(&first_weight_blocks_buffer), 0);
+    encoder.set_buffer(3, Some(&first_output_buffer), 0);
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+
+    encoder.set_buffer(2, Some(&second_weight_blocks_buffer), 0);
+    encoder.set_buffer(3, Some(&second_output_buffer), 0);
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+
+    encoder.end_encoding();
+    command_buffer.commit();
+    cpu_work();
+    command_buffer.wait_until_completed();
+    drop(cache);
+    read_buffer_f32(&first_output_buffer, first_output);
+    read_buffer_f32(&second_output_buffer, second_output);
+    true
+}
+
 #[cfg(not(target_os = "macos"))]
 pub fn try_linear_row_f32(
     _input_row: &[f32],
@@ -902,6 +1012,25 @@ pub fn try_q8_0_block_linear_row_with_cpu<F>(
     _rows: usize,
     _blocks_per_row: usize,
     _output: &mut [f32],
+    _cpu_work: F,
+) -> bool
+where
+    F: FnOnce(),
+{
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_q8_0_block_two_linear_rows_with_cpu<F>(
+    _input_scales: &[f32],
+    _input_quants: &[i8],
+    _first_weight_blocks: &[u8],
+    _second_weight_blocks: &[u8],
+    _rows: usize,
+    _blocks_per_row: usize,
+    _first_output: &mut [f32],
+    _second_output: &mut [f32],
     _cpu_work: F,
 ) -> bool
 where
@@ -1220,6 +1349,88 @@ mod tests {
             &mut output,
         ));
         for (actual, expected) in output.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 1.0e-4, "{actual} != {expected}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_q8_0_block_two_linear_rows_matches_cpu_for_small_rows() {
+        if !detect_metal_device().available {
+            return;
+        }
+
+        let input_scales = [0.25_f32];
+        let input_quants = [
+            1_i8, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 17, -18, 19, -20, 21,
+            -22, 23, -24, 25, -26, 27, -28, 29, -30, 31, -32,
+        ];
+        let rows = [
+            [
+                -1_i8, 2, -3, 4, -5, 6, -7, 8, -9, 10, -11, 12, -13, 14, -15, 16, -17, 18, -19, 20,
+                -21, 22, -23, 24, -25, 26, -27, 28, -29, 30, -31, 32,
+            ],
+            [
+                2_i8, 1, -2, -1, 3, 2, -3, -2, 4, 3, -4, -3, 5, 4, -5, -4, 6, 5, -6, -5, 7, 6, -7,
+                -6, 8, 7, -8, -7, 9, 8, -9, -8,
+            ],
+        ];
+        let first_weight_scales = [0.5_f32, 0.125];
+        let second_weight_scales = [0.25_f32, 0.75];
+        let encode_weight_blocks = |scales: &[f32; 2]| {
+            let mut weight_blocks = Vec::new();
+            for (scale, row) in scales.iter().zip(rows) {
+                weight_blocks.extend_from_slice(&scale.to_le_bytes());
+                weight_blocks.extend(row.iter().map(|value| *value as u8));
+            }
+            weight_blocks
+        };
+        let first_weight_blocks = encode_weight_blocks(&first_weight_scales);
+        let second_weight_blocks = encode_weight_blocks(&second_weight_scales);
+        let expected_for = |scales: &[f32; 2]| -> [f32; 2] {
+            [
+                input_quants
+                    .iter()
+                    .zip(rows[0])
+                    .map(|(a, b)| i32::from(*a) * i32::from(b))
+                    .sum::<i32>() as f32
+                    * input_scales[0]
+                    * scales[0],
+                input_quants
+                    .iter()
+                    .zip(rows[1])
+                    .map(|(a, b)| i32::from(*a) * i32::from(b))
+                    .sum::<i32>() as f32
+                    * input_scales[0]
+                    * scales[1],
+            ]
+        };
+
+        let mut first_output = [0.0_f32; 2];
+        let mut second_output = [0.0_f32; 2];
+        let mut cpu_work_ran = false;
+        assert!(try_q8_0_block_two_linear_rows_with_cpu(
+            &input_scales,
+            &input_quants,
+            &first_weight_blocks,
+            &second_weight_blocks,
+            2,
+            1,
+            &mut first_output,
+            &mut second_output,
+            || cpu_work_ran = true,
+        ));
+        assert!(cpu_work_ran);
+        for (actual, expected) in first_output
+            .into_iter()
+            .zip(expected_for(&first_weight_scales))
+        {
+            assert!((actual - expected).abs() < 1.0e-4, "{actual} != {expected}");
+        }
+        for (actual, expected) in second_output
+            .into_iter()
+            .zip(expected_for(&second_weight_scales))
+        {
             assert!((actual - expected).abs() < 1.0e-4, "{actual} != {expected}");
         }
     }

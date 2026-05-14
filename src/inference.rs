@@ -5538,20 +5538,33 @@ fn gated_ffn_activation(
         if let Some((gate_transposed, up_transposed)) = shared_q8_gate_up {
             let started = Instant::now();
             let quantized_input = quantize_q8_0_row(input_row);
-            accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+            if let Some(total_elapsed) = try_gated_ffn_gate_up_hybrid_q8_0(
                 &quantized_input.blocks,
                 gate_transposed,
-                &mut gate,
-            );
-            let gate_elapsed = started.elapsed().as_micros();
-
-            let started = Instant::now();
-            accumulate_transposed_linear_row_q8_0_block_dot_quantized(
-                &quantized_input.blocks,
                 up_transposed,
+                &mut gate,
                 &mut up,
-            );
-            (gate_elapsed, started.elapsed().as_micros())
+            ) {
+                // Gate/up are submitted as one hybrid CPU+Metal batch, so split the measured
+                // elapsed time across the two existing timing fields while preserving the total.
+                let gate_elapsed = total_elapsed / 2;
+                (gate_elapsed, total_elapsed - gate_elapsed)
+            } else {
+                accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+                    &quantized_input.blocks,
+                    gate_transposed,
+                    &mut gate,
+                );
+                let gate_elapsed = started.elapsed().as_micros();
+
+                let started = Instant::now();
+                accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+                    &quantized_input.blocks,
+                    up_transposed,
+                    &mut up,
+                );
+                (gate_elapsed, started.elapsed().as_micros())
+            }
         } else {
             let started = Instant::now();
             accumulate_linear_row(
@@ -5621,6 +5634,71 @@ fn gated_ffn_activation(
         up_diagnostic,
         activation_diagnostic,
     })
+}
+
+fn try_gated_ffn_gate_up_hybrid_q8_0(
+    quantized_input: &[Q8_0Block],
+    gate_weight: BorrowedLinearWeight<'_>,
+    up_weight: BorrowedLinearWeight<'_>,
+    gate: &mut [f32],
+    up: &mut [f32],
+) -> Option<u128> {
+    if !q8_0_hybrid_retained_enabled() || gate.is_empty() || gate.len() != up.len() {
+        return None;
+    }
+    let blocks_per_row = quantized_input.len();
+    let gate_weight_blocks = gate_weight.q8_0_blocks?;
+    let up_weight_blocks = up_weight.q8_0_blocks?;
+    if gate_weight_blocks.len() != gate.len().saturating_mul(blocks_per_row)
+        || up_weight_blocks.len() != up.len().saturating_mul(blocks_per_row)
+    {
+        return None;
+    }
+    let gpu_rows = q8_0_hybrid_retained_gpu_rows(gate.len());
+    if gpu_rows == 0 || gpu_rows >= gate.len() {
+        return None;
+    }
+    let cpu_rows = gate.len() - gpu_rows;
+    let gpu_block_start = cpu_rows * blocks_per_row;
+
+    let (gate_cpu_output, gate_gpu_output) = gate.split_at_mut(cpu_rows);
+    let (up_cpu_output, up_gpu_output) = up.split_at_mut(cpu_rows);
+    let gate_cpu_weight_blocks = &gate_weight_blocks[..gpu_block_start];
+    let gate_gpu_weight_blocks = &gate_weight_blocks[gpu_block_start..];
+    let up_cpu_weight_blocks = &up_weight_blocks[..gpu_block_start];
+    let up_gpu_weight_blocks = &up_weight_blocks[gpu_block_start..];
+    let (input_scales, input_quants) = q8_0_block_scales_and_quants(quantized_input);
+    let gate_gpu_weight_bytes = q8_0_blocks_as_bytes(gate_gpu_weight_blocks);
+    let up_gpu_weight_bytes = q8_0_blocks_as_bytes(up_gpu_weight_blocks);
+
+    let started = Instant::now();
+    if metal::try_q8_0_block_two_linear_rows_with_cpu(
+        &input_scales,
+        &input_quants,
+        gate_gpu_weight_bytes,
+        up_gpu_weight_bytes,
+        gpu_rows,
+        blocks_per_row,
+        gate_gpu_output,
+        up_gpu_output,
+        || {
+            accumulate_q8_0_block_dot_quantized_cpu(
+                quantized_input,
+                gate_cpu_weight_blocks,
+                gate_cpu_output,
+            );
+            accumulate_q8_0_block_dot_quantized_cpu(
+                quantized_input,
+                up_cpu_weight_blocks,
+                up_cpu_output,
+            );
+        },
+    ) {
+        trace_q8_0_hybrid_retained_success(cpu_rows, gpu_rows, blocks_per_row);
+        Some(started.elapsed().as_micros())
+    } else {
+        None
+    }
 }
 
 fn gated_ffn_activation_batch(
@@ -6173,7 +6251,7 @@ fn q8_0_hybrid_retained_gpu_rows(output_rows: usize) -> usize {
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(5)
+        .unwrap_or(10)
         .min(90);
     ((output_rows * percent).div_ceil(100))
         .max(1)
