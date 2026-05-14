@@ -6546,6 +6546,35 @@ fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
         .sum()
 }
 
+fn q8_0_two_dot_rows(
+    first_weight: &[Q8_0Block],
+    second_weight: &[Q8_0Block],
+    input: &[Q8_0Block],
+) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if aarch64_dotprod_enabled() {
+            // SAFETY: runtime feature detection confirms dot-product support; the slice
+            // iterator only passes complete Q8_0 blocks.
+            return unsafe { q8_0_two_dot_rows_dotprod(first_weight, second_weight, input) };
+        }
+    }
+
+    let mut first_sum = 0.0_f32;
+    let mut second_sum = 0.0_f32;
+    for ((first_block, second_block), input_block) in
+        first_weight.iter().zip(second_weight).zip(input)
+    {
+        let first_int_sum =
+            q8_0_block_int_dot_horizontal_sum(&first_block.quants, &input_block.quants);
+        let second_int_sum =
+            q8_0_block_int_dot_horizontal_sum(&second_block.quants, &input_block.quants);
+        first_sum += first_int_sum as f32 * first_block.scale * input_block.scale;
+        second_sum += second_int_sum as f32 * second_block.scale * input_block.scale;
+    }
+    (first_sum, second_sum)
+}
+
 fn q8_0_block_scales_and_quants(blocks: &[Q8_0Block]) -> (Vec<f32>, Vec<i8>) {
     let mut scales = Vec::with_capacity(blocks.len());
     let mut quants = Vec::with_capacity(blocks.len() * Q8_0_BLOCK_VALUES);
@@ -6603,6 +6632,32 @@ unsafe fn q8_0_dot_rows_dotprod(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f3
             int_sum as f32 * weight_block.scale * input_block.scale
         })
         .sum()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_two_dot_rows_dotprod(
+    first_weight: &[Q8_0Block],
+    second_weight: &[Q8_0Block],
+    input: &[Q8_0Block],
+) -> (f32, f32) {
+    let mut first_sum = 0.0_f32;
+    let mut second_sum = 0.0_f32;
+    for ((first_block, second_block), input_block) in
+        first_weight.iter().zip(second_weight).zip(input)
+    {
+        // SAFETY: each Q8_0Block contains exactly 32 contiguous i8 values.
+        let first_int_sum = unsafe {
+            q8_0_i8_block_dotprod(first_block.quants.as_ptr(), input_block.quants.as_ptr())
+        };
+        // SAFETY: each Q8_0Block contains exactly 32 contiguous i8 values.
+        let second_int_sum = unsafe {
+            q8_0_i8_block_dotprod(second_block.quants.as_ptr(), input_block.quants.as_ptr())
+        };
+        first_sum += first_int_sum as f32 * first_block.scale * input_block.scale;
+        second_sum += second_int_sum as f32 * second_block.scale * input_block.scale;
+    }
+    (first_sum, second_sum)
 }
 
 fn q8_0_reader_backing(weight: &CpuTensor, input_width: usize) -> Result<Option<&Q8_0FileBacking>> {
@@ -7999,14 +8054,13 @@ fn accumulate_two_q8_0_block_dot_quantized_cpu(
             .for_each(|(out_idx, (first_value, second_value))| {
                 let weight_start = out_idx * blocks_per_row;
                 let weight_end = weight_start + blocks_per_row;
-                *first_value = q8_0_dot_rows(
+                let (first_sum, second_sum) = q8_0_two_dot_rows(
                     &first_weight_blocks[weight_start..weight_end],
-                    quantized_input,
-                );
-                *second_value = q8_0_dot_rows(
                     &second_weight_blocks[weight_start..weight_end],
                     quantized_input,
                 );
+                *first_value = first_sum;
+                *second_value = second_sum;
             });
         return;
     }
@@ -8017,14 +8071,13 @@ fn accumulate_two_q8_0_block_dot_quantized_cpu(
     {
         let weight_start = out_idx * blocks_per_row;
         let weight_end = weight_start + blocks_per_row;
-        *first_value = q8_0_dot_rows(
+        let (first_sum, second_sum) = q8_0_two_dot_rows(
             &first_weight_blocks[weight_start..weight_end],
-            quantized_input,
-        );
-        *second_value = q8_0_dot_rows(
             &second_weight_blocks[weight_start..weight_end],
             quantized_input,
         );
+        *first_value = first_sum;
+        *second_value = second_sum;
     }
 }
 
@@ -10744,6 +10797,45 @@ mod tests {
         assert_eq!(block.quants[0], 127);
         assert_eq!(block.quants[1], 2);
         assert_eq!((input_values[1] / block.scale).round() as i8, 3);
+    }
+
+    #[test]
+    fn q8_0_two_dot_rows_matches_individual_dot_rows() {
+        let input = vec![
+            Q8_0Block {
+                scale: 0.25,
+                quants: std::array::from_fn(|idx| idx as i8 - 16),
+            },
+            Q8_0Block {
+                scale: 0.5,
+                quants: std::array::from_fn(|idx| 15 - idx as i8),
+            },
+        ];
+        let first_weight = vec![
+            Q8_0Block {
+                scale: 0.125,
+                quants: std::array::from_fn(|idx| (idx as i8 % 9) - 4),
+            },
+            Q8_0Block {
+                scale: 0.375,
+                quants: std::array::from_fn(|idx| (idx as i8 % 7) - 3),
+            },
+        ];
+        let second_weight = vec![
+            Q8_0Block {
+                scale: 0.625,
+                quants: std::array::from_fn(|idx| (idx as i8 % 11) - 5),
+            },
+            Q8_0Block {
+                scale: 0.875,
+                quants: std::array::from_fn(|idx| (idx as i8 % 13) - 6),
+            },
+        ];
+
+        let (first, second) = q8_0_two_dot_rows(&first_weight, &second_weight, &input);
+
+        assert_eq!(first, q8_0_dot_rows(&first_weight, &input));
+        assert_eq!(second, q8_0_dot_rows(&second_weight, &input));
     }
 
     #[test]
