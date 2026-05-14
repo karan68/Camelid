@@ -23,7 +23,7 @@ use crate::{
         LlamaTensorBinding,
     },
     tensor::{
-        parse_byte_count_env, q8_0_file_read_stats, record_q8_0_file_read,
+        dot_product, parse_byte_count_env, q8_0_file_read_stats, record_q8_0_file_read,
         should_parallelize_linear_output, with_q8_file_cache_capacity_override, CpuTensor,
         Q8_0Block, Q8_0FileBacking, Q8_0FileReadStats, TensorShape, TensorStore,
     },
@@ -64,8 +64,8 @@ impl LlamaKvCachePlan {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaKvCache {
     pub plan: LlamaKvCachePlan,
-    pub keys: Vec<u16>,
-    pub values: Vec<u16>,
+    pub keys: Vec<f32>,
+    pub values: Vec<f32>,
     pub allocated_sequence_length: usize,
     pub position: usize,
 }
@@ -103,8 +103,8 @@ impl LlamaKvCache {
             .ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
             })?;
-        self.keys.resize(values, 0);
-        self.values.resize(values, 0);
+        self.keys.resize(values, 0.0);
+        self.values.resize(values, 0.0);
         self.allocated_sequence_length = target_sequence_length;
         Ok(())
     }
@@ -125,23 +125,7 @@ impl LlamaKvCache {
     }
 
     pub fn allocated_bytes(&self) -> u64 {
-        (self.allocated_elements() as u64) * (std::mem::size_of::<u16>() as u64)
-    }
-
-    pub fn decoded_key_at(&self, index: usize) -> f32 {
-        f16_bits_to_f32(self.keys[index])
-    }
-
-    pub fn decoded_value_at(&self, index: usize) -> f32 {
-        f16_bits_to_f32(self.values[index])
-    }
-
-    pub fn decoded_keys(&self) -> Vec<f32> {
-        decode_f16_kv_cache_storage(&self.keys)
-    }
-
-    pub fn decoded_values(&self) -> Vec<f32> {
-        decode_f16_kv_cache_storage(&self.values)
+        (self.allocated_elements() as u64) * (std::mem::size_of::<f32>() as u64)
     }
 }
 
@@ -8798,8 +8782,6 @@ fn kv_cache_trace(
             .zip(kv_cache.values[start..end].iter())
             .enumerate()
         {
-            let key = f16_bits_to_f32(key);
-            let value = f16_bits_to_f32(value);
             if !key.is_finite() || !value.is_finite() {
                 return Err(BackendError::RuntimeShapeMismatch(format!(
                     "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
@@ -8870,8 +8852,6 @@ fn kv_cache_position_trace(
     let mut key_max_abs = 0.0_f32;
     let mut value_max_abs = 0.0_f32;
     for (idx, (&key, &value)) in key_slice.iter().zip(value_slice.iter()).enumerate() {
-        let key = f16_bits_to_f32(key);
-        let value = f16_bits_to_f32(value);
         if !key.is_finite() || !value.is_finite() {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "KV position trace found non-finite value at layer {layer_idx} position {position} index {idx}"
@@ -8896,54 +8876,24 @@ fn kv_cache_position_trace(
         value_rms: (value_sum_square / width).sqrt() as f32,
         key_max_abs,
         value_max_abs,
-        key_first_values: sample_first_kv_cache_values_with_limit(
-            key_slice,
-            TENSOR_CHECKPOINT_SAMPLE,
-        ),
-        value_first_values: sample_first_kv_cache_values_with_limit(
-            value_slice,
-            TENSOR_CHECKPOINT_SAMPLE,
-        ),
+        key_first_values: key_slice
+            .iter()
+            .take(TENSOR_CHECKPOINT_SAMPLE)
+            .copied()
+            .collect(),
+        value_first_values: value_slice
+            .iter()
+            .take(TENSOR_CHECKPOINT_SAMPLE)
+            .copied()
+            .collect(),
     })
 }
 
-fn copy_to_f16_kv_cache_storage(dest: &mut [u16], source: &[f32]) {
+fn copy_to_f16_kv_cache_storage(dest: &mut [f32], source: &[f32]) {
     debug_assert_eq!(dest.len(), source.len());
     for (dest_value, source_value) in dest.iter_mut().zip(source.iter().copied()) {
-        *dest_value = f32_to_f16_bits(source_value);
+        *dest_value = f16_bits_to_f32(f32_to_f16_bits(source_value));
     }
-}
-
-fn copy_from_f16_kv_cache_storage(dest: &mut [f32], source: &[u16]) {
-    debug_assert_eq!(dest.len(), source.len());
-    for (dest_value, source_value) in dest.iter_mut().zip(source.iter().copied()) {
-        *dest_value = f16_bits_to_f32(source_value);
-    }
-}
-
-fn decode_f16_kv_cache_storage(source: &[u16]) -> Vec<f32> {
-    source.iter().copied().map(f16_bits_to_f32).collect()
-}
-
-fn dot_product_f16_kv_cache_storage(left: &[f32], right: &[u16]) -> f32 {
-    debug_assert_eq!(left.len(), right.len());
-    left.iter()
-        .zip(right.iter().copied())
-        .map(|(left, right)| *left * f16_bits_to_f32(right))
-        .sum()
-}
-
-fn sample_first_kv_cache_values(values: &[u16]) -> Vec<f32> {
-    sample_first_kv_cache_values_with_limit(values, ATTENTION_TRACE_VALUE_LIMIT)
-}
-
-fn sample_first_kv_cache_values_with_limit(values: &[u16], limit: usize) -> Vec<f32> {
-    values
-        .iter()
-        .take(limit)
-        .copied()
-        .map(f16_bits_to_f32)
-        .collect()
 }
 
 const ATTENTION_TRACE_HEAD_LIMIT: usize = 8;
@@ -9006,10 +8956,8 @@ fn causal_attention_context(
                 map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
             let out_start = attention_head * head_dim;
             let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
-            copy_from_f16_kv_cache_storage(
-                &mut out[out_start..out_start + head_dim],
-                &kv_cache.values[value_start..value_start + head_dim],
-            );
+            out[out_start..out_start + head_dim]
+                .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
         }
     } else {
         let mut scores = Vec::with_capacity(position_count);
@@ -9116,10 +9064,8 @@ fn causal_attention_context_batch(
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
                 let out_start = attention_head * head_dim;
                 let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
-                copy_from_f16_kv_cache_storage(
-                    &mut out_row[out_start..out_start + head_dim],
-                    &kv_cache.values[value_start..value_start + head_dim],
-                );
+                out_row[out_start..out_start + head_dim]
+                    .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
             }
         } else {
             for attention_head in 0..attention_heads {
@@ -9187,7 +9133,7 @@ fn attention_context_for_head_into(
     let mut key_start = head_base;
     for position in 0..params.position_count {
         let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
-        let score = dot_product_f16_kv_cache_storage(params.query_slice, key_slice) * params.scale;
+        let score = dot_product(params.query_slice, key_slice) * params.scale;
         scores.push(score);
         if position + 1 < params.position_count {
             key_start += position_stride;
@@ -9211,8 +9157,8 @@ fn attention_context_for_head_into(
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
         let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
-        for (out_value, value) in out_slice.iter_mut().zip(value_slice.iter().copied()) {
-            *out_value += probability * f16_bits_to_f32(value);
+        for (out_value, value) in out_slice.iter_mut().zip(value_slice) {
+            *out_value += probability * *value;
         }
         if position + 1 < params.position_count {
             value_start += position_stride;
@@ -9337,7 +9283,7 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
             let qk_products = query_slice
                 .iter()
                 .zip(key_slice.iter())
-                .map(|(query, key)| *query * f16_bits_to_f32(*key))
+                .map(|(query, key)| query * key)
                 .collect::<Vec<_>>();
             let reconstructed_score = qk_products.iter().sum::<f32>() * params.scale;
             let qk_products_max_abs_index = max_abs_index(&qk_products);
@@ -9353,11 +9299,11 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
                 reconstructed_score,
                 score_reconstruction_delta: (scores[position] - reconstructed_score).abs(),
                 probability: probabilities[position],
-                key_first_values: sample_first_kv_cache_values(key_slice),
+                key_first_values: sample_first_values(key_slice),
                 qk_products_first_values: sample_first_values(&qk_products),
                 qk_products_max_abs_window_start,
                 qk_products_max_abs_window,
-                value_first_values: sample_first_kv_cache_values(value_slice),
+                value_first_values: sample_first_values(value_slice),
             });
         }
         heads.push(LlamaAttentionHeadTrace {
@@ -9400,7 +9346,7 @@ fn attention_scores_for_head(
     let position_stride = kv_cache_position_stride(kv_cache);
     for position in 0..position_count {
         let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
-        let score = dot_product_f16_kv_cache_storage(query_slice, key_slice) * scale;
+        let score = dot_product(query_slice, key_slice) * scale;
         scores.push(score);
         if position + 1 < position_count {
             key_start += position_stride;
@@ -9449,7 +9395,7 @@ fn reconstruct_attention_context_for_head(
         let value_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
         let value_slice = &kv_cache.values[value_start..value_start + head_dim];
         for dim in 0..head_dim {
-            context[dim] += probability * f16_bits_to_f32(value_slice[dim]);
+            context[dim] += probability * value_slice[dim];
         }
     }
     context
@@ -9488,8 +9434,8 @@ fn top_attention_probability_positions(
                 position,
                 score: scores[position],
                 probability,
-                key_first_values: sample_first_kv_cache_values(key_slice),
-                value_first_values: sample_first_kv_cache_values(value_slice),
+                key_first_values: sample_first_values(key_slice),
+                value_first_values: sample_first_values(value_slice),
             }
         })
         .collect()
@@ -10458,12 +10404,7 @@ mod tests {
             "CAMELID_FORWARD_MEMORY_TRACE",
             "CAMELID_FORWARD_RSS_TIMINGS",
             "CAMELID_GQA_HEAD_MAPPING",
-            "CAMELID_HYBRID_Q8_GPU_PERCENT",
-            "CAMELID_HYBRID_Q8_GPU_ROWS",
-            "CAMELID_HYBRID_Q8_RETAINED",
             "CAMELID_LINEAR_ACCUMULATION",
-            "CAMELID_METAL_Q8",
-            "CAMELID_METAL_Q8_RETAINED",
             "CAMELID_OUTPUT_PROJECTION_LAYOUT",
             "CAMELID_PREFILL_LAYER_MAJOR",
             "CAMELID_PREFILL_LAYER_MAJOR_Q8_0_FILE_CACHE_BYTES",
@@ -11784,8 +11725,6 @@ mod tests {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
         std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
-        std::env::set_var("CAMELID_HYBRID_Q8_RETAINED", "off");
-        std::env::set_var("CAMELID_METAL_Q8_RETAINED", "off");
 
         let mut input_values = Vec::with_capacity(32);
         input_values.push(127.0);
@@ -13654,14 +13593,8 @@ mod tests {
             &sequential_step.hidden_state.data,
         );
         assert_eq!(chunked.kv_cache.position, sequential.kv_cache.position);
-        assert_slice_close(
-            &chunked.kv_cache.decoded_keys(),
-            &sequential.kv_cache.decoded_keys(),
-        );
-        assert_slice_close(
-            &chunked.kv_cache.decoded_values(),
-            &sequential.kv_cache.decoded_values(),
-        );
+        assert_slice_close(&chunked.kv_cache.keys, &sequential.kv_cache.keys);
+        assert_slice_close(&chunked.kv_cache.values, &sequential.kv_cache.values);
 
         std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR", "1");
         std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION", "1");
@@ -13705,14 +13638,8 @@ mod tests {
             &sequential_step.hidden_state.data,
         );
         assert_eq!(layer_major.kv_cache.position, sequential.kv_cache.position);
-        assert_slice_close(
-            &layer_major.kv_cache.decoded_keys(),
-            &sequential.kv_cache.decoded_keys(),
-        );
-        assert_slice_close(
-            &layer_major.kv_cache.decoded_values(),
-            &sequential.kv_cache.decoded_values(),
-        );
+        assert_slice_close(&layer_major.kv_cache.keys, &sequential.kv_cache.keys);
+        assert_slice_close(&layer_major.kv_cache.values, &sequential.kv_cache.values);
 
         std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
         std::env::remove_var("CAMELID_PREFILL_LAYER_MAJOR");
@@ -14111,11 +14038,11 @@ mod tests {
 
         let prior_layer1_start = kv_cache_offset(&kv_cache, 1, 0, 0);
         assert_eq!(
-            &kv_cache.decoded_keys()[prior_layer1_start..prior_layer1_start + 2],
+            &kv_cache.keys[prior_layer1_start..prior_layer1_start + 2],
             &[5.0, 6.0]
         );
         assert_eq!(
-            &kv_cache.decoded_values()[prior_layer1_start..prior_layer1_start + 2],
+            &kv_cache.values[prior_layer1_start..prior_layer1_start + 2],
             &[7.0, 8.0]
         );
     }
@@ -14158,7 +14085,7 @@ mod tests {
         write_kv_cache(&mut kv_cache, 0, &key, &value).unwrap();
 
         assert_eq!(
-            kv_cache.decoded_keys(),
+            kv_cache.keys,
             key.data
                 .iter()
                 .copied()
@@ -14166,7 +14093,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            kv_cache.decoded_values(),
+            kv_cache.values,
             value
                 .data
                 .iter()
@@ -14174,8 +14101,8 @@ mod tests {
                 .map(|value| f16_bits_to_f32(f32_to_f16_bits(value)))
                 .collect::<Vec<_>>()
         );
-        assert_ne!(kv_cache.decoded_keys(), key.data);
-        assert_ne!(kv_cache.decoded_values(), value.data);
+        assert_ne!(kv_cache.keys, key.data);
+        assert_ne!(kv_cache.values, value.data);
     }
 
     #[test]

@@ -32,10 +32,10 @@ fn runs_single_token_dense_llama_forward_skeleton() {
     assert_eq!(output.logits.shape.dims, vec![1, 3]);
     assert_eq!(output.hidden_state.shape.dims, vec![1, 4]);
     assert_eq!(session.kv_cache.position, 1);
-    assert_approx_eq(session.kv_cache.decoded_key_at(0), 1.999984);
-    assert_approx_eq(session.kv_cache.decoded_key_at(1), 0.0);
-    assert_approx_eq(session.kv_cache.decoded_value_at(0), 0.999992);
-    assert_approx_eq(session.kv_cache.decoded_value_at(1), 0.0);
+    assert_approx_eq(session.kv_cache.keys[0], 1.999984);
+    assert_approx_eq(session.kv_cache.keys[1], 0.0);
+    assert_approx_eq(session.kv_cache.values[0], 0.999992);
+    assert_approx_eq(session.kv_cache.values[1], 0.0);
     assert!(output.logits.data.iter().all(|value| value.is_finite()));
 }
 
@@ -51,8 +51,8 @@ fn applies_rope_before_writing_current_key_to_cache() {
     let unrotated_key_y = 1.0 / (0.25_f32 + 1e-6).sqrt();
     let (sin, cos) = 1.0_f32.sin_cos();
     assert_eq!(session.kv_cache.position, 2);
-    assert_approx_eq(session.kv_cache.decoded_key_at(2), -unrotated_key_y * sin);
-    assert_approx_eq(session.kv_cache.decoded_key_at(3), unrotated_key_y * cos);
+    assert_approx_eq(session.kv_cache.keys[2], -unrotated_key_y * sin);
+    assert_approx_eq(session.kv_cache.keys[3], unrotated_key_y * cos);
 }
 
 #[test]
@@ -78,12 +78,12 @@ fn writes_all_layers_to_same_token_position_before_advancing_cache() {
     assert!(
         session.kv_cache.keys[layer_0_position_0..layer_0_position_0 + plan.head_dim]
             .iter()
-            .any(|value| *value != 0)
+            .any(|value| *value != 0.0)
     );
     assert!(
         session.kv_cache.keys[layer_1_position_0..layer_1_position_0 + plan.head_dim]
             .iter()
-            .any(|value| *value != 0)
+            .any(|value| *value != 0.0)
     );
 }
 
@@ -135,7 +135,7 @@ fn prompt_prefill_writes_every_layer_at_each_token_position() {
             assert!(
                 session.kv_cache.keys[start..start + plan.head_dim]
                     .iter()
-                    .any(|value| *value != 0),
+                    .any(|value| *value != 0.0),
                 "expected layer {layer_idx} position {position} to be populated"
             );
         }
