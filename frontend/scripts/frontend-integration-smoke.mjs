@@ -39,7 +39,7 @@ try {
   }
   const capabilities = {
     support_contract: {
-      current_gate: 'supported_current_gate',
+      current_gate: 'Current exact-row support: no model-native/larger context beyond checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.',
       support_policy: 'Only exact rows unlock chat.',
       unsupported_policy: 'Everything else remains guarded.',
     },
@@ -57,7 +57,7 @@ try {
         latest_checked_result: 'pass',
         latest_checked_output: 'exact row fixture output',
         full_support_status: 'guarded_by_exact_row',
-        full_support_blockers: 'No broad-family inheritance.',
+        full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing',
         evidence: 'Exact row evidence bundle.',
         metadata_parses: 'validated',
         tokenizer_works: 'validated',
@@ -69,7 +69,7 @@ try {
         bounded_context_1024_pack: 'validated',
         bounded_context_2048_pack: 'validated',
         performance_measured: 'measured',
-        next_step: 'Keep exact-row scoped.',
+        next_step: 'preserve exact-row smoke while normalizing model-native/larger context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader claim',
       },
       {
         id: 'other_future_row_q8_0',
@@ -250,6 +250,11 @@ try {
   assert.match(exactReadyMarkup, /llama32_3b_instruct_q8_0/, 'API view should render the selected exact compatibility row id')
   assert.match(exactReadyMarkup, /Exact row evidence bundle\./, 'API view should render exact-row evidence text')
   assert.match(exactReadyMarkup, /exact row fixture output/, 'API view should render latest exact-row output evidence')
+  assert.match(exactReadyMarkup, /Template\/Jinja readiness[\s\S]*Template readiness is green for this supported exact row/, 'API view should show resolved template/Jinja as a green exact-row readiness lane')
+  assert.match(exactReadyMarkup, /Throughput readiness[\s\S]*Production-throughput readiness is green for this supported exact row/, 'API view should show resolved production-throughput as a green exact-row readiness lane')
+  assert.match(exactReadyMarkup, /Remaining support boundary:<\/b> model-native\/larger context beyond checked packs; portability; and durable repeated current-head bundles remain missing/, 'API view should keep unresolved row blockers while filtering resolved template/Jinja and throughput caveats')
+  assert.doesNotMatch(exactReadyMarkup, /arbitrary-template behavior|arbitrary\/Jinja templates, production throughput|throughput, portability, neighboring-row/, 'API support surface should not repeat resolved template/Jinja or throughput caveats as generic blockers')
+  assert.doesNotMatch(exactReadyMarkup, /normalizing model-native\/larger context; arbitrary\/Jinja template behavior; production throughput/, 'API compatibility list next-step copy should filter resolved template/Jinja and production-throughput caveats')
   assert.match(exactReadyMarkup, /Supported API feature rows/, 'API view should render supported feature rows from /api/capabilities')
   assert.match(exactReadyMarkup, /chat completions/, 'API view should display provider-scoped feature ids as neutral capability names')
   assert.match(exactReadyMarkup, /standard-compatible streaming stays enabled\./, 'API view should sanitize provider-specific feature notes before rendering')
