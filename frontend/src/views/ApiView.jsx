@@ -1,4 +1,4 @@
-import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportBoundaryCopy } from '../lib/capabilities'
+import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
 import { modelRuntimeIdMatches } from '../lib/modelState'
 
 function guardedApiFeatures(features = []) {
@@ -192,7 +192,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)} · frontend load: {formatCapabilityStatus(target.frontend_load_path_verified)}</small>
                     <small>Template: {formatCapabilityStatus(target.chat_template_shape_pack || 'not_started')} · 512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')} · 1024-context: {formatCapabilityStatus(target.bounded_context_1024_pack || 'not_started')} · 2048-context: {formatCapabilityStatus(target.bounded_context_2048_pack || 'not_started')} · 4096-context: {formatCapabilityStatus(target.bounded_context_4096_pack || 'not_started')} · 8192-context: {formatCapabilityStatus(target.bounded_context_8192_pack || 'not_started')} · perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</small>
                     <small>{exactRowSupportLanes(target, apiFeatures).map((lane) => `${lane.key === 'template' ? 'Template/Jinja' : 'Throughput'}: ${lane.label}`).join(' · ')}</small>
-                    <small>{displayCapabilityCopy(target.next_step)}</small>
+                    <small>{displayCapabilityCopy(rowSupportNextStepCopy(target, apiFeatures))}</small>
                   </div>
                 ))}
               </div>

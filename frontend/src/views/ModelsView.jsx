@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { LLAMA32_3B_ACCEPTANCE_AVAILABILITY, LLAMA32_3B_ACCEPTANCE_GATING_NOTE, LLAMA32_3B_ACCEPTANCE_SUMMARY, LLAMA32_3B_ACCEPTANCE_TARGET } from '../lib/acceptanceTargets'
-import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus, rowSupportBoundaryCopy } from '../lib/capabilities'
+import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { formatBytes, formatCompactNumber } from '../lib/formatters'
 import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, isRunnableModel } from '../lib/modelState'
@@ -611,7 +611,7 @@ export default function ModelsView({
               <p className="panel-kicker">Exact-row full-support hardening</p>
               <h3>Current Q8 support rows</h3>
             </div>
-            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, while the stricter full-support bar stays visible; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
+            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, with template/Jinja and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
           </div>
 
           <div className="models-card-grid">
@@ -694,7 +694,7 @@ export default function ModelsView({
                       <p className="model-summary" key={lane.key}><b>{lane.key === 'template' ? 'Template/Jinja readiness' : 'Throughput readiness'}:</b> {lane.copy}</p>
                     ))}
                     <p className="model-summary"><b>Remaining support boundary:</b> {rowSupportBoundaryCopy(target, apiFeatures)}</p>
-                    <p className="model-summary"><b>Next step:</b> {target.next_step}</p>
+                    <p className="model-summary"><b>Next step:</b> {rowSupportNextStepCopy(target, apiFeatures)}</p>
                     <p className="model-summary">
                       {chatUnlocked
                         ? 'This exact row is both contract-supported and runtime-green.'

@@ -22,7 +22,7 @@ export const LLAMA32_3B_ACCEPTANCE_TARGET = {
   },
 }
 
-export const LLAMA32_3B_ACCEPTANCE_SUMMARY = 'This exact 3B Q8_0 row is smoke-supported for local chat after exact-row /api/models/load, /v1/completions, /v1/chat/completions, frontend smoke, compact parity, broader three-prompt 50-token parity, a five-prompt API smoke pack, and bounded 512/1024/2048-context parity packs. The frontend now shows template/Jinja and throughput as their own row-scoped readiness lanes from /api/capabilities instead of repeating them as generic chat caveats; it does not promote neighboring Llama sizes or model-native/larger contexts beyond the checked packs, and the 1B/8B wins remain their own exact rows, not inherited from this 3B row.'
+export const LLAMA32_3B_ACCEPTANCE_SUMMARY = 'This exact 3B Q8_0 row is smoke-supported for local chat after exact-row /api/models/load, /v1/completions, /v1/chat/completions, frontend smoke, compact parity, broader three-prompt 50-token parity, a five-prompt API smoke pack, and bounded 512/1024/2048-context parity packs. The frontend now shows template/Jinja and production-throughput as their own row-scoped readiness lanes from /api/capabilities instead of repeating them as generic chat caveats; it does not promote neighboring Llama sizes or model-native/larger contexts beyond the checked packs, and the 1B/8B wins remain their own exact rows, not inherited from this 3B row.'
 
 export const LLAMA32_3B_ACCEPTANCE_AVAILABILITY = 'This browser/runtime list does not currently show the exact 3B row. That does not erase the existing support evidence for the row, but it also must not be turned into a green frontend state unless the loaded local GGUF exactly matches the supported 3B Q8_0 row.'
 

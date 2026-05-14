@@ -256,21 +256,42 @@ export function exactRowSupportLanes(target, apiFeatures = []) {
   return [describeTemplateReadiness(target), describeThroughputReadiness(target, apiFeatures)]
 }
 
-export function rowSupportBoundaryCopy(target, apiFeatures = []) {
-  if (!target) return 'No exact row selected.'
-  const blockers = String(target.full_support_blockers || '').trim()
-  if (!blockers) return 'No remaining full-support boundary is advertised for this exact row.'
+function resolvedLaneState(target, apiFeatures = []) {
   const lanes = exactRowSupportLanes(target, apiFeatures)
-  const templateReady = lanes.some((lane) => lane.key === 'template' && lane.ready)
-  const throughputReady = lanes.some((lane) => lane.key === 'throughput' && lane.ready)
-  const remaining = blockers
+  return {
+    templateReady: lanes.some((lane) => lane.key === 'template' && lane.ready),
+    throughputReady: lanes.some((lane) => lane.key === 'throughput' && lane.ready),
+  }
+}
+
+function filterResolvedSupportCaveats(copy, target, apiFeatures = []) {
+  const text = String(copy || '').trim()
+  if (!text) return ''
+  const { templateReady, throughputReady } = resolvedLaneState(target, apiFeatures)
+  return text
     .split(/;\s*|,\s+/)
     .map((part) => part.trim())
     .filter(Boolean)
     .filter((part) => !(templateReady && /\b(?:arbitrary|jinja|template)\b/i.test(part)))
     .filter((part) => !(throughputReady && /\b(?:production|throughput|perf(?:ormance)?)\b/i.test(part)))
+    .join('; ')
+}
 
-  return remaining.length ? remaining.join('; ') : 'Template/Jinja and production-throughput lanes are green for this exact row; remaining readiness follows runtime loaded_now/generation_ready and any other /api/capabilities fields.'
+export function rowSupportBoundaryCopy(target, apiFeatures = []) {
+  if (!target) return 'No exact row selected.'
+  const blockers = String(target.full_support_blockers || '').trim()
+  if (!blockers) return 'No remaining full-support boundary is advertised for this exact row.'
+  const remaining = filterResolvedSupportCaveats(blockers, target, apiFeatures)
+
+  return remaining.length ? remaining : 'Template/Jinja and production-throughput lanes are green for this exact row; remaining readiness follows runtime loaded_now/generation_ready and any other /api/capabilities fields.'
+}
+
+export function rowSupportNextStepCopy(target, apiFeatures = []) {
+  if (!target) return 'No exact row selected.'
+  const nextStep = String(target.next_step || '').trim()
+  if (!nextStep) return 'No next support step is advertised for this exact row.'
+  const remaining = filterResolvedSupportCaveats(nextStep, target, apiFeatures)
+  return remaining.length ? remaining : 'Template/Jinja and production-throughput are already represented by green row-scoped readiness lanes for this exact row; continue to require runtime loaded_now/generation_ready and any other advertised evidence before widening support.'
 }
 
 export function supportedRowsHaveGreenTemplateAndThroughput(capabilities) {
@@ -290,8 +311,12 @@ export function frontendSupportContractCopy(capabilities) {
 
   return currentGate
     .replace(/,?\s*arbitrary[- ]template behavior/gi, '')
+    .replace(/,?\s*arbitrary\/Jinja[- ]template behavior/gi, '')
+    .replace(/,?\s*arbitrary\/Jinja[- ]templates?/gi, '')
+    .replace(/,?\s*arbitrary Jinja[- ]templates?/gi, '')
     .replace(/,?\s*arbitrary GGUF\/Jinja templates/gi, '')
     .replace(/,?\s*arbitrary\/Jinja templates/gi, '')
+    .replace(/,?\s*arbitrary templates?/gi, '')
     .replace(/,?\s*production[- ]throughput/gi, '')
     .replace(/,?\s*throughput/gi, '')
     .replace(/no model-native\/larger context beyond the checked packs, portability/gi, 'no model-native/larger context beyond the checked packs, portability')
