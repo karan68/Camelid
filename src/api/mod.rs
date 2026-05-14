@@ -4,7 +4,7 @@ use std::{
     env, mem,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -47,6 +47,11 @@ const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
+const JINJA_CHAT_TEMPLATE_NAME: &str = "chat";
+const JINJA_CHAT_TEMPLATE_CACHE_LIMIT: usize = 16;
+
+static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environment<'static>>>>> =
+    OnceLock::new();
 
 #[derive(Clone, Default)]
 pub struct AppState {
@@ -3630,6 +3635,32 @@ fn render_jinja_chat_template(
     let eom_token = tokenizer.token_text(tokenizer.special.eom).unwrap_or("");
     let unk_token = tokenizer.token_text(tokenizer.special.unk).unwrap_or("");
 
+    let env = cached_jinja_chat_template_environment(template)?;
+    let compiled = env.get_template(JINJA_CHAT_TEMPLATE_NAME)?;
+    compiled.render(context! {
+        messages => template_messages,
+        bos_token => bos_token,
+        eos_token => eos_token,
+        eot_token => eot_token,
+        eom_token => eom_token,
+        unk_token => unk_token,
+        add_generation_prompt => true,
+    })
+}
+
+fn cached_jinja_chat_template_environment(
+    template: &str,
+) -> std::result::Result<Arc<Environment<'static>>, MiniJinjaError> {
+    let cache = JINJA_CHAT_TEMPLATE_ENV_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(env) = cache
+        .lock()
+        .expect("jinja chat-template cache poisoned")
+        .get(template)
+        .cloned()
+    {
+        return Ok(env);
+    }
+
     let mut env = Environment::new();
     env.add_function(
         "raise_exception",
@@ -3640,16 +3671,41 @@ fn render_jinja_chat_template(
             ))
         },
     );
-    let compiled = env.template_from_str(template)?;
-    compiled.render(context! {
-        messages => template_messages,
-        bos_token => bos_token,
-        eos_token => eos_token,
-        eot_token => eot_token,
-        eom_token => eom_token,
-        unk_token => unk_token,
-        add_generation_prompt => true,
-    })
+    env.add_template_owned(JINJA_CHAT_TEMPLATE_NAME.to_string(), template.to_string())?;
+    let env = Arc::new(env);
+
+    let mut cache = cache.lock().expect("jinja chat-template cache poisoned");
+    if let Some(cached) = cache.get(template) {
+        return Ok(Arc::clone(cached));
+    }
+    if cache.len() >= JINJA_CHAT_TEMPLATE_CACHE_LIMIT {
+        cache.clear();
+    }
+    cache.insert(template.to_string(), Arc::clone(&env));
+    Ok(env)
+}
+
+#[cfg(test)]
+fn clear_jinja_chat_template_environment_cache() {
+    if let Some(cache) = JINJA_CHAT_TEMPLATE_ENV_CACHE.get() {
+        cache
+            .lock()
+            .expect("jinja chat-template cache poisoned")
+            .clear();
+    }
+}
+
+#[cfg(test)]
+fn jinja_chat_template_environment_cache_len() -> usize {
+    JINJA_CHAT_TEMPLATE_ENV_CACHE
+        .get()
+        .map(|cache| {
+            cache
+                .lock()
+                .expect("jinja chat-template cache poisoned")
+                .len()
+        })
+        .unwrap_or(0)
 }
 
 fn rendered_prompt_starts_with_token_text(
@@ -5120,6 +5176,28 @@ mod tests {
         assert!(rendered.parse_special);
         assert_eq!(rendered.text, "system=Be brief.\nuser=hello\n");
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+    }
+
+    #[test]
+    fn metadata_jinja_renderer_reuses_compiled_template_environment() {
+        let _guard = crate::test_support::env_lock();
+        clear_jinja_chat_template_environment_cache();
+        std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+        let tokenizer = llama3_tokenizer_with_template(
+            "{% for message in messages %}{{ message['role'] }}={{ message['content'] }}\n{% endfor %}",
+        );
+        let messages = [ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+
+        let first = render_chat_prompt_for_tokenization(&messages, &tokenizer);
+        let second = render_chat_prompt_for_tokenization(&messages, &tokenizer);
+
+        assert_eq!(first, second);
+        assert_eq!(jinja_chat_template_environment_cache_len(), 1);
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        clear_jinja_chat_template_environment_cache();
     }
 
     #[test]
