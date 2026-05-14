@@ -108,6 +108,21 @@ That means Camelid should say this plainly today:
 
 That missing table is an execution gap, not a copywriting gap.
 
+The tracked harness for closing the first same-host 3B slice is:
+
+```sh
+CAMELID_BIN=target/release/camelid \
+LLAMA3_LLAMA_SERVER=target/reference/llama.cpp/build/bin/llama-server \
+node scripts/bench-llama3-same-host.mjs \
+  --model /home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --model-id llama32-3b-q8-throughput \
+  --row-id llama32_3b_instruct_q8_0 \
+  --max-tokens 16 --warmup 1 --repeats 3 --threads 8 \
+  --out target/bench-llama32-3b-same-host.json
+```
+
+Use `--print-plan` with the same arguments to audit exact spawned commands, stdout keys, JSON schema, and metric bounds before starting servers. The harness reports bounded TTFT, elapsed-time, and streamed-chunk-derived decode estimates only; it does not promote production throughput, 1B, Mixtral, neighboring-row, portability, or broader-family support without separate row-specific evidence.
+
 ## What should be added next
 
 The next benchmark slice worth publishing is:
