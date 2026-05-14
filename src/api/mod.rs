@@ -15,7 +15,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use minijinja::{context, Environment, Error as MiniJinjaError, ErrorKind as MiniJinjaErrorKind};
+use minijinja::{
+    context, Environment, Error as MiniJinjaError, ErrorKind as MiniJinjaErrorKind,
+    UndefinedBehavior,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -3662,6 +3665,7 @@ fn cached_jinja_chat_template_environment(
     }
 
     let mut env = Environment::new();
+    env.set_undefined_behavior(UndefinedBehavior::Strict);
     env.add_function(
         "raise_exception",
         |message: String| -> std::result::Result<String, MiniJinjaError> {
@@ -5242,6 +5246,41 @@ mod tests {
         assert!(err
             .to_string()
             .contains("unsupported exact-row chat-template branch"));
+    }
+
+    #[test]
+    fn metadata_jinja_renderer_reports_undefined_variables_as_unsupported() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+        let template = "{{ unsupported_template_variable }}";
+        let tokenizer = llama3_tokenizer_with_template(template);
+
+        let err =
+            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+
+        assert_eq!(err.kind(), MiniJinjaErrorKind::UndefinedError);
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+    }
+
+    #[test]
+    fn exact_llama32_1b_required_metadata_jinja_renderer_reports_undefined_variables() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let template =
+            "{{ unsupported_template_variable }}<|start_header_id|><|end_header_id|><|eot_id|>";
+        let tokenizer = llama3_tokenizer_with_template(template);
+
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            &tokenizer,
+            Some("Llama-3.2-1B-Instruct-Q8_0"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), MiniJinjaErrorKind::UndefinedError);
     }
 
     fn llama3_test_tokenizer() -> Tokenizer {

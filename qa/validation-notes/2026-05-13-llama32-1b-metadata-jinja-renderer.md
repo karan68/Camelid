@@ -62,3 +62,21 @@ Validation artifacts are under `target/cron-58d09b5e-20260513T2302Z-backend-resu
 - `ubuntu-readiness.log`: canonical Ubuntu host `54.186.43.33` remains blocked for fresh current-head validation because `/` is 100% full with about 297 MiB available and the default Rust toolchain is 1.75.0. No fresh remote build was attempted in this resume.
 
 This resume still does not promote arbitrary templates, neighboring rows, model-native/larger contexts beyond the checked 512/1024/2048/4096/8192 packs for the exact 1B row, production throughput, portability, or full Llama-family support.
+
+## 2026-05-14 strict undefined-variable follow-up
+
+Scope: exact Llama 3.2 1B Instruct Q8_0 metadata-Jinja renderer hardening. The supported renderer environment now uses MiniJinja strict undefined-variable behavior so unsupported template references fail as `UndefinedError` instead of silently rendering empty text. This preserves the existing exact-row system+user, user-only, multi-turn, assistant-continuation/final, no-BOS, loop-template, cache-reuse, and explicit `raise_exception(...)` behavior while making unsupported metadata-template cases more honest.
+
+Validation artifact: `target/cron-95495a91-20260514T0450Z-jinja-strict-undefined-head-d927cef5dc2a/`
+
+Recorded local gates:
+
+- `cargo fmt --check`
+- `cargo test metadata_jinja_renderer --lib -- --nocapture` — 15/15 focused metadata-Jinja tests passed, including the new undefined-variable unsupported cases.
+- `cargo test exact_llama32_1b --lib -- --nocapture` — 6/6 exact-row required-renderer tests passed.
+- `cargo test capabilities_report_support_contract_and_planned_lanes --test api_vertical_slice -- --nocapture` — API support-contract/capabilities gate passed, including the 8192 bounded-pack surface for the exact 1B row.
+- `cargo test` — full local test suite passed, including runtime/multi-CPU unit gates already covered in the suite.
+- `git diff --check`
+- `scripts/check-public-scrub.sh`
+
+No new model-runtime 8192 parity bundle was produced in this follow-up; the existing exact-row 8192 runtime bundle remains the current cited model-runtime evidence. No broad arbitrary-template, neighboring-row, production-throughput, portability, or broader/full-support claim is promoted here.
