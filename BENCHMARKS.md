@@ -1,6 +1,6 @@
 # Camelid Benchmarks
 
-Last updated: 2026-05-12
+Last updated: 2026-05-14
 
 This file is Camelid's public performance snapshot.
 
@@ -39,6 +39,25 @@ Method summary:
 | --- | ---: | ---: | ---: | ---: | --- |
 | Llama 3.2 1B Instruct Q8_0 | 7379.73 | 7065.25 | 1413.05 | 274.31 | Exact-row bounded unique-chat envelope only |
 | Llama 3.2 3B Instruct Q8_0 | 19762.21 | 19449.25 | 3889.85 | 287.21 | Exact-row bounded unique-chat envelope only |
+
+### Apple Silicon memory-first profile vs MLX-LM
+
+These results come from `qa/evidence-bundles/apple-silicon-camelid-vs-mlx-memory-20260514T001835Z-head-775db673af32/summary.json`.
+
+Method summary:
+
+- scope: same-host Apple Silicon resident-memory profile
+- Camelid mode: memory-first lazy GGUF Q8_0 (`CAMELID_LAZY_Q8_0_LINEAR=1`, retained Q8 blocks disabled)
+- MLX mode: public `mlx-community` 4-bit MLX-LM weights, cache already warm for committed timing rows
+- metric: observed process RSS sampled with `ps`; Camelid rows also include structured forward RSS and Q8 file-read counters
+- boundary: this is a **memory** comparison, not a strict quant-equivalent speed claim; MLX is much faster in this short probe
+
+| Model family | Camelid row/profile | Camelid observed RSS MiB | MLX-LM row/profile | MLX-LM observed RSS MiB | MLX / Camelid RSS |
+| --- | --- | ---: | --- | ---: | ---: |
+| Llama 3.2 1B Instruct | GGUF Q8_0, memory-first lazy | 257.72 | 4-bit MLX-LM | 1062.06 | 4.12x |
+| Llama 3.2 3B Instruct | GGUF Q8_0, memory-first lazy | 328.92 | 4-bit MLX-LM | 2139.7 | 6.51x |
+
+This is a useful Camelid result, but the claim must stay precise: Camelid's Rust GGUF path can run the exact Q8_0 rows with substantially lower resident memory in the memory-first profile. It does **not** claim Camelid is faster than MLX-LM on this workload.
 
 ### Ubuntu first-token direction probe
 
