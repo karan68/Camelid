@@ -278,16 +278,26 @@ fn mac_q8_repack_enabled() -> bool {
     env_flag_enabled("CAMELID_MAC_Q8_REPACK")
 }
 
-fn mac_q8_repack_tensor_enabled(name: &str) -> bool {
-    mac_q8_repack_enabled()
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_repack_enabled() -> bool {
+    env_flag_enabled("CAMELID_X86_Q8_REPACK")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn x86_q8_repack_enabled() -> bool {
+    false
+}
+
+fn q8_repack_tensor_enabled(name: &str) -> bool {
+    (mac_q8_repack_enabled() || x86_q8_repack_enabled())
         && name.starts_with("blk.")
         && (name.ends_with(".attn_q.weight")
             || name.ends_with(".ffn_gate.weight")
             || name.ends_with(".ffn_up.weight"))
 }
 
-fn mac_q8_repack_linear_shape(name: &str, shape: &TensorShape) -> Option<(usize, usize)> {
-    if !mac_q8_repack_tensor_enabled(name) || shape.dims.len() != 2 {
+fn q8_repack_linear_shape(name: &str, shape: &TensorShape) -> Option<(usize, usize)> {
+    if !q8_repack_tensor_enabled(name) || shape.dims.len() != 2 {
         return None;
     }
     let rows = shape.dims[0];
@@ -320,7 +330,7 @@ fn q8_0_runtime_packed_rows4_for_tensor(
     if env_flag_disabled("CAMELID_Q8_0_BLOCK_DOT") {
         return Ok(None);
     }
-    let Some((rows, cols)) = mac_q8_repack_linear_shape(name, shape) else {
+    let Some((rows, cols)) = q8_repack_linear_shape(name, shape) else {
         return Ok(None);
     };
     if !rows.is_multiple_of(4) || !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
@@ -2502,7 +2512,7 @@ impl TensorStore {
                 "tensor {name} Q8_0 element count {expected_elements} is not block aligned"
             )));
         }
-        if mac_q8_repack_tensor_enabled(name) {
+        if q8_repack_tensor_enabled(name) {
             let bytes = self.tensor_bytes(name)?;
             if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
                 q8_0_runtime_packed_rows4_for_tensor(name, &shape, &bytes)?
@@ -2854,6 +2864,7 @@ mod tests {
     fn q8_packed_rows4_sidecars_stay_opt_in_per_layout() {
         let _env_guard = env_lock();
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
         std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
 
@@ -2919,6 +2930,13 @@ mod tests {
         assert!(non_family_mac_repack_weight.q8_0_packed_rows4_4x8.is_none());
 
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+        let x86_repack_weight = make_weight();
+        assert!(x86_repack_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(x86_repack_weight.q8_0_packed_rows4_4x8.is_none());
+        assert!(x86_repack_weight.q8_0_runtime_storage.is_none());
+
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
     }
 
     #[test]

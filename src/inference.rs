@@ -4909,6 +4909,15 @@ fn matmul_rhs_transposed_with_precision(
             name,
         );
     }
+    if let Some((packed, interleave)) = q8_0_selected_packed_rows4(weight) {
+        return matmul_rhs_transposed_q8_0_packed_rows4_f32_input(
+            input,
+            packed,
+            interleave,
+            weight.dim(0)?,
+            name,
+        );
+    }
     match diagnostic_linear_accumulation_precision()? {
         LinearAccumulationPrecision::F32 => input.matmul_rhs_transposed(weight, name),
         LinearAccumulationPrecision::F64 => matmul_rhs_transposed_f64(input, weight, name),
@@ -7276,6 +7285,41 @@ fn matmul_rhs_transposed_q8_0_block_reader(
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
+fn matmul_rhs_transposed_q8_0_packed_rows4_f32_input(
+    input: &CpuTensor,
+    packed: &Q8_0PackedRows4,
+    interleave: Q8_0PackedRows4Interleave,
+    output_width: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "q8_0 packed rows4 f32 fallback input width {input_width} is not a multiple of {Q8_0_BLOCK_VALUES}"
+        )));
+    }
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    if packed.rows != output_width || packed.blocks_per_row != blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "q8_0 packed rows4 f32 fallback shape mismatch: packed rows={}, blocks_per_row={}, requested output_width={output_width}, input blocks_per_row={blocks_per_row}",
+            packed.rows, packed.blocks_per_row
+        )));
+    }
+    let mut output = vec![0.0_f32; rows * output_width];
+    for row in 0..rows {
+        let input_start = row * input_width;
+        let output_start = row * output_width;
+        accumulate_q8_0_packed_rows4_f32_input(
+            &input.data[input_start..input_start + input_width],
+            packed,
+            interleave,
+            &mut output[output_start..output_start + output_width],
+        );
+    }
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
+}
+
 #[cfg(test)]
 fn dot_q8_0_encoded_row(input: &[Q8_0Block], row_bytes: &[u8]) -> f32 {
     let mut sum = 0.0_f32;
@@ -7401,13 +7445,15 @@ fn q8_0_block_int_dot_horizontal_sum_encoded_impl(
     weight: &[u8],
     input: &[i8; Q8_0_BLOCK_VALUES],
 ) -> i32 {
-    let lanes = [
-        q8_0_dot_group4_encoded(weight, input, 0) + q8_0_dot_group4_encoded(weight, input, 16),
-        q8_0_dot_group4_encoded(weight, input, 4) + q8_0_dot_group4_encoded(weight, input, 20),
-        q8_0_dot_group4_encoded(weight, input, 8) + q8_0_dot_group4_encoded(weight, input, 24),
-        q8_0_dot_group4_encoded(weight, input, 12) + q8_0_dot_group4_encoded(weight, input, 28),
-    ];
-    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if x86_q8_kernel_avx2_enabled() && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime feature detection confirms AVX2 support; callers pass one
+            // complete encoded Q8_0 block (32 signed bytes) and one complete input block.
+            return unsafe { q8_0_i8_block_avx2(weight.as_ptr().cast::<i8>(), input.as_ptr()) };
+        }
+    }
+    q8_0_block_int_dot_horizontal_sum_encoded_scalar(weight, input)
 }
 
 fn q8_0_block_int_dot_horizontal_sum(
@@ -7431,15 +7477,42 @@ fn q8_0_block_int_dot_horizontal_sum_impl(
     weight: &[i8; Q8_0_BLOCK_VALUES],
     input: &[i8; Q8_0_BLOCK_VALUES],
 ) -> i32 {
-    // The current generic q8_0 x q8_0 dot sums the 32 products in scalar order.
-    // ARM dot-product kernels commonly accumulate four int8 products into each i32 lane and
-    // then horizontally reduce lanes. This is a deterministic scalar equivalent of that
-    // grouping, not a claim that Camelid has identified any exact external runtime kernel.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if x86_q8_kernel_avx2_enabled() && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime feature detection confirms AVX2 support; callers pass complete
+            // Q8_0 blocks containing 32 contiguous signed bytes each.
+            return unsafe { q8_0_i8_block_avx2(weight.as_ptr(), input.as_ptr()) };
+        }
+    }
+    q8_0_block_int_dot_horizontal_sum_scalar(weight, input)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn q8_0_block_int_dot_horizontal_sum_scalar(
+    weight: &[i8; Q8_0_BLOCK_VALUES],
+    input: &[i8; Q8_0_BLOCK_VALUES],
+) -> i32 {
+    // The generic q8_0 x q8_0 dot sums products in deterministic four-product lanes.
     let lanes = [
         q8_0_dot_group4(weight, input, 0) + q8_0_dot_group4(weight, input, 16),
         q8_0_dot_group4(weight, input, 4) + q8_0_dot_group4(weight, input, 20),
         q8_0_dot_group4(weight, input, 8) + q8_0_dot_group4(weight, input, 24),
         q8_0_dot_group4(weight, input, 12) + q8_0_dot_group4(weight, input, 28),
+    ];
+    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn q8_0_block_int_dot_horizontal_sum_encoded_scalar(
+    weight: &[u8],
+    input: &[i8; Q8_0_BLOCK_VALUES],
+) -> i32 {
+    let lanes = [
+        q8_0_dot_group4_encoded(weight, input, 0) + q8_0_dot_group4_encoded(weight, input, 16),
+        q8_0_dot_group4_encoded(weight, input, 4) + q8_0_dot_group4_encoded(weight, input, 20),
+        q8_0_dot_group4_encoded(weight, input, 8) + q8_0_dot_group4_encoded(weight, input, 24),
+        q8_0_dot_group4_encoded(weight, input, 12) + q8_0_dot_group4_encoded(weight, input, 28),
     ];
     (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
 }
@@ -7462,6 +7535,48 @@ fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start
         + i32::from(weight[start + 1] as i8) * i32::from(input[start + 1])
         + i32::from(weight[start + 2] as i8) * i32::from(input[start + 2])
         + i32::from(weight[start + 3] as i8) * i32::from(input[start + 3])
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_kernel_avx2_enabled() -> bool {
+    matches!(
+        env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
+        Ok("avx2") | Ok("AVX2") | Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadu_si128,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadu_si128,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_si256();
+    for offset in [0usize, 16] {
+        // SAFETY: callers provide two complete 32-byte Q8_0 quant arrays; each iteration
+        // loads one unaligned 16-byte half from both arrays.
+        let weight_i8 = unsafe { _mm_loadu_si128(weight.add(offset).cast()) };
+        let input_i8 = unsafe { _mm_loadu_si128(input.add(offset).cast()) };
+        let weight_i16 = _mm256_cvtepi8_epi16(weight_i8);
+        let input_i16 = _mm256_cvtepi8_epi16(input_i8);
+        let products_i16 = _mm256_mullo_epi16(weight_i16, input_i16);
+        let pair_sums_i32 = _mm256_madd_epi16(products_i16, ones);
+        acc = _mm256_add_epi32(acc, pair_sums_i32);
+    }
+
+    let mut lanes = [0_i32; 8];
+    // SAFETY: lanes has exactly 32 bytes of storage for one __m256i value.
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc) };
+    lanes.iter().sum()
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -8192,6 +8307,15 @@ fn accumulate_transposed_linear_row_with_precision(
         accumulate_transposed_linear_row_q8_0_block_dot(input_row, weight, output);
         return;
     }
+    if let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(weight) {
+        if input_row.len().is_multiple_of(Q8_0_BLOCK_VALUES)
+            && packed.rows == output.len()
+            && packed.blocks_per_row == input_row.len() / Q8_0_BLOCK_VALUES
+        {
+            accumulate_q8_0_packed_rows4_f32_input(input_row, packed, interleave, output);
+            return;
+        }
+    }
     match precision {
         LinearAccumulationPrecision::F32 => {
             accumulate_transposed_linear_row(input_row, weight, output)
@@ -8378,6 +8502,54 @@ fn accumulate_q8_0_packed_rows4_dot_quantized_cpu(
     }
 }
 
+fn accumulate_q8_0_packed_rows4_f32_input(
+    input_row: &[f32],
+    packed: &Q8_0PackedRows4,
+    interleave: Q8_0PackedRows4Interleave,
+    output: &mut [f32],
+) {
+    let blocks_per_row = input_row.len() / Q8_0_BLOCK_VALUES;
+    debug_assert_eq!(packed.blocks_per_row, blocks_per_row);
+    debug_assert_eq!(packed.rows, output.len());
+    debug_assert!(output.len().is_multiple_of(4));
+
+    let block_len = interleave.block_len();
+    let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
+        debug_assert_eq!(output_chunk.len(), 4);
+        let mut sums = [0.0_f32; 4];
+        let group_blocks =
+            &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+        for (block_idx, packed_block) in group_blocks.iter().enumerate() {
+            let input_block_start = block_idx * Q8_0_BLOCK_VALUES;
+            for idx in 0..Q8_0_BLOCK_VALUES {
+                let chunk = idx / block_len;
+                let lane_offset = idx % block_len;
+                let packed_chunk_start = chunk * 4 * block_len;
+                let input_value = input_row[input_block_start + idx];
+                for lane in 0..4 {
+                    let packed_idx = packed_chunk_start + lane * block_len + lane_offset;
+                    sums[lane] += input_value
+                        * f32::from(packed_block.quants[packed_idx])
+                        * packed_block.scales[lane];
+                }
+            }
+        }
+        output_chunk.copy_from_slice(&sums);
+    };
+
+    if should_parallelize_linear_output(output.len()) {
+        output
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(group_idx, output_chunk)| compute_group(group_idx, output_chunk));
+        return;
+    }
+
+    for (group_idx, output_chunk) in output.chunks_mut(4).enumerate() {
+        compute_group(group_idx, output_chunk);
+    }
+}
+
 fn q8_0_packed_rows4_dot(
     packed_blocks: &[Q8_0PackedRows4Block],
     input: &[Q8_0Block],
@@ -8410,11 +8582,38 @@ fn q8_0_packed_rows4_dot(
             )
         };
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let int_sums = q8_0_packed_rows4_block_dot_scalar(
-            &packed_block.quants,
-            &input_block.quants,
-            interleave,
-        );
+        let int_sums = {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                if interleave == Q8_0PackedRows4Interleave::I8
+                    && x86_q8_kernel_avx2_enabled()
+                    && std::arch::is_x86_feature_detected!("avx2")
+                {
+                    // SAFETY: runtime feature detection confirms AVX2 support; packed quants
+                    // contain one complete rows4/I8 block and input quants contain one Q8_0 block.
+                    unsafe {
+                        q8_0_packed_4x8_block_avx2(
+                            packed_block.quants.as_ptr(),
+                            input_block.quants.as_ptr(),
+                        )
+                    }
+                } else {
+                    q8_0_packed_rows4_block_dot_scalar(
+                        &packed_block.quants,
+                        &input_block.quants,
+                        interleave,
+                    )
+                }
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                q8_0_packed_rows4_block_dot_scalar(
+                    &packed_block.quants,
+                    &input_block.quants,
+                    interleave,
+                )
+            }
+        };
         for lane in 0..4 {
             sums[lane] += int_sums[lane] as f32 * packed_block.scales[lane] * input_block.scale;
         }
@@ -8436,6 +8635,42 @@ fn q8_0_packed_rows4_block_dot_scalar(
                 sums[lane] += i32::from(packed[chunk * 4 * block_len + lane * block_len + idx])
                     * i32::from(input[chunk * block_len + idx]);
             }
+        }
+    }
+    sums
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i32; 4] {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
+        _mm256_storeu_si256, _mm_loadl_epi64, _mm_loadu_si128, _mm_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
+        _mm256_storeu_si256, _mm_loadl_epi64, _mm_loadu_si128, _mm_unpacklo_epi64,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let mut sums = [0_i32; 4];
+    for chunk in 0..4usize {
+        let chunk_packed = unsafe { packed.add(chunk * 32) };
+        let input8 = unsafe { _mm_loadl_epi64(input.add(chunk * 8).cast()) };
+        let input16 = _mm_unpacklo_epi64(input8, input8);
+        let input_i16 = _mm256_cvtepi8_epi16(input16);
+
+        for pair in 0..2usize {
+            let packed16 = unsafe { _mm_loadu_si128(chunk_packed.add(pair * 16).cast()) };
+            let packed_i16 = _mm256_cvtepi8_epi16(packed16);
+            let products_i16 = _mm256_mullo_epi16(packed_i16, input_i16);
+            let pair_sums_i32 = _mm256_madd_epi16(products_i16, ones);
+            let mut lanes = [0_i32; 8];
+            unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), pair_sums_i32) };
+            sums[pair * 2] += lanes[..4].iter().sum::<i32>();
+            sums[pair * 2 + 1] += lanes[4..].iter().sum::<i32>();
         }
     }
     sums
@@ -9995,6 +10230,16 @@ mod tests {
         }
     }
 
+    fn assert_slice_close_with_tolerance(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len(), "slice length mismatch");
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (*actual - *expected).abs() <= tolerance,
+                "expected index {idx} to be within {tolerance} of {expected}, got {actual}"
+            );
+        }
+    }
+
     fn no_rope_scaling() -> RopeScaling {
         RopeScaling {
             kind: RopeScalingKind::None,
@@ -10003,6 +10248,61 @@ mod tests {
             low_freq_factor: None,
             high_freq_factor: None,
         }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_avx2_kernel_matches_scalar_dot() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+        let weight = std::array::from_fn(|idx| (idx as i8).wrapping_mul(7).wrapping_sub(59));
+        let input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(17));
+        let encoded = weight.map(|value| value as u8);
+        let expected = q8_0_block_int_dot_horizontal_sum_scalar(&weight, &input);
+
+        assert_eq!(q8_0_block_int_dot_horizontal_sum(&weight, &input), expected);
+        assert_eq!(
+            q8_0_block_int_dot_horizontal_sum_encoded(&encoded, &input),
+            expected
+        );
+        std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_avx2_packed_rows4_i8_matches_scalar_dot() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+        let packed = std::array::from_fn(|idx| (idx as i8).wrapping_mul(11).wrapping_sub(37));
+        let input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(19));
+        let expected =
+            q8_0_packed_rows4_block_dot_scalar(&packed, &input, Q8_0PackedRows4Interleave::I8);
+
+        if std::arch::is_x86_feature_detected!("avx2") {
+            let actual = unsafe { q8_0_packed_4x8_block_avx2(packed.as_ptr(), input.as_ptr()) };
+            assert_eq!(actual, expected);
+        }
+
+        let packed_block = Q8_0PackedRows4Block {
+            scales: [0.25, 0.5, 0.75, 1.25],
+            quants: packed,
+        };
+        let input_block = Q8_0Block {
+            scale: 0.125,
+            quants: input,
+        };
+        let actual = q8_0_packed_rows4_dot(
+            &[packed_block],
+            &[input_block],
+            Q8_0PackedRows4Interleave::I8,
+        );
+        for lane in 0..4 {
+            assert_eq!(
+                actual[lane],
+                expected[lane] as f32 * [0.25, 0.5, 0.75, 1.25][lane] * 0.125
+            );
+        }
+        std::env::remove_var("CAMELID_X86_Q8_KERNEL");
     }
 
     #[test]
@@ -11412,6 +11712,127 @@ mod tests {
 
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    }
+
+    #[test]
+    fn q8_0_runtime_packed_rows4_f32_fallback_handles_empty_runtime_data() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "off");
+
+        let blocks_per_row = 1;
+        let rows = 4;
+        let row_blocks: Vec<Q8_0Block> = (0..rows)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.0625,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(5).wrapping_sub(row as i8)
+                }),
+            })
+            .collect();
+        let input = CpuTensor::from_f32(
+            "input",
+            vec![1, Q8_0_BLOCK_VALUES],
+            (0..Q8_0_BLOCK_VALUES)
+                .map(|idx| (idx as f32 - 12.0) * 0.25)
+                .collect(),
+        )
+        .unwrap();
+        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_weight",
+            vec![rows, Q8_0_BLOCK_VALUES],
+            dequantized_q8_0_rows(&row_blocks),
+            row_blocks.clone(),
+        )
+        .unwrap();
+        let expected =
+            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
+
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.attn_q.weight",
+            TensorShape {
+                dims: vec![rows, Q8_0_BLOCK_VALUES],
+            },
+            Q8_0PackedRows4::from_rows(
+                rows,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &row_blocks,
+            )
+            .unwrap(),
+        );
+        assert!(packed_weight.data.is_empty());
+        assert!(packed_weight.q8_0_blocks.is_none());
+        assert!(packed_weight.q8_0_file_backing.is_none());
+
+        let actual = matmul_rhs_transposed_with_precision(&input, &packed_weight, "actual")
+            .expect("runtime-owned packed Q8 fallback must not crash when block-dot is off");
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    }
+
+    #[test]
+    fn q8_0_runtime_packed_ffn_transposed_f32_fallback_handles_empty_runtime_data() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "off");
+
+        let rows = 64;
+        let input_width = Q8_0_BLOCK_VALUES;
+        let row_blocks: Vec<Q8_0Block> = (0..rows)
+            .map(|row| Q8_0Block {
+                scale: 0.2 + row as f32 * 0.004,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(7).wrapping_add(row as i8)
+                }),
+            })
+            .collect();
+        let input = CpuTensor::from_f32(
+            "input",
+            vec![1, input_width],
+            (0..input_width)
+                .map(|idx| (idx as f32 - 8.0) * 0.125)
+                .collect(),
+        )
+        .unwrap();
+        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_ffn_gate_transposed",
+            vec![rows, input_width],
+            dequantized_q8_0_rows(&row_blocks),
+            row_blocks.clone(),
+        )
+        .unwrap();
+        let expected =
+            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
+
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_gate.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            Q8_0PackedRows4::from_rows(rows, 1, Q8_0PackedRows4Interleave::I8, &row_blocks)
+                .unwrap(),
+        );
+        assert!(packed_weight.data.is_empty());
+        assert!(packed_weight.q8_0_blocks.is_none());
+        assert!(packed_weight.q8_0_file_backing.is_none());
+
+        let actual = linear_for_role_runtime(&input, &packed_weight, "actual", "ffn gate", false)
+            .expect(
+                "transposed runtime-owned packed Q8 fallback must not crash when block-dot is off",
+            );
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
     }
 
