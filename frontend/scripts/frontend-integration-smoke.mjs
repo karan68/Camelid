@@ -345,9 +345,9 @@ try {
 
   const liveBackendIdModel = {
     ...selectedModel,
-    id: 'llama32-3b-q8-current-cc43d1115e56',
-    name: 'llama32-3b-q8-current-cc43d1115e56',
-    runtime_model_name: 'llama32-3b-q8-current-cc43d1115e56',
+    id: 'scalar_default_rerun',
+    name: 'scalar_default_rerun',
+    runtime_model_name: 'scalar_default_rerun',
   }
   const liveBackendIdRuntime = { ...readyRuntime, active_model_id: liveBackendIdModel.id }
   const liveBackendIdChatGate = getChatGateState(capabilities, liveBackendIdModel, liveBackendIdRuntime)

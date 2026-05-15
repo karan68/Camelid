@@ -397,6 +397,23 @@ assert.equal(
   true,
   'Llama 3.2 3B exact rows should unlock supported WebUI chat when runtime-green',
 )
+const liveScalarThreeBModel = {
+  ...localLoadedReady,
+  id: 'scalar_default_rerun',
+  name: 'scalar_default_rerun',
+  runtime_model_name: 'scalar_default_rerun',
+  model_path: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  quant: 'file_type 7',
+}
+const liveScalarThreeBGate = getChatGateState(capabilityFixture, liveScalarThreeBModel, { active_model_id: 'scalar_default_rerun', loaded_now: true, generation_ready: true })
+assert.equal(liveScalarThreeBGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'canonical Ubuntu 3B runtime ids like scalar_default_rerun should resolve to the exact 3B row from GGUF path + file_type 7 evidence')
+assert.equal(liveScalarThreeBGate.runtimeReady, true, 'canonical Ubuntu 3B runtime health should remain visible when active_model_id is a backend run label')
+assert.equal(liveScalarThreeBGate.chatUnlocked, true, 'canonical Ubuntu 3B backend run labels should unlock only when path, Q8_0 file_type, active_model_id, loaded_now, and generation_ready are all green')
+assert.equal(
+  getChatGateState(capabilityFixture, { ...liveScalarThreeBModel, quant: 'Q4_K_M' }, { active_model_id: 'scalar_default_rerun', loaded_now: true, generation_ready: true }).chatUnlocked,
+  false,
+  'canonical Ubuntu 3B runtime labels must still fail closed when explicit quant evidence disagrees with the supported Q8_0 row',
+)
 const llama3EightBHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct Q8_0', quant: 'Q8_0' })
 assert.equal(llama3EightBHint.target.id, 'llama3_8b_instruct_q8_0', 'Llama 3 8B must match its exact supported row')
 assert.match(compatibilityHintCopy(llama3EightBHint), /checked 512\/1024\/2048-context packs, compact template-shapes pack evidence, bounded memory\/hot-path measurements, and current-head 1024\/2048 PASS evidence/)
