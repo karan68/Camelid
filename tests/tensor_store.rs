@@ -134,9 +134,18 @@ fn mac_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate() {
     let store = TensorStore::open(&path, &gguf);
     let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
 
-    assert!(tensor.data.is_empty(), "{tensor_name} materialized f32 data");
-    assert!(tensor.q8_0_blocks.is_none(), "{tensor_name} kept q8_0 blocks");
-    assert!(tensor.q8_0_file_backing.is_none(), "{tensor_name} kept file backing");
+    assert!(
+        tensor.data.is_empty(),
+        "{tensor_name} materialized f32 data"
+    );
+    assert!(
+        tensor.q8_0_blocks.is_none(),
+        "{tensor_name} kept q8_0 blocks"
+    );
+    assert!(
+        tensor.q8_0_file_backing.is_none(),
+        "{tensor_name} kept file backing"
+    );
     assert!(tensor.q8_0_packed_rows4_4x4.is_none());
     assert!(tensor.q8_0_packed_rows4_4x8.is_none());
     let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
@@ -144,9 +153,18 @@ fn mac_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate() {
     assert_eq!(packed.blocks_per_row, 1, "{tensor_name}");
 
     let block_backed_tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
-    assert!(block_backed_tensor.data.is_empty(), "{tensor_name} block-backed materialized f32 data");
-    assert!(block_backed_tensor.q8_0_blocks.is_none(), "{tensor_name} block-backed kept q8_0 blocks");
-    assert!(block_backed_tensor.q8_0_file_backing.is_none(), "{tensor_name} block-backed kept file backing");
+    assert!(
+        block_backed_tensor.data.is_empty(),
+        "{tensor_name} block-backed materialized f32 data"
+    );
+    assert!(
+        block_backed_tensor.q8_0_blocks.is_none(),
+        "{tensor_name} block-backed kept q8_0 blocks"
+    );
+    assert!(
+        block_backed_tensor.q8_0_file_backing.is_none(),
+        "{tensor_name} block-backed kept file backing"
+    );
     assert!(block_backed_tensor.q8_0_packed_rows4_4x4.is_none());
     assert!(block_backed_tensor.q8_0_packed_rows4_4x8.is_none());
     let Q8_0RuntimeStorage::PackedRows4(packed) = block_backed_tensor.q8_0_runtime_storage.unwrap();
@@ -176,12 +194,24 @@ fn mac_q8_repack_keeps_attention_kv_on_non_runtime_packed_paths_until_dispatch_i
         let gguf = read_metadata(&path).unwrap();
         let store = TensorStore::open(&path, &gguf);
         let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
-        assert!(tensor.q8_0_runtime_storage.is_none(), "{tensor_name} should not be runtime-packed on Mac auto path");
-        assert!(tensor.q8_0_file_backing.is_some(), "{tensor_name} should stay file-backed when runtime-packed dispatch is not proven");
+        assert!(
+            tensor.q8_0_runtime_storage.is_none(),
+            "{tensor_name} should not be runtime-packed on Mac auto path"
+        );
+        assert!(
+            tensor.q8_0_file_backing.is_some(),
+            "{tensor_name} should stay file-backed when runtime-packed dispatch is not proven"
+        );
 
         let block_backed_tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
-        assert!(block_backed_tensor.q8_0_runtime_storage.is_none(), "{tensor_name} block-backed should not be runtime-packed on Mac auto path");
-        assert!(block_backed_tensor.q8_0_blocks.is_some(), "{tensor_name} block-backed path should retain q8 blocks");
+        assert!(
+            block_backed_tensor.q8_0_runtime_storage.is_none(),
+            "{tensor_name} block-backed should not be runtime-packed on Mac auto path"
+        );
+        assert!(
+            block_backed_tensor.q8_0_blocks.is_some(),
+            "{tensor_name} block-backed path should retain q8 blocks"
+        );
     }
 
     std::env::remove_var("CAMELID_MAC_Q8_REPACK");

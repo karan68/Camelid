@@ -12,6 +12,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_FORWARD_RSS_TIMINGS",
     "CAMELID_X86_Q8_REPACK",
     "CAMELID_X86_Q8_KERNEL",
+    "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
 ];
 
 pub const MAC_Q8_PREFILL_I8MM_MIN_ROWS: usize = 4;
@@ -142,30 +143,29 @@ pub fn plan_for_model_with_platform(
         prefill_runtime_policy,
         decode_path,
         fallback_path,
-    ) =
-        if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
-            if platform.operating_system == "macos" && platform.architecture == "aarch64" {
-                select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
-            } else if platform.operating_system == "linux" && platform.architecture == "x86_64" {
-                select_linux_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
-            } else {
-                reasons.push(
+    ) = if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
+        if platform.operating_system == "macos" && platform.architecture == "aarch64" {
+            select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+        } else if platform.operating_system == "linux" && platform.architecture == "x86_64" {
+            select_linux_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+        } else {
+            reasons.push(
                     "no validated platform-specific Q8_0 plan for this OS/arch; failing closed to safe path"
                         .into(),
                 );
-                safe_q8_plan()
-            }
-        } else {
-            reasons.push("non-validated row or quant; failing closed to safe path".into());
-            (
-                "cpu_reference",
-                "safe_dense_or_q8_cpu",
-                "safe_cpu_prefill",
-                "always_retained_reference_path",
-                "safe_cpu_decode",
-                "safe_cpu_reference_path",
-            )
-        };
+            safe_q8_plan()
+        }
+    } else {
+        reasons.push("non-validated row or quant; failing closed to safe path".into());
+        (
+            "cpu_reference",
+            "safe_dense_or_q8_cpu",
+            "safe_cpu_prefill",
+            "always_retained_reference_path",
+            "safe_cpu_decode",
+            "safe_cpu_reference_path",
+        )
+    };
 
     let plan = ExecutionPlan {
         profile,
@@ -381,9 +381,8 @@ fn support_level(row: &str) -> String {
         "supported_current_gate".into()
     } else if normalized.contains("llama_3_2_1b_instruct") {
         "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
-    } else if normalized.contains("llama_3_2_3b_instruct") {
-        "supported_exact_row_smoke_512_1024_2048".into()
-    } else if normalized.contains("llama_3_8b_instruct")
+    } else if normalized.contains("llama_3_2_3b_instruct")
+        || normalized.contains("llama_3_8b_instruct")
         || normalized.contains("meta_llama_3_8b_instruct")
     {
         "supported_exact_row_smoke_512_1024_2048".into()
@@ -651,6 +650,7 @@ mod tests {
             "CAMELID_MAC_Q8_SCHED",
             "CAMELID_X86_Q8_REPACK",
             "CAMELID_X86_Q8_KERNEL",
+            "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
         ] {
             env::remove_var(key);
         }
@@ -669,7 +669,10 @@ mod tests {
         );
         assert_eq!(outcome.plan.profile, ExecutionProfile::Safe);
         assert_eq!(outcome.plan.selected_backend, "cpu_reference");
-        assert_eq!(outcome.plan.prefill_runtime_policy, "always_retained_reference_path");
+        assert_eq!(
+            outcome.plan.prefill_runtime_policy,
+            "always_retained_reference_path"
+        );
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
         clear_profile_env();
     }
@@ -686,8 +689,14 @@ mod tests {
         );
         assert_eq!(outcome.plan.profile, ExecutionProfile::Auto);
         assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
-        assert_eq!(outcome.plan.prefill_path, "q8_0_direct_pack_prefill_i8mm_available");
-        assert_eq!(outcome.plan.prefill_runtime_policy, "enabled_when_prefill_rows_gte_4");
+        assert_eq!(
+            outcome.plan.prefill_path,
+            "q8_0_direct_pack_prefill_i8mm_available"
+        );
+        assert_eq!(
+            outcome.plan.prefill_runtime_policy,
+            "enabled_when_prefill_rows_gte_4"
+        );
         assert_eq!(
             outcome.env_updates.get("CAMELID_PARALLEL_LINEAR"),
             Some(&Some("on"))
@@ -724,7 +733,10 @@ mod tests {
             outcome.plan.prefill_path,
             "q8_0_experimental_packed_prefill_i8mm_available"
         );
-        assert_eq!(outcome.plan.prefill_runtime_policy, "enabled_when_prefill_rows_gte_4");
+        assert_eq!(
+            outcome.plan.prefill_runtime_policy,
+            "enabled_when_prefill_rows_gte_4"
+        );
         assert_eq!(
             outcome.env_updates.get("CAMELID_MAC_Q8_SCHED"),
             Some(&Some("packed_prefill"))
@@ -751,15 +763,30 @@ mod tests {
             platform("macos", "aarch64", &["dotprod", "i8mm"]),
         );
         assert_eq!(default_outcome.plan.profile, explicit_outcome.plan.profile);
-        assert_eq!(default_outcome.plan.selected_backend, explicit_outcome.plan.selected_backend);
-        assert_eq!(default_outcome.plan.selected_q8_path, explicit_outcome.plan.selected_q8_path);
-        assert_eq!(default_outcome.plan.prefill_path, explicit_outcome.plan.prefill_path);
+        assert_eq!(
+            default_outcome.plan.selected_backend,
+            explicit_outcome.plan.selected_backend
+        );
+        assert_eq!(
+            default_outcome.plan.selected_q8_path,
+            explicit_outcome.plan.selected_q8_path
+        );
+        assert_eq!(
+            default_outcome.plan.prefill_path,
+            explicit_outcome.plan.prefill_path
+        );
         assert_eq!(
             default_outcome.plan.prefill_runtime_policy,
             explicit_outcome.plan.prefill_runtime_policy
         );
-        assert_eq!(default_outcome.plan.decode_path, explicit_outcome.plan.decode_path);
-        assert_eq!(default_outcome.plan.fallback_path, explicit_outcome.plan.fallback_path);
+        assert_eq!(
+            default_outcome.plan.decode_path,
+            explicit_outcome.plan.decode_path
+        );
+        assert_eq!(
+            default_outcome.plan.fallback_path,
+            explicit_outcome.plan.fallback_path
+        );
         assert_eq!(default_outcome.env_updates, explicit_outcome.env_updates);
         clear_profile_env();
     }

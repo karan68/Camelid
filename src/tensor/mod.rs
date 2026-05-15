@@ -208,10 +208,10 @@ impl Q8_0PackedRows4 {
             for block_idx in 0..blocks_per_row {
                 let mut scales = [0.0_f32; 4];
                 let mut quants = [0_i8; 128];
-                for lane in 0..4 {
+                for (lane, scale) in scales.iter_mut().enumerate() {
                     let source_block = (row_group + lane) * blocks_per_row + block_idx;
                     let source_start = source_block * Q8_0_BLOCK_BYTES;
-                    scales[lane] = f16_bits_to_f32(u16::from_le_bytes([
+                    *scale = f16_bits_to_f32(u16::from_le_bytes([
                         q8_0_bytes[source_start],
                         q8_0_bytes[source_start + 1],
                     ]));
