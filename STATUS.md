@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-05-14
+Last updated: 2026-05-15
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
 
@@ -56,6 +56,28 @@ Two standing rules apply to every row:
 For the formal support ledger, see [`COMPATIBILITY.md`](COMPATIBILITY.md). For sequencing, see [`ROADMAP.md`](ROADMAP.md).
 
 Bottom line for reviewers: Camelid has the original TinyLlama verified support gate plus three exact Llama Q8_0 rows with verified support within validated bounds. Mixtral remains partial runtime evidence only until later-generation divergence and API/WebUI/frontend readiness blockers close.
+
+## Ubuntu x86 Q8 acceleration update
+
+Recent Ubuntu x86 Q8 work has significantly improved the experimental accelerated path while keeping the default/reference path intact. The current work focuses on packed Q8 runtime storage, matrix-level execution, and AVX2 packed kernels. These paths remain default-off while validation continues; they are production-directional, not production-ready.
+
+Current public takeaways:
+
+- The retained Ubuntu x86 Q8 candidate remains a **default-off** acceleration path guarded by `CAMELID_X86_Q8_REPACK=on` plus the measured AVX2 kernel/runtime gates used in the current Ubuntu lane.
+- Packed Q8 runtime storage now covers the dense attention projection family plus FFN gate/up/down rows for the measured Llama 3.2 3B Instruct Q8_0 lane, while preserving the safe fallback path when gates are absent or disabled.
+- Evidence bundles now include parity checks, repeated timing discipline, perf counters, hot-symbol captures, explicit reject notes for non-retained experiments, and cold-vs-warm request evidence.
+- Rejected Ubuntu x86 Q8 candidates are being documented instead of hidden; no claimed win is retained unless it survives repeated confirmation with checksum/text preservation on a clean host.
+- The cold/warm split is now explicit in the evidence: `from_q8_0_bytes` is a cold/reload materialization cost on this lane, not the warm decode bottleneck.
+- The active warm-path direction has shifted from leaf row-dot tuning toward matrix-level Q8 GEMM/MUL_MAT ownership, starting with deeper FFN ownership slices.
+
+Boundaries that remain in force:
+
+- No default-on acceleration claim.
+- No broad production-throughput claim.
+- No portability claim beyond the measured Ubuntu x86_64 lane.
+- No broader model-family or neighboring-row support claim from this work alone.
+
+Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8-progress-20260515.md`](docs/performance/ubuntu-x86-q8-progress-20260515.md).
 
 ## Durable evidence anchors
 

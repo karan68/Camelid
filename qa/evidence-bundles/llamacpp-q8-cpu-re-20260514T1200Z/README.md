@@ -1,4 +1,4 @@
-# llama.cpp Ubuntu x86_64 Q8_0 CPU reverse engineering — Llama 3.2 3B Instruct Q8_0
+# Ubuntu x86_64 Q8_0 CPU performance investigation — Llama 3.2 3B Instruct Q8_0
 
 Generated: 2026-05-14 UTC
 LANE: `UBUNTU_X86_Q8`
