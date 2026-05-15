@@ -1,5 +1,6 @@
 pub mod api;
 pub mod error;
+pub mod execution_plan;
 pub mod gguf;
 pub mod inference;
 pub mod metal;

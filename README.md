@@ -145,7 +145,7 @@ Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The curren
 
 ## Quickstart
 
-This quickstart verifies that Camelid builds cleanly, starts the backend, and returns a live API response. It is intentionally simple and honest: the repository does not bundle supported GGUF model files, so full local chat requires one additional setup step after the server is running.
+This quickstart verifies that Camelid builds cleanly, starts the backend, and returns a live API response. It is intentionally simple and honest: the repository does not bundle supported GGUF model files, so full local chat requires a supported GGUF already present on your machine.
 
 ### 1) Build and run the server
 
@@ -153,6 +153,14 @@ This quickstart verifies that Camelid builds cleanly, starts the backend, and re
 git checkout main
 git pull --ff-only
 cargo build --release --bin camelid
+target/release/camelid serve --model /path/to/model.gguf
+```
+
+`serve --model` loads the model at startup and lets Camelid choose the safest validated execution plan for the current host. The default profile is `auto`; low-level environment variables remain developer overrides, not normal setup.
+
+If you only want to bring up the API without a model:
+
+```bash
 target/release/camelid serve --addr 127.0.0.1:8181
 ```
 
@@ -173,10 +181,10 @@ Success looks like a live JSON capability response from Camelid. That confirms t
 You will need:
 
 - a supported GGUF model file already present on your machine
-- the model path wired into a load request you control
+- the model path passed with `--model`, or loaded later through the model API/UI
 - any extra contributor setup described in [`docs/CONTRIBUTOR_QUICKSTART.md`](docs/CONTRIBUTOR_QUICKSTART.md) and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)
 
-For a first supported local run, TinyLlama is the clearest path. It is **not bundled** in this repository, but once you have a supported GGUF locally and a load request wired in, Camelid is designed to make the readiness boundary explicit instead of guessing.
+For a first supported local run, TinyLlama is the clearest path. It is **not bundled** in this repository, but once you have a supported GGUF locally, Camelid is designed to make the readiness boundary explicit instead of guessing.
 
 ## Frontend
 
