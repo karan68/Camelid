@@ -35,8 +35,8 @@ if (args.has('help') || args.has('h')) {
 }
 
 const benchmarkMessages = [
-  { role: 'system', content: 'You are Camelid benchmark mode. Reply with concise factual text only.' },
-  { role: 'user', content: 'Give a short three-line summary of why exact-row parity matters for local inference, and end the last line with the marker CMLD-BENCH.' },
+  { role: 'system', content: 'You are Camelid benchmark mode. Reply with the exact requested text and nothing else.' },
+  { role: 'user', content: 'Reply with exactly this single line and nothing else: CMLD-BENCH' },
 ]
 
 const expectedPrompt = renderExpectedPrompt(benchmarkMessages, renderMode)
@@ -65,8 +65,12 @@ let backendChild = null
 let llamaChild = null
 let backendSpawnError = null
 let llamaSpawnError = null
+let backendStartupMs = null
+let llamaStartupMs = null
+let camelidModelLoadMs = null
 
 try {
+  const backendStart = performance.now()
   if (startBackend) {
     const url = new URL(backendBase)
     backendChild = spawn(backendBin, ['serve', '--addr', `${url.hostname}:${url.port || '8181'}`], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -75,6 +79,7 @@ try {
     backendChild.stderr.on('data', (chunk) => process.stderr.write(`[camelid] ${chunk}`))
   }
 
+  const llamaStart = performance.now()
   if (startLlamaServer) {
     const url = new URL(llamaBase)
     const llamaArgs = ['--host', url.hostname, '--port', url.port || '8183', '-m', modelPath, '-ngl', '0', '-c', String(llamaContext), '--no-warmup']
@@ -86,20 +91,24 @@ try {
   }
 
   await waitForJson(`${backendBase}/v1/health`, {}, 'camelid', waitMs)
+  backendStartupMs = round(performance.now() - backendStart)
   await waitForJson(`${llamaBase}/health`, {}, 'llama-server', waitMs).catch((err) => {
     if (llamaSpawnError?.code === 'ENOENT') {
       throw new Error(`could not start llama-server binary ${JSON.stringify(llamaServerBin)}`)
     }
     throw err
   })
+  llamaStartupMs = round(performance.now() - llamaStart)
   if (backendSpawnError?.code === 'ENOENT') {
     throw new Error(`could not start Camelid binary ${JSON.stringify(backendBin)}`)
   }
 
+  const loadStarted = performance.now()
   await fetchJson(`${backendBase}/api/models/load`, {
     method: 'POST',
     body: JSON.stringify({ path: modelPath, id: modelId }),
   })
+  camelidModelLoadMs = round(performance.now() - loadStarted)
 
   const camelidWarmups = []
   const llamaWarmups = []
@@ -112,9 +121,15 @@ try {
 
   const camelidRuns = []
   const llamaRuns = []
+  const measuredOrder = []
   for (let i = 0; i < repeats; i += 1) {
-    camelidRuns.push(await runCamelidStream(i, 'measure'))
-    llamaRuns.push(await runLlamaStream(i, 'measure'))
+    const camelidRun = await runCamelidStream(i, 'measure')
+    camelidRuns.push(camelidRun)
+    measuredOrder.push({ engine: 'camelid', label: camelidRun.label })
+
+    const llamaRun = await runLlamaStream(i, 'measure')
+    llamaRuns.push(llamaRun)
+    measuredOrder.push({ engine: 'llama_cpp', label: llamaRun.label })
   }
 
   const afterMeasuredSnapshot = await captureResourceSnapshot('after_measured_runs')
@@ -143,13 +158,23 @@ try {
       commands: buildPlan().commands,
       outputs: buildPlan().outputs,
       bounded_metrics: boundedMetrics(),
+      server_lifecycle: {
+        camelid_started_by_harness: startBackend,
+        llama_started_by_harness: startLlamaServer,
+        camelid_startup_ms: backendStartupMs,
+        llama_startup_ms: llamaStartupMs,
+        camelid_model_load_ms: camelidModelLoadMs,
+        camelid_model_preloaded: !startBackend,
+        llama_model_preloaded: !startLlamaServer,
+      },
       evidence_context: evidenceContext,
       resource_snapshots: {
         pre_start: preStartSnapshot,
         before_measured_runs: beforeMeasuredSnapshot,
         after_measured_runs: afterMeasuredSnapshot,
       },
-      note: 'Same-host comparison using streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens.',
+      measured_order: measuredOrder,
+      note: 'Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens.',
     },
     camelid: {
       base_url: backendBase,
@@ -234,6 +259,7 @@ function buildPlan() {
       ],
       json: 'Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.',
       guardrail: `marker_presence=${expectedMarker}; pass/fail is recorded under guardrails and can be enforced with --require-marker`,
+      lifecycle: 'Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded.',
     },
     claim_boundary: claimBoundary(),
   }
@@ -249,6 +275,7 @@ function boundedMetrics() {
     'decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content',
     'marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker',
     'resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs',
+    'server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior',
   ]
 }
 
@@ -446,13 +473,14 @@ function printHumanSummary(report) {
 }
 
 function benchmarkGuardrails(camelidRuns, llamaRuns) {
-  const markerStatus = (runs) => runs.map((run) => ({
+  const runStatus = (runs) => runs.map((run) => ({
     label: run.label,
     contains_expected_marker: String(run.text || '').includes(expectedMarker),
+    nonempty_streamed_output: Boolean(String(run.text || '').trim()) && (run.completion_tokens_estimate || 0) > 0,
   }))
-  const camelid = markerStatus(camelidRuns)
-  const llamaCpp = markerStatus(llamaRuns)
-  const passed = [...camelid, ...llamaCpp].every((item) => item.contains_expected_marker)
+  const camelid = runStatus(camelidRuns)
+  const llamaCpp = runStatus(llamaRuns)
+  const passed = [...camelid, ...llamaCpp].every((item) => item.contains_expected_marker && item.nonempty_streamed_output)
   return {
     expected_marker: expectedMarker,
     require_marker: requireMarker,
@@ -462,8 +490,8 @@ function benchmarkGuardrails(camelidRuns, llamaRuns) {
     },
     passed,
     note: requireMarker
-      ? 'The harness exits non-zero if any measured run omits the expected marker.'
-      : 'Marker presence is recorded for deterministic-output hygiene but is not enforced unless --require-marker is set.',
+      ? 'The harness exits non-zero if any measured run omits the expected marker; empty measured output is always treated as a failed guardrail.'
+      : 'Marker presence and non-empty streamed output are recorded for deterministic-output hygiene; empty measured output always fails the recorded guardrail even when marker enforcement is not requested.',
   }
 }
 

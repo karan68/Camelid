@@ -17,6 +17,7 @@ use std::{
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 
 const Q8_SCHEDULE_TELEMETRY_ENV: &str = "CAMELID_Q8_SCHED_TELEMETRY";
@@ -4521,6 +4522,12 @@ fn linear_for_role_runtime(
     if collect_diagnostics {
         linear_for_role(input, weight, name, rectangular_role)
     } else {
+        let name = name.into();
+        if let Some(output) =
+            try_x86_q8_ffn_down_decode_owner_path(input, weight, &name, rectangular_role)?
+        {
+            return Ok(output);
+        }
         linear_with_diagnostic_layouts(
             input,
             weight,
@@ -6831,6 +6838,67 @@ impl BorrowedQuantizedQ8_0Rows<'_> {
     }
 }
 
+fn x86_q8_ffn_down_decode_owner_enabled() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        env_flag_enabled("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER")
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+fn try_x86_q8_ffn_down_decode_owner_path(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+) -> Result<Option<CpuTensor>> {
+    if !x86_q8_ffn_down_decode_owner_enabled()
+        || rectangular_role != "ffn_down"
+        || input.rank() != 2
+        || input.dim(0)? != 1
+        || weight.source_type != Some(GgufTensorType::Q8_0)
+    {
+        return Ok(None);
+    }
+    let input_width = input.dim(1)?;
+    let output_width = linear_output_width(input, weight, rectangular_role)?;
+    let borrowed = if weight.dim(1)? == input_width {
+        BorrowedLinearWeight::from_tensor(weight)?
+    } else if weight.dim(0)? == input_width {
+        BorrowedLinearWeight::from_tensor(weight)?.with_swapped_matrix_shape()
+    } else {
+        return Ok(None);
+    };
+    let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
+        return Ok(None);
+    };
+    if interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || !input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
+        || !output_width.is_multiple_of(4)
+    {
+        return Ok(None);
+    }
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let mut output = vec![0.0_f32; output_width];
+    let blocks_per_row = packed.blocks_per_row;
+    for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate() {
+        let group_blocks =
+            &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+        let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
+        output_chunk.copy_from_slice(&sums);
+    }
+    Ok(Some(CpuTensor::from_f32(
+        name,
+        vec![1, output_width],
+        output,
+    )?))
+}
+
 fn matmul_rhs_transposed_q8_0_block_dot(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -6870,7 +6938,7 @@ fn matmul_rhs_transposed_q8_0_block_dot(
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if mac_q8_prefill_i8mm_enabled() && rows >= 4 {
+    if mac_q8_prefill_i8mm_enabled() && mac_q8_prefill_i8mm_row_threshold_met(rows) {
         if let Some((packed, Q8_0PackedRows4Interleave::I8)) = q8_0_selected_packed_rows4(weight) {
             if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
                 return matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
@@ -8862,6 +8930,11 @@ fn mac_q8_prefill_i8mm_enabled() -> bool {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mac_q8_prefill_i8mm_row_threshold_met(rows: usize) -> bool {
+    rows >= MAC_Q8_PREFILL_I8MM_MIN_ROWS
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn mac_q8_sched_packed_prefill_enabled() -> bool {
     env::var("CAMELID_MAC_Q8_SCHED")
         .map(|value| value.trim().eq_ignore_ascii_case("packed_prefill"))
@@ -8979,13 +9052,13 @@ fn quantize_pack_q8_0_rows4_i8_direct_into(
         for block_idx in 0..blocks_per_row {
             let mut scales = [0.0_f32; 4];
             let mut quants = [0_i8; 128];
-            for lane in 0..4 {
+            for (lane, scale) in scales.iter_mut().enumerate() {
                 let row_start = (row_group + lane) * input_width;
                 let block_start = row_start + block_idx * Q8_0_BLOCK_VALUES;
                 let block = quantize_q8_0_block(
                     &row_major_input[block_start..block_start + Q8_0_BLOCK_VALUES],
                 );
-                scales[lane] = block.scale;
+                *scale = block.scale;
                 for chunk in 0..4 {
                     let src_start = chunk * 8;
                     let dst_start = chunk * 32 + lane * 8;
@@ -9221,9 +9294,9 @@ fn accumulate_q8_0_packed_rows4_f32_input(
                 let lane_offset = idx % block_len;
                 let packed_chunk_start = chunk * 4 * block_len;
                 let input_value = input_row[input_block_start + idx];
-                for lane in 0..4 {
+                for (lane, sum) in sums.iter_mut().enumerate() {
                     let packed_idx = packed_chunk_start + lane * block_len + lane_offset;
-                    sums[lane] += input_value
+                    *sum += input_value
                         * f32::from(packed_block.quants[packed_idx])
                         * packed_block.scales[lane];
                 }
@@ -12532,12 +12605,114 @@ mod tests {
     }
 
     #[test]
-    fn q8_0_runtime_packed_ffn_gate_transposed_view_matches_retained_blocks() {
+    fn transposed_runtime_packed_attention_k_without_row_major_data_returns_error_instead_of_panicking(
+    ) {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "off");
+        std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+
+        let input_width = Q8_0_BLOCK_VALUES;
+        let kv_width = 16;
+        let rows = input_width;
+        let blocks: Vec<Q8_0Block> = (0..rows)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.00390625,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(3).wrapping_add(row as i8)
+                }),
+            })
+            .collect();
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.attn_k.weight",
+            TensorShape {
+                dims: vec![input_width, kv_width],
+            },
+            Q8_0PackedRows4::from_rows(rows, 1, Q8_0PackedRows4Interleave::I8, &blocks).unwrap(),
+        );
+        let input = CpuTensor::from_f32(
+            "input",
+            vec![1, input_width],
+            (0..input_width)
+                .map(|idx| (idx as f32 - 16.0) * 0.125)
+                .collect(),
+        )
+        .unwrap();
+
+        let outcome = std::panic::catch_unwind(|| {
+            linear_for_role_runtime(&input, &packed_weight, "actual", "attention k", false)
+        });
+        assert!(
+            outcome.is_ok(),
+            "runtime-packed K tensor must not panic when row-major data is empty"
+        );
+        let err = outcome.unwrap().expect_err(
+            "transposed runtime-packed attention K should be rejected unless a matching packed consumer path is available",
+        );
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains(
+                "matmul rhs-transposed rhs cannot read tensor blk.0.attn_k.weight as row-major f32"
+            ),
+            "{err_text}"
+        );
+        assert!(err_text.contains("storage=no-row-major-data"), "{err_text}");
+
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    }
+
+    fn assert_q8_0_runtime_packed_ffn_transposed_view_matches_retained_blocks(
+        tensor_name: &str,
+        role_name: &str,
+        descriptor_dims: Vec<usize>,
+        rows: usize,
+        input_width: usize,
+        row_blocks: Vec<Q8_0Block>,
+        input_values: Vec<f32>,
+    ) {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
         std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
         std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
 
+        let input = CpuTensor::from_f32("input", vec![1, input_width], input_values).unwrap();
+        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            format!("retained_{role_name}_transposed"),
+            vec![rows, input_width],
+            dequantized_q8_0_rows(&row_blocks),
+            row_blocks.clone(),
+        )
+        .unwrap();
+        let expected =
+            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
+
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            tensor_name,
+            TensorShape {
+                dims: descriptor_dims,
+            },
+            Q8_0PackedRows4::from_rows(
+                rows,
+                input_width / Q8_0_BLOCK_VALUES,
+                Q8_0PackedRows4Interleave::I8,
+                &row_blocks,
+            )
+            .unwrap(),
+        );
+        let actual =
+            linear_for_role_runtime(&input, &packed_weight, "actual", role_name, false).unwrap();
+
+        assert_slice_close(&actual.data, &expected.data);
+        assert!(packed_weight.q8_0_blocks.is_none());
+        assert!(packed_weight.q8_0_file_backing.is_none());
+
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    }
+
+    #[test]
+    fn q8_0_runtime_packed_ffn_gate_transposed_view_matches_retained_blocks() {
         let rows = 64;
         let input_width = Q8_0_BLOCK_VALUES;
         let row_blocks: Vec<Q8_0Block> = (0..rows)
@@ -12548,40 +12723,94 @@ mod tests {
                 }),
             })
             .collect();
+        assert_q8_0_runtime_packed_ffn_transposed_view_matches_retained_blocks(
+            "blk.0.ffn_gate.weight",
+            "ffn gate",
+            vec![input_width, rows],
+            rows,
+            input_width,
+            row_blocks,
+            (0..input_width)
+                .map(|idx| (idx as f32 - 12.0) * 0.25)
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn q8_0_runtime_packed_ffn_down_transposed_view_matches_retained_blocks() {
+        let rows = 32;
+        let input_width = Q8_0_BLOCK_VALUES * 2;
+        let row_blocks: Vec<Q8_0Block> = (0..rows * 2)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.006,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(9).wrapping_sub(row as i8)
+                }),
+            })
+            .collect();
+        assert_q8_0_runtime_packed_ffn_transposed_view_matches_retained_blocks(
+            "blk.0.ffn_down.weight",
+            "ffn_down",
+            vec![input_width, rows],
+            rows,
+            input_width,
+            row_blocks,
+            (0..input_width)
+                .map(|idx| (idx as f32 - 16.0) * 0.1875)
+                .collect(),
+        );
+    }
+
+    #[test]
+    fn x86_q8_ffn_down_decode_owner_path_matches_runtime_packed_baseline() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
+        std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", "on");
+
+        let rows = 32;
+        let input_width = Q8_0_BLOCK_VALUES * 2;
+        let row_blocks: Vec<Q8_0Block> = (0..rows * 2)
+            .map(|row| Q8_0Block {
+                scale: 0.125 + row as f32 * 0.006,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(9).wrapping_sub(row as i8)
+                }),
+            })
+            .collect();
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            Q8_0PackedRows4::from_rows(
+                rows,
+                input_width / Q8_0_BLOCK_VALUES,
+                Q8_0PackedRows4Interleave::I8,
+                &row_blocks,
+            )
+            .unwrap(),
+        );
         let input = CpuTensor::from_f32(
             "input",
             vec![1, input_width],
             (0..input_width)
-                .map(|idx| (idx as f32 - 12.0) * 0.25)
+                .map(|idx| (idx as f32 - 16.0) * 0.1875)
                 .collect(),
         )
         .unwrap();
-        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
-            "retained_ffn_gate_transposed",
-            vec![rows, input_width],
-            dequantized_q8_0_rows(&row_blocks),
-            row_blocks.clone(),
-        )
-        .unwrap();
-        let expected =
-            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
 
-        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
-            "blk.0.ffn_gate.weight",
-            TensorShape {
-                dims: vec![input_width, rows],
-            },
-            Q8_0PackedRows4::from_rows(rows, 1, Q8_0PackedRows4Interleave::I8, &row_blocks)
-                .unwrap(),
-        );
-        let actual =
-            linear_for_role_runtime(&input, &packed_weight, "actual", "ffn gate", false).unwrap();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER");
+        let baseline =
+            linear_for_role_runtime(&input, &packed_weight, "baseline", "ffn_down", false).unwrap();
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", "on");
+        let owned =
+            linear_for_role_runtime(&input, &packed_weight, "owned", "ffn_down", false).unwrap();
+        assert_eq!(owned.data, baseline.data);
 
-        assert_slice_close(&actual.data, &expected.data);
-        assert!(packed_weight.q8_0_blocks.is_none());
-        assert!(packed_weight.q8_0_file_backing.is_none());
-
-        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER");
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
     }
 
@@ -12715,6 +12944,17 @@ mod tests {
         std::env::remove_var("CAMELID_MAC_Q8_PREFILL_I8MM");
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn q8_0_runtime_packed_prefill_i8mm_respects_min_row_threshold() {
+        assert!(!mac_q8_prefill_i8mm_row_threshold_met(
+            MAC_Q8_PREFILL_I8MM_MIN_ROWS - 1
+        ));
+        assert!(mac_q8_prefill_i8mm_row_threshold_met(
+            MAC_Q8_PREFILL_I8MM_MIN_ROWS
+        ));
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

@@ -51,7 +51,7 @@ const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
-const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 2048;
+const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
 const JINJA_CHAT_TEMPLATE_NAME: &str = "chat";
 const JINJA_CHAT_TEMPLATE_CACHE_LIMIT: usize = 16;
 
@@ -1403,6 +1403,7 @@ fn log_selected_execution_plan(plan: &ExecutionPlan) {
         backend=%plan.selected_backend,
         q8_path=%plan.selected_q8_path,
         prefill_path=%plan.prefill_path,
+        prefill_runtime_policy=%plan.prefill_runtime_policy,
         decode_path=%plan.decode_path,
         threads=plan.thread_count,
         diagnostics=%plan.diagnostics_status,
@@ -4120,6 +4121,7 @@ mod tests {
             selected_backend: "cpu_q8_runtime_repack".into(),
             selected_q8_path: "x86_experimental_q8_0_avx2".into(),
             prefill_path: "q8_0_x86_avx2_tiled_gemm_experimental".into(),
+            prefill_runtime_policy: "manual_override_only".into(),
             decode_path: "q8_0_decode_avx2".into(),
             thread_count: 16,
             diagnostics_status: "standard diagnostics; RSS timings disabled by default".into(),

@@ -12,7 +12,10 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_FORWARD_RSS_TIMINGS",
     "CAMELID_X86_Q8_REPACK",
     "CAMELID_X86_Q8_KERNEL",
+    "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
 ];
+
+pub const MAC_Q8_PREFILL_I8MM_MIN_ROWS: usize = 4;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +41,7 @@ pub struct ExecutionPlan {
     pub selected_backend: String,
     pub selected_q8_path: String,
     pub prefill_path: String,
+    pub prefill_runtime_policy: String,
     pub decode_path: String,
     pub thread_count: usize,
     pub diagnostics_status: String,
@@ -132,29 +136,36 @@ pub fn plan_for_model_with_platform(
         env_updates.insert("CAMELID_FORWARD_RSS_TIMINGS", Some("on"));
     }
 
-    let (selected_backend, selected_q8_path, prefill_path, decode_path, fallback_path) =
-        if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
-            if platform.operating_system == "macos" && platform.architecture == "aarch64" {
-                select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
-            } else if platform.operating_system == "linux" && platform.architecture == "x86_64" {
-                select_linux_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
-            } else {
-                reasons.push(
+    let (
+        selected_backend,
+        selected_q8_path,
+        prefill_path,
+        prefill_runtime_policy,
+        decode_path,
+        fallback_path,
+    ) = if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
+        if platform.operating_system == "macos" && platform.architecture == "aarch64" {
+            select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+        } else if platform.operating_system == "linux" && platform.architecture == "x86_64" {
+            select_linux_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+        } else {
+            reasons.push(
                     "no validated platform-specific Q8_0 plan for this OS/arch; failing closed to safe path"
                         .into(),
                 );
-                safe_q8_plan()
-            }
-        } else {
-            reasons.push("non-validated row or quant; failing closed to safe path".into());
-            (
-                "cpu_reference",
-                "safe_dense_or_q8_cpu",
-                "safe_cpu_prefill",
-                "safe_cpu_decode",
-                "safe_cpu_reference_path",
-            )
-        };
+            safe_q8_plan()
+        }
+    } else {
+        reasons.push("non-validated row or quant; failing closed to safe path".into());
+        (
+            "cpu_reference",
+            "safe_dense_or_q8_cpu",
+            "safe_cpu_prefill",
+            "always_retained_reference_path",
+            "safe_cpu_decode",
+            "safe_cpu_reference_path",
+        )
+    };
 
     let plan = ExecutionPlan {
         profile,
@@ -170,6 +181,7 @@ pub fn plan_for_model_with_platform(
         selected_backend: selected_backend.to_string(),
         selected_q8_path: selected_q8_path.to_string(),
         prefill_path: prefill_path.to_string(),
+        prefill_runtime_policy: prefill_runtime_policy.to_string(),
         decode_path: decode_path.to_string(),
         thread_count,
         diagnostics_status,
@@ -185,6 +197,7 @@ fn select_macos_q8_plan(
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
     reasons: &mut Vec<String>,
 ) -> (
+    &'static str,
     &'static str,
     &'static str,
     &'static str,
@@ -217,20 +230,24 @@ fn select_macos_q8_plan(
     let prefill_path = if i8mm && !env_flag_disabled("CAMELID_MAC_Q8_PREFILL_I8MM") {
         env_updates.insert("CAMELID_MAC_Q8_PREFILL_I8MM", Some("on"));
         reasons.push("validated direct-pack prefill I8MM enabled".into());
+        reasons.push(format!(
+            "direct-pack I8MM dispatch engages only when prefill rows >= {}",
+            MAC_Q8_PREFILL_I8MM_MIN_ROWS
+        ));
         if matches!(profile, ExecutionProfile::Experimental) {
             env_updates.insert("CAMELID_MAC_Q8_SCHED", Some("packed_prefill"));
             reasons.push(
                 "experimental packed prefill scheduling enabled; single-token decode remains GEMV/DOTPROD"
                     .into(),
             );
-            "q8_0_experimental_packed_prefill_i8mm"
+            "q8_0_experimental_packed_prefill_i8mm_available"
         } else {
             env_updates.insert("CAMELID_MAC_Q8_SCHED", Some("off"));
             reasons.push(
                 "packed prefill scheduling remains experimental and is disabled for auto profile"
                     .into(),
             );
-            "q8_0_direct_pack_prefill_i8mm"
+            "q8_0_direct_pack_prefill_i8mm_available"
         }
     } else {
         if env_flag_disabled("CAMELID_MAC_Q8_PREFILL_I8MM") {
@@ -240,7 +257,7 @@ fn select_macos_q8_plan(
             reasons
                 .push("I8MM/MATMUL_INT8 unavailable; using packed Q8 CPU prefill fallback".into());
         }
-        "q8_0_cpu_packed_prefill_fallback"
+        "q8_0_cpu_packed_prefill_fallback_available"
     };
 
     if matches!(profile, ExecutionProfile::Experimental) {
@@ -256,6 +273,7 @@ fn select_macos_q8_plan(
         "cpu_q8_runtime_repack",
         "mac_validated_q8_0_repack",
         prefill_path,
+        "enabled_when_prefill_rows_gte_4",
         "q8_0_decode_gemv_dotprod",
         "retained_q8_reference_path",
     )
@@ -267,6 +285,7 @@ fn select_linux_x86_q8_plan(
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
     reasons: &mut Vec<String>,
 ) -> (
+    &'static str,
     &'static str,
     &'static str,
     &'static str,
@@ -309,11 +328,13 @@ fn safe_q8_plan() -> (
     &'static str,
     &'static str,
     &'static str,
+    &'static str,
 ) {
     (
         "cpu_reference",
         "safe_q8_0_block_dot",
         "safe_cpu_prefill",
+        "always_retained_reference_path",
         "safe_cpu_decode",
         "retained_q8_reference_path",
     )
@@ -360,9 +381,8 @@ fn support_level(row: &str) -> String {
         "supported_current_gate".into()
     } else if normalized.contains("llama_3_2_1b_instruct") {
         "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
-    } else if normalized.contains("llama_3_2_3b_instruct") {
-        "supported_exact_row_smoke_512_1024_2048".into()
-    } else if normalized.contains("llama_3_8b_instruct")
+    } else if normalized.contains("llama_3_2_3b_instruct")
+        || normalized.contains("llama_3_8b_instruct")
         || normalized.contains("meta_llama_3_8b_instruct")
     {
         "supported_exact_row_smoke_512_1024_2048".into()
@@ -630,6 +650,7 @@ mod tests {
             "CAMELID_MAC_Q8_SCHED",
             "CAMELID_X86_Q8_REPACK",
             "CAMELID_X86_Q8_KERNEL",
+            "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
         ] {
             env::remove_var(key);
         }
@@ -648,6 +669,10 @@ mod tests {
         );
         assert_eq!(outcome.plan.profile, ExecutionProfile::Safe);
         assert_eq!(outcome.plan.selected_backend, "cpu_reference");
+        assert_eq!(
+            outcome.plan.prefill_runtime_policy,
+            "always_retained_reference_path"
+        );
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
         clear_profile_env();
     }
@@ -664,7 +689,14 @@ mod tests {
         );
         assert_eq!(outcome.plan.profile, ExecutionProfile::Auto);
         assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
-        assert_eq!(outcome.plan.prefill_path, "q8_0_direct_pack_prefill_i8mm");
+        assert_eq!(
+            outcome.plan.prefill_path,
+            "q8_0_direct_pack_prefill_i8mm_available"
+        );
+        assert_eq!(
+            outcome.plan.prefill_runtime_policy,
+            "enabled_when_prefill_rows_gte_4"
+        );
         assert_eq!(
             outcome.env_updates.get("CAMELID_PARALLEL_LINEAR"),
             Some(&Some("on"))
@@ -699,12 +731,63 @@ mod tests {
         assert_eq!(outcome.plan.profile, ExecutionProfile::Experimental);
         assert_eq!(
             outcome.plan.prefill_path,
-            "q8_0_experimental_packed_prefill_i8mm"
+            "q8_0_experimental_packed_prefill_i8mm_available"
+        );
+        assert_eq!(
+            outcome.plan.prefill_runtime_policy,
+            "enabled_when_prefill_rows_gte_4"
         );
         assert_eq!(
             outcome.env_updates.get("CAMELID_MAC_Q8_SCHED"),
             Some(&Some("packed_prefill"))
         );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn mac_auto_explicit_matches_auto_default_plan() {
+        let _guard = env_lock();
+        clear_profile_env();
+        let default_outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(10),
+            platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        clear_profile_env();
+        env::set_var("CAMELID_PROFILE", "auto");
+        let explicit_outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(10),
+            platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(default_outcome.plan.profile, explicit_outcome.plan.profile);
+        assert_eq!(
+            default_outcome.plan.selected_backend,
+            explicit_outcome.plan.selected_backend
+        );
+        assert_eq!(
+            default_outcome.plan.selected_q8_path,
+            explicit_outcome.plan.selected_q8_path
+        );
+        assert_eq!(
+            default_outcome.plan.prefill_path,
+            explicit_outcome.plan.prefill_path
+        );
+        assert_eq!(
+            default_outcome.plan.prefill_runtime_policy,
+            explicit_outcome.plan.prefill_runtime_policy
+        );
+        assert_eq!(
+            default_outcome.plan.decode_path,
+            explicit_outcome.plan.decode_path
+        );
+        assert_eq!(
+            default_outcome.plan.fallback_path,
+            explicit_outcome.plan.fallback_path
+        );
+        assert_eq!(default_outcome.env_updates, explicit_outcome.env_updates);
         clear_profile_env();
     }
 

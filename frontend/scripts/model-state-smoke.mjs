@@ -409,6 +409,16 @@ const liveScalarThreeBGate = getChatGateState(capabilityFixture, liveScalarThree
 assert.equal(liveScalarThreeBGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'canonical Ubuntu 3B runtime ids like scalar_default_rerun should resolve to the exact 3B row from GGUF path + file_type 7 evidence')
 assert.equal(liveScalarThreeBGate.runtimeReady, true, 'canonical Ubuntu 3B runtime health should remain visible when active_model_id is a backend run label')
 assert.equal(liveScalarThreeBGate.chatUnlocked, true, 'canonical Ubuntu 3B backend run labels should unlock only when path, Q8_0 file_type, active_model_id, loaded_now, and generation_ready are all green')
+const liveNamedThreeBModel = {
+  ...liveScalarThreeBModel,
+  id: 'Llama 3.2 3B Instruct',
+  name: 'Llama 3.2 3B Instruct',
+  runtime_model_name: 'Llama 3.2 3B Instruct',
+  quant: 'Q8_0',
+}
+const liveNamedThreeBGate = getChatGateState(capabilityFixture, liveNamedThreeBModel, { active_model_id: 'Llama 3.2 3B Instruct', loaded_now: true, generation_ready: true })
+assert.equal(liveNamedThreeBGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'canonical Ubuntu 3B active_model_id copy without Q8_0 in the runtime name should still resolve through the exact loaded GGUF path plus Q8_0 metadata')
+assert.equal(liveNamedThreeBGate.chatUnlocked, true, 'canonical Ubuntu 3B human-readable active_model_id should unlock WebUI chat only when the exact loaded path, Q8_0 metadata, and runtime readiness are all green')
 assert.equal(
   getChatGateState(capabilityFixture, { ...liveScalarThreeBModel, quant: 'Q4_K_M' }, { active_model_id: 'scalar_default_rerun', loaded_now: true, generation_ready: true }).chatUnlocked,
   false,
