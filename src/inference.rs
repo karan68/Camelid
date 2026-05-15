@@ -3654,6 +3654,7 @@ fn forward_layer_timed(
         ffn_activation_stats,
         ffn_down_diagnostic,
         ffn_output_stats,
+        ffn_out_already_residual,
     ) = if let (Some(moe), Some(router)) = (&params.config.moe, &layer.moe_router) {
         if collect_diagnostics {
             return Err(BackendError::UnsupportedModelArchitecture(
@@ -3673,7 +3674,9 @@ fn forward_layer_timed(
         timings.ffn_up = up;
         timings.ffn_activation = activation;
         timings.ffn_down = down;
-        (ffn_out, None, None, None, None, None, None, None, None)
+        (
+            ffn_out, None, None, None, None, None, None, None, None, false,
+        )
     } else {
         let activated = gated_ffn_activation(
             &ffn_norm,
@@ -3699,13 +3702,39 @@ fn forward_layer_timed(
         }
         trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
         let started = Instant::now();
-        let ffn_out = linear_for_role_runtime(
-            &activated,
-            &layer.ffn_down,
-            format!("layer_{layer_idx}_ffn_down"),
-            "ffn_down",
-            collect_diagnostics,
-        )?;
+        let (ffn_out, ffn_out_already_residual) = if !collect_diagnostics {
+            if let Some(output) = try_x86_q8_ffn_down_decode_owner_residual_path(
+                &activated,
+                &layer.ffn_down,
+                &residual,
+                format!("layer_{layer_idx}_ffn_residual"),
+                "ffn_down",
+            )? {
+                (output, true)
+            } else {
+                (
+                    linear_for_role_runtime(
+                        &activated,
+                        &layer.ffn_down,
+                        format!("layer_{layer_idx}_ffn_down"),
+                        "ffn_down",
+                        collect_diagnostics,
+                    )?,
+                    false,
+                )
+            }
+        } else {
+            (
+                linear_for_role_runtime(
+                    &activated,
+                    &layer.ffn_down,
+                    format!("layer_{layer_idx}_ffn_down"),
+                    "ffn_down",
+                    collect_diagnostics,
+                )?,
+                false,
+            )
+        };
         let ffn_output_stats = collect_diagnostics
             .then(|| LlamaTensorStats::from_tensor(&ffn_out))
             .transpose()?;
@@ -3725,6 +3754,7 @@ fn forward_layer_timed(
             ffn_activation_stats,
             ffn_down_diagnostic,
             ffn_output_stats,
+            ffn_out_already_residual,
         )
     };
     if collect_diagnostics && diagnostic_zero_delta(DeltaZeroTarget::Ffn, layer_idx)? {
@@ -3736,7 +3766,11 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "ffn_down_done");
 
     let started = Instant::now();
-    let output = residual.add(&ffn_out, format!("layer_{layer_idx}_ffn_residual"))?;
+    let output = if ffn_out_already_residual {
+        ffn_out.clone()
+    } else {
+        residual.add(&ffn_out, format!("layer_{layer_idx}_ffn_residual"))?
+    };
     let ffn_residual_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&output))
         .transpose()?;
@@ -6891,6 +6925,78 @@ fn try_x86_q8_ffn_down_decode_owner_path(
             &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
         let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
         output_chunk.copy_from_slice(&sums);
+    }
+    Ok(Some(CpuTensor::from_f32(
+        name,
+        vec![1, output_width],
+        output,
+    )?))
+}
+
+fn try_x86_q8_ffn_down_decode_owner_residual_path(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    residual: &CpuTensor,
+    name: impl Into<String>,
+    rectangular_role: &str,
+) -> Result<Option<CpuTensor>> {
+    if !x86_q8_ffn_down_decode_owner_enabled()
+        || rectangular_role != "ffn_down"
+        || input.rank() != 2
+        || input.dim(0)? != 1
+        || residual.rank() != 2
+        || residual.dim(0)? != 1
+        || weight.source_type != Some(GgufTensorType::Q8_0)
+    {
+        return Ok(None);
+    }
+    let input_width = input.dim(1)?;
+    let output_width = linear_output_width(input, weight, rectangular_role)?;
+    if residual.dim(1)? != output_width || residual.data.len() != output_width {
+        return Ok(None);
+    }
+    let borrowed = if weight.dim(1)? == input_width {
+        BorrowedLinearWeight::from_tensor(weight)?
+    } else if weight.dim(0)? == input_width {
+        BorrowedLinearWeight::from_tensor(weight)?.with_swapped_matrix_shape()
+    } else {
+        return Ok(None);
+    };
+    let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
+        return Ok(None);
+    };
+    if interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || !input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
+        || !output_width.is_multiple_of(4)
+    {
+        return Ok(None);
+    }
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let mut output = residual.data.clone();
+    let blocks_per_row = packed.blocks_per_row;
+    if should_parallelize_linear_output(output.len()) {
+        output
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(group_idx, output_chunk)| {
+                let group_blocks =
+                    &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+                let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
+                for lane in 0..4 {
+                    output_chunk[lane] += sums[lane];
+                }
+            });
+    } else {
+        for (group_idx, output_chunk) in output.chunks_mut(4).enumerate() {
+            let group_blocks =
+                &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+            let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
+            for lane in 0..4 {
+                output_chunk[lane] += sums[lane];
+            }
+        }
     }
     Ok(Some(CpuTensor::from_f32(
         name,

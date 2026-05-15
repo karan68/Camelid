@@ -53,6 +53,21 @@ try {
     supported_quantization: [{ id: 'broad_quant_trap', status: 'supported' }],
     model_compatibility: [
       {
+        id: 'tinyllama_1_1b_chat_q8_0',
+        status: 'supported_current_gate',
+        family: 'llama_spm_decoder',
+        quantization: 'Q8_0',
+        support_scope: 'exact row only',
+        frontend_readiness_gate: 'loaded_now + generation_ready + active_model_id + exact row',
+        full_support_status: 'guarded_by_exact_row',
+        full_support_blockers: 'arbitrary/Jinja templates, production throughput, portability',
+        evidence: 'TinyLlama fixture row; must not be inherited by misleading 3B backend ids.',
+        chat_template_renderer: 'tinyllama-marker',
+        chat_template_shape_pack: 'validated_bounded_pack',
+        performance_measured: 'measured',
+        next_step: 'preserve exact-row scoping before widening support claims',
+      },
+      {
         id: 'llama32_3b_instruct_q8_0',
         status: 'supported_current_gate',
         family: 'llama_bpe_decoder',
@@ -373,6 +388,42 @@ try {
   const liveBackendIdChatGate = getChatGateState(capabilities, liveBackendIdModel, liveBackendIdRuntime)
   assert.equal(liveBackendIdChatGate.chatUnlocked, true, '3B rows loaded under a backend-generated runtime id should still unlock from GGUF path + Q8_0 exact-row evidence')
   assert.equal(liveBackendIdChatGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'backend-generated 3B runtime ids must resolve to the canonical exact row, not a broad family claim')
+
+  const misleadingTinyRuntimeModel = {
+    ...selectedModel,
+    id: 'tinyllama-q8',
+    name: resolveLoadedModelDisplayName({ fallbackName: 'tinyllama-q8', modelPath: selectedModel.model_path, quantLabel: selectedModel.quant }),
+    runtime_model_name: 'tinyllama-q8',
+  }
+  const misleadingTinyRuntime = { ...readyRuntime, active_model_id: misleadingTinyRuntimeModel.id }
+  const misleadingTinyChatGate = getChatGateState(capabilities, misleadingTinyRuntimeModel, misleadingTinyRuntime)
+  assert.equal(misleadingTinyChatGate.chatUnlocked, true, 'live 3B runs with a stale tinyllama-q8 runtime id should still unlock only from exact loaded GGUF path + Q8_0 support evidence')
+  assert.equal(misleadingTinyChatGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'stale tinyllama-q8 runtime ids must not steal the TinyLlama row when the loaded file is Llama 3.2 3B Instruct Q8_0')
+
+  const misleadingTinyModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: misleadingTinyRuntime,
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [misleadingTinyRuntimeModel],
+    selectedModelId: misleadingTinyRuntimeModel.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+
+  assert.match(misleadingTinyModelsMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'Models view should present the stale-id live run as the exact 3B row, not TinyLlama')
+  assert.match(misleadingTinyModelsMarkup, /Loaded exact-row match/, 'Models tracked 3B card should mark stale-id live runs as loaded exact-row matches')
+  assert.doesNotMatch(misleadingTinyModelsMarkup, /tinyllama_1_1b_chat_q8_0: supported current gate/, 'stale tinyllama-q8 runtime ids must not make the selected live 3B model inherit TinyLlama support copy')
 
   const liveBackendIdChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: null,

@@ -419,6 +419,15 @@ const liveNamedThreeBModel = {
 const liveNamedThreeBGate = getChatGateState(capabilityFixture, liveNamedThreeBModel, { active_model_id: 'Llama 3.2 3B Instruct', loaded_now: true, generation_ready: true })
 assert.equal(liveNamedThreeBGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'canonical Ubuntu 3B active_model_id copy without Q8_0 in the runtime name should still resolve through the exact loaded GGUF path plus Q8_0 metadata')
 assert.equal(liveNamedThreeBGate.chatUnlocked, true, 'canonical Ubuntu 3B human-readable active_model_id should unlock WebUI chat only when the exact loaded path, Q8_0 metadata, and runtime readiness are all green')
+const liveMisleadingTinyThreeBModel = {
+  ...liveScalarThreeBModel,
+  id: 'tinyllama-q8',
+  name: 'Llama 3.2 3B Instruct Q8_0',
+  runtime_model_name: 'tinyllama-q8',
+}
+const liveMisleadingTinyThreeBGate = getChatGateState(capabilityFixture, liveMisleadingTinyThreeBModel, { active_model_id: 'tinyllama-q8', loaded_now: true, generation_ready: true })
+assert.equal(liveMisleadingTinyThreeBGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'canonical Ubuntu 3B runtime labels that still say tinyllama-q8 must resolve through the exact 3B GGUF path/name + Q8_0 metadata, not the TinyLlama row')
+assert.equal(liveMisleadingTinyThreeBGate.chatUnlocked, true, 'misleading backend runtime ids should not block or mislabel exact 3B WebUI support when the loaded GGUF path, quant, and runtime readiness are green')
 assert.equal(
   getChatGateState(capabilityFixture, { ...liveScalarThreeBModel, quant: 'Q4_K_M' }, { active_model_id: 'scalar_default_rerun', loaded_now: true, generation_ready: true }).chatUnlocked,
   false,

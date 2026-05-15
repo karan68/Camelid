@@ -505,6 +505,12 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
   const exactIdentityTarget = findExactCompatibilityRowByIdentity(rows, model, catalogItem)
   if (exactIdentityTarget) return quantAwareCompatibilityHint(exactIdentityTarget, quantKey, 'exact /api/capabilities row id match', { exact: true })
 
+  const llamaBpeIdentity = detectLlamaBpeTarget(subject)
+  if (llamaBpeIdentity) {
+    const hint = findLlamaBpeCompatibilityHint(rows, plannedFamilies, quantKey, llamaBpeIdentity)
+    if (hint) return hint.kind === 'quant_mismatch' ? { ...hint, observedQuant: model?.quant || catalogItem?.quant || quantKey } : hint
+  }
+
   if (subject.includes('tinyllama')) {
     const target = findRow((row) => row.id.includes('tinyllama'))
     if (target && quantKey && targetMatchesQuant(target, quantKey)) return { kind: 'compatibility', target, confidence: 'exact TinyLlama row + quant match', exact: true }
@@ -512,12 +518,6 @@ export function findCompatibilityHint(capabilities, model, catalogItem) {
     const quantSpecificTarget = findCompatibilityRowForQuant(rows, 'llama_spm_decoder', quantKey)
     if (quantSpecificTarget) return { kind: 'family', target: quantSpecificTarget, observedQuant: model?.quant || catalogItem?.quant || quantKey, confidence: 'family + quant match without exact TinyLlama row' }
     if (target) return { kind: 'quant_mismatch', target, observedQuant: model?.quant || catalogItem?.quant || quantKey, confidence: 'name/path match with different quant', exact: true }
-  }
-
-  const llamaBpeIdentity = detectLlamaBpeTarget(subject)
-  if (llamaBpeIdentity) {
-    const hint = findLlamaBpeCompatibilityHint(rows, plannedFamilies, quantKey, llamaBpeIdentity)
-    if (hint) return hint.kind === 'quant_mismatch' ? { ...hint, observedQuant: model?.quant || catalogItem?.quant || quantKey } : hint
   }
 
   if (subject.includes('mistral')) {
