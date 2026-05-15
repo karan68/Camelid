@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
+    execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
         diagnostic_attention_score_scale, diagnostic_ffn_gate_up_order,
@@ -31,10 +32,11 @@ use crate::{
         diagnostic_output_projection_layout, diagnostic_rectangular_linear_layout,
         diagnostic_rms_norm_epsilon, diagnostic_rope_direction, diagnostic_rope_pairing,
         diagnostic_rope_position_mode, diagnostic_square_linear_layout,
-        diagnostic_zero_delta_selector, output_projection_diagnostics, DeltaZeroTarget,
-        LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep, LlamaInferenceSession,
-        LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
-        LlamaOutputProjectionDiagnostic, LlamaSampler, SamplingConfig,
+        diagnostic_zero_delta_selector, output_projection_diagnostics,
+        q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
+        DeltaZeroTarget, LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep,
+        LlamaInferenceSession, LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
+        LlamaOutputProjectionDiagnostic, LlamaQ8ScheduleTelemetry, LlamaSampler, SamplingConfig,
     },
     model::{DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0Block, TensorStore},
@@ -56,12 +58,38 @@ const JINJA_CHAT_TEMPLATE_CACHE_LIMIT: usize = 16;
 static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environment<'static>>>>> =
     OnceLock::new();
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppState {
     loaded_model: Arc<RwLock<Option<LoadedModel>>>,
+    execution_plan: Arc<RwLock<Option<ExecutionPlan>>>,
     cached_weights: Arc<RwLock<Option<CachedLlamaWeights>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
+    planner_env: PlannerEnv,
+    configured_threads: Option<usize>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            loaded_model: Arc::new(RwLock::new(None)),
+            execution_plan: Arc::new(RwLock::new(None)),
+            cached_weights: Arc::new(RwLock::new(None)),
+            cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            generation_sessions: Arc::new(RwLock::new(HashMap::new())),
+            planner_env: PlannerEnv::capture(),
+            configured_threads: None,
+        }
+    }
+}
+
+impl AppState {
+    pub fn with_configured_threads(configured_threads: Option<usize>) -> Self {
+        Self {
+            configured_threads,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +189,7 @@ pub struct HealthResponse {
     pub loaded_now: bool,
     pub generation_ready: bool,
     pub active_model_id: Option<String>,
+    pub execution_plan: Option<ExecutionPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +200,7 @@ pub struct CapabilitiesResponse {
     pub tokenization: bool,
     pub inference: bool,
     pub streaming: bool,
+    pub execution_plan: Option<ExecutionPlan>,
     pub support_contract: SupportContract,
     pub supported_quantization: Vec<SupportItem>,
     pub planned_quantization: Vec<SupportItem>,
@@ -488,6 +518,8 @@ pub struct GenerationTimings {
     pub layers: Vec<GenerationLayerTimings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::inference::LlamaForwardMemoryTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q8_schedule: Option<LlamaQ8ScheduleTelemetry>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -682,11 +714,16 @@ pub struct ErrorBody {
 }
 
 pub fn router() -> Router {
-    let state = AppState::default();
+    router_with_state(AppState::default())
+}
+
+pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/execution-plan", get(execution_plan))
+        .route("/api/execution-plan", get(execution_plan))
         .route("/api/models/load", post(load_model))
         .route("/api/models/unload", post(unload_model))
         .route("/api/models/current", get(current_model))
@@ -707,10 +744,21 @@ pub fn router() -> Router {
         .with_state(state)
 }
 
-pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    configured_threads: Option<usize>,
+    initial_model: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let state = AppState::with_configured_threads(configured_threads);
+    if let Some(model_path) = initial_model {
+        if let Err(err) = load_model_from_path(&state, model_path, None).await {
+            tracing::error!(error=%err, "failed to load startup model");
+            return Err(std::io::Error::other(err.to_string()));
+        }
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "camelid server listening");
-    axum::serve(listener, router()).await
+    tracing::info!(%addr, execution_plan=?state.execution_plan.read().await.as_ref(), "camelid server listening");
+    axum::serve(listener, router_with_state(state)).await
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -723,6 +771,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         loaded_now,
         generation_ready,
         active_model_id: model.as_ref().map(|m| m.id.clone()),
+        execution_plan: state.execution_plan.read().await.clone(),
     })
 }
 
@@ -735,11 +784,22 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
         && guard_cpu_weight_materialization_budget(binding).is_ok()
 }
 
-async fn capabilities() -> Json<CapabilitiesResponse> {
-    Json(capabilities_response())
+async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    Json(capabilities_response_with_plan(
+        state.execution_plan.read().await.clone(),
+    ))
 }
 
+async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionPlan>> {
+    Json(state.execution_plan.read().await.clone())
+}
+
+#[cfg(test)]
 fn capabilities_response() -> CapabilitiesResponse {
+    capabilities_response_with_plan(None)
+}
+
+fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> CapabilitiesResponse {
     CapabilitiesResponse {
         engine: "camelid",
         gguf_metadata: true,
@@ -747,6 +807,7 @@ fn capabilities_response() -> CapabilitiesResponse {
         tokenization: true,
         inference: true,
         streaming: true,
+        execution_plan,
         support_contract: SupportContract {
             current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
@@ -1273,50 +1334,8 @@ fn capabilities_response() -> CapabilitiesResponse {
 }
 
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
-    match read_metadata(&req.path) {
-        Ok(gguf) => {
-            let id = req
-                .id
-                .or_else(|| gguf.model_name().map(ToOwned::to_owned))
-                .or_else(|| {
-                    req.path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "loaded-model".to_string());
-            let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
-            let unsupported_runtime = match &llama_config_result {
-                Err(BackendError::UnsupportedModelArchitecture(message)) => {
-                    Some(UnsupportedRuntimeSummary {
-                        code: "unsupported_model_architecture",
-                        message: message.clone(),
-                    })
-                }
-                _ => None,
-            };
-            let llama_config = llama_config_result.ok();
-            let llama_tensors = llama_config
-                .as_ref()
-                .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
-            let tokenizer_result = Tokenizer::from_gguf(&gguf);
-            let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
-            let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-            let loaded = LoadedModel {
-                id,
-                path: req.path,
-                gguf,
-                llama_config,
-                llama_tensors,
-                unsupported_runtime,
-                tokenizer,
-                tokenizer_runtime,
-            };
-            let body = loaded.clone();
-            *state.loaded_model.write().await = Some(loaded);
-            *state.cached_weights.write().await = None;
-            clear_prompt_prefix_cache(&state);
-            (StatusCode::OK, Json(body)).into_response()
-        }
+    match load_model_from_path(&state, req.path, req.id).await {
+        Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         Err(err) => api_error(
             StatusCode::BAD_REQUEST,
             "invalid_model",
@@ -1326,8 +1345,76 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     }
 }
 
+async fn load_model_from_path(
+    state: &AppState,
+    path: PathBuf,
+    id: Option<String>,
+) -> Result<LoadedModel, BackendError> {
+    let gguf = read_metadata(&path)?;
+    let outcome = plan_for_model(&path, &gguf, state.configured_threads);
+    state.planner_env.apply(&outcome.env_updates);
+    log_selected_execution_plan(&outcome.plan);
+    let id = id
+        .or_else(|| gguf.model_name().map(ToOwned::to_owned))
+        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "loaded-model".to_string());
+    let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+    let unsupported_runtime = match &llama_config_result {
+        Err(BackendError::UnsupportedModelArchitecture(message)) => {
+            Some(UnsupportedRuntimeSummary {
+                code: "unsupported_model_architecture",
+                message: message.clone(),
+            })
+        }
+        _ => None,
+    };
+    let llama_config = llama_config_result.ok();
+    let llama_tensors = llama_config
+        .as_ref()
+        .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
+    let tokenizer_result = Tokenizer::from_gguf(&gguf);
+    let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
+    let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
+    let loaded = LoadedModel {
+        id,
+        path,
+        gguf,
+        llama_config,
+        llama_tensors,
+        unsupported_runtime,
+        tokenizer,
+        tokenizer_runtime,
+    };
+    *state.loaded_model.write().await = Some(loaded.clone());
+    *state.execution_plan.write().await = Some(outcome.plan);
+    *state.cached_weights.write().await = None;
+    clear_prompt_prefix_cache(state);
+    Ok(loaded)
+}
+
+fn log_selected_execution_plan(plan: &ExecutionPlan) {
+    tracing::info!(
+        profile=?plan.profile,
+        platform=%plan.platform_label,
+        cpu_model=%plan.cpu_model,
+        cpu_features=?plan.cpu_features,
+        model=%plan.exact_model_row,
+        support_level=%plan.support_level,
+        backend=%plan.selected_backend,
+        q8_path=%plan.selected_q8_path,
+        prefill_path=%plan.prefill_path,
+        decode_path=%plan.decode_path,
+        threads=plan.thread_count,
+        diagnostics=%plan.diagnostics_status,
+        fallback_path=%plan.fallback_path,
+        reasons=?plan.reasons,
+        "Camelid execution plan selected"
+    );
+}
+
 async fn unload_model(State(state): State<AppState>) -> Response {
     *state.loaded_model.write().await = None;
+    *state.execution_plan.write().await = None;
     *state.cached_weights.write().await = None;
     clear_prompt_prefix_cache(&state);
     StatusCode::NO_CONTENT.into_response()
@@ -2831,6 +2918,10 @@ fn generate_token_ids(
     mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedTokens, Box<Response>> {
     let generation_started = Instant::now();
+    let collect_q8_schedule = q8_schedule_telemetry_enabled();
+    if collect_q8_schedule {
+        reset_q8_schedule_telemetry();
+    }
     let mut input = prepared.token_ids.clone();
     let mut history = prepared.token_ids.clone();
     let mut generated = Vec::new();
@@ -2984,6 +3075,9 @@ fn generate_token_ids(
     prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
     prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
     prepared.timings.memory = forward_timings.memory;
+    if collect_q8_schedule {
+        prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+    }
 
     Ok(GeneratedTokens {
         prompt_token_ids: prepared.token_ids,
@@ -3998,6 +4092,7 @@ mod tests {
     };
 
     use crate::{
+        execution_plan::{ExecutionPlan, ExecutionProfile},
         inference::{LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, SamplingConfig},
         model::LlamaModelConfig,
         tensor::CpuTensor,
@@ -4008,6 +4103,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn capabilities_can_include_selected_execution_plan() {
+        let plan = ExecutionPlan {
+            profile: ExecutionProfile::Experimental,
+            operating_system: "linux".into(),
+            architecture: "x86_64".into(),
+            platform_label: "Ubuntu/Linux x86_64".into(),
+            cpu_model: "Intel Xeon Platinum 8488C".into(),
+            cpu_features: vec!["avx2".into()],
+            model_family: "llama".into(),
+            quant_type: "Q8_0".into(),
+            exact_model_row: "Llama 3.2 3B Instruct".into(),
+            support_level: "supported_exact_row_smoke_512_1024_2048".into(),
+            selected_backend: "cpu_q8_runtime_repack".into(),
+            selected_q8_path: "x86_experimental_q8_0_avx2".into(),
+            prefill_path: "q8_0_x86_avx2_tiled_gemm_experimental".into(),
+            decode_path: "q8_0_decode_avx2".into(),
+            thread_count: 16,
+            diagnostics_status: "standard diagnostics; RSS timings disabled by default".into(),
+            fallback_path: "retained_q8_reference_path".into(),
+            reasons: vec!["default-off Ubuntu x86_64 experiment selected".into()],
+        };
+
+        let response = capabilities_response_with_plan(Some(plan.clone()));
+
+        assert_eq!(response.execution_plan, Some(plan));
+    }
 
     #[test]
     fn capabilities_report_llama32_context_pack_boundaries() {

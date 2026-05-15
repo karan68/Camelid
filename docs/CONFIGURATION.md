@@ -41,6 +41,14 @@ Typical start command:
 target/release/camelid serve --addr 127.0.0.1:8181
 ```
 
+Appliance-style start command:
+
+```bash
+target/release/camelid serve --model /path/to/model.gguf
+```
+
+That startup path loads the model immediately and applies the default `auto` execution profile for the current host. Use `CAMELID_PROFILE=safe|auto|experimental|debug` when you need to change planner behavior; keep lower-level experiment env vars as developer overrides rather than the primary user workflow.
+
 ## Frontend API base override
 
 The frontend defaults to:
@@ -97,6 +105,10 @@ Backend runtime knobs used during performance work:
 - `CAMELID_Q8_0_FILE_READER_RETAINED_SCRATCH_BYTES` caps how much per-thread Q8 file-reader scratch capacity is retained after oversized row, scale, quantized-input, and output chunks. Default: `67108864` (64 MiB). This is an RSS headroom knob only; it does not promote 8B 1024/2048 support by itself.
 - `CAMELID_KV_CACHE_GROW_TOKENS` controls KV-cache allocation growth for model-sized contexts. Default: `256` positions when context length is at least 512; tiny diagnostic/test contexts keep exact one-position growth. This reduces repeated realloc/copy churn during decode and is a runtime performance knob only.
 - `CAMELID_METAL_Q8` / `--metal-q8` enables the macOS Metal Q8_0 encoded file-backed row-dot path. It falls back to CPU when unavailable and is not support evidence by itself.
+- `CAMELID_PROFILE` selects the execution-planning profile: `safe` keeps only conservative known-good paths, `auto` keeps default-off experiment lanes disabled, `experimental` allows evidence-lane experiments with a warning, and `debug` favors diagnostics over performance claims.
+- On the Ubuntu x86_64 dense Llama Q8_0 evidence lane, the appliance planner keeps x86 Q8 experiment flags off by default. Manual developer overrides remain evidence-lane only and must not be treated as support-contract, portability, accelerator-backend, or broader model-family evidence. Current reference truth for this lane is `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/README.md`.
+- `CAMELID_X86_Q8_REPACK=on` is a default-off Ubuntu x86_64 developer experiment that loads selected dense Llama Q8_0 linears into backend-owned packed runtime storage instead of retaining a duplicate row-major packed sidecar. The current x86 slice covers the dense attention projection family (`blk.*.attn_{q,k,v}.weight`, `blk.*.attn_output.weight`) plus dense FFN gate/up/down rows; leave it unset for the safe fallback.
+- Explicit x86 disables remain available as developer overrides. The execution planner respects `CAMELID_X86_Q8_REPACK=off` and `CAMELID_X86_Q8_KERNEL=off|disabled` by failing closed to the safe CPU path.
 - `CAMELID_METAL_Q8_RETAINED` enables the retained-Q8 all-Metal kernel path for focused kernel experiments. Current local 3B profiling showed all-Metal retained Q8 is slower than the retained-Q8 CPU path, so normal macOS serving keeps this off unless explicitly enabled.
 - `CAMELID_HYBRID_Q8_RETAINED` controls the retained-Q8 CPU+Metal split path for single-row decode projections. It defaults to off because same-host Apple Silicon sweeps showed the Metal suffix scheduler was slower and used more RSS than the paired CPU Q8 path on the measured 3B short-decode gate. Set it to `1`, `true`, `on`, or `enabled` to opt into the experiment; set it to `0`, `false`, `off`, `disabled`, or `cpu` to force CPU-only. When enabled, it launches a Metal command buffer for a suffix of output rows while CPU threads compute the rest, then merges the output. Tune the GPU slice with `CAMELID_HYBRID_Q8_GPU_PERCENT` (default `10`, capped below 100) or `CAMELID_HYBRID_Q8_GPU_ROWS`.
 

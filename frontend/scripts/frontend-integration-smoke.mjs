@@ -22,6 +22,8 @@ try {
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
+  const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
+  const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
 
   const noop = () => {}
   const readyRuntime = {
@@ -38,6 +40,8 @@ try {
     generation_ready: true,
     status: 'ready',
     quant: 'Q8_0',
+    model_path: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+    runtime_model_name: 'llama32_3b_instruct_q8_0',
   }
   const capabilities = {
     support_contract: {
@@ -88,6 +92,8 @@ try {
       { id: 'future_batch_endpoint', status: 'planned', notes: `Guarded feature row; do not label it ${'Clau' + 'de'} or ${'Gem' + 'ini'} compatible from API metadata.` },
     ],
   }
+  const selectedModelRunnable = getChatGateState(capabilities, selectedModel, readyRuntime).chatUnlocked
+  assert.equal(selectedModelRunnable, true, '3B Q8_0 fixture must be end-to-end runnable only when model path, runtime readiness, and exact-row support are all green')
 
   const streamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
@@ -111,7 +117,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: false,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -144,7 +150,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: true,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -174,7 +180,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: false,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -204,7 +210,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: false,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -235,7 +241,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: true,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -337,6 +343,61 @@ try {
   assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+
+  assert.equal(
+    resolveLoadedModelDisplayName({
+      fallbackName: 'scalar_default_rerun',
+      modelPath: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+      quantLabel: 'Q8_0',
+    }),
+    'Llama 3.2 3B Instruct Q8_0',
+    'live backend-generated ids should display the exact 3B row name when the loaded GGUF filename and Q8_0 metadata are exact',
+  )
+  assert.equal(
+    resolveLoadedModelDisplayName({
+      fallbackName: 'scalar_default_rerun',
+      modelPath: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q4_0.gguf',
+      quantLabel: 'Q4_0',
+    }),
+    'scalar_default_rerun',
+    'the 3B display alias must stay fail-closed for neighboring quants',
+  )
+
+  const liveBackendIdModel = {
+    ...selectedModel,
+    id: 'scalar_default_rerun',
+    name: resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: selectedModel.model_path, quantLabel: selectedModel.quant }),
+    runtime_model_name: 'scalar_default_rerun',
+  }
+  const liveBackendIdRuntime = { ...readyRuntime, active_model_id: liveBackendIdModel.id }
+  const liveBackendIdChatGate = getChatGateState(capabilities, liveBackendIdModel, liveBackendIdRuntime)
+  assert.equal(liveBackendIdChatGate.chatUnlocked, true, '3B rows loaded under a backend-generated runtime id should still unlock from GGUF path + Q8_0 exact-row evidence')
+  assert.equal(liveBackendIdChatGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'backend-generated 3B runtime ids must resolve to the canonical exact row, not a broad family claim')
+
+  const liveBackendIdChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel: liveBackendIdModel,
+    selectedModelId: liveBackendIdModel.id,
+    setSelectedModelId: noop,
+    models: [liveBackendIdModel],
+    runtime: liveBackendIdRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Say hello from 3B',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: liveBackendIdChatGate.chatUnlocked,
+    setTab: noop,
+  }))
+
+  assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
+  assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
+  assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
+  assert.match(liveBackendIdChatMarkup, /Exact row supported/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
+  assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
+  assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
 
   assert.match(exactReadyMarkup, /responses stream/, 'API view should normalize provider-scoped dotted feature ids before rendering')
   assert.match(exactReadyMarkup, /hosted model-style streamed response compatibility stays provider-neutral/, 'API view should neutralize hosted-brand feature notes before rendering')
