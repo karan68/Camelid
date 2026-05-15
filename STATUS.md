@@ -63,11 +63,12 @@ Recent Ubuntu x86 Q8 work has significantly improved the experimental accelerate
 
 Current public takeaways:
 
-- The retained Ubuntu x86 Q8 candidate remains a **default-off** acceleration path guarded by `CAMELID_X86_Q8_REPACK=on` and `CAMELID_X86_Q8_KERNEL=avx2`.
+- The retained Ubuntu x86 Q8 candidate remains a **default-off** acceleration path guarded by `CAMELID_X86_Q8_REPACK=on` plus the measured AVX2 kernel/runtime gates used in the current Ubuntu lane.
 - Packed Q8 runtime storage now covers the dense attention projection family plus FFN gate/up/down rows for the measured Llama 3.2 3B Instruct Q8_0 lane, while preserving the safe fallback path when gates are absent or disabled.
-- Evidence bundles now include parity checks, repeated timing discipline, perf counters, hot-symbol captures, and explicit reject notes for non-retained experiments.
-- Rejected Ubuntu x86 Q8 candidates are being documented instead of hidden; no claimed win is retained unless it survives repeated confirmation with checksum/text preservation.
-- The next measurement split is explicit: cold materialization costs versus warm inference costs. The team is avoiding new cache sidecars or micro-variant churn unless the evidence proves repeated materialization or a real warm-path bottleneck.
+- Evidence bundles now include parity checks, repeated timing discipline, perf counters, hot-symbol captures, explicit reject notes for non-retained experiments, and cold-vs-warm request evidence.
+- Rejected Ubuntu x86 Q8 candidates are being documented instead of hidden; no claimed win is retained unless it survives repeated confirmation with checksum/text preservation on a clean host.
+- The cold/warm split is now explicit in the evidence: `from_q8_0_bytes` is a cold/reload materialization cost on this lane, not the warm decode bottleneck.
+- The active warm-path direction has shifted from leaf row-dot tuning toward matrix-level Q8 GEMM/MUL_MAT ownership, starting with deeper FFN ownership slices.
 
 Boundaries that remain in force:
 

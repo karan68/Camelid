@@ -81,7 +81,34 @@ Camelid is advancing on three tracks:
 - **Ubuntu x86 Q8 performance investigation:** default-off experimental acceleration work is improving the measured Ubuntu x86 Q8 path through packed Q8 runtime storage, matrix-level execution work, and AVX2 packed kernels while keeping the safe fallback path intact. These paths remain under validation and are not public support or default-on acceleration claims.
 - **Active next-model bring-up:** Mistral 7B Instruct is the lead exact-row bring-up lane; Qwen 2.5 7B Instruct and Gemma 2 9B Instruct remain planned exact-row candidates.
 
-For deeper row-by-row promotion rules and blocker detail, see [`COMPATIBILITY.md`](COMPATIBILITY.md#locked-next-family-readiness-language), [`STATUS.md`](STATUS.md), and [`docs/performance/ubuntu-x86-q8-progress-20260515.md`](docs/performance/ubuntu-x86-q8-progress-20260515.md).
+For deeper row-by-row promotion rules and blocker detail, see [`COMPATIBILITY.md`](COMPATIBILITY.md#locked-next-family-readiness-language), [`STATUS.md`](STATUS.md), and [`docs/performance/ubuntu-x86-q8.md`](docs/performance/ubuntu-x86-q8.md).
+
+## Ubuntu x86 Q8 acceleration work
+
+Camelid now includes default-off Ubuntu x86 Q8 acceleration paths focused on packed Q8 runtime storage, AVX2 packed kernels, and matrix-level execution.
+
+This work is evidence-gated. Optimized paths are not enabled by default yet. Each candidate is validated with parity checks, repeated timing runs, perf counters, and retained/rejected evidence notes.
+
+Current focus areas:
+
+- packed Q8 runtime storage
+- AVX2 scaled row-dot path
+- matrix-level Q8 GEMM/MUL_MAT ownership
+- FFN projection optimization
+- attention projection optimization
+- warm vs cold inference separation
+- reducing wrapper/callback overhead in hot inference
+
+The default/reference path remains available while accelerated paths continue to be validated. The current direction is production-directional runtime work, not a production-ready throughput claim.
+
+| Area | Result | Status |
+| --- | --- | --- |
+| AVX2 scaled row-dot path | Improved repeat/perf direction with checksum preservation in the measured Ubuntu x86 lane | retained default-off |
+| Packed Q8 runtime storage | Large selected-tensor improvements in the bounded Ubuntu x86 lane | retained only where evidence-backed |
+| Matrix-level Q8 work | Active validation around deeper GEMM/MUL_MAT ownership | default-off / experimental |
+| Rejected experiments | Failed wall-clock, parity, or clean-host discipline are documented instead of hidden | rejected |
+
+Camelid is also moving toward an appliance-style execution plan where validated runtime paths can be selected automatically while experimental acceleration remains opt-in.
 
 ## What makes it different
 
