@@ -1,9 +1,15 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use camelid::{
     gguf::{read_metadata, GgufTensorType},
-    tensor::{CpuTensor, Q8_0Block, RuntimeDType, TensorStore},
+    tensor::{CpuTensor, Q8_0Block, Q8_0RuntimeStorage, RuntimeDType, TensorStore},
 };
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn loads_f32_tensor_payload() {
@@ -105,6 +111,338 @@ fn loads_q8_0_file_backed_linear_without_f32_materialization() {
     let first = backing.file().unwrap();
     let second = backing.clone().file().unwrap();
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[test]
+fn mac_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    let tensor_name = "blk.0.attn_q.weight";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tensor.gguf");
+    let mut payload = Vec::new();
+    for block_idx in 0..32 {
+        payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+        payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+    }
+    write_named_tensor_gguf_with_dims(&path, tensor_name, 8, &[32, 32], &payload);
+
+    let gguf = read_metadata(&path).unwrap();
+    let store = TensorStore::open(&path, &gguf);
+    let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+
+    assert!(
+        tensor.data.is_empty(),
+        "{tensor_name} materialized f32 data"
+    );
+    assert!(
+        tensor.q8_0_blocks.is_none(),
+        "{tensor_name} kept q8_0 blocks"
+    );
+    assert!(
+        tensor.q8_0_file_backing.is_none(),
+        "{tensor_name} kept file backing"
+    );
+    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 32, "{tensor_name}");
+    assert_eq!(packed.blocks_per_row, 1, "{tensor_name}");
+
+    let block_backed_tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
+    assert!(
+        block_backed_tensor.data.is_empty(),
+        "{tensor_name} block-backed materialized f32 data"
+    );
+    assert!(
+        block_backed_tensor.q8_0_blocks.is_none(),
+        "{tensor_name} block-backed kept q8_0 blocks"
+    );
+    assert!(
+        block_backed_tensor.q8_0_file_backing.is_none(),
+        "{tensor_name} block-backed kept file backing"
+    );
+    assert!(block_backed_tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(block_backed_tensor.q8_0_packed_rows4_4x8.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = block_backed_tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 32, "{tensor_name}");
+    assert_eq!(packed.blocks_per_row, 1, "{tensor_name}");
+
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+}
+
+#[test]
+fn mac_q8_repack_keeps_attention_kv_on_non_runtime_packed_paths_until_dispatch_is_proven() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    for tensor_name in ["blk.0.attn_k.weight", "blk.0.attn_v.weight"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tensor.gguf");
+        let mut payload = Vec::new();
+        for block_idx in 0..32 {
+            payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+            payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+        }
+        write_named_tensor_gguf_with_dims(&path, tensor_name, 8, &[32, 32], &payload);
+
+        let gguf = read_metadata(&path).unwrap();
+        let store = TensorStore::open(&path, &gguf);
+        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+        assert!(
+            tensor.q8_0_runtime_storage.is_none(),
+            "{tensor_name} should not be runtime-packed on Mac auto path"
+        );
+        assert!(
+            tensor.q8_0_file_backing.is_some(),
+            "{tensor_name} should stay file-backed when runtime-packed dispatch is not proven"
+        );
+
+        let block_backed_tensor = store.load_q8_0_block_backed_linear(tensor_name).unwrap();
+        assert!(
+            block_backed_tensor.q8_0_runtime_storage.is_none(),
+            "{tensor_name} block-backed should not be runtime-packed on Mac auto path"
+        );
+        assert!(
+            block_backed_tensor.q8_0_blocks.is_some(),
+            "{tensor_name} block-backed path should retain q8 blocks"
+        );
+    }
+
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+}
+
+#[test]
+fn mac_q8_repack_loads_ffn_gate_as_transposed_packed_runtime_without_row_major_duplicate() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tensor.gguf");
+    let mut payload = Vec::new();
+    for block_idx in 0..64 {
+        payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+        payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+    }
+    write_named_tensor_gguf_with_dims(&path, "blk.0.ffn_gate.weight", 8, &[32, 64], &payload);
+
+    let gguf = read_metadata(&path).unwrap();
+    let store = TensorStore::open(&path, &gguf);
+    let tensor = store
+        .load_q8_0_file_backed_linear("blk.0.ffn_gate.weight")
+        .unwrap();
+
+    assert_eq!(tensor.shape.dims, vec![32, 64]);
+    assert!(tensor.data.is_empty());
+    assert!(tensor.q8_0_blocks.is_none());
+    assert!(tensor.q8_0_file_backing.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 64);
+    assert_eq!(packed.blocks_per_row, 1);
+
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_repack_loads_attn_q_as_packed_runtime_without_row_major_duplicate() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tensor.gguf");
+    let mut payload = Vec::new();
+    for block_idx in 0..32 {
+        payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+        payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+    }
+    write_named_tensor_gguf_with_dims(&path, "blk.0.attn_q.weight", 8, &[32, 32], &payload);
+
+    let gguf = read_metadata(&path).unwrap();
+    let store = TensorStore::open(&path, &gguf);
+    let tensor = store
+        .load_q8_0_file_backed_linear("blk.0.attn_q.weight")
+        .unwrap();
+
+    assert!(tensor.data.is_empty());
+    assert!(tensor.q8_0_blocks.is_none());
+    assert!(tensor.q8_0_file_backing.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 32);
+    assert_eq!(packed.blocks_per_row, 1);
+
+    let block_backed_tensor = store
+        .load_q8_0_block_backed_linear("blk.0.attn_q.weight")
+        .unwrap();
+    assert!(block_backed_tensor.data.is_empty());
+    assert!(block_backed_tensor.q8_0_blocks.is_none());
+    assert!(block_backed_tensor.q8_0_file_backing.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = block_backed_tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 32);
+    assert_eq!(packed.blocks_per_row, 1);
+
+    std::env::remove_var("CAMELID_X86_Q8_REPACK");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_repack_loads_dense_attention_family_as_packed_runtime() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    for tensor_name in [
+        "blk.0.attn_q.weight",
+        "blk.0.attn_k.weight",
+        "blk.0.attn_v.weight",
+        "blk.0.attn_output.weight",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tensor.gguf");
+        let mut payload = Vec::new();
+        for block_idx in 0..32 {
+            payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+            payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+        }
+        write_named_tensor_gguf_with_dims(&path, tensor_name, 8, &[32, 32], &payload);
+
+        let gguf = read_metadata(&path).unwrap();
+        let store = TensorStore::open(&path, &gguf);
+        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+
+        assert_eq!(tensor.shape.dims, vec![32, 32]);
+        assert!(
+            tensor.data.is_empty(),
+            "{tensor_name} materialized f32 data"
+        );
+        assert!(
+            tensor.q8_0_blocks.is_none(),
+            "{tensor_name} kept q8_0 blocks"
+        );
+        assert!(
+            tensor.q8_0_file_backing.is_none(),
+            "{tensor_name} kept file backing instead of runtime storage"
+        );
+        assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+        assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+        let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+        assert_eq!(packed.rows, 32, "{tensor_name} packed row count");
+        assert_eq!(packed.blocks_per_row, 1, "{tensor_name} packed k blocks");
+    }
+
+    std::env::remove_var("CAMELID_X86_Q8_REPACK");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_repack_loads_dense_ffn_family_as_transposed_packed_runtime() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    for (tensor_name, dims, expected_rows, expected_blocks_per_row) in [
+        ("blk.0.ffn_gate.weight", [32_i64, 64_i64], 64_usize, 1_usize),
+        ("blk.0.ffn_up.weight", [32_i64, 64_i64], 64_usize, 1_usize),
+        // Llama dense FFN down rows are [ffn, hidden] in GGUF, so the x86
+        // runtime storage must be directly usable as transposed rows [hidden, ffn].
+        ("blk.0.ffn_down.weight", [64_i64, 32_i64], 32_usize, 2_usize),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tensor.gguf");
+        let block_count = (dims[0] as usize * dims[1] as usize) / 32;
+        let mut payload = Vec::new();
+        for block_idx in 0..block_count {
+            payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+            payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+        }
+        write_named_tensor_gguf_with_dims(&path, tensor_name, 8, &dims, &payload);
+
+        let gguf = read_metadata(&path).unwrap();
+        let store = TensorStore::open(&path, &gguf);
+        let tensor = store.load_q8_0_file_backed_linear(tensor_name).unwrap();
+
+        assert_eq!(tensor.shape.dims, dims.map(|dim| dim as usize).to_vec());
+        assert!(
+            tensor.data.is_empty(),
+            "{tensor_name} materialized f32 data"
+        );
+        assert!(
+            tensor.q8_0_blocks.is_none(),
+            "{tensor_name} kept q8_0 blocks"
+        );
+        assert!(
+            tensor.q8_0_file_backing.is_none(),
+            "{tensor_name} kept file backing instead of runtime storage"
+        );
+        assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+        assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+        let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+        assert_eq!(packed.rows, expected_rows, "{tensor_name} packed row count");
+        assert_eq!(
+            packed.blocks_per_row, expected_blocks_per_row,
+            "{tensor_name} packed k blocks"
+        );
+    }
+
+    std::env::remove_var("CAMELID_X86_Q8_REPACK");
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn x86_q8_repack_loads_output_projection_as_token_major_packed_runtime() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::remove_var("CAMELID_X86_Q8_REPACK");
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tensor.gguf");
+    let mut payload = Vec::new();
+    for block_idx in 0..64 {
+        payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+        payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+    }
+    write_named_tensor_gguf_with_dims(&path, "output.weight", 8, &[32, 64], &payload);
+
+    let gguf = read_metadata(&path).unwrap();
+    let store = TensorStore::open(&path, &gguf);
+    let fallback = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    assert!(fallback.q8_0_runtime_storage.is_none());
+    assert!(fallback.q8_0_file_backing.is_some());
+
+    std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+    let tensor = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+
+    assert_eq!(tensor.shape.dims, vec![32, 64]);
+    assert!(tensor.data.is_empty());
+    assert!(tensor.q8_0_blocks.is_none());
+    assert!(tensor.q8_0_file_backing.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 64);
+    assert_eq!(packed.blocks_per_row, 1);
+
+    std::env::remove_var("CAMELID_X86_Q8_REPACK");
 }
 
 #[test]
@@ -477,6 +815,16 @@ fn write_tensor_gguf(path: &Path, tensor_type: i32, payload: &[u8]) {
 }
 
 fn write_tensor_gguf_with_dims(path: &Path, tensor_type: i32, dims: &[i64], payload: &[u8]) {
+    write_named_tensor_gguf_with_dims(path, "test.weight", tensor_type, dims, payload);
+}
+
+fn write_named_tensor_gguf_with_dims(
+    path: &Path,
+    tensor_name: &str,
+    tensor_type: i32,
+    dims: &[i64],
+    payload: &[u8],
+) {
     let mut b = Vec::new();
     b.extend_from_slice(b"GGUF");
     push_u32(&mut b, 3);
@@ -485,7 +833,7 @@ fn write_tensor_gguf_with_dims(path: &Path, tensor_type: i32, dims: &[i64], payl
 
     push_kv_string(&mut b, "general.architecture", "llama");
 
-    push_string(&mut b, "test.weight");
+    push_string(&mut b, tensor_name);
     push_u32(&mut b, dims.len() as u32);
     for dim in dims {
         push_i64(&mut b, *dim);

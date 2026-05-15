@@ -1,5 +1,5 @@
 import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
-import { modelRuntimeIdMatches } from '../lib/modelState'
+import { getRuntimeRequestModelId, modelRuntimeIdMatches } from '../lib/modelState'
 
 function guardedApiFeatures(features = []) {
   return features.filter((feature) => isGuardedCapabilityStatus(feature.status))
@@ -14,7 +14,7 @@ function summarizeExactRowField(targets = [], field, fallback = 'No exact compat
 
 export default function ApiView({ runtime, selectedModel, capabilities }) {
   const apiBase = runtime?.api_base || ''
-  const modelId = selectedModel?.id || runtime?.active_model_id || '<loaded-model-id>'
+  const modelId = getRuntimeRequestModelId(selectedModel, runtime, '<loaded-model-id>') || '<loaded-model-id>'
   const supportContract = capabilities?.support_contract
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
   const compatibilityTargets = capabilities?.model_compatibility || []

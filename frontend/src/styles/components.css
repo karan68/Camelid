@@ -5908,6 +5908,18 @@ textarea.composer-input-gemini {
   border-left: 1px solid color-mix(in srgb, var(--color-border-soft) 48%, transparent);
 }
 
+.message-finish-warning {
+  width: fit-content;
+  margin-top: 14px;
+  padding: 7px 11px;
+  border: 1px solid color-mix(in srgb, #f5b642 48%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, #f5b642 12%, transparent);
+  color: color-mix(in srgb, #f5b642 72%, var(--color-text) 28%);
+  font-size: 0.78rem;
+  font-weight: 700;
+}
+
 .streaming-loader {
   display: flex;
   align-items: center;

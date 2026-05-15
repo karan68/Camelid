@@ -7,6 +7,7 @@ Scope: local throughput-harness hygiene and support-claim boundary only.
 - Promoted the local ignored WIP harness `scripts/bench-llama3-same-host.mjs` into a tracked, repeatable same-host Camelid-vs-llama.cpp benchmark harness.
 - Removed the local `.git/info/exclude` rule that silently hid that script from `git status`.
 - Added `scripts/test-bench-llama3-same-host.mjs` to exercise the non-network `--print-plan` and `--help` paths.
+- Rechecked the local support path: the harness is tracked, there is no `.git/info/exclude` rule hiding it, and the remaining ignored throughput/perf files are historical evidence/log artifacts rather than active silent harness WIP.
 
 ## Exact harness command shape
 

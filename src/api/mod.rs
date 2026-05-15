@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
+    execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
     inference::{
         diagnostic_attention_score_scale, diagnostic_ffn_gate_up_order,
@@ -31,10 +32,11 @@ use crate::{
         diagnostic_output_projection_layout, diagnostic_rectangular_linear_layout,
         diagnostic_rms_norm_epsilon, diagnostic_rope_direction, diagnostic_rope_pairing,
         diagnostic_rope_position_mode, diagnostic_square_linear_layout,
-        diagnostic_zero_delta_selector, output_projection_diagnostics, DeltaZeroTarget,
-        LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep, LlamaInferenceSession,
-        LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
-        LlamaOutputProjectionDiagnostic, LlamaSampler, SamplingConfig,
+        diagnostic_zero_delta_selector, output_projection_diagnostics,
+        q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
+        DeltaZeroTarget, LlamaForwardDiagnostics, LlamaForwardTimings, LlamaGenerationStep,
+        LlamaInferenceSession, LlamaLayerMemoryTimings, LlamaLayerTimings, LlamaLoadedWeights,
+        LlamaOutputProjectionDiagnostic, LlamaQ8ScheduleTelemetry, LlamaSampler, SamplingConfig,
     },
     model::{DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0Block, TensorStore},
@@ -56,12 +58,38 @@ const JINJA_CHAT_TEMPLATE_CACHE_LIMIT: usize = 16;
 static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environment<'static>>>>> =
     OnceLock::new();
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct AppState {
     loaded_model: Arc<RwLock<Option<LoadedModel>>>,
+    execution_plan: Arc<RwLock<Option<ExecutionPlan>>>,
     cached_weights: Arc<RwLock<Option<CachedLlamaWeights>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
+    planner_env: PlannerEnv,
+    configured_threads: Option<usize>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            loaded_model: Arc::new(RwLock::new(None)),
+            execution_plan: Arc::new(RwLock::new(None)),
+            cached_weights: Arc::new(RwLock::new(None)),
+            cached_prompt_prefix: Arc::new(Mutex::new(None)),
+            generation_sessions: Arc::new(RwLock::new(HashMap::new())),
+            planner_env: PlannerEnv::capture(),
+            configured_threads: None,
+        }
+    }
+}
+
+impl AppState {
+    pub fn with_configured_threads(configured_threads: Option<usize>) -> Self {
+        Self {
+            configured_threads,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +189,7 @@ pub struct HealthResponse {
     pub loaded_now: bool,
     pub generation_ready: bool,
     pub active_model_id: Option<String>,
+    pub execution_plan: Option<ExecutionPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -171,6 +200,7 @@ pub struct CapabilitiesResponse {
     pub tokenization: bool,
     pub inference: bool,
     pub streaming: bool,
+    pub execution_plan: Option<ExecutionPlan>,
     pub support_contract: SupportContract,
     pub supported_quantization: Vec<SupportItem>,
     pub planned_quantization: Vec<SupportItem>,
@@ -488,6 +518,8 @@ pub struct GenerationTimings {
     pub layers: Vec<GenerationLayerTimings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<crate::inference::LlamaForwardMemoryTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q8_schedule: Option<LlamaQ8ScheduleTelemetry>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -682,11 +714,16 @@ pub struct ErrorBody {
 }
 
 pub fn router() -> Router {
-    let state = AppState::default();
+    router_with_state(AppState::default())
+}
+
+pub fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/execution-plan", get(execution_plan))
+        .route("/api/execution-plan", get(execution_plan))
         .route("/api/models/load", post(load_model))
         .route("/api/models/unload", post(unload_model))
         .route("/api/models/current", get(current_model))
@@ -707,10 +744,21 @@ pub fn router() -> Router {
         .with_state(state)
 }
 
-pub async fn serve(addr: SocketAddr) -> std::io::Result<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    configured_threads: Option<usize>,
+    initial_model: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let state = AppState::with_configured_threads(configured_threads);
+    if let Some(model_path) = initial_model {
+        if let Err(err) = load_model_from_path(&state, model_path, None).await {
+            tracing::error!(error=%err, "failed to load startup model");
+            return Err(std::io::Error::other(err.to_string()));
+        }
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "camelid server listening");
-    axum::serve(listener, router()).await
+    tracing::info!(%addr, execution_plan=?state.execution_plan.read().await.as_ref(), "camelid server listening");
+    axum::serve(listener, router_with_state(state)).await
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -723,6 +771,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         loaded_now,
         generation_ready,
         active_model_id: model.as_ref().map(|m| m.id.clone()),
+        execution_plan: state.execution_plan.read().await.clone(),
     })
 }
 
@@ -735,11 +784,22 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
         && guard_cpu_weight_materialization_budget(binding).is_ok()
 }
 
-async fn capabilities() -> Json<CapabilitiesResponse> {
-    Json(capabilities_response())
+async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
+    Json(capabilities_response_with_plan(
+        state.execution_plan.read().await.clone(),
+    ))
 }
 
+async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionPlan>> {
+    Json(state.execution_plan.read().await.clone())
+}
+
+#[cfg(test)]
 fn capabilities_response() -> CapabilitiesResponse {
+    capabilities_response_with_plan(None)
+}
+
+fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> CapabilitiesResponse {
     CapabilitiesResponse {
         engine: "camelid",
         gguf_metadata: true,
@@ -747,8 +807,9 @@ fn capabilities_response() -> CapabilitiesResponse {
         tokenization: true,
         inference: true,
         streaming: true,
+        execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs, while Llama 3.2 3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -771,7 +832,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "Q8_0",
                 status: "supported_current_gate",
-                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs, while the exact Llama 3.2 3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 rows have checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
+                notes: "TinyLlama remains the current support gate; exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; and exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs where row-specific PASS artifacts exist. These are exact bounded-pack lanes only; no model-native/larger-context beyond the checked packs, arbitrary-template, production-throughput, portability, neighboring-row, or broad-family support is implied.",
             },
         ],
         planned_quantization: vec![
@@ -795,7 +856,7 @@ fn capabilities_response() -> CapabilitiesResponse {
             SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
-                notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+                notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
             },
         ],
         planned_model_families: vec![
@@ -920,7 +981,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 status: "supported_exact_row_smoke",
                 support_scope: "exact_row_smoke_only",
                 full_support_status: "blocked_pending_normalized_full_support",
-                full_support_blockers: "model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing",
+                full_support_blockers: "model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond row-scoped metadata-Jinja renderer and template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated_for_compact_and_small_prompt_pack",
                 tensors_load: "validated",
@@ -930,7 +991,7 @@ fn capabilities_response() -> CapabilitiesResponse {
                 frontend_load_path_verified: "validated",
                 frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
                 tested_context: "short_api_webui_smoke_with_broader_prompt_pack_parity_plus_first_512_second_1024_and_third_2048_context_packs",
-                chat_template_renderer: "compact",
+                chat_template_renderer: "metadata_jinja_supported_for_exact_row",
                 chat_template_shape_pack: "validated_bounded_pack",
                 chat_template_shape_pack_id: "llama3-chat-template-shapes-v1",
                 bounded_context_512_pack: "validated_bounded_pack",
@@ -951,8 +1012,8 @@ fn capabilities_response() -> CapabilitiesResponse {
                 latest_checked_bucket: "llama3-context-2048-smoke-v1",
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-204",
-                evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
-                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader/full-support claim",
+                evidence: "the exact tracked Llama-3.2-3B-Instruct-Q8_0 GGUF has canonical Ubuntu main-lane API/WebUI support-gate refresh evidence at qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json for source head e9f926ed1a65, plus exact-row load, completion, chat-completion, frontend-smoke, five-prompt API smoke evidence, compact prompt-token/deterministic 1-token/5-token/bounded 50-token parity, broader three-prompt 50-token parity, first bounded 512-context parity, second bounded 1024-context parity, third bounded 2048-context parity, bounded compact template-shape coverage, exact-row metadata-Jinja renderer coverage for the recognized Llama 3.2 row template, and bounded unique-chat perf/RSS evidence; Camelid supports exact-row smoke for this row only, not broader/full support",
+                next_step: "preserve exact-row smoke plus checked 512/1024/2048 context support while normalizing model-native/larger context, broader arbitrary/Jinja template behavior beyond row-scoped metadata-Jinja/template-shape evidence, production throughput beyond bounded perf/RSS and the first-token direction probe, portability, and durable full-support bundle evidence before any broader/full-support claim",
             },
             ModelCompatibilityTarget {
                 id: "llama3_8b_instruct_q8_0",
@@ -1273,50 +1334,8 @@ fn capabilities_response() -> CapabilitiesResponse {
 }
 
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
-    match read_metadata(&req.path) {
-        Ok(gguf) => {
-            let id = req
-                .id
-                .or_else(|| gguf.model_name().map(ToOwned::to_owned))
-                .or_else(|| {
-                    req.path
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "loaded-model".to_string());
-            let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
-            let unsupported_runtime = match &llama_config_result {
-                Err(BackendError::UnsupportedModelArchitecture(message)) => {
-                    Some(UnsupportedRuntimeSummary {
-                        code: "unsupported_model_architecture",
-                        message: message.clone(),
-                    })
-                }
-                _ => None,
-            };
-            let llama_config = llama_config_result.ok();
-            let llama_tensors = llama_config
-                .as_ref()
-                .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
-            let tokenizer_result = Tokenizer::from_gguf(&gguf);
-            let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
-            let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
-            let loaded = LoadedModel {
-                id,
-                path: req.path,
-                gguf,
-                llama_config,
-                llama_tensors,
-                unsupported_runtime,
-                tokenizer,
-                tokenizer_runtime,
-            };
-            let body = loaded.clone();
-            *state.loaded_model.write().await = Some(loaded);
-            *state.cached_weights.write().await = None;
-            clear_prompt_prefix_cache(&state);
-            (StatusCode::OK, Json(body)).into_response()
-        }
+    match load_model_from_path(&state, req.path, req.id).await {
+        Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         Err(err) => api_error(
             StatusCode::BAD_REQUEST,
             "invalid_model",
@@ -1326,8 +1345,77 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     }
 }
 
+async fn load_model_from_path(
+    state: &AppState,
+    path: PathBuf,
+    id: Option<String>,
+) -> Result<LoadedModel, BackendError> {
+    let gguf = read_metadata(&path)?;
+    let outcome = plan_for_model(&path, &gguf, state.configured_threads);
+    state.planner_env.apply(&outcome.env_updates);
+    log_selected_execution_plan(&outcome.plan);
+    let id = id
+        .or_else(|| gguf.model_name().map(ToOwned::to_owned))
+        .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "loaded-model".to_string());
+    let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+    let unsupported_runtime = match &llama_config_result {
+        Err(BackendError::UnsupportedModelArchitecture(message)) => {
+            Some(UnsupportedRuntimeSummary {
+                code: "unsupported_model_architecture",
+                message: message.clone(),
+            })
+        }
+        _ => None,
+    };
+    let llama_config = llama_config_result.ok();
+    let llama_tensors = llama_config
+        .as_ref()
+        .and_then(|config| LlamaTensorBinding::bind(&gguf, config).ok());
+    let tokenizer_result = Tokenizer::from_gguf(&gguf);
+    let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
+    let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
+    let loaded = LoadedModel {
+        id,
+        path,
+        gguf,
+        llama_config,
+        llama_tensors,
+        unsupported_runtime,
+        tokenizer,
+        tokenizer_runtime,
+    };
+    *state.loaded_model.write().await = Some(loaded.clone());
+    *state.execution_plan.write().await = Some(outcome.plan);
+    *state.cached_weights.write().await = None;
+    clear_prompt_prefix_cache(state);
+    Ok(loaded)
+}
+
+fn log_selected_execution_plan(plan: &ExecutionPlan) {
+    tracing::info!(
+        profile=?plan.profile,
+        platform=%plan.platform_label,
+        cpu_model=%plan.cpu_model,
+        cpu_features=?plan.cpu_features,
+        model=%plan.exact_model_row,
+        support_level=%plan.support_level,
+        backend=%plan.selected_backend,
+        q8_path=%plan.selected_q8_path,
+        prefill_path=%plan.prefill_path,
+        prefill_runtime_policy=%plan.prefill_runtime_policy,
+        decode_path=%plan.decode_path,
+        threads=plan.thread_count,
+        diagnostics=%plan.diagnostics_status,
+        fallback_path=%plan.fallback_path,
+        reasons=?plan.reasons,
+        "Camelid execution plan selected"
+    );
+}
+
 async fn unload_model(State(state): State<AppState>) -> Response {
     *state.loaded_model.write().await = None;
+    *state.execution_plan.write().await = None;
     *state.cached_weights.write().await = None;
     clear_prompt_prefix_cache(&state);
     StatusCode::NO_CONTENT.into_response()
@@ -2831,6 +2919,10 @@ fn generate_token_ids(
     mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedTokens, Box<Response>> {
     let generation_started = Instant::now();
+    let collect_q8_schedule = q8_schedule_telemetry_enabled();
+    if collect_q8_schedule {
+        reset_q8_schedule_telemetry();
+    }
     let mut input = prepared.token_ids.clone();
     let mut history = prepared.token_ids.clone();
     let mut generated = Vec::new();
@@ -2984,6 +3076,9 @@ fn generate_token_ids(
     prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
     prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
     prepared.timings.memory = forward_timings.memory;
+    if collect_q8_schedule {
+        prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+    }
 
     Ok(GeneratedTokens {
         prompt_token_ids: prepared.token_ids,
@@ -3480,23 +3575,26 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     tokenizer: &Tokenizer,
     model_id: Option<&str>,
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
-    let exact_llama32_1b_row = model_id.is_some_and(is_llama32_1b_exact_row_model_id);
+    let exact_llama32_metadata_jinja_row =
+        model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
         if metadata_chat_template_enabled() {
             return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
         }
-        if exact_llama32_1b_row {
+        if let Some(row_label) = exact_llama32_metadata_jinja_row {
             if is_llama3_instruct_template(template) {
                 return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
             }
-            return Err(exact_llama32_1b_chat_template_error(
-                "exact Llama 3.2 1B Instruct Q8_0 requires a recognized Llama 3 metadata chat_template containing <|start_header_id|>, <|end_header_id|>, and <|eot_id|>",
+            return Err(exact_llama32_metadata_jinja_chat_template_error(
+                &format!(
+                    "{row_label} requires a recognized Llama 3 metadata chat_template containing <|start_header_id|>, <|end_header_id|>, and <|eot_id|>"
+                ),
             ));
         }
-    } else if exact_llama32_1b_row {
-        return Err(exact_llama32_1b_chat_template_error(
-            "exact Llama 3.2 1B Instruct Q8_0 requires tokenizer.chat_template metadata for chat prompt rendering",
-        ));
+    } else if let Some(row_label) = exact_llama32_metadata_jinja_row {
+        return Err(exact_llama32_metadata_jinja_chat_template_error(&format!(
+            "{row_label} requires tokenizer.chat_template metadata for chat prompt rendering"
+        )));
     }
 
     Ok(render_chat_prompt_for_tokenization_fallback(
@@ -3580,8 +3678,18 @@ fn is_mistral_instruct_template(template: &str) -> bool {
         && (template.contains("bos_token") || template.contains("</s>"))
 }
 
-fn exact_llama32_1b_chat_template_error(message: &str) -> MiniJinjaError {
+fn exact_llama32_metadata_jinja_chat_template_error(message: &str) -> MiniJinjaError {
     MiniJinjaError::new(MiniJinjaErrorKind::InvalidOperation, message.to_string())
+}
+
+fn llama32_metadata_jinja_exact_row_label(model_id: &str) -> Option<&'static str> {
+    if is_llama32_1b_exact_row_model_id(model_id) {
+        return Some("exact Llama 3.2 1B Instruct Q8_0");
+    }
+    if is_llama32_3b_exact_row_model_id(model_id) {
+        return Some("exact Llama 3.2 3B Instruct Q8_0");
+    }
+    None
 }
 
 fn is_llama32_1b_exact_row_model_id(model_id: &str) -> bool {
@@ -3595,6 +3703,19 @@ fn is_llama32_1b_exact_row_model_id(model_id: &str) -> bool {
         .collect::<String>();
     normalized.contains("llama32_1b_instruct_q8_0")
         || normalized.contains("llama_3_2_1b_instruct_q8_0")
+}
+
+fn is_llama32_3b_exact_row_model_id(model_id: &str) -> bool {
+    let normalized = model_id
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|ch| match ch {
+            '-' | '.' | ' ' => '_',
+            ch => ch,
+        })
+        .collect::<String>();
+    normalized.contains("llama32_3b_instruct_q8_0")
+        || normalized.contains("llama_3_2_3b_instruct_q8_0")
 }
 
 fn metadata_chat_template_enabled() -> bool {
@@ -3972,6 +4093,7 @@ mod tests {
     };
 
     use crate::{
+        execution_plan::{ExecutionPlan, ExecutionProfile},
         inference::{LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, SamplingConfig},
         model::LlamaModelConfig,
         tensor::CpuTensor,
@@ -3982,6 +4104,35 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn capabilities_can_include_selected_execution_plan() {
+        let plan = ExecutionPlan {
+            profile: ExecutionProfile::Experimental,
+            operating_system: "linux".into(),
+            architecture: "x86_64".into(),
+            platform_label: "Ubuntu/Linux x86_64".into(),
+            cpu_model: "Intel Xeon Platinum 8488C".into(),
+            cpu_features: vec!["avx2".into()],
+            model_family: "llama".into(),
+            quant_type: "Q8_0".into(),
+            exact_model_row: "Llama 3.2 3B Instruct".into(),
+            support_level: "supported_exact_row_smoke_512_1024_2048".into(),
+            selected_backend: "cpu_q8_runtime_repack".into(),
+            selected_q8_path: "x86_experimental_q8_0_avx2".into(),
+            prefill_path: "q8_0_x86_avx2_tiled_gemm_experimental".into(),
+            prefill_runtime_policy: "manual_override_only".into(),
+            decode_path: "q8_0_decode_avx2".into(),
+            thread_count: 16,
+            diagnostics_status: "standard diagnostics; RSS timings disabled by default".into(),
+            fallback_path: "retained_q8_reference_path".into(),
+            reasons: vec!["default-off Ubuntu x86_64 experiment selected".into()],
+        };
+
+        let response = capabilities_response_with_plan(Some(plan.clone()));
+
+        assert_eq!(response.execution_plan, Some(plan));
+    }
 
     #[test]
     fn capabilities_report_llama32_context_pack_boundaries() {
@@ -4102,8 +4253,12 @@ mod tests {
             "Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs"
         ));
         assert!(response.support_contract.current_gate.contains(
-            "Llama 3.2 3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 have checked bounded 512/1024/2048 packs"
+            "Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs"
         ));
+        assert!(response
+            .support_contract
+            .current_gate
+            .contains("Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs"));
         assert!(response
             .support_contract
             .current_gate
@@ -4122,7 +4277,10 @@ mod tests {
             "exact Llama 3.2 1B Instruct Q8_0 now has checked bounded 512/1024/2048/4096/8192-context packs"
         ));
         assert!(q8.notes.contains(
-            "the exact Llama 3.2 3B Instruct Q8_0 and Llama 3 8B Instruct Q8_0 rows have checked bounded 512/1024/2048-context packs"
+            "exact Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
+        ));
+        assert!(q8.notes.contains(
+            "exact Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048-context packs"
         ));
         assert!(q8.notes.contains("where row-specific PASS artifacts exist"));
         assert!(!q8.notes.contains("8B 1024/2048 remain red"));
@@ -4136,7 +4294,10 @@ mod tests {
             "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs"
         ));
         assert!(llama_bpe.notes.contains(
-            "exact Llama 3.2 3B Instruct Q8_0 and exact Llama 3 8B Instruct Q8_0 have row-specific smoke support with checked bounded 512/1024/2048-context packs"
+            "exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs"
+        ));
+        assert!(llama_bpe.notes.contains(
+            "exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs"
         ));
         assert!(llama_bpe
             .notes
@@ -4323,7 +4484,7 @@ mod tests {
             .current_gate
             .contains("Current exact-row support"));
         assert!(response.support_contract.current_gate.contains(
-            "no model-native/larger context beyond the checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied"
+            "no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied"
         ));
     }
 
@@ -4911,6 +5072,101 @@ mod tests {
     }
 
     #[test]
+    fn metadata_jinja_renderer_executes_full_llama32_gguf_template_system_user() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(METADATA_CHAT_TEMPLATE_ENV, "metadata");
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+
+        let rendered = render_chat_prompt_for_tokenization(
+            &[
+                ChatMessage {
+                    role: "system".to_string(),
+                    content: "  Be brief.  ".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: "  hello  ".to_string(),
+                },
+            ],
+            &tokenizer,
+        );
+
+        assert!(!rendered.add_special);
+        assert!(rendered.parse_special);
+        assert_eq!(
+            rendered.text,
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+    }
+
+    #[test]
+    fn exact_llama32_1b_row_executes_full_metadata_jinja_template_without_env_opt_in() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+
+        let rendered = render_chat_prompt_for_tokenization_for_model(
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: " Alpha? ".to_string(),
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: " alpha ".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: " Beta? ".to_string(),
+                },
+            ],
+            &tokenizer,
+            Some("bartowski/Meta-Llama-3.2-1B-Instruct-Q8_0"),
+        );
+
+        assert!(!rendered.add_special);
+        assert!(rendered.parse_special);
+        assert_eq!(
+            rendered.text,
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nAlpha?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nalpha<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nBeta?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
+    fn exact_llama32_3b_row_executes_full_metadata_jinja_template_without_env_opt_in() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+
+        let rendered = render_chat_prompt_for_tokenization_for_model(
+            &[
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: " Alpha? ".to_string(),
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: " alpha ".to_string(),
+                },
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: " Beta? ".to_string(),
+                },
+            ],
+            &tokenizer,
+            Some("bartowski/Meta-Llama-3.2-3B-Instruct-Q8_0"),
+        );
+
+        assert!(!rendered.add_special);
+        assert!(rendered.parse_special);
+        assert_eq!(
+            rendered.text,
+            "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nAlpha?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nalpha<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nBeta?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+    }
+
+    #[test]
     fn exact_llama32_1b_row_uses_metadata_jinja_renderer_without_env_opt_in_system_user() {
         let _guard = crate::test_support::env_lock();
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
@@ -5026,7 +5282,7 @@ mod tests {
     }
 
     #[test]
-    fn non_exact_llama32_row_keeps_compact_renderer_without_env_opt_in() {
+    fn llama32_non_q8_or_untracked_row_keeps_compact_renderer_without_env_opt_in() {
         let _guard = crate::test_support::env_lock();
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_SUBSET_TEMPLATE);
@@ -5037,7 +5293,7 @@ mod tests {
                 content: "  hello  ".to_string(),
             }],
             &tokenizer,
-            Some("llama32_3b_instruct_q8_0"),
+            Some("llama32_3b_instruct"),
         );
 
         assert!(rendered.add_special);
@@ -5283,6 +5539,30 @@ mod tests {
     }
 
     #[test]
+    fn exact_llama32_3b_required_metadata_jinja_renderer_does_not_silently_fallback() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = llama3_tokenizer_with_template("{{ unsupported_call(messages) }}");
+
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "  hello  ".to_string(),
+            }],
+            &tokenizer,
+            Some("llama32_3b_instruct_q8_0"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+        assert!(
+            err.to_string()
+                .contains("exact Llama 3.2 3B Instruct Q8_0 requires a recognized Llama 3 metadata chat_template"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn exact_llama32_1b_required_renderer_rejects_unrecognized_template_shape() {
         let _guard = crate::test_support::env_lock();
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
@@ -5304,6 +5584,30 @@ mod tests {
         assert!(err
             .to_string()
             .contains("requires a recognized Llama 3 metadata chat_template"));
+    }
+
+    #[test]
+    fn exact_llama32_3b_required_renderer_rejects_unrecognized_template_shape() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = llama3_tokenizer_with_template(
+            "{% for message in messages %}{{ message.role }}: {{ message.content }}{% endfor %}",
+        );
+
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            &tokenizer,
+            Some("Llama-3.2-3B-Instruct-Q8_0"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+        assert!(err.to_string().contains(
+            "exact Llama 3.2 3B Instruct Q8_0 requires a recognized Llama 3 metadata chat_template"
+        ));
     }
 
     #[test]
@@ -5329,6 +5633,34 @@ mod tests {
         assert!(err
             .to_string()
             .contains("requires tokenizer.chat_template metadata"));
+    }
+
+    #[test]
+    fn exact_llama32_3b_required_renderer_rejects_missing_template_metadata() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = Tokenizer {
+            chat_template: None,
+            ..llama3_tokenizer_with_template(LLAMA3_METADATA_SUBSET_TEMPLATE)
+        };
+
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "  hello  ".to_string(),
+            }],
+            &tokenizer,
+            Some("Meta-Llama-3.2-3B-Instruct-Q8_0"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), MiniJinjaErrorKind::InvalidOperation);
+        assert!(
+            err.to_string().contains(
+                "exact Llama 3.2 3B Instruct Q8_0 requires tokenizer.chat_template metadata"
+            ),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -5360,6 +5692,27 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), MiniJinjaErrorKind::UndefinedError);
+    }
+
+    #[test]
+    fn exact_llama32_3b_required_metadata_jinja_renderer_reports_undefined_variables() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let template =
+            "{{ unsupported_template_variable }}<|start_header_id|><|end_header_id|><|eot_id|>";
+        let tokenizer = llama3_tokenizer_with_template(template);
+
+        let err = render_chat_prompt_for_tokenization_for_model_result(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+            &tokenizer,
+            Some("Meta-Llama-3.2-3B-Instruct-Q8_0"),
         )
         .unwrap_err();
 
@@ -5427,6 +5780,100 @@ mod tests {
     }
 
     const LLAMA3_METADATA_SUBSET_TEMPLATE: &str = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}{% if add_generation_prompt %}{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}{% endif %}";
+
+    const LLAMA3_METADATA_FULL_TEMPLATE: &str = r#"{{- bos_token }}
+{%- if custom_tools is defined %}
+    {%- set tools = custom_tools %}
+{%- endif %}
+{%- if not tools_in_user_message is defined %}
+    {%- set tools_in_user_message = true %}
+{%- endif %}
+{%- if not date_string is defined %}
+    {%- if strftime_now is defined %}
+        {%- set date_string = strftime_now("%d %b %Y") %}
+    {%- else %}
+        {%- set date_string = "26 Jul 2024" %}
+    {%- endif %}
+{%- endif %}
+{%- if not tools is defined %}
+    {%- set tools = none %}
+{%- endif %}
+
+{#- This block extracts the system message, so we can slot it into the right place. #}
+{%- if messages[0]['role'] == 'system' %}
+    {%- set system_message = messages[0]['content']|trim %}
+    {%- set messages = messages[1:] %}
+{%- else %}
+    {%- set system_message = "" %}
+{%- endif %}
+
+{#- System message #}
+{{- "<|start_header_id|>system<|end_header_id|>\n\n" }}
+{%- if tools is not none %}
+    {{- "Environment: ipython\n" }}
+{%- endif %}
+{{- "Cutting Knowledge Date: December 2023\n" }}
+{{- "Today Date: " + date_string + "\n\n" }}
+{%- if tools is not none and not tools_in_user_message %}
+    {{- "You have access to the following functions. To call a function, please respond with JSON for a function call." }}
+    {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
+    {{- "Do not use variables.\n\n" }}
+    {%- for t in tools %}
+        {{- t | tojson(indent=4) }}
+        {{- "\n\n" }}
+    {%- endfor %}
+{%- endif %}
+{{- system_message }}
+{{- "<|eot_id|>" }}
+
+{#- Custom tools are passed in a user message with some extra guidance #}
+{%- if tools_in_user_message and not tools is none %}
+    {#- Extract the first user message so we can plug it in here #}
+    {%- if messages | length != 0 %}
+        {%- set first_user_message = messages[0]['content']|trim %}
+        {%- set messages = messages[1:] %}
+    {%- else %}
+        {{- raise_exception("Cannot put tools in the first user message when there's no first user message!") }}
+{%- endif %}
+    {{- '<|start_header_id|>user<|end_header_id|>\n\n' -}}
+    {{- "Given the following functions, please respond with a JSON for a function call " }}
+    {{- "with its proper arguments that best answers the given prompt.\n\n" }}
+    {{- 'Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.' }}
+    {{- "Do not use variables.\n\n" }}
+    {%- for t in tools %}
+        {{- t | tojson(indent=4) }}
+        {{- "\n\n" }}
+    {%- endfor %}
+    {{- first_user_message + "<|eot_id|>"}}
+{%- endif %}
+
+{%- for message in messages %}
+    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}
+        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' }}
+    {%- elif 'tool_calls' in message %}
+        {%- if not message.tool_calls|length == 1 %}
+            {{- raise_exception("This model only supports single tool-calls at once!") }}
+        {%- endif %}
+        {%- set tool_call = message.tool_calls[0].function %}
+        {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' -}}
+        {{- '{"name": "' + tool_call.name + '", ' }}
+        {{- '"parameters": ' }}
+        {{- tool_call.arguments | tojson }}
+        {{- "}" }}
+        {{- "<|eot_id|>" }}
+    {%- elif message.role == "tool" or message.role == "ipython" %}
+        {{- "<|start_header_id|>ipython<|end_header_id|>\n\n" }}
+        {%- if message.content is mapping or message.content is iterable %}
+            {{- message.content | tojson }}
+        {%- else %}
+            {{- message.content }}
+        {%- endif %}
+        {{- "<|eot_id|>" }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|start_header_id|>assistant<|end_header_id|>\n\n' }}
+{%- endif %}"#;
 
     fn llama3_tokenizer_with_template(template: &str) -> Tokenizer {
         Tokenizer {

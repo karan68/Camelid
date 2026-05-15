@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { LLAMA32_3B_ACCEPTANCE_AVAILABILITY, LLAMA32_3B_ACCEPTANCE_GATING_NOTE, LLAMA32_3B_ACCEPTANCE_SUMMARY, LLAMA32_3B_ACCEPTANCE_TARGET } from '../lib/acceptanceTargets'
-import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
+import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, compatibilityHintMatchesExactTarget, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { formatBytes, formatCompactNumber } from '../lib/formatters'
-import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, isRunnableModel } from '../lib/modelState'
+import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, isRunnableModel, modelRuntimeIdMatches } from '../lib/modelState'
 
 const FILTERS = [
   { key: 'all', label: 'Everything' },
@@ -17,7 +17,7 @@ const FILTERS = [
 const CATALOG_PAGE_SIZE = 18
 
 function getGroupKey(model, runtime) {
-  if (runtime?.active_model_id === model.id) return 'installed'
+  if (modelRuntimeIdMatches(model, runtime)) return 'installed'
   if (model.load_error || model.install_error) return 'attention'
   if (isExternalModel(model)) return model.status === 'ready' ? 'external' : 'attention'
   if (model.status === 'failed' || ((model.status === 'ready' || model.status === 'registered') && !model.model_path)) return 'attention'
@@ -56,18 +56,25 @@ function findCatalogMatch(models, item) {
   return models.find((model) => model.hf_repo === item.repo_id && model.hf_filename === item.filename)
 }
 
-function matchesLlama32ThreeBTarget(model) {
-  const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path].filter(Boolean).join(' ').toLowerCase()
-  return model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
+function matchesLlama32ThreeBTarget(model, capabilities) {
+  const target = { id: 'llama32_3b_instruct_q8_0' }
+  if (compatibilityHintMatchesExactTarget(capabilities, model, target)) return true
+
+  const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path, model?.quant].filter(Boolean).join(' ').toLowerCase()
+  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
     || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
-    || /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
+  const hasLlama32ThreeB = /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
     || /llama[\s._-]*32[\s._-]*3b/.test(subject)
+  const hasInstruct = /(?:^|[^a-z0-9])instruct(?:[^a-z0-9]|$)/i.test(subject)
+  const hasQ8 = /(?:^|[^a-z0-9])q8[\s._-]*0(?:[^a-z0-9]|$)/i.test(subject)
+    || /\bfile[_\s-]*type\s*7\b/i.test(subject)
+  return Boolean(exactAcceptanceIdentity || (hasLlama32ThreeB && hasInstruct && hasQ8))
 }
 
 function findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId) {
   if (!target) return { model: null, active: false, selected: false }
-  const matches = models.filter((model) => findCompatibilityHint(capabilities, model)?.target?.id === target.id)
-  const activeModel = matches.find((model) => runtime?.active_model_id === model.id) || null
+  const matches = models.filter((model) => compatibilityHintMatchesExactTarget(capabilities, model, target))
+  const activeModel = matches.find((model) => modelRuntimeIdMatches(model, runtime)) || null
   const selectedModel = matches.find((model) => model.id === selectedModelId) || null
   return {
     model: activeModel || selectedModel || matches[0] || null,
@@ -141,7 +148,7 @@ function modelErrorCopy(model) {
 }
 
 function getReadinessRows(model, runtime) {
-  const active = runtime?.active_model_id === model?.id || isModelLoadedNow(model)
+  const active = modelRuntimeIdMatches(model, runtime) || isModelLoadedNow(model)
   const readiness = model?.camelid || {}
   const generationReady = isModelGenerationReady(model)
   return [
@@ -365,7 +372,7 @@ export default function ModelsView({
   }, [filteredModels, runtime])
 
   const counts = useMemo(() => ({
-    loaded: models.filter((model) => isModelLoadedNow(model) || runtime?.active_model_id === model.id).length || (runtime?.loaded_now ? 1 : 0),
+    loaded: models.filter((model) => isModelLoadedNow(model) || modelRuntimeIdMatches(model, runtime)).length || (runtime?.loaded_now ? 1 : 0),
     generationReady: models.filter(isModelGenerationReady).length || (runtime?.generation_ready ? 1 : 0),
     localPaths: models.filter((model) => !isExternalModel(model) && hasLocalModelPath(model)).length,
     installed: models.filter((model) => getGroupKey(model, runtime) === 'installed').length,
@@ -381,13 +388,13 @@ export default function ModelsView({
   )
 
   const activeLocalModel = useMemo(
-    () => models.find((model) => model.id === runtime?.active_model_id) || null,
+    () => models.find((model) => modelRuntimeIdMatches(model, runtime)) || null,
     [models, runtime?.active_model_id],
   )
 
   const llama32ThreeBModel = useMemo(
-    () => models.find(matchesLlama32ThreeBTarget) || null,
-    [models],
+    () => models.find((model) => matchesLlama32ThreeBTarget(model, capabilities)) || null,
+    [models, capabilities],
   )
   const showLlama32ThreeBAcceptanceTarget = !llama32ThreeBModel
   const fillLlama32ThreeBImport = () => {
@@ -542,7 +549,7 @@ export default function ModelsView({
                 ? `${selectedChatGate.label}: Camelid reports this exact model loaded and generation-ready, but chat stays blocked until /api/capabilities promotes the matching COMPATIBILITY.md row.`
                 : selectedLocalModel
                   ? getNextStepCopy(selectedLocalModel, {
-                    active: selectedLocalModel.id === runtime?.active_model_id,
+                    active: modelRuntimeIdMatches(selectedLocalModel, runtime),
                     selected: true,
                     runnable: selectedRuntimeReady,
                     generationReady: isModelGenerationReady(selectedLocalModel),
@@ -747,7 +754,7 @@ export default function ModelsView({
               const contractBlocked = runtimeReady && !chatGate.contractSupported
               const canLoad = canLoadIntoRuntime(model)
               const external = isExternalModel(model)
-              const active = runtime?.active_model_id === model.id
+              const active = modelRuntimeIdMatches(model, runtime)
               const loadedNow = isModelLoadedNow(model) || active
               const generationReady = isModelGenerationReady(model)
               const selected = selectedModelId === model.id
@@ -816,7 +823,7 @@ export default function ModelsView({
               {discoverCatalogItems.map((item) => {
                 const localMatch = findCatalogMatch(models, item)
                 const runnable = Boolean(localMatch && (localMatch.status === 'ready' || localMatch.status === 'registered' || localMatch.status === 'failed') && hasLocalModelPath(localMatch))
-                const active = runtime?.active_model_id === localMatch?.id
+                const active = modelRuntimeIdMatches(localMatch, runtime)
                 const selected = selectedModelId === localMatch?.id
                 const busy = localMatch && loadingModelId === localMatch.id
                 const errorCopy = modelErrorCopy(localMatch)
@@ -997,7 +1004,7 @@ export default function ModelsView({
               const canLoad = canLoadIntoRuntime(model)
               const external = isExternalModel(model)
               const selected = selectedModelId === model.id
-              const active = runtime?.active_model_id === model.id
+              const active = modelRuntimeIdMatches(model, runtime)
               const loadedNow = isModelLoadedNow(model) || active
               const generationReady = isModelGenerationReady(model)
               const busy = loadingModelId === model.id

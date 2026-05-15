@@ -1,5 +1,5 @@
 import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus } from '../lib/capabilities'
-import { describeModelState } from '../lib/modelState'
+import { describeModelState, getRuntimeRequestModelId } from '../lib/modelState'
 
 function runtimeReadinessLabel(runtime) {
   if (runtime?.generation_ready) return 'Loaded for local generation'
@@ -11,7 +11,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
   const runtimePill = runtimeReadinessLabel(runtime)
   const selectedModelName = selectedModel?.name || 'No next-chat model selected'
   const apiBase = runtime?.api_base || 'Local API unavailable'
-  const modelId = selectedModel?.id || runtime?.active_model_id || '<loaded-model-id>'
+  const modelId = getRuntimeRequestModelId(selectedModel, runtime, '<loaded-model-id>') || '<loaded-model-id>'
   const supportContract = capabilities?.support_contract
   const supportContractCurrentGate = frontendSupportContractCopy(capabilities)
   const compatibilityTargets = capabilities?.model_compatibility || []

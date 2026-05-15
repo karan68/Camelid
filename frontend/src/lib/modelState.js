@@ -30,6 +30,11 @@ export function modelRuntimeIdMatches(model, runtime) {
   return activeModelId === model.id || activeModelId === model.runtime_model_name
 }
 
+export function getRuntimeRequestModelId(model, runtime, fallback = '') {
+  if (modelRuntimeIdMatches(model, runtime) && runtime?.active_model_id) return runtime.active_model_id
+  return model?.runtime_model_name || model?.id || fallback || runtime?.active_model_id || ''
+}
+
 export function isRunnableInCurrentRuntime(model, runtime) {
   if (!isRunnableModel(model)) return false
   if (isExternalModel(model)) return Boolean(runtime?.generation_ready)

@@ -23,6 +23,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
         addr: SocketAddr,
+        /// Load a GGUF model at startup and auto-select the safest validated execution plan.
+        #[arg(long, env = "CAMELID_MODEL")]
+        model: Option<PathBuf>,
         /// Override Rayon worker threads for the inference server.
         #[arg(long, env = "CAMELID_THREADS")]
         threads: Option<usize>,
@@ -124,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve {
             addr,
+            model,
             threads,
             parallel_linear_min_outputs,
             apple_accelerate_min_elements,
@@ -141,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
             if log_acceleration {
                 log_acceleration_state();
             }
-            api::serve(addr).await?
+            api::serve(addr, threads, model).await?
         }
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;

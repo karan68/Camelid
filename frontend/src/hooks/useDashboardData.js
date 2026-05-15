@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { LLAMA32_3B_ACCEPTANCE_TARGET } from '../lib/acceptanceTargets'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
-import { isExternalModel, isRunnableModel } from '../lib/modelState'
+import { getRuntimeRequestModelId, isExternalModel, isRunnableModel, modelRuntimeIdMatches } from '../lib/modelState'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -75,6 +76,26 @@ function getModelPath(model) {
   return typeof model?.path === 'string' ? model.path : ''
 }
 
+function pathBasename(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
+}
+
+function normalizeQuantLabel(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+}
+
+const LLAMA32_3B_ACCEPTANCE_FILENAME = pathBasename(LLAMA32_3B_ACCEPTANCE_TARGET.source)
+
+function isExactLlama32ThreeBLoadedGguf(modelPath, quantLabel) {
+  return pathBasename(modelPath).toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase()
+    && normalizeQuantLabel(quantLabel) === 'Q8_0'
+}
+
+export function resolveLoadedModelDisplayName({ fallbackName, modelPath, quantLabel }) {
+  if (isExactLlama32ThreeBLoadedGguf(modelPath, quantLabel)) return LLAMA32_3B_ACCEPTANCE_TARGET.name
+  return fallbackName
+}
+
 function getLoadedModelFileType(model) {
   const metadata = model?.gguf?.metadata || {}
   return metadata?.general?.file_type ?? metadata?.['general.file_type'] ?? null
@@ -101,6 +122,7 @@ function estimateChatTokenCount(messages) {
 
 const CODE_FIRST_SYSTEM_PROMPT = 'begin immediately with complete runnable code. No intro. Output one self-contained file unless the user asks otherwise. For Python, start exactly with ```python, include imports, and close the fence after the complete script. For Python games, prefer tkinter from the standard library over pygame, keep it compact, and include a complete runnable event loop. For HTML output ONE self-contained file. Never use external files or script src. Include inline <style> and inline <script> with working click/game logic before </body>. Start exactly with ```html then <!doctype html> and close the fence after </html>.'
 const LOCAL_CHAT_DEMO_MAX_TOKENS = 800
+const LOCAL_CHAT_CODE_MAX_TOKENS = 2048
 
 function looksLikeCodePrompt(value) {
   const text = String(value || '').toLowerCase()
@@ -115,6 +137,11 @@ function applyLocalChatPolicy(messages) {
     { role: 'system', content: CODE_FIRST_SYSTEM_PROMPT },
     ...messages,
   ]
+}
+
+function localChatMaxTokens(messages) {
+  const lastUser = [...(messages || [])].reverse().find((message) => message.role === 'user')
+  return looksLikeCodePrompt(lastUser?.content) ? LOCAL_CHAT_CODE_MAX_TOKENS : LOCAL_CHAT_DEMO_MAX_TOKENS
 }
 
 function tokensPerSecond(tokens, elapsedMs) {
@@ -205,13 +232,25 @@ function modelReadinessFromCurrent(currentModel, active, generationReady) {
   }
 }
 
+function localRecordMatchesBackendId(record, backendModelId) {
+  if (!record || !backendModelId) return false
+  return backendModelId === record.id || backendModelId === record.runtime_model_name
+}
+
+function modelMatchesHealthActive(model, health) {
+  return modelRuntimeIdMatches(model, { active_model_id: health?.active_model_id })
+}
+
 function modelFromLocalRecord(record, health, currentModel, apiBase) {
-  const active = health?.active_model_id === record.id
+  const active = modelMatchesHealthActive(record, health)
   const generationReady = active && Boolean(health?.generation_ready)
+  const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : record.quant
+  const modelPath = active ? getModelPath(currentModel) || record.model_path : record.model_path
   return {
     ...record,
+    name: resolveLoadedModelDisplayName({ fallbackName: record.name, modelPath, quantLabel }),
     status: generationReady ? 'ready' : record.status,
-    model_path: active ? getModelPath(currentModel) || record.model_path : record.model_path,
+    model_path: modelPath,
     api_base: apiBase,
     install_error: active ? null : record.install_error,
     load_error: active ? null : record.load_error,
@@ -222,19 +261,22 @@ function modelFromLocalRecord(record, health, currentModel, apiBase) {
 }
 
 function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
-  const active = health?.active_model_id === item.id
+  const runtimeModelName = item.id
+  const id = localRecord?.id || item.id
+  const active = localRecordMatchesBackendId(localRecord, health?.active_model_id) || health?.active_model_id === item.id
   const generationReady = active && Boolean(health?.generation_ready)
   const tokenizer = active ? currentModel?.tokenizer : null
   const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : null
   const modelPath = active ? getModelPath(currentModel) || localRecord?.model_path || '' : localRecord?.model_path || ''
+  const fallbackName = localRecord?.name || item.name || item.id
 
   return {
-    id: item.id,
-    name: localRecord?.name || item.name || item.id,
+    id,
+    name: resolveLoadedModelDisplayName({ fallbackName, modelPath, quantLabel }),
     provider_kind: 'local',
     status: generationReady ? 'ready' : localRecord?.status || 'registered',
     model_path: modelPath,
-    runtime_model_name: item.id,
+    runtime_model_name: runtimeModelName,
     source: localRecord?.source || 'Camelid local runtime',
     engine: 'camelid',
     quant: quantLabel || localRecord?.quant || null,
@@ -258,8 +300,9 @@ function mergeModelLists({ modelItems, health, currentModel, localModels, apiBas
     byId.set(record.id, modelFromLocalRecord(record, health, currentModel, apiBase))
   })
   modelItems.forEach((item) => {
-    const localRecord = localRecords.find((record) => record.id === item.id) || null
-    byId.set(item.id, modelFromBackend(item, health, currentModel, localRecord, apiBase))
+    const localRecord = localRecords.find((record) => localRecordMatchesBackendId(record, item.id)) || null
+    const mergedModel = modelFromBackend(item, health, currentModel, localRecord, apiBase)
+    byId.set(mergedModel.id, mergedModel)
   })
   return [...byId.values()].sort(compareModelsByName)
 }
@@ -479,7 +522,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setSelectedModelId((current) => {
         if (!nextModels.length) return ''
         const currentModel = current ? nextModels.find((model) => model.id === current) : null
-        const activeModel = health?.active_model_id ? nextModels.find((model) => model.id === health.active_model_id) : null
+        const activeModel = health?.active_model_id ? nextModels.find((model) => modelRuntimeIdMatches(model, { active_model_id: health.active_model_id })) : null
         const activeModelRunnable = activeModel && isRunnableModel(activeModel)
         const currentModelRunnable = currentModel && isRunnableModel(currentModel)
         const runnableModel = nextModels.find((model) => isRunnableModel(model)) || null
@@ -682,10 +725,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
       setPendingChat(null)
 
+      const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: selectedModelId, messages: requestMessages, temperature: 0, max_tokens: LOCAL_CHAT_DEMO_MAX_TOKENS, stream: true }),
+        body: JSON.stringify({ model: requestModelId, messages: requestMessages, temperature: 0, max_tokens: localChatMaxTokens(history), stream: true }),
       })
       const applyAssistantStreamPatch = (patch) => {
         updateConversationsState((current) => current.map((item) => (
@@ -902,7 +946,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       showNotice('This model needs a local GGUF path before Camelid can load it.', 'error')
       return
     }
-    if (runtime?.active_model_id === id && runtime?.generation_ready) {
+    if (modelRuntimeIdMatches(model, runtime) && runtime?.generation_ready) {
       showNotice('That model is already loaded and generation-ready.', 'success')
       return
     }

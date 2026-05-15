@@ -10,11 +10,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
     },
+    time::Instant,
 };
 
 const RETAIN_Q8_BLOCKS_ENV: &str = "CAMELID_RETAIN_Q8_0_BLOCKS";
 const Q8_FILE_CACHE_BYTES_ENV: &str = "CAMELID_Q8_0_FILE_CACHE_BYTES";
 const Q8_0_BLOCK_BYTES: usize = 34;
+const Q8_0_BLOCK_VALUES: usize = 32;
 // Keep lazy Q8_0 file reads memory-safe by default. The bounded chunk cache is an
 // explicit diagnostic/performance probe until long-context prefill has row-specific evidence.
 const DEFAULT_Q8_FILE_CACHE_BYTES: usize = 0;
@@ -84,6 +86,339 @@ pub enum RuntimeDType {
 pub struct Q8_0Block {
     pub scale: f32,
     pub quants: [i8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Q8_0PackedRows4Interleave {
+    I4,
+    I8,
+}
+
+impl Q8_0PackedRows4Interleave {
+    pub fn block_len(self) -> usize {
+        match self {
+            Self::I4 => 4,
+            Self::I8 => 8,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::I4 => "4x4",
+            Self::I8 => "4x8",
+        }
+    }
+}
+
+#[repr(C, align(16))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q8_0PackedRows4Block {
+    pub scales: [f32; 4],
+    pub quants: [i8; 128],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q8_0PackedRows4 {
+    pub rows: usize,
+    pub blocks_per_row: usize,
+    pub interleave: Q8_0PackedRows4Interleave,
+    pub blocks: Vec<Q8_0PackedRows4Block>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Q8_0RuntimeStorage {
+    PackedRows4(Q8_0PackedRows4),
+}
+
+impl Q8_0PackedRows4 {
+    pub fn from_rows(
+        rows: usize,
+        blocks_per_row: usize,
+        interleave: Q8_0PackedRows4Interleave,
+        row_major_blocks: &[Q8_0Block],
+    ) -> Result<Self> {
+        let expected = rows.checked_mul(blocks_per_row).ok_or_else(|| {
+            BackendError::InvalidTensorData("q8_0 packed rows4 block count overflow".to_string())
+        })?;
+        if row_major_blocks.len() != expected || !rows.is_multiple_of(4) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q8_0 packed rows4 expected row-major blocks for rows multiple of 4; rows={rows}, blocks_per_row={blocks_per_row}, got {} blocks",
+                row_major_blocks.len()
+            )));
+        }
+
+        let block_len = interleave.block_len();
+        let chunks = 32 / block_len;
+        let mut blocks = Vec::with_capacity((rows / 4) * blocks_per_row);
+        for row_group in (0..rows).step_by(4) {
+            for block_idx in 0..blocks_per_row {
+                let mut scales = [0.0_f32; 4];
+                let mut quants = [0_i8; 128];
+                for lane in 0..4 {
+                    let source = &row_major_blocks[(row_group + lane) * blocks_per_row + block_idx];
+                    scales[lane] = source.scale;
+                }
+                for chunk in 0..chunks {
+                    for lane in 0..4 {
+                        let source =
+                            &row_major_blocks[(row_group + lane) * blocks_per_row + block_idx];
+                        let src_start = chunk * block_len;
+                        let dst_start = chunk * 4 * block_len + lane * block_len;
+                        quants[dst_start..dst_start + block_len]
+                            .copy_from_slice(&source.quants[src_start..src_start + block_len]);
+                    }
+                }
+                blocks.push(Q8_0PackedRows4Block { scales, quants });
+            }
+        }
+
+        Ok(Self {
+            rows,
+            blocks_per_row,
+            interleave,
+            blocks,
+        })
+    }
+
+    pub fn from_q8_0_bytes(
+        rows: usize,
+        blocks_per_row: usize,
+        interleave: Q8_0PackedRows4Interleave,
+        q8_0_bytes: &[u8],
+    ) -> Result<Self> {
+        let expected_blocks = rows.checked_mul(blocks_per_row).ok_or_else(|| {
+            BackendError::InvalidTensorData("q8_0 packed rows4 block count overflow".to_string())
+        })?;
+        let expected_bytes = expected_blocks
+            .checked_mul(Q8_0_BLOCK_BYTES)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData("q8_0 packed rows4 byte count overflow".to_string())
+            })?;
+        if q8_0_bytes.len() != expected_bytes || !rows.is_multiple_of(4) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q8_0 packed rows4 expected GGUF Q8_0 bytes for rows multiple of 4; rows={rows}, blocks_per_row={blocks_per_row}, got {} bytes, expected {expected_bytes}",
+                q8_0_bytes.len()
+            )));
+        }
+
+        let block_len = interleave.block_len();
+        let chunks = Q8_0_BLOCK_VALUES / block_len;
+        let mut blocks = Vec::with_capacity((rows / 4) * blocks_per_row);
+        for row_group in (0..rows).step_by(4) {
+            for block_idx in 0..blocks_per_row {
+                let mut scales = [0.0_f32; 4];
+                let mut quants = [0_i8; 128];
+                for (lane, scale) in scales.iter_mut().enumerate() {
+                    let source_block = (row_group + lane) * blocks_per_row + block_idx;
+                    let source_start = source_block * Q8_0_BLOCK_BYTES;
+                    *scale = f16_bits_to_f32(u16::from_le_bytes([
+                        q8_0_bytes[source_start],
+                        q8_0_bytes[source_start + 1],
+                    ]));
+                }
+                for chunk in 0..chunks {
+                    for lane in 0..4 {
+                        let source_block = (row_group + lane) * blocks_per_row + block_idx;
+                        let source_start = source_block * Q8_0_BLOCK_BYTES + 2;
+                        let src_start = source_start + chunk * block_len;
+                        let dst_start = chunk * 4 * block_len + lane * block_len;
+                        for (dst, src) in quants[dst_start..dst_start + block_len]
+                            .iter_mut()
+                            .zip(&q8_0_bytes[src_start..src_start + block_len])
+                        {
+                            *dst = *src as i8;
+                        }
+                    }
+                }
+                blocks.push(Q8_0PackedRows4Block { scales, quants });
+            }
+        }
+
+        Ok(Self {
+            rows,
+            blocks_per_row,
+            interleave,
+            blocks,
+        })
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.blocks.len() * std::mem::size_of::<Q8_0PackedRows4Block>()
+    }
+}
+
+fn q8_0_pack_trace_enabled() -> bool {
+    env_flag_enabled("CAMELID_Q8_0_PACK_TRACE")
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("0")
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("off")
+                || value.eq_ignore_ascii_case("disabled")
+                || value.eq_ignore_ascii_case("dequantized")
+                || value.eq_ignore_ascii_case("f32")
+        })
+        .unwrap_or(false)
+}
+
+fn mac_q8_repack_enabled() -> bool {
+    env_flag_enabled("CAMELID_MAC_Q8_REPACK")
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_repack_enabled() -> bool {
+    env_flag_enabled("CAMELID_X86_Q8_REPACK")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn x86_q8_repack_enabled() -> bool {
+    false
+}
+
+fn q8_repack_tensor_enabled(name: &str) -> bool {
+    (name.starts_with("blk.") && mac_q8_repack_enabled() && q8_repack_mac_tensor_enabled(name))
+        || (x86_q8_repack_enabled() && q8_repack_x86_tensor_enabled(name))
+}
+
+fn q8_repack_mac_tensor_enabled(name: &str) -> bool {
+    name.ends_with(".attn_q.weight")
+        || name.ends_with(".ffn_gate.weight")
+        || name.ends_with(".ffn_up.weight")
+}
+
+fn q8_repack_x86_tensor_enabled(name: &str) -> bool {
+    (name.starts_with("blk.")
+        && (q8_repack_attention_tensor_enabled(name)
+            || name.ends_with(".ffn_gate.weight")
+            || name.ends_with(".ffn_up.weight")
+            || name.ends_with(".ffn_down.weight")))
+        || name == "output.weight"
+}
+
+fn q8_repack_attention_tensor_enabled(name: &str) -> bool {
+    name.ends_with(".attn_q.weight")
+        || name.ends_with(".attn_k.weight")
+        || name.ends_with(".attn_v.weight")
+        || name.ends_with(".attn_output.weight")
+}
+
+fn q8_repack_linear_shape(name: &str, shape: &TensorShape) -> Option<(usize, usize)> {
+    if !q8_repack_tensor_enabled(name) || shape.dims.len() != 2 {
+        return None;
+    }
+    let rows = shape.dims[0];
+    let cols = shape.dims[1];
+    if name == "output.weight" {
+        // Llama output projection commonly arrives as [hidden, vocab], while
+        // Camelid's token-major runtime consumes rows as [vocab, hidden]. If a
+        // GGUF already stores [vocab, hidden], keep it as-is; otherwise pack the
+        // backend-owned runtime storage in the directly consumable token-row view.
+        if rows < cols {
+            Some((cols, rows))
+        } else {
+            Some((rows, cols))
+        }
+    } else if name.ends_with(".ffn_gate.weight")
+        || name.ends_with(".ffn_up.weight")
+        || name.ends_with(".ffn_down.weight")
+    {
+        // Llama FFN descriptors are stored as [input, output], while the runtime
+        // linear path consumes transposed rows [output, input]. Pack the
+        // backend-owned storage in the same output-row order used by the existing
+        // file-backed Q8 reader instead of packing descriptor rows that the hot
+        // matmul path cannot consume directly.
+        Some((cols, rows))
+    } else {
+        Some((rows, cols))
+    }
+}
+
+fn q8_0_packed_rows4_enabled_for_tensor(name: &str, interleave: Q8_0PackedRows4Interleave) -> bool {
+    let _ = name;
+    match interleave {
+        Q8_0PackedRows4Interleave::I4 => env_flag_enabled("CAMELID_Q8_0_PACKED_4X4_DOT"),
+        Q8_0PackedRows4Interleave::I8 => env_flag_enabled("CAMELID_Q8_0_PACKED_4X8_DOT"),
+    }
+}
+
+fn q8_0_runtime_packed_rows4_for_tensor(
+    name: &str,
+    shape: &TensorShape,
+    q8_0_bytes: &[u8],
+) -> Result<Option<Q8_0RuntimeStorage>> {
+    if env_flag_disabled("CAMELID_Q8_0_BLOCK_DOT") {
+        return Ok(None);
+    }
+    let Some((rows, cols)) = q8_repack_linear_shape(name, shape) else {
+        return Ok(None);
+    };
+    if !rows.is_multiple_of(4) || !cols.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let packed = Q8_0PackedRows4::from_q8_0_bytes(
+        rows,
+        cols / Q8_0_BLOCK_VALUES,
+        Q8_0PackedRows4Interleave::I8,
+        q8_0_bytes,
+    )?;
+    if q8_0_pack_trace_enabled() {
+        eprintln!(
+            "camelid_q8_pack tensor={name} owner=runtime layout={} rows={rows} cols={cols} blocks={} bytes={} micros={}",
+            Q8_0PackedRows4Interleave::I8.label(),
+            packed.blocks.len(),
+            packed.byte_len(),
+            started.elapsed().as_micros()
+        );
+    }
+    Ok(Some(Q8_0RuntimeStorage::PackedRows4(packed)))
+}
+
+fn q8_0_packed_rows4_for_shape(
+    name: &str,
+    shape: &TensorShape,
+    q8_0_blocks: Option<&[Q8_0Block]>,
+    interleave: Q8_0PackedRows4Interleave,
+) -> Result<Option<Q8_0PackedRows4>> {
+    if !q8_0_packed_rows4_enabled_for_tensor(name, interleave) {
+        return Ok(None);
+    }
+    let Some(blocks) = q8_0_blocks else {
+        return Ok(None);
+    };
+    if shape.dims.len() != 2 {
+        return Ok(None);
+    }
+    let rows = shape.dims[0];
+    let cols = shape.dims[1];
+    if !rows.is_multiple_of(4) || !cols.is_multiple_of(32) {
+        return Ok(None);
+    }
+    let started = Instant::now();
+    let packed = Q8_0PackedRows4::from_rows(rows, cols / 32, interleave, blocks)?;
+    if q8_0_pack_trace_enabled() {
+        eprintln!(
+            "camelid_q8_pack tensor={name} layout={} rows={rows} cols={cols} blocks={} bytes={} micros={}",
+            interleave.label(),
+            packed.blocks.len(),
+            packed.byte_len(),
+            started.elapsed().as_micros()
+        );
+    }
+    Ok(Some(packed))
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +694,9 @@ pub struct CpuTensor {
     pub dtype: RuntimeDType,
     pub source_type: Option<GgufTensorType>,
     pub q8_0_blocks: Option<Vec<Q8_0Block>>,
+    pub q8_0_packed_rows4_4x4: Option<Q8_0PackedRows4>,
+    pub q8_0_packed_rows4_4x8: Option<Q8_0PackedRows4>,
+    pub q8_0_runtime_storage: Option<Q8_0RuntimeStorage>,
     pub q8_0_file_backing: Option<Q8_0FileBacking>,
     pub q8_0_split_file_backing: Option<Vec<Q8_0FileBacking>>,
     pub data: Vec<f32>,
@@ -505,6 +843,9 @@ impl Q8_0TensorBlocks {
             dtype: RuntimeDType::F32,
             source_type: None,
             q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
             q8_0_file_backing: None,
             q8_0_split_file_backing: None,
             data,
@@ -567,6 +908,9 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: None,
             q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
             q8_0_file_backing: None,
             q8_0_split_file_backing: None,
             data,
@@ -593,6 +937,18 @@ impl CpuTensor {
         let mut tensor = Self::from_f32(name, dims, data)?;
         tensor.source_type = Some(GgufTensorType::Q8_0);
         tensor.q8_0_blocks = Some(q8_0_blocks);
+        tensor.q8_0_packed_rows4_4x4 = q8_0_packed_rows4_for_shape(
+            &tensor.name,
+            &tensor.shape,
+            tensor.q8_0_blocks.as_deref(),
+            Q8_0PackedRows4Interleave::I4,
+        )?;
+        tensor.q8_0_packed_rows4_4x8 = q8_0_packed_rows4_for_shape(
+            &tensor.name,
+            &tensor.shape,
+            tensor.q8_0_blocks.as_deref(),
+            Q8_0PackedRows4Interleave::I8,
+        )?;
         Ok(tensor)
     }
 
@@ -614,12 +970,28 @@ impl CpuTensor {
                 q8_0_blocks.len()
             )));
         }
+        let name = name.into();
+        let q8_0_packed_rows4_4x4 = q8_0_packed_rows4_for_shape(
+            &name,
+            &shape,
+            Some(&q8_0_blocks),
+            Q8_0PackedRows4Interleave::I4,
+        )?;
+        let q8_0_packed_rows4_4x8 = q8_0_packed_rows4_for_shape(
+            &name,
+            &shape,
+            Some(&q8_0_blocks),
+            Q8_0PackedRows4Interleave::I8,
+        )?;
         Ok(Self {
-            name: name.into(),
+            name,
             shape,
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: Some(q8_0_blocks),
+            q8_0_packed_rows4_4x4,
+            q8_0_packed_rows4_4x8,
+            q8_0_runtime_storage: None,
             q8_0_file_backing: None,
             q8_0_split_file_backing: None,
             data: Vec::new(),
@@ -642,7 +1014,30 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
             q8_0_file_backing: Some(backing),
+            q8_0_split_file_backing: None,
+            data: Vec::new(),
+        }
+    }
+
+    pub fn q8_0_runtime_packed_rows4_linear(
+        name: impl Into<String>,
+        shape: TensorShape,
+        packed: Q8_0PackedRows4,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(GgufTensorType::Q8_0),
+            q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: Some(Q8_0RuntimeStorage::PackedRows4(packed)),
+            q8_0_file_backing: None,
             q8_0_split_file_backing: None,
             data: Vec::new(),
         }
@@ -659,6 +1054,9 @@ impl CpuTensor {
             dtype: RuntimeDType::F32,
             source_type: Some(GgufTensorType::Q8_0),
             q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
             q8_0_file_backing: None,
             q8_0_split_file_backing: Some(backings),
             data: Vec::new(),
@@ -754,6 +1152,7 @@ impl CpuTensor {
     pub fn matmul_rhs_transposed(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
         require_rank(self, 2, "matmul rhs-transposed lhs")?;
         require_rank(rhs, 2, "matmul rhs-transposed rhs")?;
+        rhs.require_row_major_f32_data("matmul rhs-transposed rhs")?;
         let m = self.dim(0)?;
         let k = self.dim(1)?;
         let n = rhs.dim(0)?;
@@ -806,6 +1205,28 @@ impl CpuTensor {
             }
         }
         Self::from_f32(name, vec![m, n], out)
+    }
+
+    fn require_row_major_f32_data(&self, context: &str) -> Result<()> {
+        let expected_len = self.shape.element_count()?;
+        if self.data.len() == expected_len {
+            return Ok(());
+        }
+        let storage = if self.q8_0_runtime_storage.is_some() {
+            "runtime-packed-q8"
+        } else if self.q8_0_blocks.is_some() {
+            "retained-q8-blocks"
+        } else if self.q8_0_file_backing.is_some() {
+            "file-backed-q8"
+        } else if self.data.is_empty() {
+            "no-row-major-data"
+        } else {
+            "invalid-row-major-f32"
+        };
+        Err(BackendError::InvalidTensorData(format!(
+            "{context} cannot read tensor {} as row-major f32: storage={storage}, shape={:?}, data_len={}, expected_len={expected_len}",
+            self.name, self.shape.dims, self.data.len()
+        )))
     }
 
     pub fn add(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
@@ -2070,6 +2491,13 @@ impl TensorStore {
         }
         let expected_elements = shape.element_count()?;
         let bytes = self.tensor_bytes(name)?;
+        if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
+            q8_0_runtime_packed_rows4_for_tensor(name, &shape, &bytes)?
+        {
+            return Ok(CpuTensor::q8_0_runtime_packed_rows4_linear(
+                name, shape, packed,
+            ));
+        }
         let blocks = decode_q8_0_blocks(name, &bytes, expected_elements)?;
         CpuTensor::from_q8_0_blocks(name, shape, blocks)
     }
@@ -2139,15 +2567,44 @@ impl TensorStore {
                 "tensor {name} Q8_0 element count {expected_elements} is not block aligned"
             )));
         }
-        Ok(CpuTensor::q8_0_file_backed_linear(
+        if q8_repack_tensor_enabled(name) {
+            let bytes = self.tensor_bytes(name)?;
+            if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
+                q8_0_runtime_packed_rows4_for_tensor(name, &shape, &bytes)?
+            {
+                return Ok(CpuTensor::q8_0_runtime_packed_rows4_linear(
+                    name, shape, packed,
+                ));
+            }
+        }
+        let mut tensor = CpuTensor::q8_0_file_backed_linear(
             name,
-            shape,
+            shape.clone(),
             Q8_0FileBacking::new(
                 self.path.clone(),
                 desc.absolute_offset,
                 expected_elements / 32,
             ),
-        ))
+        );
+        if q8_0_packed_rows4_enabled_for_tensor(name, Q8_0PackedRows4Interleave::I4)
+            || q8_0_packed_rows4_enabled_for_tensor(name, Q8_0PackedRows4Interleave::I8)
+        {
+            let bytes = self.tensor_bytes(name)?;
+            let blocks = decode_q8_0_blocks(name, &bytes, expected_elements)?;
+            tensor.q8_0_packed_rows4_4x4 = q8_0_packed_rows4_for_shape(
+                name,
+                &shape,
+                Some(&blocks),
+                Q8_0PackedRows4Interleave::I4,
+            )?;
+            tensor.q8_0_packed_rows4_4x8 = q8_0_packed_rows4_for_shape(
+                name,
+                &shape,
+                Some(&blocks),
+                Q8_0PackedRows4Interleave::I8,
+            )?;
+        }
+        Ok(tensor)
     }
 
     pub fn load_cpu_f32(&self, name: &str) -> Result<CpuTensor> {
@@ -2192,12 +2649,27 @@ impl TensorStore {
                 )))
             }
         };
+        let q8_0_packed_rows4_4x4 = q8_0_packed_rows4_for_shape(
+            name,
+            &shape,
+            q8_0_blocks.as_deref(),
+            Q8_0PackedRows4Interleave::I4,
+        )?;
+        let q8_0_packed_rows4_4x8 = q8_0_packed_rows4_for_shape(
+            name,
+            &shape,
+            q8_0_blocks.as_deref(),
+            Q8_0PackedRows4Interleave::I8,
+        )?;
         Ok(CpuTensor {
             name: name.to_string(),
             shape,
             dtype: RuntimeDType::F32,
             source_type: Some(desc.tensor_type),
             q8_0_blocks,
+            q8_0_packed_rows4_4x4,
+            q8_0_packed_rows4_4x8,
+            q8_0_runtime_storage: None,
             q8_0_file_backing,
             q8_0_split_file_backing: None,
             data,
@@ -2333,8 +2805,8 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::{
         f16_bits_to_f32, parse_byte_count, q8_0_file_read_stats, q8_file_cache_get,
-        q8_file_cache_insert, with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block,
-        Q8_0FileBacking, TensorShape, Q8_0_BLOCK_BYTES,
+        q8_file_cache_insert, q8_repack_x86_tensor_enabled, with_q8_file_cache_capacity_override,
+        CpuTensor, Q8_0Block, Q8_0FileBacking, TensorShape, Q8_0_BLOCK_BYTES,
     };
     use crate::test_support::env_lock;
 
@@ -2441,6 +2913,122 @@ mod tests {
         assert_eq!(embedding.shape.dims, vec![2, 32]);
         assert_eq!(&embedding.data[..32], &[-1.0; 32]);
         assert_eq!(&embedding.data[32..], &[1.0; 32]);
+    }
+
+    #[test]
+    fn q8_packed_rows4_sidecars_stay_opt_in_per_layout() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+        let make_weight = || {
+            let rows = 4;
+            let cols = 32;
+            let blocks = (0..rows)
+                .map(|row| Q8_0Block {
+                    scale: 0.25 + row as f32 * 0.125,
+                    quants: std::array::from_fn(|idx| (idx as i8 % 17) - 8),
+                })
+                .collect::<Vec<_>>();
+            let data = blocks
+                .iter()
+                .flat_map(|block| block.quants.iter().map(|q| block.scale * f32::from(*q)))
+                .collect::<Vec<_>>();
+
+            CpuTensor::from_f32_with_q8_0_blocks(
+                "blk.0.attn_q.weight",
+                vec![rows, cols],
+                data,
+                blocks,
+            )
+            .unwrap()
+        };
+
+        let default_weight = make_weight();
+        assert!(default_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(default_weight.q8_0_packed_rows4_4x8.is_none());
+
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X4_DOT", "on");
+        let packed_4x4_weight = make_weight();
+        assert!(packed_4x4_weight.q8_0_packed_rows4_4x4.is_some());
+        assert!(packed_4x4_weight.q8_0_packed_rows4_4x8.is_none());
+
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X4_DOT");
+        std::env::set_var("CAMELID_Q8_0_PACKED_4X8_DOT", "on");
+        let packed_4x8_weight = make_weight();
+        assert!(packed_4x8_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(packed_4x8_weight.q8_0_packed_rows4_4x8.is_some());
+
+        std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+        std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+        let mac_repack_weight = make_weight();
+        assert!(mac_repack_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(mac_repack_weight.q8_0_packed_rows4_4x8.is_none());
+        assert!(mac_repack_weight.q8_0_runtime_storage.is_none());
+
+        let non_family_mac_repack_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "blk.0.ffn_up.weight",
+            vec![4, 32],
+            vec![0.0; 128],
+            vec![
+                Q8_0Block {
+                    scale: 1.0,
+                    quants: [0; 32],
+                };
+                4
+            ],
+        )
+        .unwrap();
+        assert!(non_family_mac_repack_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(non_family_mac_repack_weight.q8_0_packed_rows4_4x8.is_none());
+
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+        let x86_repack_weight = make_weight();
+        assert!(x86_repack_weight.q8_0_packed_rows4_4x4.is_none());
+        assert!(x86_repack_weight.q8_0_packed_rows4_4x8.is_none());
+        assert!(x86_repack_weight.q8_0_runtime_storage.is_none());
+
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+    }
+
+    #[test]
+    fn q8_x86_repack_family_includes_output_projection_only() {
+        assert!(q8_repack_x86_tensor_enabled("output.weight"));
+        assert!(q8_repack_x86_tensor_enabled("blk.0.attn_output.weight"));
+        assert!(q8_repack_x86_tensor_enabled("blk.0.ffn_down.weight"));
+        assert!(!q8_repack_x86_tensor_enabled("token_embd.weight"));
+        assert!(!q8_repack_x86_tensor_enabled("blk.0.attn_norm.weight"));
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn q8_x86_repack_includes_output_projection_runtime_storage() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        let shape = TensorShape { dims: vec![32, 64] };
+        let bytes = vec![0_u8; 64 * Q8_0_BLOCK_BYTES];
+
+        assert!(
+            super::q8_0_runtime_packed_rows4_for_tensor("output.weight", &shape, &bytes)
+                .unwrap()
+                .is_none()
+        );
+
+        std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
+        let Some(super::Q8_0RuntimeStorage::PackedRows4(packed)) =
+            super::q8_0_runtime_packed_rows4_for_tensor("output.weight", &shape, &bytes).unwrap()
+        else {
+            panic!("expected x86 output projection Q8_0 runtime-packed rows4 storage");
+        };
+        assert_eq!(packed.rows, 64);
+        assert_eq!(packed.blocks_per_row, 1);
+        assert_eq!(packed.interleave, super::Q8_0PackedRows4Interleave::I8);
+
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
     }
 
     #[test]

@@ -1,6 +1,9 @@
 #!/usr/bin/env node
-import { spawn } from 'node:child_process'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { spawn, spawnSync } from 'node:child_process'
+import { createReadStream } from 'node:fs'
+import { mkdir, readFile, stat, statfs, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import os from 'node:os'
 import { dirname, resolve } from 'node:path'
 
 import { renderExpectedPrompt, resolveReferenceContext } from './lib/chat-parity-harness.mjs'
@@ -23,6 +26,8 @@ const startLlamaServer = args.get('start-llama-server') !== 'false'
 const waitMs = parsePositiveInt(args.get('wait-ms') || process.env.CAMELID_BENCH_WAIT_MS || '600000', 'wait-ms')
 const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') || process.env.LLAMA3_LLAMA_CONTEXT, 'llama-context')
 const threads = parseOptionalPositiveInt(args.get('threads') || process.env.CAMELID_BENCH_THREADS, 'threads')
+const requireMarker = args.has('require-marker') || process.env.CAMELID_BENCH_REQUIRE_MARKER === '1'
+const expectedMarker = args.get('expected-marker') || process.env.CAMELID_BENCH_EXPECTED_MARKER || 'CMLD-BENCH'
 
 if (args.has('help') || args.has('h')) {
   console.log(usage())
@@ -30,8 +35,8 @@ if (args.has('help') || args.has('h')) {
 }
 
 const benchmarkMessages = [
-  { role: 'system', content: 'You are Camelid benchmark mode. Reply with concise factual text only.' },
-  { role: 'user', content: 'Give a short three-line summary of why exact-row parity matters for local inference, and end the last line with the marker CMLD-BENCH.' },
+  { role: 'system', content: 'You are Camelid benchmark mode. Reply with the exact requested text and nothing else.' },
+  { role: 'user', content: 'Reply with exactly this single line and nothing else: CMLD-BENCH' },
 ]
 
 const expectedPrompt = renderExpectedPrompt(benchmarkMessages, renderMode)
@@ -41,6 +46,8 @@ const llamaContext = resolveReferenceContext({
   maxTokens,
   explicitContext: explicitLlamaContext,
 })
+const evidenceContext = await collectEvidenceContext({ includeFileHashes: !args.has('print-plan') })
+const preStartSnapshot = await captureResourceSnapshot('pre_start')
 
 if (args.has('print-plan')) {
   const plan = buildPlan()
@@ -58,8 +65,12 @@ let backendChild = null
 let llamaChild = null
 let backendSpawnError = null
 let llamaSpawnError = null
+let backendStartupMs = null
+let llamaStartupMs = null
+let camelidModelLoadMs = null
 
 try {
+  const backendStart = performance.now()
   if (startBackend) {
     const url = new URL(backendBase)
     backendChild = spawn(backendBin, ['serve', '--addr', `${url.hostname}:${url.port || '8181'}`], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -68,6 +79,7 @@ try {
     backendChild.stderr.on('data', (chunk) => process.stderr.write(`[camelid] ${chunk}`))
   }
 
+  const llamaStart = performance.now()
   if (startLlamaServer) {
     const url = new URL(llamaBase)
     const llamaArgs = ['--host', url.hostname, '--port', url.port || '8183', '-m', modelPath, '-ngl', '0', '-c', String(llamaContext), '--no-warmup']
@@ -79,20 +91,24 @@ try {
   }
 
   await waitForJson(`${backendBase}/v1/health`, {}, 'camelid', waitMs)
+  backendStartupMs = round(performance.now() - backendStart)
   await waitForJson(`${llamaBase}/health`, {}, 'llama-server', waitMs).catch((err) => {
     if (llamaSpawnError?.code === 'ENOENT') {
       throw new Error(`could not start llama-server binary ${JSON.stringify(llamaServerBin)}`)
     }
     throw err
   })
+  llamaStartupMs = round(performance.now() - llamaStart)
   if (backendSpawnError?.code === 'ENOENT') {
     throw new Error(`could not start Camelid binary ${JSON.stringify(backendBin)}`)
   }
 
+  const loadStarted = performance.now()
   await fetchJson(`${backendBase}/api/models/load`, {
     method: 'POST',
     body: JSON.stringify({ path: modelPath, id: modelId }),
   })
+  camelidModelLoadMs = round(performance.now() - loadStarted)
 
   const camelidWarmups = []
   const llamaWarmups = []
@@ -101,12 +117,24 @@ try {
     llamaWarmups.push(await runLlamaStream(i, 'warmup'))
   }
 
+  const beforeMeasuredSnapshot = await captureResourceSnapshot('before_measured_runs')
+
   const camelidRuns = []
   const llamaRuns = []
+  const measuredOrder = []
   for (let i = 0; i < repeats; i += 1) {
-    camelidRuns.push(await runCamelidStream(i, 'measure'))
-    llamaRuns.push(await runLlamaStream(i, 'measure'))
+    const camelidRun = await runCamelidStream(i, 'measure')
+    camelidRuns.push(camelidRun)
+    measuredOrder.push({ engine: 'camelid', label: camelidRun.label })
+
+    const llamaRun = await runLlamaStream(i, 'measure')
+    llamaRuns.push(llamaRun)
+    measuredOrder.push({ engine: 'llama_cpp', label: llamaRun.label })
   }
+
+  const afterMeasuredSnapshot = await captureResourceSnapshot('after_measured_runs')
+
+  const guardrails = benchmarkGuardrails(camelidRuns, llamaRuns)
 
   const report = {
     schema: 'camelid.same_host_llama3_benchmark.v1',
@@ -121,6 +149,8 @@ try {
       warmup,
       repeats,
       max_tokens: maxTokens,
+      expected_marker: expectedMarker,
+      require_marker: requireMarker,
       benchmark_messages: benchmarkMessages,
       estimated_prompt_tokens: estimatedPromptTokens,
       llama_context: llamaContext,
@@ -128,7 +158,23 @@ try {
       commands: buildPlan().commands,
       outputs: buildPlan().outputs,
       bounded_metrics: boundedMetrics(),
-      note: 'Same-host comparison using streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens.',
+      server_lifecycle: {
+        camelid_started_by_harness: startBackend,
+        llama_started_by_harness: startLlamaServer,
+        camelid_startup_ms: backendStartupMs,
+        llama_startup_ms: llamaStartupMs,
+        camelid_model_load_ms: camelidModelLoadMs,
+        camelid_model_preloaded: !startBackend,
+        llama_model_preloaded: !startLlamaServer,
+      },
+      evidence_context: evidenceContext,
+      resource_snapshots: {
+        pre_start: preStartSnapshot,
+        before_measured_runs: beforeMeasuredSnapshot,
+        after_measured_runs: afterMeasuredSnapshot,
+      },
+      measured_order: measuredOrder,
+      note: 'Same-host comparison using alternating streaming requests to Camelid /v1/chat/completions and llama.cpp /completion. TTFT is first non-empty streamed content chunk; token throughput is estimated from streamed content chunks, not tokenizer-ground-truth completion tokens.',
     },
     camelid: {
       base_url: backendBase,
@@ -144,6 +190,7 @@ try {
       binary: llamaServerBin,
     },
     comparison: compareSummaries(summarizeRuns(camelidRuns), summarizeRuns(llamaRuns)),
+    guardrails,
     claim_boundary: claimBoundary(),
   }
 
@@ -153,6 +200,9 @@ try {
     await mkdir(dirname(outPath), { recursive: true })
     await writeFile(outPath, `${JSON.stringify(report, null, 2)}\n`)
     console.log(`json_out=${outPath}`)
+  }
+  if (requireMarker && !guardrails.passed) {
+    throw new Error(`benchmark marker guard failed: expected ${JSON.stringify(expectedMarker)} in every measured run`)
   }
 } finally {
   backendChild?.kill('SIGTERM')
@@ -177,14 +227,20 @@ function buildPlan() {
       warmup,
       repeats,
       max_tokens: maxTokens,
+      expected_marker: expectedMarker,
+      require_marker: requireMarker,
       estimated_prompt_tokens: estimatedPromptTokens,
       llama_context: llamaContext,
       threads: threads ?? null,
       benchmark_messages: benchmarkMessages,
       bounded_metrics: boundedMetrics(),
+      evidence_context: evidenceContext,
+      resource_snapshots: {
+        pre_start: preStartSnapshot,
+      },
     },
     commands: {
-      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
+      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
       camelid_serve: startBackend ? `${shellQuote(backendBin)} serve --addr ${shellQuote(`${backendUrl.hostname}:${backendUrl.port || '8181'}`)}` : 'not started by harness (--start-backend=false)',
       llama_server: startLlamaServer ? [shellQuote(llamaServerBin), ...llamaArgs.map(shellQuote)].join(' ') : 'not started by harness (--start-llama-server=false)',
       camelid_load_request: `POST ${backendBase}/api/models/load {"path":${JSON.stringify(modelPath)},"id":${JSON.stringify(modelId)}}`,
@@ -202,6 +258,8 @@ function buildPlan() {
         'json_out=<absolute path when --out is set>',
       ],
       json: 'Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.',
+      guardrail: `marker_presence=${expectedMarker}; pass/fail is recorded under guardrails and can be enforced with --require-marker`,
+      lifecycle: 'Report records server startup timing, model-load timing, warmups, and whether servers were started by the harness or reused preloaded.',
     },
     claim_boundary: claimBoundary(),
   }
@@ -215,6 +273,9 @@ function boundedMetrics() {
     'total_elapsed_ms: full streaming response wall time',
     'completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens',
     'decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content',
+    'marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker',
+    'resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs',
+    'server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior',
   ]
 }
 
@@ -249,6 +310,8 @@ Key options:
   --repeats <n>                   Measured runs per engine. Default: 3
   --threads <n>                   Optional llama-server CPU threads.
   --llama-context <n>             Optional llama-server context; otherwise bounded from prompt + max tokens.
+  --expected-marker <text>        Marker checked in measured output. Default: CMLD-BENCH.
+  --require-marker                Fail the run after writing output unless every measured output contains the marker.
   --start-backend=false           Reuse an already-running Camelid server.
   --start-llama-server=false      Reuse an already-running llama-server.
   --out <path>                    Write the JSON report or --print-plan JSON.
@@ -361,6 +424,7 @@ async function consumeSseResponse({ response, started, label }) {
   doneAtMs = nowMs()
   const decodeWindowMs = firstContentMs === null ? null : Math.max(doneAtMs - firstContentMs, 0)
   return {
+    label,
     text: content,
     first_byte_ms: round(firstByteMs),
     first_event_ms: round(firstEventMs),
@@ -406,6 +470,156 @@ function printHumanSummary(report) {
   console.log(`llama_cpp_ttft_ms=${l.avg_ttft_ms}`)
   console.log(`llama_cpp_decode_tok_s=${l.avg_decode_tok_per_s}`)
   console.log(`llama_cpp_ms_tok=${l.avg_ms_per_token_after_first}`)
+}
+
+function benchmarkGuardrails(camelidRuns, llamaRuns) {
+  const runStatus = (runs) => runs.map((run) => ({
+    label: run.label,
+    contains_expected_marker: String(run.text || '').includes(expectedMarker),
+    nonempty_streamed_output: Boolean(String(run.text || '').trim()) && (run.completion_tokens_estimate || 0) > 0,
+  }))
+  const camelid = runStatus(camelidRuns)
+  const llamaCpp = runStatus(llamaRuns)
+  const passed = [...camelid, ...llamaCpp].every((item) => item.contains_expected_marker && item.nonempty_streamed_output)
+  return {
+    expected_marker: expectedMarker,
+    require_marker: requireMarker,
+    marker_presence: {
+      camelid,
+      llama_cpp: llamaCpp,
+    },
+    passed,
+    note: requireMarker
+      ? 'The harness exits non-zero if any measured run omits the expected marker; empty measured output is always treated as a failed guardrail.'
+      : 'Marker presence and non-empty streamed output are recorded for deterministic-output hygiene; empty measured output always fails the recorded guardrail even when marker enforcement is not requested.',
+  }
+}
+
+async function collectEvidenceContext({ includeFileHashes }) {
+  const modelInfo = await fileEvidence(modelPath, { includeHash: includeFileHashes })
+  const backendInfo = await fileEvidence(backendBin, { includeHash: includeFileHashes })
+  const llamaInfo = await fileEvidence(llamaServerBin, { includeHash: includeFileHashes })
+  return {
+    repository: {
+      head: gitOutput(['rev-parse', 'HEAD']),
+      branch: gitOutput(['rev-parse', '--abbrev-ref', 'HEAD']),
+      status_short: gitOutput(['status', '--short']) || '',
+    },
+    host_class: hostClass(),
+    binaries: {
+      camelid: backendInfo,
+      llama_server: llamaInfo,
+      node: process.version,
+    },
+    model_artifact: modelInfo,
+    privacy_note: 'Host name, user name, and home-relative local paths are intentionally not recorded; scrub full artifacts before publication if absolute paths appear in commands.',
+  }
+}
+
+function gitOutput(argsList) {
+  try {
+    const result = spawnSync('git', argsList, { cwd: process.cwd(), encoding: 'utf8' })
+    if (result.status !== 0) return null
+    return result.stdout.trim()
+  } catch {
+    return null
+  }
+}
+
+function hostClass() {
+  const cpu = os.cpus()?.[0] || {}
+  return {
+    os_type: os.type(),
+    platform: os.platform(),
+    release: os.release(),
+    arch: os.arch(),
+    cpu_model: cpu.model || null,
+    cpu_count: os.cpus()?.length || null,
+    total_memory_gib: round(os.totalmem() / 1024 / 1024 / 1024),
+  }
+}
+
+async function fileEvidence(path, { includeHash }) {
+  const resolved = resolve(path)
+  const info = {
+    path: resolved,
+    exists: false,
+    size_bytes: null,
+    sha256: includeHash ? null : 'not_computed_in_plan_mode',
+  }
+  try {
+    const metadata = await stat(resolved)
+    info.exists = metadata.isFile()
+    info.size_bytes = metadata.size
+    if (includeHash && info.exists) info.sha256 = await sha256File(resolved)
+  } catch (error) {
+    info.error = error.code || error.message
+  }
+  return info
+}
+
+function sha256File(path) {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(path)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('error', rejectPromise)
+    stream.on('end', () => resolvePromise(hash.digest('hex')))
+  })
+}
+
+async function captureResourceSnapshot(label) {
+  const memory = {
+    total_gib: round(os.totalmem() / 1024 / 1024 / 1024),
+    free_gib: round(os.freemem() / 1024 / 1024 / 1024),
+    process_rss_mib: round(process.memoryUsage().rss / 1024 / 1024),
+  }
+  const linuxMemory = await readLinuxMeminfo()
+  const storage = await filesystemSnapshot(process.cwd())
+  return {
+    label,
+    captured_utc: new Date().toISOString(),
+    loadavg_1m_5m_15m: os.loadavg().map(round),
+    memory,
+    linux_meminfo: linuxMemory,
+    storage,
+  }
+}
+
+async function readLinuxMeminfo() {
+  try {
+    const text = await readFile('/proc/meminfo', 'utf8')
+    const getKiB = (key) => {
+      const match = text.match(new RegExp(`^${key}:\\s+(\\d+)\\s+kB`, 'm'))
+      return match ? Number(match[1]) : null
+    }
+    const toGiB = (kib) => Number.isFinite(kib) ? round(kib / 1024 / 1024) : null
+    return {
+      mem_available_gib: toGiB(getKiB('MemAvailable')),
+      swap_total_gib: toGiB(getKiB('SwapTotal')),
+      swap_free_gib: toGiB(getKiB('SwapFree')),
+      dirty_mib: Number.isFinite(getKiB('Dirty')) ? round(getKiB('Dirty') / 1024) : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+async function filesystemSnapshot(path) {
+  try {
+    const fs = await statfs(path)
+    const blockSize = Number(fs.bsize || 0)
+    const totalBytes = Number(fs.blocks || 0) * blockSize
+    const availableBytes = Number(fs.bavail || 0) * blockSize
+    return {
+      path: resolve(path),
+      total_gib: round(totalBytes / 1024 / 1024 / 1024),
+      available_gib: round(availableBytes / 1024 / 1024 / 1024),
+      used_pct: totalBytes > 0 ? round(((totalBytes - availableBytes) / totalBytes) * 100) : null,
+    }
+  } catch (error) {
+    return { path: resolve(path), error: error.code || error.message }
+  }
 }
 
 async function waitForJson(url, init, label, timeoutMs) {

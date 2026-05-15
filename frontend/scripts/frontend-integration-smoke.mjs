@@ -20,6 +20,10 @@ const server = await createServer({
 try {
   const { default: ChatWorkspace } = await server.ssrLoadModule('/src/views/ChatWorkspace.jsx')
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
+  const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
+  const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
+  const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
+  const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
 
   const noop = () => {}
   const readyRuntime = {
@@ -36,16 +40,33 @@ try {
     generation_ready: true,
     status: 'ready',
     quant: 'Q8_0',
+    model_path: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+    runtime_model_name: 'llama32_3b_instruct_q8_0',
   }
   const capabilities = {
     support_contract: {
-      current_gate: 'Current exact-row support: no model-native/larger context beyond checked packs, arbitrary-template behavior, throughput, portability, neighboring-row, or broad-family support is implied.',
+      current_gate: 'Current exact-row support: no model-native/larger context beyond checked packs, arbitrary/Jinja template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.',
       support_policy: 'Only exact rows unlock chat.',
       unsupported_policy: 'Everything else remains guarded.',
     },
     supported_model_families: [{ id: 'broad_family_trap', status: 'supported' }],
     supported_quantization: [{ id: 'broad_quant_trap', status: 'supported' }],
     model_compatibility: [
+      {
+        id: 'tinyllama_1_1b_chat_q8_0',
+        status: 'supported_current_gate',
+        family: 'llama_spm_decoder',
+        quantization: 'Q8_0',
+        support_scope: 'exact row only',
+        frontend_readiness_gate: 'loaded_now + generation_ready + active_model_id + exact row',
+        full_support_status: 'guarded_by_exact_row',
+        full_support_blockers: 'arbitrary/Jinja templates, production throughput, portability',
+        evidence: 'TinyLlama fixture row; must not be inherited by misleading 3B backend ids.',
+        chat_template_renderer: 'tinyllama-marker',
+        chat_template_shape_pack: 'validated_bounded_pack',
+        performance_measured: 'measured',
+        next_step: 'preserve exact-row scoping before widening support claims',
+      },
       {
         id: 'llama32_3b_instruct_q8_0',
         status: 'supported_current_gate',
@@ -86,6 +107,8 @@ try {
       { id: 'future_batch_endpoint', status: 'planned', notes: `Guarded feature row; do not label it ${'Clau' + 'de'} or ${'Gem' + 'ini'} compatible from API metadata.` },
     ],
   }
+  const selectedModelRunnable = getChatGateState(capabilities, selectedModel, readyRuntime).chatUnlocked
+  assert.equal(selectedModelRunnable, true, '3B Q8_0 fixture must be end-to-end runnable only when model path, runtime readiness, and exact-row support are all green')
 
   const streamingMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: {
@@ -109,7 +132,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: false,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -142,7 +165,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: true,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -172,7 +195,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: false,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -202,7 +225,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: false,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -233,7 +256,7 @@ try {
     saveToMemory: noop,
     sendMessage: noop,
     sending: true,
-    selectedModelRunnable: true,
+    selectedModelRunnable,
     setTab: noop,
   }))
 
@@ -251,13 +274,182 @@ try {
   assert.match(exactReadyMarkup, /Exact row evidence bundle\./, 'API view should render exact-row evidence text')
   assert.match(exactReadyMarkup, /exact row fixture output/, 'API view should render latest exact-row output evidence')
   assert.match(exactReadyMarkup, /Template\/Jinja readiness[\s\S]*Template readiness is green for this supported exact row/, 'API view should show resolved template/Jinja as a green exact-row readiness lane')
-  assert.match(exactReadyMarkup, /Throughput readiness[\s\S]*Production-throughput readiness is green for this supported exact row/, 'API view should show resolved production-throughput as a green exact-row readiness lane')
-  assert.match(exactReadyMarkup, /Remaining support boundary:<\/b> model-native\/larger context beyond checked packs; portability; and durable repeated current-head bundles remain missing/, 'API view should keep unresolved row blockers while filtering resolved template/Jinja and throughput caveats')
-  assert.doesNotMatch(exactReadyMarkup, /arbitrary-template behavior|arbitrary\/Jinja templates, production throughput|throughput, portability, neighboring-row/, 'API support surface should not repeat resolved template/Jinja or throughput caveats as generic blockers')
-  assert.doesNotMatch(exactReadyMarkup, /normalizing model-native\/larger context; arbitrary\/Jinja template behavior; production throughput/, 'API compatibility list next-step copy should filter resolved template/Jinja and production-throughput caveats')
+  assert.match(exactReadyMarkup, /Throughput readiness[\s\S]*Bounded row-scoped performance\/RSS evidence is present/, 'API view should show bounded 3B performance/RSS evidence without promoting production-throughput readiness')
+  assert.match(exactReadyMarkup, /Remaining support boundary:<\/b> model-native\/larger context beyond checked packs; production throughput; portability; durable repeated current-head bundles remain missing/, 'API view should keep unresolved row blockers while filtering only resolved template/Jinja caveats')
+  assert.doesNotMatch(exactReadyMarkup, /arbitrary-template behavior|arbitrary\/Jinja templates/, 'API support surface should not repeat resolved template/Jinja caveats after row-scoped template evidence is green')
+  assert.doesNotMatch(exactReadyMarkup, /normalizing model-native\/larger context; arbitrary\/Jinja template behavior; production throughput/, 'API compatibility list next-step copy should filter resolved template/Jinja caveats while retaining production-throughput blockers')
   assert.match(exactReadyMarkup, /Supported API feature rows/, 'API view should render supported feature rows from /api/capabilities')
   assert.match(exactReadyMarkup, /chat completions/, 'API view should display provider-scoped feature ids as neutral capability names')
   assert.match(exactReadyMarkup, /standard-compatible streaming stays enabled\./, 'API view should sanitize provider-specific feature notes before rendering')
+
+  const topBarMarkup = renderToStaticMarkup(React.createElement(TopBar, {
+    tab: 'api',
+    setTab: noop,
+    selectedConversationTitle: '',
+    selectedConversationUpdatedAt: '',
+    selectedConversationPreview: '',
+    runtime: readyRuntime,
+    capabilities,
+    selectedModelId: selectedModel.id,
+    setSelectedModelId: noop,
+    models: [selectedModel],
+  }))
+
+  assert.match(topBarMarkup, /Support contract/, 'TopBar should render the support contract status surface')
+  assert.doesNotMatch(topBarMarkup, /arbitrary|Jinja/s, 'TopBar support contract label should filter resolved template/Jinja caveats')
+  assert.match(topBarMarkup, /production throughput|throughput/s, 'TopBar support contract label should keep production-throughput caveats until explicit production evidence is green')
+
+  const aliasSelectedModel = {
+    ...selectedModel,
+    id: 'browser-llama32-3b-alias',
+    runtime_model_name: selectedModel.id,
+    model_path: '/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+  }
+  const aliasApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: readyRuntime,
+    selectedModel: aliasSelectedModel,
+    capabilities,
+  }))
+
+  assert.match(aliasApiMarkup, /Selected exact row ready/, 'API view should keep alias-selected 3B exact rows green when active_model_id matches runtime_model_name')
+  assert.match(aliasApiMarkup, /&quot;model&quot;: &quot;llama32_3b_instruct_q8_0&quot;/, 'API curl should send the backend loaded model id, not the browser-only alias')
+  assert.doesNotMatch(aliasApiMarkup, /&quot;model&quot;: &quot;browser-llama32-3b-alias&quot;/, 'API curl must not create model_mismatch risk for alias-selected exact rows')
+
+  const aliasTopBarMarkup = renderToStaticMarkup(React.createElement(TopBar, {
+    tab: 'api',
+    setTab: noop,
+    selectedConversationTitle: '',
+    selectedConversationUpdatedAt: '',
+    selectedConversationPreview: '',
+    runtime: readyRuntime,
+    capabilities,
+    selectedModelId: aliasSelectedModel.id,
+    setSelectedModelId: noop,
+    models: [aliasSelectedModel],
+  }))
+
+  assert.match(aliasTopBarMarkup, /Runtime chat gate[\s\S]*Llama 3\.2 3B Instruct Q8_0/, 'TopBar runtime readiness should resolve the active model through runtime_model_name aliases')
+  assert.doesNotMatch(aliasTopBarMarkup, /Nothing loaded now/, 'TopBar must not show an empty runtime state for alias-selected loaded 3B rows')
+
+  const modelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: readyRuntime,
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [aliasSelectedModel],
+    selectedModelId: aliasSelectedModel.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+
+  assert.match(modelsMarkup, /Llama 3\.2 3B Instruct Q8_0/, 'Models view should render the exact 3B row when the browser id differs from the backend runtime id')
+  assert.match(modelsMarkup, /chat enabled|The selected model is loaded, generation-ready, and backed by an exact supported \/api\/capabilities row/, 'Models view should treat runtime_model_name active_model_id matches as next-chat ready when exact 3B evidence is supported')
+  assert.match(modelsMarkup, /Chat unlockable/, 'Tracked 3B card should turn green only after exact row support and runtime readiness both match')
+  assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
+  assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
+  assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+
+  assert.equal(
+    resolveLoadedModelDisplayName({
+      fallbackName: 'scalar_default_rerun',
+      modelPath: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+      quantLabel: 'Q8_0',
+    }),
+    'Llama 3.2 3B Instruct Q8_0',
+    'live backend-generated ids should display the exact 3B row name when the loaded GGUF filename and Q8_0 metadata are exact',
+  )
+  assert.equal(
+    resolveLoadedModelDisplayName({
+      fallbackName: 'scalar_default_rerun',
+      modelPath: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q4_0.gguf',
+      quantLabel: 'Q4_0',
+    }),
+    'scalar_default_rerun',
+    'the 3B display alias must stay fail-closed for neighboring quants',
+  )
+
+  const liveBackendIdModel = {
+    ...selectedModel,
+    id: 'scalar_default_rerun',
+    name: resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: selectedModel.model_path, quantLabel: selectedModel.quant }),
+    runtime_model_name: 'scalar_default_rerun',
+  }
+  const liveBackendIdRuntime = { ...readyRuntime, active_model_id: liveBackendIdModel.id }
+  const liveBackendIdChatGate = getChatGateState(capabilities, liveBackendIdModel, liveBackendIdRuntime)
+  assert.equal(liveBackendIdChatGate.chatUnlocked, true, '3B rows loaded under a backend-generated runtime id should still unlock from GGUF path + Q8_0 exact-row evidence')
+  assert.equal(liveBackendIdChatGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'backend-generated 3B runtime ids must resolve to the canonical exact row, not a broad family claim')
+
+  const misleadingTinyRuntimeModel = {
+    ...selectedModel,
+    id: 'tinyllama-q8',
+    name: resolveLoadedModelDisplayName({ fallbackName: 'tinyllama-q8', modelPath: selectedModel.model_path, quantLabel: selectedModel.quant }),
+    runtime_model_name: 'tinyllama-q8',
+  }
+  const misleadingTinyRuntime = { ...readyRuntime, active_model_id: misleadingTinyRuntimeModel.id }
+  const misleadingTinyChatGate = getChatGateState(capabilities, misleadingTinyRuntimeModel, misleadingTinyRuntime)
+  assert.equal(misleadingTinyChatGate.chatUnlocked, true, 'live 3B runs with a stale tinyllama-q8 runtime id should still unlock only from exact loaded GGUF path + Q8_0 support evidence')
+  assert.equal(misleadingTinyChatGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'stale tinyllama-q8 runtime ids must not steal the TinyLlama row when the loaded file is Llama 3.2 3B Instruct Q8_0')
+
+  const misleadingTinyModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: misleadingTinyRuntime,
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [misleadingTinyRuntimeModel],
+    selectedModelId: misleadingTinyRuntimeModel.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+
+  assert.match(misleadingTinyModelsMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'Models view should present the stale-id live run as the exact 3B row, not TinyLlama')
+  assert.match(misleadingTinyModelsMarkup, /Loaded exact-row match/, 'Models tracked 3B card should mark stale-id live runs as loaded exact-row matches')
+  assert.doesNotMatch(misleadingTinyModelsMarkup, /tinyllama_1_1b_chat_q8_0: supported current gate/, 'stale tinyllama-q8 runtime ids must not make the selected live 3B model inherit TinyLlama support copy')
+
+  const liveBackendIdChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
+    selectedConversation: null,
+    selectedModel: liveBackendIdModel,
+    selectedModelId: liveBackendIdModel.id,
+    setSelectedModelId: noop,
+    models: [liveBackendIdModel],
+    runtime: liveBackendIdRuntime,
+    capabilities,
+    pendingConversation: null,
+    composer: 'Say hello from 3B',
+    setComposer: noop,
+    saveToMemory: noop,
+    sendMessage: noop,
+    sending: false,
+    selectedModelRunnable: liveBackendIdChatGate.chatUnlocked,
+    setTab: noop,
+  }))
+
+  assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
+  assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
+  assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
+  assert.match(liveBackendIdChatMarkup, /Exact row supported/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
+  assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
+  assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
+
   assert.match(exactReadyMarkup, /responses stream/, 'API view should normalize provider-scoped dotted feature ids before rendering')
   assert.match(exactReadyMarkup, /hosted model-style streamed response compatibility stays provider-neutral/, 'API view should neutralize hosted-brand feature notes before rendering')
   assert.match(exactReadyMarkup, /Guarded feature row; do not label it hosted model or hosted model compatible from API metadata\./, 'API view should also neutralize guarded feature metadata before rendering')
