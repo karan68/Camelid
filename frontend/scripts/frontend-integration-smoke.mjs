@@ -23,6 +23,7 @@ try {
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
+  const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
 
   const noop = () => {}
   const readyRuntime = {
@@ -343,10 +344,29 @@ try {
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
 
+  assert.equal(
+    resolveLoadedModelDisplayName({
+      fallbackName: 'scalar_default_rerun',
+      modelPath: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q8_0.gguf',
+      quantLabel: 'Q8_0',
+    }),
+    'Llama 3.2 3B Instruct Q8_0',
+    'live backend-generated ids should display the exact 3B row name when the loaded GGUF filename and Q8_0 metadata are exact',
+  )
+  assert.equal(
+    resolveLoadedModelDisplayName({
+      fallbackName: 'scalar_default_rerun',
+      modelPath: '/home/ubuntu/models/Llama-3.2-3B-Instruct-Q4_0.gguf',
+      quantLabel: 'Q4_0',
+    }),
+    'scalar_default_rerun',
+    'the 3B display alias must stay fail-closed for neighboring quants',
+  )
+
   const liveBackendIdModel = {
     ...selectedModel,
     id: 'scalar_default_rerun',
-    name: 'scalar_default_rerun',
+    name: resolveLoadedModelDisplayName({ fallbackName: 'scalar_default_rerun', modelPath: selectedModel.model_path, quantLabel: selectedModel.quant }),
     runtime_model_name: 'scalar_default_rerun',
   }
   const liveBackendIdRuntime = { ...readyRuntime, active_model_id: liveBackendIdModel.id }
@@ -374,6 +394,7 @@ try {
 
   assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
   assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
+  assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
   assert.match(liveBackendIdChatMarkup, /Exact row supported/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
   assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
   assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')

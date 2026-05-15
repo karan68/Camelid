@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { LLAMA32_3B_ACCEPTANCE_TARGET } from '../lib/acceptanceTargets'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
@@ -73,6 +74,26 @@ function compareModelsByName(left, right) {
 
 function getModelPath(model) {
   return typeof model?.path === 'string' ? model.path : ''
+}
+
+function pathBasename(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
+}
+
+function normalizeQuantLabel(value) {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+}
+
+const LLAMA32_3B_ACCEPTANCE_FILENAME = pathBasename(LLAMA32_3B_ACCEPTANCE_TARGET.source)
+
+function isExactLlama32ThreeBLoadedGguf(modelPath, quantLabel) {
+  return pathBasename(modelPath).toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase()
+    && normalizeQuantLabel(quantLabel) === 'Q8_0'
+}
+
+export function resolveLoadedModelDisplayName({ fallbackName, modelPath, quantLabel }) {
+  if (isExactLlama32ThreeBLoadedGguf(modelPath, quantLabel)) return LLAMA32_3B_ACCEPTANCE_TARGET.name
+  return fallbackName
 }
 
 function getLoadedModelFileType(model) {
@@ -223,10 +244,13 @@ function modelMatchesHealthActive(model, health) {
 function modelFromLocalRecord(record, health, currentModel, apiBase) {
   const active = modelMatchesHealthActive(record, health)
   const generationReady = active && Boolean(health?.generation_ready)
+  const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : record.quant
+  const modelPath = active ? getModelPath(currentModel) || record.model_path : record.model_path
   return {
     ...record,
+    name: resolveLoadedModelDisplayName({ fallbackName: record.name, modelPath, quantLabel }),
     status: generationReady ? 'ready' : record.status,
-    model_path: active ? getModelPath(currentModel) || record.model_path : record.model_path,
+    model_path: modelPath,
     api_base: apiBase,
     install_error: active ? null : record.install_error,
     load_error: active ? null : record.load_error,
@@ -244,10 +268,11 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
   const tokenizer = active ? currentModel?.tokenizer : null
   const quantLabel = active ? getLoadedModelQuantLabel(currentModel) : null
   const modelPath = active ? getModelPath(currentModel) || localRecord?.model_path || '' : localRecord?.model_path || ''
+  const fallbackName = localRecord?.name || item.name || item.id
 
   return {
     id,
-    name: localRecord?.name || item.name || item.id,
+    name: resolveLoadedModelDisplayName({ fallbackName, modelPath, quantLabel }),
     provider_kind: 'local',
     status: generationReady ? 'ready' : localRecord?.status || 'registered',
     model_path: modelPath,
