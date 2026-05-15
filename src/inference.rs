@@ -8376,6 +8376,19 @@ fn q8_0_dot_group4_encoded(weight: &[u8], input: &[i8; Q8_0_BLOCK_VALUES], start
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_kernel_avx2_enabled() -> bool {
+    #[cfg(test)]
+    {
+        x86_q8_kernel_avx2_enabled_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_KERNEL_AVX2_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_KERNEL_AVX2_ENABLED.get_or_init(x86_q8_kernel_avx2_enabled_from_env)
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
     matches!(
         env::var("CAMELID_X86_Q8_KERNEL").as_deref(),
         Ok("avx2") | Ok("AVX2") | Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
