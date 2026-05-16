@@ -669,6 +669,7 @@ struct Q8RuntimeFlags {
     block_dot: bool,
     file_reader_block_dot: bool,
     attention_projection_decode_consumer: bool,
+    ffn_down_decode_consumer: bool,
     metal: bool,
     metal_retained: bool,
     hybrid_retained: bool,
@@ -700,6 +701,9 @@ impl Q8RuntimeFlags {
             ),
             attention_projection_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
+            ),
+            ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             ),
             metal: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8"),
             metal_retained: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED"),
@@ -3777,41 +3781,15 @@ fn forward_layer_timed(
         }
         trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
         let started = Instant::now();
-        let (ffn_out, ffn_out_already_residual) = if !collect_diagnostics {
-            if let Some(output) = try_x86_q8_ffn_down_decode_owner_residual_path(
-                &activated,
-                &layer.ffn_down,
-                &residual,
-                format!("layer_{layer_idx}_ffn_residual"),
-                "ffn_down",
-            )? {
-                (output, true)
-            } else {
-                (
-                    linear_for_role_runtime_with_plan(
-                        &activated,
-                        &layer.ffn_down,
-                        format!("layer_{layer_idx}_ffn_down"),
-                        "ffn_down",
-                        runtime_plan,
-                        collect_diagnostics,
-                    )?,
-                    false,
-                )
-            }
-        } else {
-            (
-                linear_for_role_runtime_with_plan(
-                    &activated,
-                    &layer.ffn_down,
-                    format!("layer_{layer_idx}_ffn_down"),
-                    "ffn_down",
-                    runtime_plan,
-                    collect_diagnostics,
-                )?,
-                false,
-            )
-        };
+        let ffn_out = linear_for_role_runtime_with_plan(
+            &activated,
+            &layer.ffn_down,
+            format!("layer_{layer_idx}_ffn_down"),
+            "ffn_down",
+            runtime_plan,
+            collect_diagnostics,
+        )?;
+        let ffn_out_already_residual = false;
         let ffn_output_stats = collect_diagnostics
             .then(|| LlamaTensorStats::from_tensor(&ffn_out))
             .transpose()?;
@@ -4680,9 +4658,13 @@ fn linear_for_role_runtime_with_plan(
         )? {
             return Ok(output);
         }
-        if let Some(output) =
-            try_x86_q8_ffn_down_decode_owner_path(input, weight, &name, rectangular_role)?
-        {
+        if let Some(output) = try_x86_q8_ffn_down_decode_consumer_path(
+            input,
+            weight,
+            &name,
+            rectangular_role,
+            runtime_plan,
+        )? {
             return Ok(output);
         }
         linear_with_diagnostic_layouts_with_plan(
@@ -7156,17 +7138,6 @@ impl BorrowedQuantizedQ8_0Rows<'_> {
     }
 }
 
-fn x86_q8_ffn_down_decode_owner_enabled() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        env_flag_enabled("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER")
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        false
-    }
-}
-
 fn x86_q8_output_decode_owner_enabled() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -7290,13 +7261,14 @@ fn try_x86_q8_attention_projection_decode_consumer_path(
     )?))
 }
 
-fn try_x86_q8_ffn_down_decode_owner_path(
+fn try_x86_q8_ffn_down_decode_consumer_path(
     input: &CpuTensor,
     weight: &CpuTensor,
     name: &str,
     rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !x86_q8_ffn_down_decode_owner_enabled()
+    if !runtime_plan.q8.ffn_down_decode_consumer
         || rectangular_role != "ffn_down"
         || input.rank() != 2
         || input.dim(0)? != 1
@@ -7304,33 +7276,44 @@ fn try_x86_q8_ffn_down_decode_owner_path(
     {
         return Ok(None);
     }
+
     let input_width = input.dim(1)?;
-    let output_width = linear_output_width(input, weight, rectangular_role)?;
-    let borrowed = if weight.dim(1)? == input_width {
-        BorrowedLinearWeight::from_tensor(weight)?
-    } else if weight.dim(0)? == input_width {
-        BorrowedLinearWeight::from_tensor(weight)?.with_swapped_matrix_shape()
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) || weight.rank() != 2 {
+        return Ok(None);
+    }
+
+    let weight_rows = weight.dim(0)?;
+    let weight_cols = weight.dim(1)?;
+    let output_width = if weight_rows == input_width {
+        weight_cols
+    } else if weight_cols == input_width {
+        weight_rows
     } else {
         return Ok(None);
     };
-    let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
+
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
         return Ok(None);
     };
-    if interleave != Q8_0PackedRows4Interleave::I8
+    if packed.interleave != Q8_0PackedRows4Interleave::I8
         || packed.rows != output_width
         || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
-        || !input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
         || !output_width.is_multiple_of(4)
     {
         return Ok(None);
     }
+
     let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
     let mut output = vec![0.0_f32; output_width];
     let blocks_per_row = packed.blocks_per_row;
     for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate() {
         let group_blocks =
             &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
-        let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
+        let sums = q8_0_packed_rows4_dot(
+            group_blocks,
+            &quantized_input.blocks,
+            Q8_0PackedRows4Interleave::I8,
+        );
         output_chunk.copy_from_slice(&sums);
     }
     Ok(Some(CpuTensor::from_f32(
@@ -7340,77 +7323,7 @@ fn try_x86_q8_ffn_down_decode_owner_path(
     )?))
 }
 
-fn try_x86_q8_ffn_down_decode_owner_residual_path(
-    input: &CpuTensor,
-    weight: &CpuTensor,
-    residual: &CpuTensor,
-    name: impl Into<String>,
-    rectangular_role: &str,
-) -> Result<Option<CpuTensor>> {
-    if !x86_q8_ffn_down_decode_owner_enabled()
-        || rectangular_role != "ffn_down"
-        || input.rank() != 2
-        || input.dim(0)? != 1
-        || residual.rank() != 2
-        || residual.dim(0)? != 1
-        || weight.source_type != Some(GgufTensorType::Q8_0)
-    {
-        return Ok(None);
-    }
-    let input_width = input.dim(1)?;
-    let output_width = linear_output_width(input, weight, rectangular_role)?;
-    if residual.dim(1)? != output_width || residual.data.len() != output_width {
-        return Ok(None);
-    }
-    let borrowed = if weight.dim(1)? == input_width {
-        BorrowedLinearWeight::from_tensor(weight)?
-    } else if weight.dim(0)? == input_width {
-        BorrowedLinearWeight::from_tensor(weight)?.with_swapped_matrix_shape()
-    } else {
-        return Ok(None);
-    };
-    let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(borrowed) else {
-        return Ok(None);
-    };
-    if interleave != Q8_0PackedRows4Interleave::I8
-        || packed.rows != output_width
-        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
-        || !input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
-        || !output_width.is_multiple_of(4)
-    {
-        return Ok(None);
-    }
-    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
-    let mut output = residual.data.clone();
-    let blocks_per_row = packed.blocks_per_row;
-    if should_parallelize_linear_output(output.len()) {
-        output
-            .par_chunks_mut(4)
-            .enumerate()
-            .for_each(|(group_idx, output_chunk)| {
-                let group_blocks =
-                    &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
-                let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
-                for lane in 0..4 {
-                    output_chunk[lane] += sums[lane];
-                }
-            });
-    } else {
-        for (group_idx, output_chunk) in output.chunks_mut(4).enumerate() {
-            let group_blocks =
-                &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
-            let sums = q8_0_packed_rows4_dot(group_blocks, &quantized_input.blocks, interleave);
-            for lane in 0..4 {
-                output_chunk[lane] += sums[lane];
-            }
-        }
-    }
-    Ok(Some(CpuTensor::from_f32(
-        name,
-        vec![1, output_width],
-        output,
-    )?))
-}
+#[allow(dead_code)]
 fn matmul_rhs_transposed_q8_0_block_dot(
     input: &CpuTensor,
     weight: &CpuTensor,
@@ -12903,6 +12816,7 @@ mod tests {
                 block_dot: true,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                ffn_down_decode_consumer: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -12995,6 +12909,7 @@ mod tests {
         std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
         std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "1");
         std::env::set_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER", "on");
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
 
@@ -13007,10 +12922,16 @@ mod tests {
         assert!(plan.q8.block_dot);
         assert!(plan.q8.file_reader_block_dot);
         assert!(plan.q8.attention_projection_decode_consumer);
+        assert!(plan.q8.ffn_down_decode_consumer);
         std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
         assert!(
             plan.q8.attention_projection_decode_consumer,
             "resolved plan should cache the attention projection consumer gate"
+        );
+        assert!(
+            plan.q8.ffn_down_decode_consumer,
+            "resolved plan should cache the FFN-down consumer gate"
         );
         assert_eq!(plan.q8.hybrid_gpu_rows, Some(7));
         assert_eq!(plan.q8.hybrid_gpu_percent, 25);
@@ -13035,6 +12956,10 @@ mod tests {
             assert!(
                 !plan.q8.attention_projection_decode_consumer,
                 "{profile} should not enable attention projection consumer by default"
+            );
+            assert!(
+                !plan.q8.ffn_down_decode_consumer,
+                "{profile} should not enable FFN-down consumer by default"
             );
             assert!(
                 !plan.q8.metal,
@@ -13549,6 +13474,7 @@ mod tests {
                 block_dot: false,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: enabled,
+                ffn_down_decode_consumer: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -13676,17 +13602,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn x86_q8_ffn_down_decode_owner_path_matches_runtime_packed_baseline() {
-        let _env_guard = env_lock();
-        clear_dense_diagnostic_env();
-        std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
-        std::env::set_var("CAMELID_X86_Q8_REPACK", "on");
-        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", "on");
+    fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
+        ResolvedRuntimePlan {
+            linear_accumulation_precision: LinearAccumulationPrecision::F32,
+            q8: Q8RuntimeFlags {
+                block_dot: false,
+                file_reader_block_dot: false,
+                attention_projection_decode_consumer: false,
+                ffn_down_decode_consumer: enabled,
+                metal: false,
+                metal_retained: false,
+                hybrid_retained: false,
+                hybrid_gpu_rows: None,
+                hybrid_gpu_percent: 10,
+            },
+        }
+    }
 
+    fn runtime_packed_ffn_down_case() -> (CpuTensor, CpuTensor, CpuTensor) {
         let rows = 32;
         let input_width = Q8_0_BLOCK_VALUES * 2;
-        let row_blocks: Vec<Q8_0Block> = (0..rows * 2)
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let row_blocks: Vec<Q8_0Block> = (0..rows * blocks_per_row)
             .map(|row| Q8_0Block {
                 scale: 0.125 + row as f32 * 0.006,
                 quants: std::array::from_fn(|idx| {
@@ -13694,19 +13631,6 @@ mod tests {
                 }),
             })
             .collect();
-        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
-            "blk.0.ffn_down.weight",
-            TensorShape {
-                dims: vec![input_width, rows],
-            },
-            Q8_0PackedRows4::from_rows(
-                rows,
-                input_width / Q8_0_BLOCK_VALUES,
-                Q8_0PackedRows4Interleave::I8,
-                &row_blocks,
-            )
-            .unwrap(),
-        );
         let input = CpuTensor::from_f32(
             "input",
             vec![1, input_width],
@@ -13715,18 +13639,150 @@ mod tests {
                 .collect(),
         )
         .unwrap();
+        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_ffn_down_transposed",
+            vec![rows, input_width],
+            dequantized_q8_0_rows(&row_blocks),
+            row_blocks.clone(),
+        )
+        .unwrap();
+        let expected =
+            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            Q8_0PackedRows4::from_rows(
+                rows,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &row_blocks,
+            )
+            .unwrap(),
+        );
+        assert!(packed_weight.data.is_empty());
+        assert!(packed_weight.q8_0_blocks.is_none());
+        assert!(packed_weight.q8_0_file_backing.is_none());
+        assert!(matches!(
+            packed_weight.q8_0_runtime_storage.as_ref(),
+            Some(Q8_0RuntimeStorage::PackedRows4(packed))
+                if packed.rows == rows && packed.blocks_per_row == blocks_per_row
+        ));
+        (input, packed_weight, expected)
+    }
 
-        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER");
-        let baseline =
-            linear_for_role_runtime(&input, &packed_weight, "baseline", "ffn_down", false).unwrap();
+    #[test]
+    fn q8_ffn_down_consumer_matches_runtime_packed_baseline() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_weight, expected) = runtime_packed_ffn_down_case();
+        let plan = ffn_down_consumer_plan(true);
+
+        let actual = linear_for_role_runtime_with_plan(
+            &input,
+            &packed_weight,
+            "actual",
+            "ffn_down",
+            &plan,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    }
+
+    #[test]
+    fn q8_ffn_down_consumer_is_plan_gated_and_distinct_from_old_owner_gate() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
         std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", "on");
-        let owned =
-            linear_for_role_runtime(&input, &packed_weight, "owned", "ffn_down", false).unwrap();
-        assert_eq!(owned.data, baseline.data);
+        let (input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+
+        let disabled = ffn_down_consumer_plan(false);
+        assert!(
+            try_x86_q8_ffn_down_decode_consumer_path(
+                &input,
+                &packed_weight,
+                "disabled",
+                "ffn_down",
+                &disabled,
+            )
+            .unwrap()
+            .is_none(),
+            "old owner gate must not enable the new FFN-down consumer"
+        );
+
+        let enabled = ffn_down_consumer_plan(true);
+        assert!(
+            try_x86_q8_ffn_down_decode_consumer_path(
+                &input,
+                &packed_weight,
+                "wrong_role",
+                "attention_output",
+                &enabled,
+            )
+            .unwrap()
+            .is_none(),
+            "attention-output must not use the FFN-down consumer"
+        );
 
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER");
-        std::env::remove_var("CAMELID_X86_Q8_REPACK");
-        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    }
+
+    #[test]
+    fn q8_ffn_down_consumer_fails_closed_for_non_runtime_or_mismatched_storage() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+        let plan = ffn_down_consumer_plan(true);
+
+        let element_count = packed_weight.shape.element_count().unwrap();
+        let retained_like = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_ffn_down_transposed",
+            packed_weight.shape.dims.clone(),
+            vec![0.0; element_count],
+            vec![
+                Q8_0Block {
+                    scale: 1.0,
+                    quants: [0; Q8_0_BLOCK_VALUES],
+                };
+                element_count / Q8_0_BLOCK_VALUES
+            ],
+        )
+        .unwrap();
+        assert!(
+            try_x86_q8_ffn_down_decode_consumer_path(
+                &input,
+                &retained_like,
+                "retained_like",
+                "ffn_down",
+                &plan,
+            )
+            .unwrap()
+            .is_none(),
+            "consumer must require backend-owned runtime-packed storage"
+        );
+
+        let mut mismatched = packed_weight.clone();
+        if let Some(Q8_0RuntimeStorage::PackedRows4(packed)) =
+            mismatched.q8_0_runtime_storage.as_mut()
+        {
+            packed.rows += 4;
+        }
+        assert!(
+            try_x86_q8_ffn_down_decode_consumer_path(
+                &input,
+                &mismatched,
+                "mismatched",
+                "ffn_down",
+                &plan,
+            )
+            .unwrap()
+            .is_none(),
+            "consumer must fail closed when packed rows do not match output width"
+        );
     }
 
     #[test]
