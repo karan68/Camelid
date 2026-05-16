@@ -669,6 +669,7 @@ struct Q8RuntimeFlags {
     block_dot: bool,
     file_reader_block_dot: bool,
     attention_projection_decode_consumer: bool,
+    attention_qkv_decode_consumer: bool,
     ffn_down_decode_consumer: bool,
     metal: bool,
     metal_retained: bool,
@@ -701,6 +702,9 @@ impl Q8RuntimeFlags {
             ),
             attention_projection_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
+            ),
+            attention_qkv_decode_consumer: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             ),
             ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
@@ -3485,6 +3489,14 @@ fn forward_layer_timed(
     let qkv_started = Instant::now();
     let shared_qkv = if collect_diagnostics {
         None
+    } else if let Some(qkv) = try_x86_q8_attention_qkv_decode_consumer_path(
+        &attn_norm,
+        &layer.attention_q,
+        &layer.attention_k,
+        &layer.attention_v,
+        runtime_plan,
+    )? {
+        Some(qkv)
     } else {
         try_attention_qkv_shared_q8_0_block_dot(
             &attn_norm,
@@ -7189,6 +7201,106 @@ fn try_x86_q8_output_decode_owner_path(
         vec![1, borrowed.rows],
         output,
     )?))
+}
+
+fn try_x86_q8_attention_qkv_decode_consumer_path(
+    input: &CpuTensor,
+    q_weight: &CpuTensor,
+    k_weight: &CpuTensor,
+    v_weight: &CpuTensor,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<(CpuTensor, CpuTensor, CpuTensor)>> {
+    if !runtime_plan.q8.attention_qkv_decode_consumer || input.rank() != 2 || input.dim(0)? != 1 {
+        return Ok(None);
+    }
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+
+    let Some((q_packed, q_width)) =
+        q8_0_attention_projection_runtime_packed(q_weight, input_width)?
+    else {
+        return Ok(None);
+    };
+    let Some((k_packed, k_width)) =
+        q8_0_attention_projection_runtime_packed(k_weight, input_width)?
+    else {
+        return Ok(None);
+    };
+    let Some((v_packed, v_width)) =
+        q8_0_attention_projection_runtime_packed(v_weight, input_width)?
+    else {
+        return Ok(None);
+    };
+
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let q = q8_0_packed_rows4_single_input_projection(
+        q_packed,
+        &quantized_input.blocks,
+        q_width,
+        "attention_q_x86_q8_qkv_consumer",
+    )?;
+    let k = q8_0_packed_rows4_single_input_projection(
+        k_packed,
+        &quantized_input.blocks,
+        k_width,
+        "attention_k_x86_q8_qkv_consumer",
+    )?;
+    let v = q8_0_packed_rows4_single_input_projection(
+        v_packed,
+        &quantized_input.blocks,
+        v_width,
+        "attention_v_x86_q8_qkv_consumer",
+    )?;
+    Ok(Some((q, k, v)))
+}
+
+fn q8_0_attention_projection_runtime_packed(
+    weight: &CpuTensor,
+    input_width: usize,
+) -> Result<Option<(&Q8_0PackedRows4, usize)>> {
+    if weight.source_type != Some(GgufTensorType::Q8_0) {
+        return Ok(None);
+    }
+    let weight_rows = weight.dim(0)?;
+    let weight_cols = weight.dim(1)?;
+    let output_width = if weight_rows == input_width {
+        weight_cols
+    } else if weight_cols == input_width {
+        weight_rows
+    } else {
+        return Ok(None);
+    };
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || !output_width.is_multiple_of(4)
+    {
+        return Ok(None);
+    }
+    Ok(Some((packed, output_width)))
+}
+
+fn q8_0_packed_rows4_single_input_projection(
+    packed: &Q8_0PackedRows4,
+    quantized_input: &[Q8_0Block],
+    output_width: usize,
+    name: &str,
+) -> Result<CpuTensor> {
+    let mut output = vec![0.0_f32; output_width];
+    let blocks_per_row = packed.blocks_per_row;
+    for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate() {
+        let group_blocks =
+            &packed.blocks[group_idx * blocks_per_row..(group_idx + 1) * blocks_per_row];
+        let sums =
+            q8_0_packed_rows4_dot(group_blocks, quantized_input, Q8_0PackedRows4Interleave::I8);
+        output_chunk.copy_from_slice(&sums);
+    }
+    CpuTensor::from_f32(name, vec![1, output_width], output)
 }
 
 fn try_x86_q8_attention_projection_decode_consumer_path(
@@ -12816,6 +12928,7 @@ mod tests {
                 block_dot: true,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                attention_qkv_decode_consumer: false,
                 ffn_down_decode_consumer: false,
                 metal: false,
                 metal_retained: false,
@@ -12909,6 +13022,7 @@ mod tests {
         std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
         std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "1");
         std::env::set_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER", "on");
+        std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "yes");
         std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
@@ -12922,12 +13036,18 @@ mod tests {
         assert!(plan.q8.block_dot);
         assert!(plan.q8.file_reader_block_dot);
         assert!(plan.q8.attention_projection_decode_consumer);
+        assert!(plan.q8.attention_qkv_decode_consumer);
         assert!(plan.q8.ffn_down_decode_consumer);
         std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER");
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
         assert!(
             plan.q8.attention_projection_decode_consumer,
             "resolved plan should cache the attention projection consumer gate"
+        );
+        assert!(
+            plan.q8.attention_qkv_decode_consumer,
+            "resolved plan should cache the attention QKV consumer gate"
         );
         assert!(
             plan.q8.ffn_down_decode_consumer,
@@ -12956,6 +13076,10 @@ mod tests {
             assert!(
                 !plan.q8.attention_projection_decode_consumer,
                 "{profile} should not enable attention projection consumer by default"
+            );
+            assert!(
+                !plan.q8.attention_qkv_decode_consumer,
+                "{profile} should not enable attention QKV consumer by default"
             );
             assert!(
                 !plan.q8.ffn_down_decode_consumer,
@@ -13468,12 +13592,24 @@ mod tests {
     }
 
     fn attention_projection_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
+        q8_attention_consumer_plan(enabled, false)
+    }
+
+    fn attention_qkv_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
+        q8_attention_consumer_plan(false, enabled)
+    }
+
+    fn q8_attention_consumer_plan(
+        attention_projection_decode_consumer: bool,
+        attention_qkv_decode_consumer: bool,
+    ) -> ResolvedRuntimePlan {
         ResolvedRuntimePlan {
             linear_accumulation_precision: LinearAccumulationPrecision::F32,
             q8: Q8RuntimeFlags {
                 block_dot: false,
                 file_reader_block_dot: false,
-                attention_projection_decode_consumer: enabled,
+                attention_projection_decode_consumer,
+                attention_qkv_decode_consumer,
                 ffn_down_decode_consumer: false,
                 metal: false,
                 metal_retained: false,
@@ -13567,6 +13703,76 @@ mod tests {
     }
 
     #[test]
+    fn q8_attention_qkv_consumer_quantizes_once_for_runtime_packed_qkv() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, q_weight, q_expected) =
+            runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+        let (_, k_weight, k_expected) =
+            runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+        let (_, v_weight, v_expected) =
+            runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+        let plan = attention_qkv_consumer_plan(true);
+
+        let (q, k, v) = try_x86_q8_attention_qkv_decode_consumer_path(
+            &input, &q_weight, &k_weight, &v_weight, &plan,
+        )
+        .unwrap()
+        .expect("QKV consumer should accept runtime-packed attention Q/K/V weights");
+
+        assert_eq!(q.name, "attention_q_x86_q8_qkv_consumer");
+        assert_eq!(k.name, "attention_k_x86_q8_qkv_consumer");
+        assert_eq!(v.name, "attention_v_x86_q8_qkv_consumer");
+        assert_slice_close_with_tolerance(&q.data, &q_expected.data, 5e-4);
+        assert_slice_close_with_tolerance(&k.data, &k_expected.data, 5e-4);
+        assert_slice_close_with_tolerance(&v.data, &v_expected.data, 5e-4);
+    }
+
+    #[test]
+    fn q8_attention_qkv_consumer_is_default_off_and_requires_all_runtime_packed_inputs() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, q_weight, _) =
+            runtime_packed_attention_projection_case("attention_q", "blk.0.attn_q.weight");
+        let (_, k_weight, _) =
+            runtime_packed_attention_projection_case("attention_k", "blk.0.attn_k.weight");
+        let (_, v_weight, _) =
+            runtime_packed_attention_projection_case("attention_v", "blk.0.attn_v.weight");
+
+        assert!(
+            try_x86_q8_attention_qkv_decode_consumer_path(
+                &input,
+                &q_weight,
+                &k_weight,
+                &v_weight,
+                &attention_qkv_consumer_plan(false),
+            )
+            .unwrap()
+            .is_none(),
+            "default-off plan should not enter the fused QKV consumer"
+        );
+
+        let dense_v = CpuTensor::from_f32(
+            "dense_v",
+            vec![12, Q8_0_BLOCK_VALUES * 2],
+            vec![0.0; 12 * Q8_0_BLOCK_VALUES * 2],
+        )
+        .unwrap();
+        assert!(
+            try_x86_q8_attention_qkv_decode_consumer_path(
+                &input,
+                &q_weight,
+                &k_weight,
+                &dense_v,
+                &attention_qkv_consumer_plan(true),
+            )
+            .unwrap()
+            .is_none(),
+            "fused QKV consumer must fail closed unless every Q/K/V projection is runtime-packed Q8_0"
+        );
+    }
+
+    #[test]
     fn q8_attention_projection_consumer_is_plan_gated_and_role_limited() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
@@ -13609,6 +13815,7 @@ mod tests {
                 block_dot: false,
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
+                attention_qkv_decode_consumer: false,
                 ffn_down_decode_consumer: enabled,
                 metal: false,
                 metal_retained: false,
