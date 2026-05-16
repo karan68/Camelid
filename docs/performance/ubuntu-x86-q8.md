@@ -30,6 +30,7 @@ Only list the paths that are currently evidence-backed and default-off:
 - `CAMELID_X86_Q8_REPACK=on` for the retained Ubuntu x86 runtime-packed lane used in current evidence.
 - AVX2 packed-kernel work in the measured Ubuntu x86 lane where parity and bounded timing evidence support keeping the path under default-off gating.
 - Packed Q8 runtime storage for the dense attention projection family plus dense FFN gate/up/down rows in the measured lane.
+- Default-off decode consumers that directly use backend-owned packed runtime storage for narrow one-row dense projection families, including output, attention QKV/projection, FFN down, and the FFN gate/up activation slice while validation remains opt-in.
 
 ## Active experimental direction
 
@@ -37,7 +38,7 @@ Current work is focused on:
 
 - AVX2 scaled row-dot and packed-kernel execution
 - matrix-level Q8 GEMM/MUL_MAT ownership
-- FFN projection optimization, especially deeper `ffn_down` decode ownership
+- FFN projection optimization, especially deeper `ffn_down` decode ownership and one-quantization FFN gate/up decode consumption
 - attention projection optimization
 - reducing wrapper/callback overhead in hot inference
 - keeping the default/reference path safe while experimental paths stay opt-in
@@ -89,6 +90,8 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/README.md`
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260515T1108Z-x86-attn-family.txt`
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260515T1235Z-x86-ffn-down-runtime.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer-tests.txt`
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note

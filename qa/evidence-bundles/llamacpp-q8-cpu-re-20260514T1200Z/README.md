@@ -6,6 +6,15 @@ Scope: Ubuntu x86_64 dense Llama Q8_0 only.
 
 Claim guardrail: this report is the current Q8 reference truth for the Ubuntu x86_64 experiment lane only. It is not Mac, Apple Silicon, Metal, Mixtral, portability, production-throughput, or support-contract evidence. All Camelid x86 Q8 runtime changes described here are default-off developer experiments unless explicitly promoted by separate support evidence.
 
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-16T01:36Z
+
+- Small technical slice added a directly usable one-row dense FFN gate/up decode consumer for backend-owned packed Q8_0 runtime storage, gated by the new default-off x86 flag `CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER`.
+- The path is intentionally narrow: dense Llama Q8_0 `blk.*.ffn_gate.weight` plus `blk.*.ffn_up.weight`, one activation row, runtime-packed `Q8_0RuntimeStorage::PackedRows4`, I8 interleave, input width divisible by 32, matching gate/up output widths divisible by 4. If any guard fails or the env flag is unset/off, `gated_ffn_activation_with_plan` falls back to the existing safe gate/up path.
+- This avoids the failed duplicate packed-copy sidecar direction: it consumes backend-owned packed/runtime storage attached to the two FFN tensors and does not add a row-major+packed duplicate as the final design.
+- llama.cpp/Camelid grep evidence was refreshed for `q8_0`, `tinyBLAS`, `ggml_vec_dot_q8_0_q8_0`, `repack`, `MUL_MAT`, scheduling, OpenMP, AVX2, AVX512, and VNNI in `artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer.txt`.
+- Canonical Ubuntu x86_64 validation passed in `/home/ubuntu/work/camelid-ffngateup-consumer-20260516T0136Z` on `ubuntu@54.186.43.33`: `cargo fmt --check`, `cargo test -q q8_ffn_gate_up_consumer --lib` (`2 passed`), and `cargo test -q --lib` (`245 passed`). Output: `artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer-tests.txt`.
+- No throughput/support promotion is claimed from this slice. It is parity/unit evidence for a default-off Ubuntu x86_64 experiment path only.
+
 ## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-15T19:33Z
 
 - Small technical slice added a directly usable one-row decode output-projection consumer for backend-owned packed Q8_0 runtime storage, gated by the new default-off x86 flag `CAMELID_X86_Q8_OUTPUT_DECODE_OWNER`.
@@ -59,6 +68,8 @@ Claim guardrail: this report is the current Q8 reference truth for the Ubuntu x8
 
 Evidence:
 - `artifacts/cron-95495a91-20260515T1933Z-x86-output-decode-owner.txt`
+- `artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer.txt`
+- `artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer-tests.txt`
 - `artifacts/cron-95495a91-20260515T1933Z-x86-output-decode-owner-tests.txt`
 - `artifacts/cron-95495a91-20260515T1759Z-x86-ffn-down-decode-owner-grep.txt`
 - `artifacts/cron-95495a91-20260515T1759Z-x86-ffn-down-decode-owner-tests.txt`

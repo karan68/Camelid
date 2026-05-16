@@ -17,6 +17,7 @@ use std::{
 use rayon::prelude::*;
 use serde::Serialize;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 
@@ -670,6 +671,7 @@ struct Q8RuntimeFlags {
     file_reader_block_dot: bool,
     attention_projection_decode_consumer: bool,
     attention_qkv_decode_consumer: bool,
+    ffn_gate_up_decode_consumer: bool,
     ffn_down_decode_consumer: bool,
     metal: bool,
     metal_retained: bool,
@@ -705,6 +707,9 @@ impl Q8RuntimeFlags {
             ),
             attention_qkv_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
+            ),
+            ffn_gate_up_decode_consumer: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             ),
             ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
@@ -1465,12 +1470,14 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
     }
 }
 
+#[allow(dead_code)]
 fn add_q8_schedule_counter(counter: &AtomicU64, value: u64) {
     if q8_schedule_telemetry_enabled() && value > 0 {
         counter.fetch_add(value, Ordering::Relaxed);
     }
 }
 
+#[allow(dead_code)]
 fn update_q8_schedule_peak(counter: &AtomicU64, value: u64) {
     if !q8_schedule_telemetry_enabled() {
         return;
@@ -1484,6 +1491,7 @@ fn update_q8_schedule_peak(counter: &AtomicU64, value: u64) {
     }
 }
 
+#[allow(dead_code)]
 fn record_q8_schedule_activation_pack(
     packed_inputs: &mut Vec<Q8_0PackedRows4Block>,
     before_capacity: usize,
@@ -6054,7 +6062,22 @@ fn gated_ffn_activation_with_plan(
     let mut gate = vec![0.0; gate_width];
     let mut up = vec![0.0; up_width];
 
+    let ffn_gate_up_decode_consumer = if collect_diagnostics {
+        None
+    } else {
+        try_x86_q8_ffn_gate_up_decode_consumer_path(
+            input,
+            gate_weight,
+            up_weight,
+            &mut gate,
+            &mut up,
+            runtime_plan,
+        )?
+    };
+
     let shared_q8_gate_up = if collect_diagnostics {
+        None
+    } else if ffn_gate_up_decode_consumer.is_some() {
         None
     } else {
         match (
@@ -6081,65 +6104,66 @@ fn gated_ffn_activation_with_plan(
         }
     };
 
-    let (gate_elapsed, up_elapsed) =
-        if let Some((gate_transposed, up_transposed)) = shared_q8_gate_up {
-            let started = Instant::now();
-            let quantized_input = quantize_q8_0_row(input_row);
-            if let Some(total_elapsed) = try_gated_ffn_gate_up_hybrid_q8_0(
+    let (gate_elapsed, up_elapsed) = if let Some(elapsed) = ffn_gate_up_decode_consumer {
+        elapsed
+    } else if let Some((gate_transposed, up_transposed)) = shared_q8_gate_up {
+        let started = Instant::now();
+        let quantized_input = quantize_q8_0_row(input_row);
+        if let Some(total_elapsed) = try_gated_ffn_gate_up_hybrid_q8_0(
+            &quantized_input.blocks,
+            gate_transposed,
+            up_transposed,
+            &mut gate,
+            &mut up,
+            &runtime_plan.q8,
+        ) {
+            // Gate/up are submitted as one hybrid CPU+Metal batch, so split the measured
+            // elapsed time across the two existing timing fields while preserving the total.
+            let gate_elapsed = total_elapsed / 2;
+            (gate_elapsed, total_elapsed - gate_elapsed)
+        } else if let (Some(gate_blocks), Some(up_blocks)) =
+            (gate_transposed.q8_0_blocks, up_transposed.q8_0_blocks)
+        {
+            accumulate_two_q8_0_block_dot_quantized_cpu(
+                &quantized_input.blocks,
+                gate_blocks,
+                &mut gate,
+                up_blocks,
+                &mut up,
+            );
+            let total_elapsed = started.elapsed().as_micros();
+            let gate_elapsed = total_elapsed / 2;
+            (gate_elapsed, total_elapsed - gate_elapsed)
+        } else {
+            accumulate_transposed_linear_row_q8_0_block_dot_quantized(
                 &quantized_input.blocks,
                 gate_transposed,
+                &mut gate,
+            );
+            accumulate_transposed_linear_row_q8_0_block_dot_quantized(
+                &quantized_input.blocks,
                 up_transposed,
-                &mut gate,
                 &mut up,
-                &runtime_plan.q8,
-            ) {
-                // Gate/up are submitted as one hybrid CPU+Metal batch, so split the measured
-                // elapsed time across the two existing timing fields while preserving the total.
-                let gate_elapsed = total_elapsed / 2;
-                (gate_elapsed, total_elapsed - gate_elapsed)
-            } else if let (Some(gate_blocks), Some(up_blocks)) =
-                (gate_transposed.q8_0_blocks, up_transposed.q8_0_blocks)
-            {
-                accumulate_two_q8_0_block_dot_quantized_cpu(
-                    &quantized_input.blocks,
-                    gate_blocks,
-                    &mut gate,
-                    up_blocks,
-                    &mut up,
-                );
-                let total_elapsed = started.elapsed().as_micros();
-                let gate_elapsed = total_elapsed / 2;
-                (gate_elapsed, total_elapsed - gate_elapsed)
-            } else {
-                accumulate_transposed_linear_row_q8_0_block_dot_quantized(
-                    &quantized_input.blocks,
-                    gate_transposed,
-                    &mut gate,
-                );
-                accumulate_transposed_linear_row_q8_0_block_dot_quantized(
-                    &quantized_input.blocks,
-                    up_transposed,
-                    &mut up,
-                );
-                let total_elapsed = started.elapsed().as_micros();
-                let gate_elapsed = total_elapsed / 2;
-                (gate_elapsed, total_elapsed - gate_elapsed)
-            }
-        } else {
-            let started = Instant::now();
-            accumulate_linear_row(
-                input_row,
-                gate_weight,
-                &mut gate,
-                "ffn gate",
-                collect_diagnostics,
-            )?;
-            let gate_elapsed = started.elapsed().as_micros();
+            );
+            let total_elapsed = started.elapsed().as_micros();
+            let gate_elapsed = total_elapsed / 2;
+            (gate_elapsed, total_elapsed - gate_elapsed)
+        }
+    } else {
+        let started = Instant::now();
+        accumulate_linear_row(
+            input_row,
+            gate_weight,
+            &mut gate,
+            "ffn gate",
+            collect_diagnostics,
+        )?;
+        let gate_elapsed = started.elapsed().as_micros();
 
-            let started = Instant::now();
-            accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", collect_diagnostics)?;
-            (gate_elapsed, started.elapsed().as_micros())
-        };
+        let started = Instant::now();
+        accumulate_linear_row(input_row, up_weight, &mut up, "ffn up", collect_diagnostics)?;
+        (gate_elapsed, started.elapsed().as_micros())
+    };
 
     let gate_projection = collect_diagnostics
         .then(|| CpuTensor::from_f32("ffn_gate_diagnostic", vec![1, gate_width], gate.clone()))
@@ -7218,19 +7242,13 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
         return Ok(None);
     }
 
-    let Some((q_packed, q_width)) =
-        q8_0_attention_projection_runtime_packed(q_weight, input_width)?
-    else {
+    let Some((q_packed, q_width)) = q8_0_runtime_packed_projection(q_weight, input_width)? else {
         return Ok(None);
     };
-    let Some((k_packed, k_width)) =
-        q8_0_attention_projection_runtime_packed(k_weight, input_width)?
-    else {
+    let Some((k_packed, k_width)) = q8_0_runtime_packed_projection(k_weight, input_width)? else {
         return Ok(None);
     };
-    let Some((v_packed, v_width)) =
-        q8_0_attention_projection_runtime_packed(v_weight, input_width)?
-    else {
+    let Some((v_packed, v_width)) = q8_0_runtime_packed_projection(v_weight, input_width)? else {
         return Ok(None);
     };
 
@@ -7256,7 +7274,65 @@ fn try_x86_q8_attention_qkv_decode_consumer_path(
     Ok(Some((q, k, v)))
 }
 
-fn q8_0_attention_projection_runtime_packed(
+fn try_x86_q8_ffn_gate_up_decode_consumer_path(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    gate: &mut [f32],
+    up: &mut [f32],
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<(u128, u128)>> {
+    if !runtime_plan.q8.ffn_gate_up_decode_consumer
+        || input.rank() != 2
+        || input.dim(0)? != 1
+        || gate.is_empty()
+        || gate.len() != up.len()
+    {
+        return Ok(None);
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+
+    let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
+    else {
+        return Ok(None);
+    };
+    let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
+    else {
+        return Ok(None);
+    };
+    if gate_width != gate.len()
+        || up_width != up.len()
+        || gate_width != up_width
+        || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
+        || up_packed.interleave != Q8_0PackedRows4Interleave::I8
+    {
+        return Ok(None);
+    }
+
+    let started = Instant::now();
+    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+        &quantized_input.blocks,
+        gate_packed,
+        Q8_0PackedRows4Interleave::I8,
+        gate,
+    );
+    accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+        &quantized_input.blocks,
+        up_packed,
+        Q8_0PackedRows4Interleave::I8,
+        up,
+    );
+    let total_elapsed = started.elapsed().as_micros();
+    let gate_elapsed = total_elapsed / 2;
+    Ok(Some((gate_elapsed, total_elapsed - gate_elapsed)))
+}
+
+fn q8_0_runtime_packed_projection(
     weight: &CpuTensor,
     input_width: usize,
 ) -> Result<Option<(&Q8_0PackedRows4, usize)>> {
@@ -12929,6 +13005,7 @@ mod tests {
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
                 attention_qkv_decode_consumer: false,
+                ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: false,
                 metal: false,
                 metal_retained: false,
@@ -13023,6 +13100,7 @@ mod tests {
         std::env::set_var("CAMELID_Q8_0_FILE_READER_BLOCK_DOT", "1");
         std::env::set_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER", "on");
         std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "yes");
+        std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "true");
         std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
@@ -13037,9 +13115,11 @@ mod tests {
         assert!(plan.q8.file_reader_block_dot);
         assert!(plan.q8.attention_projection_decode_consumer);
         assert!(plan.q8.attention_qkv_decode_consumer);
+        assert!(plan.q8.ffn_gate_up_decode_consumer);
         assert!(plan.q8.ffn_down_decode_consumer);
         std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
         std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
         assert!(
             plan.q8.attention_projection_decode_consumer,
@@ -13048,6 +13128,10 @@ mod tests {
         assert!(
             plan.q8.attention_qkv_decode_consumer,
             "resolved plan should cache the attention QKV consumer gate"
+        );
+        assert!(
+            plan.q8.ffn_gate_up_decode_consumer,
+            "resolved plan should cache the FFN gate/up consumer gate"
         );
         assert!(
             plan.q8.ffn_down_decode_consumer,
@@ -13080,6 +13164,10 @@ mod tests {
             assert!(
                 !plan.q8.attention_qkv_decode_consumer,
                 "{profile} should not enable attention QKV consumer by default"
+            );
+            assert!(
+                !plan.q8.ffn_gate_up_decode_consumer,
+                "{profile} should not enable FFN gate/up consumer by default"
             );
             assert!(
                 !plan.q8.ffn_down_decode_consumer,
@@ -13610,6 +13698,7 @@ mod tests {
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer,
                 attention_qkv_decode_consumer,
+                ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: false,
                 metal: false,
                 metal_retained: false,
@@ -13816,6 +13905,7 @@ mod tests {
                 file_reader_block_dot: false,
                 attention_projection_decode_consumer: false,
                 attention_qkv_decode_consumer: false,
+                ffn_gate_up_decode_consumer: false,
                 ffn_down_decode_consumer: enabled,
                 metal: false,
                 metal_retained: false,
@@ -13824,6 +13914,105 @@ mod tests {
                 hybrid_gpu_percent: 10,
             },
         }
+    }
+
+    fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
+        ResolvedRuntimePlan {
+            linear_accumulation_precision: LinearAccumulationPrecision::F32,
+            q8: Q8RuntimeFlags {
+                block_dot: false,
+                file_reader_block_dot: false,
+                attention_projection_decode_consumer: false,
+                attention_qkv_decode_consumer: false,
+                ffn_gate_up_decode_consumer: enabled,
+                ffn_down_decode_consumer: false,
+                metal: false,
+                metal_retained: false,
+                hybrid_retained: false,
+                hybrid_gpu_rows: None,
+                hybrid_gpu_percent: 10,
+            },
+        }
+    }
+
+    fn runtime_packed_ffn_gate_up_case() -> (CpuTensor, CpuTensor, CpuTensor, GatedFfnActivation) {
+        let rows = 64;
+        let input_width = Q8_0_BLOCK_VALUES * 2;
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let gate_blocks: Vec<Q8_0Block> = (0..rows * blocks_per_row)
+            .map(|block_idx| Q8_0Block {
+                scale: 0.125 + block_idx as f32 * 0.005,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(3).wrapping_add(block_idx as i8)
+                }),
+            })
+            .collect();
+        let up_blocks: Vec<Q8_0Block> = (0..rows * blocks_per_row)
+            .map(|block_idx| Q8_0Block {
+                scale: 0.2 + block_idx as f32 * 0.003,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(7).wrapping_sub(block_idx as i8)
+                }),
+            })
+            .collect();
+        let input = CpuTensor::from_f32(
+            "input",
+            vec![1, input_width],
+            (0..input_width)
+                .map(|idx| (idx as f32 - 8.0) * 0.125)
+                .collect(),
+        )
+        .unwrap();
+        let retained_gate = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_gate",
+            vec![rows, input_width],
+            dequantized_q8_0_rows(&gate_blocks),
+            gate_blocks.clone(),
+        )
+        .unwrap();
+        let retained_up = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_up",
+            vec![rows, input_width],
+            dequantized_q8_0_rows(&up_blocks),
+            up_blocks.clone(),
+        )
+        .unwrap();
+        let expected = gated_ffn_activation_with_plan(
+            &input,
+            &retained_gate,
+            &retained_up,
+            "expected",
+            &ffn_gate_up_consumer_plan(false),
+            false,
+        )
+        .unwrap();
+        let packed_gate = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_gate.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            Q8_0PackedRows4::from_rows(
+                rows,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &gate_blocks,
+            )
+            .unwrap(),
+        );
+        let packed_up = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_up.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            Q8_0PackedRows4::from_rows(
+                rows,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &up_blocks,
+            )
+            .unwrap(),
+        );
+        (input, packed_gate, packed_up, expected)
     }
 
     fn runtime_packed_ffn_down_case() -> (CpuTensor, CpuTensor, CpuTensor) {
@@ -13990,6 +14179,88 @@ mod tests {
             .is_none(),
             "consumer must fail closed when packed rows do not match output width"
         );
+    }
+
+    #[test]
+    fn q8_ffn_gate_up_consumer_matches_runtime_packed_baseline() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_gate, packed_up, expected) = runtime_packed_ffn_gate_up_case();
+
+        let actual = gated_ffn_activation_with_plan(
+            &input,
+            &packed_gate,
+            &packed_up,
+            "actual",
+            &ffn_gate_up_consumer_plan(true),
+            false,
+        )
+        .unwrap();
+
+        assert_slice_close_with_tolerance(&actual.tensor.data, &expected.tensor.data, 5e-4);
+        assert!(packed_gate.q8_0_blocks.is_none());
+        assert!(packed_up.q8_0_blocks.is_none());
+        assert!(matches!(
+            packed_gate.q8_0_runtime_storage.as_ref(),
+            Some(Q8_0RuntimeStorage::PackedRows4(_))
+        ));
+        assert!(matches!(
+            packed_up.q8_0_runtime_storage.as_ref(),
+            Some(Q8_0RuntimeStorage::PackedRows4(_))
+        ));
+    }
+
+    #[test]
+    fn q8_ffn_gate_up_consumer_is_plan_gated_and_requires_runtime_storage() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", "on");
+        let (input, packed_gate, packed_up, _expected) = runtime_packed_ffn_gate_up_case();
+        let mut gate = vec![0.0; 64];
+        let mut up = vec![0.0; 64];
+
+        assert!(
+            try_x86_q8_ffn_gate_up_decode_consumer_path(
+                &input,
+                &packed_gate,
+                &packed_up,
+                &mut gate,
+                &mut up,
+                &ffn_gate_up_consumer_plan(false),
+            )
+            .unwrap()
+            .is_none(),
+            "default-off plan and old owner gate must not enter the FFN gate/up consumer"
+        );
+
+        let retained_like = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_gate",
+            packed_gate.shape.dims.clone(),
+            vec![0.0; packed_gate.shape.element_count().unwrap()],
+            vec![
+                Q8_0Block {
+                    scale: 1.0,
+                    quants: [0; Q8_0_BLOCK_VALUES],
+                };
+                packed_gate.shape.element_count().unwrap() / Q8_0_BLOCK_VALUES
+            ],
+        )
+        .unwrap();
+        assert!(
+            try_x86_q8_ffn_gate_up_decode_consumer_path(
+                &input,
+                &retained_like,
+                &packed_up,
+                &mut gate,
+                &mut up,
+                &ffn_gate_up_consumer_plan(true),
+            )
+            .unwrap()
+            .is_none(),
+            "consumer must require backend-owned runtime-packed storage for both gate and up"
+        );
+
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER");
     }
 
     #[test]
