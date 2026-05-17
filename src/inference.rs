@@ -679,6 +679,7 @@ struct Q8RuntimeFlags {
     ffn_gate_up_packed_rows4_matmul: bool,
     ffn_down_decode_consumer: bool,
     ffn_down_packed_rows4_matmul: bool,
+    ffn_down_single_owner: bool,
     metal: bool,
     metal_retained: bool,
     hybrid_retained: bool,
@@ -737,6 +738,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_down_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
+            ),
+            ffn_down_single_owner: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
             ),
             metal: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8"),
             metal_retained: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED"),
@@ -4728,6 +4732,15 @@ fn linear_for_role_runtime_with_plan(
         )? {
             return Ok(output);
         }
+        if let Some(output) = try_x86_q8_ffn_down_single_owner_path(
+            input,
+            weight,
+            &name,
+            rectangular_role,
+            runtime_plan,
+        )? {
+            return Ok(output);
+        }
         if let Some(output) = try_x86_q8_ffn_down_decode_consumer_path(
             input,
             weight,
@@ -8475,6 +8488,47 @@ fn try_x86_q8_ffn_down_packed_rows4_matmul_path(
     }
 
     q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+}
+
+fn try_x86_q8_ffn_down_single_owner_path(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<CpuTensor>> {
+    if !runtime_plan.q8.ffn_down_single_owner
+        || rectangular_role != "ffn_down"
+        || input.rank() != 2
+        || weight.rank() != 2
+    {
+        return Ok(None);
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+
+    let Some((packed, output_width)) = q8_0_runtime_packed_projection(weight, input_width)? else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8 {
+        return Ok(None);
+    }
+
+    if input.dim(0)? == 1 {
+        let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+        q8_0_packed_rows4_single_input_projection(
+            packed,
+            &quantized_input.blocks,
+            output_width,
+            name,
+        )
+        .map(Some)
+    } else {
+        q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+    }
 }
 
 fn try_x86_q8_ffn_down_decode_consumer_path(
@@ -14029,6 +14083,7 @@ mod tests {
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
+                ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -14818,6 +14873,7 @@ mod tests {
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
+                ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -15349,6 +15405,7 @@ mod tests {
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_down_decode_consumer: enabled,
                 ffn_down_packed_rows4_matmul: false,
+                ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -15374,6 +15431,7 @@ mod tests {
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: enabled,
+                ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -15381,6 +15439,12 @@ mod tests {
                 hybrid_gpu_percent: 10,
             },
         }
+    }
+
+    fn ffn_down_single_owner_plan(enabled: bool) -> ResolvedRuntimePlan {
+        let mut plan = ffn_down_packed_rows4_matmul_plan(false);
+        plan.q8.ffn_down_single_owner = enabled;
+        plan
     }
 
     fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
@@ -15399,6 +15463,7 @@ mod tests {
                 ffn_gate_up_packed_rows4_matmul: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
+                ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -15741,6 +15806,93 @@ mod tests {
             "wrong_role",
             "attention_output",
             &ffn_down_packed_rows4_matmul_plan(true),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn q8_ffn_down_single_owner_matches_decode_and_prefill_owners() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (decode_input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+
+        let actual_decode = try_x86_q8_ffn_down_single_owner_path(
+            &decode_input,
+            &packed_weight,
+            "actual_decode",
+            "ffn_down",
+            &ffn_down_single_owner_plan(true),
+        )
+        .unwrap()
+        .expect("single owner should cover FFN-down decode");
+        let expected_decode = try_x86_q8_ffn_down_decode_consumer_path(
+            &decode_input,
+            &packed_weight,
+            "expected_decode",
+            "ffn_down",
+            &ffn_down_consumer_plan(true),
+        )
+        .unwrap()
+        .expect("decode consumer should cover FFN-down decode");
+        assert_eq!(actual_decode.shape.dims, expected_decode.shape.dims);
+        assert_slice_close_with_tolerance(&actual_decode.data, &expected_decode.data, 5e-4);
+
+        let input_width = packed_weight.dim(0).unwrap();
+        let rows = 3;
+        let prefill_input = CpuTensor::from_f32(
+            "prefill_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| {
+                    ((idx % input_width) as f32 - 9.0) * 0.125 + (idx / input_width) as f32 * 0.0625
+                })
+                .collect(),
+        )
+        .unwrap();
+        let actual_prefill = try_x86_q8_ffn_down_single_owner_path(
+            &prefill_input,
+            &packed_weight,
+            "actual_prefill",
+            "ffn_down",
+            &ffn_down_single_owner_plan(true),
+        )
+        .unwrap()
+        .expect("single owner should cover FFN-down prefill");
+        let expected_prefill = try_x86_q8_ffn_down_packed_rows4_matmul_path(
+            &prefill_input,
+            &packed_weight,
+            "expected_prefill",
+            "ffn_down",
+            &ffn_down_packed_rows4_matmul_plan(true),
+        )
+        .unwrap()
+        .expect("packed rows4 matmul should cover FFN-down prefill");
+        assert_eq!(actual_prefill.shape.dims, expected_prefill.shape.dims);
+        assert_slice_close_with_tolerance(&actual_prefill.data, &expected_prefill.data, 5e-4);
+    }
+
+    #[test]
+    fn q8_ffn_down_single_owner_is_plan_gated_and_role_limited() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+
+        assert!(try_x86_q8_ffn_down_single_owner_path(
+            &input,
+            &packed_weight,
+            "disabled",
+            "ffn_down",
+            &ffn_down_single_owner_plan(false),
+        )
+        .unwrap()
+        .is_none());
+        assert!(try_x86_q8_ffn_down_single_owner_path(
+            &input,
+            &packed_weight,
+            "wrong_role",
+            "attention_output",
+            &ffn_down_single_owner_plan(true),
         )
         .unwrap()
         .is_none());
