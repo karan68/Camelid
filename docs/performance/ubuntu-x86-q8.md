@@ -93,6 +93,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260515T1235Z-x86-ffn-down-runtime.txt`
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer.txt`
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer-tests.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T0320Z-x86-ffndown-consumer-planner.txt`
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note

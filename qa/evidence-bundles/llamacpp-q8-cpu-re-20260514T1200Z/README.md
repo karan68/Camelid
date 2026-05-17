@@ -6,6 +6,16 @@ Scope: Ubuntu x86_64 dense Llama Q8_0 only.
 
 Claim guardrail: this report is the current Q8 reference truth for the Ubuntu x86_64 experiment lane only. It is not Mac, Apple Silicon, Metal, Mixtral, portability, production-throughput, or support-contract evidence. All Camelid x86 Q8 runtime changes described here are default-off developer experiments unless explicitly promoted by separate support evidence.
 
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T03:20Z
+
+- Small technical slice completed ExecutionPlan ownership of the default-off Ubuntu x86 Q8 decode-consumer gate set by adding `CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER` to managed stale-env clearing and the validated experimental-plan off pins.
+- The older `CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER` key remains cleared for compatibility, but the directly usable FFN-down packed runtime path reads the `CONSUMER` gate through `ResolvedRuntimePlan`; this closes the planner hygiene gap without adding a duplicate packed-copy sidecar.
+- The current validated Ubuntu x86 experimental plan still requires explicit `CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2`, preserves safe fallback otherwise, and pins attention QKV/projection, FFN gate/up, FFN down, and output decode-owner experiments to `off` unless a fresh slice explicitly validates a narrower gate.
+- llama.cpp/Camelid grep evidence was refreshed for `q8_0`, `tinyBLAS`, `ggml_vec_dot_q8_0_q8_0`, `repack`, `MUL_MAT`, scheduling, OpenMP/GOMP, AVX2, AVX512, and VNNI in `artifacts/cron-95495a91-20260517T0320Z-x86-ffndown-consumer-planner.txt`.
+- Local validation passed: `cargo fmt --check`, `cargo test -q planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`, `cargo test -q ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib`, `cargo test -q resolved_runtime_plan_captures_q8_env_once --lib`, and `cargo test -q q8_ffn_down_consumer --lib`.
+- Canonical Ubuntu x86_64 validation passed in `<ubuntu-workdir>/camelid-x86-q8-planner-ffndown-consumer-20260517T0320Z` via `ssh -i <operator-key> ubuntu@<validation-host>` using Rust 1.90.0: same fmt and four targeted test commands passed.
+- No throughput/support promotion is claimed from this slice. It is planner/runtime-gate evidence for the default-off Ubuntu x86_64 experiment lane only.
+
 ## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T00:35Z
 
 - Small technical slice hardened ExecutionPlan ownership of the default-off Ubuntu x86 Q8 decode-consumer gates: `CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER`, `CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER`, and `CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER` are now managed alongside the existing x86 repack/kernel/output/FFN-down gates.

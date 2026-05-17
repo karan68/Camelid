@@ -15,6 +15,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
     "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+    "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
     "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
 ];
@@ -345,6 +346,7 @@ fn select_linux_x86_q8_plan(
     );
     env_updates.insert("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", Some("off"));
+    env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", Some("off"));
     reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
@@ -714,6 +716,7 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER",
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+            "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
             "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
         ] {
@@ -940,6 +943,12 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER"),
             Some(&Some("off"))
         );
@@ -959,12 +968,14 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
 
         PlannerEnv::capture().apply(&BTreeMap::new());
 
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER").is_err());
         clear_profile_env();
     }
 
