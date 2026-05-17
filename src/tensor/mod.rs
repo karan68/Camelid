@@ -337,8 +337,9 @@ fn q8_repack_linear_shape(name: &str, shape: &TensorShape) -> Option<(usize, usi
         || name.ends_with(".attn_q.weight")
         || name.ends_with(".attn_k.weight")
         || name.ends_with(".attn_v.weight")
+        || name.ends_with(".attn_output.weight")
     {
-        // Llama FFN and attention Q/K/V descriptors are stored as [input, output],
+        // Llama FFN and attention projection descriptors are stored as [input, output],
         // while Camelid's hot linear path consumes rows as [output, input]. Pack
         // backend-owned runtime storage in output-row order so optimized consumers
         // do not have to fall back to row-major f32 data that runtime-packed tensors
@@ -3030,6 +3031,19 @@ mod tests {
         assert_eq!(packed.rows, 64);
         assert_eq!(packed.blocks_per_row, 1);
         assert_eq!(packed.interleave, super::Q8_0PackedRows4Interleave::I8);
+
+        let Some(super::Q8_0RuntimeStorage::PackedRows4(attn_output_packed)) =
+            super::q8_0_runtime_packed_rows4_for_tensor("blk.0.attn_output.weight", &shape, &bytes)
+                .unwrap()
+        else {
+            panic!("expected x86 attention output Q8_0 runtime-packed rows4 storage");
+        };
+        assert_eq!(attn_output_packed.rows, 64);
+        assert_eq!(attn_output_packed.blocks_per_row, 1);
+        assert_eq!(
+            attn_output_packed.interleave,
+            super::Q8_0PackedRows4Interleave::I8
+        );
 
         std::env::remove_var("CAMELID_X86_Q8_REPACK");
     }

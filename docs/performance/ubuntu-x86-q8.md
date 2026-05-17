@@ -10,7 +10,7 @@ The current goal is production-directional runtime improvement on a narrow Ubunt
 
 - Added and validated default-off AVX2 Q8 acceleration paths in the measured Ubuntu x86 lane.
 - Added packed Q8 runtime storage work for selected dense tensors.
-- Added matrix-level Q8 execution experiments and deeper FFN ownership slices.
+- Kept matrix-level Q8 GEMM/MUL_MAT as an evidence-gated direction while documenting only concrete default-off FFN/attention/output decode slices that have Ubuntu x86_64 validation.
 - Separated cold materialization from warm inference.
 - Documented rejected candidates when they failed parity, wall-clock, or clean-host discipline.
 
@@ -20,7 +20,7 @@ The current goal is production-directional runtime improvement on a narrow Ubunt
 - Cold materialization and warm decode are separate problems.
 - `from_q8_0_bytes` is cold/reload-only on the measured Ubuntu x86 lane.
 - Row-dot micro-optimizations are not enough by themselves.
-- Matrix-level ownership is the current direction.
+- Matrix-level ownership remains a direction, not a support or throughput claim until a fresh Ubuntu x86_64 run proves a concrete default-off path.
 - Retain decisions require parity plus repeated wall-clock evidence on a clean host.
 
 ## Current retained paths
@@ -30,17 +30,18 @@ Only list the paths that are currently evidence-backed and default-off:
 - `CAMELID_X86_Q8_REPACK=on` for the retained Ubuntu x86 runtime-packed lane used in current evidence.
 - AVX2 packed-kernel work in the measured Ubuntu x86 lane where parity and bounded timing evidence support keeping the path under default-off gating.
 - Packed Q8 runtime storage for the dense attention projection family plus dense FFN gate/up/down rows in the measured lane.
-- Default-off decode consumers that directly use backend-owned packed runtime storage for narrow one-row dense projection families, including output, attention QKV/projection, FFN down, and the FFN gate/up activation slice while validation remains opt-in.
-- ExecutionPlan now treats the x86 attention QKV/projection and FFN gate/up decode-consumer flags as managed default-off knobs, so appliance planning clears stale owner experiments instead of inheriting them accidentally.
+- Default-off decode consumers that directly use backend-owned packed runtime storage for narrow one-row dense projection families, including output, attention Q/K/V, attention output, FFN down, and the FFN gate/up activation slice while validation remains opt-in.
+- Default-off packed-rows4 matmul slices that consume backend-owned packed runtime storage for concrete dense projection families currently validated only as planner/runtime-gate experiments: FFN down, multi-row attention Q/K/V, and multi-row attention output.
+- ExecutionPlan now treats the x86 attention Q/K/V, attention-output, output, FFN gate/up/down decode-consumer, packed-rows4 FFN-down matmul, packed-rows4 attention-Q/K/V matmul, and packed-rows4 attention-output matmul flags as managed default-off knobs, so appliance planning clears stale owner experiments instead of inheriting them accidentally.
 
 ## Active experimental direction
 
 Current work is focused on:
 
-- AVX2 scaled row-dot and packed-kernel execution
-- matrix-level Q8 GEMM/MUL_MAT ownership
+- explicit `CAMELID_X86_Q8_KERNEL=avx2` packed-kernel execution
+- matrix-level Q8 GEMM/MUL_MAT ownership only after a concrete default-off flag/path has fresh Ubuntu x86_64 evidence
 - FFN projection optimization, especially deeper `ffn_down` decode ownership and one-quantization FFN gate/up decode consumption
-- attention projection optimization
+- attention projection optimization, including narrow multi-row Q/K/V and attention-output packed-runtime matmul slices only when guarded by fresh Ubuntu x86_64 evidence
 - reducing wrapper/callback overhead in hot inference
 - keeping the default/reference path safe while experimental paths stay opt-in
 
@@ -71,16 +72,14 @@ Contaminated runs are not used as retained evidence.
 
 ## How to reproduce
 
-Use only the currently validated default-off gates for the retained baseline and keep the host clean before running:
+Use only the current reference default-off gates for the retained Ubuntu x86_64 experiment and keep the host clean before running:
 
 ```bash
-CAMELID_X86_Q8_KERNEL=avx2_scaled_rowdot \
 CAMELID_X86_Q8_REPACK=on \
-CAMELID_X86_Q8_REPACK_TENSORS=ffn,attention_projection \
-CAMELID_X86_Q8_GEMM=avx2_tiled \
-CAMELID_X86_Q8_PACKED_TILE16=on \
-CAMELID_X86_Q8_PACKED_TILE16_SERIAL_OWNER=on
+CAMELID_X86_Q8_KERNEL=avx2
 ```
+
+Do not add older sketch flags or matrix-owner placeholders to reproduction commands unless a fresh Ubuntu x86_64 evidence entry proves that exact flag and shape. Narrow decode-consumer/owner flags are separate default-off developer experiments; enable them only when the current evidence report names the exact flag and validation target for that slice.
 
 For bounded warm-request measurement, use the same host, same model, same request shape, repeated runs, parity checks, and paired `perf stat` / `perf record` evidence.
 
@@ -94,6 +93,13 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer.txt`
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260516T0136Z-x86-ffn-gate-up-consumer-tests.txt`
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T0320Z-x86-ffndown-consumer-planner.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T0503Z-x86-attn-output-consumer.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260517T0511Z-doc-claim-guard.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T0655Z-x86-ffndown-packed-rows4-matmul-planner.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260517T0733Z-doc-claim-guard.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T0825Z-x86-attn-output-packed-rows4-matmul.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T1013Z-x86-attn-qkv-packed-rows4-matmul.txt`
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T1148Z-x86-attn-qkv-shared-input-quant.txt`
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note

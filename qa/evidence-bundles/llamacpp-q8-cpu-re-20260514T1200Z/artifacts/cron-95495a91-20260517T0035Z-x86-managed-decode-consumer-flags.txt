@@ -2,7 +2,7 @@
 
 Timestamp: 2026-05-17T00:35Z
 Scope: Ubuntu x86_64 dense Llama Q8_0 only.
-Canonical host check: `ssh -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@35.85.220.175` reported Ubuntu 24.04, x86_64, 16 CPUs, Intel Xeon Platinum 8488C, with AVX2/AVX512/VNNI/AMX CPU flags available.
+Canonical host check: `ssh -i <operator-key> ubuntu@<validation-host>` reported Ubuntu 24.04, x86_64, 16 CPUs, Intel Xeon Platinum 8488C, with AVX2/AVX512/VNNI/AMX CPU flags available.
 
 ## Small technical slice
 

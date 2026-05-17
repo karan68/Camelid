@@ -6,6 +6,92 @@ Scope: Ubuntu x86_64 dense Llama Q8_0 only.
 
 Claim guardrail: this report is the current Q8 reference truth for the Ubuntu x86_64 experiment lane only. It is not Mac, Apple Silicon, Metal, Mixtral, portability, production-throughput, or support-contract evidence. All Camelid x86 Q8 runtime changes described here are default-off developer experiments unless explicitly promoted by separate support evidence.
 
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T11:48Z
+
+- Small technical slice tightened the existing default-off dense attention Q/K/V multi-row packed-runtime matmul path, `CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL`, so `try_x86_q8_attention_qkv_packed_rows4_matmul_path` quantizes the shared multi-row activation input once and reuses those Q8_0 blocks for Q, K, and V projections.
+- Added `q8_0_quantized_matmul_input_rows` plus `q8_0_packed_rows4_matmul_projection_from_quantized`; the existing `q8_0_packed_rows4_matmul_projection` remains the single-projection helper used by attention-output and FFN-down packed rows4 matmul slices.
+- Added exact `blocks_per_row` equality guards across Q/K/V packed runtime storage before sharing quantized input. The path still requires rank-2 input with more than one row, Q8_0 `Q8_0RuntimeStorage::PackedRows4`, I8 interleave, input width divisible by 32, output rows divisible by four, and matching runtime-plan gate. If any guard fails or the flag is unset/off, the executor falls through to the existing safe attention projection paths.
+- This continues to consume backend-owned packed runtime storage only; no duplicate packed-copy sidecar was added, and no throughput/support/default-on promotion is claimed from this unit/planner slice.
+- llama.cpp/Camelid grep evidence was refreshed for `q8_0`, `tinyBLAS`, `ggml_vec_dot_q8_0_q8_0`, `repack`, `MUL_MAT`, scheduling, OpenMP, AVX2, AVX512, and VNNI in `artifacts/cron-95495a91-20260517T1148Z-x86-attn-qkv-shared-input-quant.txt`.
+- Local validation passed: `cargo fmt --all`, `cargo fmt --all -- --check`, `cargo test q8_attention_qkv_packed_rows4_matmul --lib`, `cargo test q8_attention_output_packed_rows4_matmul --lib`, `cargo test q8_ffn_down_packed_rows4_matmul --lib`, `cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`, and `cargo test ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib`.
+- Canonical Ubuntu x86_64 validation passed in `<ubuntu-workdir>/camelid-q8-qkv-shared-input-20260517T1148Z` via `ssh -i <operator-key> ubuntu@<validation-host>` using Rust/Cargo 1.95.0: `cargo fmt --all -- --check`, `cargo test q8_attention_qkv_packed_rows4_matmul --lib`, `cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`, and `cargo test ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib` passed.
+
+## CAMELID DOCS UBUNTU X86 Q8 — cron 5e4b0b83, 2026-05-17T11:43Z
+
+- Guarded the current docs/report surface after the attention Q/K/V packed-rows4 matmul slice without widening README support matrix, support-contract, API/frontend, platform, or performance claims.
+- Confirmed `docs/CONFIGURATION.md` names `CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL` only as a default-off Ubuntu x86_64 developer experiment for dense attention Q/K/V multi-row packed-runtime matmul with exact fallback guards.
+- Confirmed `docs/performance/ubuntu-x86-q8.md` keeps reproduction scoped to the current reference flags (`CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2`) and treats matrix-level Q8 GEMM/MUL_MAT as evidence-gated default-off work only.
+- Scrubbed raw operator SSH key path / host IP details in backend evidence artifacts to `<operator-key>`, `<validation-host>`, and `<ubuntu-workdir>` placeholders.
+- No Mac evidence, Apple Silicon label, Metal claim, Mixtral claim, production-throughput claim, portability claim, or default-on acceleration claim was added.
+- Audit artifact: `artifacts/cron-5e4b0b83-20260517T1143Z-doc-claim-guard.txt`.
+
+## CAMELID DOCS UBUNTU X86 Q8 — cron 5e4b0b83, 2026-05-17T09:43Z
+
+- Guarded the current public docs/report surface after the attention-output packed-rows4 matmul slice without widening support-contract/API/frontend/performance claims.
+- Narrowed only the README Ubuntu x86 Q8 acceleration subsection so it describes selected default-off experiments, explicit `CAMELID_X86_Q8_KERNEL=avx2` packed-kernel work, concrete evidence-gated matrix-level slices, and no production-throughput/default-on/platform claim.
+- Confirmed `docs/CONFIGURATION.md` names `CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL` only as a default-off Ubuntu x86_64 developer experiment scoped to dense attention-output multi-row packed-runtime matmul with fallback guards.
+- Confirmed `docs/performance/ubuntu-x86-q8.md` keeps reproduction scoped to the current reference flags (`CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2`) and keeps matrix-level Q8 GEMM/MUL_MAT evidence-gated.
+- Did not change the support matrix rows, API/frontend readiness language, Mac/Apple Silicon/Metal notes, or Mixtral language.
+- Audit artifact: `artifacts/cron-5e4b0b83-20260517T0943Z-doc-claim-guard.txt`.
+
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T08:25Z
+
+- Small technical slice added a directly usable multi-row dense attention-output packed-runtime matmul consumer for backend-owned Q8_0 `PackedRows4` storage, gated by new default-off flag `CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL`.
+- The path is intentionally narrow: dense Llama Q8_0 `blk.*.attn_output.weight`, rank-2 input with more than one row, `Q8_0RuntimeStorage::PackedRows4`, I8 interleave, input width divisible by 32, `rectangular_role == "linear"`, and exact packed projection shape guards. If any guard fails or the flag is unset/off, `linear_for_role_runtime_with_plan` falls through to existing guarded paths and the safe linear fallback.
+- The executor reuses the backend-owned packed rows4 storage and shared dot path; it does not add a duplicate packed-copy sidecar.
+- ExecutionPlan now manages and pins `CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL=off` in the validated Ubuntu x86 experimental plan, and stale planner env clearing covers this gate alongside the other x86 Q8 consumer/matmul flags.
+- llama.cpp/Camelid grep evidence was refreshed for `q8_0`, `tinyBLAS`, `ggml_vec_dot_q8_0_q8_0`, `repack`, `MUL_MAT`, scheduling, OpenMP, AVX2, AVX512, and VNNI in `artifacts/cron-95495a91-20260517T0825Z-x86-attn-output-packed-rows4-matmul.txt`.
+- Local validation passed: `cargo fmt --all`, `cargo test q8_attention_output_packed_rows4_matmul --lib`, `cargo test resolved_runtime_plan_captures_q8_env_once --lib`, `cargo test runtime_profile_defaults_keep_experimental_q8_gates_closed --lib`, `cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`, and `cargo test ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib`.
+- Canonical Ubuntu x86_64 validation passed in `<ubuntu-workdir>/camelid-q8-slice-20260517T0825Z` via `ssh -i <operator-key> ubuntu@<validation-host>` using Rust/Cargo 1.95.0: `cargo fmt --all -- --check`, `cargo test q8_attention_output_packed_rows4_matmul --lib`, `cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`, and `cargo test ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib` passed.
+- No throughput/support promotion is claimed from this slice. It is runtime-gate/backend-owned-storage evidence for the default-off Ubuntu x86_64 experiment lane only.
+
+## CAMELID DOCS UBUNTU X86 Q8 — cron 5e4b0b83, 2026-05-17T07:33Z
+
+- Guarded the current docs/report surface after the packed-rows4 FFN-down matmul planner slice without widening README/support-contract/API/frontend/performance claims.
+- Confirmed `docs/CONFIGURATION.md` names `CAMELID_X86_Q8_PACKED_ROWS4_MATMUL` only as a default-off Ubuntu x86_64 developer experiment scoped to dense FFN-down multi-row packed-runtime matmul with fallback guards.
+- Confirmed `docs/performance/ubuntu-x86-q8.md` keeps reproduction scoped to the current reference flags (`CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2`) and keeps matrix-level Q8 GEMM/MUL_MAT evidence-gated.
+- Did not change the project README, support contract, API/frontend surfaces, Mac/Apple Silicon/Metal notes, or Mixtral language.
+- Audit artifact: `artifacts/cron-5e4b0b83-20260517T0733Z-doc-claim-guard.txt`.
+
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T06:55Z
+
+- Small technical slice completed planner/docs ownership for `CAMELID_X86_Q8_PACKED_ROWS4_MATMUL`, the default-off dense FFN-down multi-row packed-runtime matmul experiment.
+- The existing runtime path remains directly usable only for `ffn_down` with backend-owned `Q8_0RuntimeStorage::PackedRows4`, I8 interleave, Q8_0 weights, matching input/output dimensions, 32-wide input blocks, and output rows divisible by four; otherwise it falls back to the safe linear path.
+- `ExecutionPlan` now manages stale-env clearing and pins `CAMELID_X86_Q8_PACKED_ROWS4_MATMUL=off` in the validated Ubuntu x86 experimental plan, matching the default-off gate policy for the decode-consumer family.
+- Refreshed llama.cpp evidence confirms dense Ubuntu x86_64 Q8_0 should keep moving toward directly usable backend-owned packed/runtime storage or x86-specific matmul: llama.cpp's CPU_REPACK Q8_0 selection has NEON/RISC-V branches but no AVX2/AVX512 x86 branch to mirror wholesale.
+- Local validation passed: `cargo fmt --all`, `cargo test q8_ffn_down_packed_rows4_matmul --lib`, `cargo test ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib`, and `cargo test planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`.
+- Canonical Ubuntu x86_64 validation passed in `<ubuntu-workdir>/camelid-x86-q8-packed-rows4-matmul-20260517T0655Z` via `ssh -i <operator-key> ubuntu@<validation-host>` using Rust/Cargo 1.95.0: `cargo fmt --all -- --check` and the same three targeted test commands passed.
+- Artifact: `artifacts/cron-95495a91-20260517T0655Z-x86-ffndown-packed-rows4-matmul-planner.txt`.
+- No throughput/support promotion is claimed from this slice. It is planner/runtime-gate evidence for the default-off Ubuntu x86_64 experiment lane only.
+
+## CAMELID DOCS UBUNTU X86 Q8 — cron 5e4b0b83, 2026-05-17T05:11Z
+
+- Guarded the current docs/report surface after the attention-output consumer slice without widening README/support-contract/API/frontend/performance claims.
+- Added the new `CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER` only as a default-off Ubuntu x86_64 developer experiment in `docs/CONFIGURATION.md`, backed by the 2026-05-17T05:03Z evidence entry.
+- Tightened `docs/performance/ubuntu-x86-q8.md` wording to separate attention Q/K/V from attention-output decode consumers and keep all decode-consumer paths opt-in.
+- Scrubbed the latest report entry to use `<ubuntu-workdir>`, `<operator-key>`, and `<validation-host>` placeholders instead of raw operator SSH/IP details.
+- Removed a placeholder matrix-owner flag from the recommended future slice wording; matrix-level Q8 GEMM/MUL_MAT remains directional until a concrete default-off Ubuntu x86_64 path has fresh evidence.
+- Audit artifact: `artifacts/cron-5e4b0b83-20260517T0511Z-doc-claim-guard.txt`.
+
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T05:03Z
+
+- Small technical slice added a directly usable one-row dense attention-output decode consumer for backend-owned packed Q8_0 runtime storage, gated by new default-off flag `CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER`.
+- The path is intentionally narrow: dense Llama Q8_0 `blk.*.attn_output.weight`, one input row, `Q8_0RuntimeStorage::PackedRows4`, I8 interleave, input width divisible by 32, and `rectangular_role == "linear"`. If any guard fails or the flag is unset/off, `linear_for_role_runtime_with_plan` falls back to the existing safe linear path.
+- Runtime storage ownership was extended by packing `*.attn_output.weight` in directly consumable output-row order when `CAMELID_X86_Q8_REPACK=on`; no duplicate packed-copy sidecar was added.
+- ExecutionPlan now manages and pins `CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER=off` in the validated Ubuntu x86 experimental plan, alongside the other default-off Q8 decode-consumer flags.
+- llama.cpp/Camelid grep evidence was refreshed for `q8_0`, `tinyBLAS`, `ggml_vec_dot_q8_0_q8_0`, `repack`, `MUL_MAT`, scheduling, OpenMP, AVX2, AVX512, and VNNI in `artifacts/cron-95495a91-20260517T0503Z-x86-attn-output-consumer.txt`.
+- Local validation passed: `cargo fmt --all`, `cargo test q8_attention_output_consumer --lib`, `cargo test q8_x86_repack --lib`, `cargo test resolved_runtime_plan_captures_q8_env_once --lib`, `cargo test runtime_profile_defaults_keep_experimental_q8_gates_closed --lib`, and `cargo test ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib`.
+- Canonical Ubuntu x86_64 validation passed in `<ubuntu-workdir>/camelid-x86-q8-attn-output-consumer-20260517T0503Z` via `ssh -i <operator-key> ubuntu@<validation-host>` using Rust/Cargo 1.95.0: `cargo fmt --all -- --check` and the same five targeted test commands passed.
+- No throughput/support promotion is claimed from this slice. It is runtime-gate/backend-owned-storage evidence for the default-off Ubuntu x86_64 experiment lane only.
+
+## CAMELID DOCS UBUNTU X86 Q8 — cron 5e4b0b83, 2026-05-17T03:36Z
+
+- Guarded `docs/performance/ubuntu-x86-q8.md` again against over-reading matrix-level Q8 GEMM/MUL_MAT as implemented owner/performance/support evidence.
+- Kept the reproduction block scoped to only the current reference default-off Ubuntu x86_64 experiment gates: `CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2`.
+- Clarified that matrix-level Q8 GEMM/MUL_MAT remains evidence-gated directional work until a fresh Ubuntu x86_64 slice proves a concrete default-off flag/path.
+- Did not change the project README, support contract, API/frontend surfaces, Mac/Apple Silicon/Metal notes, or Mixtral language.
+- Audit artifact: `artifacts/cron-5e4b0b83-20260517T0336Z-doc-claim-guard.txt`.
+
 ## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T03:20Z
 
 - Small technical slice completed ExecutionPlan ownership of the default-off Ubuntu x86 Q8 decode-consumer gate set by adding `CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER` to managed stale-env clearing and the validated experimental-plan off pins.
@@ -15,6 +101,14 @@ Claim guardrail: this report is the current Q8 reference truth for the Ubuntu x8
 - Local validation passed: `cargo fmt --check`, `cargo test -q planner_env_apply_clears_stale_x86_q8_decode_consumer_flags --lib`, `cargo test -q ubuntu_experimental_validated_gates_select_rust_avx2_q8_path --lib`, `cargo test -q resolved_runtime_plan_captures_q8_env_once --lib`, and `cargo test -q q8_ffn_down_consumer --lib`.
 - Canonical Ubuntu x86_64 validation passed in `<ubuntu-workdir>/camelid-x86-q8-planner-ffndown-consumer-20260517T0320Z` via `ssh -i <operator-key> ubuntu@<validation-host>` using Rust 1.90.0: same fmt and four targeted test commands passed.
 - No throughput/support promotion is claimed from this slice. It is planner/runtime-gate evidence for the default-off Ubuntu x86_64 experiment lane only.
+
+## CAMELID DOCS UBUNTU X86 Q8 — cron 5e4b0b83, 2026-05-17T00:43Z
+
+- Guarded docs/report wording against unsupported Ubuntu x86 Q8 claims without changing the project README, support contract, API/frontend surfaces, Mac/Apple Silicon/Metal notes, or Mixtral language.
+- Corrected `docs/performance/ubuntu-x86-q8.md` reproduction wording to use only the current reference default-off experiment gate shape: `CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2`.
+- Removed stale/non-current sketch flags from that reproduction command (`CAMELID_X86_Q8_REPACK_TENSORS`, `CAMELID_X86_Q8_GEMM`, `CAMELID_X86_Q8_PACKED_TILE16`, `CAMELID_X86_Q8_PACKED_TILE16_SERIAL_OWNER`, and `CAMELID_X86_Q8_KERNEL=avx2_scaled_rowdot`) because they are not the current Q8 reference truth for this lane.
+- Kept the language scoped to the Ubuntu x86_64 dense Llama Q8_0 experiment: default-off developer flags only, safe fallback preserved, no Mac evidence, no Apple Silicon labels, no Metal, no Mixtral, no production-throughput or support-contract promotion.
+- Audit artifact: `artifacts/cron-5e4b0b83-20260517T0043Z-doc-claim-guard.txt`.
 
 ## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T00:35Z
 
@@ -222,6 +316,7 @@ Implemented in `src/tensor/mod.rs`, `src/inference.rs`, `src/execution_plan.rs`,
 - FFN gate/up/down descriptor shapes are packed in runtime output-row order so `linear_for_role_runtime` consumes the backend-owned packed storage directly.
 - `CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER=on` is a second default-off experiment gate for decode-time `ffn_down` to consume `Q8_0RuntimeStorage::PackedRows4` directly through `try_x86_q8_ffn_down_decode_owner_path`; it falls back unless the tensor/shape/interleave guards match exactly.
 - `CAMELID_X86_Q8_OUTPUT_DECODE_OWNER=on` is a default-off experiment gate for one-row decode `output.weight` to consume `Q8_0RuntimeStorage::PackedRows4` directly through `try_x86_q8_output_decode_owner_path`; it falls back unless the tensor/shape/interleave guards match exactly.
+- `CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL=on` is a default-off Ubuntu x86_64 experiment gate for multi-row dense attention Q/K/V to consume backend-owned `Q8_0RuntimeStorage::PackedRows4` through `try_x86_q8_attention_qkv_packed_rows4_matmul_path`; it falls back unless all three Q/K/V weights are runtime-packed Q8_0, dimensions match, row count is greater than one, and packed interleave guards match exactly.
 - `x86_q8_kernel_avx2_enabled()` reads `CAMELID_X86_Q8_KERNEL` and accepts `avx2/on/1/true` (case variants included).
 - `q8_0_i8_block_avx2()` and `q8_0_packed_4x8_block_avx2()` are `#[target_feature(enable = "avx2")]` and default-off behind both the env gate and `std::arch::is_x86_feature_detected!("avx2")`.
 - Existing path fallback is preserved when the env gates are absent/off or AVX2 is not detected.
@@ -233,6 +328,7 @@ Validation:
 - Ubuntu x86_64 release build pass: `artifacts/camelid-x86-repack-build.txt`
 - Same-host microbench parity: all retained-block Camelid modes had identical `dot_checksum = -0.05126936`.
 - Same-host API smoke parity: baseline and `CAMELID_X86_Q8_REPACK=on CAMELID_X86_Q8_KERNEL=avx2` both emitted first-token text `Here` for the measured Ubuntu x86_64 prompt; timings are in `benchmarks/unique-chat-*.json`. Those timings cover the earlier measured gate/up runtime-repacked slice and are not evidence for FFN-down throughput.
+- Ubuntu x86_64 attention Q/K/V packed-rows4 matmul test pass: `artifacts/cron-95495a91-20260517T1013Z-x86-attn-qkv-packed-rows4-matmul.txt`; this is a unit/planner evidence slice only and does not claim throughput improvement.
 - Non-Ubuntu test gates are not claimed here. The Ubuntu x86_64 slice compiled and passed in `/tmp/camelid-ubuntu-x86-q8-20260514T2221Z` on the canonical host.
 
 This slice intentionally avoids a performance-mode row-major+packed duplicate for the selected runtime-packed tensors. Existing opt-in debug/parity sidecars remain separate gates.
@@ -247,7 +343,7 @@ This slice intentionally avoids a performance-mode row-major+packed duplicate fo
 | Prove actual hot symbols | PASS | `artifacts/perf-bench-pp-symbols.txt` |
 | Benchmark llama.cpp same host | PASS | `benchmarks/llama-bench-t16-p128-n16.json`, `benchmarks/llama-bench-t1-p128-n16.json` |
 | Benchmark Camelid baseline/default-parallel/parallel-off | PASS (microbench) | `benchmarks/baseline.json`, `parallel_on.json`, `parallel_off.json` |
-| Implement bounded default-off x86 slice | PASS | `src/tensor/mod.rs`, `src/inference.rs`, `src/execution_plan.rs`, `docs/CONFIGURATION.md`, `tests/tensor_store.rs`; env `CAMELID_X86_Q8_REPACK=on`, `CAMELID_X86_Q8_KERNEL=avx2`, `CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER=on`, `CAMELID_X86_Q8_OUTPUT_DECODE_OWNER=on`; follow-on attention-family loader evidence in `artifacts/cron-95495a91-20260515T1108Z-x86-attn-family.txt`; FFN-down runtime-storage evidence in `artifacts/cron-95495a91-20260515T1235Z-x86-ffn-down-runtime.txt`; default-off FFN-down decode-owner evidence in `artifacts/cron-95495a91-20260515T1759Z-x86-ffn-down-decode-owner-tests.txt`; default-off output decode-owner evidence in `artifacts/cron-95495a91-20260515T1933Z-x86-output-decode-owner-tests.txt` |
+| Implement bounded default-off x86 slice | PASS | `src/tensor/mod.rs`, `src/inference.rs`, `src/execution_plan.rs`, `docs/CONFIGURATION.md`, `tests/tensor_store.rs`; env `CAMELID_X86_Q8_REPACK=on`, `CAMELID_X86_Q8_KERNEL=avx2`, `CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER=on`, `CAMELID_X86_Q8_OUTPUT_DECODE_OWNER=on`, `CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL=on`; follow-on attention-family loader evidence in `artifacts/cron-95495a91-20260515T1108Z-x86-attn-family.txt`; FFN-down runtime-storage evidence in `artifacts/cron-95495a91-20260515T1235Z-x86-ffn-down-runtime.txt`; default-off FFN-down decode-owner evidence in `artifacts/cron-95495a91-20260515T1759Z-x86-ffn-down-decode-owner-tests.txt`; default-off output decode-owner evidence in `artifacts/cron-95495a91-20260515T1933Z-x86-output-decode-owner-tests.txt`; default-off attention Q/K/V packed-rows4 matmul evidence in `artifacts/cron-95495a91-20260517T1013Z-x86-attn-qkv-packed-rows4-matmul.txt` |
 | Parity test on Ubuntu x86_64 | PASS | `artifacts/camelid-x86-repack-tests.txt`; microbench checksum parity; API first token `Here` in both JSON files |
 | Demonstrate performance movement from bounded measured slice | PASS (bounded smoke) | `benchmarks/unique-chat-baseline-1tok.json` vs `unique-chat-x86-repack-avx2-1tok.json`; gate/up timings and total first-token wall time reduced in the one-request Ubuntu x86_64 API smoke; no FFN-down, production-throughput, portability, or support-contract claim |
 | Full end-to-end Camelid API vs llama.cpp API | BLOCKED / partial | llama.cpp-vs-Camelid API harness did not complete promptly; this bundle has llama.cpp bench plus Camelid default-vs-repack API smoke, not API equivalence vs llama.cpp |
@@ -257,6 +353,6 @@ This slice intentionally avoids a performance-mode row-major+packed duplicate fo
 Continue toward the actual winning llama.cpp architecture without widening support claims:
 
 1. Keep widening the default-off x86 runtime-packed path only with Ubuntu x86 parity/bench evidence per tensor family; FFN down now has loader/runtime-storage coverage but still needs performance measurement.
-2. Add a default-off x86 Q8_0 tiled matmul/GEMM path, e.g. `CAMELID_X86_Q8_GEMM=avx2`, then consider `avx512_vnni` only after rebuilding/benchmarking llama.cpp with VNNI enabled for comparison.
+2. Add any future tiled Q8_0 matmul/GEMM path only under a concrete, newly validated default-off Ubuntu x86_64 experiment gate; do not cite a placeholder matrix-owner flag as current evidence. Consider `avx512_vnni` only after rebuilding/benchmarking llama.cpp with VNNI enabled for comparison.
 3. Tile over multiple output rows and input blocks, quantize the f32 activation row once to Q8_0, and amortize env/dispatch outside the innermost 32-byte block loop.
 4. Add perf evidence on Ubuntu x86 before claiming broader speedup: hot symbols should move from scalar Rust loops toward a tiled x86 kernel, with unchanged checksums/output tokens.
