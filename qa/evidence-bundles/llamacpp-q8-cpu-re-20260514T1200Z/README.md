@@ -6,6 +6,14 @@ Scope: Ubuntu x86_64 dense Llama Q8_0 only.
 
 Claim guardrail: this report is the current Q8 reference truth for the Ubuntu x86_64 experiment lane only. It is not Mac, Apple Silicon, Metal, Mixtral, portability, production-throughput, or support-contract evidence. All Camelid x86 Q8 runtime changes described here are default-off developer experiments unless explicitly promoted by separate support evidence.
 
+## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T13:59Z
+
+- Small technical slice added `CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL`, a default-off Ubuntu x86_64 dense Llama Q8_0 multi-row FFN gate/up packed-runtime matmul consumer.
+- The path uses backend-owned `Q8_0RuntimeStorage::PackedRows4` for `blk.*.ffn_{gate,up}.weight`, quantizes the shared activation rows once with `q8_0_quantized_matmul_input_rows`, reuses those input Q8_0 blocks for both projections through `q8_0_packed_rows4_matmul_projection_from_quantized`, then applies the existing gated activation order.
+- Fallback stays closed unless the resolved runtime plan enables the gate, the input is rank-2 prefill, Q8_0 block aligned, both packed tensors are I8 `PackedRows4`, dimensions and row grouping agree, and both output widths match.
+- No duplicate packed-copy sidecar was introduced; the slice continues the backend-owned runtime-storage design.
+- Validation artifact: `artifacts/cron-95495a91-20260517T1359Z-x86-ffn-gate-up-packed-rows4-matmul.txt`.
+
 ## CAMELID BACKEND ENGINEER UBUNTU X86 Q8 — cron 95495a91, 2026-05-17T11:48Z
 
 - Small technical slice tightened the existing default-off dense attention Q/K/V multi-row packed-runtime matmul path, `CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL`, so `try_x86_q8_attention_qkv_packed_rows4_matmul_path` quantizes the shared multi-row activation input once and reuses those Q8_0 blocks for Q, K, and V projections.

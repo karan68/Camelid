@@ -18,6 +18,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
     "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+    "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
     "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
@@ -362,6 +363,10 @@ fn select_linux_x86_q8_plan(
         Some("off"),
     );
     env_updates.insert("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", Some("off"));
+    env_updates.insert(
+        "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
+        Some("off"),
+    );
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", Some("off"));
@@ -736,6 +741,7 @@ mod tests {
             "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER",
             "CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+            "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
             "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
             "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
@@ -982,6 +988,12 @@ mod tests {
         assert_eq!(
             outcome
                 .env_updates
+                .get("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL"),
+            Some(&Some("off"))
+        );
+        assert_eq!(
+            outcome
+                .env_updates
                 .get("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER"),
             Some(&Some("off"))
         );
@@ -1016,6 +1028,7 @@ mod tests {
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
+        env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
         env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
         env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
 
@@ -1027,6 +1040,7 @@ mod tests {
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER").is_err());
+        assert!(env::var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL").is_err());
         assert!(env::var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER").is_err());
         assert!(env::var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL").is_err());
         clear_profile_env();
