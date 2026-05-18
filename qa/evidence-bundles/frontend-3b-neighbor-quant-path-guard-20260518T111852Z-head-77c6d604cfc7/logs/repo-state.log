@@ -1,7 +1,7 @@
 timestamp_utc=20260518T111852Z
 head=77c6d604cfc77c114d2e339b84a1d263d0838a14
 branch=ubuntu-x86-q8-f23-plus-qkv-consumers
-repo=/Users/timtoole/.openclaw/workspace/projects/Camelid
+repo=<local-checkout>
 dirty_status_begin:
  M STATUS.md
  M docs/CONFIGURATION.md

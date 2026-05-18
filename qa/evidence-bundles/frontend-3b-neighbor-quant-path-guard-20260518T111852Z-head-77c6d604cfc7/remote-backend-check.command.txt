@@ -1,4 +1,4 @@
-ssh -i /Users/timtoole/Documents/cert/ubuntu.pem -o BatchMode=yes -o ConnectTimeout=8 ubuntu@16.146.143.184 'set -euo pipefail
+ssh <canonical-ubuntu-host> 'set -euo pipefail
 printf "timestamp_utc="; date -u +%Y%m%dT%H%M%SZ
 printf "hostname="; hostname
 printf "%s\n" "---HEALTH---"

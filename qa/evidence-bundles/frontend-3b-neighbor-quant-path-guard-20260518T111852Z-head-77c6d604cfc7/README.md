@@ -5,7 +5,7 @@ CAMELID SLICE:
 - Domain terms used: support contract, exact row, tracer bullet, evidence bundle, retained slice, parity envelope.
 - Feedback loop: frontend model-state smoke, SSR integration smoke, UI regression smoke, production build, source inspection, canonical Ubuntu backend probe.
 - Files changed: frontend/src/lib/capabilities.js; frontend/scripts/model-state-smoke.mjs; frontend/scripts/frontend-integration-smoke.mjs.
-- Gate/env: local macOS frontend Node/Vite; canonical Ubuntu SSH probe to 16.146.143.184.
+- Gate/env: local macOS frontend Node/Vite; canonical Ubuntu SSH probe to <canonical-ubuntu-host>.
 - Baseline: 3B WebUI exact-row readiness already required runtime loaded_now/generation_ready and supported /api/capabilities row, but quant inference could read Q8_0 from a canonical browser row id before reading a loaded GGUF path that named a neighboring quant.
 - Results: local frontend gates pass; source inspection shows artifact-path quant precedence, GGUF-style mismatch copy, and new 3B Q4_0-path support-gated chat regression coverage.
 - Retain/reject: retain frontend guard; reject live backend/API green claim if remote probe is not fully green (see remote log/status below).
