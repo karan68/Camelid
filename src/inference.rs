@@ -677,6 +677,7 @@ struct Q8RuntimeFlags {
     output_packed_rows4_matmul: bool,
     ffn_gate_up_decode_consumer: bool,
     ffn_gate_up_packed_rows4_matmul: bool,
+    ffn_gate_up_single_owner: bool,
     ffn_down_decode_consumer: bool,
     ffn_down_packed_rows4_matmul: bool,
     ffn_down_single_owner: bool,
@@ -732,6 +733,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
+            ),
+            ffn_gate_up_single_owner: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER",
             ),
             ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
@@ -6119,6 +6123,7 @@ fn gated_ffn_activation_with_plan(
     runtime_plan: &ResolvedRuntimePlan,
     collect_diagnostics: bool,
 ) -> Result<GatedFfnActivation> {
+    let name = name.into();
     let rows = input.dim(0)?;
     if input.rank() != 2 || rows != 1 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -6133,6 +6138,18 @@ fn gated_ffn_activation_with_plan(
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "gated FFN gate/up width mismatch: gate output {gate_width}, up output {up_width}"
         )));
+    }
+
+    if !collect_diagnostics {
+        if let Some(activated) = try_x86_q8_ffn_gate_up_single_owner_path(
+            input,
+            gate_weight,
+            up_weight,
+            &name,
+            runtime_plan,
+        )? {
+            return Ok(activated);
+        }
     }
 
     let input_row = &input.data[..input_width];
@@ -6374,6 +6391,15 @@ fn gated_ffn_activation_batch(
     }
 
     let runtime_plan = ResolvedRuntimePlan::from_env()?;
+    if let Some(activated) = try_x86_q8_ffn_gate_up_single_owner_path(
+        input,
+        gate_weight,
+        up_weight,
+        &name,
+        &runtime_plan,
+    )? {
+        return Ok(activated);
+    }
     if let Some(activated) = try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
         input,
         gate_weight,
@@ -6423,6 +6449,82 @@ fn gated_ffn_activation_batch(
         up_diagnostic: None,
         activation_diagnostic: None,
     })
+}
+
+fn try_x86_q8_ffn_gate_up_single_owner_path(
+    input: &CpuTensor,
+    gate_weight: &CpuTensor,
+    up_weight: &CpuTensor,
+    name: impl Into<String>,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<GatedFfnActivation>> {
+    if !runtime_plan.q8.ffn_gate_up_single_owner || input.rank() != 2 {
+        return Ok(None);
+    }
+    let name = name.into();
+    let rows = input.dim(0)?;
+    if rows == 0 {
+        return Ok(None);
+    }
+
+    if rows > 1 {
+        let mut matmul_plan = *runtime_plan;
+        matmul_plan.q8.ffn_gate_up_packed_rows4_matmul = true;
+        return try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
+            input,
+            gate_weight,
+            up_weight,
+            &name,
+            &matmul_plan,
+        );
+    }
+
+    let input_width = input.dim(1)?;
+    let gate_width = linear_output_width(input, gate_weight, "ffn gate")?;
+    let up_width = linear_output_width(input, up_weight, "ffn up")?;
+    if gate_width != up_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "gated FFN gate/up width mismatch: gate output {gate_width}, up output {up_width}"
+        )));
+    }
+
+    let mut gate = vec![0.0; gate_width];
+    let mut up = vec![0.0; up_width];
+    let mut decode_plan = *runtime_plan;
+    decode_plan.q8.ffn_gate_up_decode_consumer = true;
+    let Some((gate_elapsed, up_elapsed)) = try_x86_q8_ffn_gate_up_decode_consumer_path(
+        input,
+        gate_weight,
+        up_weight,
+        &mut gate,
+        &mut up,
+        &decode_plan,
+    )?
+    else {
+        let _ = input_width;
+        return Ok(None);
+    };
+
+    let order = diagnostic_ffn_gate_up_order()?;
+    let activation_started = Instant::now();
+    for (gate_value, up_value) in gate.iter_mut().zip(up) {
+        *gate_value = match order {
+            FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
+            FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
+        };
+    }
+
+    Ok(Some(GatedFfnActivation {
+        tensor: CpuTensor::from_f32(name, vec![1, gate_width], gate)?,
+        gate: gate_elapsed,
+        up: up_elapsed,
+        activation: activation_started.elapsed().as_micros(),
+        gate_stats: None,
+        up_stats: None,
+        gate_diagnostic: None,
+        up_diagnostic: None,
+        activation_diagnostic: None,
+    }))
 }
 
 fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
@@ -14081,6 +14183,7 @@ mod tests {
                 output_packed_rows4_matmul: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
+                ffn_gate_up_single_owner: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_single_owner: false,
@@ -14183,6 +14286,7 @@ mod tests {
         std::env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
         std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "true");
         std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
+        std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
         std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
         std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", "on");
         std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
@@ -14204,6 +14308,7 @@ mod tests {
         assert!(plan.q8.output_packed_rows4_matmul);
         assert!(plan.q8.ffn_gate_up_decode_consumer);
         assert!(plan.q8.ffn_gate_up_packed_rows4_matmul);
+        assert!(plan.q8.ffn_gate_up_single_owner);
         assert!(plan.q8.ffn_down_decode_consumer);
         assert!(plan.q8.ffn_down_packed_rows4_matmul);
         std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
@@ -14214,6 +14319,7 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL");
         std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
         std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
         std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL");
         assert!(
@@ -14247,6 +14353,10 @@ mod tests {
         assert!(
             plan.q8.ffn_gate_up_packed_rows4_matmul,
             "resolved plan should cache the FFN gate/up packed-rows4 matmul gate"
+        );
+        assert!(
+            plan.q8.ffn_gate_up_single_owner,
+            "resolved plan should cache the FFN gate/up single-owner gate"
         );
         assert!(
             plan.q8.ffn_down_decode_consumer,
@@ -14307,6 +14417,10 @@ mod tests {
             assert!(
                 !plan.q8.ffn_gate_up_packed_rows4_matmul,
                 "{profile} should not enable FFN gate/up packed-rows4 matmul by default"
+            );
+            assert!(
+                !plan.q8.ffn_gate_up_single_owner,
+                "{profile} should not enable FFN gate/up single owner by default"
             );
             assert!(
                 !plan.q8.ffn_down_decode_consumer,
@@ -14871,6 +14985,7 @@ mod tests {
                 output_packed_rows4_matmul: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
+                ffn_gate_up_single_owner: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_single_owner: false,
@@ -15403,6 +15518,7 @@ mod tests {
                 output_packed_rows4_matmul: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
+                ffn_gate_up_single_owner: false,
                 ffn_down_decode_consumer: enabled,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_single_owner: false,
@@ -15429,6 +15545,7 @@ mod tests {
                 output_packed_rows4_matmul: false,
                 ffn_gate_up_decode_consumer: false,
                 ffn_gate_up_packed_rows4_matmul: false,
+                ffn_gate_up_single_owner: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: enabled,
                 ffn_down_single_owner: false,
@@ -15461,6 +15578,7 @@ mod tests {
                 output_packed_rows4_matmul: false,
                 ffn_gate_up_decode_consumer: enabled,
                 ffn_gate_up_packed_rows4_matmul: false,
+                ffn_gate_up_single_owner: false,
                 ffn_down_decode_consumer: false,
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_single_owner: false,
@@ -15477,6 +15595,12 @@ mod tests {
     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
         let mut plan = ffn_gate_up_consumer_plan(false);
         plan.q8.ffn_gate_up_packed_rows4_matmul = enabled;
+        plan
+    }
+
+    fn ffn_gate_up_single_owner_plan(enabled: bool) -> ResolvedRuntimePlan {
+        let mut plan = ffn_gate_up_consumer_plan(false);
+        plan.q8.ffn_gate_up_single_owner = enabled;
         plan
     }
 
@@ -16081,6 +16205,106 @@ mod tests {
             &dense_up,
             "dense_up",
             &ffn_gate_up_packed_rows4_matmul_plan(true),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn q8_ffn_gate_up_single_owner_matches_decode_and_prefill_owners() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (decode_input, packed_gate, packed_up, expected_decode) =
+            runtime_packed_ffn_gate_up_case();
+
+        let actual_decode = try_x86_q8_ffn_gate_up_single_owner_path(
+            &decode_input,
+            &packed_gate,
+            &packed_up,
+            "actual_decode",
+            &ffn_gate_up_single_owner_plan(true),
+        )
+        .unwrap()
+        .expect("single owner should cover FFN gate/up decode");
+        assert_eq!(
+            actual_decode.tensor.shape.dims,
+            expected_decode.tensor.shape.dims
+        );
+        assert_slice_close_with_tolerance(
+            &actual_decode.tensor.data,
+            &expected_decode.tensor.data,
+            5e-4,
+        );
+
+        let input_width = packed_gate.dim(0).unwrap();
+        let output_width = packed_gate.dim(1).unwrap();
+        let rows = 3;
+        let prefill_input = CpuTensor::from_f32(
+            "prefill_gate_up_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| {
+                    ((idx % input_width) as f32 - 7.0) * 0.109375
+                        + (idx / input_width) as f32 * 0.046875
+                })
+                .collect(),
+        )
+        .unwrap();
+        let actual_prefill = try_x86_q8_ffn_gate_up_single_owner_path(
+            &prefill_input,
+            &packed_gate,
+            &packed_up,
+            "actual_prefill",
+            &ffn_gate_up_single_owner_plan(true),
+        )
+        .unwrap()
+        .expect("single owner should cover FFN gate/up prefill");
+        let expected_prefill = try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
+            &prefill_input,
+            &packed_gate,
+            &packed_up,
+            "expected_prefill",
+            &ffn_gate_up_packed_rows4_matmul_plan(true),
+        )
+        .unwrap()
+        .expect("packed rows4 matmul should cover FFN gate/up prefill");
+        assert_eq!(actual_prefill.tensor.name, "actual_prefill");
+        assert_eq!(actual_prefill.tensor.shape.dims, vec![rows, output_width]);
+        assert_slice_close_with_tolerance(
+            &actual_prefill.tensor.data,
+            &expected_prefill.tensor.data,
+            5e-4,
+        );
+    }
+
+    #[test]
+    fn q8_ffn_gate_up_single_owner_is_default_off_and_requires_runtime_storage() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_gate, packed_up, _expected) = runtime_packed_ffn_gate_up_case();
+
+        assert!(try_x86_q8_ffn_gate_up_single_owner_path(
+            &input,
+            &packed_gate,
+            &packed_up,
+            "disabled",
+            &ffn_gate_up_single_owner_plan(false),
+        )
+        .unwrap()
+        .is_none());
+
+        let dense_up = CpuTensor::from_f32(
+            "dense_up",
+            packed_up.shape.dims.clone(),
+            vec![0.0; packed_up.shape.element_count().unwrap()],
+        )
+        .unwrap();
+        assert!(try_x86_q8_ffn_gate_up_single_owner_path(
+            &input,
+            &packed_gate,
+            &dense_up,
+            "dense_up",
+            &ffn_gate_up_single_owner_plan(true),
         )
         .unwrap()
         .is_none());
