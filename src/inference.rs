@@ -9753,6 +9753,20 @@ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
     )
 }
 
+fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_PACKED_ROWS4_AVX2_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_PACKED_ROWS4_AVX2_DOT_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT")
+        })
+    }
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
@@ -11271,7 +11285,7 @@ fn q8_0_packed_rows4_dot(
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             {
                 if interleave == Q8_0PackedRows4Interleave::I8
-                    && x86_q8_kernel_avx2_enabled()
+                    && (x86_q8_packed_rows4_avx2_dot_enabled() || x86_q8_kernel_avx2_enabled())
                     && std::arch::is_x86_feature_detected!("avx2")
                 {
                     // SAFETY: runtime feature detection confirms AVX2 support; packed quants
@@ -11330,35 +11344,49 @@ fn q8_0_packed_rows4_block_dot_scalar(
 unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i32; 4] {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_loadu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadl_epi64,
+        _mm_loadu_si128, _mm_unpacklo_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16, _mm256_set1_epi16,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_loadu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadl_epi64,
+        _mm_loadu_si128, _mm_unpacklo_epi64,
     };
 
     let ones = _mm256_set1_epi16(1);
-    let mut sums = [0_i32; 4];
+    let mut acc01 = _mm256_setzero_si256();
+    let mut acc23 = _mm256_setzero_si256();
     for chunk in 0..4usize {
         let chunk_packed = unsafe { packed.add(chunk * 32) };
         let input8 = unsafe { _mm_loadl_epi64(input.add(chunk * 8).cast()) };
         let input16 = _mm_unpacklo_epi64(input8, input8);
         let input_i16 = _mm256_cvtepi8_epi16(input16);
 
-        for pair in 0..2usize {
-            let packed16 = unsafe { _mm_loadu_si128(chunk_packed.add(pair * 16).cast()) };
-            let packed_i16 = _mm256_cvtepi8_epi16(packed16);
-            let products_i16 = _mm256_mullo_epi16(packed_i16, input_i16);
-            let pair_sums_i32 = _mm256_madd_epi16(products_i16, ones);
-            let mut lanes = [0_i32; 8];
-            unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), pair_sums_i32) };
-            sums[pair * 2] += lanes[..4].iter().sum::<i32>();
-            sums[pair * 2 + 1] += lanes[4..].iter().sum::<i32>();
-        }
+        let packed01 = unsafe { _mm_loadu_si128(chunk_packed.cast()) };
+        let packed01_i16 = _mm256_cvtepi8_epi16(packed01);
+        let products01_i16 = _mm256_mullo_epi16(packed01_i16, input_i16);
+        acc01 = _mm256_add_epi32(acc01, _mm256_madd_epi16(products01_i16, ones));
+
+        let packed23 = unsafe { _mm_loadu_si128(chunk_packed.add(16).cast()) };
+        let packed23_i16 = _mm256_cvtepi8_epi16(packed23);
+        let products23_i16 = _mm256_mullo_epi16(packed23_i16, input_i16);
+        acc23 = _mm256_add_epi32(acc23, _mm256_madd_epi16(products23_i16, ones));
     }
-    sums
+
+    let mut lanes01 = [0_i32; 8];
+    let mut lanes23 = [0_i32; 8];
+    unsafe {
+        _mm256_storeu_si256(lanes01.as_mut_ptr().cast(), acc01);
+        _mm256_storeu_si256(lanes23.as_mut_ptr().cast(), acc23);
+    }
+    [
+        lanes01[..4].iter().sum(),
+        lanes01[4..].iter().sum(),
+        lanes23[..4].iter().sum(),
+        lanes23[4..].iter().sum(),
+    ]
 }
 
 fn accumulate_q8_0_block_dot_quantized_cpu(
@@ -12957,7 +12985,7 @@ mod tests {
     #[test]
     fn x86_q8_avx2_packed_rows4_i8_matches_scalar_dot() {
         let _env_guard = env_lock();
-        std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+        std::env::set_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT", "on");
         let packed = std::array::from_fn(|idx| (idx as i8).wrapping_mul(11).wrapping_sub(37));
         let input = std::array::from_fn(|idx| (idx as i8).wrapping_mul(5).wrapping_add(19));
         let expected =
@@ -12987,7 +13015,7 @@ mod tests {
                 expected[lane] as f32 * [0.25, 0.5, 0.75, 1.25][lane] * 0.125
             );
         }
-        std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+        std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT");
     }
 
     #[test]
