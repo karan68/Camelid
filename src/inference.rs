@@ -4023,34 +4023,60 @@ fn forward_prefill_layer_chunk_timed(
     }
     trace_chunk_memory("attention_norm_done");
 
-    let started = Instant::now();
-    let q = linear_runtime(
-        &attn_norm,
-        &layer.attention_q,
-        format!("layer_{layer_idx}_prefill_attention_q"),
-        false,
-    )?;
-    timings.attention_q = started.elapsed().as_micros();
+    let qkv_started = Instant::now();
+    let shared_qkv = if x86_q8_attention_qkv_prefill_consumer_enabled() {
+        let runtime_plan = ResolvedRuntimePlan::from_env()?;
+        try_x86_q8_attention_qkv_packed_rows4_matmul_path(
+            &attn_norm,
+            &layer.attention_q,
+            &layer.attention_k,
+            &layer.attention_v,
+            &runtime_plan,
+        )?
+    } else {
+        None
+    };
 
-    let started = Instant::now();
-    let k = linear_for_role_runtime(
-        &attn_norm,
-        &layer.attention_k,
-        format!("layer_{layer_idx}_prefill_attention_k"),
-        "attention_k",
-        false,
-    )?;
-    timings.attention_k = started.elapsed().as_micros();
+    let (q, k, v, shared_qkv_elapsed) = if let Some((q, k, v)) = shared_qkv {
+        let elapsed = qkv_started.elapsed().as_micros();
+        (q, k, v, Some(elapsed))
+    } else {
+        let started = Instant::now();
+        let q = linear_runtime(
+            &attn_norm,
+            &layer.attention_q,
+            format!("layer_{layer_idx}_prefill_attention_q"),
+            false,
+        )?;
+        timings.attention_q = started.elapsed().as_micros();
 
-    let started = Instant::now();
-    let v = linear_for_role_runtime(
-        &attn_norm,
-        &layer.attention_v,
-        format!("layer_{layer_idx}_prefill_attention_v"),
-        "attention_v",
-        false,
-    )?;
-    timings.attention_v = started.elapsed().as_micros();
+        let started = Instant::now();
+        let k = linear_for_role_runtime(
+            &attn_norm,
+            &layer.attention_k,
+            format!("layer_{layer_idx}_prefill_attention_k"),
+            "attention_k",
+            false,
+        )?;
+        timings.attention_k = started.elapsed().as_micros();
+
+        let started = Instant::now();
+        let v = linear_for_role_runtime(
+            &attn_norm,
+            &layer.attention_v,
+            format!("layer_{layer_idx}_prefill_attention_v"),
+            "attention_v",
+            false,
+        )?;
+        timings.attention_v = started.elapsed().as_micros();
+        (q, k, v, None)
+    };
+    if let Some(total_elapsed) = shared_qkv_elapsed {
+        let base = total_elapsed / 3;
+        timings.attention_q = base;
+        timings.attention_k = base;
+        timings.attention_v = total_elapsed - (base * 2);
+    }
     if let Some(memory) = &mut memory {
         memory.record_after_attention_q(capture_memory_sample(kv_cache));
     }
@@ -7538,6 +7564,20 @@ fn try_x86_q8_output_decode_owner_path(
     let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
     q8_0_packed_rows4_single_input_projection(packed, &quantized_input.blocks, borrowed.rows, name)
         .map(Some)
+}
+
+fn x86_q8_attention_qkv_prefill_consumer_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER")
+        })
+    }
 }
 
 fn try_x86_q8_attention_qkv_decode_consumer_path(
@@ -15366,6 +15406,17 @@ mod tests {
             .is_none(),
             "fused QKV consumer must fail closed unless every Q/K/V projection is runtime-packed Q8_0"
         );
+    }
+
+    #[test]
+    fn q8_attention_qkv_prefill_consumer_gate_is_default_off() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
+        assert!(!x86_q8_attention_qkv_prefill_consumer_enabled());
+        std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER", "on");
+        assert!(x86_q8_attention_qkv_prefill_consumer_enabled());
+        std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PREFILL_CONSUMER");
     }
 
     #[test]
