@@ -512,6 +512,46 @@ fn x86_q8_repack_loads_dense_ffn_family_as_transposed_packed_runtime() {
     std::env::remove_var("CAMELID_X86_Q8_REPACK");
 }
 
+#[test]
+fn mac_q8_repack_loads_output_projection_as_token_major_packed_runtime() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+    std::env::remove_var("CAMELID_X86_Q8_REPACK");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+    std::env::remove_var("CAMELID_Q8_0_PACKED_4X8_DOT");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tensor.gguf");
+    let mut payload = Vec::new();
+    for block_idx in 0..64 {
+        payload.extend_from_slice(&0x3c00u16.to_le_bytes());
+        payload.extend((0..32).map(|v| (v as i8).wrapping_add(block_idx as i8) as u8));
+    }
+    write_named_tensor_gguf_with_dims(&path, "output.weight", 8, &[32, 64], &payload);
+
+    let gguf = read_metadata(&path).unwrap();
+    let store = TensorStore::open(&path, &gguf);
+
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    let fallback = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    assert!(fallback.q8_0_runtime_storage.is_none());
+    assert!(fallback.q8_0_file_backing.is_some());
+
+    std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+    let tensor = store.load_q8_0_file_backed_linear("output.weight").unwrap();
+    assert_eq!(tensor.shape.dims, vec![32, 64]);
+    assert!(tensor.data.is_empty());
+    assert!(tensor.q8_0_blocks.is_none());
+    assert!(tensor.q8_0_file_backing.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x4.is_none());
+    assert!(tensor.q8_0_packed_rows4_4x8.is_none());
+    let Q8_0RuntimeStorage::PackedRows4(packed) = tensor.q8_0_runtime_storage.unwrap();
+    assert_eq!(packed.rows, 64);
+    assert_eq!(packed.blocks_per_row, 1);
+
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[test]
 fn x86_q8_repack_loads_output_projection_as_token_major_packed_runtime() {

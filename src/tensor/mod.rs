@@ -289,15 +289,21 @@ fn x86_q8_repack_enabled() -> bool {
 }
 
 fn q8_repack_tensor_enabled(name: &str) -> bool {
-    (name.starts_with("blk.") && mac_q8_repack_enabled() && q8_repack_mac_tensor_enabled(name))
-        || (x86_q8_repack_enabled() && q8_repack_x86_tensor_enabled(name))
+    q8_repack_tensor_enabled_for_flags(name, mac_q8_repack_enabled(), x86_q8_repack_enabled())
+}
+
+fn q8_repack_tensor_enabled_for_flags(name: &str, mac_enabled: bool, x86_enabled: bool) -> bool {
+    (mac_enabled && q8_repack_mac_tensor_enabled(name))
+        || (x86_enabled && q8_repack_x86_tensor_enabled(name))
 }
 
 fn q8_repack_mac_tensor_enabled(name: &str) -> bool {
-    q8_repack_attention_tensor_enabled(name)
-        || name.ends_with(".ffn_gate.weight")
-        || name.ends_with(".ffn_up.weight")
-        || name.ends_with(".ffn_down.weight")
+    (name.starts_with("blk.")
+        && (q8_repack_attention_tensor_enabled(name)
+            || name.ends_with(".ffn_gate.weight")
+            || name.ends_with(".ffn_up.weight")
+            || name.ends_with(".ffn_down.weight")))
+        || name == "output.weight"
 }
 
 fn q8_repack_x86_tensor_enabled(name: &str) -> bool {
@@ -2810,8 +2816,9 @@ fn f16_bits_to_f32(bits: u16) -> f32 {
 mod tests {
     use super::{
         f16_bits_to_f32, parse_byte_count, q8_0_file_read_stats, q8_file_cache_get,
-        q8_file_cache_insert, q8_repack_x86_tensor_enabled, with_q8_file_cache_capacity_override,
-        CpuTensor, Q8_0Block, Q8_0FileBacking, TensorShape, Q8_0_BLOCK_BYTES,
+        q8_file_cache_insert, q8_repack_tensor_enabled_for_flags, q8_repack_x86_tensor_enabled,
+        with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking, TensorShape,
+        Q8_0_BLOCK_BYTES,
     };
     use crate::test_support::env_lock;
 
@@ -3006,6 +3013,85 @@ mod tests {
         assert!(q8_repack_x86_tensor_enabled("blk.0.ffn_down.weight"));
         assert!(!q8_repack_x86_tensor_enabled("token_embd.weight"));
         assert!(!q8_repack_x86_tensor_enabled("blk.0.attn_norm.weight"));
+    }
+
+    #[test]
+    fn q8_runtime_repack_route_stays_default_off_and_family_scoped() {
+        assert!(!q8_repack_tensor_enabled_for_flags(
+            "output.weight",
+            false,
+            false
+        ));
+        assert!(!q8_repack_tensor_enabled_for_flags(
+            "blk.0.attn_output.weight",
+            false,
+            false
+        ));
+        assert!(!q8_repack_tensor_enabled_for_flags(
+            "token_embd.weight",
+            true,
+            true
+        ));
+        assert!(!q8_repack_tensor_enabled_for_flags(
+            "blk.0.attn_norm.weight",
+            true,
+            true
+        ));
+        assert!(q8_repack_tensor_enabled_for_flags(
+            "output.weight",
+            true,
+            false
+        ));
+        assert!(q8_repack_tensor_enabled_for_flags(
+            "output.weight",
+            false,
+            true
+        ));
+        assert!(q8_repack_tensor_enabled_for_flags(
+            "blk.0.ffn_down.weight",
+            true,
+            false
+        ));
+        assert!(q8_repack_tensor_enabled_for_flags(
+            "blk.0.attn_q.weight",
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn q8_runtime_repack_linear_shape_preserves_token_major_output_route() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+        std::env::remove_var("CAMELID_X86_Q8_REPACK");
+
+        let hidden_vocab = TensorShape { dims: vec![32, 64] };
+        let vocab_hidden = TensorShape { dims: vec![64, 32] };
+
+        assert_eq!(
+            super::q8_repack_linear_shape("output.weight", &hidden_vocab),
+            None
+        );
+
+        std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+        assert_eq!(
+            super::q8_repack_linear_shape("output.weight", &hidden_vocab),
+            Some((64, 32))
+        );
+        assert_eq!(
+            super::q8_repack_linear_shape("output.weight", &vocab_hidden),
+            Some((64, 32))
+        );
+        assert_eq!(
+            super::q8_repack_linear_shape("blk.0.attn_output.weight", &hidden_vocab),
+            Some((64, 32))
+        );
+        assert_eq!(
+            super::q8_repack_linear_shape("token_embd.weight", &vocab_hidden),
+            None
+        );
+
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
