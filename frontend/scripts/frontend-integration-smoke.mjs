@@ -23,6 +23,11 @@ try {
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
   const { default: TopBar } = await server.ssrLoadModule('/src/components/TopBar.jsx')
   const { getChatGateState } = await server.ssrLoadModule('/src/lib/chatGate.js')
+  const {
+    exactRowSupportLanes,
+    rowSupportBoundaryCopy,
+    rowSupportNextStepCopy,
+  } = await server.ssrLoadModule('/src/lib/capabilities.js')
   const { resolveLoadedModelDisplayName } = await server.ssrLoadModule('/src/hooks/useDashboardData.js')
 
   const noop = () => {}
@@ -358,6 +363,60 @@ try {
   assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
+
+  const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
+  green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })
+  green3BCapabilities.model_compatibility = green3BCapabilities.model_compatibility.map((target) => target.id === 'llama32_3b_instruct_q8_0'
+    ? {
+      ...target,
+      chat_template_renderer: 'metadata_jinja_supported_for_exact_row',
+      chat_template_shape_pack: 'validated_bounded_pack',
+      performance_measured: 'production_throughput_validated',
+      full_support_blockers: 'model-native/larger context beyond checked packs, arbitrary/Jinja templates, production throughput, portability, and durable repeated current-head bundles remain missing',
+      next_step: 'preserve exact-row smoke while normalizing model-native/larger context, arbitrary/Jinja template behavior, production throughput, portability, and durable full-support bundle evidence before any broader claim',
+    }
+    : target)
+  const green3BRow = green3BCapabilities.model_compatibility.find((target) => target.id === 'llama32_3b_instruct_q8_0')
+  assert.deepEqual(
+    exactRowSupportLanes(green3BRow, green3BCapabilities.api_features).map((lane) => [lane.key, lane.ready]),
+    [['template', true], ['throughput', true]],
+    '3B exact row should show both template/Jinja and production-throughput lanes green once /api/capabilities advertises row evidence',
+  )
+  assert.doesNotMatch(rowSupportBoundaryCopy(green3BRow, green3BCapabilities.api_features), /arbitrary|Jinja|production|throughput/i, '3B remaining boundary should filter resolved template/Jinja and production-throughput blockers when both lanes are green')
+  assert.doesNotMatch(rowSupportNextStepCopy(green3BRow, green3BCapabilities.api_features), /arbitrary|Jinja|production|throughput/i, '3B next-step copy should filter resolved template/Jinja and production-throughput blockers when both lanes are green')
+  assert.equal(getChatGateState(green3BCapabilities, aliasSelectedModel, readyRuntime).chatUnlocked, true, 'green 3B evidence must still require runtime loaded_now/generation_ready and exact-row model identity before chat unlocks')
+
+  const green3BApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: readyRuntime,
+    selectedModel: aliasSelectedModel,
+    capabilities: green3BCapabilities,
+  }))
+  assert.match(green3BApiMarkup, /Throughput readiness[\s\S]*Production-throughput support is advertised by \/api\/capabilities as supported exact row evidence/, 'API view should render green 3B production-throughput evidence only when /api/capabilities advertises it')
+  assert.doesNotMatch(green3BApiMarkup, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'API view 3B boundary should not repeat resolved template/Jinja or production-throughput blockers after green evidence')
+
+  const green3BModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: readyRuntime,
+    capabilities: green3BCapabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [aliasSelectedModel],
+    selectedModelId: aliasSelectedModel.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+  assert.match(green3BModelsMarkup, /Chat unlockable/, 'Models tracked 3B card should remain chat-unlockable when exact row, runtime readiness, and green evidence all align')
+  assert.match(green3BModelsMarkup, /Throughput: Production throughput ready for this exact row/, 'Models tracked 3B card should show production-throughput green only from row/API evidence')
+  assert.doesNotMatch(green3BModelsMarkup, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'Models tracked 3B card should not keep resolved 3B support blockers visible when evidence is green')
 
   assert.equal(
     resolveLoadedModelDisplayName({
