@@ -682,6 +682,7 @@ struct Q8RuntimeFlags {
     ffn_down_packed_rows4_matmul: bool,
     ffn_down_gemm4_prefill: bool,
     ffn_down_gemm4_row_group_schedule: bool,
+    ffn_down_gemm4_avx2: bool,
     ffn_down_single_owner: bool,
     metal: bool,
     metal_retained: bool,
@@ -750,6 +751,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_down_gemm4_row_group_schedule: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
+            ),
+            ffn_down_gemm4_avx2: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2",
             ),
             ffn_down_single_owner: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
@@ -8261,6 +8265,28 @@ fn q8_0_packed_rows4_matmul_projection_from_quantized(
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
+fn q8_0_packed_rows4_gemm4_block(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    use_avx2: bool,
+) -> [[i32; 4]; 4] {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if use_avx2 && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime feature detection confirms AVX2 support; both operands are
+            // complete rows4/I8 packed Q8_0 blocks.
+            return unsafe {
+                q8_0_packed_rows4_gemm4_block_avx2(
+                    input_block.quants.as_ptr(),
+                    weight_block.quants.as_ptr(),
+                )
+            };
+        }
+    }
+    let _ = use_avx2;
+    q8_0_packed_rows4_gemm4_block_scalar(input_block, weight_block)
+}
+
 fn q8_0_packed_rows4_gemm4_block_scalar(
     input_block: &Q8_0PackedRows4Block,
     weight_block: &Q8_0PackedRows4Block,
@@ -8285,6 +8311,7 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel_row_group_parallel(
     packed_inputs: &[Q8_0PackedRows4Block],
     input_groups: usize,
     output: &mut [f32],
+    use_avx2: bool,
 ) {
     let rows = packed_weight.rows;
     let blocks_per_row = packed_weight.blocks_per_row;
@@ -8304,7 +8331,8 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel_row_group_parallel(
                     [output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
                 let mut sums = [[0.0_f32; 4]; 4];
                 for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
-                    let int_sums = q8_0_packed_rows4_gemm4_block_scalar(input_block, weight_block);
+                    let int_sums =
+                        q8_0_packed_rows4_gemm4_block(input_block, weight_block, use_avx2);
                     for input_lane in 0..4 {
                         for output_lane in 0..4 {
                             sums[input_lane][output_lane] += int_sums[input_lane][output_lane]
@@ -8328,6 +8356,7 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
     packed_inputs: &[Q8_0PackedRows4Block],
     input_groups: usize,
     output: &mut [f32],
+    use_avx2: bool,
 ) {
     let rows = packed_weight.rows;
     let blocks_per_row = packed_weight.blocks_per_row;
@@ -8351,7 +8380,7 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
                     let mut sums = [[0.0_f32; 4]; 4];
                     for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
                         let int_sums =
-                            q8_0_packed_rows4_gemm4_block_scalar(input_block, weight_block);
+                            q8_0_packed_rows4_gemm4_block(input_block, weight_block, use_avx2);
                         for input_lane in 0..4 {
                             for output_lane in 0..4 {
                                 sums[input_lane][output_lane] += int_sums[input_lane][output_lane]
@@ -8376,6 +8405,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
     output_width: usize,
     name: &str,
     row_group_schedule: bool,
+    use_avx2: bool,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
     let input_width = input.dim(1)?;
@@ -8416,6 +8446,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
                 &packed_inputs,
                 packed_rows / 4,
                 &mut output,
+                use_avx2,
             );
         } else {
             run_q8_0_packed_rows4_prefill_gemm4_kernel(
@@ -8423,6 +8454,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
                 &packed_inputs,
                 packed_rows / 4,
                 &mut output,
+                use_avx2,
             );
         }
         packed_inputs.clear();
@@ -8452,6 +8484,32 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
     }
 
     CpuTensor::from_f32(name, vec![rows, output_width], output)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
+    input_packed: *const i8,
+    weight_packed: *const i8,
+) -> [[i32; 4]; 4] {
+    let mut sums = [[0_i32; 4]; 4];
+    let mut input_lane = [0_i8; Q8_0_BLOCK_VALUES];
+    for input_idx in 0..4 {
+        for chunk in 0..4usize {
+            let src_start = chunk * 32 + input_idx * 8;
+            let dst_start = chunk * 8;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    input_packed.add(src_start),
+                    input_lane.as_mut_ptr().add(dst_start),
+                    8,
+                );
+            }
+        }
+        // SAFETY: this function is AVX2-gated and both arrays contain complete rows4/I8 blocks.
+        sums[input_idx] = unsafe { q8_0_packed_4x8_block_avx2(weight_packed, input_lane.as_ptr()) };
+    }
+    sums
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8934,6 +8992,7 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
         output_width,
         name,
         runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
+        runtime_plan.q8.ffn_down_gemm4_avx2,
     )
     .map(Some)
 }
@@ -14729,6 +14788,7 @@ mod tests {
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
+                ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
@@ -15533,6 +15593,7 @@ mod tests {
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
+                ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
@@ -16079,6 +16140,7 @@ mod tests {
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
+                ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
@@ -16108,6 +16170,7 @@ mod tests {
                 ffn_down_packed_rows4_matmul: enabled,
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
+                ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
@@ -16149,6 +16212,7 @@ mod tests {
                 ffn_down_packed_rows4_matmul: false,
                 ffn_down_gemm4_prefill: false,
                 ffn_down_gemm4_row_group_schedule: false,
+                ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
                 metal: false,
                 metal_retained: false,
@@ -16586,6 +16650,51 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    fn q8_ffn_down_gemm4_avx2_matches_default_gemm4() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (_decode_input, packed_weight, _decode_expected) = runtime_packed_ffn_down_case();
+        let input_width = packed_weight.dim(0).unwrap();
+        let rows = 8;
+        let input = CpuTensor::from_f32(
+            "ffn_down_gemm4_avx2_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| {
+                    ((idx % input_width) as f32 - 5.0) * 0.125
+                        + (idx / input_width) as f32 * 0.046875
+                })
+                .collect(),
+        )
+        .unwrap();
+
+        let default_plan = ffn_down_gemm4_prefill_plan(true);
+        let expected = try_x86_q8_ffn_down_gemm4_prefill_path(
+            &input,
+            &packed_weight,
+            "expected_default_gemm4_avx2",
+            "ffn_down",
+            &default_plan,
+        )
+        .unwrap()
+        .expect("default gemm4 should cover rows4 FFN-down input");
+        let mut avx2_plan = ffn_down_gemm4_prefill_plan(true);
+        avx2_plan.q8.ffn_down_gemm4_avx2 = true;
+        let actual = try_x86_q8_ffn_down_gemm4_prefill_path(
+            &input,
+            &packed_weight,
+            "actual_avx2_gemm4",
+            "ffn_down",
+            &avx2_plan,
+        )
+        .unwrap()
+        .expect("AVX2 gemm4 should cover rows4 FFN-down input");
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
     }
 
     #[test]

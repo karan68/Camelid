@@ -24,6 +24,7 @@ const MANAGED_ENV_KEYS: &[&str] = &[
     "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
     "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
     "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED",
+    "CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2",
     "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
     "CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER",
     "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
@@ -383,6 +384,7 @@ fn select_linux_x86_q8_plan(
     env_updates.insert("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_SCHED", Some("off"));
+    env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_GEMM4_AVX2", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_FFN_DOWN_DECODE_OWNER", Some("off"));
     env_updates.insert("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", Some("off"));
