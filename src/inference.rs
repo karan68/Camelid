@@ -7492,6 +7492,7 @@ const Q8_0_BLOCK_VALUES: usize = 32;
 const X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS: usize = 1024;
 const X86_Q8_PACKED_ROWS4_MATMUL_PARALLEL_MIN_GROUPS: usize = 64;
 const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK: usize = 8;
+const X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS: usize = 8;
 
 #[derive(Debug, Clone)]
 struct QuantizedQ8_0Row {
@@ -8082,6 +8083,35 @@ fn should_parallelize_q8_packed_rows4_matmul(total_output_groups: usize) -> bool
         && rayon::current_num_threads() > 1
 }
 
+fn x86_q8_ffn_down_gemm4_row_group_min_input_groups() -> usize {
+    #[cfg(test)]
+    {
+        env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS)
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS_ONCE: OnceLock<usize> =
+            OnceLock::new();
+        *X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS_ONCE.get_or_init(|| {
+            env::var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS)
+        })
+    }
+}
+
+fn should_use_x86_q8_ffn_down_gemm4_row_group_schedule(enabled: bool, input_groups: usize) -> bool {
+    enabled
+        && rayon::current_num_threads() > 1
+        && input_groups >= x86_q8_ffn_down_gemm4_row_group_min_input_groups()
+}
+
 fn x86_q8_packed_rows4_matmul_groups_per_chunk() -> usize {
     #[cfg(test)]
     {
@@ -8440,11 +8470,12 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
             blocks_per_row,
             &mut packed_inputs,
         );
-        if row_group_schedule {
+        let input_groups = packed_rows / 4;
+        if should_use_x86_q8_ffn_down_gemm4_row_group_schedule(row_group_schedule, input_groups) {
             run_q8_0_packed_rows4_prefill_gemm4_kernel_row_group_parallel(
                 packed,
                 &packed_inputs,
-                packed_rows / 4,
+                input_groups,
                 &mut output,
                 use_avx2,
             );
@@ -8452,7 +8483,7 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
             run_q8_0_packed_rows4_prefill_gemm4_kernel(
                 packed,
                 &packed_inputs,
-                packed_rows / 4,
+                input_groups,
                 &mut output,
                 use_avx2,
             );
@@ -13480,6 +13511,50 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK");
     }
 
+    #[test]
+    fn x86_q8_ffn_down_gemm4_row_group_schedule_respects_min_input_groups() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
+        assert_eq!(
+            x86_q8_ffn_down_gemm4_row_group_min_input_groups(),
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+        );
+        assert!(!should_use_x86_q8_ffn_down_gemm4_row_group_schedule(
+            false,
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+        ));
+        assert!(!should_use_x86_q8_ffn_down_gemm4_row_group_schedule(
+            true,
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS - 1
+        ));
+        assert_eq!(
+            should_use_x86_q8_ffn_down_gemm4_row_group_schedule(
+                true,
+                X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+            ),
+            rayon::current_num_threads() > 1
+        );
+
+        std::env::set_var(
+            "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+            "2",
+        );
+        assert_eq!(x86_q8_ffn_down_gemm4_row_group_min_input_groups(), 2);
+        assert_eq!(
+            should_use_x86_q8_ffn_down_gemm4_row_group_schedule(true, 2),
+            rayon::current_num_threads() > 1
+        );
+        std::env::set_var(
+            "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+            "0",
+        );
+        assert_eq!(
+            x86_q8_ffn_down_gemm4_row_group_min_input_groups(),
+            X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS
+        );
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn x86_q8_avx2_packed_rows4_i8_matches_scalar_dot() {
@@ -16564,6 +16639,94 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    #[test]
+    #[ignore = "manual x86 Q8 scheduler tracer bullet benchmark"]
+    fn q8_ffn_down_gemm4_row_group_threshold_benchmark() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let input_width = Q8_0_BLOCK_VALUES * 8;
+        let output_width = 1024;
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let row_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+            .map(|row| Q8_0Block {
+                scale: 0.03125 + row as f32 * 0.000001,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(9).wrapping_sub(row as i8)
+                }),
+            })
+            .collect();
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, output_width],
+            },
+            Q8_0PackedRows4::from_rows(
+                output_width,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &row_blocks,
+            )
+            .unwrap(),
+        );
+        let rows = 16;
+        let input = CpuTensor::from_f32(
+            "ffn_down_gemm4_threshold_bench_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| {
+                    ((idx % input_width) as f32 - 9.0) * 0.125 + (idx / input_width) as f32 * 0.0625
+                })
+                .collect(),
+        )
+        .unwrap();
+        let Some((packed, packed_output_width)) =
+            q8_0_runtime_packed_projection(&packed_weight, input_width).unwrap()
+        else {
+            panic!("expected runtime packed FFN-down weight")
+        };
+        assert_eq!(packed_output_width, output_width);
+
+        let iterations = std::env::var("CAMELID_X86_Q8_SCHED_BENCH_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(50);
+        let run = |label: &str, min_groups: &str, row_group_schedule: bool| {
+            std::env::set_var(
+                "CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS",
+                min_groups,
+            );
+            let started = Instant::now();
+            let mut last = None;
+            for _ in 0..iterations {
+                last = Some(
+                    q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+                        &input,
+                        packed,
+                        output_width,
+                        label,
+                        row_group_schedule,
+                        false,
+                    )
+                    .unwrap(),
+                );
+            }
+            let elapsed = started.elapsed().as_micros();
+            (elapsed, last.unwrap())
+        };
+
+        let (baseline_us, baseline) = run("baseline_output_group", "8", false);
+        let (old_row_group_us, old_row_group) = run("forced_row_group", "1", true);
+        let (thresholded_us, thresholded) = run("thresholded_row_group", "8", true);
+        assert_slice_close_with_tolerance(&old_row_group.data, &baseline.data, 5e-4);
+        assert_slice_close_with_tolerance(&thresholded.data, &baseline.data, 5e-4);
+        println!(
+            "rows={rows} input_groups={} input_width={input_width} output_width={output_width} iterations={iterations} baseline_us={baseline_us} forced_row_group_us={old_row_group_us} thresholded_us={thresholded_us}",
+            rows / 4
+        );
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS");
     }
 
     #[test]
