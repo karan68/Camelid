@@ -10184,6 +10184,7 @@ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
     )
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
     #[cfg(test)]
     {
@@ -16298,6 +16299,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
         let mut plan = ffn_gate_up_consumer_plan(false);
         plan.q8.ffn_gate_up_packed_rows4_matmul = enabled;

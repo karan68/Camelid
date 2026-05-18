@@ -1,1 +1,2 @@
-ssh <canonical-ubuntu-host> 'set -euo pipefail; date -u; hostname; curl -fsS http://127.0.0.1:8181/v1/health; printf "\n---CAPABILITIES---\n"; curl -fsS http://127.0.0.1:8181/api/capabilities'
+# Sanitized: validation-host SSH command intentionally omitted from public evidence.
+# Equivalent private command checked local backend health and capabilities endpoints.

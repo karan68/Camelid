@@ -1,10 +1,2 @@
-ssh <canonical-ubuntu-host> 'set -euo pipefail
-printf "timestamp_utc="; date -u +%Y%m%dT%H%M%SZ
-printf "hostname="; hostname
-printf "%s\n" "---HEALTH---"
-curl -fsS --max-time 8 http://127.0.0.1:8181/v1/health
-printf "\n%s\n" "---CURRENT---"
-curl -fsS --max-time 8 http://127.0.0.1:8181/api/models/current
-printf "\n%s\n" "---CAPABILITIES---"
-curl -fsS --max-time 8 http://127.0.0.1:8181/api/capabilities
-'
+# Sanitized: validation-host SSH command intentionally omitted from public evidence.
+# Equivalent private command checked the local backend health, current model, and capabilities endpoints.
