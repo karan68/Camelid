@@ -72,6 +72,7 @@ Current public takeaways:
 - Latest local-only follow-on work tightened default-off paired/triplet helpers and one-row packed-runtime decode output-group traversal so related projections reuse shared quantized inputs and wide rows4 decode projections can schedule independent output groups while consuming backend-owned packed runtime storage; Ubuntu x86_64 timing/profiling proof is still pending, so no measured-effect or support claim is added from those tweaks.
 - Latest bounded output-slice work added a default-off multi-row `output.weight` PackedRows4 matmul consumer (`CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL`) that consumes backend-owned runtime storage only and is managed off by ExecutionPlan; local parity/gate tests pass, but Ubuntu x86_64 timing/profiling is blocked by validation-host SSH timeout, so no retained measured-effect or support claim is added.
 - Latest local-only packed-rows4 matmul follow-ons chunk parallel output-group traversal and reuse bounded quantized-input scratch for existing single, paired, and triplet multi-row helpers; they keep I8/matching-layout/backend-owned-storage guards and have local fmt/clippy/unit/timing-smoke coverage only, with Ubuntu x86_64 timing/profiling still blocked.
+- Latest docs/context guard keeps the new FFN-down GEMM4 AVX2 and output-route-resolver work in the evidence-needed lane: the same-host guard still rejects any Camelid speed promotion, and output route cleanup is implementation guidance only until local plus canonical Ubuntu gates prove it.
 
 Boundaries that remain in force:
 
@@ -80,7 +81,7 @@ Boundaries that remain in force:
 - No portability claim beyond the measured Ubuntu x86_64 lane.
 - No broader model-family or neighboring-row support claim from this work alone.
 
-Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8-progress-20260515.md`](docs/performance/ubuntu-x86-q8-progress-20260515.md).
+Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8.md`](docs/performance/ubuntu-x86-q8.md).
 
 ## Durable evidence anchors
 

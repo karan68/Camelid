@@ -32,7 +32,8 @@ Only list the paths that are currently evidence-backed and default-off:
 - Packed Q8 runtime storage for the dense attention projection family plus dense FFN gate/up/down rows in the measured lane.
 - Default-off decode consumers that directly use backend-owned packed runtime storage for narrow one-row dense projection families, including output, attention Q/K/V, attention output, FFN down, and the FFN gate/up activation slice while validation remains opt-in.
 - Default-off packed-rows4 matmul slices consume backend-owned packed runtime storage for concrete dense projection families with per-slice evidence recorded below: FFN down, multi-row FFN gate/up, multi-row attention Q/K/V, multi-row attention output, and local-only multi-row `output.weight`; the newest chunked output-group traversal and quantized-input scratch-reuse follow-ons are local-only until Ubuntu timing/profiling recovers. This is planner/runtime-gate/allocation-shape evidence, not a blanket throughput, support, portability, or default-on claim.
-- ExecutionPlan now treats the x86 attention Q/K/V, attention-output, output, FFN gate/up/down decode-consumer, packed-rows4 FFN-down matmul, packed-rows4 FFN gate/up matmul, packed-rows4 attention-Q/K/V matmul, packed-rows4 attention-output matmul, and packed-rows4 output matmul flags as managed default-off knobs, so appliance planning clears stale owner experiments instead of inheriting them accidentally.
+- Default-off FFN-down GEMM4 follow-ons now include prefill, row-group scheduling, and an AVX2 experiment gate. Current public docs retain these as developer experiments only: canonical Ubuntu parity plus repeated same-host timing/profiling evidence is still required before any throughput/RSS/support/default-on claim.
+- ExecutionPlan now treats the x86 attention Q/K/V, attention-output, output, FFN gate/up/down decode-consumer, packed-rows4 FFN-down matmul, packed-rows4 FFN gate/up matmul, packed-rows4 attention-Q/K/V matmul, packed-rows4 attention-output matmul, packed-rows4 output matmul, and FFN-down GEMM4 flags as managed default-off knobs, so appliance planning clears stale owner experiments instead of inheriting them accidentally.
 
 ## Active experimental direction
 
@@ -46,6 +47,7 @@ Current work is focused on:
 - multi-row output projection ownership through backend-owned packed runtime storage; the current `CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL` slice has local parity/gate evidence only because Ubuntu host reachability blocked timing/profiling.
 - bounded packed-rows4 matmul scheduling follow-ons that reduce Rayon task granularity by chunking output groups across single/pair/triplet helpers; current proof is local semantic coverage only, not a retained Ubuntu speed claim.
 - bounded packed-rows4 matmul activation-quantization scratch reuse, so existing default-off single/pair/triplet matmul consumers can reuse cleared thread-local input blocks rather than allocating a fresh quantized-input vector per helper call; current proof is local allocation-shape/timing-smoke coverage only, not a retained Ubuntu speed claim.
+- FFN-down GEMM4 AVX2 and output-route-resolver cleanup are evidence-needed tracer bullets: keep them default-off, preserve backend-owned packed runtime storage, and require parity plus same-host guard evidence before retaining any performance claim.
 - reducing wrapper/callback overhead in hot inference
 - keeping the default/reference path safe while experimental paths stay opt-in
 
@@ -116,6 +118,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260517T2001Z-x86-packed-rows4-matmul-chunking-local.txt` (local fmt/clippy/unit parity only; canonical Ubuntu SSH timed out, so no Ubuntu timing/perf claim)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260517T2118Z-x86-packed-rows4-input-scratch-local.txt` (local scratch-reuse parity/timing-smoke only; canonical Ubuntu SSH timed out, so no Ubuntu timing/perf claim)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260517T2207Z-x86-output-packed-rows4-canonical-host-blocker.txt` (canonical-host reachability blocker for the default-off output packed-rows4 matmul validation attempt; no Ubuntu timing/perf claim)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260518T1526Z-docs-claim-guard/README.md` (docs/context claim guard: FFN-down GEMM4 AVX2 remains default-off evidence-needed work; latest same-host guard rejects new performance promotion; output route resolver remains implementation guidance only)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
