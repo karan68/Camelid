@@ -8089,6 +8089,20 @@ fn q8_packed_rows4_matmul_parallel_chunk_floats(total_output_groups: usize) -> u
     groups_per_chunk * 4
 }
 
+fn x86_q8_parallel_matmul_input_quantize_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE")
+    }
+    #[cfg(not(test))]
+    {
+        static X86_Q8_PARALLEL_INPUT_QUANTIZE: OnceLock<bool> = OnceLock::new();
+        *X86_Q8_PARALLEL_INPUT_QUANTIZE.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE")
+        })
+    }
+}
+
 #[cfg(test)]
 fn q8_0_quantized_matmul_input_rows(
     input: &CpuTensor,
@@ -8127,8 +8141,30 @@ fn q8_0_fill_quantized_matmul_input_rows(
 
     quantized_inputs.clear();
     quantized_inputs.reserve(rows * blocks_per_row);
-    for row in input.data.chunks_exact(input_width) {
-        quantize_q8_0_blocks_into(row, quantized_inputs);
+    if x86_q8_parallel_matmul_input_quantize_enabled()
+        && rows >= 8
+        && rayon::current_num_threads() > 1
+    {
+        let rows_per_chunk = rows.clamp(1, 8);
+        let floats_per_chunk = rows_per_chunk * input_width;
+        let quantized_chunks: Vec<Vec<Q8_0Block>> = input
+            .data
+            .par_chunks(floats_per_chunk)
+            .map(|input_rows| {
+                let mut local_blocks = Vec::with_capacity(input_rows.len() / Q8_0_BLOCK_VALUES);
+                for row in input_rows.chunks_exact(input_width) {
+                    quantize_q8_0_blocks_into(row, &mut local_blocks);
+                }
+                local_blocks
+            })
+            .collect();
+        for chunk in quantized_chunks {
+            quantized_inputs.extend(chunk);
+        }
+    } else {
+        for row in input.data.chunks_exact(input_width) {
+            quantize_q8_0_blocks_into(row, quantized_inputs);
+        }
     }
     Ok(rows)
 }
@@ -18753,6 +18789,31 @@ mod tests {
 
         assert_eq!(actual.shape.dims, vec![rows, output_rows]);
         assert_eq!(actual.data, expected);
+    }
+
+    #[test]
+    fn q8_packed_rows4_parallel_input_quantize_matches_serial() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let rows = 11;
+        let blocks_per_row = 3;
+        let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+        let input = CpuTensor::from_f32(
+            "parallel_quantize_input",
+            vec![rows, input_width],
+            (0..rows * input_width)
+                .map(|idx| ((idx % 37) as f32 - 18.0) * 0.0546875)
+                .collect(),
+        )
+        .unwrap();
+
+        std::env::remove_var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE");
+        let serial = q8_0_quantized_matmul_input_rows(&input, blocks_per_row).unwrap();
+        std::env::set_var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE", "on");
+        let parallel = q8_0_quantized_matmul_input_rows(&input, blocks_per_row).unwrap();
+        std::env::remove_var("CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE");
+
+        assert_eq!(parallel, serial);
     }
 
     #[test]
