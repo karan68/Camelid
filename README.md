@@ -10,7 +10,7 @@ Camelid does not treat “probably works” as “supported.” Support moves on
 
 ## Why organizations adopt Camelid
 
-Organizations adopt Camelid because local AI needs more than raw inference. They need to know what works, what does not, and whether the runtime, API, and UI all tell the same truth.
+Organizations adopt Camelid because local AI needs more than raw inference. They need a product contract they can trust: what works, what does not, and whether the runtime, API, and UI all tell the same truth.
 
 Camelid gives teams:
 
@@ -20,7 +20,7 @@ Camelid gives teams:
 - **evidence-backed support** tied directly to runtime reality
 - **one consistent product contract** across backend, API, WebUI, docs, and validation
 
-If you have ever wanted to use local AI without guessing what is actually ready, Camelid is built for that gap.
+If you want local AI without guessing what is actually ready, Camelid is built for that gap.
 
 ## Why Camelid matters
 
