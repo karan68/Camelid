@@ -79,7 +79,13 @@ Contaminated runs are not used as retained evidence.
 
 ## Host-status reporting
 
-Do not present the canonical Ubuntu validation host as blocked, down, unavailable, or failing SSH unless the canonical SSH probe was executed in the same run and the exact stderr is cited in the evidence bundle. If remote validation was not attempted in the run, say that plainly instead of implying host failure.
+Do not present any negative host-access state for the canonical Ubuntu validation host unless the canonical SSH probe was executed in the same run and the exact stderr is cited in the evidence bundle. The canonical probe is:
+
+```bash
+ssh -o IdentitiesOnly=yes -i /Users/timtoole/Documents/cert/ubuntu.pem ubuntu@16.146.143.184
+```
+
+If remote validation was not attempted in the run, say that plainly instead of implying host failure.
 
 Historical notes about operator-paused validation lanes are not current host-access evidence. Keep them framed as historical execution posture, not as proof of today's host state.
 
@@ -135,6 +141,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260519T1004Z-docs-host-reporting-retain/README.md` (docs/context claim guard: stale validation-host wording purged from summaries; remote validation was not attempted in this run)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260519T1232Z-docs-host-reporting-rule/README.md` (docs/context host-reporting rule cleanup: historical operator-paused notes reframed, pre-existing private EC2 hostname leaks scrubbed, and remote validation was not attempted in this run)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260519T1439Z-docs-cross-lane-evidence-status/README.md` (docs cross-lane evidence-status refresh: `docs/runtime/cross-lane-sync.md` now scopes Ubuntu status as evidence status, keeps `d9ad412` evidence-needed, and states remote validation was not attempted in this run)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260519T1647Z-docs-host-reporting-neutral/README.md` (docs host-reporting neutral wording: public docs now require evidence-scoped host-status language and include the canonical probe command; remote validation was not attempted in this run)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
