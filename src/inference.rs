@@ -9155,7 +9155,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.ffn_down_decode_consumer
+    if !(runtime_plan.q8.ffn_down_decode_consumer || x86_q8_kernel_avx2_enabled())
         || rectangular_role != "ffn_down"
         || input.rank() != 2
         || input.dim(0)? != 1
@@ -13738,6 +13738,67 @@ mod tests {
             .unwrap();
         assert_eq!(actual, expected);
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST");
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_ffn_down_decode_uses_avx2_reference_gate() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+            return;
+        }
+
+        let input = CpuTensor::from_f32(
+            "hidden",
+            vec![1, Q8_0_BLOCK_VALUES],
+            (0..Q8_0_BLOCK_VALUES)
+                .map(|idx| (idx as f32 - 15.0) / 8.0)
+                .collect(),
+        )
+        .unwrap();
+        let row_major_blocks: Vec<Q8_0Block> = (0..4)
+            .map(|row| Q8_0Block {
+                scale: 0.25 + row as f32 * 0.125,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(3).wrapping_add(row as i8 * 11)
+                }),
+            })
+            .collect();
+        let packed =
+            Q8_0PackedRows4::from_rows(4, 1, Q8_0PackedRows4Interleave::I8, &row_major_blocks)
+                .unwrap();
+        let weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![4, Q8_0_BLOCK_VALUES],
+            },
+            packed.clone(),
+        );
+        let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+        assert!(!runtime_plan.q8.ffn_down_decode_consumer);
+
+        let actual = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &weight,
+            "ffn_down",
+            "ffn_down",
+            &runtime_plan,
+        )
+        .unwrap()
+        .unwrap();
+        let quantized_input = quantize_q8_0_row(&input.data);
+        let expected = q8_0_packed_rows4_single_input_projection(
+            &packed,
+            &quantized_input.blocks,
+            4,
+            "expected",
+        )
+        .unwrap();
+        assert_eq!(actual.shape.dims, vec![1, 4]);
+        assert_eq!(actual.data, expected.data);
+        std::env::remove_var("CAMELID_X86_Q8_KERNEL");
     }
 
     #[test]
