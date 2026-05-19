@@ -72,6 +72,7 @@ Owner: Cross-lane sync owner; Product/ExecutionPlan owner implements UX/runtime 
 ## Current Ubuntu x86 Q8 status
 
 - Current evidence posture: keep public status evidence-scoped. This sync note does not establish host availability or failure; where no current remote run was attempted, say that no Ubuntu timing/profiling validation is recorded for the slice.
+- Latest docs host-reporting audit (`qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-5e4b0b83-20260519T2329Z-docs-host-reporting-audit/README.md`) found no focused stale Ubuntu host-access wording across docs/status/context/validation notes/evidence READMEs. Remote validation was not attempted in that docs-only audit.
 - Recent retained control-plane/scheduler hygiene includes the FFN-down GEMM4 row-group min-input-groups guard. That evidence is default-off, synthetic scheduler evidence only; it is not broad throughput, support, portability, RSS, or default-on evidence.
 - Runtime/config hot-path overhead remains a benchmark-validity lesson: path sanity must precede new Q8 kernel or owner experiments.
 - `f65eac8` runtime-plan candidate is rejected: it timed out and still showed `getenv` / env-lock contention dominating.
