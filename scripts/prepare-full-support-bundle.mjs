@@ -26,7 +26,7 @@ const repoRoot = resolve(args.get('repo-root') || '.')
 const utcStamp = args.get('utc') || isoStamp(new Date())
 const gitHead = git(['rev-parse', 'HEAD'], repoRoot)
 const gitHeadShort = git(['rev-parse', '--short=12', 'HEAD'], repoRoot)
-const originMain = git(['rev-parse', 'origin/main'], repoRoot)
+const originMain = resolveOriginMain(repoRoot)
 const branch = git(['branch', '--show-current'], repoRoot)
 const outDir = resolve(args.get('out-dir') || join(repoRoot, 'target', `full-support-${utcStamp}-head-${gitHeadShort}`))
 const outDirRelative = relative(repoRoot, outDir) || '.'
@@ -659,6 +659,28 @@ async function collectFiles(rootDir, currentDir, output) {
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
+}
+
+function tryGit(args, cwd) {
+  try {
+    return git(args, cwd)
+  } catch {
+    return null
+  }
+}
+
+function resolveOriginMain(cwd) {
+  const candidates = [
+    'origin/main',
+    'refs/remotes/origin/main',
+    'main',
+    'refs/heads/main',
+  ]
+  for (const candidate of candidates) {
+    const resolved = tryGit(['rev-parse', '--verify', candidate], cwd)
+    if (resolved) return resolved
+  }
+  return 'unavailable: origin/main not fetched'
 }
 
 function gitLines(args, cwd) {
