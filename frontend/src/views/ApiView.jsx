@@ -1,4 +1,5 @@
 import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
+import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId, modelRuntimeIdMatches } from '../lib/modelState'
 
 function guardedApiFeatures(features = []) {
@@ -21,14 +22,15 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
   const apiFeatures = capabilities?.api_features || []
   const supportedFeatures = apiFeatures.filter((feature) => isSupportedCapabilityStatus(feature.status))
   const guardedFeatures = guardedApiFeatures(apiFeatures)
-  const selectedCompatibilityHint = findCompatibilityHint(capabilities, selectedModel)
+  const selectedChatGate = getChatGateState(capabilities, selectedModel, runtime)
+  const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
   const selectedCompatibilityTarget = isExactCompatibilityHint(selectedCompatibilityHint) ? selectedCompatibilityHint.target : null
-  const selectedCompatibilitySupported = selectedCompatibilityTarget ? isSupportedCapabilityStatus(selectedCompatibilityTarget.status) : false
+  const selectedCompatibilitySupported = selectedChatGate.contractSupported
   const selectedSupportLanes = exactRowSupportLanes(selectedCompatibilityTarget, apiFeatures)
   const generationReady = Boolean(runtime?.generation_ready)
   const loadedNow = Boolean(runtime?.loaded_now)
   const selectedRuntimeMatches = modelRuntimeIdMatches(selectedModel, runtime)
-  const selectedExactRowReady = Boolean(loadedNow && generationReady && selectedRuntimeMatches && selectedCompatibilitySupported)
+  const selectedExactRowReady = selectedChatGate.chatUnlocked
   const readinessPillCopy = selectedExactRowReady
     ? 'Selected exact row ready'
     : generationReady && selectedModel && !selectedRuntimeMatches
