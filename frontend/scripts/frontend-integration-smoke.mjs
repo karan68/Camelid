@@ -466,7 +466,7 @@ try {
     selectedModel: aliasSelectedModel,
     capabilities: green3BCapabilities,
   }))
-  assert.match(green3BApiMarkup, /Throughput readiness[\s\S]*Production-throughput support is advertised by \/api\/capabilities as supported exact row evidence/, 'API view should render green 3B production-throughput evidence only when /api/capabilities advertises it')
+  assert.match(green3BApiMarkup, /Throughput readiness[\s\S]*Production-throughput readiness is green for this supported exact row from production throughput validated evidence/, 'API view should render green 3B production-throughput evidence only when /api/capabilities advertises row-owned evidence')
   assert.doesNotMatch(green3BApiMarkup, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'API view 3B boundary should not repeat resolved template/Jinja or production-throughput blockers after green evidence')
 
   const green3BModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
@@ -489,9 +489,11 @@ try {
     installCatalogModel: noop,
     cancelModelDownload: noop,
   }))
+  const green3BTrackedCard = green3BModelsMarkup.match(/<article class="model-card models-model-card">(?:(?!<\/article>)[\s\S])*<strong>llama32_3b_instruct_q8_0<\/strong>(?:(?!<\/article>)[\s\S])*<\/article>/)?.[0] || ''
+  assert.ok(green3BTrackedCard, 'Models view should render the tracked 3B row card')
   assert.match(green3BModelsMarkup, /Chat unlockable/, 'Models tracked 3B card should remain chat-unlockable when exact row, runtime readiness, and green evidence all align')
   assert.match(green3BModelsMarkup, /Throughput: Production throughput ready for this exact row/, 'Models tracked 3B card should show production-throughput green only from row/API evidence')
-  assert.doesNotMatch(green3BModelsMarkup, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'Models tracked 3B card should not keep resolved 3B support blockers visible when evidence is green')
+  assert.doesNotMatch(green3BTrackedCard, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'Models tracked 3B card should not keep resolved 3B support blockers visible when evidence is green')
 
   assert.equal(
     resolveLoadedModelDisplayName({

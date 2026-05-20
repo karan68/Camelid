@@ -248,22 +248,20 @@ export function describeThroughputReadiness(target, apiFeatures = []) {
   const performance = target.performance_measured || ''
   const rowThroughputReady = hasExactRowProductionThroughputReadiness(target)
   const boundedPerformanceReady = hasExactRowBoundedPerformanceEvidence(target)
-  const ready = Boolean(feature || rowThroughputReady)
+  const ready = rowThroughputReady
   const label = ready ? 'Production throughput ready for this exact row' : 'Production throughput not promoted'
 
   return {
     key: 'throughput',
     label,
-    status: feature?.status || performance || 'not advertised',
+    status: performance || feature?.status || 'not advertised',
     tone: ready ? 'ready' : boundedPerformanceReady ? 'warm' : 'warm',
     ready,
-    copy: feature
-      ? `Production-throughput support is advertised by /api/capabilities as ${formatCapabilityStatus(feature.status)}: ${displayCapabilityCopy(feature.notes || 'No notes advertised.')}`
-      : rowThroughputReady
+    copy: rowThroughputReady
         ? `Production-throughput readiness is green for this supported exact row from ${formatCapabilityStatus(performance)} evidence reported by /api/capabilities.`
         : boundedPerformanceReady
-          ? `Bounded row-scoped performance/RSS evidence is present as ${formatCapabilityStatus(performance)}, but production throughput is still not promoted for this exact row.`
-          : 'Production throughput evidence is not promoted for this row; keep readiness guarded until /api/capabilities reports explicit production-throughput support.',
+          ? `Bounded row-scoped performance/RSS evidence is present as ${formatCapabilityStatus(performance)}, but production throughput is still not promoted for this exact row${feature ? `; generic API feature ${formatCapabilityStatus(feature.status)} does not widen row support.` : '.'}`
+          : `Production throughput evidence is not promoted for this row; keep readiness guarded until /api/capabilities reports explicit production-throughput support on the exact row${feature ? `, not just generic API feature ${formatCapabilityStatus(feature.status)}.` : '.'}`,
   }
 }
 

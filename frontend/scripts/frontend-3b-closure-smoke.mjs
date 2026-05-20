@@ -170,6 +170,20 @@ assert.equal(getChatGateState(noThreeBRowCapabilities, exactThreeBModel, runtime
 
 const lanes = exactRowSupportLanes(llama32ThreeBTarget, capabilities.api_features)
 assert.deepEqual(lanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', false]], '3B template/Jinja readiness is row-green while production throughput remains unpromoted')
+const genericThroughputCapabilities = {
+  ...capabilities,
+  api_features: [
+    {
+      id: 'production_throughput_api',
+      status: 'supported_current_gate',
+      notes: 'generic API throughput reporting exists',
+    },
+  ],
+}
+const lanesWithGenericThroughput = exactRowSupportLanes(llama32ThreeBTarget, genericThroughputCapabilities.api_features)
+const throughputLaneWithGenericFeature = lanesWithGenericThroughput.find((lane) => lane.key === 'throughput')
+assert.equal(throughputLaneWithGenericFeature.ready, false, '3B production-throughput readiness must stay row-owned and not inherit a generic API feature')
+assert.match(throughputLaneWithGenericFeature.copy, /generic API feature supported current gate does not widen row support/, '3B throughput copy must explain why generic API features do not promote exact-row throughput')
 assert.doesNotMatch(rowSupportBoundaryCopy(llama32ThreeBTarget, capabilities.api_features), /arbitrary|Jinja/i, '3B boundary copy should not repeat resolved row-scoped metadata-Jinja caveats')
 assert.match(rowSupportBoundaryCopy(llama32ThreeBTarget, capabilities.api_features), /production|throughput/i, '3B boundary copy must keep production-throughput caveats visible')
 assert.doesNotMatch(rowSupportNextStepCopy(llama32ThreeBTarget, capabilities.api_features), /arbitrary|Jinja/i, '3B next-step copy should not repeat resolved template/Jinja caveats')
