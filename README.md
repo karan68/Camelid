@@ -79,7 +79,7 @@ Camelid is advancing on three tracks:
 
 - **Supported-row hardening:** preserve TinyLlama as the full current gate, keep Llama 3.2 3B support wording tied to its exact-row API/WebUI/parity/runtime evidence, and continue portability/broader-context/production-throughput work without blurring support scope.
 - **Ubuntu x86 Q8 performance investigation:** default-off experimental acceleration work is exploring the measured Ubuntu x86 Q8 path through packed Q8 runtime storage, selected matrix-level experiments, and AVX2 packed kernels while keeping the safe fallback path intact. These paths remain under validation and are not public support, portability, or default-on acceleration claims.
-- **Active next-model bring-up:** Mistral 7B Instruct is the lead exact-row bring-up lane; Qwen 2.5 7B Instruct and Gemma 2 9B Instruct remain planned exact-row candidates.
+- **Active next-model bring-up:** Mistral 7B Instruct is the lead exact-row bring-up lane; Qwen 2.5 7B Instruct, Gemma 2 9B Instruct, and Fortytwo Strand Rust Coder 14B remain planned exact-row candidates.
 
 For deeper row-by-row promotion rules and blocker detail, see [`COMPATIBILITY.md`](COMPATIBILITY.md#locked-next-family-readiness-language), [`STATUS.md`](STATUS.md), and [`docs/performance/ubuntu-x86-q8.md`](docs/performance/ubuntu-x86-q8.md).
 
@@ -138,6 +138,7 @@ Camelid’s public support boundary is intentionally narrow and exact-row. Read 
 | Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | **Active validation; partial backend runtime only** | One-token backend MoE runtime evidence exists, with tokenizer/template and sparse MoE metadata proof. Blocker anchors: `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-gate9a-50tok-20260511/`, `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-longgen-continuation-20260511/`, and `qa/evidence-bundles/mixtral-8x7b-v0.1-q8-blocker-reconciliation-20260512/`. |
 | Qwen2.5-7B-Instruct-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/tokenizer planning only. |
 | gemma-2-9b-it-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected for acquisition/tokenizer planning only. |
+| Fortytwo-Network/Strand-Rust-Coder-14B-v1 | **Planned Rust-coder validation target** | Rust-specialized Qwen2.5-Coder-14B-derived model selected for future Camelid testing. Hugging Face lists Safetensors plus separate GGUF quantizations, including Q8_0; no Camelid load, tokenizer, GGUF, parity, API, WebUI, RSS, or throughput evidence is claimed yet. |
 
 ### Latest model checks
 
@@ -158,7 +159,7 @@ The maintainer matrix now includes four exact Q8_0 supported rows with checked r
 - Support language currently means only the exact supported rows above; Mistral has no support claim yet and may only be discussed as the exact active validation row above. The Mixtral row may only be described as one-token backend MoE runtime evidence with later-generation/API/WebUI/frontend readiness not yet established.
 - Checked context packs do **not** imply model-native or broader context support.
 - Template and bounded perf/RSS evidence for current supported rows is exact-row scoped; it does **not** imply broad arbitrary/Jinja-template behavior, production throughput, neighboring GGUFs, portability, or broader context support.
-- The next exact-row 8B, `Mistral-7B-Instruct-v0.3.Q8_0.gguf`, and `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` gaps are broader context, portability, repeated durability evidence, and normalized support bundles; Mistral also still needs explicit contract promotion after fail-closed API/WebUI/RSS readiness, and Mixtral must first fix later-generation divergence and the continuation hang before any API/WebUI/frontend support claim.
+- The next exact-row 8B, `Mistral-7B-Instruct-v0.3.Q8_0.gguf`, `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`, and `Fortytwo-Network/Strand-Rust-Coder-14B-v1` gaps are broader context, portability, repeated durability evidence, and normalized support bundles; Mistral also still needs explicit contract promotion after fail-closed API/WebUI/RSS readiness, Mixtral must first fix later-generation divergence and the continuation hang before any API/WebUI/frontend support claim, and Strand first needs acquisition, GGUF/tokenizer/runtime mapping, and parity validation before any support claim.
 
 Authoritative details live in [`COMPATIBILITY.md`](COMPATIBILITY.md). The current evidence snapshot lives in [`STATUS.md`](STATUS.md).
 
