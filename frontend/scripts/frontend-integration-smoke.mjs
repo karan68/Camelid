@@ -735,6 +735,7 @@ try {
     loaded_now: true,
     generation_ready: true,
     quant: 'Q8_0',
+    model_path: '/models/custom-exact-row-q8-0.gguf',
   }
   const genericExactCapabilities = {
     support_contract: capabilities.support_contract,
