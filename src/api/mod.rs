@@ -51,6 +51,7 @@ const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
 const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
+const STREAM_POLL_YIELD_ENV: &str = "CAMELID_STREAM_POLL_YIELD";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
 const JINJA_CHAT_TEMPLATE_NAME: &str = "chat";
@@ -3249,6 +3250,13 @@ fn stream_timing_diagnostics_enabled() -> bool {
     )
 }
 
+fn stream_poll_yield_enabled() -> bool {
+    matches!(
+        env::var(STREAM_POLL_YIELD_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON") | Ok("yes") | Ok("YES")
+    )
+}
+
 fn stream_role_timings_json(
     phase: &GenerationPhaseTimings,
     layers: &[GenerationLayerTimings],
@@ -3266,15 +3274,70 @@ fn stream_role_timings_json(
     })
 }
 
+fn stream_layer_role_hotspots_json(
+    layers: &[GenerationLayerTimings],
+    limit: usize,
+) -> serde_json::Value {
+    let mut rows = Vec::new();
+    for layer in layers {
+        let roles = [
+            ("attention_norm", layer.attention_norm),
+            ("attention_q", layer.attention_q),
+            ("attention_k", layer.attention_k),
+            ("attention_v", layer.attention_v),
+            ("attention_rope", layer.attention_rope),
+            ("kv_cache_write", layer.kv_cache_write),
+            ("attention_context", layer.attention_context),
+            ("attention_output", layer.attention_output),
+            ("attention_residual", layer.attention_residual),
+            ("ffn_norm", layer.ffn_norm),
+            ("ffn_gate", layer.ffn_gate),
+            ("ffn_up", layer.ffn_up),
+            ("ffn_activation", layer.ffn_activation),
+            ("ffn_down", layer.ffn_down),
+            ("ffn_residual", layer.ffn_residual),
+        ];
+        for (role, elapsed_ms) in roles {
+            if elapsed_ms > 0.0 && elapsed_ms.is_finite() {
+                rows.push((layer.layer_index, role, elapsed_ms));
+            }
+        }
+    }
+    rows.sort_by(|left, right| {
+        right
+            .2
+            .total_cmp(&left.2)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(right.1))
+    });
+
+    serde_json::Value::Array(
+        rows.into_iter()
+            .take(limit)
+            .map(|(layer_index, role, elapsed_ms)| {
+                serde_json::json!({
+                    "layer_index": layer_index,
+                    "role": role,
+                    "elapsed_ms": elapsed_ms,
+                })
+            })
+            .collect(),
+    )
+}
+
 fn stream_timing_diagnostics_json(
     timings: &GenerationTimings,
     first_content_ms: Option<u128>,
+    stream_events: StreamEventTimings,
 ) -> serde_json::Value {
+    let first_content_accounting = stream_first_content_accounting_json(timings, first_content_ms);
     serde_json::json!({
         "stream_timing_diagnostics": {
             "timings_ms": {
                 "generate": timings.generate,
                 "first_content": first_content_ms,
+                "first_content_accounting": first_content_accounting,
+                "stream_event_accounting": stream_event_accounting_json(stream_events),
                 "tokenize": timings.tokenize,
                 "weight_load": timings.weight_load,
                 "weight_cache_hit": timings.weight_cache_hit,
@@ -3286,22 +3349,82 @@ fn stream_timing_diagnostics_json(
                 "prefill_role_timings": stream_role_timings_json(&timings.prompt_evaluation.prefill, &timings.prompt_evaluation.prefill_layers),
                 "first_token_role_timings": stream_role_timings_json(&timings.prompt_evaluation.first_token, &timings.prompt_evaluation.first_token_layers),
                 "generation_role_timings": stream_role_timings_json(&timings.generation, &timings.layers),
+                "layer_role_hotspots": {
+                    "prefill": stream_layer_role_hotspots_json(&timings.prompt_evaluation.prefill_layers, 10),
+                    "first_token": stream_layer_role_hotspots_json(&timings.prompt_evaluation.first_token_layers, 10),
+                    "generation": stream_layer_role_hotspots_json(&timings.layers, 10),
+                },
             },
             "q8_schedule": timings.q8_schedule,
         }
     })
 }
 
+#[derive(Clone, Copy, Default)]
+struct StreamEventTimings {
+    poll_yield_enabled: bool,
+    role_yield: Option<u128>,
+    generate_start: Option<u128>,
+    first_content_yield: Option<u128>,
+    final_yield: Option<u128>,
+}
+
+fn stream_event_accounting_json(events: StreamEventTimings) -> serde_json::Value {
+    let delta = |later: Option<u128>, earlier: Option<u128>| {
+        later
+            .zip(earlier)
+            .map(|(later, earlier)| later as i128 - earlier as i128)
+    };
+    serde_json::json!({
+        "poll_yield_enabled": events.poll_yield_enabled,
+        "role_yield": events.role_yield,
+        "generate_start": events.generate_start,
+        "first_content_yield": events.first_content_yield,
+        "final_yield": events.final_yield,
+        "generate_start_minus_role_yield": delta(events.generate_start, events.role_yield),
+        "first_content_yield_minus_role_yield": delta(events.first_content_yield, events.role_yield),
+        "final_yield_minus_first_content_yield": delta(events.final_yield, events.first_content_yield),
+    })
+}
+
+fn stream_first_content_accounting_json(
+    timings: &GenerationTimings,
+    first_content_ms: Option<u128>,
+) -> serde_json::Value {
+    let prompt_eval_forward = timings.prompt_evaluation.prefill.forward_total
+        + timings.prompt_evaluation.first_token.forward_total;
+    let prompt_eval_logits =
+        timings.prompt_evaluation.prefill.logits + timings.prompt_evaluation.first_token.logits;
+    let prompt_eval_sample =
+        timings.prompt_evaluation.prefill.sample + timings.prompt_evaluation.first_token.sample;
+    let prompt_eval_forward_plus_sample = prompt_eval_forward + prompt_eval_sample;
+    let first_content = first_content_ms.map(|value| value as f64);
+
+    serde_json::json!({
+        "prompt_eval_forward_total": prompt_eval_forward,
+        "prompt_eval_logits": prompt_eval_logits,
+        "prompt_eval_sample": prompt_eval_sample,
+        "prompt_eval_forward_plus_sample": prompt_eval_forward_plus_sample,
+        "first_content_minus_prompt_eval_forward": first_content.map(|value| value - prompt_eval_forward),
+        "first_content_minus_prompt_eval_forward_plus_sample": first_content.map(|value| value - prompt_eval_forward_plus_sample),
+    })
+}
+
 fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     let model_id = prepared.model_id.clone();
     let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let stream_poll_yield = stream_poll_yield_enabled();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
     } else {
         format!("cmpl-{}", uuid::Uuid::new_v4())
     };
     let events = async_stream::stream! {
+        let stream_started = Instant::now();
+        let mut stream_event_timings = StreamEventTimings::default();
+        stream_event_timings.poll_yield_enabled = stream_poll_yield;
         if chat {
+            stream_event_timings.role_yield = Some(stream_started.elapsed().as_millis());
             let role_chunk = ChatCompletionStreamChunk {
                 id: stream_id.clone(),
                 object: "chat.completion.chunk",
@@ -3318,8 +3441,12 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                 camelid: None,
             };
             yield sse_json_event(&role_chunk);
+            if stream_poll_yield {
+                tokio::task::yield_now().await;
+            }
         }
 
+        stream_event_timings.generate_start = Some(stream_started.elapsed().as_millis());
         let generation_started = Instant::now();
         let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
         if collect_q8_schedule {
@@ -3453,6 +3580,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             if !delta.is_empty() {
                 if first_content_ms.is_none() {
                     first_content_ms = Some(generation_started.elapsed().as_millis());
+                    stream_event_timings.first_content_yield = Some(stream_started.elapsed().as_millis());
                 }
                 if chat {
                     let chunk = ChatCompletionStreamChunk {
@@ -3471,6 +3599,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                         camelid: None,
                     };
                     yield sse_json_event(&chunk);
+                    if stream_poll_yield {
+                        tokio::task::yield_now().await;
+                    }
                 } else {
                     let chunk = CompletionStreamChunk {
                         id: stream_id.clone(),
@@ -3485,6 +3616,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                         camelid: None,
                     };
                     yield sse_json_event(&chunk);
+                    if stream_poll_yield {
+                        tokio::task::yield_now().await;
+                    }
                 }
             }
             if finish_reason != "length" {
@@ -3503,8 +3637,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         if collect_q8_schedule {
             prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
         }
+        stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
         let camelid_diagnostics = stream_timing_diagnostics
-            .then(|| stream_timing_diagnostics_json(&prepared.timings, first_content_ms));
+            .then(|| stream_timing_diagnostics_json(&prepared.timings, first_content_ms, stream_event_timings));
 
         if chat {
             let final_chunk = ChatCompletionStreamChunk {
@@ -4235,9 +4370,14 @@ mod tests {
             ..GenerationTimings::default()
         };
         timings.prompt_evaluation.prefill.forward_total = 10.0;
+        timings.prompt_evaluation.prefill.logits = 1.5;
+        timings.prompt_evaluation.prefill.sample = 0.25;
         timings.prompt_evaluation.first_token.forward_total = 20.0;
+        timings.prompt_evaluation.first_token.logits = 2.5;
+        timings.prompt_evaluation.first_token.sample = 0.75;
         timings.generation.forward_total = 30.0;
         timings.prompt_evaluation.prefill_layers = vec![GenerationLayerTimings {
+            layer_index: 2,
             attention_context: 1.25,
             attention_output: 2.0,
             ffn_gate: 3.0,
@@ -4246,25 +4386,82 @@ mod tests {
             ..GenerationLayerTimings::default()
         }];
         timings.prompt_evaluation.first_token_layers = vec![GenerationLayerTimings {
+            layer_index: 3,
             attention_context: 0.5,
             ..GenerationLayerTimings::default()
         }];
         timings.layers = vec![
             GenerationLayerTimings {
+                layer_index: 4,
                 ffn_down: 7.0,
                 ..GenerationLayerTimings::default()
             },
             GenerationLayerTimings {
+                layer_index: 5,
                 ffn_down: 11.0,
                 attention_output: 13.0,
                 ..GenerationLayerTimings::default()
             },
         ];
 
-        let value = stream_timing_diagnostics_json(&timings, Some(321));
+        let value = stream_timing_diagnostics_json(
+            &timings,
+            Some(321),
+            StreamEventTimings {
+                poll_yield_enabled: true,
+                role_yield: Some(3),
+                generate_start: Some(5),
+                first_content_yield: Some(326),
+                final_yield: Some(1239),
+            },
+        );
         let diagnostics = &value["stream_timing_diagnostics"];
         assert_eq!(diagnostics["timings_ms"]["generate"], 1234);
         assert_eq!(diagnostics["timings_ms"]["first_content"], 321);
+        assert_eq!(
+            diagnostics["timings_ms"]["stream_event_accounting"]["poll_yield_enabled"],
+            true
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["stream_event_accounting"]["role_yield"],
+            3
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["stream_event_accounting"]["generate_start_minus_role_yield"],
+            2
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["stream_event_accounting"]
+                ["first_content_yield_minus_role_yield"],
+            323
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["stream_event_accounting"]
+                ["final_yield_minus_first_content_yield"],
+            913
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["first_content_accounting"]["prompt_eval_forward_total"],
+            30.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["first_content_accounting"]["prompt_eval_logits"],
+            4.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["first_content_accounting"]["prompt_eval_sample"],
+            1.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["first_content_accounting"]
+                ["first_content_minus_prompt_eval_forward"],
+            291.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["first_content_accounting"]
+                ["first_content_minus_prompt_eval_forward_plus_sample"],
+            290.0
+        );
         assert_eq!(diagnostics["timings_ms"]["weight_cache_hit"], true);
         assert_eq!(diagnostics["timings_ms"]["prompt_cache_hit"], false);
         assert_eq!(
@@ -4277,6 +4474,22 @@ mod tests {
         );
         assert_eq!(
             diagnostics["timings_ms"]["generation_role_timings"]["attention_output"],
+            13.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_hotspots"]["prefill"][0]["role"],
+            "ffn_down"
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_hotspots"]["prefill"][0]["layer_index"],
+            2
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_hotspots"]["generation"][0]["role"],
+            "attention_output"
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["layer_role_hotspots"]["generation"][0]["elapsed_ms"],
             13.0
         );
         assert!(diagnostics["q8_schedule"].is_null());

@@ -117,12 +117,20 @@ pub struct Q8_0PackedRows4Block {
     pub quants: [i8; 128],
 }
 
+#[repr(C, align(64))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q8_0AmxPackedBlock {
+    pub scales: [f32; 16],
+    pub quants: [i8; 512],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Q8_0PackedRows4 {
     pub rows: usize,
     pub blocks_per_row: usize,
     pub interleave: Q8_0PackedRows4Interleave,
     pub blocks: Vec<Q8_0PackedRows4Block>,
+    pub amx_blocks: Option<Vec<Q8_0AmxPackedBlock>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +184,7 @@ impl Q8_0PackedRows4 {
             rows,
             blocks_per_row,
             interleave,
+            amx_blocks: q8_0_pack_rows4_amx16_if_enabled(rows, blocks_per_row, interleave, &blocks),
             blocks,
         })
     }
@@ -238,6 +247,7 @@ impl Q8_0PackedRows4 {
             rows,
             blocks_per_row,
             interleave,
+            amx_blocks: q8_0_pack_rows4_amx16_if_enabled(rows, blocks_per_row, interleave, &blocks),
             blocks,
         })
     }
@@ -245,6 +255,53 @@ impl Q8_0PackedRows4 {
     pub fn byte_len(&self) -> usize {
         self.blocks.len() * std::mem::size_of::<Q8_0PackedRows4Block>()
     }
+}
+
+fn q8_0_pack_rows4_amx16_if_enabled(
+    rows: usize,
+    blocks_per_row: usize,
+    interleave: Q8_0PackedRows4Interleave,
+    rows4_blocks: &[Q8_0PackedRows4Block],
+) -> Option<Vec<Q8_0AmxPackedBlock>> {
+    if !x86_q8_amx_repack_enabled()
+        || interleave != Q8_0PackedRows4Interleave::I8
+        || !rows.is_multiple_of(16)
+    {
+        return None;
+    }
+    let expected = (rows / 4).checked_mul(blocks_per_row)?;
+    if rows4_blocks.len() != expected {
+        return None;
+    }
+
+    let mut amx_blocks = Vec::with_capacity((rows / 16) * blocks_per_row);
+    for output_tile in 0..rows / 16 {
+        let rows4_tile_base = output_tile * 4;
+        for block_idx in 0..blocks_per_row {
+            let mut packed = Q8_0AmxPackedBlock {
+                scales: [0.0; 16],
+                quants: [0; 512],
+            };
+            for n in 0..16 {
+                let rows4_group = rows4_tile_base + n / 4;
+                let lane = n % 4;
+                let source = &rows4_blocks[rows4_group * blocks_per_row + block_idx];
+                packed.scales[n] = source.scales[lane];
+                for k_group in 0..8 {
+                    for k_lane in 0..4 {
+                        let k = k_group * 4 + k_lane;
+                        let chunk = k / 8;
+                        let offset_in_chunk = k % 8;
+                        let src_idx = chunk * 32 + lane * 8 + offset_in_chunk;
+                        let dst_idx = k_group * 64 + n * 4 + k_lane;
+                        packed.quants[dst_idx] = source.quants[src_idx];
+                    }
+                }
+            }
+            amx_blocks.push(packed);
+        }
+    }
+    Some(amx_blocks)
 }
 
 fn q8_0_pack_trace_enabled() -> bool {
@@ -285,6 +342,16 @@ fn x86_q8_repack_enabled() -> bool {
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 fn x86_q8_repack_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_q8_amx_repack_enabled() -> bool {
+    env_flag_enabled("CAMELID_X86_Q8_AMX_REPACK")
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn x86_q8_amx_repack_enabled() -> bool {
     false
 }
 

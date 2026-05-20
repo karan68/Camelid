@@ -9,7 +9,7 @@ use std::{
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::Instant,
 };
@@ -37,6 +37,22 @@ use crate::{
     },
     BackendError, Result,
 };
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::tensor::Q8_0AmxPackedBlock;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe extern "C" {
+    fn camelid_x86_q8_amx_supported() -> std::os::raw::c_int;
+    fn camelid_q8_0_amx_compute_tile16(
+        input_groups: *const Q8_0PackedRows4Block,
+        blocks_per_row: usize,
+        m_rows: usize,
+        weight_blocks: *const Q8_0AmxPackedBlock,
+        output: *mut f32,
+        output_stride: usize,
+    );
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct LlamaKvCachePlan {
@@ -733,6 +749,8 @@ impl Q8RuntimeFlags {
             ),
             ffn_gate_up_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER",
+            ) || q8_0_env_flag_enabled_default_off(
+                "CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER",
             ),
             ffn_gate_up_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL",
@@ -742,6 +760,8 @@ impl Q8RuntimeFlags {
             ),
             ffn_down_decode_consumer: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
+            ) || q8_0_env_flag_enabled_default_off(
+                "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
             ),
             ffn_down_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
@@ -1448,6 +1468,14 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub rayon_fanout_boundaries: u64,
     pub i8mm_single_projection_calls: u64,
     pub i8mm_fused_gate_up_calls: u64,
+    pub i8mm_single_projection_by_role: HashMap<String, LlamaQ8ScheduleRoleTelemetry>,
+    pub output_projection_calls: u64,
+    pub output_projection_by_route: HashMap<String, LlamaQ8OutputProjectionRouteTelemetry>,
+    pub output_projection_by_layer_route:
+        HashMap<String, LlamaQ8OutputProjectionLayerRouteTelemetry>,
+    pub projection_route_denials: HashMap<String, LlamaQ8ProjectionRouteDenialTelemetry>,
+    pub ffn_gate_up_decode_consumer_activation_us: u64,
+    pub ffn_gate_up_decode_consumer_tensor_us: u64,
     pub activation_pack_calls: u64,
     pub activation_pack_rows: u64,
     pub activation_pack_bytes_requested: u64,
@@ -1458,11 +1486,70 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub activation_quantize_pack_us: u64,
     pub q8_gemm_compute_us: u64,
     pub conservative_tail_rows: u64,
+    pub ffn_down_gemm4_prefill_candidates: u64,
+    pub ffn_down_gemm4_prefill_reject_plan_off: u64,
+    pub ffn_down_gemm4_prefill_reject_rows_lt4: u64,
+    pub ffn_down_gemm4_prefill_reject_bad_input_width: u64,
+    pub ffn_down_gemm4_prefill_reject_no_runtime_packed: u64,
+    pub ffn_down_gemm4_prefill_reject_non_i8_interleave: u64,
+    pub ffn_down_decode_consumer_taken: u64,
+    pub prefill_single_token_fallbacks: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct LlamaQ8ScheduleRoleTelemetry {
+    pub calls: u64,
+    pub rows: u64,
+    pub pack_us: u64,
+    pub gemm_us: u64,
+    pub tail_rows: u64,
+    pub rayon_fanout_boundaries: u64,
+    pub scheduler_chunk_calls: u64,
+    pub scheduler_output_groups: u64,
+    pub scheduler_row_groups: u64,
+    pub scheduler_groups_per_chunk: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct LlamaQ8OutputProjectionRouteTelemetry {
+    pub role: String,
+    pub route: String,
+    pub calls: u64,
+    pub rows: u64,
+    pub input_width: u64,
+    pub output_width: u64,
+    pub elapsed_us: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct LlamaQ8OutputProjectionLayerRouteTelemetry {
+    pub layer_index: usize,
+    pub role: String,
+    pub route: String,
+    pub calls: u64,
+    pub rows: u64,
+    pub input_width: u64,
+    pub output_width: u64,
+    pub elapsed_us: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
+pub struct LlamaQ8ProjectionRouteDenialTelemetry {
+    pub role: String,
+    pub route: String,
+    pub reason: String,
+    pub denials: u64,
+    pub rows: u64,
+    pub input_width: u64,
+    pub output_width: u64,
 }
 
 static Q8_SCHED_RAYON_FANOUT_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_OUTPUT_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_CALLS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_ROWS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -1473,6 +1560,26 @@ static Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_Q8_GEMM_COMPUTE_US: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_CONSERVATIVE_TAIL_ROWS: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE: OnceLock<
+    Mutex<HashMap<String, LlamaQ8ScheduleRoleTelemetry>>,
+> = OnceLock::new();
+static Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE: OnceLock<
+    Mutex<HashMap<String, LlamaQ8OutputProjectionRouteTelemetry>>,
+> = OnceLock::new();
+static Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE: OnceLock<
+    Mutex<HashMap<String, LlamaQ8OutputProjectionLayerRouteTelemetry>>,
+> = OnceLock::new();
+static Q8_SCHED_PROJECTION_ROUTE_DENIALS: OnceLock<
+    Mutex<HashMap<String, LlamaQ8ProjectionRouteDenialTelemetry>>,
+> = OnceLock::new();
 static Q8_SCHED_TELEMETRY_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub fn q8_schedule_telemetry_enabled() -> bool {
@@ -1483,6 +1590,9 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_RAYON_FANOUT_BOUNDARIES.store(0, Ordering::Relaxed);
     Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS.store(0, Ordering::Relaxed);
+    Q8_SCHED_OUTPUT_PROJECTION_CALLS.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_ROWS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED.store(0, Ordering::Relaxed);
@@ -1493,6 +1603,35 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.store(0, Ordering::Relaxed);
     Q8_SCHED_Q8_GEMM_COMPUTE_US.store(0, Ordering::Relaxed);
     Q8_SCHED_CONSERVATIVE_TAIL_ROWS.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS.store(0, Ordering::Relaxed);
+    if let Some(by_role) = Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE.get() {
+        by_role.lock().expect("q8 role telemetry mutex").clear();
+    }
+    if let Some(by_route) = Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE.get() {
+        by_route
+            .lock()
+            .expect("q8 output projection telemetry mutex")
+            .clear();
+    }
+    if let Some(by_layer_route) = Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE.get() {
+        by_layer_route
+            .lock()
+            .expect("q8 output projection layer route telemetry mutex")
+            .clear();
+    }
+    if let Some(denials) = Q8_SCHED_PROJECTION_ROUTE_DENIALS.get() {
+        denials
+            .lock()
+            .expect("q8 projection route denial telemetry mutex")
+            .clear();
+    }
 }
 
 pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
@@ -1500,6 +1639,42 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
         rayon_fanout_boundaries: Q8_SCHED_RAYON_FANOUT_BOUNDARIES.load(Ordering::Relaxed),
         i8mm_single_projection_calls: Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS.load(Ordering::Relaxed),
         i8mm_fused_gate_up_calls: Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS.load(Ordering::Relaxed),
+        i8mm_single_projection_by_role: Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE
+            .get()
+            .map(|by_role| by_role.lock().expect("q8 role telemetry mutex").clone())
+            .unwrap_or_default(),
+        output_projection_calls: Q8_SCHED_OUTPUT_PROJECTION_CALLS.load(Ordering::Relaxed),
+        output_projection_by_route: Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE
+            .get()
+            .map(|by_route| {
+                by_route
+                    .lock()
+                    .expect("q8 output projection telemetry mutex")
+                    .clone()
+            })
+            .unwrap_or_default(),
+        output_projection_by_layer_route: Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE
+            .get()
+            .map(|by_layer_route| {
+                by_layer_route
+                    .lock()
+                    .expect("q8 output projection layer route telemetry mutex")
+                    .clone()
+            })
+            .unwrap_or_default(),
+        projection_route_denials: Q8_SCHED_PROJECTION_ROUTE_DENIALS
+            .get()
+            .map(|denials| {
+                denials
+                    .lock()
+                    .expect("q8 projection route denial telemetry mutex")
+                    .clone()
+            })
+            .unwrap_or_default(),
+        ffn_gate_up_decode_consumer_activation_us:
+            Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.load(Ordering::Relaxed),
+        ffn_gate_up_decode_consumer_tensor_us: Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US
+            .load(Ordering::Relaxed),
         activation_pack_calls: Q8_SCHED_ACTIVATION_PACK_CALLS.load(Ordering::Relaxed),
         activation_pack_rows: Q8_SCHED_ACTIVATION_PACK_ROWS.load(Ordering::Relaxed),
         activation_pack_bytes_requested: Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED
@@ -1511,6 +1686,22 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
         activation_quantize_pack_us: Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.load(Ordering::Relaxed),
         q8_gemm_compute_us: Q8_SCHED_Q8_GEMM_COMPUTE_US.load(Ordering::Relaxed),
         conservative_tail_rows: Q8_SCHED_CONSERVATIVE_TAIL_ROWS.load(Ordering::Relaxed),
+        ffn_down_gemm4_prefill_candidates: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES
+            .load(Ordering::Relaxed),
+        ffn_down_gemm4_prefill_reject_plan_off: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF
+            .load(Ordering::Relaxed),
+        ffn_down_gemm4_prefill_reject_rows_lt4: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4
+            .load(Ordering::Relaxed),
+        ffn_down_gemm4_prefill_reject_bad_input_width:
+            Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH.load(Ordering::Relaxed),
+        ffn_down_gemm4_prefill_reject_no_runtime_packed:
+            Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED.load(Ordering::Relaxed),
+        ffn_down_gemm4_prefill_reject_non_i8_interleave:
+            Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE.load(Ordering::Relaxed),
+        ffn_down_decode_consumer_taken: Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN
+            .load(Ordering::Relaxed),
+        prefill_single_token_fallbacks: Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -1570,6 +1761,256 @@ fn record_q8_schedule_activation_pack(
         &Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES,
         after_capacity_bytes as u64,
     );
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_i8mm_single_projection_role_call(
+    role: &str,
+    rows: u64,
+    rayon_fanout_boundaries: u64,
+) {
+    if !q8_schedule_telemetry_enabled() {
+        return;
+    }
+    update_q8_schedule_role(role, |entry| {
+        entry.calls = entry.calls.saturating_add(1);
+        entry.rows = entry.rows.saturating_add(rows);
+        entry.rayon_fanout_boundaries = entry
+            .rayon_fanout_boundaries
+            .saturating_add(rayon_fanout_boundaries);
+    });
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_i8mm_single_projection_role_pack(role: &str, elapsed_us: u128) {
+    if !q8_schedule_telemetry_enabled() {
+        return;
+    }
+    update_q8_schedule_role(role, |entry| {
+        entry.pack_us = entry.pack_us.saturating_add(elapsed_us as u64);
+    });
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_i8mm_single_projection_role_gemm(role: &str, elapsed_us: u128) {
+    if !q8_schedule_telemetry_enabled() {
+        return;
+    }
+    update_q8_schedule_role(role, |entry| {
+        entry.gemm_us = entry.gemm_us.saturating_add(elapsed_us as u64);
+    });
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_i8mm_single_projection_role_tail(role: &str, tail_rows: u64) {
+    if !q8_schedule_telemetry_enabled() || tail_rows == 0 {
+        return;
+    }
+    update_q8_schedule_role(role, |entry| {
+        entry.tail_rows = entry.tail_rows.saturating_add(tail_rows);
+    });
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_i8mm_single_projection_role_scheduler(
+    role: &str,
+    output_groups: u64,
+    row_groups: u64,
+    groups_per_chunk: u64,
+) {
+    if !q8_schedule_telemetry_enabled() || output_groups == 0 {
+        return;
+    }
+    update_q8_schedule_role(role, |entry| {
+        entry.scheduler_chunk_calls = entry.scheduler_chunk_calls.saturating_add(1);
+        entry.scheduler_output_groups = entry.scheduler_output_groups.saturating_add(output_groups);
+        entry.scheduler_row_groups = entry.scheduler_row_groups.saturating_add(row_groups);
+        entry.scheduler_groups_per_chunk = entry
+            .scheduler_groups_per_chunk
+            .saturating_add(groups_per_chunk.max(1));
+    });
+}
+
+#[allow(dead_code)]
+fn update_q8_schedule_role(role: &str, update: impl FnOnce(&mut LlamaQ8ScheduleRoleTelemetry)) {
+    let by_role =
+        Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut by_role = by_role.lock().expect("q8 role telemetry mutex");
+    update(by_role.entry(role.to_string()).or_default());
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_output_projection_route_call(
+    role: &str,
+    route: &str,
+    projection_name: Option<&str>,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+    elapsed_us: u128,
+) {
+    if !q8_schedule_telemetry_enabled() {
+        return;
+    }
+    Q8_SCHED_OUTPUT_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
+    let key = format!("{role}.{route}");
+    let by_route = Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut by_route = by_route
+        .lock()
+        .expect("q8 output projection telemetry mutex");
+    let entry = by_route
+        .entry(key)
+        .or_insert_with(|| LlamaQ8OutputProjectionRouteTelemetry {
+            role: role.to_string(),
+            route: route.to_string(),
+            ..LlamaQ8OutputProjectionRouteTelemetry::default()
+        });
+    entry.calls = entry.calls.saturating_add(1);
+    entry.rows = entry.rows.saturating_add(rows as u64);
+    entry.input_width = input_width as u64;
+    entry.output_width = output_width as u64;
+    entry.elapsed_us = entry.elapsed_us.saturating_add(elapsed_us as u64);
+
+    let Some(layer_index) = projection_name.and_then(q8_schedule_layer_index_for_projection_name)
+    else {
+        return;
+    };
+    let key = format!("layer_{layer_index}.{role}.{route}");
+    let by_layer_route =
+        Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut by_layer_route = by_layer_route
+        .lock()
+        .expect("q8 output projection layer route telemetry mutex");
+    let entry =
+        by_layer_route
+            .entry(key)
+            .or_insert_with(|| LlamaQ8OutputProjectionLayerRouteTelemetry {
+                layer_index,
+                role: role.to_string(),
+                route: route.to_string(),
+                ..LlamaQ8OutputProjectionLayerRouteTelemetry::default()
+            });
+    entry.calls = entry.calls.saturating_add(1);
+    entry.rows = entry.rows.saturating_add(rows as u64);
+    entry.input_width = input_width as u64;
+    entry.output_width = output_width as u64;
+    entry.elapsed_us = entry.elapsed_us.saturating_add(elapsed_us as u64);
+}
+
+fn q8_schedule_layer_index_for_projection_name(name: &str) -> Option<usize> {
+    let rest = name.strip_prefix("layer_")?;
+    let (digits, _) = rest.split_once('_')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn record_q8_schedule_projection_route_elapsed(
+    role: &str,
+    route: &str,
+    projection_name: &str,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+    started: Option<Instant>,
+) {
+    if let Some(started) = started {
+        record_q8_schedule_output_projection_route_call(
+            role,
+            route,
+            Some(projection_name),
+            rows,
+            input_width,
+            output_width,
+            started.elapsed().as_micros(),
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn record_q8_schedule_projection_route_denial(
+    role: &str,
+    route: &str,
+    reason: &str,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+) {
+    if !q8_schedule_telemetry_enabled() {
+        return;
+    }
+    let key = format!("{role}.{route}.{reason}");
+    let denials = Q8_SCHED_PROJECTION_ROUTE_DENIALS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut denials = denials
+        .lock()
+        .expect("q8 projection route denial telemetry mutex");
+    let entry = denials
+        .entry(key)
+        .or_insert_with(|| LlamaQ8ProjectionRouteDenialTelemetry {
+            role: role.to_string(),
+            route: route.to_string(),
+            reason: reason.to_string(),
+            ..LlamaQ8ProjectionRouteDenialTelemetry::default()
+        });
+    entry.denials = entry.denials.saturating_add(1);
+    entry.rows = entry.rows.saturating_add(rows as u64);
+    entry.input_width = input_width as u64;
+    entry.output_width = output_width as u64;
+}
+
+#[allow(dead_code)]
+fn q8_schedule_output_projection_route_kind(
+    weight: BorrowedLinearWeight<'_>,
+    input_width: usize,
+    output_width: usize,
+) -> &'static str {
+    if weight.source_type == Some(GgufTensorType::Q8_0) {
+        if q8_0_selected_borrowed_packed_rows4(weight)
+            .filter(|(packed, _)| {
+                packed.rows == output_width
+                    && packed.blocks_per_row == input_width / Q8_0_BLOCK_VALUES
+            })
+            .is_some()
+        {
+            "q8_0_borrowed_packed_rows4"
+        } else if weight.q8_0_blocks.is_some() {
+            "q8_0_retained_blocks"
+        } else if weight.q8_0_file_backing.is_some()
+            && weight.cols == input_width
+            && weight.rows == output_width
+            && input_width.is_multiple_of(Q8_0_BLOCK_VALUES)
+        {
+            "q8_0_file_reader"
+        } else {
+            "q8_0_f32_fallback"
+        }
+    } else {
+        "f32"
+    }
+}
+
+#[allow(dead_code)]
+fn q8_schedule_role_for_output_name(name: &str) -> &'static str {
+    if name.contains("attention_q") || name.contains("attn_q") {
+        "attention_q"
+    } else if name.contains("attention_k") || name.contains("attn_k") {
+        "attention_k"
+    } else if name.contains("attention_v") || name.contains("attn_v") {
+        "attention_v"
+    } else if name.contains("attention_output") || name.contains("attn_output") {
+        "attention_output"
+    } else if name.contains("ffn_gate") {
+        "ffn_gate"
+    } else if name.contains("ffn_up") {
+        "ffn_up"
+    } else if name.contains("ffn_down") {
+        "ffn_down"
+    } else if name.contains("logits") {
+        "logits"
+    } else {
+        "unknown"
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -2338,6 +2779,7 @@ impl LlamaInferenceSession {
             }
         } else {
             for token_id in &token_ids[..prefill_count] {
+                add_q8_schedule_counter(&Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS, 1);
                 let timed = self.forward_single_token_timed_internal(*token_id, false, false)?;
                 timings.add_assign(&timed.timings);
                 prefill_timings.add_assign(&timed.timings);
@@ -5356,12 +5798,28 @@ fn output_projection_with_layout_with_plan(
                 return Ok(output);
             }
             let token_major = borrowed_linear_weight_as_transposed(weight, input_width)?;
-            matmul_rhs_transposed_borrowed_with_precision_with_plan(
+            let output_width = token_major.rows;
+            let route =
+                q8_schedule_output_projection_route_kind(token_major, input_width, output_width);
+            let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let output = matmul_rhs_transposed_borrowed_with_precision_with_plan(
                 input,
                 token_major,
-                name,
+                name.as_str(),
                 runtime_plan,
-            )
+            )?;
+            if let Some(telemetry_started) = telemetry_started {
+                record_q8_schedule_output_projection_route_call(
+                    "logits",
+                    route,
+                    Some(&name),
+                    input.dim(0)?,
+                    input_width,
+                    output_width,
+                    telemetry_started.elapsed().as_micros(),
+                );
+            }
+            Ok(output)
         }
     }
 }
@@ -6204,12 +6662,23 @@ fn gated_ffn_activation_with_plan(
     let mut up = vec![0.0; up_width];
 
     let ffn_gate_up_decode_consumer = if collect_diagnostics {
+        if runtime_plan.q8.ffn_gate_up_decode_consumer {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "decode_consumer",
+                "stream_diagnostics_collect_projection_details",
+                rows,
+                input_width,
+                gate_width,
+            );
+        }
         None
     } else {
         try_x86_q8_ffn_gate_up_decode_consumer_path(
             input,
             gate_weight,
             up_weight,
+            &name,
             &mut gate,
             &mut up,
             runtime_plan,
@@ -6243,6 +6712,7 @@ fn gated_ffn_activation_with_plan(
         }
     };
 
+    let used_ffn_gate_up_decode_consumer = ffn_gate_up_decode_consumer.is_some();
     let (gate_elapsed, up_elapsed) = if let Some(elapsed) = ffn_gate_up_decode_consumer {
         elapsed
     } else if let Some((gate_transposed, up_transposed)) = shared_q8_gate_up {
@@ -6330,7 +6800,22 @@ fn gated_ffn_activation_with_plan(
         };
     }
     let activation_elapsed = started.elapsed().as_micros();
+    if used_ffn_gate_up_decode_consumer {
+        add_q8_schedule_counter(
+            &Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US,
+            activation_elapsed as u64,
+        );
+    }
+    let tensor_started = q8_schedule_telemetry_enabled().then(Instant::now);
     let tensor = CpuTensor::from_f32(name, vec![1, gate_width], gate)?;
+    if used_ffn_gate_up_decode_consumer {
+        if let Some(started) = tensor_started {
+            add_q8_schedule_counter(
+                &Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US,
+                started.elapsed().as_micros() as u64,
+            );
+        }
+    }
     let activation_diagnostic = if collect_diagnostics {
         Some(ffn_activation_diagnostics(
             gate_projection
@@ -6438,6 +6923,26 @@ fn gated_ffn_activation_batch(
     }
 
     let runtime_plan = ResolvedRuntimePlan::from_env()?;
+    let rows = input.dim(0)?;
+    if q8_schedule_telemetry_enabled()
+        && rows == 1
+        && runtime_plan.q8.ffn_gate_up_decode_consumer
+        && !runtime_plan.q8.ffn_gate_up_single_owner
+    {
+        let input_width = input.dim(1)?;
+        let gate_width = linear_output_width(input, gate_weight, "ffn gate")?;
+        let up_width = linear_output_width(input, up_weight, "ffn up")?;
+        if gate_width == up_width {
+            record_q8_schedule_projection_route_denial(
+                "ffn_gate_up",
+                "decode_consumer",
+                "batch_decode_requires_single_owner_or_direct_call",
+                rows,
+                input_width,
+                gate_width,
+            );
+        }
+    }
     if let Some(activated) = try_x86_q8_ffn_gate_up_single_owner_path(
         input,
         gate_weight,
@@ -6543,6 +7048,7 @@ fn try_x86_q8_ffn_gate_up_single_owner_path(
         input,
         gate_weight,
         up_weight,
+        &name,
         &mut gate,
         &mut up,
         &decode_plan,
@@ -7696,6 +8202,7 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
     input: &CpuTensor,
     gate_weight: &CpuTensor,
     up_weight: &CpuTensor,
+    name: &str,
     gate: &mut [f32],
     up: &mut [f32],
     runtime_plan: &ResolvedRuntimePlan,
@@ -7711,15 +8218,39 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
 
     let input_width = input.dim(1)?;
     if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_consumer",
+            "input_width_not_q8_block_multiple",
+            1,
+            input_width,
+            gate.len(),
+        );
         return Ok(None);
     }
 
     let Some((gate_packed, gate_width)) = q8_0_runtime_packed_projection(gate_weight, input_width)?
     else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_consumer",
+            "missing_gate_runtime_packed_rows4",
+            1,
+            input_width,
+            gate.len(),
+        );
         return Ok(None);
     };
     let Some((up_packed, up_width)) = q8_0_runtime_packed_projection(up_weight, input_width)?
     else {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_consumer",
+            "missing_up_runtime_packed_rows4",
+            1,
+            input_width,
+            up.len(),
+        );
         return Ok(None);
     };
     if gate_width != gate.len()
@@ -7728,6 +8259,14 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
         || gate_packed.interleave != Q8_0PackedRows4Interleave::I8
         || up_packed.interleave != Q8_0PackedRows4Interleave::I8
     {
+        record_q8_schedule_projection_route_denial(
+            "ffn_gate_up",
+            "decode_consumer",
+            "packed_projection_shape_or_interleave_mismatch",
+            1,
+            input_width,
+            gate.len(),
+        );
         return Ok(None);
     }
 
@@ -7741,6 +8280,15 @@ fn try_x86_q8_ffn_gate_up_decode_consumer_path(
         up,
     )?;
     let total_elapsed = started.elapsed().as_micros();
+    record_q8_schedule_output_projection_route_call(
+        "ffn_gate_up",
+        "decode_consumer",
+        Some(name),
+        1,
+        input_width,
+        gate_width,
+        total_elapsed,
+    );
     let gate_elapsed = total_elapsed / 2;
     Ok(Some((gate_elapsed, total_elapsed - gate_elapsed)))
 }
@@ -7774,19 +8322,281 @@ fn q8_0_runtime_packed_projection(
     Ok(Some((packed, output_width)))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum X86Q8FfnDownRouteKind {
+    Decode,
+    PackedRows4Matmul,
+    Gemm4Prefill,
+    SingleOwner,
+}
+
+impl X86Q8FfnDownRouteKind {
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Decode => "x86_decode_consumer",
+            Self::PackedRows4Matmul => "x86_packed_rows4_matmul",
+            Self::Gemm4Prefill => "x86_gemm4_prefill",
+            Self::SingleOwner => "x86_single_owner",
+        }
+    }
+}
+
+struct X86Q8FfnDownRoute<'a> {
+    packed: &'a Q8_0PackedRows4,
+    input_width: usize,
+    output_width: usize,
+}
+
+fn resolve_x86_q8_ffn_down_route<'a>(
+    input: &CpuTensor,
+    weight: &'a CpuTensor,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+    route: X86Q8FfnDownRouteKind,
+) -> Result<Option<X86Q8FfnDownRoute<'a>>> {
+    let route_enabled = match route {
+        X86Q8FfnDownRouteKind::Decode => runtime_plan.q8.ffn_down_decode_consumer,
+        X86Q8FfnDownRouteKind::PackedRows4Matmul => runtime_plan.q8.ffn_down_packed_rows4_matmul,
+        X86Q8FfnDownRouteKind::Gemm4Prefill => runtime_plan.q8.ffn_down_gemm4_prefill,
+        X86Q8FfnDownRouteKind::SingleOwner => runtime_plan.q8.ffn_down_single_owner,
+    };
+    let route_name = route.telemetry_name();
+    let is_gemm4_prefill = matches!(route, X86Q8FfnDownRouteKind::Gemm4Prefill);
+    if !route_enabled || rectangular_role != "ffn_down" || input.rank() != 2 || weight.rank() != 2 {
+        if is_gemm4_prefill
+            && rectangular_role == "ffn_down"
+            && input.rank() == 2
+            && weight.rank() == 2
+        {
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES, 1);
+            if !route_enabled {
+                add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF, 1);
+            }
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                if !route_enabled {
+                    "plan_off"
+                } else {
+                    "role_or_rank_mismatch"
+                },
+                input.dim(0).unwrap_or(0),
+                input.dim(1).unwrap_or(0),
+                0,
+            );
+        }
+        return Ok(None);
+    }
+
+    if is_gemm4_prefill {
+        add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES, 1);
+    }
+
+    let rows = input.dim(0)?;
+    match route {
+        X86Q8FfnDownRouteKind::Decode if rows != 1 => return Ok(None),
+        X86Q8FfnDownRouteKind::PackedRows4Matmul if rows <= 1 => return Ok(None),
+        X86Q8FfnDownRouteKind::Gemm4Prefill if rows < 4 => {
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4, 1);
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "rows_lt4",
+                rows,
+                input.dim(1).unwrap_or(0),
+                0,
+            );
+            return Ok(None);
+        }
+        X86Q8FfnDownRouteKind::SingleOwner if rows == 0 => return Ok(None),
+        _ => {}
+    }
+
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        if is_gemm4_prefill {
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH, 1);
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "bad_input_width",
+                rows,
+                input_width,
+                0,
+            );
+        }
+        return Ok(None);
+    }
+    if weight.source_type != Some(GgufTensorType::Q8_0) {
+        if is_gemm4_prefill {
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "non_q8_storage",
+                rows,
+                input_width,
+                0,
+            );
+        }
+        return Ok(None);
+    }
+
+    let weight_rows = weight.dim(0)?;
+    let weight_cols = weight.dim(1)?;
+    let output_width = if weight_rows == input_width {
+        weight_cols
+    } else if weight_cols == input_width {
+        weight_rows
+    } else {
+        if is_gemm4_prefill {
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "weight_shape_mismatch",
+                rows,
+                input_width,
+                0,
+            );
+        }
+        return Ok(None);
+    };
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
+        if is_gemm4_prefill {
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED, 1);
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "no_runtime_packed",
+                rows,
+                input_width,
+                output_width,
+            );
+        }
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8 {
+        if is_gemm4_prefill {
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE, 1);
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "non_i8_interleave",
+                rows,
+                input_width,
+                output_width,
+            );
+        }
+        return Ok(None);
+    }
+    if packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+        || !output_width.is_multiple_of(4)
+    {
+        if is_gemm4_prefill {
+            record_q8_schedule_projection_route_denial(
+                "ffn_down",
+                route_name,
+                "packed_shape_mismatch",
+                rows,
+                input_width,
+                output_width,
+            );
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(X86Q8FfnDownRoute {
+        packed,
+        input_width,
+        output_width,
+    }))
+}
+
 fn q8_0_packed_rows4_single_input_projection(
     packed: &Q8_0PackedRows4,
     quantized_input: &[Q8_0Block],
     output_width: usize,
     name: &str,
 ) -> Result<CpuTensor> {
+    q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+        packed,
+        quantized_input,
+        output_width,
+        name,
+        false,
+    )
+}
+
+fn q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+    packed: &Q8_0PackedRows4,
+    quantized_input: &[Q8_0Block],
+    output_width: usize,
+    name: &str,
+    decode_group_chunking: bool,
+) -> Result<CpuTensor> {
     let mut output = vec![0.0_f32; output_width];
-    q8_0_packed_rows4_single_input_projection_into(packed, quantized_input, &mut output)?;
+    q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+        packed,
+        quantized_input,
+        &mut output,
+        decode_group_chunking,
+    )?;
     CpuTensor::from_f32(name, vec![1, output_width], output)
 }
 
 fn x86_q8_packed_rows4_serial_decode_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE")
+}
+
+fn mac_q8_ffn_down_decode_group_chunking_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING")
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+fn mac_q8_ffn_down_decode_groups_per_chunk() -> usize {
+    env::var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(16)
+}
+
+fn mac_q8_ffn_down_decode_consumer_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER")
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+fn mac_q8_ffn_down_single_projection_scheduler_counters_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS")
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+fn q8_ffn_down_decode_consumer_route_name(decode_group_chunking: bool) -> &'static str {
+    if decode_group_chunking {
+        "mac_decode_consumer_group_chunking"
+    } else if mac_q8_ffn_down_decode_consumer_enabled() {
+        "mac_decode_consumer"
+    } else {
+        "x86_decode_consumer"
+    }
 }
 
 fn should_parallelize_x86_q8_packed_rows4_decode_output(output_width: usize) -> bool {
@@ -7795,10 +8605,25 @@ fn should_parallelize_x86_q8_packed_rows4_decode_output(output_width: usize) -> 
         && rayon::current_num_threads() > 1
 }
 
+#[allow(dead_code)]
 fn q8_0_packed_rows4_single_input_projection_into(
     packed: &Q8_0PackedRows4,
     quantized_input: &[Q8_0Block],
     output: &mut [f32],
+) -> Result<()> {
+    q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+        packed,
+        quantized_input,
+        output,
+        false,
+    )
+}
+
+fn q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+    packed: &Q8_0PackedRows4,
+    quantized_input: &[Q8_0Block],
+    output: &mut [f32],
+    decode_group_chunking: bool,
 ) -> Result<()> {
     let output_width = output.len();
     let output_groups = q8_0_packed_rows4_output_groups(output_width, "decode projection")?;
@@ -7826,10 +8651,25 @@ fn q8_0_packed_rows4_single_input_projection_into(
     };
 
     if output_groups > 1 && should_parallelize_x86_q8_packed_rows4_decode_output(output_width) {
-        output
-            .par_chunks_mut(4)
-            .enumerate()
-            .for_each(|(group_idx, output_chunk)| compute_group(group_idx, output_chunk));
+        if decode_group_chunking {
+            let groups_per_chunk = mac_q8_ffn_down_decode_groups_per_chunk().min(output_groups);
+            let chunk_floats = groups_per_chunk * 4;
+            output.par_chunks_mut(chunk_floats).enumerate().for_each(
+                |(chunk_idx, output_chunk)| {
+                    let first_group_idx = chunk_idx * groups_per_chunk;
+                    for (local_group_idx, output_group) in
+                        output_chunk.chunks_exact_mut(4).enumerate()
+                    {
+                        compute_group(first_group_idx + local_group_idx, output_group);
+                    }
+                },
+            );
+        } else {
+            output
+                .par_chunks_mut(4)
+                .enumerate()
+                .for_each(|(group_idx, output_chunk)| compute_group(group_idx, output_chunk));
+        }
     } else {
         for (group_idx, output_chunk) in output.chunks_exact_mut(4).enumerate() {
             compute_group(group_idx, output_chunk);
@@ -8265,26 +9105,54 @@ fn q8_0_packed_rows4_matmul_projection_from_quantized(
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
-fn q8_0_packed_rows4_gemm4_block(
+fn q8_0_packed_rows4_gemm4_accumulate_block(
     input_block: &Q8_0PackedRows4Block,
     weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
     use_avx2: bool,
-) -> [[i32; 4]; 4] {
+) {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         if use_avx2 && std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime feature detection confirms AVX2 support; both operands are
-            // complete rows4/I8 packed Q8_0 blocks.
-            return unsafe {
-                q8_0_packed_rows4_gemm4_block_avx2(
+            // SAFETY: runtime feature detection confirms AVX2 support; pointers reference
+            // complete packed rows4/I8 Q8_0 blocks and a contiguous 4x4 f32 accumulator.
+            unsafe {
+                q8_0_packed_rows4_gemm4_accumulate_block_avx2(
                     input_block.quants.as_ptr(),
+                    input_block.scales.as_ptr(),
                     weight_block.quants.as_ptr(),
-                )
-            };
+                    weight_block.scales.as_ptr(),
+                    sums.as_mut_ptr().cast::<f32>(),
+                );
+            }
+            return;
         }
     }
+
     let _ = use_avx2;
-    q8_0_packed_rows4_gemm4_block_scalar(input_block, weight_block)
+    let int_sums = q8_0_packed_rows4_gemm4_block_scalar(input_block, weight_block);
+    for input_lane in 0..4 {
+        let input_scale = input_block.scales[input_lane];
+        for output_lane in 0..4 {
+            sums[input_lane][output_lane] += int_sums[input_lane][output_lane] as f32
+                * weight_block.scales[output_lane]
+                * input_scale;
+        }
+    }
+}
+
+#[inline(always)]
+fn q8_0_packed_rows4_prefetch_block(block: &Q8_0PackedRows4Block) {
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        std::arch::x86::_mm_prefetch(block.quants.as_ptr(), std::arch::x86::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(block.quants.as_ptr(), std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let _ = block;
 }
 
 fn q8_0_packed_rows4_gemm4_block_scalar(
@@ -8330,17 +9198,19 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel_row_group_parallel(
                 let weight_group = &packed_weight.blocks
                     [output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
                 let mut sums = [[0.0_f32; 4]; 4];
-                for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
-                    let int_sums =
-                        q8_0_packed_rows4_gemm4_block(input_block, weight_block, use_avx2);
-                    for input_lane in 0..4 {
-                        for output_lane in 0..4 {
-                            sums[input_lane][output_lane] += int_sums[input_lane][output_lane]
-                                as f32
-                                * weight_block.scales[output_lane]
-                                * input_block.scales[input_lane];
-                        }
+                for (block_idx, (input_block, weight_block)) in
+                    input_blocks.iter().zip(weight_group).enumerate()
+                {
+                    if block_idx + 1 < blocks_per_row {
+                        q8_0_packed_rows4_prefetch_block(&input_blocks[block_idx + 1]);
+                        q8_0_packed_rows4_prefetch_block(&weight_group[block_idx + 1]);
                     }
+                    q8_0_packed_rows4_gemm4_accumulate_block(
+                        input_block,
+                        weight_block,
+                        &mut sums,
+                        use_avx2,
+                    );
                 }
                 let start = output_group * 4;
                 row0[start..start + 4].copy_from_slice(&sums[0]);
@@ -8378,17 +9248,19 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
                     let weight_group = &packed_weight.blocks
                         [output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
                     let mut sums = [[0.0_f32; 4]; 4];
-                    for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
-                        let int_sums =
-                            q8_0_packed_rows4_gemm4_block(input_block, weight_block, use_avx2);
-                        for input_lane in 0..4 {
-                            for output_lane in 0..4 {
-                                sums[input_lane][output_lane] += int_sums[input_lane][output_lane]
-                                    as f32
-                                    * weight_block.scales[output_lane]
-                                    * input_block.scales[input_lane];
-                            }
+                    for (block_idx, (input_block, weight_block)) in
+                        input_blocks.iter().zip(weight_group).enumerate()
+                    {
+                        if block_idx + 1 < blocks_per_row {
+                            q8_0_packed_rows4_prefetch_block(&input_blocks[block_idx + 1]);
+                            q8_0_packed_rows4_prefetch_block(&weight_group[block_idx + 1]);
                         }
+                        q8_0_packed_rows4_gemm4_accumulate_block(
+                            input_block,
+                            weight_block,
+                            &mut sums,
+                            use_avx2,
+                        );
                     }
                     row0_chunk.copy_from_slice(&sums[0]);
                     row1_chunk.copy_from_slice(&sums[1]);
@@ -8486,24 +9358,34 @@ fn q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
     CpuTensor::from_f32(name, vec![rows, output_width], output)
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx2(
     input_packed: *const i8,
+    input_scales: *const f32,
     weight_packed: *const i8,
-) -> [[i32; 4]; 4] {
-    #[cfg(target_arch = "x86")]
-    use std::arch::x86::{
-        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
-    };
-    #[cfg(target_arch = "x86_64")]
+    weight_scales: *const f32,
+    sums: *mut f32,
+) {
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
-        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
-        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_castsi256_si128,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_ps, _mm_cvtepi32_ps,
+        _mm_hadd_epi32, _mm_loadl_epi64, _mm_loadu_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_si128,
+        _mm_storeu_ps, _mm_unpacklo_epi64,
     };
+
+    #[inline(always)]
+    unsafe fn reduce_pairs_i32x8_to_i32x4(
+        acc: std::arch::x86_64::__m256i,
+    ) -> std::arch::x86_64::__m128i {
+        let zero = _mm_setzero_si128();
+        let lo = _mm256_castsi256_si128(acc);
+        let hi = _mm256_extracti128_si256::<1>(acc);
+        let lo = _mm_hadd_epi32(lo, zero);
+        let hi = _mm_hadd_epi32(hi, zero);
+        _mm_unpacklo_epi64(lo, hi)
+    }
 
     let ones = _mm256_set1_epi16(1);
     let mut acc0 = _mm256_setzero_si256();
@@ -8514,10 +9396,6 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
     for chunk in 0..4usize {
         let chunk_start = chunk * 32;
         let weight32 = unsafe { _mm256_loadu_si256(weight_packed.add(chunk_start).cast()) };
-        // Same signed-i8 lowering as llama.cpp ggml_vec_dot_q8_0_q8_0: abs(lhs)
-        // as unsigned bytes, sign(rhs, lhs), then maddubs+madd. Here lhs is the
-        // four packed output rows, reused across all four input rows in this 4x4
-        // GEMM block, avoiding the old per-input stack repack and repeated weight abs.
         let abs_weight = _mm256_sign_epi8(weight32, weight32);
 
         let lane0 = unsafe { _mm_loadl_epi64(input_packed.add(chunk_start).cast()) };
@@ -8553,42 +9431,39 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
         );
     }
 
-    let mut lanes0 = [0_i32; 8];
-    let mut lanes1 = [0_i32; 8];
-    let mut lanes2 = [0_i32; 8];
-    let mut lanes3 = [0_i32; 8];
-    unsafe {
-        _mm256_storeu_si256(lanes0.as_mut_ptr().cast(), acc0);
-        _mm256_storeu_si256(lanes1.as_mut_ptr().cast(), acc1);
-        _mm256_storeu_si256(lanes2.as_mut_ptr().cast(), acc2);
-        _mm256_storeu_si256(lanes3.as_mut_ptr().cast(), acc3);
-    }
-    [
-        [
-            lanes0[0] + lanes0[1],
-            lanes0[2] + lanes0[3],
-            lanes0[4] + lanes0[5],
-            lanes0[6] + lanes0[7],
-        ],
-        [
-            lanes1[0] + lanes1[1],
-            lanes1[2] + lanes1[3],
-            lanes1[4] + lanes1[5],
-            lanes1[6] + lanes1[7],
-        ],
-        [
-            lanes2[0] + lanes2[1],
-            lanes2[2] + lanes2[3],
-            lanes2[4] + lanes2[5],
-            lanes2[6] + lanes2[7],
-        ],
-        [
-            lanes3[0] + lanes3[1],
-            lanes3[2] + lanes3[3],
-            lanes3[4] + lanes3[5],
-            lanes3[6] + lanes3[7],
-        ],
-    ]
+    let weight_scale = unsafe { _mm_loadu_ps(weight_scales) };
+
+    let values0 = _mm_cvtepi32_ps(unsafe { reduce_pairs_i32x8_to_i32x4(acc0) });
+    let scaled0 = _mm_mul_ps(
+        _mm_mul_ps(values0, weight_scale),
+        _mm_set1_ps(unsafe { *input_scales.add(0) }),
+    );
+    let sum0 = unsafe { _mm_loadu_ps(sums.add(0)) };
+    unsafe { _mm_storeu_ps(sums.add(0), _mm_add_ps(sum0, scaled0)) };
+
+    let values1 = _mm_cvtepi32_ps(unsafe { reduce_pairs_i32x8_to_i32x4(acc1) });
+    let scaled1 = _mm_mul_ps(
+        _mm_mul_ps(values1, weight_scale),
+        _mm_set1_ps(unsafe { *input_scales.add(1) }),
+    );
+    let sum1 = unsafe { _mm_loadu_ps(sums.add(4)) };
+    unsafe { _mm_storeu_ps(sums.add(4), _mm_add_ps(sum1, scaled1)) };
+
+    let values2 = _mm_cvtepi32_ps(unsafe { reduce_pairs_i32x8_to_i32x4(acc2) });
+    let scaled2 = _mm_mul_ps(
+        _mm_mul_ps(values2, weight_scale),
+        _mm_set1_ps(unsafe { *input_scales.add(2) }),
+    );
+    let sum2 = unsafe { _mm_loadu_ps(sums.add(8)) };
+    unsafe { _mm_storeu_ps(sums.add(8), _mm_add_ps(sum2, scaled2)) };
+
+    let values3 = _mm_cvtepi32_ps(unsafe { reduce_pairs_i32x8_to_i32x4(acc3) });
+    let scaled3 = _mm_mul_ps(
+        _mm_mul_ps(values3, weight_scale),
+        _mm_set1_ps(unsafe { *input_scales.add(3) }),
+    );
+    let sum3 = unsafe { _mm_loadu_ps(sums.add(12)) };
+    unsafe { _mm_storeu_ps(sums.add(12), _mm_add_ps(sum3, scaled3)) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9000,42 +9875,31 @@ fn try_x86_q8_ffn_down_packed_rows4_matmul_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.ffn_down_packed_rows4_matmul
-        || rectangular_role != "ffn_down"
-        || input.rank() != 2
-        || weight.rank() != 2
-        || weight.source_type != Some(GgufTensorType::Q8_0)
-    {
-        return Ok(None);
-    }
-
-    let input_width = input.dim(1)?;
-    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Ok(None);
-    }
-
-    let weight_rows = weight.dim(0)?;
-    let weight_cols = weight.dim(1)?;
-    let output_width = if weight_rows == input_width {
-        weight_cols
-    } else if weight_cols == input_width {
-        weight_rows
-    } else {
+    let Some(route) = resolve_x86_q8_ffn_down_route(
+        input,
+        weight,
+        rectangular_role,
+        runtime_plan,
+        X86Q8FfnDownRouteKind::PackedRows4Matmul,
+    )?
+    else {
         return Ok(None);
     };
 
-    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
-        return Ok(None);
-    };
-    if packed.interleave != Q8_0PackedRows4Interleave::I8
-        || packed.rows != output_width
-        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
-        || !output_width.is_multiple_of(4)
-    {
-        return Ok(None);
-    }
-
-    q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
+    let rows = input.dim(0)?;
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+    let output =
+        q8_0_packed_rows4_matmul_projection(input, route.packed, route.output_width, name)?;
+    record_q8_schedule_projection_route_elapsed(
+        "ffn_down",
+        "x86_packed_rows4_matmul",
+        name,
+        rows,
+        route.input_width,
+        route.output_width,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 fn try_x86_q8_ffn_down_gemm4_prefill_path(
@@ -9045,35 +9909,42 @@ fn try_x86_q8_ffn_down_gemm4_prefill_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.ffn_down_gemm4_prefill
-        || rectangular_role != "ffn_down"
-        || input.rank() != 2
-        || input.dim(0)? < 4
-    {
-        return Ok(None);
-    }
-
-    let input_width = input.dim(1)?;
-    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Ok(None);
-    }
-
-    let Some((packed, output_width)) = q8_0_runtime_packed_projection(weight, input_width)? else {
+    let Some(route) = resolve_x86_q8_ffn_down_route(
+        input,
+        weight,
+        rectangular_role,
+        runtime_plan,
+        X86Q8FfnDownRouteKind::Gemm4Prefill,
+    )?
+    else {
         return Ok(None);
     };
-    if packed.interleave != Q8_0PackedRows4Interleave::I8 {
-        return Ok(None);
-    }
 
-    q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
+    let rows = input.dim(0)?;
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+    let output = q8_0_packed_rows4_gemm4_projection_with_row_group_schedule(
         input,
-        packed,
-        output_width,
+        route.packed,
+        route.output_width,
         name,
         runtime_plan.q8.ffn_down_gemm4_row_group_schedule,
         runtime_plan.q8.ffn_down_gemm4_avx2,
-    )
-    .map(Some)
+    )?;
+    let route_name = if runtime_plan.q8.ffn_down_gemm4_row_group_schedule {
+        "x86_gemm4_prefill_row_group"
+    } else {
+        "x86_gemm4_prefill"
+    };
+    record_q8_schedule_projection_route_elapsed(
+        "ffn_down",
+        route_name,
+        name,
+        rows,
+        route.input_width,
+        route.output_width,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 fn try_x86_q8_ffn_down_single_owner_path(
@@ -9083,38 +9954,45 @@ fn try_x86_q8_ffn_down_single_owner_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.ffn_down_single_owner
-        || rectangular_role != "ffn_down"
-        || input.rank() != 2
-        || weight.rank() != 2
-    {
-        return Ok(None);
-    }
-
-    let input_width = input.dim(1)?;
-    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
-        return Ok(None);
-    }
-
-    let Some((packed, output_width)) = q8_0_runtime_packed_projection(weight, input_width)? else {
+    let Some(route) = resolve_x86_q8_ffn_down_route(
+        input,
+        weight,
+        rectangular_role,
+        runtime_plan,
+        X86Q8FfnDownRouteKind::SingleOwner,
+    )?
+    else {
         return Ok(None);
     };
-    if packed.interleave != Q8_0PackedRows4Interleave::I8 {
-        return Ok(None);
-    }
 
-    if input.dim(0)? == 1 {
-        let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
+    let rows = input.dim(0)?;
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+    let output = if rows == 1 {
+        let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
         q8_0_packed_rows4_single_input_projection(
-            packed,
+            route.packed,
             &quantized_input.blocks,
-            output_width,
+            route.output_width,
             name,
-        )
-        .map(Some)
+        )?
     } else {
-        q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
-    }
+        q8_0_packed_rows4_matmul_projection(input, route.packed, route.output_width, name)?
+    };
+    let route_name = if rows == 1 {
+        "x86_single_owner_decode"
+    } else {
+        "x86_single_owner_prefill"
+    };
+    record_q8_schedule_projection_route_elapsed(
+        "ffn_down",
+        route_name,
+        name,
+        rows,
+        route.input_width,
+        route.output_width,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 fn try_x86_q8_ffn_down_decode_consumer_path(
@@ -9124,44 +10002,39 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.ffn_down_decode_consumer
-        || rectangular_role != "ffn_down"
-        || input.rank() != 2
-        || input.dim(0)? != 1
-        || weight.source_type != Some(GgufTensorType::Q8_0)
-    {
-        return Ok(None);
-    }
-
-    let input_width = input.dim(1)?;
-    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) || weight.rank() != 2 {
-        return Ok(None);
-    }
-
-    let weight_rows = weight.dim(0)?;
-    let weight_cols = weight.dim(1)?;
-    let output_width = if weight_rows == input_width {
-        weight_cols
-    } else if weight_cols == input_width {
-        weight_rows
-    } else {
+    let Some(route) = resolve_x86_q8_ffn_down_route(
+        input,
+        weight,
+        rectangular_role,
+        runtime_plan,
+        X86Q8FfnDownRouteKind::Decode,
+    )?
+    else {
         return Ok(None);
     };
 
-    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
-        return Ok(None);
-    };
-    if packed.interleave != Q8_0PackedRows4Interleave::I8
-        || packed.rows != output_width
-        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
-        || !output_width.is_multiple_of(4)
-    {
-        return Ok(None);
-    }
-
-    let quantized_input = quantize_q8_0_row(&input.data[..input_width]);
-    q8_0_packed_rows4_single_input_projection(packed, &quantized_input.blocks, output_width, name)
-        .map(Some)
+    let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+    add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
+    let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
+    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled();
+    let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
+        route.packed,
+        &quantized_input.blocks,
+        route.output_width,
+        name,
+        decode_group_chunking,
+    )?;
+    let route_name = q8_ffn_down_decode_consumer_route_name(decode_group_chunking);
+    record_q8_schedule_projection_route_elapsed(
+        "ffn_down",
+        route_name,
+        name,
+        1,
+        route.input_width,
+        route.output_width,
+        telemetry_started,
+    );
+    Ok(Some(output))
 }
 
 #[allow(dead_code)]
@@ -9180,6 +10053,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
     name: impl Into<String>,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<CpuTensor> {
+    let name = name.into();
     let rows = input.dim(0)?;
     let input_width = input.dim(1)?;
     let output_width = weight.dim(0)?;
@@ -9221,6 +10095,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
                     input,
                     packed,
                     output_width,
+                    q8_schedule_role_for_output_name(&name),
                     name,
                 );
             }
@@ -11401,6 +12276,7 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
     input: &CpuTensor,
     packed_weight: &Q8_0PackedRows4,
     output_width: usize,
+    q8_role: &str,
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
@@ -11422,7 +12298,18 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
     let packed_rows = rows / 4 * 4;
     let collect_q8_schedule = q8_schedule_telemetry_enabled();
     if collect_q8_schedule {
+        let row_groups = (packed_rows / 4) as u64;
         add_q8_schedule_counter(&Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS, 1);
+        record_q8_schedule_i8mm_single_projection_role_call(q8_role, rows as u64, row_groups);
+        if q8_role == "ffn_down" && mac_q8_ffn_down_single_projection_scheduler_counters_enabled() {
+            let output_groups = (output_width / 4) as u64;
+            record_q8_schedule_i8mm_single_projection_role_scheduler(
+                q8_role,
+                output_groups,
+                row_groups,
+                1,
+            );
+        }
     }
     with_q8_0_file_reader_quantized_inputs(|quantized_inputs| {
         quantized_inputs.clear();
@@ -11439,13 +12326,15 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
                 &mut packed_inputs,
             );
             if let Some(pack_started) = pack_started {
+                let elapsed_us = pack_started.elapsed().as_micros();
                 record_q8_schedule_activation_pack(
                     &mut packed_inputs,
                     before_capacity,
                     packed_rows,
                     blocks_per_row,
-                    pack_started.elapsed().as_micros(),
+                    elapsed_us,
                 );
+                record_q8_schedule_i8mm_single_projection_role_pack(q8_role, elapsed_us);
             }
             let gemm_started = collect_q8_schedule.then(Instant::now);
             run_q8_0_packed_rows4_prefill_i8mm_kernel(
@@ -11456,10 +12345,9 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
                 collect_q8_schedule,
             );
             if let Some(gemm_started) = gemm_started {
-                add_q8_schedule_counter(
-                    &Q8_SCHED_Q8_GEMM_COMPUTE_US,
-                    gemm_started.elapsed().as_micros() as u64,
-                );
+                let elapsed_us = gemm_started.elapsed().as_micros();
+                add_q8_schedule_counter(&Q8_SCHED_Q8_GEMM_COMPUTE_US, elapsed_us as u64);
+                record_q8_schedule_i8mm_single_projection_role_gemm(q8_role, elapsed_us);
             }
             packed_inputs.clear();
             cap_q8_0_file_reader_scratch(&mut packed_inputs, 0);
@@ -11468,6 +12356,7 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
         let tail_rows = rows - packed_rows;
         if collect_q8_schedule {
             add_q8_schedule_counter(&Q8_SCHED_CONSERVATIVE_TAIL_ROWS, tail_rows as u64);
+            record_q8_schedule_i8mm_single_projection_role_tail(q8_role, tail_rows as u64);
         }
         if tail_rows > 0 {
             quantized_inputs.reserve(tail_rows * blocks_per_row);
@@ -11903,48 +12792,44 @@ fn q8_0_packed_rows4_block_dot_scalar(
 unsafe fn q8_0_packed_4x8_block_avx2(packed: *const i8, input: *const i8) -> [i32; 4] {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadl_epi64,
-        _mm_loadu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_cvtepi8_epi16, _mm256_madd_epi16, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_setzero_si256, _mm256_storeu_si256, _mm_loadl_epi64,
-        _mm_loadu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
     };
 
     let ones = _mm256_set1_epi16(1);
-    let mut acc01 = _mm256_setzero_si256();
-    let mut acc23 = _mm256_setzero_si256();
+    let mut acc = _mm256_setzero_si256();
     for chunk in 0..4usize {
-        let chunk_packed = unsafe { packed.add(chunk * 32) };
+        let chunk_start = chunk * 32;
+        let packed32 = unsafe { _mm256_loadu_si256(packed.add(chunk_start).cast()) };
+        // Signed i8 x signed i8 via the same abs/sign lowering used by llama.cpp's
+        // q8_0 dot path: abs(lhs) as unsigned bytes, sign(rhs, lhs), then
+        // maddubs+madd. This avoids the old widen-to-i16 + mullo sequence.
+        let abs_packed = _mm256_sign_epi8(packed32, packed32);
         let input8 = unsafe { _mm_loadl_epi64(input.add(chunk * 8).cast()) };
-        let input16 = _mm_unpacklo_epi64(input8, input8);
-        let input_i16 = _mm256_cvtepi8_epi16(input16);
-
-        let packed01 = unsafe { _mm_loadu_si128(chunk_packed.cast()) };
-        let packed01_i16 = _mm256_cvtepi8_epi16(packed01);
-        let products01_i16 = _mm256_mullo_epi16(packed01_i16, input_i16);
-        acc01 = _mm256_add_epi32(acc01, _mm256_madd_epi16(products01_i16, ones));
-
-        let packed23 = unsafe { _mm_loadu_si128(chunk_packed.add(16).cast()) };
-        let packed23_i16 = _mm256_cvtepi8_epi16(packed23);
-        let products23_i16 = _mm256_mullo_epi16(packed23_i16, input_i16);
-        acc23 = _mm256_add_epi32(acc23, _mm256_madd_epi16(products23_i16, ones));
+        let input32 = _mm256_broadcastsi128_si256(_mm_unpacklo_epi64(input8, input8));
+        let signed_input = _mm256_sign_epi8(input32, packed32);
+        acc = _mm256_add_epi32(
+            acc,
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_packed, signed_input), ones),
+        );
     }
 
-    let mut lanes01 = [0_i32; 8];
-    let mut lanes23 = [0_i32; 8];
+    let mut lanes = [0_i32; 8];
     unsafe {
-        _mm256_storeu_si256(lanes01.as_mut_ptr().cast(), acc01);
-        _mm256_storeu_si256(lanes23.as_mut_ptr().cast(), acc23);
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc);
     }
     [
-        lanes01[..4].iter().sum(),
-        lanes01[4..].iter().sum(),
-        lanes23[..4].iter().sum(),
-        lanes23[4..].iter().sum(),
+        lanes[0] + lanes[1],
+        lanes[2] + lanes[3],
+        lanes[4] + lanes[5],
+        lanes[6] + lanes[7],
     ]
 }
 
@@ -13632,6 +14517,7 @@ mod tests {
             rows: 4,
             blocks_per_row,
             interleave: Q8_0PackedRows4Interleave::I8,
+            amx_blocks: None,
             blocks: (0..blocks_per_row)
                 .map(|block_idx| Q8_0PackedRows4Block {
                     scales: [0.25, 0.5, 0.75, 1.25],
@@ -14519,6 +15405,10 @@ mod tests {
             "CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS",
             "CAMELID_Q8_0_BLOCK_DOT",
             "CAMELID_MAC_Q8_REPACK",
+            "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
+            "CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING",
+            "CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK",
+            "CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS",
             "CAMELID_Q8_0_PACKED_4X4_DOT",
             "CAMELID_Q8_0_PACKED_4X8_DOT",
             "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
@@ -16450,6 +17340,121 @@ mod tests {
     }
 
     #[test]
+    fn mac_q8_ffn_down_decode_consumer_alias_is_default_off_and_opt_in() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+        assert!(!Q8RuntimeFlags::from_env().ffn_down_decode_consumer);
+
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+        assert!(Q8RuntimeFlags::from_env().ffn_down_decode_consumer);
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mac_q8_ffn_down_decode_consumer_uses_mac_route_telemetry_name() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
+        assert_eq!(
+            q8_ffn_down_decode_consumer_route_name(false),
+            "x86_decode_consumer"
+        );
+
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+        assert_eq!(
+            q8_ffn_down_decode_consumer_route_name(false),
+            "mac_decode_consumer"
+        );
+        assert_eq!(
+            q8_ffn_down_decode_consumer_route_name(true),
+            "mac_decode_consumer_group_chunking"
+        );
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER");
+    }
+
+    #[test]
+    fn mac_q8_ffn_down_single_projection_scheduler_counters_are_default_off_and_opt_in() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS");
+        assert!(!mac_q8_ffn_down_single_projection_scheduler_counters_enabled());
+
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS", "on");
+        assert!(mac_q8_ffn_down_single_projection_scheduler_counters_enabled());
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS");
+    }
+
+    #[test]
+    fn q8_projection_route_telemetry_records_layer_route_bucket() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+        reset_q8_schedule_telemetry();
+
+        assert_eq!(
+            q8_schedule_layer_index_for_projection_name("layer_21_ffn_down"),
+            Some(21)
+        );
+        assert_eq!(q8_schedule_layer_index_for_projection_name("logits"), None);
+
+        record_q8_schedule_output_projection_route_call(
+            "ffn_down",
+            "mac_decode_consumer",
+            Some("layer_21_ffn_down"),
+            1,
+            8192,
+            3072,
+            12_345,
+        );
+        record_q8_schedule_output_projection_route_call(
+            "logits",
+            "q8_0_retained_blocks",
+            Some("logits"),
+            1,
+            3072,
+            128_256,
+            6_789,
+        );
+
+        let telemetry = snapshot_q8_schedule_telemetry();
+        assert_eq!(telemetry.output_projection_calls, 2);
+        assert_eq!(telemetry.ffn_gate_up_decode_consumer_activation_us, 0);
+        assert_eq!(telemetry.ffn_gate_up_decode_consumer_tensor_us, 0);
+        assert!(telemetry
+            .output_projection_by_route
+            .contains_key("ffn_down.mac_decode_consumer"));
+        let layer_route = telemetry
+            .output_projection_by_layer_route
+            .get("layer_21.ffn_down.mac_decode_consumer")
+            .expect("layer route telemetry");
+        assert_eq!(layer_route.layer_index, 21);
+        assert_eq!(layer_route.calls, 1);
+        assert_eq!(layer_route.elapsed_us, 12_345);
+        assert!(!telemetry
+            .output_projection_by_layer_route
+            .contains_key("layer_0.logits.q8_0_retained_blocks"));
+        reset_q8_schedule_telemetry();
+        std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    }
+
+    #[test]
+    fn mac_q8_ffn_gate_up_decode_consumer_alias_is_default_off_and_opt_in() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+        assert!(!Q8RuntimeFlags::from_env().ffn_gate_up_decode_consumer);
+
+        std::env::set_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER", "on");
+        assert!(Q8RuntimeFlags::from_env().ffn_gate_up_decode_consumer);
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_GATE_UP_DECODE_CONSUMER");
+    }
+
+    #[test]
     fn q8_ffn_down_consumer_matches_runtime_packed_baseline() {
         let _env_guard = env_lock();
         clear_dense_diagnostic_env();
@@ -16468,6 +17473,47 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mac_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
+        assert!(!mac_q8_ffn_down_decode_group_chunking_enabled());
+
+        let (input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+        let plan = ffn_down_consumer_plan(true);
+        let unchunked = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "unchunked",
+            "ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("unchunked ffn_down consumer");
+
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
+        assert!(mac_q8_ffn_down_decode_group_chunking_enabled());
+        assert_eq!(mac_q8_ffn_down_decode_groups_per_chunk(), 2);
+
+        let chunked = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "chunked",
+            "ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("chunked ffn_down consumer");
+
+        assert_eq!(chunked.shape.dims, unchunked.shape.dims);
+        assert_slice_close_with_tolerance(&chunked.data, &unchunked.data, 1e-6);
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
+        std::env::remove_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK");
     }
 
     #[test]
@@ -16560,6 +17606,53 @@ mod tests {
             .is_none(),
             "consumer must fail closed when packed rows do not match output width"
         );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn mac_q8_ffn_down_single_projection_counter_probe_records_scheduler_shape() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+        std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS", "on");
+        reset_q8_schedule_telemetry();
+
+        let (_decode_input, packed_weight_tensor, _expected) = runtime_packed_ffn_down_case();
+        let input_width = packed_weight_tensor.dim(0).unwrap();
+        let output_width = packed_weight_tensor.dim(1).unwrap();
+        let packed_weight = match packed_weight_tensor.q8_0_runtime_storage.as_ref() {
+            Some(Q8_0RuntimeStorage::PackedRows4(packed)) => packed,
+            other => panic!("expected packed rows4 runtime storage, got {other:?}"),
+        };
+        let rows = 4;
+        let input = CpuTensor::from_f32(
+            "ffn_down_input",
+            vec![rows, input_width],
+            vec![0.25; rows * input_width],
+        )
+        .unwrap();
+
+        let output = matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
+            &input,
+            &packed_weight,
+            output_width,
+            "ffn_down",
+            "ffn_down_probe",
+        )
+        .unwrap();
+        assert_eq!(output.shape.dims, vec![rows, output_width]);
+
+        let telemetry = snapshot_q8_schedule_telemetry();
+        let role = telemetry
+            .i8mm_single_projection_by_role
+            .get("ffn_down")
+            .expect("ffn_down role telemetry");
+        assert_eq!(role.calls, 1);
+        assert_eq!(role.rows, rows as u64);
+        assert_eq!(role.scheduler_chunk_calls, 1);
+        assert_eq!(role.scheduler_output_groups, (output_width / 4) as u64);
+        assert_eq!(role.scheduler_row_groups, 1);
+        assert_eq!(role.scheduler_groups_per_chunk, 1);
     }
 
     #[test]
@@ -16953,6 +18046,7 @@ mod tests {
                 &input,
                 &packed_gate,
                 &packed_up,
+                "layer_7_ffn_activated",
                 &mut gate,
                 &mut up,
                 &ffn_gate_up_consumer_plan(false),
@@ -16980,6 +18074,7 @@ mod tests {
                 &input,
                 &retained_like,
                 &packed_up,
+                "layer_7_ffn_activated",
                 &mut gate,
                 &mut up,
                 &ffn_gate_up_consumer_plan(true),
@@ -17325,7 +18420,6 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 1.0e-3);
-
         std::env::remove_var("CAMELID_MAC_Q8_PREFILL_I8MM");
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
         std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
@@ -17418,7 +18512,6 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 1.0e-3);
-
         std::env::remove_var("CAMELID_MAC_Q8_SCHED");
         std::env::remove_var("CAMELID_MAC_Q8_PREFILL_I8MM");
         std::env::remove_var("CAMELID_MAC_Q8_REPACK");
