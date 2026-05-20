@@ -8523,24 +8523,103 @@ unsafe fn q8_0_packed_rows4_gemm4_block_avx2(
     input_packed: *const i8,
     weight_packed: *const i8,
 ) -> [[i32; 4]; 4] {
-    let mut sums = [[0_i32; 4]; 4];
-    let mut input_lane = [0_i8; Q8_0_BLOCK_VALUES];
-    for input_idx in 0..4 {
-        for chunk in 0..4usize {
-            let src_start = chunk * 32 + input_idx * 8;
-            let dst_start = chunk * 8;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    input_packed.add(src_start),
-                    input_lane.as_mut_ptr().add(dst_start),
-                    8,
-                );
-            }
-        }
-        // SAFETY: this function is AVX2-gated and both arrays contain complete rows4/I8 blocks.
-        sums[input_idx] = unsafe { q8_0_packed_4x8_block_avx2(weight_packed, input_lane.as_ptr()) };
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_broadcastsi128_si256, _mm256_loadu_si256, _mm256_madd_epi16,
+        _mm256_maddubs_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_sign_epi8,
+        _mm256_storeu_si256, _mm_loadl_epi64, _mm_unpacklo_epi64,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut acc2 = _mm256_setzero_si256();
+    let mut acc3 = _mm256_setzero_si256();
+
+    for chunk in 0..4usize {
+        let chunk_start = chunk * 32;
+        let weight32 = unsafe { _mm256_loadu_si256(weight_packed.add(chunk_start).cast()) };
+        // Same signed-i8 lowering as llama.cpp ggml_vec_dot_q8_0_q8_0: abs(lhs)
+        // as unsigned bytes, sign(rhs, lhs), then maddubs+madd. Here lhs is the
+        // four packed output rows, reused across all four input rows in this 4x4
+        // GEMM block, avoiding the old per-input stack repack and repeated weight abs.
+        let abs_weight = _mm256_sign_epi8(weight32, weight32);
+
+        let lane0 = unsafe { _mm_loadl_epi64(input_packed.add(chunk_start).cast()) };
+        let input0 = _mm256_broadcastsi128_si256(_mm_unpacklo_epi64(lane0, lane0));
+        let signed0 = _mm256_sign_epi8(input0, weight32);
+        acc0 = _mm256_add_epi32(
+            acc0,
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed0), ones),
+        );
+
+        let lane1 = unsafe { _mm_loadl_epi64(input_packed.add(chunk_start + 8).cast()) };
+        let input1 = _mm256_broadcastsi128_si256(_mm_unpacklo_epi64(lane1, lane1));
+        let signed1 = _mm256_sign_epi8(input1, weight32);
+        acc1 = _mm256_add_epi32(
+            acc1,
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed1), ones),
+        );
+
+        let lane2 = unsafe { _mm_loadl_epi64(input_packed.add(chunk_start + 16).cast()) };
+        let input2 = _mm256_broadcastsi128_si256(_mm_unpacklo_epi64(lane2, lane2));
+        let signed2 = _mm256_sign_epi8(input2, weight32);
+        acc2 = _mm256_add_epi32(
+            acc2,
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed2), ones),
+        );
+
+        let lane3 = unsafe { _mm_loadl_epi64(input_packed.add(chunk_start + 24).cast()) };
+        let input3 = _mm256_broadcastsi128_si256(_mm_unpacklo_epi64(lane3, lane3));
+        let signed3 = _mm256_sign_epi8(input3, weight32);
+        acc3 = _mm256_add_epi32(
+            acc3,
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed3), ones),
+        );
     }
-    sums
+
+    let mut lanes0 = [0_i32; 8];
+    let mut lanes1 = [0_i32; 8];
+    let mut lanes2 = [0_i32; 8];
+    let mut lanes3 = [0_i32; 8];
+    unsafe {
+        _mm256_storeu_si256(lanes0.as_mut_ptr().cast(), acc0);
+        _mm256_storeu_si256(lanes1.as_mut_ptr().cast(), acc1);
+        _mm256_storeu_si256(lanes2.as_mut_ptr().cast(), acc2);
+        _mm256_storeu_si256(lanes3.as_mut_ptr().cast(), acc3);
+    }
+    [
+        [
+            lanes0[0] + lanes0[1],
+            lanes0[2] + lanes0[3],
+            lanes0[4] + lanes0[5],
+            lanes0[6] + lanes0[7],
+        ],
+        [
+            lanes1[0] + lanes1[1],
+            lanes1[2] + lanes1[3],
+            lanes1[4] + lanes1[5],
+            lanes1[6] + lanes1[7],
+        ],
+        [
+            lanes2[0] + lanes2[1],
+            lanes2[2] + lanes2[3],
+            lanes2[4] + lanes2[5],
+            lanes2[6] + lanes2[7],
+        ],
+        [
+            lanes3[0] + lanes3[1],
+            lanes3[2] + lanes3[3],
+            lanes3[4] + lanes3[5],
+            lanes3[6] + lanes3[7],
+        ],
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9076,7 +9155,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
-    if !runtime_plan.q8.ffn_down_decode_consumer
+    if !(runtime_plan.q8.ffn_down_decode_consumer || x86_q8_kernel_avx2_enabled())
         || rectangular_role != "ffn_down"
         || input.rank() != 2
         || input.dim(0)? != 1
@@ -10184,6 +10263,7 @@ fn x86_q8_kernel_avx2_enabled_from_env() -> bool {
     )
 }
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn x86_q8_packed_rows4_avx2_dot_enabled() -> bool {
     #[cfg(test)]
     {
@@ -13660,6 +13740,67 @@ mod tests {
         std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_AVX2_DOT_DECODE_HOIST");
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_q8_ffn_down_decode_uses_avx2_reference_gate() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_KERNEL", "avx2");
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+            return;
+        }
+
+        let input = CpuTensor::from_f32(
+            "hidden",
+            vec![1, Q8_0_BLOCK_VALUES],
+            (0..Q8_0_BLOCK_VALUES)
+                .map(|idx| (idx as f32 - 15.0) / 8.0)
+                .collect(),
+        )
+        .unwrap();
+        let row_major_blocks: Vec<Q8_0Block> = (0..4)
+            .map(|row| Q8_0Block {
+                scale: 0.25 + row as f32 * 0.125,
+                quants: std::array::from_fn(|idx| {
+                    (idx as i8).wrapping_mul(3).wrapping_add(row as i8 * 11)
+                }),
+            })
+            .collect();
+        let packed =
+            Q8_0PackedRows4::from_rows(4, 1, Q8_0PackedRows4Interleave::I8, &row_major_blocks)
+                .unwrap();
+        let weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![4, Q8_0_BLOCK_VALUES],
+            },
+            packed.clone(),
+        );
+        let runtime_plan = ResolvedRuntimePlan::from_env().unwrap();
+        assert!(!runtime_plan.q8.ffn_down_decode_consumer);
+
+        let actual = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &weight,
+            "ffn_down",
+            "ffn_down",
+            &runtime_plan,
+        )
+        .unwrap()
+        .unwrap();
+        let quantized_input = quantize_q8_0_row(&input.data);
+        let expected = q8_0_packed_rows4_single_input_projection(
+            &packed,
+            &quantized_input.blocks,
+            4,
+            "expected",
+        )
+        .unwrap();
+        assert_eq!(actual.shape.dims, vec![1, 4]);
+        assert_eq!(actual.data, expected.data);
+        std::env::remove_var("CAMELID_X86_Q8_KERNEL");
+    }
+
     #[test]
     fn q8_0_block_reader_smoke() {
         let _q8_guard = crate::test_support::q8_file_state_lock();
@@ -16298,6 +16439,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     fn ffn_gate_up_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
         let mut plan = ffn_gate_up_consumer_plan(false);
         plan.q8.ffn_gate_up_packed_rows4_matmul = enabled;

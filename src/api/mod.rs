@@ -50,6 +50,7 @@ const RETAIN_Q8_BLOCKS_ENV: &str = "CAMELID_RETAIN_Q8_0_BLOCKS";
 const LAZY_Q8_LINEAR_ENV: &str = "CAMELID_LAZY_Q8_0_LINEAR";
 const METADATA_CHAT_TEMPLATE_ENV: &str = "CAMELID_METADATA_CHAT_TEMPLATE";
 const GENERATION_TIMEOUT_ENV: &str = "CAMELID_GENERATION_TIMEOUT_MS";
+const STREAM_TIMING_DIAGNOSTICS_ENV: &str = "CAMELID_STREAM_TIMING_DIAGNOSTICS";
 const DEFAULT_GENERATION_TIMEOUT_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_PUBLIC_CHAT_MAX_TOKENS: u32 = 800;
 const JINJA_CHAT_TEMPLATE_NAME: &str = "chat";
@@ -615,6 +616,8 @@ pub struct ChatCompletionStreamChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatCompletionStreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelid: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -639,6 +642,8 @@ pub struct CompletionStreamChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionStreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelid: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3237,8 +3242,59 @@ fn micros_to_ms(value: u128) -> f64 {
     value as f64 / 1000.0
 }
 
+fn stream_timing_diagnostics_enabled() -> bool {
+    matches!(
+        env::var(STREAM_TIMING_DIAGNOSTICS_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("on") | Ok("ON") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn stream_role_timings_json(
+    phase: &GenerationPhaseTimings,
+    layers: &[GenerationLayerTimings],
+) -> serde_json::Value {
+    let sum = |value: fn(&GenerationLayerTimings) -> f64| -> f64 {
+        layers.iter().map(value).sum::<f64>()
+    };
+    serde_json::json!({
+        "attention_context": sum(|layer| layer.attention_context),
+        "attention_output": sum(|layer| layer.attention_output),
+        "ffn_gate": sum(|layer| layer.ffn_gate),
+        "ffn_up": sum(|layer| layer.ffn_up),
+        "ffn_down": sum(|layer| layer.ffn_down),
+        "logits": phase.logits,
+    })
+}
+
+fn stream_timing_diagnostics_json(
+    timings: &GenerationTimings,
+    first_content_ms: Option<u128>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "stream_timing_diagnostics": {
+            "timings_ms": {
+                "generate": timings.generate,
+                "first_content": first_content_ms,
+                "tokenize": timings.tokenize,
+                "weight_load": timings.weight_load,
+                "weight_cache_hit": timings.weight_cache_hit,
+                "prompt_cache_hit": timings.prompt_cache_hit,
+                "session_create": timings.session_create,
+                "prefill_forward_total": timings.prompt_evaluation.prefill.forward_total,
+                "first_token_forward_total": timings.prompt_evaluation.first_token.forward_total,
+                "generation_forward_total": timings.generation.forward_total,
+                "prefill_role_timings": stream_role_timings_json(&timings.prompt_evaluation.prefill, &timings.prompt_evaluation.prefill_layers),
+                "first_token_role_timings": stream_role_timings_json(&timings.prompt_evaluation.first_token, &timings.prompt_evaluation.first_token_layers),
+                "generation_role_timings": stream_role_timings_json(&timings.generation, &timings.layers),
+            },
+            "q8_schedule": timings.q8_schedule,
+        }
+    })
+}
+
 fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     let model_id = prepared.model_id.clone();
+    let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
     let stream_id = if chat {
         format!("chatcmpl-{}", uuid::Uuid::new_v4())
     } else {
@@ -3259,10 +3315,16 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                     },
                     finish_reason: None,
                 }],
+                camelid: None,
             };
             yield sse_json_event(&role_chunk);
         }
 
+        let generation_started = Instant::now();
+        let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
+        if collect_q8_schedule {
+            reset_q8_schedule_telemetry();
+        }
         let mut input = prepared.token_ids.clone();
         let mut history = prepared.token_ids.clone();
         let mut generated = Vec::new();
@@ -3272,6 +3334,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         let mut finish_reason = "length";
         let mut streamed_text = String::new();
         let mut reused_prompt_prefix = false;
+        let mut first_content_ms = None;
+        let mut forward_timings = LlamaForwardTimings::default();
+        let mut sample = 0;
 
         if !prepared.collect_dense_diagnostics {
             if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
@@ -3282,6 +3347,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                         let cached_next_token = first_step.next_token_id;
                         reused_prompt_prefix = true;
                         prepared.timings.prompt_cache_hit = true;
+                        sample += first_step.sample;
                         if let Err(response) = consume_generation_step(
                             &prepared,
                             first_step,
@@ -3349,6 +3415,8 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             if generated.is_empty() && !reused_prompt_prefix {
                 prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
             }
+            forward_timings.add_assign(&step.timings);
+            sample += step.sample;
             if let Err(response) = consume_generation_step(
                 &prepared,
                 step,
@@ -3383,6 +3451,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                 .unwrap_or_else(|| text.clone());
             streamed_text = text;
             if !delta.is_empty() {
+                if first_content_ms.is_none() {
+                    first_content_ms = Some(generation_started.elapsed().as_millis());
+                }
                 if chat {
                     let chunk = ChatCompletionStreamChunk {
                         id: stream_id.clone(),
@@ -3397,6 +3468,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                             },
                             finish_reason: None,
                         }],
+                        camelid: None,
                     };
                     yield sse_json_event(&chunk);
                 } else {
@@ -3410,6 +3482,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                             text: delta,
                             finish_reason: None,
                         }],
+                        camelid: None,
                     };
                     yield sse_json_event(&chunk);
                 }
@@ -3422,6 +3495,16 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                 input.push(last_token);
             }
         }
+
+        prepared.timings.generate = generation_started.elapsed().as_millis();
+        prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
+        prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
+        prepared.timings.memory = forward_timings.memory;
+        if collect_q8_schedule {
+            prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+        }
+        let camelid_diagnostics = stream_timing_diagnostics
+            .then(|| stream_timing_diagnostics_json(&prepared.timings, first_content_ms));
 
         if chat {
             let final_chunk = ChatCompletionStreamChunk {
@@ -3437,6 +3520,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                     },
                     finish_reason: Some(finish_reason),
                 }],
+                camelid: camelid_diagnostics.clone(),
             };
             yield sse_json_event(&final_chunk);
         } else {
@@ -3450,6 +3534,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                     text: String::new(),
                     finish_reason: Some(finish_reason),
                 }],
+                camelid: camelid_diagnostics,
             };
             yield sse_json_event(&final_chunk);
         }
@@ -4104,6 +4189,98 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn stream_timing_diagnostics_env_is_default_off_and_opt_in() {
+        let _env_guard = crate::test_support::env_lock();
+        env::remove_var(STREAM_TIMING_DIAGNOSTICS_ENV);
+        assert!(!stream_timing_diagnostics_enabled());
+
+        env::set_var(STREAM_TIMING_DIAGNOSTICS_ENV, "on");
+        assert!(stream_timing_diagnostics_enabled());
+
+        env::set_var(STREAM_TIMING_DIAGNOSTICS_ENV, "0");
+        assert!(!stream_timing_diagnostics_enabled());
+        env::remove_var(STREAM_TIMING_DIAGNOSTICS_ENV);
+    }
+
+    #[test]
+    fn streaming_chunks_omit_camelid_diagnostics_by_default() {
+        let chunk = ChatCompletionStreamChunk {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion.chunk",
+            created: 1,
+            model: "test-model".into(),
+            choices: vec![ChatCompletionStreamChoice {
+                index: 0,
+                delta: ChatCompletionDelta {
+                    role: Some("assistant"),
+                    content: None,
+                },
+                finish_reason: None,
+            }],
+            camelid: None,
+        };
+
+        let value = serde_json::to_value(chunk).expect("stream chunk should serialize");
+        assert!(value.get("camelid").is_none());
+    }
+
+    #[test]
+    fn stream_timing_diagnostics_json_sums_roles_and_scopes_q8_schedule() {
+        let mut timings = GenerationTimings {
+            generate: 1234,
+            weight_cache_hit: true,
+            prompt_cache_hit: false,
+            ..GenerationTimings::default()
+        };
+        timings.prompt_evaluation.prefill.forward_total = 10.0;
+        timings.prompt_evaluation.first_token.forward_total = 20.0;
+        timings.generation.forward_total = 30.0;
+        timings.prompt_evaluation.prefill_layers = vec![GenerationLayerTimings {
+            attention_context: 1.25,
+            attention_output: 2.0,
+            ffn_gate: 3.0,
+            ffn_up: 4.0,
+            ffn_down: 5.0,
+            ..GenerationLayerTimings::default()
+        }];
+        timings.prompt_evaluation.first_token_layers = vec![GenerationLayerTimings {
+            attention_context: 0.5,
+            ..GenerationLayerTimings::default()
+        }];
+        timings.layers = vec![
+            GenerationLayerTimings {
+                ffn_down: 7.0,
+                ..GenerationLayerTimings::default()
+            },
+            GenerationLayerTimings {
+                ffn_down: 11.0,
+                attention_output: 13.0,
+                ..GenerationLayerTimings::default()
+            },
+        ];
+
+        let value = stream_timing_diagnostics_json(&timings, Some(321));
+        let diagnostics = &value["stream_timing_diagnostics"];
+        assert_eq!(diagnostics["timings_ms"]["generate"], 1234);
+        assert_eq!(diagnostics["timings_ms"]["first_content"], 321);
+        assert_eq!(diagnostics["timings_ms"]["weight_cache_hit"], true);
+        assert_eq!(diagnostics["timings_ms"]["prompt_cache_hit"], false);
+        assert_eq!(
+            diagnostics["timings_ms"]["prefill_role_timings"]["ffn_down"],
+            5.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["generation_role_timings"]["ffn_down"],
+            18.0
+        );
+        assert_eq!(
+            diagnostics["timings_ms"]["generation_role_timings"]["attention_output"],
+            13.0
+        );
+        assert!(diagnostics["q8_schedule"].is_null());
+    }
 
     #[test]
     fn capabilities_can_include_selected_execution_plan() {

@@ -28,6 +28,7 @@ const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') 
 const threads = parseOptionalPositiveInt(args.get('threads') || process.env.CAMELID_BENCH_THREADS, 'threads')
 const requireMarker = args.has('require-marker') || process.env.CAMELID_BENCH_REQUIRE_MARKER === '1'
 const expectedMarker = args.get('expected-marker') || process.env.CAMELID_BENCH_EXPECTED_MARKER || 'CMLD-BENCH'
+const uniquePrompt = args.has('unique-prompt') || process.env.CAMELID_BENCH_UNIQUE_PROMPT === '1'
 
 if (args.has('help') || args.has('h')) {
   console.log(usage())
@@ -39,7 +40,7 @@ const benchmarkMessages = [
   { role: 'user', content: 'Reply with exactly this single line and nothing else: CMLD-BENCH' },
 ]
 
-const expectedPrompt = renderExpectedPrompt(benchmarkMessages, renderMode)
+const expectedPrompt = renderExpectedPrompt(benchmarkMessagesForRun('plan'), renderMode)
 const estimatedPromptTokens = estimatePromptTokens(expectedPrompt)
 const llamaContext = resolveReferenceContext({
   promptTokenCount: estimatedPromptTokens,
@@ -151,6 +152,7 @@ try {
       max_tokens: maxTokens,
       expected_marker: expectedMarker,
       require_marker: requireMarker,
+      unique_prompt: uniquePrompt,
       benchmark_messages: benchmarkMessages,
       estimated_prompt_tokens: estimatedPromptTokens,
       llama_context: llamaContext,
@@ -229,6 +231,7 @@ function buildPlan() {
       max_tokens: maxTokens,
       expected_marker: expectedMarker,
       require_marker: requireMarker,
+      unique_prompt: uniquePrompt,
       estimated_prompt_tokens: estimatedPromptTokens,
       llama_context: llamaContext,
       threads: threads ?? null,
@@ -240,7 +243,7 @@ function buildPlan() {
       },
     },
     commands: {
-      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
+      harness: `node scripts/bench-llama3-same-host.mjs --model ${shellQuote(modelPath)} --model-id ${shellQuote(modelId)} --row-id ${shellQuote(rowId)} --max-tokens ${maxTokens} --warmup ${warmup} --repeats ${repeats}${threads ? ` --threads ${threads}` : ''}${explicitLlamaContext ? ` --llama-context ${explicitLlamaContext}` : ''}${uniquePrompt ? ' --unique-prompt' : ''}${requireMarker ? ` --require-marker --expected-marker ${shellQuote(expectedMarker)}` : ''}${out ? ` --out ${shellQuote(resolve(out))}` : ''}`,
       camelid_serve: startBackend ? `${shellQuote(backendBin)} serve --addr ${shellQuote(`${backendUrl.hostname}:${backendUrl.port || '8181'}`)}` : 'not started by harness (--start-backend=false)',
       llama_server: startLlamaServer ? [shellQuote(llamaServerBin), ...llamaArgs.map(shellQuote)].join(' ') : 'not started by harness (--start-llama-server=false)',
       camelid_load_request: `POST ${backendBase}/api/models/load {"path":${JSON.stringify(modelPath)},"id":${JSON.stringify(modelId)}}`,
@@ -255,6 +258,8 @@ function buildPlan() {
         'llama_cpp_ttft_ms=<same metric for llama.cpp>',
         'llama_cpp_decode_tok_s=<same metric for llama.cpp>',
         'llama_cpp_ms_tok=<same metric for llama.cpp>',
+        'camelid_backend_generate_ms=<mean Camelid backend generate timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>',
+        'camelid_backend_first_content_ms=<mean Camelid backend first-content timing when CAMELID_STREAM_TIMING_DIAGNOSTICS=on>',
         'json_out=<absolute path when --out is set>',
       ],
       json: 'Full machine-readable report at --out, schema camelid.same_host_llama3_benchmark.v1.',
@@ -274,6 +279,8 @@ function boundedMetrics() {
     'completion_tokens_estimate: count of non-empty streamed content chunks, not tokenizer-ground-truth tokens',
     'decode_tok_per_s and ms_per_token_after_first: derived from completion_tokens_estimate after first content',
     'marker_presence: exact expected marker observed in measured output text, optionally enforced with --require-marker',
+    'camelid_backend_generate_ms and camelid_backend_first_content_ms: opt-in backend timings when CAMELID_STREAM_TIMING_DIAGNOSTICS=on',
+    'camelid_backend_q8_calls and q8 timing counters: opt-in Q8 scheduler diagnostics when Camelid Q8 scheduler telemetry is also enabled',
     'resource_snapshots: host memory/load/storage snapshots before start, before measured runs, and after measured runs',
     'server_lifecycle: Camelid/llama-server startup timing, model-load timing, reuse/preloaded status, and warmup behavior',
   ]
@@ -312,6 +319,7 @@ Key options:
   --llama-context <n>             Optional llama-server context; otherwise bounded from prompt + max tokens.
   --expected-marker <text>        Marker checked in measured output. Default: CMLD-BENCH.
   --require-marker                Fail the run after writing output unless every measured output contains the marker.
+  --unique-prompt                 Add a per-run request id while preserving the expected marker; helps avoid cache-shaped timing artifacts.
   --start-backend=false           Reuse an already-running Camelid server.
   --start-llama-server=false      Reuse an already-running llama-server.
   --out <path>                    Write the JSON report or --print-plan JSON.
@@ -329,7 +337,10 @@ Example:
 
 Outputs:
   stdout summary keys: camelid_ttft_ms, camelid_decode_tok_s, camelid_ms_tok,
-  llama_cpp_ttft_ms, llama_cpp_decode_tok_s, llama_cpp_ms_tok, json_out.
+  llama_cpp_ttft_ms, llama_cpp_decode_tok_s, llama_cpp_ms_tok,
+  camelid_backend_first_content_ms, camelid_backend_generate_ms,
+  camelid_backend_q8_calls, json_out.
+  Backend timing fields are populated only when Camelid is run with CAMELID_STREAM_TIMING_DIAGNOSTICS=on.
   JSON report schema: camelid.same_host_llama3_benchmark.v1.
 
 Claim boundary:
@@ -339,35 +350,48 @@ Claim boundary:
 }
 
 async function runCamelidStream(idx, phase) {
+  const label = `camelid-${phase}-${idx + 1}`
   const started = performance.now()
   const response = await fetch(`${backendBase}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       model: modelId,
-      messages: benchmarkMessages,
+      messages: benchmarkMessagesForRun(label),
       max_tokens: maxTokens,
       stream: true,
       temperature: 0,
     }),
   })
-  return consumeSseResponse({ response, started, label: `camelid-${phase}-${idx + 1}` })
+  return consumeSseResponse({ response, started, label })
 }
 
 async function runLlamaStream(idx, phase) {
+  const label = `llama-${phase}-${idx + 1}`
   const started = performance.now()
   const response = await fetch(`${llamaBase}/completion`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
-      prompt: expectedPrompt,
+      prompt: renderExpectedPrompt(benchmarkMessagesForRun(label), renderMode),
       n_predict: maxTokens,
       temperature: 0,
       stream: true,
       cache_prompt: false,
     }),
   })
-  return consumeSseResponse({ response, started, label: `llama-${phase}-${idx + 1}` })
+  return consumeSseResponse({ response, started, label })
+}
+
+function benchmarkMessagesForRun(label) {
+  if (!uniquePrompt) return benchmarkMessages
+  return [
+    benchmarkMessages[0],
+    {
+      role: 'user',
+      content: `Reply with exactly this single line and nothing else: ${expectedMarker}\nRequest id: ${label}. The request id is for measurement only; still reply with exactly ${expectedMarker}.`,
+    },
+  ]
 }
 
 async function consumeSseResponse({ response, started, label }) {
@@ -386,6 +410,7 @@ async function consumeSseResponse({ response, started, label }) {
   let doneAtMs = null
   let chunkCount = 0
   let completionTokens = 0
+  let backendTiming = null
 
   const nowMs = () => performance.now() - started
 
@@ -412,6 +437,9 @@ async function consumeSseResponse({ response, started, label }) {
           ?? payload?.content
           ?? payload?.choices?.[0]?.text
           ?? ''
+        if (payload?.camelid?.stream_timing_diagnostics) {
+          backendTiming = payload.camelid.stream_timing_diagnostics
+        }
         if (delta) {
           if (firstContentMs === null) firstContentMs = nowMs()
           content += delta
@@ -432,6 +460,12 @@ async function consumeSseResponse({ response, started, label }) {
     total_elapsed_ms: round(doneAtMs),
     completion_tokens_estimate: completionTokens,
     chunk_count: chunkCount,
+    backend_timing: backendTiming,
+    backend_generate_ms: round(Number(backendTiming?.timings_ms?.generate)),
+    backend_first_content_ms: round(Number(backendTiming?.timings_ms?.first_content)),
+    backend_q8_gemm_compute_us: round(Number(backendTiming?.q8_schedule?.q8_gemm_compute_us)),
+    backend_q8_pack_us: round(Number(backendTiming?.q8_schedule?.activation_quantize_pack_us)),
+    backend_q8_calls: round(Number(backendTiming?.q8_schedule?.i8mm_single_projection_calls)),
     decode_tok_per_s: decodeWindowMs && completionTokens > 0 ? round((completionTokens / decodeWindowMs) * 1000) : null,
     ms_per_token_after_first: decodeWindowMs && completionTokens > 0 ? round(decodeWindowMs / completionTokens) : null,
   }
@@ -445,6 +479,11 @@ function summarizeRuns(runs) {
     avg_first_event_ms: avg('first_event_ms'),
     avg_ttft_ms: avg('first_content_ms'),
     avg_total_elapsed_ms: avg('total_elapsed_ms'),
+    avg_backend_generate_ms: avg('backend_generate_ms'),
+    avg_backend_first_content_ms: avg('backend_first_content_ms'),
+    avg_backend_q8_calls: avg('backend_q8_calls'),
+    avg_backend_q8_gemm_compute_us: avg('backend_q8_gemm_compute_us'),
+    avg_backend_q8_pack_us: avg('backend_q8_pack_us'),
     avg_decode_tok_per_s: avg('decode_tok_per_s'),
     avg_ms_per_token_after_first: avg('ms_per_token_after_first'),
     avg_completion_tokens_estimate: avg('completion_tokens_estimate'),
@@ -470,6 +509,9 @@ function printHumanSummary(report) {
   console.log(`llama_cpp_ttft_ms=${l.avg_ttft_ms}`)
   console.log(`llama_cpp_decode_tok_s=${l.avg_decode_tok_per_s}`)
   console.log(`llama_cpp_ms_tok=${l.avg_ms_per_token_after_first}`)
+  console.log(`camelid_backend_first_content_ms=${c.avg_backend_first_content_ms}`)
+  console.log(`camelid_backend_generate_ms=${c.avg_backend_generate_ms}`)
+  console.log(`camelid_backend_q8_calls=${c.avg_backend_q8_calls}`)
 }
 
 function benchmarkGuardrails(camelidRuns, llamaRuns) {
