@@ -124,6 +124,21 @@ pub struct Q8_0AmxPackedBlock {
     pub quants: [i8; 512],
 }
 
+#[repr(C, align(64))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q8_0VnniTile16 {
+    pub quants: [i8; 512],
+    pub scale_f16: [u16; 16],
+    pub comp: [i32; 16],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q8_0VnniPacked {
+    pub rows: usize,
+    pub blocks_per_row: usize,
+    pub tiles: Vec<Q8_0VnniTile16>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Q8_0PackedRows4 {
     pub rows: usize,
@@ -131,6 +146,7 @@ pub struct Q8_0PackedRows4 {
     pub interleave: Q8_0PackedRows4Interleave,
     pub blocks: Vec<Q8_0PackedRows4Block>,
     pub amx_blocks: Option<Vec<Q8_0AmxPackedBlock>>,
+    pub vnni_packed: Option<Q8_0VnniPacked>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +201,7 @@ impl Q8_0PackedRows4 {
             blocks_per_row,
             interleave,
             amx_blocks: q8_0_pack_rows4_amx16_if_enabled(rows, blocks_per_row, interleave, &blocks),
+            vnni_packed: None,
             blocks,
         })
     }
@@ -248,6 +265,7 @@ impl Q8_0PackedRows4 {
             blocks_per_row,
             interleave,
             amx_blocks: q8_0_pack_rows4_amx16_if_enabled(rows, blocks_per_row, interleave, &blocks),
+            vnni_packed: q8_0_pack_vnni16_if_enabled(rows, blocks_per_row, q8_0_bytes)?,
             blocks,
         })
     }
@@ -255,6 +273,63 @@ impl Q8_0PackedRows4 {
     pub fn byte_len(&self) -> usize {
         self.blocks.len() * std::mem::size_of::<Q8_0PackedRows4Block>()
     }
+}
+
+fn q8_0_pack_vnni16_if_enabled(
+    rows: usize,
+    blocks_per_row: usize,
+    q8_0_bytes: &[u8],
+) -> Result<Option<Q8_0VnniPacked>> {
+    if !x86_q8_vnni_decode_repack_enabled() || !rows.is_multiple_of(16) {
+        return Ok(None);
+    }
+    let expected_blocks = rows.checked_mul(blocks_per_row).ok_or_else(|| {
+        BackendError::InvalidTensorData("q8_0 VNNI packed block count overflow".to_string())
+    })?;
+    let expected_bytes = expected_blocks
+        .checked_mul(Q8_0_BLOCK_BYTES)
+        .ok_or_else(|| {
+            BackendError::InvalidTensorData("q8_0 VNNI packed byte count overflow".to_string())
+        })?;
+    if q8_0_bytes.len() != expected_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "q8_0 VNNI pack expected {expected_bytes} bytes, got {}",
+            q8_0_bytes.len()
+        )));
+    }
+
+    let mut tiles = Vec::with_capacity((rows / 16) * blocks_per_row);
+    for row_tile in 0..rows / 16 {
+        for block_idx in 0..blocks_per_row {
+            let mut tile = Q8_0VnniTile16 {
+                quants: [0; 512],
+                scale_f16: [0; 16],
+                comp: [0; 16],
+            };
+            for n in 0..16 {
+                let source_block = (row_tile * 16 + n) * blocks_per_row + block_idx;
+                let source_start = source_block * Q8_0_BLOCK_BYTES;
+                tile.scale_f16[n] =
+                    u16::from_le_bytes([q8_0_bytes[source_start], q8_0_bytes[source_start + 1]]);
+                let qs = &q8_0_bytes[source_start + 2..source_start + Q8_0_BLOCK_BYTES];
+                let sum = qs
+                    .iter()
+                    .fold(0_i32, |acc, value| acc + i32::from(*value as i8));
+                tile.comp[n] = 128 * sum;
+                for g in 0..8 {
+                    for r in 0..4 {
+                        tile.quants[g * 64 + n * 4 + r] = qs[g * 4 + r] as i8;
+                    }
+                }
+            }
+            tiles.push(tile);
+        }
+    }
+    Ok(Some(Q8_0VnniPacked {
+        rows,
+        blocks_per_row,
+        tiles,
+    }))
 }
 
 fn q8_0_pack_rows4_amx16_if_enabled(
@@ -352,6 +427,16 @@ fn x86_q8_amx_repack_enabled() -> bool {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn x86_q8_amx_repack_enabled() -> bool {
+    false
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn x86_q8_vnni_decode_repack_enabled() -> bool {
+    env_flag_enabled("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE")
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn x86_q8_vnni_decode_repack_enabled() -> bool {
     false
 }
 
@@ -2884,8 +2969,8 @@ mod tests {
     use super::{
         f16_bits_to_f32, parse_byte_count, q8_0_file_read_stats, q8_file_cache_get,
         q8_file_cache_insert, q8_repack_tensor_enabled_for_flags, q8_repack_x86_tensor_enabled,
-        with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking, TensorShape,
-        Q8_0_BLOCK_BYTES,
+        with_q8_file_cache_capacity_override, CpuTensor, Q8_0Block, Q8_0FileBacking,
+        Q8_0PackedRows4, Q8_0PackedRows4Interleave, TensorShape, Q8_0_BLOCK_BYTES,
     };
     use crate::test_support::env_lock;
 
@@ -3071,6 +3156,81 @@ mod tests {
         assert!(x86_repack_weight.q8_0_runtime_storage.is_none());
 
         std::env::remove_var("CAMELID_X86_Q8_REPACK");
+    }
+
+    #[test]
+    fn q8_0_vnni_pack_requires_raw_q8_bytes_for_scale_bits() {
+        let blocks = vec![
+            Q8_0Block {
+                scale: f16_bits_to_f32(0x3001),
+                quants: [3; 32],
+            };
+            16
+        ];
+        let packed =
+            Q8_0PackedRows4::from_rows(16, 1, Q8_0PackedRows4Interleave::I8, &blocks).unwrap();
+
+        assert!(
+            packed.vnni_packed.is_none(),
+            "from_rows cannot prove original GGUF fp16 scale bits, so VNNI packing must be raw-byte only"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn q8_0_vnni_pack_from_q8_0_bytes_matches_llamacpp_tile16_layout() {
+        let _env_guard = env_lock();
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+        let rows = 16;
+        let blocks_per_row = 2;
+        let mut bytes = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+        for row in 0..rows {
+            for block in 0..blocks_per_row {
+                let scale_bits = 0x3000_u16 + row as u16 * 17 + block as u16;
+                bytes.extend_from_slice(&scale_bits.to_le_bytes());
+                bytes.extend((0..32).map(|idx| {
+                    (idx as i8)
+                        .wrapping_mul(3)
+                        .wrapping_add(row as i8 * 5)
+                        .wrapping_sub(block as i8 * 7) as u8
+                }));
+            }
+        }
+
+        let packed = Q8_0PackedRows4::from_q8_0_bytes(
+            rows,
+            blocks_per_row,
+            Q8_0PackedRows4Interleave::I8,
+            &bytes,
+        )
+        .unwrap();
+        let vnni = packed.vnni_packed.as_ref().expect("VNNI sidecar");
+        assert_eq!(vnni.rows, rows);
+        assert_eq!(vnni.blocks_per_row, blocks_per_row);
+        assert_eq!(vnni.tiles.len(), blocks_per_row);
+
+        for block in 0..blocks_per_row {
+            let tile = &vnni.tiles[block];
+            for n in 0..16 {
+                let raw_start = (n * blocks_per_row + block) * Q8_0_BLOCK_BYTES;
+                assert_eq!(
+                    tile.scale_f16[n],
+                    u16::from_le_bytes([bytes[raw_start], bytes[raw_start + 1]])
+                );
+                let qs = &bytes[raw_start + 2..raw_start + Q8_0_BLOCK_BYTES];
+                let expected_comp = 128
+                    * qs.iter()
+                        .fold(0_i32, |acc, value| acc + i32::from(*value as i8));
+                assert_eq!(tile.comp[n], expected_comp);
+                for g in 0..8 {
+                    for r in 0..4 {
+                        assert_eq!(tile.quants[g * 64 + n * 4 + r], qs[g * 4 + r] as i8);
+                    }
+                }
+            }
+        }
+
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
     }
 
     #[test]

@@ -3421,8 +3421,10 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     };
     let events = async_stream::stream! {
         let stream_started = Instant::now();
-        let mut stream_event_timings = StreamEventTimings::default();
-        stream_event_timings.poll_yield_enabled = stream_poll_yield;
+        let mut stream_event_timings = StreamEventTimings {
+            poll_yield_enabled: stream_poll_yield,
+            ..StreamEventTimings::default()
+        };
         if chat {
             stream_event_timings.role_yield = Some(stream_started.elapsed().as_millis());
             let role_chunk = ChatCompletionStreamChunk {

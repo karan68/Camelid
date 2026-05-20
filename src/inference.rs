@@ -33,7 +33,8 @@ use crate::{
         dot_product, parse_byte_count_env, q8_0_file_read_stats, record_q8_0_file_read,
         should_parallelize_linear_output, with_q8_file_cache_capacity_override, CpuTensor,
         Q8_0Block, Q8_0FileBacking, Q8_0FileReadStats, Q8_0PackedRows4, Q8_0PackedRows4Block,
-        Q8_0PackedRows4Interleave, Q8_0RuntimeStorage, TensorShape, TensorStore,
+        Q8_0PackedRows4Interleave, Q8_0RuntimeStorage, Q8_0VnniPacked, Q8_0VnniTile16, TensorShape,
+        TensorStore,
     },
     BackendError, Result,
 };
@@ -700,6 +701,7 @@ struct Q8RuntimeFlags {
     ffn_down_gemm4_row_group_schedule: bool,
     ffn_down_gemm4_avx2: bool,
     ffn_down_single_owner: bool,
+    ffn_down_vnni_decode: bool,
     metal: bool,
     metal_retained: bool,
     hybrid_retained: bool,
@@ -777,6 +779,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_down_single_owner: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_SINGLE_OWNER",
+            ),
+            ffn_down_vnni_decode: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
             ),
             metal: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8"),
             metal_retained: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED"),
@@ -1493,6 +1498,16 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub ffn_down_gemm4_prefill_reject_no_runtime_packed: u64,
     pub ffn_down_gemm4_prefill_reject_non_i8_interleave: u64,
     pub ffn_down_decode_consumer_taken: u64,
+    pub ffn_down_vnni_decode_candidates: u64,
+    pub ffn_down_vnni_decode_taken: u64,
+    pub ffn_down_vnni_decode_quantize_us: u64,
+    pub ffn_down_vnni_decode_kernel_us: u64,
+    pub ffn_down_vnni_decode_reject_gate_off: u64,
+    pub ffn_down_vnni_decode_reject_cpu_feature: u64,
+    pub ffn_down_vnni_decode_reject_no_vnni_pack: u64,
+    pub ffn_down_vnni_decode_reject_bad_input_width: u64,
+    pub ffn_down_vnni_decode_reject_bad_output_width: u64,
+    pub ffn_down_vnni_decode_reject_shape_or_role: u64,
     pub prefill_single_token_fallbacks: u64,
 }
 
@@ -1567,6 +1582,16 @@ static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH: AtomicU64 = Atomi
 static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH: AtomicU64 = AtomicU64::new(0);
+static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE: OnceLock<
     Mutex<HashMap<String, LlamaQ8ScheduleRoleTelemetry>>,
@@ -1580,9 +1605,15 @@ static Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE: OnceLock<
 static Q8_SCHED_PROJECTION_ROUTE_DENIALS: OnceLock<
     Mutex<HashMap<String, LlamaQ8ProjectionRouteDenialTelemetry>>,
 > = OnceLock::new();
+#[cfg(not(test))]
 static Q8_SCHED_TELEMETRY_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub fn q8_schedule_telemetry_enabled() -> bool {
+    #[cfg(test)]
+    {
+        env_flag_enabled(Q8_SCHEDULE_TELEMETRY_ENV)
+    }
+    #[cfg(not(test))]
     *Q8_SCHED_TELEMETRY_ENABLED.get_or_init(|| env_flag_enabled(Q8_SCHEDULE_TELEMETRY_ENV))
 }
 
@@ -1610,6 +1641,16 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE.store(0, Ordering::Relaxed);
     Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS.store(0, Ordering::Relaxed);
     if let Some(by_role) = Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE.get() {
         by_role.lock().expect("q8 role telemetry mutex").clear();
@@ -1700,6 +1741,25 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
             Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE.load(Ordering::Relaxed),
         ffn_down_decode_consumer_taken: Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN
             .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_candidates: Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES
+            .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_taken: Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN.load(Ordering::Relaxed),
+        ffn_down_vnni_decode_quantize_us: Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US
+            .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_kernel_us: Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US
+            .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_reject_gate_off: Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF
+            .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_reject_cpu_feature: Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE
+            .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_reject_no_vnni_pack: Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK
+            .load(Ordering::Relaxed),
+        ffn_down_vnni_decode_reject_bad_input_width:
+            Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH.load(Ordering::Relaxed),
+        ffn_down_vnni_decode_reject_bad_output_width:
+            Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH.load(Ordering::Relaxed),
+        ffn_down_vnni_decode_reject_shape_or_role:
+            Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE.load(Ordering::Relaxed),
         prefill_single_token_fallbacks: Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS
             .load(Ordering::Relaxed),
     }
@@ -8368,6 +8428,7 @@ fn resolve_x86_q8_ffn_down_route<'a>(
     let route_enabled = match route {
         X86Q8FfnDownRouteKind::Decode => {
             runtime_plan.q8.ffn_down_decode_consumer
+                || runtime_plan.q8.ffn_down_vnni_decode
                 || x86_q8_ffn_down_decode_reference_gate_enabled()
         }
         X86Q8FfnDownRouteKind::PackedRows4Matmul => runtime_plan.q8.ffn_down_packed_rows4_matmul,
@@ -8611,6 +8672,172 @@ fn q8_ffn_down_decode_consumer_route_name(decode_group_chunking: bool) -> &'stat
     } else {
         "x86_decode_consumer"
     }
+}
+
+fn record_q8_ffn_down_vnni_decode_reject(
+    counter: &AtomicU64,
+    reason: &'static str,
+    rows: usize,
+    input_width: usize,
+    output_width: usize,
+) {
+    add_q8_schedule_counter(counter, 1);
+    record_q8_schedule_projection_route_denial(
+        "ffn_down",
+        "x86_vnni_decode_consumer",
+        reason,
+        rows,
+        input_width,
+        output_width,
+    );
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn x86_q8_vnni_decode_cpu_supported() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn x86_q8_vnni_decode_cpu_supported() -> bool {
+    false
+}
+
+fn q8_0_vnni_decode_1x64_projection(
+    packed: &Q8_0VnniPacked,
+    quantized_input: &[Q8_0Block],
+    output_width: usize,
+    name: &str,
+) -> Result<CpuTensor> {
+    if packed.rows != output_width
+        || packed.blocks_per_row != quantized_input.len()
+        || !output_width.is_multiple_of(64)
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 VNNI decode requires matching 64-aligned packed output/input, got packed rows {}, output {}, packed blocks_per_row {}, input blocks {}",
+            packed.rows,
+            output_width,
+            packed.blocks_per_row,
+            quantized_input.len()
+        )));
+    }
+
+    let mut output = vec![0.0_f32; output_width];
+    q8_0_vnni_decode_1x64_projection_into(packed, quantized_input, &mut output)?;
+    CpuTensor::from_f32(name, vec![1, output_width], output)
+}
+
+fn q8_0_vnni_decode_1x64_projection_into(
+    packed: &Q8_0VnniPacked,
+    quantized_input: &[Q8_0Block],
+    output: &mut [f32],
+) -> Result<()> {
+    let output_width = output.len();
+    if packed.rows != output_width
+        || packed.blocks_per_row != quantized_input.len()
+        || !output_width.is_multiple_of(64)
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 VNNI decode requires matching 64-aligned packed output/input, got packed rows {}, output {}, packed blocks_per_row {}, input blocks {}",
+            packed.rows,
+            output_width,
+            packed.blocks_per_row,
+            quantized_input.len()
+        )));
+    }
+
+    let compute_group64 = |group64: usize, output_chunk: &mut [f32]| {
+        for tile_col in 0..4 {
+            let mut sums = [0.0_f32; 16];
+            for (block_idx, input_block) in quantized_input.iter().enumerate() {
+                let tile_idx = (group64 * 4 + tile_col) * packed.blocks_per_row + block_idx;
+                let tile = &packed.tiles[tile_idx];
+                let int_sums = q8_0_vnni_tile16_dot(tile, input_block);
+                for (lane, sum) in sums.iter_mut().enumerate() {
+                    *sum += int_sums[lane] as f32
+                        * input_block.scale
+                        * f16_bits_to_f32(tile.scale_f16[lane]);
+                }
+            }
+            output_chunk[tile_col * 16..tile_col * 16 + 16].copy_from_slice(&sums);
+        }
+    };
+
+    if output.len() >= 1024 && rayon::current_num_threads() > 1 {
+        output
+            .par_chunks_exact_mut(64)
+            .enumerate()
+            .for_each(|(group64, output_chunk)| compute_group64(group64, output_chunk));
+    } else {
+        for (group64, output_chunk) in output.chunks_exact_mut(64).enumerate() {
+            compute_group64(group64, output_chunk);
+        }
+    }
+    Ok(())
+}
+
+fn q8_0_vnni_tile16_dot(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if x86_q8_vnni_decode_cpu_supported() {
+            // SAFETY: runtime feature detection confirms the AVX512-VNNI feature set.
+            return unsafe { q8_0_vnni_tile16_dot_avx512(tile, input_block) };
+        }
+    }
+    q8_0_vnni_tile16_dot_scalar(tile, input_block)
+}
+
+fn q8_0_vnni_tile16_dot_scalar(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
+    let mut sums = [0_i32; 16];
+    for (lane, sum) in sums.iter_mut().enumerate() {
+        let mut acc = 0_i32;
+        for g in 0..8 {
+            for r in 0..4 {
+                let a = i32::from(input_block.quants[g * 4 + r]) + 128;
+                let b = i32::from(tile.quants[g * 64 + lane * 4 + r]);
+                acc += a * b;
+            }
+        }
+        *sum = acc - tile.comp[lane];
+    }
+    sums
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_vnni_tile16_dot_avx512(tile: &Q8_0VnniTile16, input_block: &Q8_0Block) -> [i32; 16] {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm512_dpbusd_epi32, _mm512_loadu_si512, _mm512_set1_epi32, _mm512_setzero_si512,
+        _mm512_storeu_si512, _mm512_sub_epi32,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm512_dpbusd_epi32, _mm512_loadu_si512, _mm512_set1_epi32, _mm512_setzero_si512,
+        _mm512_storeu_si512, _mm512_sub_epi32,
+    };
+
+    let mut acc = _mm512_setzero_si512();
+    for g in 0..8 {
+        let bytes = [
+            input_block.quants[g * 4] as u8 ^ 0x80,
+            input_block.quants[g * 4 + 1] as u8 ^ 0x80,
+            input_block.quants[g * 4 + 2] as u8 ^ 0x80,
+            input_block.quants[g * 4 + 3] as u8 ^ 0x80,
+        ];
+        let activation = _mm512_set1_epi32(i32::from_le_bytes(bytes));
+        let weights = unsafe { _mm512_loadu_si512(tile.quants.as_ptr().add(g * 64).cast()) };
+        acc = _mm512_dpbusd_epi32(acc, activation, weights);
+    }
+    let comp = unsafe { _mm512_loadu_si512(tile.comp.as_ptr().cast()) };
+    acc = _mm512_sub_epi32(acc, comp);
+
+    let mut lanes = [0_i32; 16];
+    unsafe {
+        _mm512_storeu_si512(lanes.as_mut_ptr().cast(), acc);
+    }
+    lanes
 }
 
 fn should_parallelize_x86_q8_packed_rows4_decode_output(output_width: usize) -> bool {
@@ -10046,6 +10273,37 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     rectangular_role: &str,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<CpuTensor>> {
+    let rows_for_telemetry = input.dim(0).unwrap_or(0);
+    let input_width_for_telemetry = input.dim(1).unwrap_or(0);
+    let weight_rows_for_telemetry = weight.dim(0).unwrap_or(0);
+    let weight_cols_for_telemetry = weight.dim(1).unwrap_or(0);
+    let output_width_for_telemetry = if weight_rows_for_telemetry == input_width_for_telemetry {
+        weight_cols_for_telemetry
+    } else if weight_cols_for_telemetry == input_width_for_telemetry {
+        weight_rows_for_telemetry
+    } else {
+        0
+    };
+    if q8_schedule_telemetry_enabled() {
+        add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES, 1);
+        if !runtime_plan.q8.ffn_down_vnni_decode {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF,
+                "gate_off",
+                rows_for_telemetry,
+                input_width_for_telemetry,
+                output_width_for_telemetry,
+            );
+        } else if rectangular_role != "ffn_down" || input.rank() != 2 || weight.rank() != 2 {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE,
+                "shape_or_role_mismatch",
+                rows_for_telemetry,
+                input_width_for_telemetry,
+                output_width_for_telemetry,
+            );
+        }
+    }
     let Some(route) = resolve_x86_q8_ffn_down_route(
         input,
         weight,
@@ -10056,6 +10314,76 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     else {
         return Ok(None);
     };
+
+    if runtime_plan.q8.ffn_down_vnni_decode {
+        if !x86_q8_vnni_decode_cpu_supported() {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE,
+                "cpu_feature_missing",
+                1,
+                route.input_width,
+                route.output_width,
+            );
+        } else if !route.input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH,
+                "bad_input_width",
+                1,
+                route.input_width,
+                route.output_width,
+            );
+        } else if !route.output_width.is_multiple_of(64) {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH,
+                "bad_output_width",
+                1,
+                route.input_width,
+                route.output_width,
+            );
+        } else if let Some(vnni_packed) = route.packed.vnni_packed.as_ref() {
+            let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let quantize_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
+            if let Some(started) = quantize_started {
+                add_q8_schedule_counter(
+                    &Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US,
+                    started.elapsed().as_micros() as u64,
+                );
+            }
+            let kernel_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let output = q8_0_vnni_decode_1x64_projection(
+                vnni_packed,
+                &quantized_input.blocks,
+                route.output_width,
+                name,
+            )?;
+            if let Some(started) = kernel_started {
+                add_q8_schedule_counter(
+                    &Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US,
+                    started.elapsed().as_micros() as u64,
+                );
+            }
+            add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN, 1);
+            record_q8_schedule_projection_route_elapsed(
+                "ffn_down",
+                "x86_vnni_decode_consumer",
+                name,
+                1,
+                route.input_width,
+                route.output_width,
+                telemetry_started,
+            );
+            return Ok(Some(output));
+        } else {
+            record_q8_ffn_down_vnni_decode_reject(
+                &Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK,
+                "no_vnni_pack",
+                1,
+                route.input_width,
+                route.output_width,
+            );
+        }
+    }
 
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
@@ -14606,6 +14934,7 @@ mod tests {
             blocks_per_row,
             interleave: Q8_0PackedRows4Interleave::I8,
             amx_blocks: None,
+            vnni_packed: None,
             blocks: (0..blocks_per_row)
                 .map(|block_idx| Q8_0PackedRows4Block {
                     scales: [0.25, 0.5, 0.75, 1.25],
@@ -15909,6 +16238,7 @@ mod tests {
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
+                ffn_down_vnni_decode: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -16714,6 +17044,7 @@ mod tests {
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
+                ffn_down_vnni_decode: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -17261,6 +17592,7 @@ mod tests {
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
+                ffn_down_vnni_decode: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -17268,6 +17600,12 @@ mod tests {
                 hybrid_gpu_percent: 10,
             },
         }
+    }
+
+    fn ffn_down_vnni_decode_plan(enabled: bool) -> ResolvedRuntimePlan {
+        let mut plan = ffn_down_consumer_plan(false);
+        plan.q8.ffn_down_vnni_decode = enabled;
+        plan
     }
 
     fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
@@ -17291,6 +17629,7 @@ mod tests {
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
+                ffn_down_vnni_decode: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -17333,6 +17672,7 @@ mod tests {
                 ffn_down_gemm4_row_group_schedule: false,
                 ffn_down_gemm4_avx2: false,
                 ffn_down_single_owner: false,
+                ffn_down_vnni_decode: false,
                 metal: false,
                 metal_retained: false,
                 hybrid_retained: false,
@@ -17488,6 +17828,68 @@ mod tests {
         (input, packed_weight, expected)
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn runtime_vnni_packed_ffn_down_case() -> (CpuTensor, CpuTensor, CpuTensor) {
+        const Q8_0_BLOCK_BYTES: usize = 34;
+        let rows = 64;
+        let input_width = Q8_0_BLOCK_VALUES * 2;
+        let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+        let mut raw = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+        let mut row_blocks = Vec::with_capacity(rows * blocks_per_row);
+        for row in 0..rows {
+            for block_idx in 0..blocks_per_row {
+                let scale = 0.125 + row as f32 * 0.003 + block_idx as f32 * 0.017;
+                let scale_bits = f32_to_f16_bits(scale);
+                let quants = std::array::from_fn(|idx| {
+                    (idx as i8)
+                        .wrapping_mul(5)
+                        .wrapping_add((row as i8).wrapping_mul(3))
+                        .wrapping_sub((block_idx as i8).wrapping_mul(11))
+                });
+                raw.extend_from_slice(&scale_bits.to_le_bytes());
+                raw.extend(quants.iter().map(|value| *value as u8));
+                row_blocks.push(Q8_0Block {
+                    scale: f16_bits_to_f32(scale_bits),
+                    quants,
+                });
+            }
+        }
+        let input = CpuTensor::from_f32(
+            "input",
+            vec![1, input_width],
+            (0..input_width)
+                .map(|idx| (idx as f32 - 21.0) * 0.15625)
+                .collect(),
+        )
+        .unwrap();
+        let retained_weight = CpuTensor::from_f32_with_q8_0_blocks(
+            "retained_ffn_down_transposed",
+            vec![rows, input_width],
+            dequantized_q8_0_rows(&row_blocks),
+            row_blocks,
+        )
+        .unwrap();
+        let expected =
+            matmul_rhs_transposed_with_precision(&input, &retained_weight, "expected").unwrap();
+        std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+        let packed = Q8_0PackedRows4::from_q8_0_bytes(
+            rows,
+            blocks_per_row,
+            Q8_0PackedRows4Interleave::I8,
+            &raw,
+        )
+        .unwrap();
+        assert!(packed.vnni_packed.is_some());
+        let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, rows],
+            },
+            packed,
+        );
+        (input, packed_weight, expected)
+    }
+
     #[test]
     fn mac_q8_ffn_down_decode_consumer_alias_is_default_off_and_opt_in() {
         let _env_guard = env_lock();
@@ -17622,6 +18024,124 @@ mod tests {
 
         assert_eq!(actual.shape.dims, expected.shape.dims);
         assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn q8_ffn_down_vnni_decode_consumer_matches_rows4_decode_baseline() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        if !x86_q8_vnni_decode_cpu_supported() {
+            std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+            return;
+        }
+        let (input, packed_weight, expected) = runtime_vnni_packed_ffn_down_case();
+        let plan = ffn_down_vnni_decode_plan(true);
+
+        let actual = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "layer_0_ffn_down",
+            "ffn_down",
+            &plan,
+        )
+        .unwrap()
+        .expect("VNNI FFN-down decode output");
+
+        assert_eq!(actual.shape.dims, expected.shape.dims);
+        assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn q8_ffn_down_vnni_decode_records_selected_route() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        if !x86_q8_vnni_decode_cpu_supported() {
+            std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+            return;
+        }
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+        reset_q8_schedule_telemetry();
+        let (input, packed_weight, _expected) = runtime_vnni_packed_ffn_down_case();
+
+        let _ = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "layer_7_ffn_down",
+            "ffn_down",
+            &ffn_down_vnni_decode_plan(true),
+        )
+        .unwrap()
+        .expect("VNNI FFN-down decode output");
+
+        let telemetry = snapshot_q8_schedule_telemetry();
+        assert_eq!(telemetry.ffn_down_vnni_decode_taken, 1);
+        assert!(telemetry
+            .output_projection_by_route
+            .contains_key("ffn_down.x86_vnni_decode_consumer"));
+        assert!(telemetry
+            .output_projection_by_layer_route
+            .contains_key("layer_7.ffn_down.x86_vnni_decode_consumer"));
+        reset_q8_schedule_telemetry();
+        std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+    }
+
+    #[test]
+    fn q8_ffn_down_vnni_decode_falls_back_when_gate_off_or_pack_missing() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let (input, packed_weight, expected) = runtime_packed_ffn_down_case();
+
+        let gate_off = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "gate_off",
+            "ffn_down",
+            &ffn_down_consumer_plan(true),
+        )
+        .unwrap()
+        .expect("rows4 fallback with VNNI gate off");
+        assert_slice_close_with_tolerance(&gate_off.data, &expected.data, 5e-4);
+
+        let vnni_on = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "pack_missing",
+            "ffn_down",
+            &ffn_down_vnni_decode_plan(true),
+        )
+        .unwrap()
+        .expect("rows4 fallback when VNNI pack is unavailable or CPU-gated");
+        assert_slice_close_with_tolerance(&vnni_on.data, &expected.data, 5e-4);
+    }
+
+    #[test]
+    fn q8_ffn_down_vnni_decode_records_route_denials() {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+        reset_q8_schedule_telemetry();
+        let (input, packed_weight, _expected) = runtime_packed_ffn_down_case();
+
+        let _ = try_x86_q8_ffn_down_decode_consumer_path(
+            &input,
+            &packed_weight,
+            "layer_3_ffn_down",
+            "ffn_down",
+            &ffn_down_consumer_plan(true),
+        )
+        .unwrap();
+        let telemetry = snapshot_q8_schedule_telemetry();
+        assert_eq!(telemetry.ffn_down_vnni_decode_candidates, 1);
+        assert_eq!(telemetry.ffn_down_vnni_decode_reject_gate_off, 1);
+        assert!(telemetry
+            .projection_route_denials
+            .contains_key("ffn_down.x86_vnni_decode_consumer.gate_off"));
+        reset_q8_schedule_telemetry();
+        std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -17783,7 +18303,7 @@ mod tests {
 
         let output = matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
             &input,
-            &packed_weight,
+            packed_weight,
             output_width,
             "ffn_down",
             "ffn_down_probe",
