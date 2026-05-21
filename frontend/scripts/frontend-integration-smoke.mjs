@@ -144,7 +144,7 @@ try {
   }))
 
   assert.match(streamingMarkup, /data-streaming-state="active"/, 'streaming assistant rows should render an active streaming state')
-  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*Exact row supported[\s\S]*Capabilities[\s\S]*Template ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
+  assert.match(streamingMarkup, /Live chat exact-row readiness[\s\S]*Runtime[\s\S]*Local chat ready[\s\S]*Support[\s\S]*llama32_3b_instruct_q8_0: supported current gate[\s\S]*Capabilities[\s\S]*Template ready · Throughput not promoted/, 'non-empty live 3B chats should keep runtime, exact-row support, and row-scoped capability lanes visible after messages exist')
   assert.match(streamingMarkup, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability lanes must avoid widening exact-row support into broader claims')
   assert.match(streamingMarkup, /COMPATIBILITY\.md and \/api\/capabilities agree/, 'live 3B chat readiness must name the exact-row support-contract requirement')
   assert.match(streamingMarkup, /data-streaming-code-state="open"/, 'open streaming fences should expose the active code state')
@@ -582,7 +582,7 @@ try {
   assert.match(liveBackendIdChatMarkup, /How can I help\?/, 'ready 3B live-backend-id chat should render the sendable empty-state hero')
   assert.match(liveBackendIdChatMarkup, /Local chat ready/, 'ready 3B live-backend-id chat should show runtime-green chat UX')
   assert.match(liveBackendIdChatMarkup, /Llama 3\.2 3B Instruct Q8_0 is loaded now and generation_ready=true\./, 'ready 3B live-backend-id chat should display the exact 3B row name instead of the backend-generated runtime id')
-  assert.match(liveBackendIdChatMarkup, /Exact row supported/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
+  assert.match(liveBackendIdChatMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'ready 3B live-backend-id chat should show exact-row support in the composer surface')
   assert.match(liveBackendIdChatMarkup, /Message Camelid…/, 'ready 3B live-backend-id chat should enable the composer instead of showing load-first copy')
   assert.doesNotMatch(liveBackendIdChatMarkup, /Load a model first|Choose a supported model/, 'ready 3B live-backend-id chat should not fall back to blocked chat UX')
 

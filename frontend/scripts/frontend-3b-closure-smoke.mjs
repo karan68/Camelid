@@ -221,6 +221,8 @@ assert.match(chatSource, /runnableModels\s*=\s*models\.filter\(\(model\) => getC
 assert.match(chatSource, /canSubmit\s*=\s*Boolean\(composer\.trim\(\)\) && selectedModelRunnable && !generationActive/, 'composer send button must be blocked unless the exact-row chat gate unlocked')
 assert.match(chatSource, /runtimeStatusCopy[\s\S]*loaded now and generation_ready=true/, 'chat readiness copy must name the runtime readiness requirement')
 assert.match(chatSource, /supportStatusCopy[\s\S]*COMPATIBILITY\.md and \/api\/capabilities agree/, 'chat readiness copy must name the support-contract requirement')
+assert.match(chatSource, /supportStatusLabel\s*=\s*selectedModelCapabilitySupported[\s\S]*\?\s*selectedCompatibilityLabel/, 'supported live chat readiness must name the exact /api/capabilities row instead of a generic green label')
+assert.match(chatSource, /supportStatusCopy\s*=\s*selectedModelCapabilitySupported[\s\S]*`\$\{selectedCompatibilityLabel\}\. COMPATIBILITY\.md and \/api\/capabilities agree/, 'supported live chat readiness copy must preserve the exact row id after the gate turns green')
 assert.match(chatSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'non-empty live 3B chat must keep runtime, exact-row support, and row-scoped capability readiness visible after messages exist')
 assert.match(chatSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'live 3B chat must derive capability lane copy from the shared exact-row chat gate')
 assert.match(chatSource, /Row-scoped \/api\/capabilities evidence; it does not widen model-native context/, 'live 3B capability copy must not widen support beyond the exact row')
