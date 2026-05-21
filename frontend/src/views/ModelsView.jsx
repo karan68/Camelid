@@ -56,19 +56,28 @@ function findCatalogMatch(models, item) {
   return models.find((model) => model.hf_repo === item.repo_id && model.hf_filename === item.filename)
 }
 
+function pathBasename(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean).pop() || ''
+}
+
+const LLAMA32_3B_ACCEPTANCE_FILENAME = pathBasename(LLAMA32_3B_ACCEPTANCE_TARGET.source)
+
+function hasExactLlama32ThreeBArtifact(model) {
+  const exactTargetPath = model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+    || model?.path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
+  const filenames = [
+    model?.model_path,
+    model?.path,
+    model?.hf_filename,
+    model?.source,
+  ].map(pathBasename).filter(Boolean)
+  return exactTargetPath || filenames.some((filename) => filename.toLowerCase() === LLAMA32_3B_ACCEPTANCE_FILENAME.toLowerCase())
+}
+
 function matchesLlama32ThreeBTarget(model, capabilities) {
   const target = { id: 'llama32_3b_instruct_q8_0' }
   if (compatibilityHintMatchesExactTarget(capabilities, model, target)) return true
-
-  const subject = [model?.id, model?.name, model?.runtime_model_name, model?.model_path, model?.path, model?.quant].filter(Boolean).join(' ').toLowerCase()
-  const hasLlama32ThreeB = /llama[\s._-]*3\.2[\s._-]*3b/.test(subject)
-    || /llama[\s._-]*32[\s._-]*3b/.test(subject)
-  const hasInstruct = /(?:^|[^a-z0-9])instruct(?:[^a-z0-9]|$)/i.test(subject)
-  const hasQ8 = /(?:^|[^a-z0-9])q8[\s._-]*0(?:[^a-z0-9]|$)/i.test(subject)
-    || /\bfile[_\s-]*type\s*7\b/i.test(subject)
-  const exactAcceptanceIdentity = model?.id === LLAMA32_3B_ACCEPTANCE_TARGET.id
-    || model?.model_path === LLAMA32_3B_ACCEPTANCE_TARGET.model_path
-  return Boolean((exactAcceptanceIdentity && hasQ8) || (hasLlama32ThreeB && hasInstruct && hasQ8))
+  return hasExactLlama32ThreeBArtifact(model)
 }
 
 function findModelMatchingCapabilityRow(models, capabilities, target, runtime, selectedModelId) {

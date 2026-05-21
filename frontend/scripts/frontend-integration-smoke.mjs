@@ -439,6 +439,37 @@ try {
   assert.match(neighboringQuantAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when the browser acceptance id is backed by a neighboring quant')
   assert.match(neighboringQuantAcceptanceMarkup, /llama32_3b_instruct_q8_0: quant mismatch/, '3B acceptance hardening should surface the Q8_0 row mismatch instead of treating the browser id as exact evidence')
 
+  const neighboringArtifactAcceptanceRecord = {
+    ...aliasSelectedModel,
+    id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
+    name: 'Llama 3.2 3B Instruct Q8_0',
+    runtime_model_name: 'llama32_3b_instruct_q8_0_neighbor',
+    quant: 'Q8_0',
+    model_path: '/models/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
+  }
+  const neighboringArtifactAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    runtime: { ...readyRuntime, active_model_id: neighboringArtifactAcceptanceRecord.runtime_model_name },
+    capabilities,
+    refreshDashboard: noop,
+    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
+    setRegisterForm: noop,
+    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
+    setExternalForm: noop,
+    registerModel: noop,
+    connectExternalModel: noop,
+    models: [neighboringArtifactAcceptanceRecord],
+    selectedModelId: neighboringArtifactAcceptanceRecord.id,
+    setSelectedModelId: noop,
+    loadingModelId: '',
+    activateModel: noop,
+    unloadCurrentModel: noop,
+    installModel: noop,
+    installCatalogModel: noop,
+    cancelModelDownload: noop,
+  }))
+  assert.match(neighboringArtifactAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when a same-label Q8 record lacks the exact GGUF filename')
+  assert.match(neighboringArtifactAcceptanceMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B acceptance hardening should require exact artifact identity, not just the 3B Instruct Q8 label')
+
   const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
   green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })
   green3BCapabilities.model_compatibility = green3BCapabilities.model_compatibility.map((target) => target.id === 'llama32_3b_instruct_q8_0'
