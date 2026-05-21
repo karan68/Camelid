@@ -382,6 +382,7 @@ try {
   assert.match(modelsMarkup, /Chat unlockable/, 'Tracked 3B card should turn green only after exact row support and runtime readiness both match')
   assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
   assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
+  assert.match(modelsMarkup, /Capability lanes:[\s\S]*Template\/Jinja readiness: Template rendering ready for this exact row[\s\S]*Checked context readiness: Checked context packs ready for this exact row[\s\S]*Throughput readiness: Production throughput not promoted/, 'Models exact-row evidence blocks should render 3B row-scoped capability lanes without promoting production throughput')
   assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
 
   const staleRuntimeModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {

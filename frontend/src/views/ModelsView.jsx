@@ -125,11 +125,15 @@ function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
   const quant = model?.quant || catalogItem?.quant || ''
   const compatibilityHint = findCompatibilityHint(capabilities, model, catalogItem)
   const exactTarget = isExactCompatibilityHint(compatibilityHint) ? compatibilityHint.target : null
+  const supportLanes = exactTarget ? exactRowSupportLanes(exactTarget, capabilities?.api_features || []) : []
 
   return (
     <div className="models-card-copy-stack models-capability-evidence" aria-label="Capability evidence boundary">
       <p className="model-summary"><b>Exact-row quant evidence:</b> {exactTarget ? `${exactTarget.id}: ${exactTarget.quantization} · ${formatCapabilityStatus(exactTarget.status)}` : quant ? `${quant}: no exact compatibility row matched; do not infer support from this quant label.` : 'No quant label and no exact compatibility row matched.'}</p>
       <p className="model-summary"><b>Exact-row support:</b> {compatibilityHintLabel(compatibilityHint, 'No exact compatibility row matched')}. {compatibilityHintCopy(compatibilityHint)}</p>
+      {supportLanes.length > 0 && (
+        <p className="model-summary"><b>Capability lanes:</b> {supportLanes.map((lane) => `${supportLaneTitle(lane)}: ${lane.label}`).join(' · ')}</p>
+      )}
     </div>
   )
 }

@@ -280,6 +280,8 @@ assert.match(modelsSource, /Chat unlockable/, 'ModelsView must expose the retain
 assert.match(modelsSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'ModelsView retained 3B row cards must use the shared chat gate for loaded_now and generation_ready checks')
 assert.match(modelsSource, /catalogCompatibilityHint\s*=\s*findCompatibilityHint\(capabilities, localMatch, item\)/, 'ModelsView catalog cards must resolve exact-row support through the shared capability matcher')
 assert.match(modelsSource, /catalogExactTarget\.id[\s\S]*supported exact row/, 'ModelsView catalog cards must visibly label exact supported rows without widening catalog metadata into broad support')
+assert.match(modelsSource, /supportLanes\s*=\s*exactTarget \? exactRowSupportLanes\(exactTarget, capabilities\?\.api_features \|\| \[\]\) : \[\]/, 'ModelsView exact-row evidence blocks must render row-scoped capability lanes from /api/capabilities')
+assert.match(modelsSource, /Capability lanes:[\s\S]*supportLanes\.map\(\(lane\) => `\$\{supportLaneTitle\(lane\)\}: \$\{lane\.label\}`\)\.join\(' · '\)/, 'ModelsView local and catalog cards must show 3B template/context/throughput lanes instead of a generic support label')
 assert.match(apiSource, /Selected exact-row evidence/, 'API view must surface selected 3B exact-row evidence')
 assert.match(apiSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API view must use the shared exact-row chat gate for 3B endpoint readiness')
 assert.match(apiSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API view must not reimplement 3B endpoint readiness separately from Chat/System')
