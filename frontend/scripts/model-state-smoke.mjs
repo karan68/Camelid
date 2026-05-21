@@ -185,7 +185,7 @@ const boundedOnlySupportFixture = {
   ],
 }
 const boundedOnlySupportLanes = exactRowSupportLanes(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features)
-assert.deepEqual(boundedOnlySupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', false]], 'bounded perf/RSS evidence should not promote production-throughput readiness for current supported rows')
+assert.deepEqual(boundedOnlySupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['context', false], ['throughput', false]], 'bounded perf/RSS evidence should not promote checked-context or production-throughput readiness for current supported rows')
 assert.doesNotMatch(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /arbitrary|Jinja/i, 'resolved exact-row template/Jinja blockers should not remain in exact-row boundary copy')
 assert.match(rowSupportBoundaryCopy(boundedOnlySupportFixture.model_compatibility[0], boundedOnlySupportFixture.api_features), /production|throughput/i, 'production-throughput blockers must remain until explicit production-throughput evidence is advertised')
 assert.match(frontendSupportContractCopy(boundedOnlySupportFixture), /production|throughput/i, 'support contract copy must keep production-throughput caveats when only bounded perf/RSS evidence exists')
@@ -197,7 +197,7 @@ const unsupportedEvidenceFixture = {
   ],
 }
 const unsupportedEvidenceLanes = exactRowSupportLanes(unsupportedEvidenceFixture.model_compatibility[0], unsupportedEvidenceFixture.api_features)
-assert.deepEqual(unsupportedEvidenceLanes.map((lane) => [lane.key, lane.ready]), [['template', false], ['throughput', false]], 'validation-only rows must not turn template/Jinja or throughput lanes green until the row itself is supported')
+assert.deepEqual(unsupportedEvidenceLanes.map((lane) => [lane.key, lane.ready]), [['template', false], ['context', false], ['throughput', false]], 'validation-only rows must not turn template/Jinja, checked-context, or throughput lanes green until the row itself is supported')
 assert.match(rowSupportBoundaryCopy(unsupportedEvidenceFixture.model_compatibility[0], unsupportedEvidenceFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'unsupported rows should keep template/Jinja and throughput blockers visible')
 const promotedSupportFixture = {
   support_contract: boundedOnlySupportFixture.support_contract,
@@ -207,7 +207,7 @@ const promotedSupportFixture = {
   ],
 }
 const promotedSupportLanes = exactRowSupportLanes(promotedSupportFixture.model_compatibility[0], promotedSupportFixture.api_features)
-assert.deepEqual(promotedSupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', true]], 'explicit broad template and production-throughput evidence may clear those readiness lanes')
+assert.deepEqual(promotedSupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['context', false], ['throughput', true]], 'explicit broad template and production-throughput evidence may clear those readiness lanes without inventing checked-context evidence')
 assert.doesNotMatch(rowSupportBoundaryCopy(promotedSupportFixture.model_compatibility[0], promotedSupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'resolved template/Jinja and production-throughput blockers should not remain in exact-row boundary copy')
 const modelsViewSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
 assert.match(
@@ -248,12 +248,12 @@ assert.deepEqual(
 assert.deepEqual(
   trackedTargets.map((target) => [target.id, exactRowSupportLanes(target, capabilityFixture.api_features).map((lane) => [lane.key, lane.ready])]),
   [
-    ['tinyllama_1_1b_chat_q8_0', [['template', true], ['throughput', false]]],
-    ['llama32_1b_instruct_q8_0', [['template', true], ['throughput', false]]],
-    ['llama32_3b_instruct_q8_0', [['template', true], ['throughput', false]]],
-    ['llama3_8b_instruct_q8_0', [['template', true], ['throughput', false]]],
+    ['tinyllama_1_1b_chat_q8_0', [['template', true], ['context', true], ['throughput', false]]],
+    ['llama32_1b_instruct_q8_0', [['template', true], ['context', true], ['throughput', false]]],
+    ['llama32_3b_instruct_q8_0', [['template', true], ['context', true], ['throughput', false]]],
+    ['llama3_8b_instruct_q8_0', [['template', true], ['context', true], ['throughput', false]]],
   ],
-  'current supported rows should expose green template lanes while keeping production-throughput unpromoted without explicit /api/capabilities evidence',
+  'current supported rows should expose green template and checked-context lanes while keeping production-throughput unpromoted without explicit /api/capabilities evidence',
 )
 for (const target of trackedTargets) {
   assert.doesNotMatch(

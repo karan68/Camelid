@@ -252,6 +252,25 @@ function hasExactRowBoundedPerformanceEvidence(target) {
     || performance.includes('hotpath')
 }
 
+const CHECKED_CONTEXT_PACK_FIELDS = [
+  ['512', 'bounded_context_512_pack'],
+  ['1024', 'bounded_context_1024_pack'],
+  ['2048', 'bounded_context_2048_pack'],
+  ['4096', 'bounded_context_4096_pack'],
+  ['8192', 'bounded_context_8192_pack'],
+]
+
+function checkedContextPacks(target) {
+  return CHECKED_CONTEXT_PACK_FIELDS
+    .map(([label, field]) => ({ label, status: target?.[field] || '' }))
+    .filter((pack) => pack.status)
+}
+
+function readyCheckedContextPacks(target) {
+  if (!isSupportedCapabilityStatus(target?.status || '')) return []
+  return checkedContextPacks(target).filter((pack) => statusContainsSupportedEvidence(pack.status))
+}
+
 export function describeTemplateReadiness(target) {
   if (!target) {
     return { key: 'template', label: 'Template/Jinja', status: 'No exact row selected', tone: '', ready: false, copy: 'Choose an exact compatibility row before treating template behavior as supported.' }
@@ -278,6 +297,33 @@ export function describeTemplateReadiness(target) {
         ? `Template/Jinja readiness is green for this supported exact row: metadata-Jinja renderer ${formatCapabilityStatus(renderer)} with ${formatCapabilityStatus(shapePack || 'row evidence')} coverage.`
         : `Template readiness is green for this supported exact row: renderer ${formatCapabilityStatus(renderer || 'not advertised')} with ${formatCapabilityStatus(shapePack || 'row evidence')} coverage.`
       : 'Template/Jinja evidence is not promoted for this row; keep readiness guarded until /api/capabilities reports supported row evidence.',
+  }
+}
+
+export function describeCheckedContextReadiness(target) {
+  if (!target) {
+    return { key: 'context', label: 'Checked context', status: 'No exact row selected', tone: '', ready: false, copy: 'Choose an exact compatibility row before treating context behavior as supported.' }
+  }
+
+  const packs = checkedContextPacks(target)
+  const readyPacks = readyCheckedContextPacks(target)
+  const ready = readyPacks.length > 0
+  const latest = [target.latest_checked_bucket, target.latest_checked_result].filter(Boolean).map(formatCapabilityStatus).join(' · ')
+  const status = readyPacks.length
+    ? readyPacks.map((pack) => `${pack.label}: ${formatCapabilityStatus(pack.status)}`).join(' · ')
+    : packs.length
+      ? packs.map((pack) => `${pack.label}: ${formatCapabilityStatus(pack.status)}`).join(' · ')
+      : latest || 'not advertised'
+
+  return {
+    key: 'context',
+    label: ready ? 'Checked context packs ready for this exact row' : 'Checked context packs not promoted',
+    status,
+    tone: ready ? 'ready' : 'warm',
+    ready,
+    copy: ready
+      ? `Checked context readiness is green for this supported exact row: ${readyPacks.map((pack) => `${pack.label} context ${formatCapabilityStatus(pack.status)}`).join(', ')}${latest ? `; latest checked ${latest}` : ''}. This does not promote model-native/larger context beyond the checked packs.`
+      : 'Checked context evidence is not promoted for this row; keep context claims guarded until /api/capabilities reports supported exact-row context packs.',
   }
 }
 
@@ -308,7 +354,7 @@ export function describeThroughputReadiness(target, apiFeatures = []) {
 }
 
 export function exactRowSupportLanes(target, apiFeatures = []) {
-  return [describeTemplateReadiness(target), describeThroughputReadiness(target, apiFeatures)]
+  return [describeTemplateReadiness(target), describeCheckedContextReadiness(target), describeThroughputReadiness(target, apiFeatures)]
 }
 
 function resolvedLaneState(target, apiFeatures = []) {

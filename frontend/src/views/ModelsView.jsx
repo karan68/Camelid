@@ -106,6 +106,12 @@ function formatCatalogTitle(item) {
   return item.name.endsWith(suffix) ? item.name.slice(0, -suffix.length) : item.name
 }
 
+function supportLaneTitle(lane) {
+  if (lane.key === 'template') return 'Template/Jinja readiness'
+  if (lane.key === 'context') return 'Checked context readiness'
+  return 'Throughput readiness'
+}
+
 function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
   const quant = model?.quant || catalogItem?.quant || ''
   const compatibilityHint = findCompatibilityHint(capabilities, model, catalogItem)
@@ -618,7 +624,7 @@ export default function ModelsView({
               <p className="panel-kicker">Exact-row full-support hardening</p>
               <h3>Current Q8 support rows</h3>
             </div>
-            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, with template/Jinja and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
+            <p className="model-summary">These cards mirror the current exact Q8 rows from /api/capabilities. Each row gets credit only for its own evidence, with template/Jinja, checked context, and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats; chat still unlocks only when the active local GGUF is loaded_now=true, generation_ready=true, and matched to that exact supported row.</p>
           </div>
 
           <div className="models-card-grid">
@@ -699,7 +705,7 @@ export default function ModelsView({
                   <div className="models-card-copy-stack">
                     <p className="model-summary"><b>Evidence:</b> {target.evidence}</p>
                     {supportLanes.map((lane) => (
-                      <p className="model-summary" key={lane.key}><b>{lane.key === 'template' ? 'Template/Jinja readiness' : 'Throughput readiness'}:</b> {lane.copy}</p>
+                      <p className="model-summary" key={lane.key}><b>{supportLaneTitle(lane)}:</b> {lane.copy}</p>
                     ))}
                     <p className="model-summary"><b>Remaining support boundary:</b> {rowSupportBoundaryCopy(target, apiFeatures)}</p>
                     <p className="model-summary"><b>Next step:</b> {rowSupportNextStepCopy(target, apiFeatures)}</p>

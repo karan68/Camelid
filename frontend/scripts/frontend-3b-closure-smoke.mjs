@@ -202,7 +202,10 @@ assert.equal(findCompatibilityHint(noThreeBRowCapabilities, exactThreeBModel), n
 assert.equal(getChatGateState(noThreeBRowCapabilities, exactThreeBModel, runtime).chatUnlocked, false, '3B WebUI chat must stay blocked without the exact compatibility row')
 
 const lanes = exactRowSupportLanes(llama32ThreeBTarget, capabilities.api_features)
-assert.deepEqual(lanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['throughput', false]], '3B template/Jinja readiness is row-green while production throughput remains unpromoted')
+assert.deepEqual(lanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['context', true], ['throughput', false]], '3B template/Jinja and checked-context readiness are row-green while production throughput remains unpromoted')
+const contextLane = lanes.find((lane) => lane.key === 'context')
+assert.match(contextLane.copy, /512 context validated first pack, 1024 context validated second pack, 2048 context validated third pack/, '3B checked-context copy must name the supported exact-row context packs')
+assert.match(contextLane.copy, /does not promote model-native\/larger context beyond the checked packs/, '3B checked-context copy must keep the larger-context boundary visible')
 const genericThroughputCapabilities = {
   ...capabilities,
   api_features: [

@@ -31,9 +31,10 @@ function getChatCapabilityLaneCopy(selectedChatGate, capabilities) {
 
   const lanes = exactRowSupportLanes(selectedChatGate.hint.target, capabilities?.api_features || [])
   const template = lanes.find((lane) => lane.key === 'template')
+  const context = lanes.find((lane) => lane.key === 'context')
   const throughput = lanes.find((lane) => lane.key === 'throughput')
   return {
-    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
+    label: `${template?.ready ? 'Template ready' : 'Template gated'} · ${context?.ready ? 'Context ready' : 'Context gated'} · ${throughput?.ready ? 'Throughput ready' : 'Throughput not promoted'}`,
     copy: 'Row-scoped /api/capabilities evidence; it does not widen model-native context, production-throughput, portability, neighboring-row, or broad-family support.',
   }
 }
