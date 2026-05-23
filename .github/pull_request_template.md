@@ -16,7 +16,8 @@ Explain the user-visible or engineering reason for the change.
 
 ## Public-repo privacy check
 
-- [ ] No private hostnames, SSH commands, user home paths, key paths, or local validation details are included
+- [ ] No private hostnames, SSH commands, user home paths, key paths, local validation details, raw SSH stderr, or raw infrastructure failure output are included
+- [ ] Remote validation blockers are summarized generically, for example: `Remote Linux x86_64 validation was unavailable during this cycle; no fresh same-host timing/parity claim is made.`
 - [ ] `bash scripts/check-public-scrub.sh`
 - [ ] `node scripts/audit-evidence-bundle-privacy.mjs --strict`
 

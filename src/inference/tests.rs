@@ -1660,6 +1660,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -1667,6 +1668,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -1771,7 +1773,10 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE", "on");
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_ROWS", "7");
     std::env::set_var("CAMELID_HYBRID_Q8_GPU_PERCENT", "25");
 
@@ -1799,7 +1804,10 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.ffn_gate_up_packed_rows4_matmul);
     assert!(plan.q8.ffn_gate_up_single_owner);
     assert!(plan.q8.ffn_down_decode_consumer);
+    assert!(plan.q8.ffn_down_decode_group_chunking);
     assert!(plan.q8.ffn_down_packed_rows4_matmul);
+    assert!(plan.q8.ffn_down_vnni_decode);
+    assert!(plan.q8.ffn_down_vnni_decode_rawptr);
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_PROJECTION_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_OUTPUT_PACKED_ROWS4_MATMUL");
@@ -1817,7 +1825,10 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_SINGLE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING");
     std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
     assert!(
         plan.q8.attention_projection_decode_consumer,
         "resolved plan should cache the attention projection consumer gate"
@@ -1883,8 +1894,20 @@ fn resolved_runtime_plan_captures_q8_env_once() {
         "resolved plan should cache the FFN-down consumer gate"
     );
     assert!(
+        plan.q8.ffn_down_decode_group_chunking,
+        "resolved plan should cache the FFN-down decode group-chunking gate"
+    );
+    assert!(
         plan.q8.ffn_down_packed_rows4_matmul,
         "resolved plan should cache the packed-rows4 matmul gate"
+    );
+    assert!(
+        plan.q8.ffn_down_vnni_decode,
+        "resolved plan should cache the FFN-down VNNI decode gate"
+    );
+    assert!(
+        plan.q8.ffn_down_vnni_decode_rawptr,
+        "resolved plan should cache the FFN-down VNNI rawptr decode gate"
     );
     assert_eq!(plan.q8.hybrid_gpu_rows, Some(7));
     assert_eq!(plan.q8.hybrid_gpu_percent, 25);
@@ -1986,6 +2009,14 @@ fn runtime_profile_defaults_keep_experimental_q8_gates_closed() {
         assert!(
             !plan.q8.ffn_down_packed_rows4_matmul,
             "{profile} should not enable packed-rows4 matmul by default"
+        );
+        assert!(
+            !plan.q8.ffn_down_vnni_decode,
+            "{profile} should not enable FFN-down VNNI decode by default"
+        );
+        assert!(
+            !plan.q8.ffn_down_vnni_decode_rawptr,
+            "{profile} should not enable FFN-down VNNI rawptr decode by default"
         );
         assert!(
             !plan.q8.metal,
@@ -2536,6 +2567,7 @@ fn q8_attention_consumer_plan(
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -2543,6 +2575,7 @@ fn q8_attention_consumer_plan(
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -3449,6 +3482,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: enabled,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -3456,6 +3490,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -3468,6 +3503,8 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
 fn ffn_down_vnni_decode_plan(enabled: bool) -> ResolvedRuntimePlan {
     let mut plan = ffn_down_consumer_plan(false);
     plan.q8.ffn_down_vnni_decode = enabled;
+    plan.q8.ffn_down_vnni_decode_rawptr =
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
     plan
 }
 
@@ -3494,6 +3531,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: enabled,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -3501,6 +3539,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -3545,6 +3584,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_gate_up_packed_rows4_matmul: false,
             ffn_gate_up_single_owner: false,
             ffn_down_decode_consumer: false,
+            ffn_down_decode_group_chunking: false,
             ffn_down_packed_rows4_matmul: false,
             ffn_down_gemm4_prefill: false,
             ffn_down_gemm4_row_group_schedule: false,
@@ -3552,6 +3592,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_amx_prefill: false,
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
+            ffn_down_vnni_decode_rawptr: false,
             metal: false,
             metal_retained: false,
             hybrid_retained: false,
@@ -4235,6 +4276,47 @@ fn q8_ffn_down_vnni_decode_rawptr_records_selected_route() {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[test]
+fn q8_ffn_down_vnni_decode_rawptr_env_does_not_bypass_runtime_plan() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    if !x86_q8_vnni_decode_cpu_supported() {
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+        std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+        return;
+    }
+    std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR", "on");
+    std::env::set_var(Q8_SCHEDULE_TELEMETRY_ENV, "on");
+    reset_q8_schedule_telemetry();
+    let (input, packed_weight, _expected) = runtime_vnni_packed_ffn_down_case();
+    let mut plan = ffn_down_vnni_decode_plan(true);
+    plan.q8.ffn_down_vnni_decode_rawptr = false;
+
+    let _ = try_x86_q8_ffn_down_decode_consumer_path(
+        &input,
+        &packed_weight,
+        "layer_13_ffn_down",
+        "ffn_down",
+        &plan,
+    )
+    .unwrap()
+    .expect("planned VNNI FFN-down decode output");
+
+    let telemetry = snapshot_q8_schedule_telemetry();
+    assert_eq!(telemetry.ffn_down_vnni_decode_taken, 1);
+    assert!(telemetry
+        .output_projection_by_route
+        .contains_key("ffn_down.x86_vnni_decode_consumer"));
+    assert!(!telemetry
+        .output_projection_by_route
+        .contains_key("ffn_down.x86_vnni_decode_rawptr_consumer"));
+    reset_q8_schedule_telemetry();
+    std::env::remove_var(Q8_SCHEDULE_TELEMETRY_ENV);
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR");
+    std::env::remove_var("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
 fn q8_ffn_down_vnni_decode_rawptr_avx2_matches_rows4_decode_baseline() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();
@@ -4453,13 +4535,17 @@ fn mac_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
     std::env::set_var("CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
     assert!(mac_q8_ffn_down_decode_group_chunking_enabled());
     assert_eq!(mac_q8_ffn_down_decode_groups_per_chunk(), 2);
+    let mut chunked_plan = plan;
+    chunked_plan.q8.ffn_down_decode_group_chunking =
+        Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking;
+    assert!(chunked_plan.q8.ffn_down_decode_group_chunking);
 
     let chunked = try_x86_q8_ffn_down_decode_consumer_path(
         &input,
         &packed_weight,
         "chunked",
         "ffn_down",
-        &plan,
+        &chunked_plan,
     )
     .unwrap()
     .expect("chunked ffn_down consumer");
@@ -4494,18 +4580,22 @@ fn x86_q8_ffn_down_decode_group_chunking_is_default_off_and_matches_consumer() {
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUPS_PER_CHUNK", "2");
     assert!(x86_q8_ffn_down_decode_group_chunking_enabled());
+    assert!(Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking);
     assert_eq!(q8_ffn_down_decode_groups_per_chunk(), 2);
     assert_eq!(
         q8_ffn_down_decode_consumer_route_name(true),
         "x86_decode_consumer_group_chunking"
     );
 
+    let mut chunked_plan = plan;
+    chunked_plan.q8.ffn_down_decode_group_chunking =
+        Q8RuntimeFlags::from_env().ffn_down_decode_group_chunking;
     let chunked = try_x86_q8_ffn_down_decode_consumer_path(
         &input,
         &packed_weight,
         "chunked",
         "ffn_down",
-        &plan,
+        &chunked_plan,
     )
     .unwrap()
     .expect("chunked ffn_down consumer");
@@ -9460,7 +9550,7 @@ fn kv_cache_allocates_positions_lazily_without_losing_prior_layers() {
     assert_eq!(kv_cache.keys.len(), 8);
     assert_eq!(kv_cache.values.len(), 8);
 
-    let prior_layer1_start = kv_cache_offset(&kv_cache, 1, 0, 0);
+    let prior_layer1_start = kv_cache.offset(1, 0, 0);
     assert_eq!(
         &kv_cache.keys[prior_layer1_start..prior_layer1_start + 2],
         &[5.0, 6.0]

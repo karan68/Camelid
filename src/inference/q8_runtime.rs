@@ -24,6 +24,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) ffn_gate_up_packed_rows4_matmul: bool,
     pub(super) ffn_gate_up_single_owner: bool,
     pub(super) ffn_down_decode_consumer: bool,
+    pub(super) ffn_down_decode_group_chunking: bool,
     pub(super) ffn_down_packed_rows4_matmul: bool,
     pub(super) ffn_down_gemm4_prefill: bool,
     pub(super) ffn_down_gemm4_row_group_schedule: bool,
@@ -31,6 +32,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) ffn_down_amx_prefill: bool,
     pub(super) ffn_down_single_owner: bool,
     pub(super) ffn_down_vnni_decode: bool,
+    pub(super) ffn_down_vnni_decode_rawptr: bool,
     pub(super) metal: bool,
     pub(super) metal_retained: bool,
     pub(super) hybrid_retained: bool,
@@ -115,6 +117,11 @@ impl Q8RuntimeFlags {
             ) || q8_0_env_flag_enabled_default_off(
                 "CAMELID_MAC_Q8_FFN_DOWN_DECODE_CONSUMER",
             ),
+            ffn_down_decode_group_chunking: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING",
+            ) || q8_0_env_flag_enabled_default_off(
+                "CAMELID_MAC_Q8_FFN_DOWN_DECODE_GROUP_CHUNKING",
+            ),
             ffn_down_packed_rows4_matmul: x86_q8_ffn_down_packed_rows4_matmul_enabled(),
             ffn_down_gemm4_prefill: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_GEMM4_PREFILL",
@@ -133,6 +140,9 @@ impl Q8RuntimeFlags {
             ),
             ffn_down_vnni_decode: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE",
+            ),
+            ffn_down_vnni_decode_rawptr: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
             ),
             metal: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8"),
             metal_retained: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED"),

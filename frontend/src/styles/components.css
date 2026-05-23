@@ -5634,7 +5634,6 @@ textarea.composer-input-assistant {
 .composer-assistant-readiness-detail-floating {
   max-width: 62ch;
 }
-
 .chat-layout-empty .composer-assistant-disclaimer-product {
   display: none;
   justify-content: center;

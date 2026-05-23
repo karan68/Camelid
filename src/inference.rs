@@ -3,12 +3,12 @@ use std::{
     collections::HashMap,
     env, mem,
     process::Command,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
-    },
+    sync::{atomic::AtomicU64, Arc},
     time::Instant,
 };
+
+#[allow(unused_imports)]
+use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use serde::Serialize;
@@ -24,8 +24,6 @@ mod q8_runtime;
 mod q8_telemetry;
 mod rope;
 
-const Q8_SCHEDULE_TELEMETRY_ENV: &str = "CAMELID_Q8_SCHED_TELEMETRY";
-
 #[cfg(test)]
 use diagnostic_config::diagnostic_zero_delta_value;
 use diagnostic_config::{
@@ -40,20 +38,28 @@ pub use diagnostic_config::{
     GqaHeadMapping, LinearAccumulationPrecision, OutputProjectionLayout, RectangularLinearLayout,
     SquareLinearLayout,
 };
-pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan};
+pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace};
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_disabled, q8_0_env_flag_enabled_default_off,
     q8_0_env_flag_enabled_default_on_fail_closed, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
+use q8_telemetry::*;
 pub use q8_telemetry::{
+    q8_schedule_telemetry_enabled, reset_q8_schedule_telemetry, snapshot_q8_schedule_telemetry,
     LlamaQ8OutputProjectionLayerRouteTelemetry, LlamaQ8OutputProjectionRouteTelemetry,
     LlamaQ8ProjectionRouteDenialTelemetry, LlamaQ8ScheduleRoleTelemetry, LlamaQ8ScheduleTelemetry,
+};
+use rope::{
+    apply_rope, apply_rope_batch, apply_rope_with_pairing, rope_scaling_from_config,
+    validate_rope_frequency_tensor, RopeParams,
 };
 pub use rope::{
     diagnostic_rope_direction, diagnostic_rope_pairing, diagnostic_rope_position_mode,
     RopeDirection, RopePairing, RopePositionMode,
 };
+#[cfg(test)]
+use rope::{RopeScaling, RopeScalingKind};
 
 use crate::{
     gguf::GgufTensorType,
@@ -572,39 +578,6 @@ pub struct LlamaLayerDiagnostics {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct LlamaKvCacheTrace {
-    pub layer_index: usize,
-    pub position_count: usize,
-    pub kv_head_count: usize,
-    pub head_dim: usize,
-    pub key_value_width: usize,
-    pub key_checksum: f64,
-    pub value_checksum: f64,
-    pub key_rms: f32,
-    pub value_rms: f32,
-    pub key_max_abs: f32,
-    pub key_max_abs_position: usize,
-    pub key_max_abs_index: usize,
-    pub value_max_abs: f32,
-    pub value_max_abs_position: usize,
-    pub value_max_abs_index: usize,
-    pub sampled_positions: Vec<LlamaKvCachePositionTrace>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct LlamaKvCachePositionTrace {
-    pub position: usize,
-    pub key_checksum: f64,
-    pub value_checksum: f64,
-    pub key_rms: f32,
-    pub value_rms: f32,
-    pub key_max_abs: f32,
-    pub value_max_abs: f32,
-    pub key_first_values: Vec<f32>,
-    pub value_first_values: Vec<f32>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LlamaLinearProjectionDiagnostic {
     pub role: String,
     pub layout: String,
@@ -778,483 +751,6 @@ pub struct LlamaForwardTimings {
     pub logits: u128,
     pub layers: Vec<LlamaLayerTimings>,
     pub memory: Option<LlamaForwardMemoryTimings>,
-}
-
-static Q8_SCHED_RAYON_FANOUT_BOUNDARIES: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_OUTPUT_PROJECTION_CALLS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DECODE_CHAIN_TAKEN: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_ACTIVATION_PACK_CALLS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_ACTIVATION_PACK_ROWS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_SCRATCH_ALLOCATION_COUNT: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_SCRATCH_BYTES_ALLOCATED: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_SCRATCH_BYTES_REUSED: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_Q8_GEMM_COMPUTE_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_CONSERVATIVE_TAIL_ROWS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-static Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE: OnceLock<
-    Mutex<HashMap<String, LlamaQ8ScheduleRoleTelemetry>>,
-> = OnceLock::new();
-static Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE: OnceLock<
-    Mutex<HashMap<String, LlamaQ8OutputProjectionRouteTelemetry>>,
-> = OnceLock::new();
-static Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE: OnceLock<
-    Mutex<HashMap<String, LlamaQ8OutputProjectionLayerRouteTelemetry>>,
-> = OnceLock::new();
-static Q8_SCHED_PROJECTION_ROUTE_DENIALS: OnceLock<
-    Mutex<HashMap<String, LlamaQ8ProjectionRouteDenialTelemetry>>,
-> = OnceLock::new();
-#[cfg(not(test))]
-static Q8_SCHED_TELEMETRY_ENABLED: OnceLock<bool> = OnceLock::new();
-
-pub fn q8_schedule_telemetry_enabled() -> bool {
-    #[cfg(test)]
-    {
-        env_flag_enabled(Q8_SCHEDULE_TELEMETRY_ENV)
-    }
-    #[cfg(not(test))]
-    *Q8_SCHED_TELEMETRY_ENABLED.get_or_init(|| env_flag_enabled(Q8_SCHEDULE_TELEMETRY_ENV))
-}
-
-pub fn reset_q8_schedule_telemetry() {
-    Q8_SCHED_RAYON_FANOUT_BOUNDARIES.store(0, Ordering::Relaxed);
-    Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS.store(0, Ordering::Relaxed);
-    Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS.store(0, Ordering::Relaxed);
-    Q8_SCHED_OUTPUT_PROJECTION_CALLS.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_PACK_CALLS.store(0, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_PACK_ROWS.store(0, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED.store(0, Ordering::Relaxed);
-    Q8_SCHED_SCRATCH_ALLOCATION_COUNT.store(0, Ordering::Relaxed);
-    Q8_SCHED_SCRATCH_BYTES_ALLOCATED.store(0, Ordering::Relaxed);
-    Q8_SCHED_SCRATCH_BYTES_REUSED.store(0, Ordering::Relaxed);
-    Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES.store(0, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_Q8_GEMM_COMPUTE_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_CONSERVATIVE_TAIL_ROWS.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE.store(0, Ordering::Relaxed);
-    Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS.store(0, Ordering::Relaxed);
-    if let Some(by_role) = Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE.get() {
-        by_role.lock().expect("q8 role telemetry mutex").clear();
-    }
-    if let Some(by_route) = Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE.get() {
-        by_route
-            .lock()
-            .expect("q8 output projection telemetry mutex")
-            .clear();
-    }
-    if let Some(by_layer_route) = Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE.get() {
-        by_layer_route
-            .lock()
-            .expect("q8 output projection layer route telemetry mutex")
-            .clear();
-    }
-    if let Some(denials) = Q8_SCHED_PROJECTION_ROUTE_DENIALS.get() {
-        denials
-            .lock()
-            .expect("q8 projection route denial telemetry mutex")
-            .clear();
-    }
-}
-
-pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
-    LlamaQ8ScheduleTelemetry {
-        rayon_fanout_boundaries: Q8_SCHED_RAYON_FANOUT_BOUNDARIES.load(Ordering::Relaxed),
-        i8mm_single_projection_calls: Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS.load(Ordering::Relaxed),
-        i8mm_fused_gate_up_calls: Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS.load(Ordering::Relaxed),
-        i8mm_single_projection_by_role: Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE
-            .get()
-            .map(|by_role| by_role.lock().expect("q8 role telemetry mutex").clone())
-            .unwrap_or_default(),
-        output_projection_calls: Q8_SCHED_OUTPUT_PROJECTION_CALLS.load(Ordering::Relaxed),
-        output_projection_by_route: Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE
-            .get()
-            .map(|by_route| {
-                by_route
-                    .lock()
-                    .expect("q8 output projection telemetry mutex")
-                    .clone()
-            })
-            .unwrap_or_default(),
-        output_projection_by_layer_route: Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE
-            .get()
-            .map(|by_layer_route| {
-                by_layer_route
-                    .lock()
-                    .expect("q8 output projection layer route telemetry mutex")
-                    .clone()
-            })
-            .unwrap_or_default(),
-        projection_route_denials: Q8_SCHED_PROJECTION_ROUTE_DENIALS
-            .get()
-            .map(|denials| {
-                denials
-                    .lock()
-                    .expect("q8 projection route denial telemetry mutex")
-                    .clone()
-            })
-            .unwrap_or_default(),
-        ffn_gate_up_decode_consumer_activation_us:
-            Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.load(Ordering::Relaxed),
-        ffn_gate_up_decode_consumer_tensor_us: Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US
-            .load(Ordering::Relaxed),
-        ffn_decode_chain_taken: Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.load(Ordering::Relaxed),
-        ffn_decode_chain_total_us: Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.load(Ordering::Relaxed),
-        ffn_decode_chain_input_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US
-            .load(Ordering::Relaxed),
-        ffn_decode_chain_activation_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US
-            .load(Ordering::Relaxed),
-        ffn_decode_chain_down_us: Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.load(Ordering::Relaxed),
-        activation_pack_calls: Q8_SCHED_ACTIVATION_PACK_CALLS.load(Ordering::Relaxed),
-        activation_pack_rows: Q8_SCHED_ACTIVATION_PACK_ROWS.load(Ordering::Relaxed),
-        activation_pack_bytes_requested: Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED
-            .load(Ordering::Relaxed),
-        scratch_allocation_count: Q8_SCHED_SCRATCH_ALLOCATION_COUNT.load(Ordering::Relaxed),
-        scratch_bytes_allocated: Q8_SCHED_SCRATCH_BYTES_ALLOCATED.load(Ordering::Relaxed),
-        scratch_bytes_reused: Q8_SCHED_SCRATCH_BYTES_REUSED.load(Ordering::Relaxed),
-        scratch_peak_capacity_bytes: Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES.load(Ordering::Relaxed),
-        activation_quantize_pack_us: Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.load(Ordering::Relaxed),
-        q8_gemm_compute_us: Q8_SCHED_Q8_GEMM_COMPUTE_US.load(Ordering::Relaxed),
-        conservative_tail_rows: Q8_SCHED_CONSERVATIVE_TAIL_ROWS.load(Ordering::Relaxed),
-        ffn_down_gemm4_prefill_candidates: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES
-            .load(Ordering::Relaxed),
-        ffn_down_gemm4_prefill_reject_plan_off: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF
-            .load(Ordering::Relaxed),
-        ffn_down_gemm4_prefill_reject_rows_lt4: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_ROWS_LT4
-            .load(Ordering::Relaxed),
-        ffn_down_gemm4_prefill_reject_bad_input_width:
-            Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_BAD_INPUT_WIDTH.load(Ordering::Relaxed),
-        ffn_down_gemm4_prefill_reject_no_runtime_packed:
-            Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NO_RUNTIME_PACKED.load(Ordering::Relaxed),
-        ffn_down_gemm4_prefill_reject_non_i8_interleave:
-            Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_NON_I8_INTERLEAVE.load(Ordering::Relaxed),
-        ffn_down_decode_consumer_taken: Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_candidates: Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_taken: Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN.load(Ordering::Relaxed),
-        ffn_down_vnni_decode_quantize_us: Q8_SCHED_FFN_DOWN_VNNI_DECODE_QUANTIZE_US
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_kernel_us: Q8_SCHED_FFN_DOWN_VNNI_DECODE_KERNEL_US
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_reject_gate_off: Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_GATE_OFF
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_reject_cpu_feature: Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_CPU_FEATURE
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_reject_no_vnni_pack: Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_NO_VNNI_PACK
-            .load(Ordering::Relaxed),
-        ffn_down_vnni_decode_reject_bad_input_width:
-            Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_INPUT_WIDTH.load(Ordering::Relaxed),
-        ffn_down_vnni_decode_reject_bad_output_width:
-            Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_BAD_OUTPUT_WIDTH.load(Ordering::Relaxed),
-        ffn_down_vnni_decode_reject_shape_or_role:
-            Q8_SCHED_FFN_DOWN_VNNI_DECODE_REJECT_SHAPE_OR_ROLE.load(Ordering::Relaxed),
-        prefill_single_token_fallbacks: Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS
-            .load(Ordering::Relaxed),
-    }
-}
-
-#[allow(dead_code)]
-fn add_q8_schedule_counter(counter: &AtomicU64, value: u64) {
-    if q8_schedule_telemetry_enabled() && value > 0 {
-        counter.fetch_add(value, Ordering::Relaxed);
-    }
-}
-
-#[allow(dead_code)]
-fn update_q8_schedule_peak(counter: &AtomicU64, value: u64) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    let mut current = counter.load(Ordering::Relaxed);
-    while value > current {
-        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next) => current = next,
-        }
-    }
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_activation_pack(
-    packed_inputs: &mut Vec<Q8_0PackedRows4Block>,
-    before_capacity: usize,
-    packed_rows: usize,
-    blocks_per_row: usize,
-    elapsed_us: u128,
-) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    let requested_blocks = packed_rows / 4 * blocks_per_row;
-    let requested_bytes = requested_blocks.saturating_mul(mem::size_of::<Q8_0PackedRows4Block>());
-    let before_capacity_bytes =
-        before_capacity.saturating_mul(mem::size_of::<Q8_0PackedRows4Block>());
-    let after_capacity_bytes = packed_inputs
-        .capacity()
-        .saturating_mul(mem::size_of::<Q8_0PackedRows4Block>());
-    Q8_SCHED_ACTIVATION_PACK_CALLS.fetch_add(1, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_PACK_ROWS.fetch_add(packed_rows as u64, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED.fetch_add(requested_bytes as u64, Ordering::Relaxed);
-    Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US.fetch_add(elapsed_us as u64, Ordering::Relaxed);
-    if before_capacity < requested_blocks {
-        Q8_SCHED_SCRATCH_ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        Q8_SCHED_SCRATCH_BYTES_ALLOCATED.fetch_add(
-            after_capacity_bytes.saturating_sub(before_capacity_bytes) as u64,
-            Ordering::Relaxed,
-        );
-    } else {
-        Q8_SCHED_SCRATCH_BYTES_REUSED.fetch_add(requested_bytes as u64, Ordering::Relaxed);
-    }
-    update_q8_schedule_peak(
-        &Q8_SCHED_SCRATCH_PEAK_CAPACITY_BYTES,
-        after_capacity_bytes as u64,
-    );
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_i8mm_single_projection_role_call(
-    role: &str,
-    rows: u64,
-    rayon_fanout_boundaries: u64,
-) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    update_q8_schedule_role(role, |entry| {
-        entry.calls = entry.calls.saturating_add(1);
-        entry.rows = entry.rows.saturating_add(rows);
-        entry.rayon_fanout_boundaries = entry
-            .rayon_fanout_boundaries
-            .saturating_add(rayon_fanout_boundaries);
-    });
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_i8mm_single_projection_role_pack(role: &str, elapsed_us: u128) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    update_q8_schedule_role(role, |entry| {
-        entry.pack_us = entry.pack_us.saturating_add(elapsed_us as u64);
-    });
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_i8mm_single_projection_role_gemm(role: &str, elapsed_us: u128) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    update_q8_schedule_role(role, |entry| {
-        entry.gemm_us = entry.gemm_us.saturating_add(elapsed_us as u64);
-    });
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_i8mm_single_projection_role_tail(role: &str, tail_rows: u64) {
-    if !q8_schedule_telemetry_enabled() || tail_rows == 0 {
-        return;
-    }
-    update_q8_schedule_role(role, |entry| {
-        entry.tail_rows = entry.tail_rows.saturating_add(tail_rows);
-    });
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_i8mm_single_projection_role_scheduler(
-    role: &str,
-    output_groups: u64,
-    row_groups: u64,
-    groups_per_chunk: u64,
-) {
-    if !q8_schedule_telemetry_enabled() || output_groups == 0 {
-        return;
-    }
-    update_q8_schedule_role(role, |entry| {
-        entry.scheduler_chunk_calls = entry.scheduler_chunk_calls.saturating_add(1);
-        entry.scheduler_output_groups = entry.scheduler_output_groups.saturating_add(output_groups);
-        entry.scheduler_row_groups = entry.scheduler_row_groups.saturating_add(row_groups);
-        entry.scheduler_groups_per_chunk = entry
-            .scheduler_groups_per_chunk
-            .saturating_add(groups_per_chunk.max(1));
-    });
-}
-
-#[allow(dead_code)]
-fn update_q8_schedule_role(role: &str, update: impl FnOnce(&mut LlamaQ8ScheduleRoleTelemetry)) {
-    let by_role =
-        Q8_SCHED_I8MM_SINGLE_PROJECTION_BY_ROLE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut by_role = by_role.lock().expect("q8 role telemetry mutex");
-    update(by_role.entry(role.to_string()).or_default());
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_output_projection_route_call(
-    role: &str,
-    route: &str,
-    projection_name: Option<&str>,
-    rows: usize,
-    input_width: usize,
-    output_width: usize,
-    elapsed_us: u128,
-) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    Q8_SCHED_OUTPUT_PROJECTION_CALLS.fetch_add(1, Ordering::Relaxed);
-    let key = format!("{role}.{route}");
-    let by_route = Q8_SCHED_OUTPUT_PROJECTION_BY_ROUTE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut by_route = by_route
-        .lock()
-        .expect("q8 output projection telemetry mutex");
-    let entry = by_route
-        .entry(key)
-        .or_insert_with(|| LlamaQ8OutputProjectionRouteTelemetry {
-            role: role.to_string(),
-            route: route.to_string(),
-            ..LlamaQ8OutputProjectionRouteTelemetry::default()
-        });
-    entry.calls = entry.calls.saturating_add(1);
-    entry.rows = entry.rows.saturating_add(rows as u64);
-    entry.input_width = input_width as u64;
-    entry.output_width = output_width as u64;
-    entry.elapsed_us = entry.elapsed_us.saturating_add(elapsed_us as u64);
-
-    let Some(layer_index) = projection_name.and_then(q8_schedule_layer_index_for_projection_name)
-    else {
-        return;
-    };
-    let key = format!("layer_{layer_index}.{role}.{route}");
-    let by_layer_route =
-        Q8_SCHED_OUTPUT_PROJECTION_BY_LAYER_ROUTE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut by_layer_route = by_layer_route
-        .lock()
-        .expect("q8 output projection layer route telemetry mutex");
-    let entry =
-        by_layer_route
-            .entry(key)
-            .or_insert_with(|| LlamaQ8OutputProjectionLayerRouteTelemetry {
-                layer_index,
-                role: role.to_string(),
-                route: route.to_string(),
-                ..LlamaQ8OutputProjectionLayerRouteTelemetry::default()
-            });
-    entry.calls = entry.calls.saturating_add(1);
-    entry.rows = entry.rows.saturating_add(rows as u64);
-    entry.input_width = input_width as u64;
-    entry.output_width = output_width as u64;
-    entry.elapsed_us = entry.elapsed_us.saturating_add(elapsed_us as u64);
-}
-
-fn q8_schedule_layer_index_for_projection_name(name: &str) -> Option<usize> {
-    let rest = name.strip_prefix("layer_")?;
-    let (digits, _) = rest.split_once('_')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-fn record_q8_schedule_projection_route_elapsed(
-    role: &str,
-    route: &str,
-    projection_name: &str,
-    rows: usize,
-    input_width: usize,
-    output_width: usize,
-    started: Option<Instant>,
-) {
-    if let Some(started) = started {
-        record_q8_schedule_output_projection_route_call(
-            role,
-            route,
-            Some(projection_name),
-            rows,
-            input_width,
-            output_width,
-            started.elapsed().as_micros(),
-        );
-    }
-}
-
-#[allow(dead_code)]
-fn record_q8_schedule_projection_route_denial(
-    role: &str,
-    route: &str,
-    reason: &str,
-    rows: usize,
-    input_width: usize,
-    output_width: usize,
-) {
-    if !q8_schedule_telemetry_enabled() {
-        return;
-    }
-    let key = format!("{role}.{route}.{reason}");
-    let denials = Q8_SCHED_PROJECTION_ROUTE_DENIALS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut denials = denials
-        .lock()
-        .expect("q8 projection route denial telemetry mutex");
-    let entry = denials
-        .entry(key)
-        .or_insert_with(|| LlamaQ8ProjectionRouteDenialTelemetry {
-            role: role.to_string(),
-            route: route.to_string(),
-            reason: reason.to_string(),
-            ..LlamaQ8ProjectionRouteDenialTelemetry::default()
-        });
-    entry.denials = entry.denials.saturating_add(1);
-    entry.rows = entry.rows.saturating_add(rows as u64);
-    entry.input_width = input_width as u64;
-    entry.output_width = output_width as u64;
 }
 
 #[allow(dead_code)]
@@ -8135,8 +7631,7 @@ fn try_x86_q8_ffn_decode_chain_path(
     );
 
     let down_started = Instant::now();
-    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
-        || x86_q8_ffn_down_decode_group_chunking_enabled();
+    let decode_group_chunking = runtime_plan.q8.ffn_down_decode_group_chunking;
     let mut down_route_name = q8_ffn_down_decode_consumer_route_name(decode_group_chunking);
     let output = if runtime_plan.q8.ffn_down_vnni_decode {
         add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_CANDIDATES, 1);
@@ -8187,11 +7682,13 @@ fn try_x86_q8_ffn_decode_chain_path(
             )?
         } else if let Some(vnni_packed) = down_route.packed.vnni_packed.as_ref() {
             let kernel_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let use_rawptr = runtime_plan.q8.ffn_down_vnni_decode_rawptr;
             let output = q8_0_vnni_decode_1x64_projection(
                 vnni_packed,
                 &quantized_activated.blocks,
                 down_route.output_width,
                 down_name,
+                use_rawptr,
             )?;
             if let Some(started) = kernel_started {
                 add_q8_schedule_counter(
@@ -8200,7 +7697,7 @@ fn try_x86_q8_ffn_decode_chain_path(
                 );
             }
             add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN, 1);
-            down_route_name = q8_ffn_down_vnni_decode_route_name();
+            down_route_name = q8_ffn_down_vnni_decode_route_name(use_rawptr);
             output
         } else {
             record_q8_ffn_down_vnni_decode_reject(
@@ -8526,6 +8023,7 @@ fn x86_q8_packed_rows4_serial_decode_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE")
 }
 
+#[allow(dead_code)]
 fn mac_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
@@ -8589,6 +8087,7 @@ fn q8_ffn_down_decode_consumer_route_name(decode_group_chunking: bool) -> &'stat
     }
 }
 
+#[allow(dead_code)]
 fn x86_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -8638,13 +8137,15 @@ fn record_q8_ffn_down_vnni_decode_reject(
     );
 }
 
-fn q8_ffn_down_vnni_decode_route_name() -> &'static str {
+fn q8_ffn_down_vnni_decode_route_name(use_rawptr: bool) -> &'static str {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        if x86_q8_vnni_decode_rawptr_enabled() {
+        if use_rawptr {
             return "x86_vnni_decode_rawptr_consumer";
         }
     }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = use_rawptr;
     "x86_vnni_decode_consumer"
 }
 
@@ -8670,6 +8171,7 @@ fn q8_0_vnni_decode_1x64_projection(
     quantized_input: &[Q8_0Block],
     output_width: usize,
     name: &str,
+    use_rawptr: bool,
 ) -> Result<CpuTensor> {
     if packed.rows != output_width
         || packed.blocks_per_row != quantized_input.len()
@@ -8685,7 +8187,7 @@ fn q8_0_vnni_decode_1x64_projection(
     }
 
     let mut output = vec![0.0_f32; output_width];
-    q8_0_vnni_decode_1x64_projection_into(packed, quantized_input, &mut output)?;
+    q8_0_vnni_decode_1x64_projection_into(packed, quantized_input, &mut output, use_rawptr)?;
     CpuTensor::from_f32(name, vec![1, output_width], output)
 }
 
@@ -8693,7 +8195,11 @@ fn q8_0_vnni_decode_1x64_projection_into(
     packed: &Q8_0VnniPacked,
     quantized_input: &[Q8_0Block],
     output: &mut [f32],
+    use_rawptr: bool,
 ) -> Result<()> {
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = use_rawptr;
+
     let output_width = output.len();
     if packed.rows != output_width
         || packed.blocks_per_row != quantized_input.len()
@@ -8708,11 +8214,14 @@ fn q8_0_vnni_decode_1x64_projection_into(
         )));
     }
 
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let _ = use_rawptr;
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        if x86_q8_vnni_decode_rawptr_enabled() {
-            // SAFETY: runtime feature detection in `x86_q8_vnni_decode_rawptr_enabled`
-            // confirms the selected x86 SIMD support, and the shape guard above proves that
+        if use_rawptr && x86_q8_vnni_decode_rawptr_supported() {
+            // SAFETY: runtime feature detection confirms the selected x86 SIMD support,
+            // and the shape guard above proves that
             // `packed.tiles`, `quantized_input`, and `output` cover every 64-row group.
             unsafe {
                 if x86_q8_vnni_decode_avx512_supported() {
@@ -8754,9 +8263,8 @@ fn q8_0_vnni_decode_1x64_projection_into(
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn x86_q8_vnni_decode_rawptr_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR")
-        && (x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2"))
+fn x86_q8_vnni_decode_rawptr_supported() -> bool {
+    x86_q8_vnni_decode_avx512_supported() || std::arch::is_x86_feature_detected!("avx2")
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -11151,11 +10659,13 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
                 );
             }
             let kernel_started = q8_schedule_telemetry_enabled().then(Instant::now);
+            let use_rawptr = runtime_plan.q8.ffn_down_vnni_decode_rawptr;
             let output = q8_0_vnni_decode_1x64_projection(
                 vnni_packed,
                 &quantized_input.blocks,
                 route.output_width,
                 name,
+                use_rawptr,
             )?;
             if let Some(started) = kernel_started {
                 add_q8_schedule_counter(
@@ -11166,7 +10676,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
             add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_VNNI_DECODE_TAKEN, 1);
             record_q8_schedule_projection_route_elapsed(
                 "ffn_down",
-                q8_ffn_down_vnni_decode_route_name(),
+                q8_ffn_down_vnni_decode_route_name(use_rawptr),
                 name,
                 1,
                 route.input_width,
@@ -11188,8 +10698,7 @@ fn try_x86_q8_ffn_down_decode_consumer_path(
     let telemetry_started = q8_schedule_telemetry_enabled().then(Instant::now);
     add_q8_schedule_counter(&Q8_SCHED_FFN_DOWN_DECODE_CONSUMER_TAKEN, 1);
     let quantized_input = quantize_q8_0_row(&input.data[..route.input_width]);
-    let decode_group_chunking = mac_q8_ffn_down_decode_group_chunking_enabled()
-        || x86_q8_ffn_down_decode_group_chunking_enabled();
+    let decode_group_chunking = runtime_plan.q8.ffn_down_decode_group_chunking;
     let output = q8_0_packed_rows4_single_input_projection_with_decode_chunking(
         route.packed,
         &quantized_input.blocks,
@@ -14503,359 +14012,6 @@ fn dot_product_row(lhs: &[f32], rhs: &[f32]) -> f32 {
     sum
 }
 
-fn apply_rope(
-    tensor: &CpuTensor,
-    position: usize,
-    head_count: usize,
-    config: &LlamaModelConfig,
-    rope_freqs: Option<&CpuTensor>,
-    name: impl Into<String>,
-) -> Result<CpuTensor> {
-    if head_count == 0 {
-        return Err(BackendError::RuntimeShapeMismatch(
-            "RoPE head count must be greater than zero".to_string(),
-        ));
-    }
-    if tensor.rank() != 2 || tensor.dim(0)? != 1 {
-        return Err(BackendError::RuntimeShapeMismatch(format!(
-            "RoPE input {} expected shape [1, width], got {:?}",
-            tensor.name, tensor.shape.dims
-        )));
-    }
-    let width = tensor.dim(1)?;
-    if !width.is_multiple_of(head_count) {
-        return Err(BackendError::RuntimeShapeMismatch(format!(
-            "RoPE input width {width} is not divisible by head count {head_count}"
-        )));
-    }
-    let head_dim = width / head_count;
-    let rope_dim = config.rope_dimension_count.unwrap_or(head_dim as u32) as usize;
-    if rope_dim == 0 || rope_dim > head_dim || !rope_dim.is_multiple_of(2) {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "RoPE dimension count {rope_dim} must be even and within head dimension {head_dim}"
-        )));
-    }
-    let freq_base = config.rope_freq_base.unwrap_or(10_000.0);
-    if freq_base <= 0.0 || !freq_base.is_finite() {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "RoPE frequency base {freq_base} must be finite and positive"
-        )));
-    }
-    let scaling = rope_scaling_from_config(config)?;
-    let rope_freqs = rope_freqs
-        .map(|freqs| validate_rope_frequency_tensor(freqs, rope_dim))
-        .transpose()?;
-
-    apply_rope_with_pairing(
-        tensor,
-        RopeParams {
-            position,
-            head_count,
-            head_dim,
-            rope_dim,
-            freq_base,
-            pairing: diagnostic_rope_pairing()?,
-            direction: diagnostic_rope_direction()?,
-            position_mode: diagnostic_rope_position_mode()?,
-            scaling,
-            rope_freqs,
-        },
-        name,
-    )
-}
-
-fn apply_rope_batch(
-    tensor: &CpuTensor,
-    base_position: usize,
-    head_count: usize,
-    config: &LlamaModelConfig,
-    rope_freqs: Option<&CpuTensor>,
-    name: impl Into<String>,
-) -> Result<CpuTensor> {
-    if head_count == 0 {
-        return Err(BackendError::RuntimeShapeMismatch(
-            "RoPE head count must be greater than zero".to_string(),
-        ));
-    }
-    if tensor.rank() != 2 {
-        return Err(BackendError::RuntimeShapeMismatch(format!(
-            "RoPE batch input {} expected rank 2, got {:?}",
-            tensor.name, tensor.shape.dims
-        )));
-    }
-    let rows = tensor.dim(0)?;
-    let width = tensor.dim(1)?;
-    if !width.is_multiple_of(head_count) {
-        return Err(BackendError::RuntimeShapeMismatch(format!(
-            "RoPE batch input width {width} is not divisible by head count {head_count}"
-        )));
-    }
-    let head_dim = width / head_count;
-    let rope_dim = config.rope_dimension_count.unwrap_or(head_dim as u32) as usize;
-    if rope_dim == 0 || rope_dim > head_dim || !rope_dim.is_multiple_of(2) {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "RoPE dimension count {rope_dim} must be even and within head dimension {head_dim}"
-        )));
-    }
-    let freq_base = config.rope_freq_base.unwrap_or(10_000.0);
-    if freq_base <= 0.0 || !freq_base.is_finite() {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "RoPE frequency base {freq_base} must be finite and positive"
-        )));
-    }
-    let scaling = rope_scaling_from_config(config)?;
-    let rope_freqs = rope_freqs
-        .map(|freqs| validate_rope_frequency_tensor(freqs, rope_dim))
-        .transpose()?;
-    let params = RopeParams {
-        position: base_position,
-        head_count,
-        head_dim,
-        rope_dim,
-        freq_base,
-        pairing: diagnostic_rope_pairing()?,
-        direction: diagnostic_rope_direction()?,
-        position_mode: diagnostic_rope_position_mode()?,
-        scaling,
-        rope_freqs,
-    };
-
-    let mut data = tensor.data.clone();
-    for row in 0..rows {
-        apply_rope_to_row(
-            &mut data[row * width..(row + 1) * width],
-            base_position + row,
-            params,
-        );
-    }
-    CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
-}
-
-fn validate_rope_frequency_tensor(rope_freqs: &CpuTensor, rope_dim: usize) -> Result<&[f32]> {
-    let expected_count = rope_dim / 2;
-    if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "RoPE dimension count {rope_dim} must be even and greater than zero"
-        )));
-    }
-    if rope_freqs.shape.dims != [expected_count] {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "rope_freqs.weight expected shape [{expected_count}], got {:?}",
-            rope_freqs.shape.dims
-        )));
-    }
-    if let Some((idx, frequency)) = rope_freqs
-        .data
-        .iter()
-        .copied()
-        .enumerate()
-        .find(|(_, frequency)| *frequency <= 0.0 || !frequency.is_finite())
-    {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "rope_freqs.weight[{idx}] frequency factor {frequency} must be finite and positive"
-        )));
-    }
-    Ok(&rope_freqs.data)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RopeScaling {
-    kind: RopeScalingKind,
-    factor: f32,
-    original_context_length: Option<u32>,
-    low_freq_factor: Option<f32>,
-    high_freq_factor: Option<f32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RopeScalingKind {
-    None,
-    Linear,
-    Llama3,
-}
-
-impl RopeScalingKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Linear => "linear",
-            Self::Llama3 => "llama3",
-        }
-    }
-}
-
-fn rope_scaling_from_config(config: &LlamaModelConfig) -> Result<RopeScaling> {
-    let kind = match config.rope_scaling_type.as_deref().map(str::trim) {
-        None | Some("") | Some("none") => RopeScalingKind::None,
-        Some("linear") => RopeScalingKind::Linear,
-        Some("llama3") => RopeScalingKind::Llama3,
-        Some(other) => {
-            return Err(BackendError::InvalidModelMetadata(format!(
-                "unsupported llama.rope.scaling.type {other:?}; expected none, linear, or llama3"
-            )))
-        }
-    };
-
-    let factor = config.rope_scaling_factor.unwrap_or(1.0);
-    if factor <= 0.0 || !factor.is_finite() {
-        return Err(BackendError::InvalidModelMetadata(format!(
-            "RoPE scaling factor {factor} must be finite and positive"
-        )));
-    }
-
-    match kind {
-        RopeScalingKind::None => Ok(RopeScaling {
-            kind,
-            factor: 1.0,
-            original_context_length: None,
-            low_freq_factor: None,
-            high_freq_factor: None,
-        }),
-        RopeScalingKind::Linear => Ok(RopeScaling {
-            kind,
-            factor,
-            original_context_length: None,
-            low_freq_factor: None,
-            high_freq_factor: None,
-        }),
-        RopeScalingKind::Llama3 => {
-            let original_context_length =
-                config.rope_scaling_original_context_length.unwrap_or(8_192);
-            if original_context_length == 0 {
-                return Err(BackendError::InvalidModelMetadata(
-                    "llama3 RoPE scaling original context length must be greater than zero"
-                        .to_string(),
-                ));
-            }
-            let low_freq_factor = config.rope_scaling_low_freq_factor.unwrap_or(1.0);
-            let high_freq_factor = config.rope_scaling_high_freq_factor.unwrap_or(4.0);
-            if low_freq_factor <= 0.0
-                || high_freq_factor <= 0.0
-                || !low_freq_factor.is_finite()
-                || !high_freq_factor.is_finite()
-                || high_freq_factor <= low_freq_factor
-            {
-                return Err(BackendError::InvalidModelMetadata(format!(
-                    "llama3 RoPE scaling frequency factors must be finite, positive, and high > low; got low={low_freq_factor}, high={high_freq_factor}"
-                )));
-            }
-            Ok(RopeScaling {
-                kind,
-                factor,
-                original_context_length: Some(original_context_length),
-                low_freq_factor: Some(low_freq_factor),
-                high_freq_factor: Some(high_freq_factor),
-            })
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RopeParams<'a> {
-    position: usize,
-    head_count: usize,
-    head_dim: usize,
-    rope_dim: usize,
-    freq_base: f32,
-    pairing: RopePairing,
-    direction: RopeDirection,
-    position_mode: RopePositionMode,
-    scaling: RopeScaling,
-    rope_freqs: Option<&'a [f32]>,
-}
-
-fn apply_rope_with_pairing(
-    tensor: &CpuTensor,
-    params: RopeParams<'_>,
-    name: impl Into<String>,
-) -> Result<CpuTensor> {
-    let mut data = tensor.data.clone();
-    apply_rope_to_row(&mut data, params.position, params);
-
-    CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
-}
-
-fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'_>) {
-    params.position = position;
-    for head in 0..params.head_count {
-        let head_start = head * params.head_dim;
-        for pair_idx in 0..(params.rope_dim / 2) {
-            let (dim0, dim1) = match params.pairing {
-                RopePairing::AdjacentEvenOdd => {
-                    let dim0 = head_start + (pair_idx * 2);
-                    (dim0, dim0 + 1)
-                }
-                RopePairing::SplitHalf => (
-                    head_start + pair_idx,
-                    head_start + pair_idx + (params.rope_dim / 2),
-                ),
-            };
-            let theta = rope_pair_frequency(pair_idx, &params);
-            let angle = params.position_mode.effective_position(params.position) as f32 * theta;
-            let (sin, cos) = angle.sin_cos();
-            let x0 = data[dim0];
-            let x1 = data[dim1];
-            match params.direction {
-                RopeDirection::Forward => {
-                    data[dim0] = (x0 * cos) - (x1 * sin);
-                    data[dim1] = (x0 * sin) + (x1 * cos);
-                }
-                RopeDirection::Inverse => {
-                    data[dim0] = (x0 * cos) + (x1 * sin);
-                    data[dim1] = (-x0 * sin) + (x1 * cos);
-                }
-            }
-        }
-    }
-}
-
-fn rope_pair_frequency(pair_idx: usize, params: &RopeParams<'_>) -> f32 {
-    let base_frequency = params
-        .freq_base
-        .powf(-(pair_idx as f32 * 2.0) / params.rope_dim as f32);
-    // GGUF's `rope_freqs.weight` follows llama.cpp's `freq_factors` contract:
-    // the stored value divides the metadata-derived base frequency for the pair,
-    // rather than replacing it as an absolute frequency.
-    let effective_base_frequency = if let Some(rope_freqs) = params.rope_freqs {
-        base_frequency / rope_freqs[pair_idx]
-    } else {
-        base_frequency
-    };
-    match params.scaling.kind {
-        RopeScalingKind::None => effective_base_frequency,
-        RopeScalingKind::Linear => effective_base_frequency / params.scaling.factor,
-        RopeScalingKind::Llama3 => {
-            llama3_scaled_rope_frequency(effective_base_frequency, params.scaling)
-        }
-    }
-}
-
-fn llama3_scaled_rope_frequency(frequency: f32, scaling: RopeScaling) -> f32 {
-    let original_context_length = scaling
-        .original_context_length
-        .expect("validated llama3 scaling has original context length")
-        as f32;
-    let low_freq_factor = scaling
-        .low_freq_factor
-        .expect("validated llama3 scaling has low freq factor");
-    let high_freq_factor = scaling
-        .high_freq_factor
-        .expect("validated llama3 scaling has high freq factor");
-
-    let wavelength = (2.0 * std::f32::consts::PI) / frequency;
-    let low_freq_wavelength = original_context_length / low_freq_factor;
-    let high_freq_wavelength = original_context_length / high_freq_factor;
-    if wavelength < high_freq_wavelength {
-        frequency
-    } else if wavelength > low_freq_wavelength {
-        frequency / scaling.factor
-    } else {
-        let smooth = (original_context_length / wavelength - low_freq_factor)
-            / (high_freq_factor - low_freq_factor);
-        ((1.0 - smooth) * frequency / scaling.factor) + (smooth * frequency)
-    }
-}
-
 fn rope_diagnostics(
     input: &CpuTensor,
     reported: &CpuTensor,
@@ -15023,7 +14179,7 @@ fn write_kv_cache(
         )));
     }
     kv_cache.ensure_position_capacity(kv_cache.position + 1)?;
-    let offset = kv_cache_offset(kv_cache, layer_idx, kv_cache.position, 0);
+    let offset = kv_cache.offset(layer_idx, kv_cache.position, 0);
     let end = offset + expected_width;
     copy_to_f16_kv_cache_storage(&mut kv_cache.keys[offset..end], &key.data);
     copy_to_f16_kv_cache_storage(&mut kv_cache.values[offset..end], &value.data);
@@ -15059,7 +14215,7 @@ fn write_kv_cache_batch(
     kv_cache.ensure_position_capacity(base_position + rows)?;
     for row in 0..rows {
         let position = base_position + row;
-        let offset = kv_cache_offset(kv_cache, layer_idx, position, 0);
+        let offset = kv_cache.offset(layer_idx, position, 0);
         let end = offset + expected_width;
         let row_start = row * expected_width;
         let row_end = row_start + expected_width;
@@ -15116,7 +14272,7 @@ fn kv_cache_trace(
     let mut value_max_abs_index = 0;
 
     for position in 0..position_count {
-        let start = kv_cache_offset(kv_cache, layer_idx, position, 0);
+        let start = kv_cache.offset(layer_idx, position, 0);
         let end = start + key_value_width;
         for (idx, (&key, &value)) in kv_cache.keys[start..end]
             .iter()
@@ -15182,7 +14338,7 @@ fn kv_cache_position_trace(
     position: usize,
     key_value_width: usize,
 ) -> Result<LlamaKvCachePositionTrace> {
-    let start = kv_cache_offset(kv_cache, layer_idx, position, 0);
+    let start = kv_cache.offset(layer_idx, position, 0);
     let end = start + key_value_width;
     let key_slice = &kv_cache.keys[start..end];
     let value_slice = &kv_cache.values[start..end];
@@ -15296,7 +14452,7 @@ fn causal_attention_context(
             let kv_head =
                 map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
             let out_start = attention_head * head_dim;
-            let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
+            let value_start = kv_cache.offset(layer_idx, 0, kv_head);
             out[out_start..out_start + head_dim]
                 .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
         }
@@ -15404,7 +14560,7 @@ fn causal_attention_context_batch(
                 let kv_head =
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
                 let out_start = attention_head * head_dim;
-                let value_start = kv_cache_offset(kv_cache, layer_idx, 0, kv_head);
+                let value_start = kv_cache.offset(layer_idx, 0, kv_head);
                 out_row[out_start..out_start + head_dim]
                     .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
             }
@@ -15468,8 +14624,10 @@ fn attention_context_for_head_into(
     debug_assert_eq!(out_slice.len(), head_dim);
     scores.clear();
     scores.reserve(params.position_count);
-    let head_base = kv_cache_head_base_offset(params.kv_cache, params.layer_idx, params.kv_head);
-    let position_stride = kv_cache_position_stride(params.kv_cache);
+    let head_base = params
+        .kv_cache
+        .head_base_offset(params.layer_idx, params.kv_head);
+    let position_stride = params.kv_cache.position_stride();
 
     let mut key_start = head_base;
     for position in 0..params.position_count {
@@ -15507,14 +14665,6 @@ fn attention_context_for_head_into(
     }
 
     Ok(())
-}
-
-fn kv_cache_head_base_offset(kv_cache: &LlamaKvCache, layer_idx: usize, kv_head: usize) -> usize {
-    ((layer_idx * kv_cache.plan.kv_head_count) + kv_head) * kv_cache.plan.head_dim
-}
-
-fn kv_cache_position_stride(kv_cache: &LlamaKvCache) -> usize {
-    kv_cache.plan.layer_count * kv_cache.plan.kv_head_count * kv_cache.plan.head_dim
 }
 
 const PARALLEL_ATTENTION_CONTEXT_MIN_UNITS: usize = 256;
@@ -15618,7 +14768,7 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
         let sampled_positions = sampled_attention_trace_positions(params.position_count);
         let mut positions = Vec::with_capacity(sampled_positions.len());
         for position in sampled_positions {
-            let key_start = kv_cache_offset(params.kv_cache, params.layer_idx, position, kv_head);
+            let key_start = params.kv_cache.offset(params.layer_idx, position, kv_head);
             let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
             let value_slice = &params.kv_cache.values[key_start..key_start + head_dim];
             let qk_products = query_slice
@@ -15683,8 +14833,8 @@ fn attention_scores_for_head(
 ) -> Vec<f32> {
     let head_dim = kv_cache.plan.head_dim;
     let mut scores = Vec::with_capacity(position_count);
-    let mut key_start = kv_cache_head_base_offset(kv_cache, layer_idx, kv_head);
-    let position_stride = kv_cache_position_stride(kv_cache);
+    let mut key_start = kv_cache.head_base_offset(layer_idx, kv_head);
+    let position_stride = kv_cache.position_stride();
     for position in 0..position_count {
         let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
         let score = dot_product(query_slice, key_slice) * scale;
@@ -15733,7 +14883,7 @@ fn reconstruct_attention_context_for_head(
 ) -> Vec<f32> {
     let mut context = vec![0.0; head_dim];
     for (position, probability) in probabilities.iter().copied().enumerate() {
-        let value_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
+        let value_start = kv_cache.offset(layer_idx, position, kv_head);
         let value_slice = &kv_cache.values[value_start..value_start + head_dim];
         for dim in 0..head_dim {
             context[dim] += probability * value_slice[dim];
@@ -15768,7 +14918,7 @@ fn top_attention_probability_positions(
         .into_iter()
         .take(ATTENTION_TRACE_TOP_PROBABILITY_LIMIT)
         .map(|(position, probability)| {
-            let key_start = kv_cache_offset(kv_cache, layer_idx, position, kv_head);
+            let key_start = kv_cache.offset(layer_idx, position, kv_head);
             let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
             let value_slice = &kv_cache.values[key_start..key_start + head_dim];
             LlamaAttentionTopProbabilityTrace {
@@ -15853,16 +15003,6 @@ fn first_attention_head_for_kv_head(
             (kv_head..attention_heads).find(|attention_head| attention_head % kv_heads == kv_head)
         }
     }
-}
-
-fn kv_cache_offset(
-    kv_cache: &LlamaKvCache,
-    layer_idx: usize,
-    position: usize,
-    kv_head: usize,
-) -> usize {
-    (((position * kv_cache.plan.layer_count) + layer_idx) * kv_cache.plan.kv_head_count + kv_head)
-        * kv_cache.plan.head_dim
 }
 
 pub fn tensor_map(tensors: impl IntoIterator<Item = CpuTensor>) -> HashMap<String, CpuTensor> {

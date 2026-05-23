@@ -84,7 +84,9 @@ Contaminated runs are not used as retained evidence.
 
 ## Host-status reporting
 
-Do not present any negative host-access state for the canonical Ubuntu validation host unless the canonical SSH probe was executed in the same run and the exact stderr is cited in the evidence bundle. The canonical probe is the operator-provided private SSH command for the current run. Do not publish the host address, user, key path, or full command in repository files.
+Do not present any negative host-access state for the canonical Ubuntu validation host in public repository files. Keep exact probe commands, raw stderr, return codes, host addresses, users, key paths, and working directories in private operator notes only.
+
+If remote validation is unavailable for the run, use this public-safe wording: `Remote Linux x86_64 validation was unavailable during this cycle; no fresh same-host timing/parity claim is made.`
 
 If remote validation was not attempted in the run, say that plainly instead of implying host failure.
 
@@ -156,6 +158,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T1954Z-rust-vnni-rawptr/README.md` (default-off Rust AVX512-VNNI FFN-down decode raw-pointer implementation slice; canonical Ubuntu rawptr parity passed and a bounded same-host benchmark recorded route use, but llama.cpp remained faster on TTFT/total elapsed, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T2206Z-rust-vnni-scale-cache/README.md` (default-off Rust VNNI scale-cache implementation slice; local Rust parity/gates passed on Darwin arm64, but same-host Ubuntu x86 Camelid vs llama.cpp benchmarking was not feasible in this run, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260521T2015Z-vnni-rawptr-avx2/README.md` (default-off Rust AVX2 FFN-down VNNI decode raw-pointer implementation slice; local compile check only, with Linux x86_64 AVX2 parity coverage added for canonical host execution and no throughput/support/default-on promotion)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T2320Z-q8-parity/README.md` (Ubuntu Linux x86_64 same-host Llama 3.2 3B Q8_0 Camelid rawptr-VNNI versus llama.cpp timing slice; llama.cpp remained much faster on TTFT/total elapsed and the deterministic marker guard failed, so no throughput/support/default-on promotion)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
