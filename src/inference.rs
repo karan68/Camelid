@@ -7434,9 +7434,16 @@ fn try_x86_q8_output_packed_rows4_matmul_path(
         return Ok(None);
     }
 
+    if runtime_plan.q8.output_amx_prefill {
+        if let Some(output) =
+            try_q8_0_packed_rows4_amx_prefill_projection(input, packed, output_width, name)?
+        {
+            return Ok(Some(output));
+        }
+    }
+
     q8_0_packed_rows4_matmul_projection(input, packed, output_width, name).map(Some)
 }
-
 fn try_x86_q8_output_decode_owner_path(
     input: &CpuTensor,
     weight: &CpuTensor,

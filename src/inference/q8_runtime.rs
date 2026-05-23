@@ -14,6 +14,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) attention_qkv_decode_group_chunking: bool,
     pub(super) attention_qkv_packed_rows4_matmul: bool,
     pub(super) output_packed_rows4_matmul: bool,
+    pub(super) output_amx_prefill: bool,
     pub(super) output_decode_owner: bool,
     pub(super) ffn_gate_up_decode_consumer: bool,
     pub(super) ffn_gate_up_decode_group_chunking: bool,
@@ -79,6 +80,9 @@ impl Q8RuntimeFlags {
             ),
             output_packed_rows4_matmul: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL",
+            ),
+            output_amx_prefill: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
             ),
             output_decode_owner: q8_0_env_flag_enabled_default_off(
                 "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",

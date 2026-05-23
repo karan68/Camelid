@@ -1334,6 +1334,7 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_X86_Q8_FFN_DOWN_DECODE_CONSUMER",
         "CAMELID_X86_Q8_FFN_DOWN_PACKED_ROWS4_MATMUL",
         "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL",
+        "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
         "CAMELID_X86_Q8_OUTPUT_DECODE_OWNER",
     ] {
         std::env::remove_var(key);
@@ -1649,6 +1650,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_amx_prefill: false,
             output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
@@ -1758,6 +1760,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER", "yes");
     std::env::set_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL", "on");
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL", "on");
+    std::env::set_var("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL", "on");
     std::env::set_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER", "on");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER", "true");
     std::env::set_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING", "on");
@@ -1786,6 +1789,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(plan.q8.attention_qkv_decode_consumer);
     assert!(plan.q8.attention_qkv_packed_rows4_matmul);
     assert!(plan.q8.output_packed_rows4_matmul);
+    assert!(plan.q8.output_amx_prefill);
     assert!(plan.q8.output_decode_owner);
     assert!(plan.q8.ffn_gate_up_decode_consumer);
     assert!(plan.q8.ffn_gate_up_decode_group_chunking);
@@ -1802,6 +1806,7 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_ATTENTION_QKV_PACKED_ROWS4_MATMUL");
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_PACKED_ROWS4_MATMUL");
+    std::env::remove_var("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL");
     std::env::remove_var("CAMELID_X86_Q8_OUTPUT_DECODE_OWNER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_CONSUMER");
     std::env::remove_var("CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUP_CHUNKING");
@@ -1836,6 +1841,10 @@ fn resolved_runtime_plan_captures_q8_env_once() {
     assert!(
         plan.q8.output_packed_rows4_matmul,
         "resolved plan should cache the output packed-rows4 matmul gate"
+    );
+    assert!(
+        plan.q8.output_amx_prefill,
+        "resolved plan should cache the output AMX prefill gate"
     );
     assert!(
         plan.q8.output_decode_owner,
@@ -1937,6 +1946,10 @@ fn runtime_profile_defaults_keep_experimental_q8_gates_closed() {
         assert!(
             !plan.q8.output_packed_rows4_matmul,
             "{profile} should not enable output packed-rows4 matmul by default"
+        );
+        assert!(
+            !plan.q8.output_amx_prefill,
+            "{profile} should not enable output AMX prefill by default"
         );
         assert!(
             !plan.q8.output_decode_owner,
@@ -2513,6 +2526,7 @@ fn q8_attention_consumer_plan(
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_amx_prefill: false,
             output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
@@ -3425,6 +3439,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_amx_prefill: false,
             output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
@@ -3469,6 +3484,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_amx_prefill: false,
             output_decode_owner: false,
             ffn_gate_up_decode_consumer: false,
             ffn_gate_up_decode_group_chunking: false,
@@ -3519,6 +3535,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             attention_qkv_decode_group_chunking: false,
             attention_qkv_packed_rows4_matmul: false,
             output_packed_rows4_matmul: false,
+            output_amx_prefill: false,
             output_decode_owner: false,
             ffn_gate_up_decode_consumer: enabled,
             ffn_gate_up_decode_group_chunking: false,
