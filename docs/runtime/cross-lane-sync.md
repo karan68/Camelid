@@ -6,7 +6,7 @@ Rules:
 - Do not mix evidence across platforms.
 - Ubuntu numbers are Ubuntu-only.
 - Mac numbers are Mac-only.
-- Report Ubuntu validation status as evidence status, not host-access status. Keep exact probe commands, raw stderr, return codes, host addresses, users, key paths, and working directories in private operator notes only. If remote validation is unavailable for the current slice, use the public-safe wording from `docs/performance/ubuntu-x86-q8.md`.
+- Report Ubuntu validation status as evidence status, not host-access status. Keep exact probe commands, raw stderr, return codes, host addresses, users, key paths, and working directories in private operator notes only. If remote validation was not attempted for the current slice, use the public-safe wording from `docs/performance/ubuntu-x86-q8.md`.
 - Architecture lessons can be shared.
 - Kernel implementations cannot be blindly copied.
 - Mac must not copy AVX2 assumptions.

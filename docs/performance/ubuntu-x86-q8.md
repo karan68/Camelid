@@ -86,7 +86,9 @@ Contaminated runs are not used as retained evidence.
 
 Do not present any negative host-access state for the canonical Ubuntu validation host in public repository files. Keep exact probe commands, raw stderr, return codes, host addresses, users, key paths, and working directories in private operator notes only.
 
-If remote validation is unavailable for the run, use this public-safe wording: `Remote Linux x86_64 validation was unavailable during this cycle; no fresh same-host timing/parity claim is made.`
+If remote validation was not attempted in the run, use this public-safe wording: `Remote Linux x86_64 validation was not attempted in this run; no fresh same-host timing/parity claim is made.`
+
+If the canonical Ubuntu validation probe was attempted but did not produce fresh same-host evidence, say that validation did not produce fresh same-host evidence in this run and keep the exact probe output in private operator notes.
 
 If remote validation was not attempted in the run, say that plainly instead of implying host failure.
 

@@ -20,7 +20,7 @@ await writeFile(
       health_endpoint: '127.0.0.1',
       elapsed_seconds: '0.03.255.467',
       validation_status:
-        'Remote Linux x86_64 validation was unavailable during this cycle; no fresh same-host timing/parity claim is made.',
+        'Remote Linux x86_64 validation was not attempted in this run; no fresh same-host timing/parity claim is made.',
     },
     null,
     2,
