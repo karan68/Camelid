@@ -4,7 +4,7 @@ set -euo pipefail
 # Public-repo privacy guard: keep private operator paths, key paths, host commands,
 # raw SSH failures, and validation-host details out of tracked files.
 patterns=(
-  '/Users''/[^/]+' 
+  '/Users''/[^/]+'
   '/home/ubuntu'
   'Documents''/cert'
   'ssh ''-i'
