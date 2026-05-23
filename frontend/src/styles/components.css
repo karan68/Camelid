@@ -2594,10 +2594,36 @@ textarea.composer-input-assistant {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 7px 30px 7px 10px;
+  padding: 7px 30px 7px 12px;
   border: 1px solid color-mix(in srgb, var(--color-border-soft) 62%, transparent);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.04);
+}
+
+.composer-model-picker::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--color-text-muted);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-text-muted) 9%, transparent);
+}
+
+.composer-model-picker.is-ready::before {
+  background: var(--color-ready);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-ready) 13%, transparent);
+}
+
+.composer-model-picker.is-blocked::before,
+.composer-model-picker.is-offline::before {
+  background: var(--color-error);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-error) 12%, transparent);
+}
+
+.composer-model-picker.is-waiting::before {
+  background: var(--color-warning);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-warning) 12%, transparent);
 }
 
 .composer-model-picker::after {
@@ -5584,6 +5610,17 @@ textarea.composer-input-assistant {
 
 .composer-assistant-readiness-note.is-waiting {
   color: color-mix(in srgb, var(--color-warning) 60%, var(--color-text-muted) 40%);
+}
+
+.composer-assistant-readiness-note.is-offline {
+  color: color-mix(in srgb, var(--color-error) 60%, var(--color-text-muted) 40%);
+}
+
+.composer-assistant-readiness-note-floating {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--color-border-soft) 44%, transparent);
+  font-size: 0.76rem;
 }
 
 .chat-layout-empty .composer-assistant-disclaimer-product {

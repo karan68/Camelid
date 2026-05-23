@@ -433,6 +433,7 @@ export default function ChatWorkspace({
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
   const chatBottomRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
+  const composerReadinessId = 'camelid-chat-readiness-note'
   const rawVisibleMessages = useMemo(
     () => (selectedConversation?.messages || []).filter((message) => !isBootstrapMessage(message)),
     [selectedConversation?.messages],
@@ -627,8 +628,6 @@ export default function ChatWorkspace({
       )
     }
 
-    const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
-
     const modelOptionLabel = (model) => {
       const gate = getChatGateState(capabilities, model, runtime)
       if (gate.chatUnlocked) return `${model.name} · Ready`
@@ -638,17 +637,21 @@ export default function ChatWorkspace({
       return `${model.name} · Not loaded`
     }
 
+    const runnableModels = models.filter((model) => getChatGateState(capabilities, model, runtime).chatUnlocked)
+    const waitingModels = models.filter((model) => !getChatGateState(capabilities, model, runtime).chatUnlocked)
+    const selectedRunnableModelId = runnableModels.some((model) => model.id === selectedModel?.id) ? selectedModel.id : ''
+
     return (
-      <label className="composer-model-picker" title={modelPickerTitle}>
+      <label className={`composer-model-picker is-${readinessState}`} title={modelPickerTitle}>
         <span className="composer-tool-label">Model</span>
         <select
           className="composer-model-select"
           aria-label="Choose model for chat"
-          value={selectedModel?.id || selectedModelId || ''}
+          value={selectedRunnableModelId}
           onChange={(e) => setSelectedModelId(e.target.value)}
           disabled={generationActive}
         >
-          {!selectedModel && <option value="">Choose model</option>}
+          {(!selectedModel || !runnableModels.length) && <option value="">{waitingModels.length ? 'No ready models' : 'Choose model'}</option>}
           {runnableModels.map((model) => (
             <option key={model.id} value={model.id}>
               {modelOptionLabel(model)}
@@ -702,7 +705,7 @@ export default function ChatWorkspace({
               )}
 
               <div className="composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product">
-                <textarea className="composer-input composer-input-assistant composer-input-assistant-stage" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
+                <textarea className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
                 <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
                   <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
                     {renderModelPicker()}
@@ -712,7 +715,7 @@ export default function ChatWorkspace({
                     <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'}</button>
                   </div>
                 </div>
-                <p className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
+                <p id={composerReadinessId} className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
               </div>
             </div>
           </div>
@@ -775,7 +778,7 @@ export default function ChatWorkspace({
 
       {!isFreshThread && (
         <div className="composer composer-assistant composer-assistant-floating">
-          <textarea className="composer-input composer-input-assistant" value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Ask Camelid' : apiUnavailable ? 'Camelid API unavailable' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
+          <textarea className="composer-input composer-input-assistant" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Ask Camelid' : apiUnavailable ? 'Camelid API unavailable' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
           <div className="composer-assistant-footer">
             <div className="composer-assistant-tools">
               {renderModelPicker()}
@@ -787,6 +790,7 @@ export default function ChatWorkspace({
               <button className="primary-button composer-send-button" onClick={sendMessage} disabled={!canSubmit}>{generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'}</button>
             </div>
           </div>
+          <p id={composerReadinessId} className={`composer-assistant-readiness-note composer-assistant-readiness-note-floating is-${readinessState}`}>{readinessFinePrint}</p>
         </div>
       )}
     </section>
