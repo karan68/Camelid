@@ -251,6 +251,7 @@ function App() {
           setSelectedModelId={setSelectedModelId}
           models={models}
           demoMode={DEMO_UI}
+          showNewChatLanding={showNewChatLanding}
         />
 
         <GlobalNotice notice={notice} noticeTone={noticeTone} />

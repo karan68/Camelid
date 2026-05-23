@@ -32,7 +32,7 @@ function exactHintDetail(hint) {
   return exactTargetFromHint(hint) ? compatibilityHintLabel(hint) : ''
 }
 
-function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, selectedModelId, setSelectedModelId, models, demoMode = false }) {
+function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUpdatedAt, selectedConversationPreview, runtime, capabilities, selectedModelId, setSelectedModelId, models, demoMode = false, showNewChatLanding = null }) {
   const rawConversationTitle = selectedConversationTitle?.trim()
   const hasCustomConversationTitle = Boolean(rawConversationTitle && rawConversationTitle.toLowerCase() !== 'new conversation')
   const activeModel = models.find((model) => modelRuntimeIdMatches(model, runtime))
@@ -82,25 +82,32 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
           </div>
           <div className="topbar-chat-actions">
             {!demoMode && (
-              <div className={`topbar-chat-readiness ${chatReadinessTone}`} title={`${selectedModelSummary} ${runtimeGateDetail}`}>
-                <span className="topbar-chat-readiness-dot" aria-hidden="true" />
-                <select
-                  className="topbar-select topbar-select-chat"
-                  aria-label="Model for chat"
-                  value={selectedModel?.id || selectedModelId || ''}
-                  onChange={(e) => setSelectedModelId(e.target.value)}
-                  disabled={!models.length}
-                >
-                  {models.length ? models.map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.name}
-                    </option>
-                  )) : (
-                    <option value="">No models</option>
-                  )}
-                </select>
-                <span className="topbar-chat-readiness-label">{chatReadinessLabel}</span>
-              </div>
+              <>
+                {showNewChatLanding && (
+                  <button type="button" className="ghost-button ghost-button-quiet topbar-new-chat-button" onClick={showNewChatLanding}>
+                    New chat
+                  </button>
+                )}
+                <div className={`topbar-chat-readiness ${chatReadinessTone}`} title={`${selectedModelSummary} ${runtimeGateDetail}`}>
+                  <span className="topbar-chat-readiness-dot" aria-hidden="true" />
+                  <select
+                    className="topbar-select topbar-select-chat"
+                    aria-label="Model for chat"
+                    value={selectedModel?.id || selectedModelId || ''}
+                    onChange={(e) => setSelectedModelId(e.target.value)}
+                    disabled={!models.length}
+                  >
+                    {models.length ? models.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.name}
+                      </option>
+                    )) : (
+                      <option value="">No models</option>
+                    )}
+                  </select>
+                  <span className="topbar-chat-readiness-label">{chatReadinessLabel}</span>
+                </div>
+              </>
             )}
           </div>
         </div>

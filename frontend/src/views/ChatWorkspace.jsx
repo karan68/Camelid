@@ -393,6 +393,8 @@ const isInterruptedPlaceholderMessage = (message) => {
 }
 
 const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsedSeconds, priorUserPrompt }) {
+  const [copied, setCopied] = useState(false)
+  const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
   const assistantStreaming = message.role === 'assistant' && Boolean(message.streaming)
   const isOpenStreamingCode = assistantStreaming && hasOpenCodeFence(messageContent)
@@ -402,6 +404,18 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
   const showStreamingStatus = assistantStreaming && !messageContent
   const showLiveGenerationBadge = assistantStreaming && Boolean(messageContent)
   const showLengthWarning = message.role === 'assistant' && !assistantStreaming && message.finish_reason === 'length'
+  const showMessageActions = message.role === 'assistant' && Boolean(String(messageContent || '').trim())
+
+  useEffect(() => () => {
+    if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
+  }, [])
+
+  const handleCopyMessage = async () => {
+    await copyText(messageContent)
+    setCopied(true)
+    if (copiedResetRef.current) window.clearTimeout(copiedResetRef.current)
+    copiedResetRef.current = window.setTimeout(() => setCopied(false), 1600)
+  }
 
   return (
     <article
@@ -418,6 +432,13 @@ const ChatMessageRow = memo(function ChatMessageRow({ message, generationElapsed
             : null
           : <p>{messageContent}</p>}
         {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} />}
+        {showMessageActions && (
+          <div className="message-actions" aria-label="Message actions">
+            <button type="button" className="message-action-button" onClick={handleCopyMessage}>
+              {copied ? 'Copied' : 'Copy'}
+            </button>
+          </div>
+        )}
         {showLengthWarning && (
           <div className="message-finish-warning" role="status">
             Stopped before completing. Ask “continue” for a complete file.

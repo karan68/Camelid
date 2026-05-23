@@ -6211,6 +6211,12 @@ textarea.composer-input-assistant {
   color: var(--color-error);
 }
 
+.topbar-new-chat-button {
+  min-height: 34px;
+  padding-inline: 12px;
+  white-space: nowrap;
+}
+
 /* Calm assistant-first landing. The earlier oversized hero is kept by history, then tightened here. */
 .chat-layout-empty .chat-empty-shell-assistant {
   min-height: calc(100dvh - 92px);
@@ -6956,10 +6962,55 @@ textarea.composer-input-assistant {
   line-height: 1.55;
 }
 
+.message-actions {
+  display: flex;
+  justify-content: flex-start;
+  gap: 8px;
+  margin-top: 12px;
+  opacity: 0;
+  transition: opacity 140ms ease;
+}
+
+.message-row-assistant.assistant:hover .message-actions,
+.message-actions:focus-within {
+  opacity: 1;
+}
+
+.message-action-button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 72%, transparent);
+  color: var(--color-text-muted);
+  font: inherit;
+  font-size: 0.76rem;
+  font-weight: 650;
+}
+
+.message-action-button:hover,
+.message-action-button:focus-visible {
+  border-color: color-mix(in srgb, var(--color-border-strong) 78%, transparent);
+  color: var(--color-text);
+  background: color-mix(in srgb, var(--color-selected-row) 70%, transparent);
+}
+
 @media (max-width: 720px) {
   .main-pane-chat,
   .app-shell.sidebar-collapsed .main-pane-chat {
     padding: 12px 12px 16px;
+  }
+
+  .chat-readiness-pill-row.chat-readiness-strip-live {
+    width: 100%;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chat-readiness-pill {
+    width: 100%;
+    max-width: none;
+    box-sizing: border-box;
   }
 
   .chat-layout-empty .chat-empty-stage-product {
@@ -6990,5 +7041,9 @@ textarea.composer-input-assistant {
 
   .message-bubble-assistant.user {
     max-width: min(92%, 620px);
+  }
+
+  .message-actions {
+    opacity: 1;
   }
 }
