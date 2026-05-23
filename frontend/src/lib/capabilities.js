@@ -87,7 +87,9 @@ const EXACT_LLAMA_PROMOTION_ROWS = [
 ]
 
 const EXACT_ARTIFACT_GATED_ROWS = {
+  llama32_1b_instruct_q8_0: 'Llama-3.2-1B-Instruct-Q8_0.gguf',
   llama32_3b_instruct_q8_0: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
+  llama3_8b_instruct_q8_0: 'Meta-Llama-3-8B-Instruct-Q8_0.gguf',
 }
 
 function pathBasename(value) {

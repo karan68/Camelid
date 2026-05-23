@@ -361,13 +361,18 @@ assert.match(compatibilityHintCopy(tinyKQuantHint), /not chat-ready support|conc
 const llama3Q4Hint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'Q4_K_M' })
 assert.equal(llama3Q4Hint.kind, 'quant_mismatch')
 assert.match(compatibilityHintCopy(llama3Q4Hint), /Do not inherit the supported gate|wait for an exact COMPATIBILITY\.md row/)
-assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'Q8_0' }), true, 'exact promoted 8B rows are supported only with exact size/instruct/quant evidence')
-assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'file_type 7' }), true, 'GGUF file_type evidence should map the 8B exact row back to Q8_0 support only')
-const llama32OneBHint = findCompatibilityHint(capabilityFixture, { name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' })
+assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'Q8_0' }), false, '8B rows must not unlock from name/quant without exact artifact evidence')
+assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Meta Llama 3 8B Instruct', quant: 'file_type 7' }), false, 'GGUF file_type evidence still needs exact 8B artifact identity before chat unlocks')
+const llama32OneBExactArtifactModel = {
+  name: 'Llama 3.2 1B Instruct Q8_0',
+  model_path: '<ubuntu-model-path>/Llama-3.2-1B-Instruct-Q8_0.gguf',
+  quant: 'Q8_0',
+}
+const llama32OneBHint = findCompatibilityHint(capabilityFixture, llama32OneBExactArtifactModel)
 assert.equal(llama32OneBHint.target.id, 'llama32_1b_instruct_q8_0', 'Llama 3.2 1B must match its exact promoted row')
-assert.equal(isCompatibilitySupportedForModel(capabilityFixture, { name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' }), true, 'exact promoted 1B rows are supported only with exact size/instruct/quant evidence')
+assert.equal(isCompatibilitySupportedForModel(capabilityFixture, llama32OneBExactArtifactModel), true, 'exact promoted 1B rows are supported only with exact size/instruct/quant/artifact evidence')
 assert.deepEqual(
-  getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'llama32-1b', name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' }, { active_model_id: 'llama32-1b', loaded_now: true, generation_ready: true }),
+  getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'llama32-1b', ...llama32OneBExactArtifactModel }, { active_model_id: 'llama32-1b', loaded_now: true, generation_ready: true }),
   {
     hint: llama32OneBHint,
     runtimeReady: true,
@@ -386,15 +391,15 @@ assert.equal(
   false,
   'exact supported rows still require runtime loaded_now=true before chat unlocks',
 )
-const llama32OneBQuantMissingHint = findCompatibilityHint(capabilityFixture, { name: 'Llama 3.2 1B Instruct' })
-assert.equal(llama32OneBQuantMissingHint.kind, 'quant_missing', 'Llama 3.2 exact-size matches must not become compatibility matches without quant evidence')
-assert.equal(compatibilityHintLabel(llama32OneBQuantMissingHint), 'llama32_1b_instruct_q8_0: quant not verified')
-assert.match(compatibilityHintCopy(llama32OneBQuantMissingHint), /does not expose a quant label yet/)
+const llama32OneBNameOnlyHint = findCompatibilityHint(capabilityFixture, { name: 'Llama 3.2 1B Instruct Q8_0', quant: 'Q8_0' })
+assert.equal(llama32OneBNameOnlyHint.kind, 'artifact_mismatch', 'Llama 3.2 1B exact-size matches must not become compatibility matches without exact artifact evidence')
+assert.equal(compatibilityHintLabel(llama32OneBNameOnlyHint), 'llama32_1b_instruct_q8_0: exact GGUF not verified')
+assert.match(compatibilityHintCopy(llama32OneBNameOnlyHint), /requires the exact Llama-3\.2-1B-Instruct-Q8_0\.gguf artifact/)
 const promotedOneBFixture = {
   ...capabilityFixture,
   model_compatibility: capabilityFixture.model_compatibility.map((row) => row.id === 'llama32_1b_instruct_q8_0' ? { ...row, status: 'supported_current_gate' } : row),
 }
-assert.equal(isCompatibilitySupportedForModel(promotedOneBFixture, { name: 'Llama 3.2 1B Instruct' }), false, 'exact-size Llama rows still need quant evidence even after promotion')
+assert.equal(isCompatibilitySupportedForModel(promotedOneBFixture, { name: 'Llama 3.2 1B Instruct' }), false, 'exact-size Llama rows still need exact artifact evidence even after promotion')
 const llama32ThreeBExactArtifactModel = {
   name: 'Llama 3.2 3B Instruct Q8_0',
   model_path: '<ubuntu-model-path>/Llama-3.2-3B-Instruct-Q8_0.gguf',
@@ -467,19 +472,24 @@ assert.equal(
   false,
   'canonical Ubuntu 3B runtime labels must still fail closed when explicit quant evidence disagrees with the supported Q8_0 row',
 )
-const llama3EightBHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct Q8_0', quant: 'Q8_0' })
+const llama3EightBExactArtifactModel = {
+  name: 'Meta Llama 3 8B Instruct Q8_0',
+  model_path: '<ubuntu-model-path>/Meta-Llama-3-8B-Instruct-Q8_0.gguf',
+  quant: 'Q8_0',
+}
+const llama3EightBHint = findCompatibilityHint(capabilityFixture, llama3EightBExactArtifactModel)
 assert.equal(llama3EightBHint.target.id, 'llama3_8b_instruct_q8_0', 'Llama 3 8B must match its exact supported row')
 assert.match(compatibilityHintCopy(llama3EightBHint), /checked 512\/1024\/2048-context packs, compact template-shapes pack evidence, bounded memory\/hot-path measurements, and current-head 1024\/2048 PASS evidence/)
 assert.match(compatibilityHintCopy(llama3EightBHint), /No model-native\/larger context or broader\/full support is implied/)
-const llama3HyphenEightBHint = findCompatibilityHint(capabilityFixture, { name: 'Meta-Llama-3-8B-Instruct-Q8_0', quant: 'Q8_0' })
+const llama3HyphenEightBHint = findCompatibilityHint(capabilityFixture, { model_path: '<ubuntu-model-path>/Meta-Llama-3-8B-Instruct-Q8_0.gguf', quant: 'Q8_0' })
 assert.equal(llama3HyphenEightBHint.target.id, 'llama3_8b_instruct_q8_0', 'Llama-3-8B filenames should match the exact Llama 3 8B row')
-const llama3EightBQuantMissingHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct' })
-assert.equal(llama3EightBQuantMissingHint.kind, 'quant_missing', 'Llama 3 8B must not unlock from a size/instruct match without Q8_0 evidence')
-assert.equal(compatibilityHintLabel(llama3EightBQuantMissingHint), 'llama3_8b_instruct_q8_0: quant not verified')
+const llama3EightBNameOnlyHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3 8B Instruct Q8_0', quant: 'Q8_0' })
+assert.equal(llama3EightBNameOnlyHint.kind, 'artifact_mismatch', 'Llama 3 8B must not unlock from a size/instruct/quant match without exact artifact evidence')
+assert.equal(compatibilityHintLabel(llama3EightBNameOnlyHint), 'llama3_8b_instruct_q8_0: exact GGUF not verified')
 assert.equal(
-  getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'llama3-8b', name: 'Meta Llama 3 8B Instruct Q8_0', quant: 'Q8_0' }, { active_model_id: 'llama3-8b', loaded_now: true, generation_ready: true }).chatUnlocked,
+  getChatGateState(capabilityFixture, { ...localLoadedReady, id: 'llama3-8b', ...llama3EightBExactArtifactModel }, { active_model_id: 'llama3-8b', loaded_now: true, generation_ready: true }).chatUnlocked,
   true,
-  'Llama 3 8B exact rows should unlock supported WebUI chat when runtime-green',
+  'Llama 3 8B exact artifact rows should unlock supported WebUI chat when runtime-green',
 )
 const llama31EightBHint = findCompatibilityHint(capabilityFixture, { name: 'Meta Llama 3.1 8B Instruct Q8_0', quant: 'Q8_0' })
 assert.equal(llama31EightBHint, null, 'Llama 3.1 8B must not inherit the Llama 3 8B row')
