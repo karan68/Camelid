@@ -305,7 +305,12 @@ const DEMO_PROMPTS = [
   'Summarize this implementation plan and call out the risks',
   'Draft a concise release note from these changes',
   'Turn this checklist into a prioritized next-step plan',
+  'Review this response and tighten it into a shorter final answer',
 ]
+
+function formatCountLabel(count, singular, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`
+}
 
 const streamingStatusLabel = (phase, elapsedSeconds, isOpenCode = false) => {
   if (phase === 'preparing') return PREPARING_STREAMING_LABEL
@@ -589,6 +594,9 @@ export default function ChatWorkspace({
   const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
   const capabilityLaneStatus = getChatCapabilityLaneCopy(selectedChatGate, capabilities)
   const selectedModelName = selectedModel?.name || selectedModelId || 'No model selected'
+  const messageCount = visibleMessages.length
+  const userMessageCount = visibleMessages.filter((message) => message.role === 'user').length + (pendingUserPrompt ? 1 : 0)
+  const assistantMessageCount = visibleMessages.filter((message) => message.role === 'assistant').length
   const runtimeStatusLabel = apiUnavailable
     ? 'API unavailable'
     : selectedModelRunnable
@@ -637,6 +645,9 @@ export default function ChatWorkspace({
         : describeModelState(selectedModel)
     : 'Choose a model before starting a Camelid chat.'
   const emptyHeroEyebrow = 'Camelid'
+  const promptHintCopy = selectedModelRunnable
+    ? 'Enter sends · Shift+Enter adds a new line'
+    : 'Chat unlocks after runtime and exact-row readiness both pass'
   const readinessState = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const readinessLabel = selectedModelRunnable
     ? 'Ready'
@@ -655,7 +666,7 @@ export default function ChatWorkspace({
       ? 'Choose a supported model.'
       : 'Load a model to begin.'
   const productHeroSummary = selectedModelRunnable
-    ? 'Send a prompt through the selected local model. Camelid keeps the exact-row readiness boundary visible while you work.'
+    ? 'A calm local assistant surface with the current runtime and support boundary kept visible while you work.'
     : apiUnavailable
       ? 'The frontend is ready, but the Camelid API is not responding. Start the local server and the chat surface will update automatically.'
     : supportBlocked
@@ -700,6 +711,22 @@ export default function ChatWorkspace({
     if (generationActive || !selectedModelRunnable) return
     setComposer(prompt)
   }
+
+  const currentConversationSummary = hasCustomConversationTitle
+    ? `${conversationLabel}${lastUpdated ? ` · ${lastUpdated}` : ''}`
+    : lastUpdated || 'Fresh chat'
+
+  const composerStatusItems = [
+    { label: 'Model', value: selectedModelName },
+    { label: 'Chat', value: selectedModelRunnable ? 'Ready' : readinessLabel },
+    { label: 'Input', value: promptHintCopy },
+  ]
+
+  const conversationSnapshotItems = [
+    { label: 'Messages', value: formatCountLabel(messageCount, 'message') },
+    { label: 'Prompts', value: formatCountLabel(userMessageCount, 'prompt') },
+    { label: 'Replies', value: formatCountLabel(assistantMessageCount, 'reply') },
+  ]
 
   const renderReadinessPills = (extraClass = '', ariaLabel = 'Chat readiness and support boundary') => (
     <div className={`chat-readiness-pill-row chat-readiness-strip-live ${extraClass} is-${readinessState}`} aria-label={ariaLabel} aria-live="polite">
@@ -792,16 +819,31 @@ export default function ChatWorkspace({
       <div className={`chat-canvas ${isFreshThread ? 'chat-canvas-empty' : ''}`}>
         {isFreshThread ? (
           <div className="chat-empty-shell chat-empty-shell-assistant">
-            <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
-              <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
-                <p className="chat-empty-greeting">{emptyHeroEyebrow}</p>
-                <h2>{productHeroTitle}</h2>
-                {productHeroSummary && <p className="hero-summary">{productHeroSummary}</p>}
-              </div>
+              <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
+                <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
+                  <p className="chat-empty-greeting">{emptyHeroEyebrow}</p>
+                  <h2>{productHeroTitle}</h2>
+                  {productHeroSummary && <p className="hero-summary">{productHeroSummary}</p>}
+                </div>
 
-              {!demoMode && (
-                renderReadinessPills()
-              )}
+                <div className="chat-hero-facts" aria-label="Camelid chat highlights">
+                  <div className="chat-hero-fact">
+                    <span>Selected model</span>
+                    <strong>{selectedModelName}</strong>
+                  </div>
+                  <div className="chat-hero-fact">
+                    <span>Current gate</span>
+                    <strong>{selectedModelRunnable ? 'Ready to chat' : readinessLabel}</strong>
+                  </div>
+                  <div className="chat-hero-fact">
+                    <span>Local UX</span>
+                    <strong>{selectedModelRunnable ? 'Streaming responses enabled' : 'Waiting for runtime evidence'}</strong>
+                  </div>
+                </div>
+
+                {!demoMode && (
+                  renderReadinessPills()
+                )}
 
               {!selectedModelRunnable && (
                 <ChatSurfaceNotice
@@ -827,6 +869,14 @@ export default function ChatWorkspace({
               )}
 
               <div className="composer composer-assistant composer-assistant-stage composer-assistant-stage-clean composer-assistant-product">
+                <div className="composer-status-bar" aria-label="Composer status">
+                  {composerStatusItems.map((item) => (
+                    <div key={item.label} className="composer-status-chip">
+                      <span>{item.label}</span>
+                      <strong>{item.value}</strong>
+                    </div>
+                  ))}
+                </div>
                 <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Load a model first'} disabled={generationActive || !selectedModelRunnable} />
                 <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
                   <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
@@ -846,10 +896,22 @@ export default function ChatWorkspace({
           <>
             {!demoMode && (
               <>
-                <div className={`chat-session-strip is-${readinessState}`} aria-label="Current Camelid chat status">
-                  <span className="chat-session-dot" aria-hidden="true" />
-                  <strong>{selectedModelName}</strong>
-                  <small>{selectedModelRunnable ? 'Ready when you are' : readinessLabel}</small>
+                <div className={`chat-thread-header is-${readinessState}`} aria-label="Current Camelid chat status">
+                  <div className="chat-thread-header-main">
+                    <div className="chat-thread-header-copy">
+                      <span className="chat-thread-header-eyebrow">Camelid chat</span>
+                      <strong>{currentConversationSummary}</strong>
+                      <p>{selectedModelRunnable ? 'Local assistant responses stay grounded in the current runtime and support contract.' : selectedModelGateSummary}</p>
+                    </div>
+                    <div className="chat-thread-header-badges" aria-label="Conversation snapshot">
+                      {conversationSnapshotItems.map((item) => (
+                        <div key={item.label} className="chat-thread-header-badge">
+                          <span>{item.label}</span>
+                          <strong>{item.value}</strong>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 </div>
 
                 {renderReadinessPills('chat-readiness-strip-live', 'Live chat exact-row readiness')}
@@ -898,6 +960,14 @@ export default function ChatWorkspace({
 
       {!isFreshThread && (
         <div className="composer composer-assistant composer-assistant-floating">
+          <div className="composer-status-bar composer-status-bar-floating" aria-label="Composer status">
+            {composerStatusItems.map((item) => (
+              <div key={item.label} className="composer-status-chip">
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
+              </div>
+            ))}
+          </div>
           <textarea ref={composerRef} className="composer-input composer-input-assistant" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={selectedModelRunnable ? 'Message Camelid…' : apiUnavailable ? 'Camelid API unavailable' : 'Choose a ready model first'} disabled={generationActive || !selectedModelRunnable} />
           <div className="composer-assistant-footer">
             <div className="composer-assistant-tools">

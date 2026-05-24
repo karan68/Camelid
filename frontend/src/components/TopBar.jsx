@@ -71,14 +71,24 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
     : runtime?.loaded_now
       ? 'Checking'
       : 'Not ready'
+  const chatCenterLabel = hasCustomConversationTitle ? clampText(rawConversationTitle, 64) : untitledConversationLabel
+  const chatSupportLabel = selectedModelRunnable
+    ? 'Local assistant UI'
+    : apiUnavailable
+      ? 'API connection needed'
+      : 'Waiting on exact-row readiness'
 
   if (tab === 'chat') {
     return (
       <header className={`topbar topbar-chat ${demoMode ? 'topbar-demo' : ''}`}>
         <div className="topbar-chat-row">
-          <div className="topbar-chat-brand">Camelid</div>
-          <div className="topbar-chat-center" title={hasCustomConversationTitle ? rawConversationTitle : untitledConversationLabel}>
-            {hasCustomConversationTitle ? clampText(rawConversationTitle, 64) : untitledConversationLabel}
+          <div className="topbar-chat-brand topbar-chat-brand-stack">
+            <strong>Camelid</strong>
+            <span>{chatSupportLabel}</span>
+          </div>
+          <div className="topbar-chat-center topbar-chat-center-stack" title={hasCustomConversationTitle ? rawConversationTitle : untitledConversationLabel}>
+            <strong>{chatCenterLabel}</strong>
+            <span>{selectedModelLabel}</span>
           </div>
           <div className="topbar-chat-actions">
             {!demoMode && (
@@ -90,6 +100,7 @@ function TopBar({ tab, setTab, selectedConversationTitle, selectedConversationUp
                 )}
                 <div className={`topbar-chat-readiness ${chatReadinessTone}`} title={`${selectedModelSummary} ${runtimeGateDetail}`}>
                   <span className="topbar-chat-readiness-dot" aria-hidden="true" />
+                  <span className="topbar-chat-readiness-caption">Model</span>
                   <select
                     className="topbar-select topbar-select-chat"
                     aria-label="Model for chat"

@@ -7046,3 +7046,223 @@ textarea.composer-input-assistant {
     opacity: 1;
   }
 }
+
+/* Frontend redesign pass: chat-first product header, clearer conversation summary, and stronger composer metadata. */
+.topbar-chat-brand-stack,
+.topbar-chat-center-stack {
+  display: grid;
+  gap: 2px;
+}
+
+.topbar-chat-brand-stack strong,
+.topbar-chat-center-stack strong {
+  color: var(--color-text);
+  font-size: 0.92rem;
+  font-weight: 760;
+  line-height: 1.2;
+}
+
+.topbar-chat-brand-stack span,
+.topbar-chat-center-stack span,
+.topbar-chat-readiness-caption {
+  color: color-mix(in srgb, var(--color-text-muted) 92%, transparent);
+  font-size: 0.72rem;
+  font-weight: 640;
+  line-height: 1.25;
+}
+
+.topbar-chat-center-stack {
+  justify-items: center;
+  text-align: center;
+}
+
+.topbar-chat-readiness {
+  gap: 10px;
+  padding: 7px 10px 7px 12px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-chip) 80%, transparent), color-mix(in srgb, var(--color-surface) 52%, transparent));
+}
+
+.topbar-chat-readiness .topbar-select-chat {
+  min-width: 160px;
+  max-width: min(30vw, 260px);
+}
+
+.chat-hero-facts {
+  width: min(100%, 860px);
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 0 auto;
+}
+
+.chat-hero-fact,
+.chat-thread-header-badge,
+.composer-status-chip {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+  padding: 13px 15px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 86%, transparent), color-mix(in srgb, var(--color-surface-subtle) 72%, transparent));
+  box-shadow: var(--shadow-inset);
+}
+
+.chat-hero-fact span,
+.chat-thread-header-badge span,
+.composer-status-chip span,
+.chat-thread-header-eyebrow {
+  color: color-mix(in srgb, var(--color-text-muted) 92%, transparent);
+  font-size: 0.7rem;
+  font-weight: 760;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chat-hero-fact strong,
+.chat-thread-header-badge strong,
+.composer-status-chip strong {
+  color: var(--color-text);
+  font-size: 0.88rem;
+  font-weight: 720;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-status-bar {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.composer-status-chip {
+  padding: 11px 13px;
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--color-chip) 78%, transparent);
+}
+
+.composer-status-bar-floating {
+  margin-bottom: 10px;
+}
+
+.chat-thread-header {
+  width: min(100%, 900px);
+  margin: 0 auto 10px;
+  padding: 18px 20px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 58%, transparent);
+  border-radius: 24px;
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--color-info) 8%, transparent), transparent 34%),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-surface) 92%, transparent), color-mix(in srgb, var(--color-surface-subtle) 78%, transparent));
+  box-shadow: var(--shadow-inset);
+}
+
+.chat-thread-header-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(280px, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.chat-thread-header-copy {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.chat-thread-header-copy strong {
+  color: var(--color-text);
+  font-size: clamp(1.05rem, 1.4vw, 1.3rem);
+  font-weight: 760;
+  line-height: 1.2;
+}
+
+.chat-thread-header-copy p {
+  margin: 0;
+  max-width: 62ch;
+  color: color-mix(in srgb, var(--color-text-muted) 88%, var(--color-text) 12%);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.chat-thread-header-badges {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.chat-layout-empty .composer-assistant-product,
+.composer-assistant-floating {
+  background:
+    radial-gradient(circle at top, color-mix(in srgb, var(--color-info) 7%, transparent), transparent 32%),
+    linear-gradient(180deg, color-mix(in srgb, var(--color-composer-surface) 98%, transparent), color-mix(in srgb, var(--color-surface) 90%, transparent));
+}
+
+.composer-assistant-floating .composer-status-bar {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.composer-assistant-floating .composer-status-chip {
+  padding: 9px 11px;
+  border-radius: 14px;
+}
+
+.composer-assistant-floating .composer-status-chip strong {
+  font-size: 0.8rem;
+}
+
+.composer-assistant-floating .composer-model-picker,
+.chat-layout-empty .composer-model-picker {
+  background: color-mix(in srgb, var(--color-chip) 80%, transparent);
+}
+
+.message-bubble-assistant.assistant {
+  padding-right: 8px;
+}
+
+.message-markdown p,
+.message-markdown ul {
+  color: color-mix(in srgb, var(--color-text) 91%, var(--color-text-muted) 9%);
+}
+
+.message-action-button {
+  background: color-mix(in srgb, var(--color-chip) 82%, transparent);
+}
+
+@media (max-width: 960px) {
+  .chat-hero-facts,
+  .chat-thread-header-badges,
+  .composer-status-bar,
+  .composer-assistant-floating .composer-status-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-thread-header-main {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .topbar-chat-brand-stack span,
+  .topbar-chat-center-stack span,
+  .topbar-chat-readiness-caption {
+    display: none;
+  }
+
+  .chat-hero-facts {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-thread-header {
+    padding: 16px;
+    border-radius: 20px;
+  }
+
+  .composer-status-bar {
+    grid-template-columns: 1fr;
+  }
+}
