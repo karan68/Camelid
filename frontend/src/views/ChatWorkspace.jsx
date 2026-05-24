@@ -595,6 +595,7 @@ export default function ChatWorkspace({
   const selectedRuntimeReady = selectedChatGate.runtimeReady
   const selectedModelCapabilitySupported = selectedChatGate.contractSupported
   const supportBlocked = selectedRuntimeReady && !selectedModelCapabilitySupported
+  const selectedRuntimeMatchesLoadedModel = Boolean(selectedChatGate.runtimeLoaded)
   const selectedCompatibilityHint = selectedChatGate.hint || findCompatibilityHint(capabilities, selectedModel)
   const selectedCompatibilityLabel = selectedModel
     ? compatibilityHintLabel(selectedCompatibilityHint, 'No matching COMPATIBILITY.md row')
@@ -657,17 +658,32 @@ export default function ChatWorkspace({
   const selectedModelIssue = selectedModel?.load_error || selectedModel?.install_error || ''
   const readinessActionTab = apiUnavailable ? 'api' : 'library'
   const readinessActionLabel = apiUnavailable ? 'Open API' : 'Open Models'
+  const selectedModelReadinessCopy = selectedModelRunnable
+    ? 'Selected model is ready for Camelid chat.'
+    : apiUnavailable
+      ? 'The Camelid API is unavailable, so runtime truth cannot be checked yet.'
+    : selectedModelIssue
+      ? selectedModelIssue
+    : supportBlocked
+      ? 'Camelid has the runtime ready, but this selected row stays chat-locked until the exact support contract matches.'
+    : selectedRuntimeMatchesLoadedModel
+      ? 'Camelid is still preparing this loaded model. Wait for generation_ready=true before sending a prompt.'
+      : selectedModel
+        ? 'Load this model into Camelid to begin a local chat.'
+        : 'Choose a model before starting a Camelid chat.'
   const selectedModelGateSummary = selectedModel
     ? selectedModelRunnable
       ? 'Selected model is ready for Camelid chat.'
       : selectedModelIssue
         ? selectedModelIssue
-        : describeModelState(selectedModel)
+        : selectedModelReadinessCopy
     : 'Choose a model before starting a Camelid chat.'
   const emptyHeroEyebrow = 'Camelid'
   const promptHintCopy = selectedModelRunnable
     ? 'Enter sends · Shift+Enter adds a new line'
-    : 'Chat unlocks after runtime and exact-row readiness both pass'
+    : apiUnavailable
+      ? 'Draft now · send unlocks after the Camelid API reconnects'
+      : 'Chat unlocks after runtime and exact-row readiness both pass'
   const readinessState = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const readinessLabel = selectedModelRunnable
     ? 'Ready'
@@ -740,17 +756,21 @@ export default function ChatWorkspace({
   const modelInventoryLabel = availableModelCount
     ? `${readyModelCount}/${availableModelCount} ready`
     : 'No models added'
+  const composerDraftUnlocked = Boolean(selectedModelRunnable || apiUnavailable)
   const composerPlaceholder = selectedModelRunnable
     ? 'Message Camelid…'
     : apiUnavailable
-      ? 'Camelid API unavailable'
-      : isFreshThread
-        ? 'Load a model first'
-        : 'Choose a ready model first'
+      ? 'Draft a prompt while the Camelid API comes back'
+      : composerDraftUnlocked
+        ? 'Draft a prompt while Camelid finishes getting ready'
+        : isFreshThread
+          ? 'Load a model first'
+          : 'Choose a ready model first'
   const composerSendLabel = generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'
   const secondaryActionLabel = selectedModelRunnable ? 'Save to memory' : readinessActionLabel
   const secondaryAction = selectedModelRunnable ? saveToMemory : () => setTab(readinessActionTab)
   const secondaryActionDisabled = selectedModelRunnable ? generationActive : false
+  const composerDisabled = Boolean(generationActive || !composerDraftUnlocked)
   const selectionSummaryTone = selectedModelRunnable ? 'ready' : apiUnavailable ? 'offline' : selectedModelIssue ? 'blocked' : supportBlocked ? 'blocked' : selectedModel ? 'waiting' : 'idle'
   const selectionSummaryLabel = selectedModelRunnable
     ? 'Ready now'
@@ -947,7 +967,7 @@ export default function ChatWorkspace({
                     </div>
                   ))}
                 </div>
-                <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={composerPlaceholder} disabled={generationActive || !selectedModelRunnable} />
+                <textarea ref={composerRef} className="composer-input composer-input-assistant composer-input-assistant-stage" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={2} placeholder={composerPlaceholder} disabled={composerDisabled} />
                 <div className="composer-assistant-footer composer-assistant-footer-stage composer-assistant-footer-stage-clean">
                   <div className="composer-assistant-tools composer-assistant-tools-stage composer-assistant-tools-stage-clean">
                     {renderModelPicker()}
@@ -1059,7 +1079,7 @@ export default function ChatWorkspace({
               </div>
             ))}
           </div>
-          <textarea ref={composerRef} className="composer-input composer-input-assistant" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={composerPlaceholder} disabled={generationActive || !selectedModelRunnable} />
+          <textarea ref={composerRef} className="composer-input composer-input-assistant" aria-label="Message Camelid" aria-describedby={composerReadinessId} value={composer} onChange={(e) => setComposer(e.target.value)} onKeyDown={handleComposerKeyDown} rows={3} placeholder={composerPlaceholder} disabled={composerDisabled} />
           <div className="composer-assistant-footer">
             <div className="composer-assistant-tools">
               {renderModelPicker()}

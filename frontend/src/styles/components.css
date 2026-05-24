@@ -7463,3 +7463,118 @@ textarea.composer-input-assistant {
     grid-template-columns: 1fr;
   }
 }
+
+/* Frontend redesign push: keep the approved visual language, but pull the
+   empty-state workspace into a usable chat surface with less dead space. */
+.chat-layout-empty .chat-canvas-empty {
+  min-height: calc(100vh - 164px);
+  align-items: flex-start;
+  padding-top: clamp(28px, 8vh, 88px);
+}
+
+.chat-layout-empty .chat-empty-shell-assistant {
+  width: 100%;
+  min-height: auto;
+  padding-top: 0;
+}
+
+.chat-layout-empty .chat-empty-stage-product {
+  width: min(100%, 1060px);
+  gap: 22px;
+  padding: clamp(18px, 2.8vw, 30px) clamp(16px, 3.2vw, 34px) clamp(18px, 3vw, 30px);
+}
+
+.chat-layout-empty .chat-empty-hero-clean {
+  width: min(100%, 960px);
+  gap: 14px;
+}
+
+.chat-layout-empty .chat-empty-hero-clean h2 {
+  max-width: 10ch;
+  letter-spacing: -0.05em;
+}
+
+.chat-layout-empty .chat-empty-hero-clean .hero-summary {
+  max-width: 54ch;
+}
+
+.chat-layout-empty .chat-hero-grid {
+  width: min(100%, 960px);
+  grid-template-columns: minmax(0, 1.1fr) minmax(300px, 0.9fr);
+  gap: 16px;
+}
+
+.chat-layout-empty .chat-hero-facts {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.chat-layout-empty .chat-hero-fact {
+  min-height: 86px;
+}
+
+.chat-layout-empty .composer-assistant-product {
+  width: min(100%, 960px);
+  margin-top: 2px;
+}
+
+.chat-layout-empty .composer-assistant-stage-clean .composer-input-assistant-stage {
+  min-height: 120px;
+}
+
+.chat-layout-empty .composer-status-bar {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.chat-layout-empty .composer-assistant-readiness-note,
+.chat-layout-empty .composer-assistant-readiness-detail {
+  max-width: 72ch;
+}
+
+.composer-input-assistant-stage:not(:disabled),
+.composer-input-assistant:not(:disabled) {
+  border-color: color-mix(in srgb, var(--color-border-strong) 72%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+.composer-input-assistant-stage::placeholder,
+.composer-input-assistant::placeholder {
+  color: color-mix(in srgb, var(--color-text-muted) 90%, transparent);
+}
+
+.composer-input-assistant-stage:focus-visible,
+.composer-input-assistant:focus-visible {
+  border-color: color-mix(in srgb, var(--color-info) 52%, var(--color-border-strong) 48%);
+  box-shadow: var(--shadow-focus), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.chat-layout-empty .composer-send-button[disabled] {
+  opacity: 0.76;
+}
+
+@media (max-width: 960px) {
+  .chat-layout-empty .chat-hero-grid,
+  .chat-layout-empty .chat-hero-facts,
+  .chat-layout-empty .composer-status-bar {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .chat-layout-empty .chat-canvas-empty {
+    min-height: auto;
+    padding-top: 14px;
+  }
+
+  .chat-layout-empty .chat-empty-stage-product {
+    gap: 16px;
+    padding-inline: 0;
+  }
+
+  .chat-layout-empty .chat-empty-hero-clean h2 {
+    max-width: 11ch;
+  }
+
+  .chat-layout-empty .composer-assistant-stage-clean .composer-input-assistant-stage {
+    min-height: 104px;
+  }
+}
