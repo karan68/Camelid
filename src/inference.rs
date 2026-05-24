@@ -11897,17 +11897,19 @@ fn x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled() -> bool {
 unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::{
-        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
-        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
-        _mm256_storeu_si256, _mm_loadu_si128,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
     };
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::{
-        _mm256_add_epi32, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16, _mm256_loadu_si256,
-        _mm256_madd_epi16, _mm256_maddubs_epi16, _mm256_movemask_epi8, _mm256_mullo_epi16,
-        _mm256_set1_epi16, _mm256_set1_epi8, _mm256_setzero_si256, _mm256_sign_epi8,
-        _mm256_storeu_si256, _mm_loadu_si128,
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
     };
 
     let ones = _mm256_set1_epi16(1);
@@ -11937,10 +11939,13 @@ unsafe fn q8_0_i8_block_avx2(weight: *const i8, input: *const i8) -> i32 {
         _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
     };
 
-    let mut lanes = [0_i32; 8];
-    // SAFETY: lanes has exactly 32 bytes of storage for one __m256i value.
-    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast(), acc) };
-    lanes.iter().sum()
+    let sum128 = _mm_add_epi32(
+        _mm256_castsi256_si128(acc),
+        _mm256_extracti128_si256(acc, 1),
+    );
+    let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0x4E));
+    let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0xB1));
+    _mm_cvtsi128_si32(sum32)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -12030,10 +12035,7 @@ unsafe fn q8_0_i8_block_neon_mul(weight: *const i8, input: *const i8) -> i32 {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[inline(always)]
 fn horizontal_sum_i32x4(acc: std::arch::aarch64::int32x4_t) -> i32 {
-    // SAFETY: int32x4_t is a four-lane i32 vector; extracting via transmute preserves lanes.
-    let lanes: [i32; 4] =
-        unsafe { std::mem::transmute::<std::arch::aarch64::int32x4_t, [i32; 4]>(acc) };
-    lanes.iter().sum()
+    unsafe { std::arch::aarch64::vaddvq_s32(acc) }
 }
 
 fn f32_to_f16_bits(value: f32) -> u16 {
