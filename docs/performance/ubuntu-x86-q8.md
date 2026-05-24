@@ -70,6 +70,8 @@ Rejected paths stay documented when they fail for any of the following reasons:
 
 Examples already treated this way include row-dot lookalikes, tile16 hsum/lane/simd-scale variants, wrapper-style GEMM detours, and contaminated benchmark runs.
 
+The 2026-05-24 current-main AVX2 register-sum recheck also stays rejected for performance retention: exact-row one-token parity still matched llama.cpp, but the cleaned unique-prompt same-host marker run measured Camelid `8837.36 / 8837.65 ms` on `e27a4e1` versus `8823.09 / 8823.37 ms` on `214f733`, so there is no measured Ubuntu x86_64 wall-clock win to retain.
+
 ## Clean-host discipline
 
 Ubuntu x86 Q8 benchmarking now requires a clean host before major runs:
@@ -161,6 +163,7 @@ Primary public evidence anchors for this lane:
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-1eeef0a5-20260521T2206Z-rust-vnni-scale-cache/README.md` (default-off Rust VNNI scale-cache implementation slice; local Rust parity/gates passed on Darwin arm64, but same-host Ubuntu x86 Camelid vs llama.cpp benchmarking was not feasible in this run, so no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260521T2015Z-vnni-rawptr-avx2/README.md` (default-off Rust AVX2 FFN-down VNNI decode raw-pointer implementation slice; local compile check only, with Linux x86_64 AVX2 parity coverage added for canonical host execution and no throughput/support/default-on promotion)
 - `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260522T2320Z-q8-parity/README.md` (Ubuntu Linux x86_64 same-host Llama 3.2 3B Q8_0 Camelid rawptr-VNNI versus llama.cpp timing slice; llama.cpp remained much faster on TTFT/total elapsed and the deterministic marker guard failed, so no throughput/support/default-on promotion)
+- `qa/evidence-bundles/llamacpp-q8-cpu-re-20260514T1200Z/artifacts/cron-95495a91-20260524T0535Z-avx2-register-sums/README.md` (current-main AVX2 baseline recheck on Ubuntu Linux x86_64: one-token parity stayed exact, but the cleaned unique-prompt marker run was slightly slower than `214f733`, so no measured wall-clock win or promotion is retained)
 - the retained/reject notes for bounded Ubuntu x86 Q8 experiments kept under `qa/evidence-bundles/`
 
 ## Product/runtime note
