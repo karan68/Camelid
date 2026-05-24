@@ -3154,6 +3154,23 @@ textarea.composer-input-assistant {
   justify-self: end;
 }
 
+.composer-stop-button {
+  min-width: 6.5rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-chip) 92%, transparent);
+}
+
+.composer-stop-button:hover,
+.composer-stop-button:focus-visible {
+  background: color-mix(in srgb, var(--color-error) 10%, var(--color-chip) 90%);
+  border-color: color-mix(in srgb, var(--color-error) 28%, var(--color-border-soft) 72%);
+}
+
+.composer-stop-button[disabled] {
+  opacity: 0.72;
+  cursor: default;
+}
+
 .mobile-nav {
   display: none;
   gap: 6px;

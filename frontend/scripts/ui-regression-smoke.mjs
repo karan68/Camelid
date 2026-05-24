@@ -129,7 +129,7 @@ assert.match(streamParserSource, /function readSseDataLines/, 'central stream pa
 assert.match(streamParserSource, /export function extractSseEvents/, 'stream parser should keep SSE boundary handling centralized')
 assert.match(streamParserSource, /replace\(/, 'stream parser should normalize line endings before splitting SSE events')
 assert.match(streamParserSource, /split\('\\n\\n'\)/, 'stream parser should split normalized SSE events on blank lines for partial rendering')
-assert.match(dashboardHookSource, /finish_reason:\s*'error',[\s\S]*streaming:\s*false/, 'failed generations should clear streaming state instead of leaving active pellets/status forever')
+assert.match(dashboardHookSource, /finish_reason:\s*requestWasAborted\s*\?\s*'interrupted'\s*:\s*'error',[\s\S]*streaming:\s*false/, 'failed or interrupted generations should clear streaming state instead of leaving active pellets/status forever')
 assert.match(apiViewSource, /Selected exact-row evidence/, 'API support view should show selected exact-row evidence instead of a broad validated-target claim')
 assert.match(apiViewSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API endpoint readiness should use the shared exact-row chat gate')
 assert.match(apiViewSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API endpoint readiness should stay aligned with Chat/System exact-row chat unlocks')

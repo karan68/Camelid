@@ -496,7 +496,9 @@ export default function ChatWorkspace({
   setComposer,
   saveToMemory,
   sendMessage,
+  stopGeneration,
   sending,
+  stoppingGeneration = false,
   selectedModelRunnable,
   setTab,
   demoMode = false,
@@ -577,6 +579,11 @@ export default function ChatWorkspace({
   }, [composer, isFreshThread, selectedConversation?.id])
 
   const handleComposerKeyDown = async (event) => {
+    if (event.key === 'Escape' && generationActive) {
+      event.preventDefault()
+      stopGeneration?.()
+      return
+    }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault()
       if (canSubmit) {
@@ -767,6 +774,7 @@ export default function ChatWorkspace({
           ? 'Load a model first'
           : 'Choose a ready model first'
   const composerSendLabel = generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'
+  const composerStopLabel = stoppingGeneration ? 'Stopping…' : 'Stop'
   const secondaryActionLabel = selectedModelRunnable ? 'Save to memory' : readinessActionLabel
   const secondaryAction = selectedModelRunnable ? saveToMemory : () => setTab(readinessActionTab)
   const secondaryActionDisabled = selectedModelRunnable ? generationActive : false
@@ -974,6 +982,16 @@ export default function ChatWorkspace({
                     <button className="ghost-button ghost-button-quiet" onClick={secondaryAction} disabled={secondaryActionDisabled}>{secondaryActionLabel}</button>
                   </div>
                   <div className="composer-assistant-actions composer-assistant-actions-stage">
+                    {generationActive && (
+                      <button
+                        className="ghost-button composer-stop-button"
+                        aria-label="Stop Camelid generation"
+                        onClick={stopGeneration}
+                        disabled={stoppingGeneration}
+                      >
+                        {composerStopLabel}
+                      </button>
+                    )}
                     <button className="primary-button composer-send-button" aria-label="Send message to Camelid" onClick={sendMessage} disabled={!canSubmit}>{composerSendLabel}</button>
                   </div>
                 </div>
@@ -1087,6 +1105,16 @@ export default function ChatWorkspace({
               {!demoMode && <button className="ghost-button subtle-action" onClick={secondaryAction} disabled={secondaryActionDisabled}>{secondaryActionLabel}</button>}
             </div>
             <div className="composer-assistant-actions">
+              {generationActive && (
+                <button
+                  className="ghost-button composer-stop-button"
+                  aria-label="Stop Camelid generation"
+                  onClick={stopGeneration}
+                  disabled={stoppingGeneration}
+                >
+                  {composerStopLabel}
+                </button>
+              )}
               <button className="primary-button composer-send-button" aria-label="Send message to Camelid" onClick={sendMessage} disabled={!canSubmit}>{composerSendLabel}</button>
             </div>
           </div>

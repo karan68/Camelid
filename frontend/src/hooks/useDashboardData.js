@@ -388,6 +388,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const [composer, setComposer] = useState('')
   const [newChatTitle, setNewChatTitle] = useState('')
   const [sending, setSending] = useState(false)
+  const [stoppingGeneration, setStoppingGeneration] = useState(false)
   const [loadingModelId, setLoadingModelId] = useState('')
   const [pendingChat, setPendingChat] = useState(null)
   const [registerForm, setRegisterForm] = useState({ id: '', name: '', model_path: '', runtime_model_name: '' })
@@ -400,6 +401,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
   const localConversationsRef = useRef(localConversations)
   const localMemoriesRef = useRef(localMemories)
   const selectedConversationIdRef = useRef(selectedConversationId)
+  const activeChatRequestRef = useRef(null)
 
   useEffect(() => {
     localModelsRef.current = localModels
@@ -639,6 +641,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
       : selectedConversation
   )
 
+  const stopGeneration = () => {
+    if (!activeChatRequestRef.current || stoppingGeneration) return false
+    setStoppingGeneration(true)
+    activeChatRequestRef.current.abort()
+    return true
+  }
+
   const sendMessage = async () => {
     if (!composer.trim()) return
     if (!selectedModelRunnable) {
@@ -709,9 +718,12 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setPendingChat(null)
 
       const requestModelId = getRuntimeRequestModelId(selectedModel, runtime, selectedModelId)
+      const requestController = new AbortController()
+      activeChatRequestRef.current = requestController
       const response = await fetch(`${normalizedApiBase}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: requestController.signal,
         body: JSON.stringify({ model: requestModelId, messages: requestMessages, temperature: 0, max_tokens: localChatMaxTokens(history), stream: true }),
       })
       const applyAssistantStreamPatch = (patch) => {
@@ -806,13 +818,13 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
       setSelectedConversationId(conversation.id)
     } catch (error) {
+      const requestWasAborted = error?.name === 'AbortError'
       const pendingPatchAtFailure = pendingAssistantPatch
       if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(pendingAssistantFrame)
         pendingAssistantFrame = null
       }
       pendingAssistantPatch = null
-      const errorMessage = getGuardrailErrorMessage(error, 'Local inference failed.')
       if (activeConversationId && assistantId) {
         persistConversations((current) => current.map((item) => (
           item.id === activeConversationId
@@ -825,7 +837,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
                         return {
                           ...patchedMessage,
                           content: patchedMessage.content && patchedMessage.content !== '…' ? patchedMessage.content : '(generation stopped)',
-                          finish_reason: 'error',
+                          finish_reason: requestWasAborted ? 'interrupted' : 'error',
                           streaming: false,
                           streaming_phase: null,
                         }
@@ -838,8 +850,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
         )))
       }
       setPendingChat(null)
-      showNotice(errorMessage, 'error')
+      if (requestWasAborted) {
+        showNotice('Generation stopped.', 'info')
+      } else {
+        const errorMessage = getGuardrailErrorMessage(error, 'Local inference failed.')
+        showNotice(errorMessage, 'error')
+      }
     } finally {
+      activeChatRequestRef.current = null
+      setStoppingGeneration(false)
       setSending(false)
       await loadDashboard({ silent: true })
     }
@@ -1117,6 +1136,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     createConversation,
     showNewChatLanding,
     sendMessage,
+    stopGeneration,
     saveToMemory,
     createMemory,
     updateMemory,
@@ -1131,6 +1151,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     registerModel,
     connectExternalModel,
     loadDashboard,
+    stoppingGeneration,
     apiBase,
     setApiBase: (value) => {
       const next = normalizeApiBase(value)

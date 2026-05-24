@@ -227,6 +227,7 @@ try {
 
   assert.equal((activeSendStreamingMarkup.match(/data-streaming-state="active"/g) || []).length, 1, 'active sends with visible streamed content should keep exactly one active assistant row')
   assert.match(activeSendStreamingMarkup, /message-live-generation-badge/, 'active sends with visible streamed content should keep the live generation badge until completion')
+  assert.match(activeSendStreamingMarkup, /Stop</, 'active sends should expose a stop action in the composer while Camelid is still generating')
   assert.doesNotMatch(activeSendStreamingMarkup, /Preparing local response/, 'visible streamed content should replace the pre-token pending loader during an active send')
 
   const preTokenMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {

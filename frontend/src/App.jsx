@@ -75,6 +75,7 @@ function App() {
     createConversation,
     showNewChatLanding,
     sendMessage,
+    stopGeneration,
     saveToMemory,
     createMemory,
     updateMemory,
@@ -89,6 +90,7 @@ function App() {
     registerModel,
     connectExternalModel,
     loadDashboard,
+    stoppingGeneration,
   } = useDashboardData({ showNotice, clearNotice })
 
   useEffect(() => {
@@ -271,7 +273,9 @@ function App() {
             setComposer={setComposer}
             saveToMemory={saveToMemory}
             sendMessage={sendMessage}
+            stopGeneration={stopGeneration}
             sending={sending}
+            stoppingGeneration={stoppingGeneration}
             selectedModelRunnable={selectedModelRunnable}
             setTab={setTab}
             demoMode={DEMO_UI}
