@@ -831,6 +831,11 @@ export default function ChatWorkspace({
     { label: 'Prompts', value: formatCountLabel(userMessageCount, 'prompt') },
     { label: 'Replies', value: formatCountLabel(assistantMessageCount, 'reply') },
   ]
+  const readinessCardItems = [
+    { label: 'Runtime', value: runtimeStatusLabel, copy: runtimeStatusCopy, tone: runtimeTone },
+    { label: 'Support', value: supportStatusLabel, copy: supportStatusCopy, tone: supportTone },
+    { label: 'Selected model', value: selectedModelName, copy: selectionSummaryCopy, tone: selectionSummaryTone },
+  ]
 
   const renderReadinessPills = (extraClass = '', ariaLabel = 'Chat readiness and support boundary') => (
     <div className={`chat-readiness-pill-row chat-readiness-strip-live ${extraClass} is-${readinessState}`} aria-label={ariaLabel} aria-live="polite">
@@ -935,6 +940,15 @@ export default function ChatWorkspace({
               <div className={`chat-empty-stage chat-empty-stage-clean chat-empty-stage-product is-${readinessState}`}>
                 <div className="chat-stage-grid">
                   <div className="chat-stage-main">
+                    <div className="chat-empty-readiness chat-empty-readiness-ledger" aria-label="Chat readiness summary">
+                      {readinessCardItems.map((item) => (
+                        <div key={item.label} className={`chat-empty-readiness-card is-${item.tone}`}>
+                          <span>{item.label}</span>
+                          <strong>{item.value}</strong>
+                          <small>{item.copy}</small>
+                        </div>
+                      ))}
+                    </div>
                     <div className="chat-empty-hero chat-empty-hero-assistant chat-empty-hero-clean">
                       <p className="chat-empty-greeting">{emptyHeroEyebrow}</p>
                       <h2>{productHeroTitle}</h2>

@@ -1572,7 +1572,7 @@
 .syntax-token.comment { color: #7f8790; }
 .syntax-token.string { color: #8fd694; }
 .syntax-token.number { color: #f0a34a; }
-.syntax-token.keyword { color: #b989ff; }
+.syntax-token.keyword { color: #7fc7ff; }
 .syntax-token.tag { color: #ff8f8f; }
 .syntax-token.attr { color: #8ab4f8; }
 
@@ -1656,7 +1656,7 @@
   border-radius: 56px;
   background:
     radial-gradient(circle at 24% 4%, color-mix(in srgb, var(--color-info) 22%, transparent), transparent 30%),
-    radial-gradient(circle at 72% 10%, color-mix(in srgb, #c58af9 16%, transparent), transparent 28%),
+    radial-gradient(circle at 72% 10%, color-mix(in srgb, #f3c78c 18%, transparent), transparent 28%),
     radial-gradient(circle at 50% 100%, color-mix(in srgb, var(--color-ready) 11%, transparent), transparent 38%),
     linear-gradient(180deg, color-mix(in srgb, var(--color-bg-elevated) 38%, transparent), transparent 70%);
   filter: blur(1px);
@@ -1745,6 +1745,11 @@
   color: var(--color-text-muted);
   font-size: 0.76rem;
   line-height: 1.45;
+}
+
+.chat-empty-readiness-card.is-idle::before {
+  background: color-mix(in srgb, var(--color-text-muted) 46%, transparent);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-text-muted) 10%, transparent);
 }
 
 .chat-empty-hero {
