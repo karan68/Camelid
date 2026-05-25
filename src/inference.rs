@@ -97,6 +97,36 @@ unsafe extern "C" {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    pub fn vDSP_dotpr(
+        __A: *const f32,
+        __IA: i64,
+        __B: *const f32,
+        __IB: i64,
+        __C: *mut f32,
+        __N: u64,
+    );
+
+    pub fn cblas_sgemm(
+        layout: i32,
+        transa: i32,
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct InferenceWorkspace {
     pub scratch_f32: Vec<f32>,
@@ -1252,6 +1282,7 @@ impl LlamaInferenceSession {
 
         let chunk_base_position = self.kv_cache.position;
         let total_started = Instant::now();
+        metal::start_inference_session();
         let mut memory = structured_forward_memory_enabled().then(|| {
             LlamaForwardMemoryTimings::new(
                 capture_memory_sample(&self.kv_cache),
@@ -1313,6 +1344,7 @@ impl LlamaInferenceSession {
         }
         trace_forward_memory("prefill_chunk_end");
         timings.memory = memory;
+        metal::end_inference_session();
         Ok(timings)
     }
 
@@ -1506,6 +1538,9 @@ impl LlamaInferenceSession {
 
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let total_started = Instant::now();
+        if !collect_diagnostics {
+            metal::start_inference_session();
+        }
         let mut memory = structured_forward_memory_enabled().then(|| {
             LlamaForwardMemoryTimings::new(
                 capture_memory_sample(&self.kv_cache),
@@ -1630,6 +1665,9 @@ impl LlamaInferenceSession {
                 )
             };
         self.kv_cache.position += 1;
+        if !collect_diagnostics {
+            metal::end_inference_session();
+        }
         timings.total = total_started.elapsed().as_micros();
         if let Some(memory) = &mut memory {
             memory.record_end(capture_memory_sample(&self.kv_cache));
@@ -3017,6 +3055,7 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_k_done");
 
     let started = Instant::now();
+    metal::synchronize_active_session();
     let q_before_rope = q;
     let k_before_rope = k;
     let q = apply_rope(
@@ -3145,6 +3184,7 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_output_done");
 
     let started = Instant::now();
+    metal::synchronize_active_session();
     let residual = hidden.add(&attn_out, format!("layer_{layer_idx}_attention_residual"))?;
     let attention_residual_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&residual))
@@ -3317,6 +3357,7 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "ffn_down_done");
 
     let started = Instant::now();
+    metal::synchronize_active_session();
     let output = if ffn_out_already_residual {
         ffn_out.clone()
     } else {
@@ -4908,6 +4949,31 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
             &runtime_plan.q8,
         );
     }
+    #[cfg(target_os = "macos")]
+    {
+        if weight.source_type.is_none() && weight.q8_0_blocks.is_none() && weight.q8_0_file_backing.is_none() {
+            let mut output = vec![0.0; rows * output_width];
+            unsafe {
+                cblas_sgemm(
+                    101, // CblasRowMajor
+                    111, // CblasNoTrans
+                    112, // CblasTrans
+                    rows as i32,
+                    output_width as i32,
+                    input_width as i32,
+                    1.0,
+                    input.data.as_ptr(),
+                    input_width as i32,
+                    weight.data.as_ptr(),
+                    input_width as i32,
+                    0.0,
+                    output.as_mut_ptr(),
+                    output_width as i32,
+                );
+            }
+            return CpuTensor::from_f32(name, vec![rows, output_width], output);
+        }
+    }
     let mut output = vec![0.0; rows * output_width];
     for row in 0..rows {
         let input_start = row * input_width;
@@ -5784,6 +5850,7 @@ fn gated_ffn_activation_with_plan(
         .map(|tensor| linear_projection_diagnostics(input, up_weight, tensor, "ffn up"))
         .transpose()?;
 
+    metal::synchronize_active_session();
     let order = diagnostic_ffn_gate_up_order()?;
     let started = Instant::now();
     for (gate_value, up_value) in gate.iter_mut().zip(up) {
@@ -14272,20 +14339,38 @@ fn dot_product_row_f64(lhs: &[f32], rhs: &[f32]) -> f32 {
 
 fn dot_product_row(lhs: &[f32], rhs: &[f32]) -> f32 {
     debug_assert_eq!(lhs.len(), rhs.len());
-    let mut sum = 0.0;
-    let mut idx = 0;
-    while idx + 4 <= lhs.len() {
-        sum += lhs[idx] * rhs[idx];
-        sum += lhs[idx + 1] * rhs[idx + 1];
-        sum += lhs[idx + 2] * rhs[idx + 2];
-        sum += lhs[idx + 3] * rhs[idx + 3];
-        idx += 4;
+    #[cfg(target_os = "macos")]
+    {
+        let mut sum = 0.0;
+        unsafe {
+            vDSP_dotpr(
+                lhs.as_ptr(),
+                1,
+                rhs.as_ptr(),
+                1,
+                &mut sum,
+                lhs.len() as u64,
+            );
+        }
+        sum
     }
-    while idx < lhs.len() {
-        sum += lhs[idx] * rhs[idx];
-        idx += 1;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut sum = 0.0;
+        let mut idx = 0;
+        while idx + 4 <= lhs.len() {
+            sum += lhs[idx] * rhs[idx];
+            sum += lhs[idx + 1] * rhs[idx + 1];
+            sum += lhs[idx + 2] * rhs[idx + 2];
+            sum += lhs[idx + 3] * rhs[idx + 3];
+            idx += 4;
+        }
+        while idx < lhs.len() {
+            sum += lhs[idx] * rhs[idx];
+            idx += 1;
+        }
+        sum
     }
-    sum
 }
 
 fn rope_diagnostics(

@@ -31,138 +31,97 @@ struct MetalLinearKernel {
     q8_0_encoded_pipeline: ComputePipelineState,
     q8_0_encoded_rows_pipeline: ComputePipelineState,
     q8_0_block_pipeline: ComputePipelineState,
+    active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
+}
+
+#[cfg(target_os = "macos")]
+struct DeferredRead {
+    buffer: Buffer,
+    dest_ptr: usize,
+    dest_len: usize,
 }
 
 #[cfg(target_os = "macos")]
 struct MetalLinearCache {
-    input_buffer: Option<Buffer>,
-    input_capacity_bytes: usize,
-    output_buffer: Option<Buffer>,
-    output_capacity_bytes: usize,
-    aux_output_buffer: Option<Buffer>,
-    aux_output_capacity_bytes: usize,
-    scalar_buffer: Option<Buffer>,
-    scalar_capacity_bytes: usize,
-    q8_input_scales_buffer: Option<Buffer>,
-    q8_input_scales_capacity_bytes: usize,
-    q8_input_quants_buffer: Option<Buffer>,
-    q8_input_quants_capacity_bytes: usize,
-    q8_encoded_rows_buffer: Option<Buffer>,
-    q8_encoded_rows_capacity_bytes: usize,
-    q8_weight_scales_buffer: Option<Buffer>,
-    q8_weight_scales_capacity_bytes: usize,
+    // Permanent caches
     weight_buffers: HashMap<(usize, usize), Buffer>,
     q8_block_weight_buffers: HashMap<(usize, usize), Buffer>,
+
+    // Transient caches (activation buffers, scalars, deferred reads)
+    activation_buffers: HashMap<(usize, usize), Buffer>,
+    scalar_buffers: Vec<Buffer>,
+    scalar_index: usize,
+    deferred_reads: Vec<DeferredRead>,
 }
 
 #[cfg(target_os = "macos")]
 impl MetalLinearCache {
     fn new() -> Self {
         Self {
-            input_buffer: None,
-            input_capacity_bytes: 0,
-            output_buffer: None,
-            output_capacity_bytes: 0,
-            aux_output_buffer: None,
-            aux_output_capacity_bytes: 0,
-            scalar_buffer: None,
-            scalar_capacity_bytes: 0,
-            q8_input_scales_buffer: None,
-            q8_input_scales_capacity_bytes: 0,
-            q8_input_quants_buffer: None,
-            q8_input_quants_capacity_bytes: 0,
-            q8_encoded_rows_buffer: None,
-            q8_encoded_rows_capacity_bytes: 0,
-            q8_weight_scales_buffer: None,
-            q8_weight_scales_capacity_bytes: 0,
             weight_buffers: HashMap::new(),
             q8_block_weight_buffers: HashMap::new(),
+            activation_buffers: HashMap::new(),
+            scalar_buffers: Vec::new(),
+            scalar_index: 0,
+            deferred_reads: Vec::new(),
         }
     }
 
-    fn shared_buffer(
-        device: &Device,
-        slot: &mut Option<Buffer>,
-        capacity: &mut usize,
-        needed: usize,
-    ) -> Buffer {
-        if slot.is_none() || *capacity < needed {
-            *slot = Some(device.new_buffer(needed as u64, MTLResourceOptions::StorageModeShared));
-            *capacity = needed;
+    fn get_activation_buffer(&mut self, device: &Device, needed: usize, ptr: *const u8) -> Buffer {
+        let key = (ptr as usize, needed);
+        if let Some(buffer) = self.activation_buffers.get(&key) {
+            return buffer.to_owned();
         }
-        slot.as_ref().expect("buffer just initialized").to_owned()
+        let buffer = device.new_buffer(needed as u64, MTLResourceOptions::StorageModeShared);
+        self.activation_buffers.insert(key, buffer.to_owned());
+        buffer
     }
 
-    fn input_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.input_buffer,
-            &mut self.input_capacity_bytes,
-            needed,
-        )
+    fn get_scalar_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
+        if self.scalar_buffers.len() <= self.scalar_index {
+            let buffer = device.new_buffer(needed as u64, MTLResourceOptions::StorageModeShared);
+            self.scalar_buffers.push(buffer);
+        } else {
+            let buffer = &self.scalar_buffers[self.scalar_index];
+            if buffer.length() < needed as u64 {
+                self.scalar_buffers[self.scalar_index] = device.new_buffer(needed as u64, MTLResourceOptions::StorageModeShared);
+            }
+        }
+        let buf = self.scalar_buffers[self.scalar_index].to_owned();
+        self.scalar_index += 1;
+        buf
     }
 
-    fn output_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.output_buffer,
-            &mut self.output_capacity_bytes,
-            needed,
-        )
+    fn input_buffer(&mut self, device: &Device, needed: usize, ptr: *const f32) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
     }
 
-    fn aux_output_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.aux_output_buffer,
-            &mut self.aux_output_capacity_bytes,
-            needed,
-        )
+    fn output_buffer(&mut self, device: &Device, needed: usize, ptr: *mut f32) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
+    }
+
+    fn aux_output_buffer(&mut self, device: &Device, needed: usize, ptr: *mut f32) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
     }
 
     fn scalar_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.scalar_buffer,
-            &mut self.scalar_capacity_bytes,
-            needed,
-        )
+        self.get_scalar_buffer(device, needed)
     }
 
-    fn q8_input_scales_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.q8_input_scales_buffer,
-            &mut self.q8_input_scales_capacity_bytes,
-            needed,
-        )
+    fn q8_input_scales_buffer(&mut self, device: &Device, needed: usize, ptr: *const f32) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
     }
 
-    fn q8_input_quants_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.q8_input_quants_buffer,
-            &mut self.q8_input_quants_capacity_bytes,
-            needed,
-        )
+    fn q8_input_quants_buffer(&mut self, device: &Device, needed: usize, ptr: *const i8) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
     }
 
-    fn q8_encoded_rows_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.q8_encoded_rows_buffer,
-            &mut self.q8_encoded_rows_capacity_bytes,
-            needed,
-        )
+    fn q8_encoded_rows_buffer(&mut self, device: &Device, needed: usize, ptr: *const u8) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
     }
 
-    fn q8_weight_scales_buffer(&mut self, device: &Device, needed: usize) -> Buffer {
-        Self::shared_buffer(
-            device,
-            &mut self.q8_weight_scales_buffer,
-            &mut self.q8_weight_scales_capacity_bytes,
-            needed,
-        )
+    fn q8_weight_scales_buffer(&mut self, device: &Device, needed: usize, ptr: *const f32) -> Buffer {
+        self.get_activation_buffer(device, needed, ptr.cast())
     }
 
     fn weight_buffer(&mut self, device: &Device, weights: &[f32]) -> Buffer {
@@ -372,6 +331,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_encoded_pipeline,
                 q8_0_encoded_rows_pipeline,
                 q8_0_block_pipeline,
+                active_command_buffer: Mutex::new(None),
             })
         })
         .as_ref()
@@ -380,6 +340,63 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
 #[cfg(target_os = "macos")]
 fn metal_linear_cache() -> &'static Mutex<MetalLinearCache> {
     METAL_LINEAR_CACHE.get_or_init(|| Mutex::new(MetalLinearCache::new()))
+}
+
+#[cfg(target_os = "macos")]
+static SESSION_ACTIVE: Mutex<bool> = Mutex::new(false);
+
+#[cfg(target_os = "macos")]
+pub fn start_inference_session() {
+    let mut active = SESSION_ACTIVE.lock().unwrap();
+    *active = true;
+}
+
+#[cfg(target_os = "macos")]
+pub fn end_inference_session() {
+    synchronize_active_session();
+    let mut active = SESSION_ACTIVE.lock().unwrap();
+    *active = false;
+}
+
+#[cfg(target_os = "macos")]
+pub fn synchronize_active_session() {
+    let Some(kernel) = metal_linear_kernel() else {
+        return;
+    };
+    let cb_opt = {
+        let mut active_cb = kernel.active_command_buffer.lock().unwrap();
+        active_cb.take()
+    };
+    if let Some(cb) = cb_opt {
+        cb.commit();
+        cb.wait_until_completed();
+    }
+    
+    let mut cache = metal_linear_cache()
+        .lock()
+        .expect("metal linear cache poisoned");
+    let deferred = std::mem::take(&mut cache.deferred_reads);
+    for read in deferred {
+        unsafe {
+            let dest_slice = std::slice::from_raw_parts_mut(read.dest_ptr as *mut f32, read.dest_len);
+            read_buffer_f32(&read.buffer, dest_slice);
+        }
+    }
+    cache.scalar_index = 0;
+}
+
+#[cfg(target_os = "macos")]
+fn get_active_or_new_command_buffer(kernel: &MetalLinearKernel) -> (metal::CommandBuffer, bool) {
+    let session_active = *SESSION_ACTIVE.lock().unwrap();
+    if session_active {
+        let mut active = kernel.active_command_buffer.lock().unwrap();
+        if active.is_none() {
+            *active = Some(kernel.queue.new_command_buffer().to_owned());
+        }
+        (active.as_ref().unwrap().to_owned(), true)
+    } else {
+        (kernel.queue.new_command_buffer().to_owned(), false)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -462,9 +479,9 @@ fn try_linear_row_impl(
     let mut cache = metal_linear_cache()
         .lock()
         .expect("metal linear cache poisoned");
-    let input_buffer = cache.input_buffer(&kernel.device, std::mem::size_of_val(input_row));
+    let input_buffer = cache.input_buffer(&kernel.device, std::mem::size_of_val(input_row), input_row.as_ptr());
     let weight_buffer = cache.weight_buffer(&kernel.device, weights);
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output));
+    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_buffer, input_row);
     write_buffer_f32(&output_buffer, output);
@@ -474,7 +491,7 @@ fn try_linear_row_impl(
         *scalars.add(1) = cols as u32;
     }
 
-    let command_buffer = kernel.queue.new_command_buffer();
+    let (command_buffer, is_session) = get_active_or_new_command_buffer(kernel);
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(if transposed {
         &kernel.transposed_pipeline
@@ -505,10 +522,20 @@ fn try_linear_row_impl(
     };
     encoder.dispatch_thread_groups(threadgroups, threads_per_group);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    drop(cache);
-    read_buffer_f32(&output_buffer, output);
+
+    if is_session {
+        cache.deferred_reads.push(DeferredRead {
+            buffer: output_buffer.clone(),
+            dest_ptr: output.as_mut_ptr() as usize,
+            dest_len: output.len(),
+        });
+        drop(cache);
+    } else {
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        drop(cache);
+        read_buffer_f32(&output_buffer, output);
+    }
     true
 }
 
@@ -544,14 +571,14 @@ pub fn try_q8_0_encoded_linear_row(
         .lock()
         .expect("metal linear cache poisoned");
     let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales));
+        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
     let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants));
+        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
     let encoded_rows_buffer =
-        cache.q8_encoded_rows_buffer(&kernel.device, std::mem::size_of_val(encoded_rows));
+        cache.q8_encoded_rows_buffer(&kernel.device, std::mem::size_of_val(encoded_rows), encoded_rows.as_ptr());
     let weight_scales_buffer =
-        cache.q8_weight_scales_buffer(&kernel.device, std::mem::size_of_val(weight_scales));
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output));
+        cache.q8_weight_scales_buffer(&kernel.device, std::mem::size_of_val(weight_scales), weight_scales.as_ptr());
+    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -563,7 +590,7 @@ pub fn try_q8_0_encoded_linear_row(
         *scalars.add(1) = rows as u32;
     }
 
-    let command_buffer = kernel.queue.new_command_buffer();
+    let (command_buffer, is_session) = get_active_or_new_command_buffer(kernel);
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&kernel.q8_0_encoded_pipeline);
     encoder.set_buffer(0, Some(&input_scales_buffer), 0);
@@ -587,10 +614,20 @@ pub fn try_q8_0_encoded_linear_row(
     };
     encoder.dispatch_thread_groups(threadgroups, threads_per_group);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    drop(cache);
-    read_buffer_f32(&output_buffer, output);
+
+    if is_session {
+        cache.deferred_reads.push(DeferredRead {
+            buffer: output_buffer.clone(),
+            dest_ptr: output.as_mut_ptr() as usize,
+            dest_len: output.len(),
+        });
+        drop(cache);
+    } else {
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        drop(cache);
+        read_buffer_f32(&output_buffer, output);
+    }
     true
 }
 
@@ -632,14 +669,14 @@ pub fn try_q8_0_encoded_linear_rows(
         .lock()
         .expect("metal linear cache poisoned");
     let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales));
+        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
     let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants));
+        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
     let encoded_rows_buffer =
-        cache.q8_encoded_rows_buffer(&kernel.device, std::mem::size_of_val(encoded_rows));
+        cache.q8_encoded_rows_buffer(&kernel.device, std::mem::size_of_val(encoded_rows), encoded_rows.as_ptr());
     let weight_scales_buffer =
-        cache.q8_weight_scales_buffer(&kernel.device, std::mem::size_of_val(weight_scales));
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output));
+        cache.q8_weight_scales_buffer(&kernel.device, std::mem::size_of_val(weight_scales), weight_scales.as_ptr());
+    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 3 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -652,7 +689,7 @@ pub fn try_q8_0_encoded_linear_rows(
         *scalars.add(2) = weight_rows as u32;
     }
 
-    let command_buffer = kernel.queue.new_command_buffer();
+    let (command_buffer, is_session) = get_active_or_new_command_buffer(kernel);
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&kernel.q8_0_encoded_rows_pipeline);
     encoder.set_buffer(0, Some(&input_scales_buffer), 0);
@@ -685,10 +722,20 @@ pub fn try_q8_0_encoded_linear_rows(
     };
     encoder.dispatch_thread_groups(threadgroups, threads_per_group);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    drop(cache);
-    read_buffer_f32(&output_buffer, output);
+
+    if is_session {
+        cache.deferred_reads.push(DeferredRead {
+            buffer: output_buffer.clone(),
+            dest_ptr: output.as_mut_ptr() as usize,
+            dest_len: output.len(),
+        });
+        drop(cache);
+    } else {
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        drop(cache);
+        read_buffer_f32(&output_buffer, output);
+    }
     true
 }
 
@@ -722,11 +769,11 @@ pub fn try_q8_0_block_linear_row(
         .lock()
         .expect("metal linear cache poisoned");
     let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales));
+        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
     let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants));
+        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
     let weight_blocks_buffer = cache.q8_block_weight_buffer(&kernel.device, weight_blocks);
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output));
+    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -736,7 +783,7 @@ pub fn try_q8_0_block_linear_row(
         *scalars.add(1) = rows as u32;
     }
 
-    let command_buffer = kernel.queue.new_command_buffer();
+    let (command_buffer, is_session) = get_active_or_new_command_buffer(kernel);
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&kernel.q8_0_block_pipeline);
     encoder.set_buffer(0, Some(&input_scales_buffer), 0);
@@ -759,10 +806,20 @@ pub fn try_q8_0_block_linear_row(
     };
     encoder.dispatch_thread_groups(threadgroups, threads_per_group);
     encoder.end_encoding();
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    drop(cache);
-    read_buffer_f32(&output_buffer, output);
+
+    if is_session {
+        cache.deferred_reads.push(DeferredRead {
+            buffer: output_buffer.clone(),
+            dest_ptr: output.as_mut_ptr() as usize,
+            dest_len: output.len(),
+        });
+        drop(cache);
+    } else {
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        drop(cache);
+        read_buffer_f32(&output_buffer, output);
+    }
     true
 }
 
@@ -800,11 +857,11 @@ where
         .lock()
         .expect("metal linear cache poisoned");
     let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales));
+        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
     let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants));
+        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
     let weight_blocks_buffer = cache.q8_block_weight_buffer(&kernel.device, weight_blocks);
-    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output));
+    let output_buffer = cache.output_buffer(&kernel.device, std::mem::size_of_val(output), output.as_mut_ptr());
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -814,7 +871,7 @@ where
         *scalars.add(1) = rows as u32;
     }
 
-    let command_buffer = kernel.queue.new_command_buffer();
+    let (command_buffer, is_session) = get_active_or_new_command_buffer(kernel);
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&kernel.q8_0_block_pipeline);
     encoder.set_buffer(0, Some(&input_scales_buffer), 0);
@@ -837,11 +894,22 @@ where
     };
     encoder.dispatch_thread_groups(threadgroups, threads_per_group);
     encoder.end_encoding();
-    command_buffer.commit();
-    cpu_work();
-    command_buffer.wait_until_completed();
-    drop(cache);
-    read_buffer_f32(&output_buffer, output);
+
+    if is_session {
+        cpu_work();
+        cache.deferred_reads.push(DeferredRead {
+            buffer: output_buffer.clone(),
+            dest_ptr: output.as_mut_ptr() as usize,
+            dest_len: output.len(),
+        });
+        drop(cache);
+    } else {
+        command_buffer.commit();
+        cpu_work();
+        command_buffer.wait_until_completed();
+        drop(cache);
+        read_buffer_f32(&output_buffer, output);
+    }
     true
 }
 
@@ -884,17 +952,17 @@ where
         .lock()
         .expect("metal linear cache poisoned");
     let input_scales_buffer =
-        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales));
+        cache.q8_input_scales_buffer(&kernel.device, std::mem::size_of_val(input_scales), input_scales.as_ptr());
     let input_quants_buffer =
-        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants));
+        cache.q8_input_quants_buffer(&kernel.device, std::mem::size_of_val(input_quants), input_quants.as_ptr());
     let first_weight_blocks_buffer =
         cache.q8_block_weight_buffer(&kernel.device, first_weight_blocks);
     let second_weight_blocks_buffer =
         cache.q8_block_weight_buffer(&kernel.device, second_weight_blocks);
     let first_output_buffer =
-        cache.output_buffer(&kernel.device, std::mem::size_of_val(first_output));
+        cache.output_buffer(&kernel.device, std::mem::size_of_val(first_output), first_output.as_mut_ptr());
     let second_output_buffer =
-        cache.aux_output_buffer(&kernel.device, std::mem::size_of_val(second_output));
+        cache.aux_output_buffer(&kernel.device, std::mem::size_of_val(second_output), second_output.as_mut_ptr());
     let scalar_buffer = cache.scalar_buffer(&kernel.device, 2 * std::mem::size_of::<u32>());
     write_buffer_f32(&input_scales_buffer, input_scales);
     write_buffer_i8(&input_quants_buffer, input_quants);
@@ -916,7 +984,7 @@ where
         depth: 1,
     };
 
-    let command_buffer = kernel.queue.new_command_buffer();
+    let (command_buffer, is_session) = get_active_or_new_command_buffer(kernel);
     let encoder = command_buffer.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&kernel.q8_0_block_pipeline);
     encoder.set_buffer(0, Some(&input_scales_buffer), 0);
@@ -933,14 +1001,39 @@ where
     encoder.dispatch_thread_groups(threadgroups, threads_per_group);
 
     encoder.end_encoding();
-    command_buffer.commit();
-    cpu_work();
-    command_buffer.wait_until_completed();
-    drop(cache);
-    read_buffer_f32(&first_output_buffer, first_output);
-    read_buffer_f32(&second_output_buffer, second_output);
+
+    if is_session {
+        cpu_work();
+        cache.deferred_reads.push(DeferredRead {
+            buffer: first_output_buffer.clone(),
+            dest_ptr: first_output.as_mut_ptr() as usize,
+            dest_len: first_output.len(),
+        });
+        cache.deferred_reads.push(DeferredRead {
+            buffer: second_output_buffer.clone(),
+            dest_ptr: second_output.as_mut_ptr() as usize,
+            dest_len: second_output.len(),
+        });
+        drop(cache);
+    } else {
+        command_buffer.commit();
+        cpu_work();
+        command_buffer.wait_until_completed();
+        drop(cache);
+        read_buffer_f32(&first_output_buffer, first_output);
+        read_buffer_f32(&second_output_buffer, second_output);
+    }
     true
 }
+
+#[cfg(not(target_os = "macos"))]
+pub fn start_inference_session() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn end_inference_session() {}
+
+#[cfg(not(target_os = "macos"))]
+pub fn synchronize_active_session() {}
 
 #[cfg(not(target_os = "macos"))]
 pub fn try_linear_row_f32(
