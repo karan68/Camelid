@@ -5784,7 +5784,32 @@ textarea.composer-input-assistant {
   overflow-wrap: anywhere;
 }
 
+.composer-assistant-hint {
+  margin: 6px 2px 0;
+  color: color-mix(in srgb, var(--color-text-muted) 90%, transparent);
+  font-size: 0.77rem;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.composer-assistant-hint.is-ready {
+  color: color-mix(in srgb, var(--color-ready) 76%, var(--color-text) 24%);
+}
+
+.composer-assistant-hint.is-blocked,
+.composer-assistant-hint.is-offline {
+  color: color-mix(in srgb, var(--color-warning) 78%, var(--color-text) 22%);
+}
+
+.composer-assistant-hint.is-waiting {
+  color: color-mix(in srgb, var(--color-info) 76%, var(--color-text) 24%);
+}
+
 .composer-assistant-readiness-detail-floating {
+  max-width: 62ch;
+}
+
+.composer-assistant-hint-floating {
   max-width: 62ch;
 }
 

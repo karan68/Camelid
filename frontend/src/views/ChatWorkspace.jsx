@@ -585,16 +585,6 @@ export default function ChatWorkspace({
     input.style.height = `${Math.min(input.scrollHeight, 220)}px`
   }, [composer, isFreshThread, selectedConversation?.id])
 
-  useEffect(() => {
-    if (generationActive || !composerDraftUnlocked) return
-    const input = composerRef.current
-    if (!input) return
-    const activeElement = document.activeElement
-    if (activeElement && activeElement !== document.body && activeElement !== input) return
-    const frame = window.requestAnimationFrame(() => input.focus())
-    return () => window.cancelAnimationFrame(frame)
-  }, [composerDraftUnlocked, generationActive, isFreshThread, selectedConversation?.id])
-
   const handleComposerKeyDown = async (event) => {
     if (event.key === 'Escape' && generationActive) {
       event.preventDefault()
@@ -720,12 +710,12 @@ export default function ChatWorkspace({
     : apiUnavailable
       ? 'API unavailable'
     : supportBlocked
-      ? 'Choose a supported model'
+      ? 'Choose a supported model.'
       : selectedModel
         ? 'Waiting on readiness'
         : 'Choose a model to begin'
   const productHeroTitle = selectedModelRunnable
-    ? 'What should Camelid help with?'
+    ? 'How can I help?'
     : apiUnavailable
       ? 'Camelid is offline right now.'
       : supportBlocked
@@ -785,7 +775,7 @@ export default function ChatWorkspace({
   const modelInventoryLabel = availableModelCount
     ? `${readyModelCount}/${availableModelCount} ready`
     : 'No models added'
-  const composerDraftUnlocked = Boolean(selectedModelRunnable || apiUnavailable || selectedModel)
+  const composerDraftUnlocked = Boolean(selectedModelRunnable || apiUnavailable)
   const composerPlaceholder = selectedModelRunnable
     ? 'Message Camelid…'
     : apiUnavailable
@@ -842,11 +832,22 @@ export default function ChatWorkspace({
         : selectedModel
           ? 'Draft now. Send unlocks after readiness passes.'
           : 'Choose a model to unlock drafting and send.'
+  const composerHintCopy = canSubmit ? promptHintCopy : sendDisabledReason || promptHintCopy
 
   const handleDemoPrompt = (prompt) => {
     if (!composerDraftUnlocked) return
     setComposer(prompt)
   }
+
+  useEffect(() => {
+    if (generationActive || !composerDraftUnlocked) return
+    const input = composerRef.current
+    if (!input) return
+    const activeElement = document.activeElement
+    if (activeElement && activeElement !== document.body && activeElement !== input) return
+    const frame = window.requestAnimationFrame(() => input.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [composerDraftUnlocked, generationActive, isFreshThread, selectedConversation?.id])
 
   const composerStatusItems = [
     { label: 'Model', value: selectedModelName },
@@ -1102,6 +1103,7 @@ export default function ChatWorkspace({
                       </div>
                       {renderComposerModelSummary('composer-model-summary-stage')}
                       <p id={composerReadinessId} className={`composer-assistant-readiness-note is-${readinessState}`}>{readinessFinePrint}</p>
+                      <p className={`composer-assistant-hint is-${canSubmit ? 'ready' : readinessState}`}>{composerHintCopy}</p>
                       {!selectedModelRunnable && <p className="composer-assistant-readiness-detail">{selectedModelGateSummary}</p>}
                     </div>
                   </div>
@@ -1244,6 +1246,7 @@ export default function ChatWorkspace({
           </div>
           {renderComposerModelSummary('composer-model-summary-floating')}
           <p id={composerReadinessId} className={`composer-assistant-readiness-note composer-assistant-readiness-note-floating is-${readinessState}`}>{readinessFinePrint}</p>
+          <p className={`composer-assistant-hint composer-assistant-hint-floating is-${canSubmit ? 'ready' : readinessState}`}>{composerHintCopy}</p>
           {!selectedModelRunnable && <p className="composer-assistant-readiness-detail composer-assistant-readiness-detail-floating">{selectedModelGateSummary}</p>}
         </div>
       )}
