@@ -775,14 +775,14 @@ export default function ChatWorkspace({
   const modelInventoryLabel = availableModelCount
     ? `${readyModelCount}/${availableModelCount} ready`
     : 'No models added'
-  const composerDraftUnlocked = Boolean(selectedModelRunnable || apiUnavailable)
+  const composerDraftUnlocked = Boolean(selectedModel || apiUnavailable)
   const composerPlaceholder = selectedModelRunnable
     ? 'Message Camelid…'
     : apiUnavailable
       ? 'Draft a prompt while the Camelid API comes back'
       : composerDraftUnlocked
-        ? 'Draft a prompt while Camelid finishes getting ready'
-        : isFreshThread
+      ? 'Draft a prompt while Camelid finishes getting ready'
+      : isFreshThread
           ? 'Load a model first'
           : 'Choose a ready model first'
   const composerSendLabel = generationActive ? `Generating ${generationElapsedSeconds}s…` : 'Send'
@@ -812,7 +812,7 @@ export default function ChatWorkspace({
     : supportBlocked
       ? 'This selected row is loaded, but send stays locked until the exact supported row matches.'
     : selectedModel
-      ? 'Draft now. Camelid will unlock send as soon as this selected row is loaded, generation-ready, and supported.'
+      ? 'Drafting stays unlocked. Camelid will unlock send as soon as this selected row is loaded, generation-ready, and supported.'
       : 'Pick a local model first, then Camelid will keep the runtime and support boundary visible here.'
   const sendDisabledReason = selectedModelRunnable
     ? ''
@@ -830,7 +830,7 @@ export default function ChatWorkspace({
       : apiUnavailable
         ? 'Drafts stay local until the API reconnects.'
         : selectedModel
-          ? 'Draft now. Send unlocks after readiness passes.'
+          ? 'Drafting is unlocked. Send unlocks after readiness passes.'
           : 'Choose a model to unlock drafting and send.'
   const composerHintCopy = canSubmit ? promptHintCopy : sendDisabledReason || promptHintCopy
 

@@ -160,6 +160,7 @@ try {
   assert.match(blockedWrongArtifactMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B live chat must name the exact artifact blocker')
   assert.match(blockedWrongArtifactMarkup, /requires the exact Llama-3\.2-3B-Instruct-Q8_0\.gguf artifact/, '3B artifact blocker must name the canonical GGUF filename')
   assert.match(blockedWrongArtifactMarkup, /disabled="">Send</, '3B composer send must stay disabled for a runtime-ready neighboring artifact')
+  assert.doesNotMatch(blockedWrongArtifactMarkup, /Message Camelid"[^>]*disabled/, '3B draft composer should stay editable while exact-row support is still gated')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Local chat ready/, '3B spoofed artifact must not render the supported live-chat state')
   assert.doesNotMatch(blockedWrongArtifactMarkup, /Demo starters/, '3B spoofed artifact must not expose runnable demo prompts')
 
@@ -686,8 +687,9 @@ try {
   }))
 
   assert.match(staleLoadedNowChatMarkup, /No generation-ready model/, '3B chat readiness should use the shared chat gate and stay runtime-blocked when backend loaded_now=false')
-  assert.match(staleLoadedNowChatMarkup, /Load a model first/, '3B stale loaded_now=false rows must keep the composer disabled')
-  assert.doesNotMatch(staleLoadedNowChatMarkup, /Runtime ready, support gated|Local chat ready|Message Camelid…|Demo starters/, '3B stale browser readiness must not leak into live chat UX when /v1/health says loaded_now=false')
+  assert.match(staleLoadedNowChatMarkup, /Draft a prompt while Camelid finishes getting ready/, '3B stale loaded_now=false rows should keep drafting available while runtime readiness is still blocked')
+  assert.match(staleLoadedNowChatMarkup, /disabled="">Send</, '3B stale loaded_now=false rows must keep send locked until runtime readiness returns')
+  assert.doesNotMatch(staleLoadedNowChatMarkup, /Runtime ready, support gated|Local chat ready|Message Camelid…|Demo starters/, '3B stale browser readiness must not leak into live chat UX when /v1\\/health says loaded_now=false')
 
   const neighboringQuantPathModel = {
     ...selectedModel,
@@ -760,8 +762,9 @@ try {
   assert.match(backendReadyButUnsupported3BChatMarkup, /Runtime ready, support gated/, 'support-gated 3B UX should still expose that loaded_now and generation_ready are green')
   assert.match(backendReadyButUnsupported3BChatMarkup, /llama32_3b_instruct_q8_0: groundwork backend evidence only/, 'support-gated 3B UX should name the exact unpromoted capabilities row rather than hiding behind generic load-first copy')
   assert.match(backendReadyButUnsupported3BChatMarkup, /Chat unlocks only after loaded_now=true, generation_ready=true, and an exact supported compatibility row all match\./, 'support-gated 3B UX should preserve the exact-row frontend readiness rule')
-  assert.match(backendReadyButUnsupported3BChatMarkup, /Load a model first/, 'support-gated 3B composer should stay disabled instead of accepting prompts')
-  assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Local chat ready|Message Camelid…|Demo starters/, 'support-gated 3B rows must not render the live-chat ready UX')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /Draft a prompt while Camelid finishes getting ready/, 'support-gated 3B composer should stay editable while send remains locked behind the exact-row contract')
+  assert.match(backendReadyButUnsupported3BChatMarkup, /disabled="">Send</, 'support-gated 3B rows must keep send disabled until the exact-row contract is promoted')
+  assert.doesNotMatch(backendReadyButUnsupported3BChatMarkup, /Local chat ready|Message Camelid…/, 'support-gated 3B rows must not render the live-chat ready UX')
 
   const backendReadyButUnsupported3BSystemMarkup = renderToStaticMarkup(React.createElement(SystemView, {
     runtime: liveBackendIdRuntime,
