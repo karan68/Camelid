@@ -83,6 +83,7 @@ function AppSidebar({
   const [openMenuId, setOpenMenuId] = useState(null)
   const [editingConversationId, setEditingConversationId] = useState(null)
   const [editingTitle, setEditingTitle] = useState('')
+  const utilityTabs = useMemo(() => tabs.filter((item) => !primaryTabs.some((primary) => primary.id === item.id)), [])
 
   const titleCounts = useMemo(() => {
     const counts = new Map()
@@ -270,14 +271,24 @@ function AppSidebar({
                 </nav>
               </div>
 
-              <div className="sidebar-flat-section sidebar-flat-section-assistant">
-                <div className="sidebar-flat-label">Library tools</div>
-                <div className="sidebar-quick-link-row" aria-label="Secondary workspace tools">
-                  <button type="button" className={`sidebar-mini-link ${tab === 'history' ? 'active' : ''}`} onClick={() => setTab('history')}>History</button>
-                  <button type="button" className={`sidebar-mini-link ${tab === 'memory' ? 'active' : ''}`} onClick={() => setTab('memory')}>Memory</button>
-                  <button type="button" className={`sidebar-mini-link ${tab === 'system' ? 'active' : ''}`} onClick={() => setTab('system')}>System</button>
+              <details className="sidebar-tools-disclosure" open={tab !== 'chat' && tab !== 'library' && tab !== 'api'}>
+                <summary className="sidebar-tools-summary">
+                  <span className="sidebar-flat-label sidebar-flat-label-inline">More tools</span>
+                  <small>{utilityTabs.map((item) => item.label).join(' · ')}</small>
+                </summary>
+                <div className="sidebar-quick-link-row sidebar-quick-link-row-tools" aria-label="Secondary workspace tools">
+                  {utilityTabs.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={`sidebar-mini-link ${tab === item.id ? 'active' : ''}`}
+                      onClick={() => setTab(item.id)}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
                 </div>
-              </div>
+              </details>
             </div>
 
             <div className="sidebar-bottom sidebar-bottom-flat sidebar-bottom-assistant">

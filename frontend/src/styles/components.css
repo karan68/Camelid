@@ -7702,6 +7702,45 @@ textarea.composer-input-assistant {
   background: color-mix(in srgb, var(--color-selected-row) 90%, transparent);
 }
 
+.sidebar-tools-disclosure {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-radius: 20px;
+  border: 1px solid color-mix(in srgb, var(--color-border-soft) 72%, transparent);
+  background: color-mix(in srgb, var(--color-sidebar-section) 54%, transparent);
+  backdrop-filter: blur(18px);
+}
+
+.sidebar-tools-disclosure[open] {
+  background: color-mix(in srgb, var(--color-sidebar-section) 72%, transparent);
+}
+
+.sidebar-tools-summary {
+  display: grid;
+  gap: 4px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.sidebar-tools-summary::-webkit-details-marker {
+  display: none;
+}
+
+.sidebar-flat-label-inline {
+  padding: 0;
+}
+
+.sidebar-tools-summary small {
+  color: var(--color-text-muted);
+  font-size: 0.74rem;
+  line-height: 1.4;
+}
+
+.sidebar-quick-link-row-tools {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .chat-layout-modern {
   position: relative;
   z-index: 1;
