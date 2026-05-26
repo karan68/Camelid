@@ -62,9 +62,11 @@ static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environ
 
 #[derive(Clone)]
 pub struct AppState {
-    loaded_model: Arc<RwLock<Option<LoadedModel>>>,
-    execution_plan: Arc<RwLock<Option<ExecutionPlan>>>,
-    cached_weights: Arc<RwLock<Option<CachedLlamaWeights>>>,
+    loaded_models: Arc<RwLock<HashMap<String, LoadedModel>>>,
+    execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
+    cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
+    active_model_id: Arc<RwLock<Option<String>>>,
+    model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     planner_env: PlannerEnv,
@@ -74,9 +76,11 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
-            loaded_model: Arc::new(RwLock::new(None)),
-            execution_plan: Arc::new(RwLock::new(None)),
-            cached_weights: Arc::new(RwLock::new(None)),
+            loaded_models: Arc::new(RwLock::new(HashMap::new())),
+            execution_plans: Arc::new(RwLock::new(HashMap::new())),
+            cached_weights: Arc::new(RwLock::new(HashMap::new())),
+            active_model_id: Arc::new(RwLock::new(None)),
+            model_last_used: Arc::new(RwLock::new(HashMap::new())),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             planner_env: PlannerEnv::capture(),
@@ -92,13 +96,6 @@ impl AppState {
             ..Self::default()
         }
     }
-}
-
-#[derive(Clone)]
-struct CachedLlamaWeights {
-    model_id: String,
-    path: PathBuf,
-    weights: Arc<LlamaLoadedWeights>,
 }
 
 #[derive(Clone)]
@@ -779,22 +776,26 @@ pub async fn serve(
         }
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, execution_plan=?state.execution_plan.read().await.as_ref(), "camelid server listening");
+    tracing::info!(%addr, "camelid server listening");
     axum::serve(listener, router_with_state(state)).await
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    let model = state.loaded_model.read().await;
-    let loaded_now = model.is_some();
-    let generation_ready = model.as_ref().is_some_and(loaded_model_generation_ready);
+    let active_id_lock = state.active_model_id.read().await;
+    let loaded_models = state.loaded_models.read().await;
+    let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
+    let loaded_now = !loaded_models.is_empty();
+    let generation_ready = model.is_some_and(|m| loaded_model_generation_ready(m));
+    let execution_plans = state.execution_plans.read().await;
+    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
     Json(HealthResponse {
         ok: true,
         engine: "camelid",
         loaded_now,
         generation_ready,
-        active_model_id: model.as_ref().map(|m| m.id.clone()),
+        active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
-        execution_plan: state.execution_plan.read().await.clone(),
+        execution_plan,
     })
 }
 
@@ -808,13 +809,17 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
-    Json(capabilities_response_with_plan(
-        state.execution_plan.read().await.clone(),
-    ))
+    let active_id_lock = state.active_model_id.read().await;
+    let execution_plans = state.execution_plans.read().await;
+    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    Json(capabilities_response_with_plan(execution_plan))
 }
 
 async fn execution_plan(State(state): State<AppState>) -> Json<Option<ExecutionPlan>> {
-    Json(state.execution_plan.read().await.clone())
+    let active_id_lock = state.active_model_id.read().await;
+    let execution_plans = state.execution_plans.read().await;
+    let execution_plan = active_id_lock.as_ref().and_then(|id| execution_plans.get(id)).cloned();
+    Json(execution_plan)
 }
 
 #[cfg(test)]
@@ -1401,7 +1406,7 @@ async fn load_model_from_path(
     let tokenizer = tokenizer_state_from_result(tokenizer_result.as_ref());
     let tokenizer_runtime = tokenizer_result.ok().map(Arc::new);
     let loaded = LoadedModel {
-        id,
+        id: id.clone(),
         path,
         gguf,
         llama_config,
@@ -1410,9 +1415,12 @@ async fn load_model_from_path(
         tokenizer,
         tokenizer_runtime,
     };
-    *state.loaded_model.write().await = Some(loaded.clone());
-    *state.execution_plan.write().await = Some(outcome.plan);
-    *state.cached_weights.write().await = None;
+    
+    state.loaded_models.write().await.insert(id.clone(), loaded.clone());
+    state.execution_plans.write().await.insert(id.clone(), outcome.plan);
+    state.model_last_used.write().await.insert(id.clone(), std::time::Instant::now());
+    *state.active_model_id.write().await = Some(id.clone());
+    
     clear_prompt_prefix_cache(state);
     Ok(loaded)
 }
@@ -1438,58 +1446,293 @@ fn log_selected_execution_plan(plan: &ExecutionPlan) {
     );
 }
 
-async fn unload_model(State(state): State<AppState>) -> Response {
-    *state.loaded_model.write().await = None;
-    *state.execution_plan.write().await = None;
-    *state.cached_weights.write().await = None;
+#[derive(Debug, Deserialize)]
+pub struct UnloadModelRequest {
+    pub id: Option<String>,
+}
+
+async fn unload_model(State(state): State<AppState>, payload: Option<Json<UnloadModelRequest>>) -> Response {
+    let model_id = if let Some(Json(req)) = payload {
+        req.id
+    } else {
+        None
+    };
+
+    let target_id = if let Some(id) = model_id {
+        Some(id)
+    } else {
+        state.active_model_id.read().await.clone()
+    };
+
+    if let Some(id) = target_id {
+        state.loaded_models.write().await.remove(&id);
+        state.execution_plans.write().await.remove(&id);
+        state.cached_weights.write().await.remove(&id);
+        state.model_last_used.write().await.remove(&id);
+        
+        let mut active = state.active_model_id.write().await;
+        if active.as_ref() == Some(&id) {
+            *active = state.loaded_models.read().await.keys().next().cloned();
+        }
+    } else {
+        state.loaded_models.write().await.clear();
+        state.execution_plans.write().await.clear();
+        state.cached_weights.write().await.clear();
+        state.model_last_used.write().await.clear();
+        *state.active_model_id.write().await = None;
+    }
+    
     clear_prompt_prefix_cache(&state);
     StatusCode::NO_CONTENT.into_response()
 }
 
 async fn current_model(State(state): State<AppState>) -> Response {
-    match state.loaded_model.read().await.clone() {
-        Some(model) => (StatusCode::OK, Json(model)).into_response(),
-        None => api_error(
-            StatusCode::NOT_FOUND,
-            "model_not_loaded",
-            BackendError::ModelNotLoaded.to_string(),
-            None,
-        ),
+    let active_id = state.active_model_id.read().await;
+    if let Some(id) = active_id.as_ref() {
+        if let Some(model) = state.loaded_models.read().await.get(id).cloned() {
+            return (StatusCode::OK, Json(model)).into_response();
+        }
     }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "model_not_loaded",
+        BackendError::ModelNotLoaded.to_string(),
+        None,
+    )
 }
 
 async fn model_metadata(State(state): State<AppState>) -> Response {
-    match state.loaded_model.read().await.as_ref() {
-        Some(model) => (StatusCode::OK, Json(&model.gguf)).into_response(),
-        None => api_error(
-            StatusCode::NOT_FOUND,
-            "model_not_loaded",
-            BackendError::ModelNotLoaded.to_string(),
-            None,
-        ),
+    let active_id = state.active_model_id.read().await;
+    if let Some(id) = active_id.as_ref() {
+        if let Some(model) = state.loaded_models.read().await.get(id) {
+            return (StatusCode::OK, Json(&model.gguf)).into_response();
+        }
     }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "model_not_loaded",
+        BackendError::ModelNotLoaded.to_string(),
+        None,
+    )
 }
 
 async fn model_tokenizer(State(state): State<AppState>) -> Response {
-    match state.loaded_model.read().await.as_ref() {
-        Some(model) => match &model.tokenizer {
-            TokenizerLoadState::Available(summary) => {
-                (StatusCode::OK, Json(summary)).into_response()
+    let active_id = state.active_model_id.read().await;
+    if let Some(id) = active_id.as_ref() {
+        if let Some(model) = state.loaded_models.read().await.get(id) {
+            match &model.tokenizer {
+                TokenizerLoadState::Available(summary) => {
+                    return (StatusCode::OK, Json(summary)).into_response();
+                }
+                TokenizerLoadState::Unavailable { code, message } => {
+                    return api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        code,
+                        message.clone(),
+                        None,
+                    );
+                }
             }
-            TokenizerLoadState::Unavailable { code, message } => api_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                code,
-                message.clone(),
+        }
+    }
+    api_error(
+        StatusCode::NOT_FOUND,
+        "model_not_loaded",
+        BackendError::ModelNotLoaded.to_string(),
+        None,
+    )
+}
+
+async fn get_or_load_model(state: &AppState, model_id: Option<&str>) -> Result<LoadedModel, Response> {
+    let loaded_models = state.loaded_models.read().await;
+    
+    let target_id = if let Some(id) = model_id {
+        id.to_string()
+    } else {
+        if let Some(active) = state.active_model_id.read().await.as_ref() {
+            active.clone()
+        } else if loaded_models.len() == 1 {
+            loaded_models.keys().next().unwrap().clone()
+        } else {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                "model_not_loaded",
+                BackendError::ModelNotLoaded.to_string(),
                 None,
-            ),
-        },
-        None => api_error(
+            ));
+        }
+    };
+
+    if let Some(loaded) = loaded_models.get(&target_id) {
+        state.model_last_used.write().await.insert(target_id.clone(), std::time::Instant::now());
+        *state.active_model_id.write().await = Some(target_id.clone());
+        return Ok(loaded.clone());
+    }
+
+    for (id, loaded) in loaded_models.iter() {
+        if id == &target_id || loaded.id == target_id || loaded.path.file_name().is_some_and(|f| f.to_string_lossy() == target_id) {
+            state.model_last_used.write().await.insert(id.clone(), std::time::Instant::now());
+            *state.active_model_id.write().await = Some(id.clone());
+            return Ok(loaded.clone());
+        }
+    }
+
+    // Check if the model can be loaded from disk
+    let path = resolve_model_path(&target_id);
+    if let Some(path) = path {
+        if path.exists() {
+            drop(loaded_models);
+            match load_model_from_path(state, path, Some(target_id.clone())).await {
+                Ok(loaded) => return Ok(loaded),
+                Err(err) => return Err(api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "model_load_failed",
+                    format!("Failed to load model {target_id} on-demand: {err}"),
+                    None,
+                )),
+            }
+        }
+    }
+
+    // If it doesn't exist on disk, check if any models are loaded
+    if loaded_models.is_empty() {
+        return Err(api_error(
             StatusCode::NOT_FOUND,
             "model_not_loaded",
             BackendError::ModelNotLoaded.to_string(),
             None,
-        ),
+        ));
     }
+
+    Err(api_error(
+        StatusCode::NOT_FOUND,
+        "model_not_found",
+        format!("Requested model '{target_id}' is not loaded or could not be found on disk"),
+        Some("model"),
+    ))
+}
+
+fn resolve_model_path(model_id: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(model_id);
+    if path.exists() {
+        return Some(path);
+    }
+
+    let local_path = PathBuf::from("models").join(model_id);
+    if local_path.exists() {
+        return Some(local_path);
+    }
+
+    for item in curated_catalog() {
+        if item.catalog_id == model_id || item.filename == model_id {
+            let cat_path = PathBuf::from("models").join(item.filename);
+            return Some(cat_path);
+        }
+    }
+
+    if let Ok(entries) = std::fs::read_dir("models") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Some(stem) = p.file_stem() {
+                    if stem.to_string_lossy() == model_id {
+                        return Some(p);
+                    }
+                }
+                if let Some(name) = p.file_name() {
+                    if name.to_string_lossy() == model_id {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn load_weights_lru(state: &AppState, model: &LoadedModel, binding: &LlamaTensorBinding) -> Result<Arc<LlamaLoadedWeights>, Response> {
+    {
+        let cached = state.cached_weights.read().await;
+        if let Some(weights) = cached.get(&model.id) {
+            state.model_last_used.write().await.insert(model.id.clone(), std::time::Instant::now());
+            return Ok(weights.clone());
+        }
+    }
+
+    let estimated_bytes = guard_cpu_weight_materialization_budget(binding).map_err(|err| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "cpu_weight_materialization_exceeds_budget",
+            err.to_string(),
+            Some("model"),
+        )
+    })?;
+
+    let limit_bytes = cpu_weight_materialization_limit_bytes().unwrap_or(u64::MAX);
+
+    loop {
+        let loaded = state.loaded_models.read().await;
+        let cached = state.cached_weights.read().await;
+        
+        let mut current_sum = 0u64;
+        for (id, _) in cached.iter() {
+            if id != &model.id {
+                if let Some(m) = loaded.get(id) {
+                    if let Some(b) = m.llama_tensors.as_ref() {
+                        if let Ok(bytes) = estimate_cpu_weight_materialization_bytes(b) {
+                            current_sum += bytes;
+                        }
+                    }
+                }
+            }
+        }
+
+        if current_sum + estimated_bytes <= limit_bytes {
+            break;
+        }
+
+        let last_used = state.model_last_used.read().await;
+        let mut lru_id: Option<String> = None;
+        let mut oldest_time = std::time::Instant::now();
+
+        for (id, _) in cached.iter() {
+            if id != &model.id {
+                let time = last_used.get(id).cloned().unwrap_or_else(std::time::Instant::now);
+                if time < oldest_time {
+                    oldest_time = time;
+                    lru_id = Some(id.clone());
+                }
+            }
+        }
+
+        drop(cached);
+        drop(loaded);
+        drop(last_used);
+
+        if let Some(evict_id) = lru_id {
+            tracing::info!(model=%evict_id, "LRU evicting weights of model to stay under budget");
+            let mut cached_write = state.cached_weights.write().await;
+            cached_write.remove(&evict_id);
+        } else {
+            break;
+        }
+    }
+
+    let store = TensorStore::open(&model.path, &model.gguf);
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, binding, None).map_err(|err| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "loaded_cpu_weights_unavailable",
+            err.to_string(),
+            Some("model"),
+        )
+    })?);
+
+    state.cached_weights.write().await.insert(model.id.clone(), weights.clone());
+    state.model_last_used.write().await.insert(model.id.clone(), std::time::Instant::now());
+
+    Ok(weights)
 }
 
 async fn tokenizer_encode(
@@ -1591,8 +1834,8 @@ async fn tokenizer_decode(
 }
 
 async fn v1_models(State(state): State<AppState>) -> Json<ModelListResponse> {
-    let model = state.loaded_model.read().await;
-    let data = model.as_ref().map(model_list_item).into_iter().collect();
+    let loaded = state.loaded_models.read().await;
+    let data = loaded.values().map(model_list_item).collect();
     Json(ModelListResponse {
         object: "list",
         data,
@@ -1600,8 +1843,8 @@ async fn v1_models(State(state): State<AppState>) -> Json<ModelListResponse> {
 }
 
 async fn v1_model(AxumPath(model_id): AxumPath<String>, State(state): State<AppState>) -> Response {
-    let model = state.loaded_model.read().await;
-    match model.as_ref().filter(|model| model.id == model_id) {
+    let loaded = state.loaded_models.read().await;
+    match loaded.get(&model_id) {
         Some(model) => (StatusCode::OK, Json(model_list_item(model))).into_response(),
         None => api_error(
             StatusCode::NOT_FOUND,
@@ -2136,34 +2379,10 @@ async fn prepare_generation(
         }
     };
 
-    let model = state
-        .loaded_model
-        .read()
-        .await
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "model_not_loaded",
-                BackendError::ModelNotLoaded.to_string(),
-                Some("model"),
-            )
-        })?;
-
-    if let Some(requested) = req.model.as_deref() {
-        if requested != model.id {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "model_mismatch",
-                format!(
-                    "requested model {requested:?} does not match loaded model {:?}",
-                    model.id
-                ),
-                Some("model"),
-            ));
-        }
-    }
+    let model = match get_or_load_model(state, req.model.as_deref()).await {
+        Ok(m) => m,
+        Err(res) => return Err(res),
+    };
 
     let mut timings = GenerationTimings::default();
     let tokenization_started = Instant::now();
@@ -2317,37 +2536,12 @@ async fn prepare_generation(
     });
 
     let weight_load_started = Instant::now();
-    let cached_weights = state.cached_weights.read().await.clone();
-    let weights = if let Some(cached) =
-        cached_weights.filter(|cached| cached.model_id == model.id && cached.path == model.path)
-    {
-        timings.weight_cache_hit = true;
-        cached.weights
-    } else {
-        guard_cpu_weight_materialization_budget(binding).map_err(|err| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "cpu_weight_materialization_exceeds_budget",
-                err.to_string(),
-                Some("model"),
-            )
-        })?;
-        let store = TensorStore::open(&model.path, &model.gguf);
-        let weights = Arc::new(LlamaLoadedWeights::load(&store, binding, None).map_err(|err| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "loaded_cpu_weights_unavailable",
-                err.to_string(),
-                Some("model"),
-            )
-        })?);
-        *state.cached_weights.write().await = Some(CachedLlamaWeights {
-            model_id: model.id.clone(),
-            path: model.path.clone(),
-            weights: weights.clone(),
-        });
-        weights
+    let cache_hit = state.cached_weights.read().await.contains_key(&model.id);
+    let weights = match load_weights_lru(state, &model, binding).await {
+        Ok(w) => w,
+        Err(res) => return Err(res),
     };
+    timings.weight_cache_hit = cache_hit;
     timings.weight_load = weight_load_started.elapsed().as_millis();
     let session_create_started = Instant::now();
     let dense_metadata = dense_diagnostic_metadata(config, binding, &weights);
@@ -4251,8 +4445,9 @@ fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
 }
 
 async fn loaded_tokenizer(state: &AppState) -> std::result::Result<Tokenizer, Response> {
-    let model = state.loaded_model.read().await;
-    let model = model.as_ref().ok_or_else(|| {
+    let active_id = state.active_model_id.read().await;
+    let loaded_models = state.loaded_models.read().await;
+    let model = active_id.as_ref().and_then(|id| loaded_models.get(id)).ok_or_else(|| {
         api_error(
             StatusCode::NOT_FOUND,
             "model_not_loaded",
