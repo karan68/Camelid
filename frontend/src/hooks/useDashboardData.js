@@ -847,6 +847,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
           total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
         },
+        camelid: streamed.camelid || null,
         streaming: false,
         streaming_phase: null,
         first_byte_ms: streamed.firstByteMs ?? null,

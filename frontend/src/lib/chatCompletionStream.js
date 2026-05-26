@@ -87,17 +87,18 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
     const parsed = readChatCompletionJsonPayload(payload, { estimateTokenCount })
     const elapsedMs = performance.now() - responseStartedAt
     if (parsed.content) onDelta(parsed.content, parsed.content, { completionTokens: parsed.completionTokens, elapsedMs, firstByteMs: 0, firstEventMs: null, firstContentMs: elapsedMs })
-    return { ...parsed, firstByteMs: 0, firstEventMs: null, firstContentMs: parsed.content ? elapsedMs : null }
+    return { ...parsed, camelid: payload?.camelid || null, firstByteMs: 0, firstEventMs: null, firstContentMs: parsed.content ? elapsedMs : null }
   }
 
   const reader = response.body?.getReader()
-  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null }
+  if (!reader) return { content: '', finishReason: null, completionTokens: 0, firstContentMs: null, firstByteMs: null, firstEventMs: null, usage: null, camelid: null }
   const decoder = new TextDecoder()
   let buffer = ''
   let content = ''
   let finishReason = null
   let completionTokens = 0
   let usage = null
+  let camelid = null
   const streamStartedAt = performance.now()
   let firstByteMs = null
   let firstEventMs = null
@@ -154,6 +155,9 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
         if (Number.isFinite(Number(usage.completion_tokens))) completionTokens = Number(usage.completion_tokens)
         onStreamEvent?.({ type: 'usage', usage, ...streamMetrics() })
       }
+      if (chunk?.camelid) {
+        camelid = chunk.camelid
+      }
     }
   }
 
@@ -171,5 +175,5 @@ export async function readStreamingChatCompletion(response, onDelta, { estimateT
   }
   buffer += decoder.decode()
   if (buffer.trim()) consumeEvent(buffer.replace(/\r\n/g, '\n'))
-  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage }
+  return { content, finishReason, completionTokens, firstContentMs, firstByteMs, firstEventMs, usage, camelid }
 }
