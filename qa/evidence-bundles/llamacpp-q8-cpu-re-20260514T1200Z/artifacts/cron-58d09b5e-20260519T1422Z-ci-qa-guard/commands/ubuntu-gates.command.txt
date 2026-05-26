@@ -1,6 +1,6 @@
-ssh <canonical-ubuntu-host>
+# Canonical Ubuntu validation connection command intentionally omitted from public evidence.
 # Fresh interactive canonical SSH connection was opened first.
-# Remote gate payload used the canonical Ubuntu identity/host and then ran:
+# Remote gate payload then ran:
 set -euo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
 WORK="$HOME/work/cron-58d09b5e-20260519T1422Z-ci-qa-guard/repo"
