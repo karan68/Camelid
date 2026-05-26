@@ -46,7 +46,7 @@ Camelid's support boundary is exact-row only. Read each row literally; support d
 | Llama 3.2 1B Instruct Q8_0 | **Verified bounded support** | Load, completions, chat completions, WebUI validation, compact/broader parity, exact-row metadata-Jinja row-template checks, template-shape checks, unique-chat perf/RSS sampling, and checked 512/1024/2048/4096/8192 context packs. |
 | Llama 3.2 3B Instruct Q8_0 | **Supported exact-row smoke** | Canonical API/WebUI support-gate refresh at source head `e9f926ed1a65`, compact/broader 50-token parity, five-prompt API smoke, row-scoped template evidence, bounded unique-chat perf/RSS, and checked 512/1024/2048 context packs. |
 | Llama 3 8B Instruct Q8_0 | **Verified bounded support** | Load, completions, chat completions, WebUI validation, compact and broader parity, checked 512/1024/2048 context packs, compact chat-template-shape evidence, bounded memory evidence, structured RSS/Q8 read counters, and lazy-Q8 hot-path measurements. |
-| Mistral-7B-Instruct-v0.3.Q8_0.gguf | **Active validation; not supported yet** | Tokenizer/template, 1-token generation, broader five-prompt/50-token parity, bounded 512/1024/2048, checked 4096/8192 context evidence, and fail-closed API/WebUI/RSS evidence exist. Explicit contract promotion is still required. |
+| Mistral-7B-Instruct-v0.3.Q8_0.gguf | **Supported exact-row smoke** | Exact-row load, tokenizer/template, 1-token generation, broader 50-token parity, bounded 512/1024/2048, checked 4096/8192 context packs, and synchronized API/WebUI/RSS evidence are fully verified. |
 | Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | **Partial backend runtime only** | One-token backend MoE runtime evidence exists. Later-generation divergence and a continuation HTTP hang block API/WebUI/frontend readiness and support promotion. |
 | Qwen2.5-7B-Instruct-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected; no Camelid support claim yet. |
 | gemma-2-9b-it-Q8_0.gguf | **Planned exact-row candidate** | Candidate row selected; no Camelid support claim yet. |
@@ -67,7 +67,7 @@ Authoritative detail lives in [`COMPATIBILITY.md`](COMPATIBILITY.md). The curren
 The current workstream is focused on widening support without weakening the contract:
 
 - **Protect supported rows:** keep TinyLlama, Llama 3.2 1B/3B, and Llama 3 8B evidence aligned across runtime, API, frontend, and docs.
-- **Close Mistral deliberately:** Mistral 7B v0.3 Q8_0 has much of the validation work done, but still needs explicit synchronized promotion before the product can call it supported.
+- **Widen Mistral support matrices carefully:** Mistral 7B v0.3 Q8_0 is now a fully supported exact-row smoke lane. Next, we will preserve this exact-row boundary while validating neighboring quants and models.
 - **Fix Mixtral blockers:** Mixtral remains blocked until later-generation parity and the continuation HTTP hang are fixed and rerun through API/WebUI/frontend evidence.
 - **Advance Q8 performance carefully:** Apple Silicon and Ubuntu x86 Q8 acceleration remain default-off and evidence-gated. The default/reference path stays available while optimized paths prove parity and whole-model impact.
 
