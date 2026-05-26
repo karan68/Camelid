@@ -212,6 +212,8 @@ pub struct CapabilitiesResponse {
     pub tokenization: bool,
     pub inference: bool,
     pub streaming: bool,
+    pub model_downloads: bool,
+    pub hf_catalog_install: bool,
     pub execution_plan: Option<ExecutionPlan>,
     pub support_contract: SupportContract,
     pub supported_quantization: Vec<SupportItem>,
@@ -751,6 +753,10 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
         )
+        .route("/api/models/catalog", get(get_catalog))
+        .route("/api/models/catalog/install", post(install_catalog_model))
+        .route("/api/models/catalog/downloads", get(get_catalog_downloads))
+        .route("/api/models/catalog/cancel", post(cancel_catalog_download))
         .route("/v1/models", get(v1_models))
         .route("/v1/models/:model", get(v1_model))
         .route("/v1/completions", post(completions))
@@ -824,6 +830,8 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         tokenization: true,
         inference: true,
         streaming: true,
+        model_downloads: true,
+        hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
             current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral-7B-Instruct-v0.3.Q8_0.gguf now has fail-closed current-head API/WebUI/RSS evidence plus checked 512/1024/2048/4096/8192 validation evidence, but remains active_validation_unsupported with WebUI chat blocked by contract. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
@@ -6629,3 +6637,235 @@ mod tests {
         tensor(name, vec![rows, cols], data)
     }
 }
+
+// ==========================================================================
+// Curated model catalog and background GGUF downloader endpoints
+// ==========================================================================
+
+#[derive(Debug, serde::Serialize, Clone)]
+pub struct CatalogItem {
+    pub catalog_id: &'static str,
+    pub name: &'static str,
+    pub repo_id: &'static str,
+    pub filename: &'static str,
+    pub size_bytes: u64,
+    pub downloads: u64,
+    pub likes: u64,
+    pub quant: &'static str,
+    pub license: &'static str,
+}
+
+fn curated_catalog() -> Vec<CatalogItem> {
+    vec![
+        CatalogItem {
+            catalog_id: "llama32_1b_instruct_q8_0",
+            name: "Llama 3.2 1B Instruct Q8_0",
+            repo_id: "unsloth/Llama-3.2-1B-Instruct-GGUF",
+            filename: "Llama-3.2-1B-Instruct-Q8_0.gguf",
+            size_bytes: 1346203104,
+            downloads: 142000,
+            likes: 540,
+            quant: "Q8_0",
+            license: "llama3.2",
+        },
+        CatalogItem {
+            catalog_id: "llama32_3b_instruct_q8_0",
+            name: "Llama 3.2 3B Instruct Q8_0",
+            repo_id: "unsloth/Llama-3.2-3B-Instruct-GGUF",
+            filename: "Llama-3.2-3B-Instruct-Q8_0.gguf",
+            size_bytes: 3422709216,
+            downloads: 98000,
+            likes: 420,
+            quant: "Q8_0",
+            license: "llama3.2",
+        },
+        CatalogItem {
+            catalog_id: "tinyllama_1_1b_chat_q8_0",
+            name: "TinyLlama 1.1B Chat Q8_0",
+            repo_id: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+            filename: "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
+            size_bytes: 1169007424,
+            downloads: 512000,
+            likes: 1240,
+            quant: "Q8_0",
+            license: "other",
+        },
+        CatalogItem {
+            catalog_id: "llama3_8b_instruct_q8_0",
+            name: "Llama 3 8B Instruct Q8_0",
+            repo_id: "MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF",
+            filename: "Meta-Llama-3-8B-Instruct.Q8_0.gguf",
+            size_bytes: 8540846592,
+            downloads: 320000,
+            likes: 920,
+            quant: "Q8_0",
+            license: "llama3",
+        },
+    ]
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CatalogResponse {
+    pub items: Vec<CatalogItem>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CatalogQuery {
+    pub query: Option<String>,
+}
+
+async fn get_catalog(axum::extract::Query(q): axum::extract::Query<CatalogQuery>) -> Json<CatalogResponse> {
+    let items = curated_catalog();
+    let filtered = if let Some(query_str) = q.query {
+        let qs = query_str.to_lowercase();
+        items.into_iter()
+            .filter(|item| {
+                item.name.to_lowercase().contains(&qs)
+                    || item.repo_id.to_lowercase().contains(&qs)
+                    || item.filename.to_lowercase().contains(&qs)
+            })
+            .collect()
+    } else {
+        items
+    };
+    Json(CatalogResponse {
+        items: filtered,
+        next_cursor: None,
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ActiveDownload {
+    pub id: String,
+    pub repo_id: String,
+    pub filename: String,
+    pub total_bytes: u64,
+    pub bytes_downloaded: u64,
+    pub status: &'static str,
+    #[serde(skip)]
+    pub child_pid: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct InstallCatalogRequest {
+    pub catalog_id: String,
+    pub repo_id: String,
+    pub filename: String,
+    pub size_bytes: u64,
+}
+
+static ACTIVE_DOWNLOADS: OnceLock<Mutex<HashMap<String, ActiveDownload>>> = OnceLock::new();
+
+fn active_downloads_map() -> &'static Mutex<HashMap<String, ActiveDownload>> {
+    ACTIVE_DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Response {
+    let mut map = active_downloads_map().lock().unwrap();
+    if map.contains_key(&req.catalog_id) {
+        return (StatusCode::BAD_REQUEST, "Download already running").into_response();
+    }
+
+    std::fs::create_dir_all("models").ok();
+    let dest_path = format!("models/{}", req.filename);
+    let url = format!("https://huggingface.co/{}/resolve/main/{}", req.repo_id, req.filename);
+
+    match std::process::Command::new("curl")
+        .args(&[
+            "-L",
+            "-C",
+            "-",
+            "-o",
+            &dest_path,
+            &url,
+        ])
+        .spawn()
+    {
+        Ok(child) => {
+            let pid = child.id();
+            let download = ActiveDownload {
+                id: req.catalog_id.clone(),
+                repo_id: req.repo_id.clone(),
+                filename: req.filename.clone(),
+                total_bytes: req.size_bytes,
+                bytes_downloaded: 0,
+                status: "downloading",
+                child_pid: Some(pid),
+            };
+            map.insert(req.catalog_id.clone(), download);
+
+            let catalog_id_clone = req.catalog_id.clone();
+            tokio::spawn(async move {
+                let mut child = child;
+                if let Ok(status) = child.wait() {
+                    let mut map = active_downloads_map().lock().unwrap();
+                    if let Some(dl) = map.get_mut(&catalog_id_clone) {
+                        if status.success() {
+                            dl.status = "completed";
+                        } else {
+                            dl.status = "failed";
+                        }
+                    }
+                }
+            });
+
+            (StatusCode::OK, "Download started").into_response()
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to start curl: {}", err),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
+    let mut map = active_downloads_map().lock().unwrap();
+    let mut to_remove = Vec::new();
+    for (id, dl) in map.iter_mut() {
+        if dl.status == "completed" || dl.status == "failed" {
+            to_remove.push(id.clone());
+            continue;
+        }
+
+        let path = format!("models/{}", dl.filename);
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            dl.bytes_downloaded = metadata.len();
+            if dl.bytes_downloaded >= dl.total_bytes {
+                dl.status = "completed";
+            }
+        }
+    }
+
+    let result = map.values().cloned().collect::<Vec<_>>();
+
+    for id in to_remove {
+        map.remove(&id);
+    }
+
+    Json(result)
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct CancelDownloadRequest {
+    pub id: String,
+}
+
+async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Response {
+    let mut map = active_downloads_map().lock().unwrap();
+    if let Some(dl) = map.remove(&req.id) {
+        if let Some(pid) = dl.child_pid {
+            let mut kill_cmd = std::process::Command::new("kill");
+            kill_cmd.arg(pid.to_string());
+            kill_cmd.spawn().ok();
+        }
+
+        let path = format!("models/{}", dl.filename);
+        std::fs::remove_file(path).ok();
+        (StatusCode::OK, "Download canceled").into_response()
+    } else {
+        (StatusCode::NOT_FOUND, "Download not found").into_response()
+    }
+}
+

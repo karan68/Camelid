@@ -984,6 +984,15 @@ export default function ModelsView({
 
                     <CapabilityEvidenceBlock capabilities={capabilities} model={localMatch} catalogItem={item} />
 
+                    {localMatch && (localMatch.status === 'downloading' || localMatch.status === 'canceling' || localMatch.progress) && (
+                      <div className="progress-wrap" style={{ marginBlock: '12px' }}>
+                        <div className="progress-bar"><div style={{ width: `${localMatch.progress || 0}%` }} /></div>
+                        <small style={{ display: 'block', marginTop: '6px', color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>
+                          {formatDownloadCopy(localMatch)}
+                        </small>
+                      </div>
+                    )}
+
                     {localMatch && <ReadinessGrid model={localMatch} runtime={runtime} />}
 
                     {errorCopy && <p className="library-error-copy">{errorCopy}</p>}

@@ -714,15 +714,7 @@ export default function ChatWorkspace({
       : selectedModel
         ? 'Waiting on readiness'
         : 'Choose a model to begin'
-  const productHeroTitle = selectedModelRunnable
-    ? 'How can I help?'
-    : apiUnavailable
-      ? 'Camelid is offline right now.'
-      : supportBlocked
-        ? 'This model is loaded, but still gated.'
-        : selectedModel
-          ? 'Start drafting while Camelid gets ready.'
-          : 'Choose a model and start chatting.'
+  const productHeroTitle = "Hi Tim, let's get into it"
   const productHeroSummary = selectedModelRunnable
     ? 'A clean local assistant surface with the current runtime state kept visible.'
     : apiUnavailable
