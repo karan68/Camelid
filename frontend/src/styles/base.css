@@ -15,10 +15,7 @@ html {
 body {
   margin: 0;
   min-width: 320px;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--color-bg) 96%, var(--color-surface) 4%), var(--color-bg) 64%),
-    linear-gradient(120deg, color-mix(in srgb, var(--color-spectrum-blue) 7%, transparent), transparent 28%),
-    linear-gradient(260deg, color-mix(in srgb, var(--color-spectrum-green) 5%, transparent), transparent 34%);
+  background: var(--color-bg);
   color: var(--color-text);
   font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
