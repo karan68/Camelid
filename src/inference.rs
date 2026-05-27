@@ -10466,6 +10466,29 @@ fn q8_0_packed_rows4_matmul_projection_pair_from_quantized(
                     right_group.copy_from_slice(&right_sums);
                 }
             });
+    } else if should_parallelize_q8_packed_rows4_matmul(total_left_output_groups) {
+        left_output
+            .par_chunks_mut(left_output_width)
+            .zip(right_output.par_chunks_mut(right_output_width))
+            .enumerate()
+            .for_each(|(row_idx, (left_row, right_row))| {
+                let input_start = row_idx * blocks_per_row;
+                let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
+                for (group_idx, output_chunk) in left_row[..left_output_width].chunks_exact_mut(4).enumerate() {
+                    let group_start = group_idx * blocks_per_row;
+                    let group_blocks = &left_packed.blocks[group_start..group_start + blocks_per_row];
+                    let sums =
+                        q8_0_packed_rows4_dot_i8_matmul(group_blocks, quantized_row, use_hoisted_avx2);
+                    output_chunk.copy_from_slice(&sums);
+                }
+                for (group_idx, output_chunk) in right_row[..right_output_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                    let group_start = group_idx * blocks_per_row;
+                    let group_blocks = &right_packed.blocks[group_start..group_start + blocks_per_row];
+                    let sums =
+                        q8_0_packed_rows4_dot_i8_matmul(group_blocks, quantized_row, use_hoisted_avx2);
+                    output_chunk.copy_from_slice(&sums);
+                }
+            });
     } else {
         for row_idx in 0..rows {
             let input_start = row_idx * blocks_per_row;
@@ -10705,6 +10728,40 @@ fn q8_0_packed_rows4_matmul_projection_triplet_from_quantized(
                         use_hoisted_avx2,
                     ));
                     v_group.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &v_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_row,
+                        use_hoisted_avx2,
+                    ));
+                }
+            });
+    } else if should_parallelize_q8_packed_rows4_matmul(total_q_output_groups) {
+        q_output
+            .par_chunks_mut(q_width)
+            .zip(k_output.par_chunks_mut(k_width))
+            .zip(v_output.par_chunks_mut(v_width))
+            .enumerate()
+            .for_each(|(row_idx, ((q_row, k_row), v_row))| {
+                let input_start = row_idx * blocks_per_row;
+                let quantized_row = &quantized_inputs[input_start..input_start + blocks_per_row];
+                for (group_idx, output_chunk) in q_row[..q_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                    let group_start = group_idx * blocks_per_row;
+                    output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &q_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_row,
+                        use_hoisted_avx2,
+                    ));
+                }
+                for (group_idx, output_chunk) in k_row[..k_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                    let group_start = group_idx * blocks_per_row;
+                    output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
+                        &k_packed.blocks[group_start..group_start + blocks_per_row],
+                        quantized_row,
+                        use_hoisted_avx2,
+                    ));
+                }
+                for (group_idx, output_chunk) in v_row[..v_groups_per_row * 4].chunks_exact_mut(4).enumerate() {
+                    let group_start = group_idx * blocks_per_row;
+                    output_chunk.copy_from_slice(&q8_0_packed_rows4_dot_i8_matmul(
                         &v_packed.blocks[group_start..group_start + blocks_per_row],
                         quantized_row,
                         use_hoisted_avx2,
