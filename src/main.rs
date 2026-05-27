@@ -1,5 +1,13 @@
 use std::{net::{SocketAddr, TcpListener, TcpStream}, path::PathBuf, time::Instant, io::Write, sync::Arc};
 
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn pthread_set_qos_class_self_np(
+        qos_class: u32,
+        relative_priority: std::os::raw::c_int,
+    ) -> std::os::raw::c_int;
+}
+
 use camelid::{
     api,
     gguf::{read_metadata, GgufTensorType},
@@ -230,6 +238,10 @@ async fn main() -> anyhow::Result<()> {
             if log_acceleration {
                 log_acceleration_state();
             }
+            #[cfg(target_os = "macos")]
+            unsafe {
+                pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+            }
             api::serve(addr, threads, model).await?
         }
         Command::ServeDistributed {
@@ -268,6 +280,10 @@ async fn main() -> anyhow::Result<()> {
                 })?;
                 tracing::info!("Coordinator connected to worker successfully");
                 
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                }
                 api::serve(addr, threads, Some(model)).await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
@@ -292,6 +308,10 @@ async fn main() -> anyhow::Result<()> {
                 )?;
                 
                 let addr_str = addr.to_string();
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
+                }
                 camelid::distributed::run_worker_loop(&addr_str, session)?;
             } else {
                 anyhow::bail!("Invalid role: {role}. Must be 'coordinator' or 'worker'");
@@ -1132,14 +1152,30 @@ fn log_acceleration_state() {
 }
 
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
-    if let Some(threads) = threads {
-        anyhow::ensure!(threads > 0, "--threads must be greater than zero");
-        ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-            .map_err(|err| anyhow::anyhow!("failed to configure Rayon thread pool: {err}"))?;
-    }
-    Ok(())
+        #[cfg(target_os = "macos")]
+        let should_configure = true;
+        #[cfg(not(target_os = "macos"))]
+        let should_configure = threads.is_some();
+
+        if should_configure {
+            let mut builder = ThreadPoolBuilder::new();
+            if let Some(t) = threads {
+                anyhow::ensure!(t > 0, "--threads must be greater than zero");
+                builder = builder.num_threads(t);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                builder = builder.start_handler(|_| {
+                    unsafe {
+                        pthread_set_qos_class_self_np(0x21, 0); // QOS_CLASS_USER_INTERACTIVE (forces P-cores)
+                    }
+                });
+            }
+            builder
+                .build_global()
+                .map_err(|err| anyhow::anyhow!("failed to configure Rayon thread pool: {err}"))?;
+        }
+        Ok(())
 }
 
 fn average_timings(timings: &[DenseHotloopBenchTimings]) -> DenseHotloopBenchTimings {
