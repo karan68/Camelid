@@ -9,6 +9,111 @@ fn assert_close(actual: f32, expected: f32) {
     );
 }
 
+#[test]
+#[allow(clippy::needless_range_loop)]
+fn test_row_dispatch_adversarial_parity() {
+    let _env_guard = env_lock();
+
+    let n_blocks = 4;
+    
+    let mut weight_blocks = Vec::with_capacity(n_blocks);
+    let mut input_blocks = Vec::with_capacity(n_blocks);
+
+    // Block 0: Mixed signs & normal values
+    let mut w0 = [0_i8; 32];
+    let mut in0 = [0_i8; 32];
+    for idx in 0..32 {
+        w0[idx] = if idx % 2 == 0 { (idx as i8) * 3 } else { -(idx as i8) * 4 };
+        in0[idx] = if idx % 3 == 0 { 29 - (idx as i8) } else { (idx as i8) - 45 };
+    }
+    weight_blocks.push(Q8_0Block { scale: 0.125, quants: w0 });
+    input_blocks.push(Q8_0Block { scale: 0.25, quants: in0 });
+
+    // Block 1: Zero block (all zeros, scale 0)
+    weight_blocks.push(Q8_0Block { scale: 0.0, quants: [0_i8; 32] });
+    input_blocks.push(Q8_0Block { scale: 0.0, quants: [0_i8; 32] });
+
+    // Block 2: Boundary case with i8::MIN (-128) and i8::MAX (127)
+    let mut w2 = [0_i8; 32];
+    let mut in2 = [0_i8; 32];
+    for idx in 0..32 {
+        w2[idx] = match idx % 4 {
+            0 => i8::MIN,
+            1 => i8::MAX,
+            2 => 0,
+            _ => -7,
+        };
+        in2[idx] = match idx % 5 {
+            0 => i8::MIN,
+            1 => i8::MAX,
+            2 => 5,
+            _ => 13,
+        };
+    }
+    weight_blocks.push(Q8_0Block { scale: 1.5, quants: w2 });
+    input_blocks.push(Q8_0Block { scale: 0.75, quants: in2 });
+
+    // Block 3: Mixed small values/subnormal scales
+    let mut w3 = [0_i8; 32];
+    let mut in3 = [0_i8; 32];
+    for idx in 0..32 {
+        w3[idx] = (idx as i8) - 16;
+        in3[idx] = 16 - (idx as i8);
+    }
+    weight_blocks.push(Q8_0Block { scale: 1e-37, quants: w3 });
+    input_blocks.push(Q8_0Block { scale: 1e-38, quants: in3 });
+
+    // Test single-row dot product
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "off");
+    let scalar_dot = q8_0_dot_rows(&weight_blocks, &input_blocks);
+
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "on");
+    let simd_dot = q8_0_dot_rows(&weight_blocks, &input_blocks);
+
+    assert_eq!(
+        scalar_dot, simd_dot,
+        "Single-row dot product mismatch (scalar: {}, simd: {})",
+        scalar_dot, simd_dot
+    );
+
+    // Test two-row dot product
+    let mut second_weight_blocks = Vec::with_capacity(n_blocks);
+    
+    let mut w0_2 = [0_i8; 32];
+    for idx in 0..32 {
+        w0_2[idx] = if idx % 2 == 0 { -10 } else { 12 };
+    }
+    second_weight_blocks.push(Q8_0Block { scale: 0.5, quants: w0_2 });
+    
+    second_weight_blocks.push(Q8_0Block { scale: 0.0, quants: [0_i8; 32] });
+    
+    let mut w2_2 = [0_i8; 32];
+    for idx in 0..32 {
+        w2_2[idx] = if idx % 3 == 0 { i8::MIN } else { 45 };
+    }
+    second_weight_blocks.push(Q8_0Block { scale: 2.25, quants: w2_2 });
+
+    let mut w3_2 = [0_i8; 32];
+    for idx in 0..32 {
+        w3_2[idx] = -(idx as i8);
+    }
+    second_weight_blocks.push(Q8_0Block { scale: 1e-35, quants: w3_2 });
+
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "off");
+    let scalar_two_dot = q8_0_two_dot_rows(&weight_blocks, &second_weight_blocks, &input_blocks);
+
+    std::env::set_var("CAMELID_Q8_ROW_DISPATCH", "on");
+    let simd_two_dot = q8_0_two_dot_rows(&weight_blocks, &second_weight_blocks, &input_blocks);
+
+    assert_eq!(
+        scalar_two_dot, simd_two_dot,
+        "Two-row dot product mismatch (scalar: {:?}, simd: {:?})",
+        scalar_two_dot, simd_two_dot
+    );
+
+    std::env::remove_var("CAMELID_Q8_ROW_DISPATCH");
+}
+
 fn assert_slice_close(actual: &[f32], expected: &[f32]) {
     assert_eq!(actual.len(), expected.len(), "slice length mismatch");
     for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {

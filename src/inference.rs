@@ -189,6 +189,17 @@ impl LlamaLoadedWeights {
     }
 
     pub fn load(store: &TensorStore, binding: &LlamaTensorBinding) -> Result<Self> {
+        Self::load_distributed(store, binding, 0, binding.layers.len(), true, true)
+    }
+
+    pub fn load_distributed(
+        store: &TensorStore,
+        binding: &LlamaTensorBinding,
+        layer_start: usize,
+        layer_end: usize,
+        load_embedding: bool,
+        load_output: bool,
+    ) -> Result<Self> {
         let auto_retain_q8_0_blocks = auto_retain_q8_0_blocks_for_fast_local_chat(binding);
         let load_linear = |name: &str| {
             if auto_retain_q8_0_blocks {
@@ -217,27 +228,35 @@ impl LlamaLoadedWeights {
                 )
             }
         };
-        let token_embedding = normalize_token_embedding_shape(
-            load_linear(&binding.token_embedding.name)?,
-            &binding.token_embedding.name,
-        )?;
+        let token_embedding = if load_embedding {
+            normalize_token_embedding_shape(
+                load_linear(&binding.token_embedding.name)?,
+                &binding.token_embedding.name,
+            )?
+        } else {
+            CpuTensor::from_f32("token_embedding_dummy", vec![0, 0], vec![])?
+        };
         let output_norm = store.load_cpu_f32(&binding.output_norm.name)?;
-        let output = if binding.output_is_tied_embedding {
-            if auto_retain_q8_0_blocks {
-                Some(store.load_q8_0_block_backed_linear_as(
-                    &binding.token_embedding.name,
-                    "output.weight",
-                )?)
-            } else if lazy_q8_0_linear_enabled() {
-                Some(store.load_q8_0_file_backed_tensor_as(
-                    &binding.token_embedding.name,
-                    "output.weight",
-                )?)
+        let output = if load_output {
+            if binding.output_is_tied_embedding {
+                if auto_retain_q8_0_blocks {
+                    Some(store.load_q8_0_block_backed_linear_as(
+                        &binding.token_embedding.name,
+                        "output.weight",
+                    )?)
+                } else if lazy_q8_0_linear_enabled() {
+                    Some(store.load_q8_0_file_backed_tensor_as(
+                        &binding.token_embedding.name,
+                        "output.weight",
+                    )?)
+                } else {
+                    None
+                }
             } else {
-                None
+                Some(load_linear(&binding.output.name)?)
             }
         } else {
-            Some(load_linear(&binding.output.name)?)
+            None
         };
         let rope_freqs = binding
             .rope_freqs
@@ -245,38 +264,53 @@ impl LlamaLoadedWeights {
             .map(|desc| store.load_cpu_f32(&desc.name))
             .transpose()?;
         let mut layers = Vec::with_capacity(binding.layers.len());
-        for layer in &binding.layers {
-            let (ffn_gate, ffn_up, ffn_down, moe_router) = match &layer.ffn {
-                LlamaFfnTensors::Dense { gate, up, down } => (
-                    load_linear(&gate.name)?,
-                    load_linear(&up.name)?,
-                    load_linear(&down.name)?,
-                    None,
-                ),
-                LlamaFfnTensors::MoE {
-                    router,
-                    gate_experts,
-                    up_experts,
-                    down_experts,
-                } => (
-                    load_moe_experts(gate_experts)?,
-                    load_moe_experts(up_experts)?,
-                    load_moe_experts(down_experts)?,
-                    Some(store.load_cpu_f32(&router.name)?),
-                ),
-            };
-            layers.push(LlamaLayerWeights {
-                attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
-                attention_q: load_linear(&layer.attention_q.name)?,
-                attention_k: load_linear(&layer.attention_k.name)?,
-                attention_v: load_linear(&layer.attention_v.name)?,
-                attention_output: load_linear(&layer.attention_output.name)?,
-                ffn_norm: store.load_cpu_f32(&layer.ffn_norm.name)?,
-                ffn_gate,
-                ffn_up,
-                ffn_down,
-                moe_router,
-            });
+        for (idx, layer) in binding.layers.iter().enumerate() {
+            if idx >= layer_start && idx < layer_end {
+                let (ffn_gate, ffn_up, ffn_down, moe_router) = match &layer.ffn {
+                    LlamaFfnTensors::Dense { gate, up, down } => (
+                        load_linear(&gate.name)?,
+                        load_linear(&up.name)?,
+                        load_linear(&down.name)?,
+                        None,
+                    ),
+                    LlamaFfnTensors::MoE {
+                        router,
+                        gate_experts,
+                        up_experts,
+                        down_experts,
+                    } => (
+                        load_moe_experts(gate_experts)?,
+                        load_moe_experts(up_experts)?,
+                        load_moe_experts(down_experts)?,
+                        Some(store.load_cpu_f32(&router.name)?),
+                    ),
+                };
+                layers.push(LlamaLayerWeights {
+                    attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
+                    attention_q: load_linear(&layer.attention_q.name)?,
+                    attention_k: load_linear(&layer.attention_k.name)?,
+                    attention_v: load_linear(&layer.attention_v.name)?,
+                    attention_output: load_linear(&layer.attention_output.name)?,
+                    ffn_norm: store.load_cpu_f32(&layer.ffn_norm.name)?,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    moe_router,
+                });
+            } else {
+                layers.push(LlamaLayerWeights {
+                    attention_norm: CpuTensor::from_f32("dummy", vec![0], vec![])?,
+                    attention_q: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    attention_k: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    attention_v: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    attention_output: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    ffn_norm: CpuTensor::from_f32("dummy", vec![0], vec![])?,
+                    ffn_gate: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    ffn_up: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    ffn_down: CpuTensor::from_f32("dummy", vec![0, 0], vec![])?,
+                    moe_router: None,
+                });
+            }
         }
         Ok(Self {
             token_embedding,
@@ -289,18 +323,26 @@ impl LlamaLoadedWeights {
 
     pub fn validate_dense_shapes(&self, config: &LlamaModelConfig) -> Result<()> {
         let dims = DenseLlamaDims::from_config(config)?;
-        require_tensor_shape(
-            &self.token_embedding,
-            &[dims.vocab_size, dims.embedding_length],
-            "token embedding",
-        )?;
-        require_tensor_shape(&self.output_norm, &[dims.embedding_length], "output norm")?;
-        require_matrix_shape(
-            self.output_projection(),
-            dims.embedding_length,
-            dims.vocab_size,
-            "output projection",
-        )?;
+        if !self.token_embedding.shape.dims.is_empty() && self.token_embedding.shape.dims[0] > 0 {
+            require_tensor_shape(
+                &self.token_embedding,
+                &[dims.vocab_size, dims.embedding_length],
+                "token embedding",
+            )?;
+        }
+        if !self.output_norm.shape.dims.is_empty() && self.output_norm.shape.dims[0] > 0 {
+            require_tensor_shape(&self.output_norm, &[dims.embedding_length], "output norm")?;
+        }
+        if !self.token_embedding.shape.dims.is_empty() && self.token_embedding.shape.dims[0] > 0 {
+            if self.output_projection().shape.dims[0] > 0 {
+                require_matrix_shape(
+                    self.output_projection(),
+                    dims.embedding_length,
+                    dims.vocab_size,
+                    "output projection",
+                )?;
+            }
+        }
         if let Some(rope_freqs) = &self.rope_freqs {
             let rope_dim = config.rope_dimension_count.unwrap_or(dims.head_dim as u32) as usize;
             validate_rope_frequency_tensor(rope_freqs, rope_dim)?;
@@ -315,6 +357,10 @@ impl LlamaLoadedWeights {
         }
 
         for (idx, layer) in self.layers.iter().enumerate() {
+            // Skip shape validation for dummy layers (used in distributed model partitioning)
+            if !layer.attention_norm.shape.dims.is_empty() && layer.attention_norm.shape.dims[0] == 0 {
+                continue;
+            }
             require_tensor_shape(
                 &layer.attention_norm,
                 &[dims.embedding_length],
@@ -1082,6 +1128,100 @@ impl LlamaInferenceSession {
         })
     }
 
+    pub fn forward_worker_layers(
+        &mut self,
+        mut hidden: CpuTensor,
+        is_prefill: bool,
+        seq_len: usize,
+        position: usize,
+    ) -> Result<CpuTensor> {
+        let runtime_plan = ResolvedRuntimePlan::from_env()?;
+        let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let k = self.weights.layers.iter().position(|l| l.attention_norm.shape.dims[0] > 0).unwrap_or(0);
+        let n = self.weights.layers.len();
+        tracing::info!("Worker forward_worker_layers: k = {}, n = {}, layers.len = {}", k, n, self.weights.layers.len());
+        for (i, l) in self.weights.layers.iter().enumerate() {
+            tracing::info!("  layer {}: attention_norm shape = {:?}", i, l.attention_norm.shape.dims);
+        }
+
+        if is_prefill {
+            let prefill_base_position = position;
+            let chunk_tokens = 512;
+            let hidden_width = hidden.dim(1)?;
+            let hidden_dims = vec![seq_len, hidden_width];
+            let mut next_hidden = vec![0.0_f32; hidden.data.len()];
+            let mut chunk_input_buffer = Vec::with_capacity(chunk_tokens * hidden_width);
+
+            for layer_idx in k..n {
+                if next_hidden.len() != hidden.data.len() {
+                    next_hidden.resize(hidden.data.len(), 0.0);
+                }
+                let layer = &self.weights.layers[layer_idx];
+                for chunk_start in (0..seq_len).step_by(chunk_tokens) {
+                    let rows_this_chunk = chunk_tokens.min(seq_len - chunk_start);
+                    let chunk_base_position = prefill_base_position + chunk_start;
+                    copy_tensor_rows_into_buffer(
+                        &hidden,
+                        chunk_start,
+                        rows_this_chunk,
+                        &mut chunk_input_buffer,
+                    )?;
+                    let hidden_chunk = CpuTensor::from_f32(
+                        format!("layer_{layer_idx}_prefill_worker_input_{chunk_start}"),
+                        vec![rows_this_chunk, hidden_width],
+                        std::mem::take(&mut chunk_input_buffer),
+                    )?;
+
+                    self.kv_cache.position = chunk_base_position;
+                    let timed = forward_prefill_layer_chunk_timed(
+                        &hidden_chunk,
+                        layer,
+                        PrefillLayerChunkParams {
+                            config: &self.config,
+                            rope_freqs: self.weights.rope_freqs.as_ref(),
+                            rms_norm_epsilon,
+                            layer_idx,
+                            base_position: chunk_base_position,
+                            chunk_start,
+                            chunk_rows: rows_this_chunk,
+                        },
+                        &mut self.kv_cache,
+                    )?;
+                    chunk_input_buffer = hidden_chunk.data;
+                    copy_tensor_rows_into(&timed.output, &mut next_hidden, chunk_start, hidden_width)?;
+                }
+                std::mem::swap(&mut hidden.data, &mut next_hidden);
+                hidden.shape = TensorShape {
+                    dims: hidden_dims.clone(),
+                };
+            }
+            self.kv_cache.position = prefill_base_position + seq_len;
+        } else {
+            self.kv_cache.position = position;
+            for layer_idx in k..n {
+                let layer = &self.weights.layers[layer_idx];
+                let timed = forward_layer_timed(
+                    &hidden,
+                    layer,
+                    ForwardLayerParams {
+                        config: &self.config,
+                        rope_freqs: self.weights.rope_freqs.as_ref(),
+                        rms_norm_epsilon,
+                        layer_idx,
+                        collect_diagnostics: false,
+                        runtime_plan: &runtime_plan,
+                    },
+                    &mut self.kv_cache,
+                )?;
+                hidden = timed.output;
+            }
+            self.kv_cache.position = position + 1;
+        }
+
+        let norm = hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?;
+        Ok(norm)
+    }
+
     pub fn forward_single_token(&mut self, token_id: u32) -> Result<LlamaForwardOutput> {
         Ok(self.forward_single_token_timed_fast(token_id)?.output)
     }
@@ -1142,6 +1282,18 @@ impl LlamaInferenceSession {
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                if layer.attention_norm.shape.dims[0] == 0 {
+                    let worker_response = client.forward_to_worker(
+                        &hidden,
+                        true,
+                        token_ids.len(),
+                        self.kv_cache.position,
+                    )?;
+                    hidden = worker_response;
+                    break;
+                }
+            }
             let timed = forward_prefill_layer_chunk_timed(
                 &hidden,
                 layer,
@@ -1194,11 +1346,13 @@ impl LlamaInferenceSession {
         })
     }
 
+    #[allow(unused_assignments)]
     fn forward_prefill_layer_major_timed_fast_inner(
         &mut self,
         token_ids: &[u32],
         chunk_tokens: usize,
     ) -> Result<LlamaForwardTimings> {
+        tracing::info!("Coordinator forward_prefill_layer_major_timed_fast_inner: token_ids = {}, DISTRIBUTED_CLIENT set = {}", token_ids.len(), crate::distributed::DISTRIBUTED_CLIENT.get().is_some());
         if token_ids.is_empty() {
             return Ok(LlamaForwardTimings::default());
         }
@@ -1246,6 +1400,18 @@ impl LlamaInferenceSession {
         let mut next_hidden = vec![0.0_f32; hidden.data.len()];
         let mut chunk_input_buffer = Vec::with_capacity(chunk_tokens * hidden_width);
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                if layer.attention_norm.shape.dims[0] == 0 {
+                    let worker_response = client.forward_to_worker(
+                        &hidden,
+                        true,
+                        token_ids.len(),
+                        self.kv_cache.position,
+                    )?;
+                    hidden = worker_response;
+                    break;
+                }
+            }
             let hidden_bytes = tensor_f32_bytes(&hidden);
             if next_hidden.len() != hidden.data.len() {
                 next_hidden.resize(hidden.data.len(), 0.0);
@@ -1347,6 +1513,7 @@ impl LlamaInferenceSession {
         Ok(timings)
     }
 
+    #[allow(unused_assignments)]
     fn forward_single_token_timed_internal(
         &mut self,
         token_id: u32,
@@ -1391,6 +1558,19 @@ impl LlamaInferenceSession {
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
         for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
+            if let Some(client) = crate::distributed::DISTRIBUTED_CLIENT.get() {
+                if layer.attention_norm.shape.dims[0] == 0 {
+                    let worker_response = client.forward_to_worker(
+                        &hidden,
+                        false,
+                        1,
+                        self.kv_cache.position,
+                    )?;
+                    hidden = worker_response;
+                    self.kv_cache.position += 1;
+                    break;
+                }
+            }
             trace_forward_memory(&format!("layer_{layer_idx}_start"));
             let timed = forward_layer_timed(
                 &hidden,
@@ -1427,8 +1607,11 @@ impl LlamaInferenceSession {
         let (norm, logits, final_norm_diagnostic, output_norm_stats, logits_stats) =
             if compute_logits {
                 let final_norm_started = Instant::now();
-                let norm =
-                    hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?;
+                let norm = if self.weights.output_norm.shape.dims[0] == 0 {
+                    hidden.clone()
+                } else {
+                    hidden.rms_norm(&self.weights.output_norm, rms_norm_epsilon, "output_norm")?
+                };
                 trace_forward_memory("output_norm_done");
                 let final_norm_diagnostic = collect_diagnostics
                     .then(|| {
@@ -10908,7 +11091,291 @@ fn quantize_q8_0_block(block: &[f32]) -> Q8_0Block {
     Q8_0Block { scale, quants }
 }
 
+fn q8_row_dispatch_enabled() -> bool {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        !q8_0_env_flag_disabled("CAMELID_Q8_ROW_DISPATCH")
+    }
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        #[cfg(test)]
+        {
+            q8_0_env_flag_enabled_default_off("CAMELID_Q8_ROW_DISPATCH")
+        }
+        #[cfg(not(test))]
+        {
+            static Q8_ROW_DISPATCH_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *Q8_ROW_DISPATCH_ENABLED.get_or_init(|| {
+                q8_0_env_flag_enabled_default_off("CAMELID_Q8_ROW_DISPATCH")
+            })
+        }
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_dot_rows_avx2(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let mut total_sum = 0.0_f32;
+
+    for (w_block, i_block) in weight.iter().zip(input) {
+        let weight_i8 = _mm256_loadu_si256(w_block.quants.as_ptr().cast());
+        let input_i8 = _mm256_loadu_si256(i_block.quants.as_ptr().cast());
+
+        let has_min_i8 = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(weight_i8, min_i8))
+            | _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8)))
+            != 0;
+
+        let acc = if has_min_i8 {
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let weight_half = _mm_loadu_si128(w_block.quants.as_ptr().add(offset).cast());
+                let input_half = _mm_loadu_si128(i_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(weight_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(weight_i8, weight_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, weight_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        // Horizontal sum in registers (matches q8_0_i8_block_avx2 exactly)
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256(acc, 1),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0x4E));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0xB1));
+        let block_sum = _mm_cvtsi128_si32(sum32);
+
+        total_sum += block_sum as f32 * w_block.scale * i_block.scale;
+    }
+
+    total_sum
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_two_dot_rows_avx2(
+    first_weight: &[Q8_0Block],
+    second_weight: &[Q8_0Block],
+    input: &[Q8_0Block],
+) -> (f32, f32) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{
+        _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cmpeq_epi8, _mm256_cvtepi8_epi16,
+        _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_madd_epi16, _mm256_maddubs_epi16,
+        _mm256_movemask_epi8, _mm256_mullo_epi16, _mm256_set1_epi16, _mm256_set1_epi8,
+        _mm256_setzero_si256, _mm256_sign_epi8, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128,
+        _mm_shuffle_epi32,
+    };
+
+    let ones = _mm256_set1_epi16(1);
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let mut first_sum = 0.0_f32;
+    let mut second_sum = 0.0_f32;
+
+    for ((first_block, second_block), input_block) in
+        first_weight.iter().zip(second_weight).zip(input)
+    {
+        let input_i8 = _mm256_loadu_si256(input_block.quants.as_ptr().cast());
+        let w1_i8 = _mm256_loadu_si256(first_block.quants.as_ptr().cast());
+        let w2_i8 = _mm256_loadu_si256(second_block.quants.as_ptr().cast());
+
+        let has_min_w1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(w1_i8, min_i8));
+        let has_min_w2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(w2_i8, min_i8));
+        let has_min_input = _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8));
+
+        // first sum
+        let has_min_i8_1 = (has_min_w1 | has_min_input) != 0;
+        let acc1 = if has_min_i8_1 {
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let w1_half = _mm_loadu_si128(first_block.quants.as_ptr().add(offset).cast());
+                let input_half = _mm_loadu_si128(input_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(w1_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(w1_i8, w1_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, w1_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        // second sum
+        let has_min_i8_2 = (has_min_w2 | has_min_input) != 0;
+        let acc2 = if has_min_i8_2 {
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let w2_half = _mm_loadu_si128(second_block.quants.as_ptr().add(offset).cast());
+                let input_half = _mm_loadu_si128(input_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(w2_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(w2_i8, w2_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, w2_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        let mut lanes1 = [0_i32; 8];
+        let mut lanes2 = [0_i32; 8];
+        _mm256_storeu_si256(lanes1.as_mut_ptr().cast(), acc1);
+        _mm256_storeu_si256(lanes2.as_mut_ptr().cast(), acc2);
+
+        let block_sum1: i32 = lanes1.iter().sum();
+        let block_sum2: i32 = lanes2.iter().sum();
+
+        first_sum += block_sum1 as f32 * first_block.scale * input_block.scale;
+        second_sum += block_sum2 as f32 * second_block.scale * input_block.scale;
+    }
+
+    (first_sum, second_sum)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_dot_rows_neon_dotprod(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
+    use std::arch::asm;
+
+    let mut total_sum = 0.0_f32;
+
+    for (w_block, i_block) in weight.iter().zip(input) {
+        let weight_lo = vld1q_s8(w_block.quants.as_ptr());
+        let input_lo = vld1q_s8(i_block.quants.as_ptr());
+        let weight_hi = vld1q_s8(w_block.quants.as_ptr().add(16));
+        let input_hi = vld1q_s8(i_block.quants.as_ptr().add(16));
+
+        let mut acc = vdupq_n_s32(0);
+        asm!(
+            "sdot {acc:v}.4s, {weight_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc:v}.4s, {weight_hi:v}.16b, {input_hi:v}.16b",
+            acc = inout(vreg) acc,
+            weight_lo = in(vreg) weight_lo,
+            input_lo = in(vreg) input_lo,
+            weight_hi = in(vreg) weight_hi,
+            input_hi = in(vreg) input_hi,
+            options(nostack, preserves_flags)
+        );
+
+        // Keep horizontal sum exactly identical to existing register horizontal sum
+        let int_sum = horizontal_sum_i32x4(acc);
+        total_sum += int_sum as f32 * w_block.scale * i_block.scale;
+    }
+
+    total_sum
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[target_feature(enable = "dotprod")]
+unsafe fn q8_0_two_dot_rows_neon_dotprod(
+    first_weight: &[Q8_0Block],
+    second_weight: &[Q8_0Block],
+    input: &[Q8_0Block],
+) -> (f32, f32) {
+    use std::arch::aarch64::{vdupq_n_s32, vld1q_s8};
+    use std::arch::asm;
+
+    let mut first_sum = 0.0_f32;
+    let mut second_sum = 0.0_f32;
+
+    for ((first_block, second_block), input_block) in
+        first_weight.iter().zip(second_weight).zip(input)
+    {
+        let input_lo = vld1q_s8(input_block.quants.as_ptr());
+        let input_hi = vld1q_s8(input_block.quants.as_ptr().add(16));
+
+        let w1_lo = vld1q_s8(first_block.quants.as_ptr());
+        let w1_hi = vld1q_s8(first_block.quants.as_ptr().add(16));
+
+        let w2_lo = vld1q_s8(second_block.quants.as_ptr());
+        let w2_hi = vld1q_s8(second_block.quants.as_ptr().add(16));
+
+        let mut acc1 = vdupq_n_s32(0);
+        let mut acc2 = vdupq_n_s32(0);
+
+        asm!(
+            "sdot {acc1:v}.4s, {w1_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc1:v}.4s, {w1_hi:v}.16b, {input_hi:v}.16b",
+            "sdot {acc2:v}.4s, {w2_lo:v}.16b, {input_lo:v}.16b",
+            "sdot {acc2:v}.4s, {w2_hi:v}.16b, {input_hi:v}.16b",
+            acc1 = inout(vreg) acc1,
+            acc2 = inout(vreg) acc2,
+            w1_lo = in(vreg) w1_lo,
+            w1_hi = in(vreg) w1_hi,
+            w2_lo = in(vreg) w2_lo,
+            w2_hi = in(vreg) w2_hi,
+            input_lo = in(vreg) input_lo,
+            input_hi = in(vreg) input_hi,
+            options(nostack, preserves_flags)
+        );
+
+        let int_sum1 = horizontal_sum_i32x4(acc1);
+        let int_sum2 = horizontal_sum_i32x4(acc2);
+
+        first_sum += int_sum1 as f32 * first_block.scale * input_block.scale;
+        second_sum += int_sum2 as f32 * second_block.scale * input_block.scale;
+    }
+
+    (first_sum, second_sum)
+}
+
 fn q8_0_dot_rows(weight: &[Q8_0Block], input: &[Q8_0Block]) -> f32 {
+    if q8_row_dispatch_enabled() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if aarch64_dotprod_enabled() {
+                return unsafe { q8_0_dot_rows_neon_dotprod(weight, input) };
+            }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return unsafe { q8_0_dot_rows_avx2(weight, input) };
+            }
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if aarch64_dotprod_enabled() {
@@ -10934,6 +11401,21 @@ fn q8_0_two_dot_rows(
     second_weight: &[Q8_0Block],
     input: &[Q8_0Block],
 ) -> (f32, f32) {
+    if q8_row_dispatch_enabled() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            if aarch64_dotprod_enabled() {
+                return unsafe { q8_0_two_dot_rows_neon_dotprod(first_weight, second_weight, input) };
+            }
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                return unsafe { q8_0_two_dot_rows_avx2(first_weight, second_weight, input) };
+            }
+        }
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         if aarch64_dotprod_enabled() {

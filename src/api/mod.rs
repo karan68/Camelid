@@ -2325,14 +2325,26 @@ async fn prepare_generation(
             )
         })?;
         let store = TensorStore::open(&model.path, &model.gguf);
-        let weights = Arc::new(LlamaLoadedWeights::load(&store, binding).map_err(|err| {
-            api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "loaded_cpu_weights_unavailable",
-                err.to_string(),
-                Some("model"),
-            )
-        })?);
+        let weights = if let Some(&(layer_start, layer_end)) = crate::distributed::DISTRIBUTED_RANGE.get() {
+            tracing::info!("API loader running in distributed coordinator mode; loading layers {}..{}", layer_start, layer_end);
+            Arc::new(LlamaLoadedWeights::load_distributed(&store, binding, layer_start, layer_end, true, true).map_err(|err| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "loaded_cpu_weights_unavailable",
+                    err.to_string(),
+                    Some("model"),
+                )
+            })?)
+        } else {
+            Arc::new(LlamaLoadedWeights::load(&store, binding).map_err(|err| {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "loaded_cpu_weights_unavailable",
+                    err.to_string(),
+                    Some("model"),
+                )
+            })?)
+        };
         *state.cached_weights.write().await = Some(CachedLlamaWeights {
             model_id: model.id.clone(),
             path: model.path.clone(),
