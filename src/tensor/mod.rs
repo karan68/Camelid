@@ -49,6 +49,27 @@ pub(crate) fn disable_file_cache_best_effort(file: &File) {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn disable_file_cache_best_effort(_file: &File) {}
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32,
+        trans_a: i32,
+        trans_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: f32,
+        a: *const f32,
+        lda: i32,
+        b: *const f32,
+        ldb: i32,
+        beta: f32,
+        c: *mut f32,
+        ldc: i32,
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorShape {
     pub dims: Vec<usize>,
@@ -1257,31 +1278,73 @@ impl CpuTensor {
             )));
         }
         let mut out = vec![0.0; m * n];
-        if should_parallelize_linear_output(n) {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                out_row
-                    .par_iter_mut()
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            unsafe {
+                cblas_sgemm(
+                    101, // CBLAS_ROW_MAJOR
+                    111, // CBLAS_NO_TRANS
+                    111, // CBLAS_NO_TRANS
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    self.data.as_ptr(),
+                    k as i32,
+                    rhs.data.as_ptr(),
+                    n as i32,
+                    0.0,
+                    out.as_mut_ptr(),
+                    n as i32,
+                );
+            }
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if should_parallelize_linear_output(n) {
+                for row in 0..m {
+                    let lhs_start = row * k;
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
+                    out_row
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(col, out_value)| {
+                            let mut sum = 0.0;
+                            for inner in 0..k {
+                                let lhs_value = self.data[lhs_start + inner];
+                                if lhs_value == 0.0 {
+                                    continue;
+                                }
+                                sum += lhs_value * rhs.data[inner * n + col];
+                            }
+                            *out_value = sum;
+                        });
+                }
+            } else if should_parallelize_linear_output(m * n) {
+                out.par_chunks_mut(n)
                     .enumerate()
-                    .for_each(|(col, out_value)| {
-                        let mut sum = 0.0;
+                    .for_each(|(row, out_row)| {
+                        let lhs_start = row * k;
                         for inner in 0..k {
                             let lhs_value = self.data[lhs_start + inner];
                             if lhs_value == 0.0 {
                                 continue;
                             }
-                            sum += lhs_value * rhs.data[inner * n + col];
+                            let rhs_start = inner * n;
+                            let rhs_row = &rhs.data[rhs_start..rhs_start + n];
+                            for col in 0..n {
+                                out_row[col] += lhs_value * rhs_row[col];
+                            }
                         }
-                        *out_value = sum;
                     });
-            }
-        } else if should_parallelize_linear_output(m * n) {
-            out.par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(row, out_row)| {
+            } else {
+                for row in 0..m {
                     let lhs_start = row * k;
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
                     for inner in 0..k {
                         let lhs_value = self.data[lhs_start + inner];
                         if lhs_value == 0.0 {
@@ -1293,25 +1356,10 @@ impl CpuTensor {
                             out_row[col] += lhs_value * rhs_row[col];
                         }
                     }
-                });
-        } else {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                for inner in 0..k {
-                    let lhs_value = self.data[lhs_start + inner];
-                    if lhs_value == 0.0 {
-                        continue;
-                    }
-                    let rhs_start = inner * n;
-                    let rhs_row = &rhs.data[rhs_start..rhs_start + n];
-                    for col in 0..n {
-                        out_row[col] += lhs_value * rhs_row[col];
-                    }
                 }
             }
         }
+
         Self::from_f32(name, vec![m, n], out)
     }
 
@@ -1330,48 +1378,76 @@ impl CpuTensor {
             )));
         }
         let mut out = vec![0.0; m * n];
-        if should_parallelize_linear_output(n) {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let lhs_row = &self.data[lhs_start..lhs_start + k];
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                out_row
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(col, out_value)| {
-                        let rhs_start = col * k;
-                        let rhs_row = &rhs.data[rhs_start..rhs_start + k];
-                        *out_value = dot_product(lhs_row, rhs_row);
-                    });
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            unsafe {
+                cblas_sgemm(
+                    101, // CBLAS_ROW_MAJOR
+                    111, // CBLAS_NO_TRANS
+                    112, // CBLAS_TRANS
+                    m as i32,
+                    n as i32,
+                    k as i32,
+                    1.0,
+                    self.data.as_ptr(),
+                    k as i32,
+                    rhs.data.as_ptr(),
+                    k as i32,
+                    0.0,
+                    out.as_mut_ptr(),
+                    n as i32,
+                );
             }
-        } else if should_parallelize_linear_output(m * n) {
-            out.par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(row, out_row)| {
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            if should_parallelize_linear_output(n) {
+                for row in 0..m {
                     let lhs_start = row * k;
                     let lhs_row = &self.data[lhs_start..lhs_start + k];
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
+                    out_row
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(col, out_value)| {
+                            let rhs_start = col * k;
+                            let rhs_row = &rhs.data[rhs_start..rhs_start + k];
+                            *out_value = dot_product(lhs_row, rhs_row);
+                        });
+                }
+            } else if should_parallelize_linear_output(m * n) {
+                out.par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(row, out_row)| {
+                        let lhs_start = row * k;
+                        let lhs_row = &self.data[lhs_start..lhs_start + k];
+                        for (col, out_value) in out_row.iter_mut().enumerate() {
+                            let rhs_start = col * k;
+                            let rhs_row = &rhs.data[rhs_start..rhs_start + k];
+                            *out_value = dot_product(lhs_row, rhs_row);
+                        }
+                    });
+            } else {
+                for row in 0..m {
+                    let lhs_start = row * k;
+                    let lhs_row = &self.data[lhs_start..lhs_start + k];
+                    let out_start = row * n;
+                    let out_row = &mut out[out_start..out_start + n];
                     for (col, out_value) in out_row.iter_mut().enumerate() {
                         let rhs_start = col * k;
                         let rhs_row = &rhs.data[rhs_start..rhs_start + k];
                         *out_value = dot_product(lhs_row, rhs_row);
                     }
-                });
-        } else {
-            for row in 0..m {
-                let lhs_start = row * k;
-                let lhs_row = &self.data[lhs_start..lhs_start + k];
-                let out_start = row * n;
-                let out_row = &mut out[out_start..out_start + n];
-                for (col, out_value) in out_row.iter_mut().enumerate() {
-                    let rhs_start = col * k;
-                    let rhs_row = &rhs.data[rhs_start..rhs_start + k];
-                    *out_value = dot_product(lhs_row, rhs_row);
                 }
             }
         }
+
         Self::from_f32(name, vec![m, n], out)
     }
+
 
     fn require_row_major_f32_data(&self, context: &str) -> Result<()> {
         let expected_len = self.shape.element_count()?;
