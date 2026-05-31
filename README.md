@@ -1,103 +1,60 @@
-# 🐫 Camelid
+# Camelid
 
-[![CI][ci-badge]][ci-workflow]
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust: 1.87+](https://img.shields.io/badge/Rust-1.87%2B-orange.svg)](rust-toolchain.toml)
+Camelid is a Rust-native local GGUF inference backend with an evidence-gated support contract. The v0.1 release candidate is intentionally narrow: it publishes exact model rows that have row-specific validation, and it keeps everything else behind explicit blockers.
 
-**Camelid** is a state-of-the-art, Rust-native local inference engine for GGUF language models. It is designed for maximum speed, strict trust guarantees, and hardware saturation on modern platforms, especially Apple Silicon macOS. 
+Camelid is not presented as broad Llama, Mistral, Mixtral, distributed, production-throughput, or universal frontend support. If a model row, quantization, context window, comparator result, or UI readiness state is not backed by a cited artifact, it is outside the public v0.1 claim.
 
-Instead of optimistic compatibility claims, Camelid matches trusted inference baselines with 1:1 mathematical token parity and enforces an exact-row evidence-backed supported matrix.
+## Current Release Boundary
 
----
+[`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the v0.1 release-candidate support contract. It is stricter than the broader repository docs where those docs conflict with current evidence. The short version is:
 
-## ⚡ Hardware-Saturated Performance
+| Exact row | v0.1 public status | Checked boundary |
+| --- | --- | --- |
+| TinyLlama 1.1B Chat Q8_0 | Verified support gate | Parity, API/WebUI, template-shape, bounded 512-context, and RSS/perf evidence. |
+| Llama 3.2 1B Instruct Q8_0 | Verified bounded support | Load, completions, chat completions, WebUI, parity, row-scoped template evidence, unique-chat RSS/perf, and checked bounded context packs through 8192 where cited. |
+| Llama 3.2 3B Instruct Q8_0 | Supported exact-row smoke | Canonical API/WebUI support-gate refresh, compact/broader parity, template evidence, bounded RSS/perf, and checked 512/1024/2048 context packs where cited. |
+| Llama 3 8B Instruct Q8_0 | Verified bounded support | Compact/broader parity, API/WebUI, bounded memory evidence, and checked 512/1024/2048 context packs where cited. |
+| Mistral-7B-Instruct-v0.3 Q8_0 | Evidence-only bring-up | Load, tokenizer/template, one-token parity, broader 50-token parity, and checked 512/1024/2048/4096/8192 context evidence exist, but the API/WebUI support contract is still fail-closed for v0.1. |
+| Mixtral-8x7B-Instruct-v0.1 Q8_0 | Active validation only | Bounded one-token backend MoE runtime evidence exists, but later-generation parity and continuation/API/WebUI readiness remain blocked. |
+| Qwen2.5-7B-Instruct Q8_0 | Planned candidate only | No support claim. |
+| gemma-2-9b-it Q8_0 | Planned candidate only | No support claim. |
 
-Camelid bypasses high-level compilation abstractions to write bare-metal math kernels directly in AArch64 assembly and vectorized NEON SIMD.
+Nothing adjacent inherits support across size, quantization, tokenizer, context, API surface, or frontend state.
 
-```text
-               ┌────────────────────────────────────────────────────────┐
-               │              Camelid AArch64 SIMD Engine               │
-               └────────────────────────────────────────────────────────┘
-                                    │
-         ┌──────────────────────────┼──────────────────────────┐
-         ▼                          ▼                          ▼
- ┌───────────────┐          ┌───────────────┐          ┌───────────────┐
- │   i8mm GEMM   │          │  DotProd GEMV │          │   NEON Core   │
- │ (smmla, 4x8)  │          │ (sdot, 4x4)   │          │ (vadd, vmul)  │
- └───────────────┘          └───────────────┘          └───────────────┘
-   Prefill Phase             Decode Phase               Activation/Norm
-   64 MACs/cycle             4 MACs/cycle               128-bit Vectors
-```
+## What v0.1 Is For
 
-*   **Bare-Metal AArch64 Matrix Multiplication (`smmla`)**: Emits matrix multiply-accumulate instructions in hardware, performing 64 8-bit MAC operations per clock cycle to saturate prefill throughput.
-*   **Vectorized Decode Kernels (`sdot`)**: Performs high-speed row-major matrix-vector dot-products directly on repacked Q8_0 weights, eliminating dequantization overhead on Apple Silicon.
-*   **128-bit NEON Element-Wise & Reduction Pipelines**: Vectorizes input block quantization, RMS Normalization (`rms_norm`), SiLU activations, and element-wise additions/multiplications into parallel SIMD register operations.
-*   **Performance-Core Thread Scheduling**: Binds Rayon multi-threaded loops strictly to physical Performance (P) Cores, avoiding Efficiency core synchronization delays that derail inference latency.
+Camelid v0.1 is a release candidate for reviewers who care about reproducible local-inference evidence:
 
----
+- exact-row compatibility language instead of family-wide claims
+- committed parity, context, API/WebUI, RSS, and benchmark artifacts
+- explicit unsupported states for partial or blocked rows
+- small local gates that contributors can run before changing support-sensitive code
 
-## 🌐 High-Speed Distributed Clustering
+The benchmark story is similarly bounded. Camelid publishes memory and timing snapshots that are already committed in evidence bundles. It does not yet publish a complete apples-to-apples throughput table against llama.cpp for every headline row.
 
-Scale model inference across multiple machines (such as Mac minis) using high-speed interfaces like direct **Thunderbolt 4 Bridge Networking** (IP-over-Thunderbolt) for microsecond-scale bus latency.
+## Quickstart
 
-*   **Split-Model Parallelization**: Partition layers dynamically across nodes (e.g., Coordinator evaluates layers $0..K$ locally, Worker evaluates layers $K..N$).
-*   **Zero dequantization/repack overhead**: Coordinator and Worker communicate raw activations over a custom high-performance socket transport.
-*   **TCP Bus Telemetry**: Includes a built-in `bench-network` tool to physically measure link round-trip time (RTT) and throughput.
-
----
-
-## 💎 Google Gemini-Style Frontend
-
-Camelid includes a built-in React/Vite web interface inside [frontend/](frontend/) that replicates a premium Google Gemini experience:
-*   **Curated Aesthetics**: Harmonious dark mode palettes, subtle glowing gradients, glassmorphic layout rails, and micro-animations.
-*   **Honest Readiness Signals**: Interaction panels dynamically reflect loaded GGUF capabilities, locking inputs until a model is fully validated.
-*   **Intuitive Chat Surface**: Product-forward conversation area that emphasizes responsiveness.
-
----
-
-## 📋 Exact-Row Support Matrix
-
-Camelid enforces a strict evidence boundary. Support is exact-row only; neighboring sizes, formats, or tokenizers must have their own verification benchmarks before public readiness.
-
-| Exact Model Row | Public Status | Current Evidence Boundary |
-| :--- | :--- | :--- |
-| **TinyLlama 1.1B Chat Q8_0** | **Verified Support** | End-to-end generation, 50-token reference parity, and checked 512-context. |
-| **Llama 3.2 1B Instruct Q8_0** | **Verified Bounded Support** | Load, OpenAI API, WebUI chat, 1:1 token parity, and checked 512/1024 context. |
-| **Llama 3.2 3B Instruct Q8_0** | **Smoke Supported** | Compact/broader 50-token reference parity, API/WebUI smoke, and 2048 context. |
-| **Llama 3 8B Instruct Q8_0** | **Verified Bounded Support** | completions, chat completions, WebUI validation, and lazy-Q8 read hot-paths. |
-| **Mistral-7B-Instruct-v0.3 Q8_0**| **Smoke Supported** | Exact-row load, tokenizer, 50-token parity, and checked 4096 context. |
-| **Mixtral-8x7B-Instruct-v0.1** | **Backend Support Only** | One-token MoE backend execution. Later-generation divergence remains blocked. |
-
----
-
-## 🚀 Quickstart
-
-Verify that Camelid builds cleanly, starts the backend, and serves a live API endpoint locally.
-
-### 1) Build and Run the Server
-
-Ensure you are using Rust 1.87+ and target native CPU instruction sets during compilation:
+Build the backend:
 
 ```bash
-# Build optimized for your CPU
-RUSTFLAGS="-C target-cpu=native" cargo build --release
-
-# Serve a local GGUF model
-./target/release/camelid serve --model /path/to/Llama-3.2-3B-Instruct-Q8_0.gguf --threads 4
+cargo build --release
 ```
-*Note: Set `--threads` exactly to your machine's physical Performance Core count (e.g. `sysctl -a | grep hw.perflevel0.physicalcpu` on macOS) to bypass scheduling traps.*
 
-### 2) Verify Capabilities API
+Serve a local GGUF model:
 
-Verify that the local capabilities discovery is reachable:
+```bash
+./target/release/camelid serve \
+  --model /path/to/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --threads 4
+```
+
+Check local capability reporting:
 
 ```bash
 curl -s http://127.0.0.1:8181/api/capabilities
 ```
 
-### 3) Start the Gemini WebUI
-
-Run the React/Vite development server locally to access the premium front-end chat surface:
+Run the frontend development server:
 
 ```bash
 cd frontend
@@ -105,36 +62,11 @@ npm ci
 npm run dev
 ```
 
----
+The frontend is a local React/Vite chat surface. Its readiness state should be read literally: chat is enabled only when the loaded model row is recognized as supported by the current compatibility contract.
 
-## 🤝 High-Speed Cluster Commands
+## Validation
 
-To scale across two Mac minis using direct IP-over-Thunderbolt bridges:
-
-#### 1. On Worker Mini (`192.168.0.2`):
-```bash
-./target/release/camelid serve-distributed \
-    --role worker \
-    --addr 192.168.0.2:8089 \
-    --layer-range 16..32 \
-    --model /path/to/model.gguf
-```
-
-#### 2. On Coordinator Mini (`192.168.0.1`):
-```bash
-./target/release/camelid serve-distributed \
-    --role coordinator \
-    --addr 192.168.0.1:8181 \
-    --worker-addr 192.168.0.2:8089 \
-    --layer-range 0..16 \
-    --model /path/to/model.gguf
-```
-
----
-
-## 🧪 Validation & Formatting
-
-Keep the repository clean, fully validated, and formatted before committing changes:
+For normal code changes, start with:
 
 ```bash
 cargo fmt --all -- --check
@@ -142,29 +74,35 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-For front-end development, check compiling outputs:
+For public evidence and release-doc changes, also run:
 
 ```bash
-cd frontend
-npm run build
+node scripts/check-public-evidence-claims.mjs
+bash scripts/check-public-scrub.sh
+cd frontend && npm ci && npm run build && npm run smoke:model-state
 ```
 
----
+Real-model parity, comparator baselines, and full v0.1 evidence bundles require model files and comparator runtimes that are not vendored in this repository. Those runs must record the exact model path, hash, runtime versions, commands, timing, memory, and pass/fail status in a scrubbed evidence bundle.
 
-## 🗺️ Documentation Map
+## Documentation Map
 
-*   [`COMPATIBILITY.md`](COMPATIBILITY.md) — Exact support criteria and ledgers
-*   [`STATUS.md`](STATUS.md) — Active blockers, evidence checkpoints, and benchmarks
-*   [`ROADMAP.md`](ROADMAP.md) — Engineering sequencing and delivery goals
-*   [`ARCHITECTURE.md`](ARCHITECTURE.md) — Deep architectural module layouts
+- [`COMPATIBILITY.md`](COMPATIBILITY.md) - authoritative support contract
+- [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) - v0.1 release-candidate support boundary
+- [`CORRECTNESS_v0.1.md`](CORRECTNESS_v0.1.md) - v0.1 correctness boundary
+- [`STATUS.md`](STATUS.md) - current evidence snapshot and blockers
+- [`BENCHMARKS.md`](BENCHMARKS.md) - committed benchmark snapshot and claim rules
+- [`RELEASE_NOTES_v0.1.md`](RELEASE_NOTES_v0.1.md) - v0.1 release candidate notes
+- [`BENCHMARKS_v0.1.md`](BENCHMARKS_v0.1.md) - v0.1 benchmark posture
+- [`MARKET_POSITIONING_v0.1.md`](MARKET_POSITIONING_v0.1.md) - public positioning guardrails
+- [`RELEASE_GATE_v0.1.md`](RELEASE_GATE_v0.1.md) - release gate commands and status
+- [`ROADMAP.md`](ROADMAP.md) - planned engineering sequence
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) - implementation architecture
 
----
+## License and Reference Credits
 
-## 📜 License and Reference Credits
+Camelid is licensed under the [MIT License](LICENSE).
 
-Camelid is open-source and licensed under the [MIT License](LICENSE).
-
-Camelid's tokenizer, reference compatibility layouts, and validation benchmarks are inspired by and checked against [`llama.cpp`](https://github.com/ggml-org/llama.cpp) (Copyright (c) 2023-2026 The ggml authors, MIT License). Camelid maintains its original Rust-native codebase while proudly crediting the extraordinary reference work of the broader `ggml` ecosystem.
+Camelid's tokenizer, reference compatibility layouts, and validation benchmarks are inspired by and checked against [`llama.cpp`](https://github.com/ggml-org/llama.cpp) (Copyright (c) 2023-2026 The ggml authors, MIT License). Camelid maintains its own Rust-native codebase while crediting the reference work of the `ggml` ecosystem.
 
 [ci-badge]: https://github.com/timtoole02/Camelid/actions/workflows/ci.yml/badge.svg
 [ci-workflow]: https://github.com/timtoole02/Camelid/actions/workflows/ci.yml
