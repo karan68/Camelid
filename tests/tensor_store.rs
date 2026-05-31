@@ -905,12 +905,36 @@ fn rejects_non_q8_0_block_only_loads() {
 }
 
 #[test]
-fn rejects_planned_quant_tensors_until_dequant_support_exists() {
-    for (name, tensor_type, dims, payload_len) in [
-        ("q4_0", 2, [32_i64].as_slice(), 18_usize),
-        ("q5_0", 6, [32_i64].as_slice(), 22_usize),
-        ("q4_k", 12, [256_i64].as_slice(), 144_usize),
-        ("q5_k", 13, [256_i64].as_slice(), 176_usize),
+fn lower_bit_quant_tensors_decode_to_reference_f32_loads() {
+    for (name, tensor_type, dims, payload_len, source_type) in [
+        (
+            "q4_0",
+            2,
+            [32_i64].as_slice(),
+            18_usize,
+            GgufTensorType::Q4_0,
+        ),
+        (
+            "q5_0",
+            6,
+            [32_i64].as_slice(),
+            22_usize,
+            GgufTensorType::Q5_0,
+        ),
+        (
+            "q4_k",
+            12,
+            [256_i64].as_slice(),
+            144_usize,
+            GgufTensorType::Q4K,
+        ),
+        (
+            "q5_k",
+            13,
+            [256_i64].as_slice(),
+            176_usize,
+            GgufTensorType::Q5K,
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(format!("{name}.gguf"));
@@ -918,10 +942,12 @@ fn rejects_planned_quant_tensors_until_dequant_support_exists() {
 
         let gguf = read_metadata(&path).unwrap();
         let store = TensorStore::open(&path, &gguf);
-        let err = store.load_cpu_f32("test.weight").unwrap_err().to_string();
+        let tensor = store.load_cpu_f32("test.weight").unwrap();
+        let expected_dims = dims.iter().map(|dim| *dim as usize).collect::<Vec<usize>>();
 
-        assert!(err.contains("unsupported storage type"), "{name}: {err}");
-        assert!(err.contains("F32, F16, BF16, Q8_0"), "{name}: {err}");
+        assert_eq!(tensor.source_type, Some(source_type), "{name}");
+        assert_eq!(tensor.shape.dims, expected_dims, "{name}");
+        assert_eq!(tensor.data.len(), dims[0] as usize, "{name}");
     }
 }
 

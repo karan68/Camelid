@@ -38,7 +38,7 @@ Because `mlx_lm` is missing, no fresh v0.1 MLX run was performed.
 Use an isolated Python environment that has `mlx-lm` installed. Do not commit virtualenvs or downloaded model caches.
 
 ```sh
-cd /Users/timtoole/.openclaw/workspace/projects/Camelid-v0.1-evidence
+cd <repo>
 
 PYTHON=/path/to/python-with-mlx-lm \
 node scripts/bench-mlx-memory.mjs \

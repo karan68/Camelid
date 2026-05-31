@@ -33,7 +33,7 @@ Release boundary: this historical artifact is not the v0.1 baseline because the 
 Run from the release worktree:
 
 ```sh
-cd /Users/timtoole/.openclaw/workspace/projects/Camelid-v0.1-evidence
+cd <repo>
 cargo build --release
 
 CAMELID_BIN=target/release/camelid \
@@ -58,7 +58,7 @@ The harness starts llama.cpp with `-ngl 0`, so this is the CPU-only comparator.
 The existing same-host harness can compare against a manually-started Metal llama.cpp server by disabling llama-server startup:
 
 ```sh
-cd /Users/timtoole/.openclaw/workspace/projects/Camelid-v0.1-evidence
+cd <repo>
 
 "$LLAMA_CPP_BUILD/bin/llama-server" \
   --host 127.0.0.1 \

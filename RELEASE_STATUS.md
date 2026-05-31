@@ -4,11 +4,11 @@ Last updated: 2026-05-31
 
 Branch: `release/v0.1-evidence`
 
-Current release SHA: release branch HEAD; record exact SHA when cutting rc1
+Current release SHA: release branch HEAD after this gate-refresh commit
 
 Release target: `v0.1.0-rc1`
 
-Release posture: evidence release candidate in progress. No tag is allowed until all release gates below pass and the release captain signs off.
+Release posture: evidence release candidate in progress. Lightweight gates now pass locally, but no tag is allowed until real comparator evidence exists and the release captain signs off.
 
 ## Latest Release Captain Update
 
@@ -16,30 +16,29 @@ Camelid v0.1 update:
 
 Shipped:
 
-- Created clean release worktree on `release/v0.1-evidence` from `origin/main`.
-- Added this release status ledger and gate checklist.
-- Spawned scoped lanes for benchmark harness, correctness/support docs, comparator baselines, public docs, and QA gate.
-- Created durable isolated cron release-captain job `86d81dd7-ace2-4739-a3d8-8bc15de73e23` on a 30-minute cadence with no public delivery until release evidence is ready.
-- Generated dry-run harness bundle `qa/evidence-bundles/v0.1/dryrun-release-captain/` to prove bundle layout; it is skipped/dry-run evidence only, not benchmark evidence.
+- Tightened the runtime/API/frontend support contract so Mistral is evidence-only and fail-closed for v0.1.
+- Removed Mistral from frontend tracked full-support rows and moved the API Mistral family posture out of `supported_model_families`.
+- Cleared Rust format, clippy, full test suite, Metal tests, release build, frontend build/smoke, harness self-test, public evidence-claim check, and public scrub guard locally.
+- Preserved the dirty primary checkout; all edits landed only in the release worktree.
 
 Evidence:
 
-- Primary checkout was inspected before release edits and found dirty; no release edits were made there.
-- Release worktree starts clean at source SHA `b6a769301415d0f91cba7b9a043f9f925fa4b884`.
-- Durable continuation is enabled through cron job `86d81dd7-ace2-4739-a3d8-8bc15de73e23`; the isolated job has no pinned session key.
-- Dry-run harness output contains the required files: `machine.json`, `model_manifest.json`, `commands.md`, `raw_logs/`, `results.json`, `results.csv`, and `summary.md`.
+- Full local gate evidence is recorded in `RELEASE_GATE_v0.1.md`.
+- `cargo test --all-targets --all-features --no-fail-fast` passed, including Metal unit tests.
+- `cd frontend && npm run build && npm run smoke:model-state` passed.
+- `qa/evidence-bundles/v0.1/dryrun-release-captain/` still exists as skipped/dry-run harness evidence only.
 
 Blocker/Risk:
 
-- Existing README and status language currently contain broad performance/UI/distributed phrasing that is not v0.1-safe until backed by fresh evidence or rewritten.
-- Existing evidence bundles cite many historical SHAs; v0.1 needs a fresh bundle tied to this release branch SHA before an rc tag.
-- The current v0.1 bundle is dry-run only: all four entries are `skipped`, so the real benchmark gate remains blocked.
+- Real comparator evidence is still missing. The release branch has not yet produced actual llama.cpp, Ollama, or MLX v0.1 benchmark bundles.
+- Existing historical bundles remain context only unless recaptured at the release branch SHA.
+- No `v0.1.0-rc1` tag is allowed yet.
 
 Next:
 
-- Run real Camelid/llama.cpp/Ollama/MLX comparator entries or explicitly defer them with release-captain rationale.
-- Run lightweight harness self-tests and repo QA.
-- Decide which comparator baselines can be run immediately on local macOS versus explicitly deferred.
+- Run the real comparator matrix against llama.cpp, Ollama, and MLX where available.
+- Save real benchmark output under `qa/evidence-bundles/v0.1/<timestamp>/`.
+- Update comparator docs and release report from actual results, including losses.
 
 Need Tim:
 
@@ -47,9 +46,9 @@ Need Tim:
 
 ## Current Checkout
 
-- Primary repo checkout inspected: `/Users/timtoole/.openclaw/workspace/projects/Camelid`
+- Primary repo checkout inspected: `<primary-checkout>`
 - Primary checkout state at start: `main`, SHA `1b207f953ad8d40abcd833bf4d4677b22d44b334`, behind `origin/main` by 17 commits, with existing uncommitted work.
-- Release worktree: `/Users/timtoole/.openclaw/workspace/projects/Camelid-v0.1-evidence`
+- Release worktree: `<release-worktree>`
 - Release worktree state at start: clean branch `release/v0.1-evidence` from `origin/main` at the release branch HEAD
 - Preservation rule: the dirty primary checkout is not modified by this release lane.
 

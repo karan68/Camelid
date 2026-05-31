@@ -1,12 +1,12 @@
 # Camelid v0.1 Release Candidate Report
 
-Current SHA: release branch HEAD; record exact SHA when cutting rc1
+Current SHA: release branch HEAD after this gate-refresh commit
 
 Branch: `release/v0.1-evidence`
 
 Tag candidate: `v0.1.0-rc1`
 
-Release status: not ready. The release branch now has v0.1 docs, a benchmark harness, comparator baseline plans, a dry-run evidence bundle, and concrete gate failures.
+Release status: not ready to tag. The release branch now has v0.1 docs, a benchmark harness, comparator baseline plans, a dry-run evidence bundle, and passing lightweight gates. Real comparator evidence is still missing.
 
 Supported model rows:
 
@@ -17,7 +17,7 @@ Supported model rows:
 
 Correctness summary: `SUPPORT_MATRIX_v0.1.md` and `CORRECTNESS_v0.1.md` define the v0.1 boundary. Mistral is downgraded to evidence-only bring-up because the current API/WebUI support-surface evidence is fail-closed. Mixtral remains unsupported beyond bounded one-token backend MoE runtime evidence.
 
-Benchmark summary: `tools/bench/v0.1-benchmark-harness.mjs` can emit the required bundle layout and passed its synthetic self-test. `qa/evidence-bundles/v0.1/dryrun-release-captain/` proves output shape only; it is not runtime benchmark evidence.
+Benchmark summary: `tools/bench/v0.1-benchmark-harness.mjs` can emit the required bundle layout and passed its synthetic self-test. `qa/evidence-bundles/v0.1/dryrun-release-captain/` proves output shape only; it is not runtime benchmark evidence. No real v0.1 comparator bundle has been created yet.
 
 Where Camelid wins: not claimed for v0.1 yet. Real comparator benchmark evidence is still missing.
 
@@ -49,14 +49,10 @@ Docs changed:
 - `DISTRIBUTED_MAC_v0.1.md`
 - `RELEASE_GATE_v0.1.md`
 
-Tests run: see `RELEASE_GATE_v0.1.md`.
+Tests run: see `RELEASE_GATE_v0.1.md`. Local lightweight gates pass, including `cargo fmt --all -- --check`, clippy, cargo check, full Rust tests, release build, frontend build/model-state smoke, harness self-test, public evidence-claim check, and public scrub guard.
 
 Remaining blockers:
 
-- Rust formatting gate fails on existing source drift.
-- Clippy gate fails on existing warnings.
-- Full Rust test gate fails on five Metal tests.
-- Frontend model-state smoke fails because runtime capability data still exposes Mistral in the tracked hardening set.
 - Real v0.1 comparator benchmark evidence has not been generated.
 - Comparator baselines have not been finalized or explicitly release-captain-deferred.
 

@@ -24,7 +24,7 @@ Current evidence boundary:
 This check is useful before a real two-Mac run, but it is not a distributed release baseline:
 
 ```sh
-cd /Users/timtoole/.openclaw/workspace/projects/Camelid-v0.1-evidence
+cd <repo>
 cargo test --test distributed_tests -- --nocapture
 ```
 
