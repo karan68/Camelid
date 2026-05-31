@@ -312,6 +312,8 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +336,8 @@ pub struct CompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -403,6 +407,8 @@ pub struct GenerationSessionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
     default_max_tokens_cap: Option<u32>,
 }
@@ -1998,6 +2004,7 @@ async fn completions(
         camelid_logit_token_ids: req.camelid_logit_token_ids,
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
+        unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
     };
     let stream = req.stream.unwrap_or(false);
@@ -2091,6 +2098,7 @@ async fn chat_completions(
         camelid_logit_token_ids: req.camelid_logit_token_ids,
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
+        unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
     let stream = req.stream.unwrap_or(false);
@@ -2413,6 +2421,7 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
+    validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
     let sampling = sampling_config_from_request(&req).map_err(|response| *response)?;
     let stop_sequences =
@@ -2884,6 +2893,67 @@ fn validate_choice_and_logprob_fields(
         )));
     }
     Ok(())
+}
+
+fn validate_unsupported_generation_fields(
+    req: &GenerationSessionRequest,
+) -> std::result::Result<(), Box<Response>> {
+    let Some(param) = req.unsupported_fields.keys().min().map(String::as_str) else {
+        return Ok(());
+    };
+    let message = match param {
+        "tools" | "tool_choice" | "parallel_tool_calls" | "parse_tool_calls" => {
+            "tool/function calling is not supported by Camelid generation routes yet"
+        }
+        "response_format" | "json_schema" | "schema" | "grammar" => {
+            "JSON/schema/grammar constrained generation is not supported yet"
+        }
+        "stream_options" => {
+            "OpenAI stream_options are not supported yet; Camelid streams plain SSE chunks"
+        }
+        "echo" | "suffix" => "completion echo/suffix compatibility is not supported yet",
+        "mirostat" | "mirostat_tau" | "mirostat_eta" | "min_p" | "typical_p" | "tfs_z"
+        | "repeat_penalty" | "ignore_eos" | "n_keep" => {
+            "this llama-server sampler/control field is not supported yet"
+        }
+        "input" => {
+            "embeddings/Responses-style input payloads are not supported on generation routes"
+        }
+        _ => "unsupported generation request field",
+    };
+    Err(Box::new(api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_parameter",
+        message.to_string(),
+        Some(static_param_name(param)),
+    )))
+}
+
+fn static_param_name(param: &str) -> &'static str {
+    match param {
+        "tools" => "tools",
+        "tool_choice" => "tool_choice",
+        "parallel_tool_calls" => "parallel_tool_calls",
+        "parse_tool_calls" => "parse_tool_calls",
+        "response_format" => "response_format",
+        "json_schema" => "json_schema",
+        "schema" => "schema",
+        "grammar" => "grammar",
+        "stream_options" => "stream_options",
+        "echo" => "echo",
+        "suffix" => "suffix",
+        "mirostat" => "mirostat",
+        "mirostat_tau" => "mirostat_tau",
+        "mirostat_eta" => "mirostat_eta",
+        "min_p" => "min_p",
+        "typical_p" => "typical_p",
+        "tfs_z" => "tfs_z",
+        "repeat_penalty" => "repeat_penalty",
+        "ignore_eos" => "ignore_eos",
+        "n_keep" => "n_keep",
+        "input" => "input",
+        _ => "request",
+    }
 }
 
 fn stop_sequences_from_request(
