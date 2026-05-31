@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
 const repoRoot = new URL('..', import.meta.url)
@@ -26,7 +27,7 @@ assert.match(
   'README caption must preserve the intended dark collapsed-rail screenshot contract',
 )
 
-const assetBytes = readFileSync(join(repoRoot.pathname, expectedAsset))
+const assetBytes = readFileSync(join(fileURLToPath(repoRoot), expectedAsset))
 const actualSha256 = createHash('sha256').update(assetBytes).digest('hex')
 assert.equal(
   actualSha256,

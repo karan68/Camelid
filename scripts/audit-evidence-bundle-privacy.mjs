@@ -15,46 +15,55 @@ const patterns = [
   {
     id: 'linux_home_path',
     description: 'Linux home path leaked into durable bundle content',
+    shouldScan: (text) => text.includes('/home/') || text.includes('file:///home/'),
     regex: /(?:file:\/\/)?\/home\/[^/\s"']+\/[^\s"']*/g,
   },
   {
     id: 'mac_home_path',
     description: 'macOS home path leaked into durable bundle content',
+    shouldScan: (text) => text.includes('/' + 'Users/'),
     regex: /\/Users\/[^/\n]+\/[^"]*/g,
   },
   {
     id: 'mac_mounted_volume_path',
     description: 'macOS mounted-volume path leaked into durable bundle content',
+    shouldScan: (text) => text.includes('/Volumes/'),
     regex: /\/Volumes\/[^/\n]+\/[^"]*/g,
   },
   {
     id: 'ipv4_literal',
     description: 'Literal IPv4 address leaked into durable bundle content',
+    shouldScan: (text) => /\d+\.\d+\.\d+\.\d+/.test(text),
     regex: /\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]\d?)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b/g,
   },
   {
     id: 'ec2_hostname',
     description: 'Literal EC2 private hostname leaked into durable bundle content',
+    shouldScan: (text) => text.includes('ip-'),
     regex: /\bip-(?:\d+-){3}\d+\b/g,
   },
   {
     id: 'raw_ssh_command',
     description: 'Raw SSH command leaked into durable bundle content',
-    regex: /(^|[\s"'])ssh\s+(?=[^\n]*(?:-i\b|StrictHostKeyChecking|BatchMode|IdentitiesOnly))[^\n"']*/g,
+    shouldScan: (text) => text.includes('ssh ') && (text.includes('-i') || text.includes('StrictHostKeyChecking') || text.includes('BatchMode') || text.includes('IdentitiesOnly')),
+    regex: /(^|[\s"'])ssh\s+(?=[^\n]*(?:-i\b|StrictHostKeyChecking|BatchMode|IdentitiesOnly))[^\n"']*/gm,
   },
   {
     id: 'raw_ssh_timeout',
     description: 'Raw SSH timeout stderr leaked into durable bundle content',
+    shouldScan: (text) => text.includes('Operation ' + 'timed out'),
     regex: /Operation\s+timed\s+out/g,
   },
   {
     id: 'raw_ssh_rc_255',
     description: 'Raw SSH connection status leaked into durable bundle content',
+    shouldScan: (text) => text.includes('rc=' + '255'),
     regex: /\brc=25[5]\b/g,
   },
   {
     id: 'ssh_key_path',
     description: 'SSH private-key path leaked into durable bundle content',
+    shouldScan: (text) => text.includes('.' + 'pem'),
     regex: /[^\s"']*[.]pem\b/g,
   },
 ]
@@ -111,27 +120,41 @@ async function scanFile(fullPath) {
   const relPath = relative(rootDir, fullPath)
   const bundle = relPath.split('/')[0] || relPath
   const text = await readFile(fullPath, 'utf8')
-  const lines = text.split(/\r?\n/)
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]
-    for (const pattern of patterns) {
-      pattern.regex.lastIndex = 0
-      const matches = [...line.matchAll(pattern.regex)]
-      for (const match of matches) {
-        const sample = match[0]
-        if (pattern.id === 'ipv4_literal' && sample === '127.0.0.1') continue
-        if (sample === 'canonical-private-ubuntu-validation-host') continue
-        findings.push({
-          bundle,
-          file: relPath,
-          line: index + 1,
-          pattern: pattern.id,
-          description: pattern.description,
-          sample,
-        })
-      }
+  const lineStarts = [0]
+  for (let i = 0; i < text.length; i += 1) {
+    if (text.charCodeAt(i) === 10) lineStarts.push(i + 1)
+  }
+  for (const pattern of patterns) {
+    if (!pattern.shouldScan(text)) continue
+    pattern.regex.lastIndex = 0
+    for (const match of text.matchAll(pattern.regex)) {
+      const sample = match[0]
+      if (pattern.id === 'ipv4_literal' && sample === '127.0.0.1') continue
+      if (sample === 'canonical-private-ubuntu-validation-host') continue
+      findings.push({
+        bundle,
+        file: relPath,
+        line: lineForOffset(lineStarts, match.index || 0),
+        pattern: pattern.id,
+        description: pattern.description,
+        sample,
+      })
     }
   }
+}
+
+function lineForOffset(lineStarts, offset) {
+  let low = 0
+  let high = lineStarts.length - 1
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2)
+    if (lineStarts[mid] <= offset) {
+      low = mid + 1
+    } else {
+      high = mid - 1
+    }
+  }
+  return high + 1
 }
 
 function hasTextExtension(name) {
