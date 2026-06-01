@@ -122,7 +122,7 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
 async fn native_compatibility_routes_fail_closed_with_typed_errors() {
     let cases = [
         ("POST", "/props", "unsupported_llama_server_props", "props"),
-        ("GET", "/slots", "unsupported_llama_server_slots", "slots"),
+        ("POST", "/slots", "unsupported_llama_server_slots", "slots"),
         (
             "POST",
             "/completion",
@@ -157,6 +157,82 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
         assert_eq!(body["error"]["code"], code, "{uri}");
         assert_eq!(body["error"]["param"], param, "{uri}");
     }
+}
+
+#[tokio::test]
+async fn slots_reports_public_fail_closed_llama_server_shape() {
+    let app = camelid::api::router();
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/slots")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let slots = body.as_array().unwrap();
+    assert_eq!(slots.len(), 1);
+    let slot = &slots[0];
+    assert_eq!(slot["id"], 0);
+    assert_eq!(slot["id_task"], -1);
+    assert_eq!(slot["n_ctx"], 0);
+    assert_eq!(slot["speculative"], false);
+    assert_eq!(slot["is_processing"], false);
+    assert_eq!(slot["params"]["n_predict"], -1);
+    assert_eq!(slot["params"]["stream"], true);
+    assert_eq!(slot["next_token"]["has_next_token"], false);
+    assert_eq!(
+        slot["camelid"]["compatibility"],
+        "partial_llama_server_slots_read_only"
+    );
+    assert_eq!(slot["camelid"]["generation_ready"], false);
+    assert_eq!(slot["camelid"]["status"], "unavailable");
+    assert!(slot["camelid"]["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "slot_cache_save_restore_erase"));
+
+    let serialized = body.to_string();
+    for forbidden in [
+        "/Users/",
+        "/home/",
+        "file://",
+        "file:\\",
+        "/Volumes/",
+        "/private/tmp/",
+        "C:\\Users\\",
+        "C:/Users/",
+        "\\Users\\",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "/slots must not expose local/private path marker {forbidden:?}"
+        );
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/slots?fail_on_no_slot=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "runtime_unavailable");
+    assert_eq!(body["error"]["code"], "no_available_slot");
+    assert_eq!(body["error"]["param"], "fail_on_no_slot");
 }
 
 #[tokio::test]
@@ -283,6 +359,19 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
                 .contains("Local model paths are intentionally redacted")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
+        item["id"] == "llama_server_slots"
+            && item["status"] == "partial"
+            && item["notes"].as_str().unwrap().contains("GET /slots")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("fail_on_no_slot=1")
+            && item["notes"]
+                .as_str()
+                .unwrap()
+                .contains("slot save/restore/erase")
+    }));
+    assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "llama_server_apply_template"
             && item["status"] == "partial"
             && item["notes"]
@@ -296,6 +385,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["notes"].as_str().unwrap().contains("/completion")
             && item["notes"].as_str().unwrap().contains("/v1/embeddings")
             && item["notes"].as_str().unwrap().contains("/v1/responses")
+            && item["notes"].as_str().unwrap().contains("POST /slots")
     }));
     let compatibility = body["model_compatibility"].as_array().unwrap();
     let tinyllama = compatibility

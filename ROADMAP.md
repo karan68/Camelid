@@ -234,6 +234,18 @@ Near-term candidates include:
 - multi-choice generation
 - stronger seeded sampling validation
 
+### llama-server compatibility sequence
+
+Tim's 2026-05-31 product decision is to do both: preserve Camelid's honest OpenAI-style subset as the stable user/developer path, and add llama-server-compatible routes/control-plane behavior incrementally where useful. llama-server is a reference target for API shape and client expectations only; Camelid does not copy source or claim full parity.
+
+Sequenced plan:
+
+1. Keep `/v1/models`, `/v1/completions`, `/v1/chat/completions`, streaming, cancellation behavior, errors, `/api/capabilities`, docs, and frontend readiness as the stable contract. Unsupported OpenAI fields stay typed errors until implemented and tested.
+2. Grow read-only llama-server discovery first: `/props`, `/slots`, health/model metadata, and WebUI probes may expose public readiness state, but local paths stay redacted and readiness fails closed unless the loaded exact row is contract-supported and generation-ready.
+3. Keep tokenizer/control-plane utilities bounded: `/tokenize`, `/detokenize`, and `/apply-template` may work for loaded supported tokenizer/template lanes only; piece metadata, arbitrary template kwargs, prompt-cache metadata, and slot lifecycle actions remain unsupported until real semantics exist.
+4. Add native generation compatibility only after request mapping is explicit: `/completion` must translate supported llama-server parameters onto Camelid's generation path without weakening the OpenAI subset, and unsupported sampler, cache, image, infill, and tool fields must remain typed errors.
+5. Defer embeddings, reranking, Responses, multimodal routes, LoRA, metrics, router-mode model management, and full WebUI parity until backend support, route semantics, tests, capabilities text, docs, and frontend gates all move together.
+
 ### Performance, packaging, and portability
 
 Performance work matters, but it should follow correctness and support honesty.

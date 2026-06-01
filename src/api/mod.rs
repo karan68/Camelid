@@ -9,7 +9,7 @@ use std::{
 };
 
 use axum::{
-    extract::{rejection::JsonRejection, Path as AxumPath, State},
+    extract::{rejection::JsonRejection, Path as AxumPath, Query, State},
     http::StatusCode,
     response::{sse::Event, IntoResponse, Response, Sse},
     routing::{get, post},
@@ -502,6 +502,32 @@ pub struct LlamaServerPropsCamelid {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct LlamaServerSlotsQuery {
+    pub fail_on_no_slot: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerSlotResponse {
+    pub id: u32,
+    pub id_task: i32,
+    pub n_ctx: u32,
+    pub speculative: bool,
+    pub is_processing: bool,
+    pub params: LlamaServerDefaultGenerationParams,
+    pub prompt: &'static str,
+    pub next_token: LlamaServerNextTokenProps,
+    pub camelid: LlamaServerSlotCamelid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerSlotCamelid {
+    pub compatibility: &'static str,
+    pub generation_ready: bool,
+    pub status: &'static str,
+    pub unsupported: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct GenerationSessionRequest {
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -876,7 +902,10 @@ pub fn router_with_state(state: AppState) -> Router {
             "/props",
             get(llama_server_props).post(unsupported_llama_server_props),
         )
-        .route("/slots", get(llama_server_slots).post(llama_server_slots))
+        .route(
+            "/slots",
+            get(llama_server_slots).post(unsupported_llama_server_slots),
+        )
         .route("/completion", post(llama_server_completion))
         .route("/embedding", post(unsupported_embeddings))
         .route("/embeddings", post(unsupported_embeddings))
@@ -1001,7 +1030,8 @@ async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPr
             model_path_redacted: true,
             unsupported: vec![
                 "post_props",
-                "slots",
+                "post_slots",
+                "slot_cache_actions",
                 "native_completion",
                 "embeddings",
                 "reranking",
@@ -1019,10 +1049,86 @@ async fn unsupported_llama_server_props() -> Response {
     )
 }
 
-async fn llama_server_slots() -> Response {
+async fn llama_server_slots(
+    State(state): State<AppState>,
+    Query(query): Query<LlamaServerSlotsQuery>,
+) -> Response {
+    let active_id_lock = state.active_model_id.read().await;
+    let loaded_models = state.loaded_models.read().await;
+    let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
+    let generation_ready = model.is_some_and(loaded_model_generation_ready);
+
+    if query.fail_on_no_slot.as_deref() == Some("1") && !generation_ready {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_available_slot",
+            "no generation-ready Camelid slot is available".to_string(),
+            Some("fail_on_no_slot"),
+        );
+    }
+
+    let n_ctx = model
+        .and_then(|model| model.llama_config.as_ref())
+        .map(|config| config.context_length)
+        .unwrap_or(0);
+    let status = if generation_ready {
+        "idle_generation_ready"
+    } else {
+        "unavailable"
+    };
+
+    (
+        StatusCode::OK,
+        Json(vec![LlamaServerSlotResponse {
+            id: 0,
+            id_task: -1,
+            n_ctx,
+            speculative: false,
+            is_processing: false,
+            params: LlamaServerDefaultGenerationParams {
+                n_predict: -1,
+                seed: u32::MAX,
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                stop: Vec::new(),
+                max_tokens: -1,
+                ignore_eos: false,
+                stream: true,
+                n_probs: 0,
+                samplers: vec!["greedy"],
+            },
+            prompt: "",
+            next_token: LlamaServerNextTokenProps {
+                has_next_token: generation_ready,
+                has_new_line: false,
+                n_remain: -1,
+                n_decoded: 0,
+                stopping_word: "",
+            },
+            camelid: LlamaServerSlotCamelid {
+                compatibility: "partial_llama_server_slots_read_only",
+                generation_ready,
+                status,
+                unsupported: vec![
+                    "post_slots",
+                    "slot_cache_save_restore_erase",
+                    "prompt_cache_metadata",
+                    "cancellation_metadata",
+                    "continuous_batching_metrics",
+                ],
+            },
+        }]),
+    )
+        .into_response()
+}
+
+async fn unsupported_llama_server_slots() -> Response {
     unsupported_route(
         "unsupported_llama_server_slots",
-        "/slots is not supported yet; Camelid does not expose llama-server slot lifecycle, prompt-cache, or cancellation metadata",
+        "POST /slots and llama-server slot cache actions are not supported yet; Camelid exposes GET /slots as a read-only compatibility snapshot",
         Some("slots"),
     )
 }
@@ -1618,7 +1724,12 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_props",
                 status: "partial",
-                notes: "GET /props returns read-only public server properties, default generation settings, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, POST /props is unsupported, and this does not imply /slots, /completion, embeddings, or full llama-server WebUI parity.",
+                notes: "GET /props returns read-only public server properties, default generation settings, chat-template metadata when a model is loaded, and fail-closed Camelid readiness notes. Local model paths are intentionally redacted, POST /props is unsupported, and this does not imply slot lifecycle, /completion, embeddings, or full llama-server WebUI parity.",
+            },
+            SupportItem {
+                id: "llama_server_slots",
+                status: "partial",
+                notes: "GET /slots returns a single read-only, privacy-safe slot snapshot with generation readiness and fail_on_no_slot=1 handling. POST /slots, slot save/restore/erase actions, prompt-cache metadata, cancellation metadata, and continuous batching metrics remain unsupported.",
             },
             SupportItem {
                 id: "llama_server_apply_template",
@@ -1628,7 +1739,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /slots, /completion, /embedding, /embeddings, /v1/embeddings, /rerank, /reranking, /v1/rerank, /v1/reranking, and /v1/responses compatibility routes return typed not_implemented errors until real route semantics and backend support exist.",
+                notes: "Native /completion, /embedding, /embeddings, /v1/embeddings, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
             },
             SupportItem {
                 id: "multi_choice_generation",
