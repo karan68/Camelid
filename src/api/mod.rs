@@ -329,6 +329,7 @@ pub struct ChatCompletionRequest {
     pub top_logprobs: Option<u32>,
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    pub camelid_dense_diagnostic_generated_index: Option<u32>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -353,6 +354,7 @@ pub struct CompletionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    pub camelid_dense_diagnostic_generated_index: Option<u32>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -590,6 +592,7 @@ pub struct GenerationSessionRequest {
     pub camelid_logit_token_ids: Option<Vec<u32>>,
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
+    pub camelid_dense_diagnostic_generated_index: Option<u32>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
@@ -636,6 +639,8 @@ pub struct GenerationDiagnostics {
     pub output_projection: Vec<LlamaOutputProjectionDiagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dense: Option<LlamaForwardDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dense_diagnostic_generated_index: Option<usize>,
     pub timings_ms: GenerationTimings,
 }
 
@@ -863,6 +868,7 @@ struct PreparedGeneration {
     stop_sequences: Vec<String>,
     logit_diagnostic_token_ids: Vec<u32>,
     collect_dense_diagnostics: bool,
+    dense_diagnostic_generated_index: Option<usize>,
     dense_metadata: DenseDiagnosticMetadata,
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
@@ -877,6 +883,7 @@ struct GeneratedText {
     step_top_logits: Vec<Vec<LogitDiagnostic>>,
     output_projection: Vec<LlamaOutputProjectionDiagnostic>,
     dense: Option<LlamaForwardDiagnostics>,
+    dense_diagnostic_generated_index: Option<usize>,
     completion_tokens: usize,
     finish_reason: &'static str,
     timings: GenerationTimings,
@@ -890,8 +897,22 @@ struct GeneratedTokens {
     step_top_logits: Vec<Vec<RawLogitDiagnostic>>,
     output_projection: Vec<LlamaOutputProjectionDiagnostic>,
     dense: Option<LlamaForwardDiagnostics>,
+    dense_diagnostic_generated_index: Option<usize>,
     finish_reason: &'static str,
     timings: GenerationTimings,
+}
+
+fn collect_dense_diagnostics_for_generated_index(
+    prepared: &PreparedGeneration,
+    generated_index: usize,
+) -> bool {
+    if !prepared.collect_dense_diagnostics {
+        return false;
+    }
+    prepared
+        .dense_diagnostic_generated_index
+        .map(|target| target == generated_index)
+        .unwrap_or(true)
 }
 
 #[derive(Clone)]
@@ -953,6 +974,7 @@ pub fn router_with_state(state: AppState) -> Router {
             get(llama_server_slots).post(unsupported_llama_server_slots),
         )
         .route("/completion", post(llama_server_completion))
+        .route("/infill", post(unsupported_llama_server_infill))
         .route("/embedding", post(unsupported_embeddings))
         .route("/embeddings", post(unsupported_embeddings))
         .route("/rerank", post(unsupported_reranking))
@@ -1240,6 +1262,14 @@ async fn llama_server_completion() -> Response {
         "unsupported_llama_server_completion",
         "/completion is not supported yet; use /v1/completions or /v1/chat/completions for Camelid's stable generation path",
         Some("completion"),
+    )
+}
+
+async fn unsupported_llama_server_infill() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_infill",
+        "/infill is not supported yet; Camelid has no FIM runtime or compatibility contract for this route",
+        Some("input"),
     )
 }
 
@@ -1854,7 +1884,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /completion, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
+                notes: "Native /completion, /infill, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist.",
             },
             SupportItem {
                 id: "multi_choice_generation",
@@ -2707,6 +2737,7 @@ async fn completions(
         camelid_logit_token_ids: req.camelid_logit_token_ids,
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
+        camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
     };
@@ -2732,6 +2763,7 @@ async fn completions(
                 step_top_logits,
                 output_projection,
                 dense,
+                dense_diagnostic_generated_index,
                 completion_tokens,
                 finish_reason,
                 timings,
@@ -2761,6 +2793,7 @@ async fn completions(
                         step_top_logits,
                         output_projection,
                         dense,
+                        dense_diagnostic_generated_index,
                         timings_ms: timings,
                     },
                 }),
@@ -2801,6 +2834,7 @@ async fn chat_completions(
         camelid_logit_token_ids: req.camelid_logit_token_ids,
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
+        camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -2844,6 +2878,7 @@ async fn chat_completions(
                     step_top_logits: generated.step_top_logits,
                     output_projection: generated.output_projection,
                     dense: generated.dense,
+                    dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
                     timings_ms: generated.timings,
                 },
             }),
@@ -3321,6 +3356,19 @@ async fn prepare_generation(
             .map(|cap| cap.min(available_max_tokens))
             .unwrap_or(available_max_tokens)
     });
+    if let Some(index) = req.camelid_dense_diagnostic_generated_index {
+        if index >= max_tokens {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_dense_diagnostic_generated_index",
+                format!(
+                    "camelid_dense_diagnostic_generated_index {} is outside max_tokens {}",
+                    index, max_tokens
+                ),
+                Some("camelid_dense_diagnostic_generated_index"),
+            ));
+        }
+    }
 
     let weight_load_started = Instant::now();
     let cache_hit = state.cached_weights.read().await.contains_key(&model.id);
@@ -3352,7 +3400,11 @@ async fn prepare_generation(
         sampling,
         stop_sequences,
         logit_diagnostic_token_ids,
-        collect_dense_diagnostics: req.camelid_dense_diagnostics.unwrap_or(false),
+        collect_dense_diagnostics: req.camelid_dense_diagnostics.unwrap_or(false)
+            || req.camelid_dense_diagnostic_generated_index.is_some(),
+        dense_diagnostic_generated_index: req
+            .camelid_dense_diagnostic_generated_index
+            .map(|index| index as usize),
         dense_metadata,
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
@@ -4020,6 +4072,7 @@ fn generate_decoded_tokens(
             .collect(),
         output_projection: generated.output_projection,
         dense: generated.dense,
+        dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
         finish_reason: generated.finish_reason,
         timings: generated.timings,
     })
@@ -4183,6 +4236,7 @@ fn generate_token_ids(
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
     let mut output_projection = Vec::new();
     let mut dense = None;
+    let mut dense_diagnostic_generated_index = None;
     let mut finish_reason = "length";
     let mut forward_timings = LlamaForwardTimings::default();
     let mut sample = 0;
@@ -4219,6 +4273,9 @@ fn generate_token_ids(
         if finish_reason != "length" {
             break;
         }
+        let generated_index = generated.len();
+        let collect_dense_for_step =
+            collect_dense_diagnostics_for_generated_index(&prepared, generated_index);
         let mut sampling = prepared.sampling.clone();
         if let Some(seed) = sampling.seed {
             sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
@@ -4234,7 +4291,7 @@ fn generate_token_ids(
                 &input,
                 sampler,
                 &history,
-                prepared.collect_dense_diagnostics,
+                collect_dense_for_step,
             )
             .map_err(|err| {
                 Box::new(api_error(
@@ -4256,7 +4313,7 @@ fn generate_token_ids(
         }
         forward_timings.add_assign(&step.timings);
         sample += step.sample;
-        if top_logits.is_empty() || collect_step_top_logits {
+        if top_logits.is_empty() || collect_step_top_logits || collect_dense_for_step {
             let current_top_logits =
                 top_logit_diagnostics(&step.logits, 8, &prepared.logit_diagnostic_token_ids)
                     .map_err(|err| {
@@ -4271,33 +4328,34 @@ fn generate_token_ids(
                 step_top_logits.push(current_top_logits.clone());
             }
             if top_logits.is_empty() {
-                top_logits = current_top_logits;
-                let projection_token_ids = top_logits
+                top_logits = current_top_logits.clone();
+            }
+            if collect_dense_for_step && dense.is_none() {
+                let projection_token_ids = current_top_logits
                     .iter()
                     .map(|entry| entry.token_id)
                     .collect::<Vec<_>>();
-                if prepared.collect_dense_diagnostics {
-                    output_projection = output_projection_diagnostics(
-                        &step.output_norm_state,
-                        prepared.session.weights.output_projection(),
-                        &step.logits,
-                        &projection_token_ids,
-                        Some(&step.hidden_state),
-                        Some(&prepared.session.weights.output_norm),
-                        step.diagnostics
-                            .as_ref()
-                            .map(|diagnostics| diagnostics.final_norm.scale),
-                    )
-                    .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "output_projection_diagnostic_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
-                    dense = step.diagnostics.clone();
-                }
+                output_projection = output_projection_diagnostics(
+                    &step.output_norm_state,
+                    prepared.session.weights.output_projection(),
+                    &step.logits,
+                    &projection_token_ids,
+                    Some(&step.hidden_state),
+                    Some(&prepared.session.weights.output_norm),
+                    step.diagnostics
+                        .as_ref()
+                        .map(|diagnostics| diagnostics.final_norm.scale),
+                )
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "output_projection_diagnostic_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
+                dense = step.diagnostics.clone();
+                dense_diagnostic_generated_index = Some(generated_index);
             }
         }
         generated.push(step.next_token_id);
@@ -4340,6 +4398,7 @@ fn generate_token_ids(
         step_top_logits,
         output_projection,
         dense,
+        dense_diagnostic_generated_index,
         finish_reason,
         timings: prepared.timings,
     })
@@ -4764,6 +4823,9 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
             if finish_reason != "length" {
                 break;
             }
+            let generated_index = generated.len();
+            let collect_dense_for_step =
+                collect_dense_diagnostics_for_generated_index(&prepared, generated_index);
             let mut sampling = prepared.sampling.clone();
             if let Some(seed) = sampling.seed {
                 sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
@@ -4784,7 +4846,7 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                     input: input.clone(),
                     sampler,
                     history: history.clone(),
-                    collect_dense_diagnostics: prepared.collect_dense_diagnostics,
+                    collect_dense_diagnostics: collect_dense_for_step,
                     step_timeout: remaining_timeout,
                     request_timeout,
                     request_started: stream_started,
@@ -7795,6 +7857,7 @@ mod tests {
             stop_sequences: Vec::new(),
             logit_diagnostic_token_ids: Vec::new(),
             collect_dense_diagnostics: false,
+            dense_diagnostic_generated_index: None,
             dense_metadata: dummy_dense_metadata(),
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),

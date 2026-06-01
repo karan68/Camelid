@@ -14,6 +14,7 @@ if (!hasFlag(argv, 'messages-json') && process.env.MISTRAL_CHAT_MESSAGES_JSON) r
 if (!hasFlag(argv, 'message') && process.env.MISTRAL_CHAT_MESSAGE) relayArgs.push('--message', process.env.MISTRAL_CHAT_MESSAGE)
 if (!hasFlag(argv, 'max-tokens') && process.env.MISTRAL_CHAT_MAX_TOKENS) relayArgs.push('--max-tokens', process.env.MISTRAL_CHAT_MAX_TOKENS)
 if (!hasFlag(argv, 'diagnostics-out') && process.env.MISTRAL_CHAT_DIAGNOSTICS_OUT) relayArgs.push('--diagnostics-out', process.env.MISTRAL_CHAT_DIAGNOSTICS_OUT)
+if (!hasFlag(argv, 'backend-dense-diagnostic-generated-index') && process.env.MISTRAL_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX) relayArgs.push('--backend-dense-diagnostic-generated-index', process.env.MISTRAL_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX)
 if (!hasFlag(argv, 'llama-context') && process.env.MISTRAL_LLAMA_CONTEXT) relayArgs.push('--llama-context', process.env.MISTRAL_LLAMA_CONTEXT)
 if (!hasFlag(argv, 'wait-ms') && process.env.MISTRAL_WAIT_MS) relayArgs.push('--wait-ms', process.env.MISTRAL_WAIT_MS)
 
@@ -30,6 +31,7 @@ const child = spawn(process.execPath, [resolve('scripts/chat-parity-llama3.mjs')
     LLAMA3_CHAT_MESSAGE: process.env.LLAMA3_CHAT_MESSAGE || process.env.MISTRAL_CHAT_MESSAGE,
     LLAMA3_CHAT_MAX_TOKENS: process.env.LLAMA3_CHAT_MAX_TOKENS || process.env.MISTRAL_CHAT_MAX_TOKENS,
     LLAMA3_CHAT_DIAGNOSTICS_OUT: process.env.LLAMA3_CHAT_DIAGNOSTICS_OUT || process.env.MISTRAL_CHAT_DIAGNOSTICS_OUT,
+    LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX: process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX || process.env.MISTRAL_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX,
     LLAMA3_LLAMA_CONTEXT: process.env.LLAMA3_LLAMA_CONTEXT || process.env.MISTRAL_LLAMA_CONTEXT,
     LLAMA3_WAIT_MS: process.env.LLAMA3_WAIT_MS || process.env.MISTRAL_WAIT_MS,
   },

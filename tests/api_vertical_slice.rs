@@ -193,6 +193,12 @@ async fn native_compatibility_routes_fail_closed_with_typed_errors() {
             "unsupported_llama_server_completion",
             "completion",
         ),
+        (
+            "POST",
+            "/infill",
+            "unsupported_llama_server_infill",
+            "input",
+        ),
         ("POST", "/embedding", "unsupported_embeddings", "input"),
         ("POST", "/embeddings", "unsupported_embeddings", "input"),
         ("POST", "/v1/embeddings", "unsupported_embeddings", "input"),
@@ -461,6 +467,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         item["id"] == "fail_closed_native_compatibility_routes"
             && item["status"] == "unsupported"
             && item["notes"].as_str().unwrap().contains("/completion")
+            && item["notes"].as_str().unwrap().contains("/infill")
             && item["notes"].as_str().unwrap().contains("/v1/embeddings")
             && item["notes"].as_str().unwrap().contains("/v1/responses")
             && item["notes"].as_str().unwrap().contains("/v1/messages")
@@ -2804,6 +2811,41 @@ async fn chat_completion_generates_one_decoded_token_from_loaded_dense_model() {
     );
     assert!(body["camelid"]["timings_ms"]["layers"][0]["attention_q"].is_number());
     assert!(body["camelid"]["timings_ms"]["layers"][0]["ffn_down"].is_number());
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-generation","messages":[{"role":"user","content":"hello"}],"max_tokens":2,"stream":false,"camelid_dense_diagnostic_generated_index":1}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body_bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&body_bytes)
+    );
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body["usage"]["completion_tokens"], 2);
+    assert_eq!(body["camelid"]["dense_diagnostic_generated_index"], 1);
+    assert_eq!(
+        body["camelid"]["dense"]["layers"].as_array().unwrap().len(),
+        1
+    );
+    assert!(!body["camelid"]["output_projection"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     let response = app
         .oneshot(

@@ -23,6 +23,7 @@ const diagnosticsOut = args.get('diagnostics-out') || process.env.LLAMA3_CHAT_DI
 const requirePromptMatch = args.has('require-prompt-match') || process.env.LLAMA3_CHAT_REQUIRE_PROMPT_MATCH === '1'
 const requireGeneratedMatch = args.has('require-generated-match') || process.env.LLAMA3_CHAT_REQUIRE_GENERATED_MATCH === '1'
 const collectBackendDenseDiagnostics = args.has('backend-dense-diagnostics') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTICS === '1'
+const backendDenseDiagnosticGeneratedIndex = parseOptionalNonNegativeInt(args.get('backend-dense-diagnostic-generated-index') || process.env.LLAMA3_CHAT_BACKEND_DENSE_DIAGNOSTIC_GENERATED_INDEX, 'backend-dense-diagnostic-generated-index')
 const waitMs = Number.parseInt(args.get('wait-ms') || process.env.LLAMA3_WAIT_MS || '120000', 10)
 const explicitLlamaContext = parseOptionalPositiveInt(args.get('llama-context') || process.env.LLAMA3_LLAMA_CONTEXT, 'llama-context')
 const llamaFlashAttn = args.get('llama-flash-attn') || process.env.LLAMA3_LLAMA_FLASH_ATTN || 'off'
@@ -126,6 +127,10 @@ try {
       ...chatPayload,
       camelid_logit_token_ids: diagnosticTokenIds,
       ...(collectBackendDenseDiagnostics ? { camelid_dense_diagnostics: true } : {}),
+      ...(backendDenseDiagnosticGeneratedIndex !== null ? {
+        camelid_dense_diagnostics: true,
+        camelid_dense_diagnostic_generated_index: backendDenseDiagnosticGeneratedIndex,
+      } : {}),
     }),
   })
 
@@ -162,6 +167,7 @@ try {
     generated_tokens_match: generatedTokensMatch,
     generated_text_match: textMatch,
     first_generated_token_diff_index: firstArrayDifference(backendGeneratedTokens, llamaGeneratedTokens),
+    backend_dense_diagnostic_generated_index: backendChat.camelid?.dense_diagnostic_generated_index ?? null,
     first_generated_token_logit_comparison: firstGeneratedTokenLogitComparison,
     first_generated_text_diff_index: firstStringDifference(backendText, llamaText),
     backend_prompt_tokens: backendPromptTokens,
@@ -195,6 +201,7 @@ try {
   console.log(`backend_generated_tokens=${JSON.stringify(backendGeneratedTokens)}`)
   console.log(`llama_generated_tokens=${JSON.stringify(llamaGeneratedTokens)}`)
   console.log(`generated_tokens_match=${generatedTokensMatch}`)
+  console.log(`backend_dense_diagnostic_generated_index=${backendChat.camelid?.dense_diagnostic_generated_index ?? null}`)
   console.log(`first_generated_token_logit_comparison=${JSON.stringify(firstGeneratedTokenLogitComparison)}`)
   console.log(`backend_text=${JSON.stringify(backendText)}`)
   console.log(`llama_text=${JSON.stringify(llamaText)}`)
@@ -266,6 +273,15 @@ function parseOptionalPositiveInt(value, name) {
   const parsed = Number.parseInt(value, 10)
   if (!Number.isInteger(parsed) || parsed < 1) {
     throw new Error(`--${name} must be a positive integer, got ${value}`)
+  }
+  return parsed
+}
+
+function parseOptionalNonNegativeInt(value, name) {
+  if (value === undefined || value === null || value === '') return null
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`--${name} must be a non-negative integer, got ${value}`)
   }
   return parsed
 }
