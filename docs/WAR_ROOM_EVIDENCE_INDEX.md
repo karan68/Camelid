@@ -43,6 +43,12 @@ Use these anchors before changing public copy:
 - API/WebUI readiness copy must state both sides of the gate: exact compatibility-row support from `/api/capabilities` and runtime readiness from `/v1/health` (`loaded_now=true` plus `generation_ready=true`). One without the other is not chat readiness evidence.
 - Benchmark copy must keep negative, blocked, or slower same-host results when they are the current retained evidence. Do not replace an unfavorable retained result with a direction probe, local-only optimization, or future benchmark plan.
 
+## Scheduled audit rule
+
+War-room docs audits may update this policy, the evidence index, or blocker wording only when the edited surface is clean or the dirty diff has been read and does not itself promote support, benchmark, API capability, or WebUI readiness. A dirty diff in `COMPATIBILITY.md`, `/api/capabilities`, frontend readiness code, or public benchmark copy is a release-claim blocker unless the matching source-of-truth surfaces are updated in the same change.
+
+Scheduled audits should record sanitized evidence only: repo-relative paths, row IDs, manifest or summary names, checksums when public, and pass/fail outcomes. They should not add operator-local commands, private network details, hostnames, user home paths, key paths, raw model-library locations, raw stderr, or local machine notes to public docs.
+
 ## Minimum safe update checklist
 
 Before landing a support-sensitive docs/API/frontend change:
