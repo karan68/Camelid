@@ -121,6 +121,7 @@ async fn props_reports_public_fail_closed_llama_server_shape() {
 #[tokio::test]
 async fn native_compatibility_routes_fail_closed_with_typed_errors() {
     let cases = [
+        ("POST", "/props", "unsupported_llama_server_props", "props"),
         ("GET", "/slots", "unsupported_llama_server_slots", "slots"),
         (
             "POST",

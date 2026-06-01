@@ -855,7 +855,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/tokenize", post(llama_server_tokenize))
         .route("/detokenize", post(llama_server_detokenize))
         .route("/apply-template", post(llama_server_apply_template))
-        .route("/props", get(llama_server_props))
+        .route(
+            "/props",
+            get(llama_server_props).post(unsupported_llama_server_props),
+        )
         .route("/slots", get(llama_server_slots).post(llama_server_slots))
         .route("/completion", post(llama_server_completion))
         .route("/embedding", post(unsupported_embeddings))
@@ -989,6 +992,14 @@ async fn llama_server_props(State(state): State<AppState>) -> Json<LlamaServerPr
             ],
         },
     })
+}
+
+async fn unsupported_llama_server_props() -> Response {
+    unsupported_route(
+        "unsupported_llama_server_props",
+        "POST /props is not supported yet; Camelid exposes /props as a read-only, privacy-safe llama-server compatibility discovery route",
+        Some("props"),
+    )
 }
 
 async fn llama_server_slots() -> Response {
