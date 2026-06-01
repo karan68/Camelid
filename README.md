@@ -10,7 +10,7 @@ The current WebUI is product-forward while still reflecting the local-first runt
 
 ## Current Release Boundary
 
-[`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the v0.1 release-candidate support contract. It is stricter than the broader repository docs where those docs conflict with current evidence. The short version is:
+[`COMPATIBILITY.md`](COMPATIBILITY.md) is Camelid's durable support ledger, and [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the stricter v0.1 release-candidate slice. If broader repository docs drift, these two files win, with the support matrix setting the narrower rc boundary. The short version is:
 
 | Exact row | v0.1 public status | Checked boundary |
 | --- | --- | --- |
