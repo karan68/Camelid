@@ -141,3 +141,40 @@ MAX_TOKENS=64 bash tools/bench/distributed/two-mac-run.sh
 - Real two-Mac TB4 run: **done** — Llama-2-13B Q8 runs across two 16 GB minis (7.2 GB/node)
   that a single mini cannot load. Decode 1.48 tok/s (serial pipeline; throughput optimization
   is the next lever).
+
+## P2: GPU-resident pipeline decode (2026-06-03)
+
+Each node now holds its Q8_0 shard as plain RAM-resident blocks (enforced by a hard startup
+gate — a node refuses to run if any owned Q8_0 linear would stream from disk) and executes
+its layer range on the GPU in one command buffer per token, KV cache resident across tokens
+(`CAMELID_METAL_RESIDENT_DECODE=1` on both nodes).
+
+Steady-state per token, Llama-2-13B Q8 split 0..20 / 20..40 across two M4 16 GB minis over
+the Thunderbolt bridge (`CAMELID_DISTRIBUTED_TRACE=1` per-token traces):
+
+| stage | time |
+|---|---|
+| master GPU forward (20 layers, 6.82 GiB resident) | ~89 ms |
+| activation hop (TB) | ~0.1 ms |
+| worker GPU forward (20 layers) | ~85 ms |
+| worker final norm + logits (CPU) | ~22 ms |
+| feedback hop | ~1 ms |
+| **total** | **~197 ms ≈ 5.1 tok/s** |
+
+**5.1 tok/s steady-state vs 1.48 tok/s CPU pipeline = 3.4x**, with each node's forward at
+the per-node bandwidth expectation (~6.8 GiB / ~80 GB/s ≈ 85 ms). Loopback 3B parity:
+sharded resident output is byte-identical to the single-node resident stream (greedy).
+
+Known costs / next levers:
+
+- **First decode token pays a one-time per-node Metal buffer upload** of the full shard
+  (~6.8 GB copied CPU→GPU buffers). On a 16 GB node this doubles weight memory transiently
+  and the upload can page-thrash (24 s on an idle node; minutes on a loaded one), which
+  dominates short-run averages (a 63-token run reports 0.40 tok/s overall). Fix: no-copy
+  (page-aligned `newBufferWithBytesNoCopy`) weight buffers — removes both the copy and the
+  doubling.
+- Worker's final norm + logits projection still runs on the CPU (~22 ms/token for the 13B
+  output matrix); moving it into the worker's resident command buffer (as single-node decode
+  already does) saves most of it.
+- `REPACK=0` (default in `two-mac-run.sh`) is required: the resident path needs plain Q8_0
+  blocks, and the residency gate fails loudly on repacked storage.

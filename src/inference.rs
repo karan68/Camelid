@@ -189,9 +189,71 @@ pub struct LlamaLoadedWeights {
     pub layer_range: Option<std::ops::Range<usize>>,
 }
 
+/// Result of [`LlamaLoadedWeights::q8_0_residency_report`]: how many Q8_0 linears hold plain
+/// RAM-resident blocks (and their total block bytes), plus a per-tensor description of every
+/// Q8_0 linear that does NOT (file-backed streaming or repacked-without-blocks storage).
+#[derive(Debug, Default)]
+pub struct Q8ResidencyReport {
+    pub resident_tensors: usize,
+    pub resident_block_bytes: u64,
+    pub violations: Vec<String>,
+}
+
 impl LlamaLoadedWeights {
     pub fn output_projection(&self) -> &CpuTensor {
         self.output.as_ref().unwrap_or(&self.token_embedding)
+    }
+
+    /// Audit where this node's Q8_0 weights physically live. Every owned dense Q8_0 linear
+    /// must hold plain RAM-resident blocks (`q8_0_blocks`); anything file-backed or
+    /// runtime-repacked-without-blocks is reported as a violation so callers (the
+    /// distributed CLI nodes) can hard-fail instead of silently streaming weights from disk
+    /// per token. Unowned pipeline layers are zero-element placeholders with no
+    /// `source_type` and are skipped naturally. MoE expert tensors are file-backed by
+    /// design and are excluded (the resident decode path rejects MoE models anyway).
+    pub fn q8_0_residency_report(&self) -> Q8ResidencyReport {
+        let mut report = Q8ResidencyReport::default();
+        let mut audit = |tensor: &CpuTensor| {
+            if tensor.source_type != Some(GgufTensorType::Q8_0) {
+                return;
+            }
+            match &tensor.q8_0_blocks {
+                Some(blocks) => {
+                    report.resident_tensors += 1;
+                    report.resident_block_bytes +=
+                        (blocks.len() * mem::size_of::<Q8_0Block>()) as u64;
+                }
+                None => {
+                    let how = if tensor.q8_0_file_backing.is_some()
+                        || tensor.q8_0_split_file_backing.is_some()
+                    {
+                        "file-backed (streams from disk per token; unset CAMELID_LAZY_Q8_0_LINEAR)"
+                    } else if tensor.q8_0_runtime_storage.is_some() {
+                        "runtime-repacked without plain blocks (set CAMELID_MAC_Q8_REPACK=0 \
+                         for the GPU-resident path)"
+                    } else {
+                        "materialized without retained Q8_0 blocks"
+                    };
+                    report.violations.push(format!("{}: {how}", tensor.name));
+                }
+            }
+        };
+        audit(&self.token_embedding);
+        if let Some(output) = &self.output {
+            audit(output);
+        }
+        for layer in &self.layers {
+            audit(&layer.attention_q);
+            audit(&layer.attention_k);
+            audit(&layer.attention_v);
+            audit(&layer.attention_output);
+            if layer.moe_router.is_none() {
+                audit(&layer.ffn_gate);
+                audit(&layer.ffn_up);
+                audit(&layer.ffn_down);
+            }
+        }
+        report
     }
 
     fn has_lazy_q8_0_file_backing(&self) -> bool {
@@ -278,14 +340,24 @@ impl LlamaLoadedWeights {
         load_embedding: bool,
         load_output: bool,
     ) -> Result<Self> {
-        let auto_retain_q8_0_blocks = auto_retain_q8_0_blocks_for_fast_local_chat(binding);
+        // Q8_0 linears are ALWAYS retained as plain RAM-resident blocks. The old policy
+        // estimated a retention budget over the WHOLE binding — even on a pipeline-sharded
+        // node that loads only its layer range — and silently fell back to per-token file
+        // streaming when the estimate crossed a cap: ~100x slower decode, and it disqualified
+        // the GPU-resident path (which requires q8_0_blocks). The only way off the resident
+        // path now is the explicit CAMELID_LAZY_Q8_0_LINEAR opt-out, and it is loud.
+        let force_lazy_q8_0 = lazy_q8_0_linear_forced();
+        if force_lazy_q8_0 {
+            eprintln!(
+                "[camelid] WARNING: CAMELID_LAZY_Q8_0_LINEAR is set; Q8_0 weights will stream \
+                 from disk per token instead of residing in RAM (expect ~100x slower decode)"
+            );
+        }
         let load_linear = |name: &str| {
-            if auto_retain_q8_0_blocks {
-                store.load_q8_0_block_backed_linear(name)
-            } else if lazy_q8_0_linear_enabled() {
+            if force_lazy_q8_0 {
                 store.load_q8_0_file_backed_linear(name)
             } else {
-                store.load_cpu_f32(name)
+                store.load_q8_0_block_backed_linear(name)
             }
         };
         let load_moe_experts = |experts: &LlamaMoeExpertTensors| match experts {
@@ -323,18 +395,16 @@ impl LlamaLoadedWeights {
 
         let output = if load_output {
             if binding.output_is_tied_embedding {
-                if auto_retain_q8_0_blocks {
-                    Some(store.load_q8_0_block_backed_linear_as(
-                        &binding.token_embedding.name,
-                        "output.weight",
-                    )?)
-                } else if lazy_q8_0_linear_enabled() {
+                if force_lazy_q8_0 {
                     Some(store.load_q8_0_file_backed_tensor_as(
                         &binding.token_embedding.name,
                         "output.weight",
                     )?)
                 } else {
-                    None
+                    Some(store.load_q8_0_block_backed_linear_as(
+                        &binding.token_embedding.name,
+                        "output.weight",
+                    )?)
                 }
             } else {
                 Some(load_linear(&binding.output.name)?)
@@ -1330,11 +1400,11 @@ impl LlamaInferenceSession {
     /// (Grouped GQA, 1/sqrt(head_dim) scale, gate*swish(up) order), every layer a plain Q8_0
     /// row-major weight, and dims satisfying the kernel's modulo constraints. Anything else
     /// keeps the unchanged CPU layer loop.
-    fn resident_decode_eligible(&self) -> Result<bool> {
+    fn resident_decode_eligible(&self, want_logits: bool) -> Result<bool> {
         if !resident_decode_metal_enabled() {
             return Ok(false);
         }
-        if self.weights.layer_range.is_some() || self.config.moe.is_some() {
+        if self.config.moe.is_some() {
             return Ok(false);
         }
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
@@ -1345,7 +1415,16 @@ impl LlamaInferenceSession {
         }
         let is_q8 =
             |t: &CpuTensor| t.source_type == Some(GgufTensorType::Q8_0) && t.q8_0_blocks.is_some();
-        for layer in &self.weights.layers {
+        // On a pipeline-sharded node only the owned layer range is materialized.
+        let range = self
+            .weights
+            .layer_range
+            .clone()
+            .unwrap_or(0..self.weights.layers.len());
+        if range.end > self.weights.layers.len() || range.is_empty() {
+            return Ok(false);
+        }
+        for layer in &self.weights.layers[range] {
             if layer.moe_router.is_some()
                 || !is_q8(&layer.attention_q)
                 || !is_q8(&layer.attention_k)
@@ -1358,23 +1437,27 @@ impl LlamaInferenceSession {
                 return Ok(false);
             }
         }
-        // The final stage (RMSNorm + output projection) also runs on the GPU, so the output
-        // weight must be plain Q8_0 and a real output_norm must be present.
-        if !is_q8(self.weights.output_projection()) {
-            return Ok(false);
-        }
         let dims = DenseLlamaDims::from_config(&self.config)?;
-        if self
-            .weights
-            .output_norm
-            .shape
-            .dims
-            .first()
-            .copied()
-            .unwrap_or(0)
-            != dims.embedding_length
-        {
-            return Ok(false);
+        // When the GPU also runs the final stage (RMSNorm + output projection), the output
+        // weight must be plain Q8_0 and a real output_norm present. Sharded nodes that only
+        // produce hidden state (want_logits=false) skip these (a first/middle node does not
+        // even own the output tensors).
+        if want_logits {
+            if !is_q8(self.weights.output_projection()) {
+                return Ok(false);
+            }
+            if self
+                .weights
+                .output_norm
+                .shape
+                .dims
+                .first()
+                .copied()
+                .unwrap_or(0)
+                != dims.embedding_length
+            {
+                return Ok(false);
+            }
         }
         let n_heads = self.config.attention_head_count as usize;
         let q_dim = n_heads * dims.head_dim;
@@ -1398,7 +1481,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
     ) -> Result<Option<ResidentForward>> {
-        if !self.resident_decode_eligible()? {
+        if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
@@ -1408,7 +1491,10 @@ impl LlamaInferenceSession {
         let head_dim = dims.head_dim;
         let hidden = dims.embedding_length;
         let ffn_dim = dims.feed_forward_length;
-        let n_layers = dims.block_count;
+        // Pipeline-sharded nodes run only their owned layer range; the resident session is
+        // built over that subset (relative slots) while KV seeding uses absolute layer ids.
+        let range = weights.layer_range.clone().unwrap_or(0..dims.block_count);
+        let n_layers = range.len();
         let vocab = dims.vocab_size;
         // The on-GPU KV cache grows on demand up to `kv_cap` (the model context length); sizing
         // it to the full (often 128K) context up front would allocate tens of GB and thrash
@@ -1416,7 +1502,10 @@ impl LlamaInferenceSession {
         let kv_cap = self.config.context_length as usize;
         let position = self.kv_cache.position;
         let initial_positions = ((position + 1).max(512)).next_multiple_of(512).min(kv_cap);
-        if position >= kv_cap || embedding.data.len() != hidden || weights.layers.len() != n_layers
+        if position >= kv_cap
+            || embedding.data.len() != hidden
+            || weights.layers.len() != dims.block_count
+            || range.end > weights.layers.len()
         {
             return Ok(None);
         }
@@ -1462,7 +1551,7 @@ impl LlamaInferenceSession {
                     let mut cv = vec![0.0f32; kv_dim * position];
                     for p in 0..position {
                         for h in 0..n_kv {
-                            let src = self.kv_cache.offset(layer, p, h);
+                            let src = self.kv_cache.offset(range.start + layer, p, h);
                             let dst = (h * position + p) * head_dim;
                             ck[dst..dst + head_dim]
                                 .copy_from_slice(&self.kv_cache.keys[src..src + head_dim]);
@@ -1479,8 +1568,7 @@ impl LlamaInferenceSession {
             self.resident_decode = Some(session);
         }
 
-        let layer_views: Vec<metal::ResidentLayerWeights> = weights
-            .layers
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights.layers[range.clone()]
             .iter()
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
@@ -1680,6 +1768,18 @@ impl LlamaInferenceSession {
                 "activation start position {} does not match KV cache position {}",
                 start_pos, self.kv_cache.position
             )));
+        }
+
+        // Decode steps (one token) route through the GPU-resident session over this node's
+        // layer range (one command buffer per token, weights + KV resident on the GPU);
+        // prefill and ineligible configs take the CPU chunk path below.
+        if seq_len == 1 {
+            if let Some(ResidentForward::Hidden(out)) =
+                self.try_resident_decode_forward(hidden, false)?
+            {
+                self.kv_cache.position += 1;
+                return Ok(out);
+            }
         }
 
         let mut current_hidden = hidden.clone();
@@ -2063,7 +2163,9 @@ impl LlamaInferenceSession {
         // GPU-resident decode: run all layers on the Metal GPU in one command buffer with the
         // KV cache resident across tokens. Only when not collecting diagnostics; falls back to
         // the CPU layer loop below when ineligible (returns None).
-        let resident_out = if collect_diagnostics {
+        let resident_out = if collect_diagnostics || self.weights.layer_range.is_some() {
+            // Sharded nodes use the resident path via forward_layer_range_from_hidden; here it
+            // would swallow the distributed worker dispatch inside the layer loop below.
             None
         } else {
             self.try_resident_decode_forward(&hidden, compute_logits)?
@@ -7677,100 +7779,18 @@ fn q8_0_hybrid_retained_gpu_rows(output_rows: usize) -> usize {
         .min(output_rows.saturating_sub(1))
 }
 
-fn auto_retain_q8_0_blocks_for_fast_local_chat(binding: &LlamaTensorBinding) -> bool {
-    const DEFAULT_FAST_RETAINED_Q8_0_MAX_BYTES: usize = 6 * 1024 * 1024 * 1024;
-
-    if env::var("CAMELID_LAZY_Q8_0_LINEAR").is_ok() {
-        return false;
-    }
-    if q8_0_env_flag_disabled("CAMELID_RETAIN_Q8_0_BLOCKS") {
-        return false;
-    }
-    let max_bytes = parse_byte_count_env("CAMELID_FAST_RETAINED_Q8_0_MAX_BYTES")
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_FAST_RETAINED_Q8_0_MAX_BYTES);
-
-    let mut estimated_bytes = 0usize;
-    let mut saw_q8_linear = false;
-    let mut add_linear = |desc: &crate::gguf::GgufTensorDescriptor| -> Option<()> {
-        let element_count = desc
-            .dimensions
-            .iter()
-            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim as usize))?;
-        estimated_bytes = estimated_bytes.checked_add(element_count.checked_mul(4)?)?;
-        if desc.tensor_type == GgufTensorType::Q8_0 {
-            saw_q8_linear = true;
-            let block_count = element_count.checked_add(Q8_0_BLOCK_VALUES - 1)? / Q8_0_BLOCK_VALUES;
-            // Fast local chat keeps Q8_0 linear tensors as compact retained blocks and
-            // executes the block-dot path directly. Do not budget a second f32 copy here;
-            // the old f32+Q8 retention shape made 3B fall back to repeated lazy disk reads.
-            estimated_bytes = estimated_bytes.checked_sub(element_count.checked_mul(4)?)?;
-            estimated_bytes = estimated_bytes
-                .checked_add(block_count.checked_mul(mem::size_of::<Q8_0Block>())?)?;
-        }
-        Some(())
-    };
-
-    if add_linear(&binding.token_embedding).is_none() {
-        return false;
-    }
-    if !binding.output_is_tied_embedding && add_linear(&binding.output).is_none() {
-        return false;
-    }
-    for layer in &binding.layers {
-        for desc in [
-            &layer.attention_q,
-            &layer.attention_k,
-            &layer.attention_v,
-            &layer.attention_output,
-        ] {
-            if add_linear(desc).is_none() {
-                return false;
-            }
-        }
-        match &layer.ffn {
-            LlamaFfnTensors::Dense { gate, up, down } => {
-                for desc in [gate, up, down] {
-                    if add_linear(desc).is_none() {
-                        return false;
-                    }
-                }
-            }
-            LlamaFfnTensors::MoE {
-                router,
-                gate_experts,
-                up_experts,
-                down_experts,
-            } => {
-                for desc in std::iter::once(router)
-                    .chain(gate_experts.descriptors())
-                    .chain(up_experts.descriptors())
-                    .chain(down_experts.descriptors())
-                {
-                    if add_linear(desc).is_none() {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
-    saw_q8_linear && estimated_bytes <= max_bytes
-}
-
-fn lazy_q8_0_linear_enabled() -> bool {
-    match env::var("CAMELID_LAZY_Q8_0_LINEAR") {
+/// Explicit (and loud) opt-out from RAM-resident Q8_0 blocks: only an affirmatively set
+/// `CAMELID_LAZY_Q8_0_LINEAR` forces the per-token file-streaming path. Absence — and any
+/// disabled spelling — means weights are retained in RAM. There is no auto/budget fallback.
+fn lazy_q8_0_linear_forced() -> bool {
+    matches!(
+        env::var("CAMELID_LAZY_Q8_0_LINEAR"),
         Ok(value)
-            if value.eq_ignore_ascii_case("0")
+            if !(value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
                 || value.eq_ignore_ascii_case("off")
-                || value.eq_ignore_ascii_case("disabled") =>
-        {
-            false
-        }
-        Ok(_) | Err(env::VarError::NotPresent) => true,
-        Err(_) => true,
-    }
+                || value.eq_ignore_ascii_case("disabled"))
+    )
 }
 
 const Q8_0_BLOCK_VALUES: usize = 32;

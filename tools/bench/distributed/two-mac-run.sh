@@ -20,6 +20,10 @@ SPLIT="${SPLIT:-$((TOTAL_LAYERS/2))}"
 PROMPT="${PROMPT:-Explain what a Rust borrow checker does in two sentences.}"
 MAX_TOKENS="${MAX_TOKENS:-64}"
 REMOTE_BIN="${REMOTE_BIN:-/tmp/camelid}"
+EXTRA_ENV="${EXTRA_ENV:-}"   # extra VAR=VAL pairs exported on BOTH nodes (e.g. CAMELID_DISTRIBUTED_TRACE=1)
+# Repack OFF by default: the GPU-resident decode path needs plain (un-packed) Q8_0 blocks,
+# and the nodes' residency gate hard-fails on repacked storage. Set REPACK=1 for CPU-decode runs.
+REPACK="${REPACK:-0}"
 REMOTE_MODEL="${REMOTE_MODEL:-$MODEL}"
 PORT_W=5005
 PORT_M=5006
@@ -29,9 +33,14 @@ echo "[two-mac] worker $SPLIT..$TOTAL_LAYERS on $WORKER_HOST ($WORKER_TB_IP)"
 
 # 1) Stage binary + model to the worker if missing (over the fast TB link).
 ssh "$WORKER_HOST" "mkdir -p \"\$(dirname '$REMOTE_MODEL')\""
-if ! ssh "$WORKER_HOST" "test -x '$REMOTE_BIN'"; then
+# Re-stage the binary whenever it differs (size check) — a stale worker binary silently
+# running old code is exactly the class of failure the residency gate exists to kill.
+remote_bin_size="$(ssh "$WORKER_HOST" "stat -f%z '$REMOTE_BIN' 2>/dev/null || echo 0")"
+local_bin_size="$(stat -f%z "$CAMELID_BIN")"
+if [ "$remote_bin_size" != "$local_bin_size" ]; then
   echo "[two-mac] copying binary -> $WORKER_HOST:$REMOTE_BIN"
   scp -q "$CAMELID_BIN" "$WORKER_HOST:$REMOTE_BIN"
+  ssh "$WORKER_HOST" "chmod +x '$REMOTE_BIN'"
 fi
 remote_size="$(ssh "$WORKER_HOST" "stat -f%z '$REMOTE_MODEL' 2>/dev/null || echo 0")"
 local_size="$(stat -f%z "$MODEL")"
@@ -42,7 +51,7 @@ fi
 
 # 2) Launch the worker (last node) on the remote, bound to its TB IP.
 echo "[two-mac] starting remote worker..."
-ssh "$WORKER_HOST" "CAMELID_MAC_Q8_REPACK=1 /usr/bin/time -l '$REMOTE_BIN' distribute-worker '$REMOTE_MODEL' \
+ssh "$WORKER_HOST" "CAMELID_MAC_Q8_REPACK=$REPACK $EXTRA_ENV /usr/bin/time -l '$REMOTE_BIN' distribute-worker '$REMOTE_MODEL' \
   --addr $WORKER_TB_IP:$PORT_W --layers $SPLIT..$TOTAL_LAYERS --master-addr $MASTER_TB_IP:$PORT_M" \
   >/tmp/two_mac_worker.out 2>&1 &
 SSH_PID=$!
@@ -50,7 +59,7 @@ SSH_PID=$!
 # 3) Run the master (first node) here; it connects to the worker over TB.
 echo "[two-mac] starting master..."
 START=$(python3 -c 'import time;print(time.time())')
-CAMELID_MAC_Q8_REPACK=1 /usr/bin/time -l "$CAMELID_BIN" distribute-master "$MODEL" \
+env CAMELID_MAC_Q8_REPACK=$REPACK $EXTRA_ENV /usr/bin/time -l "$CAMELID_BIN" distribute-master "$MODEL" \
   --worker-addr "$WORKER_TB_IP:$PORT_W" --layers "0..$SPLIT" --addr "$MASTER_TB_IP:$PORT_M" \
   --prompt "$PROMPT" --max-tokens "$MAX_TOKENS" >/tmp/two_mac_master.out 2>/tmp/two_mac_master.time || true
 END=$(python3 -c 'import time;print(time.time())')

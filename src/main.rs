@@ -20,7 +20,9 @@ use camelid::{
         recv_activation_packet, recv_token_feedback, send_activation_packet, send_token_feedback,
     },
     gguf::{read_metadata, GgufTensorType},
-    inference::{LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler, SamplingConfig},
+    inference::{
+        LlamaInferenceSession, LlamaLoadedWeights, LlamaSampler, Q8ResidencyReport, SamplingConfig,
+    },
     metal::detect_metal_device,
     model::{LlamaModelConfig, LlamaTensorBinding},
     tensor::{CpuTensor, Q8_0TensorBlocks, TensorStore},
@@ -701,6 +703,71 @@ fn infer_quantization(path: &std::path::Path) -> String {
     "unknown".to_string()
 }
 
+/// Hard residency gate for pipeline nodes: every owned Q8_0 linear must hold plain
+/// RAM-resident blocks, and the process memory footprint must account for them. Panics with
+/// a per-tensor trace otherwise — a node is NEVER allowed to silently fall back to streaming
+/// weights from disk per token (~100x slower decode, and it disqualifies the GPU-resident path).
+fn assert_q8_0_weight_residency(weights: &LlamaLoadedWeights, node: &str) {
+    let gib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let report: Q8ResidencyReport = weights.q8_0_residency_report();
+    if !report.violations.is_empty() {
+        eprintln!("[{node}] Q8_0 residency violations:");
+        for violation in &report.violations {
+            eprintln!("  - {violation}");
+        }
+        panic!(
+            "[{node}] {} Q8_0 tensor(s) are NOT RAM-resident plain blocks; refusing to run",
+            report.violations.len()
+        );
+    }
+    // The retained blocks must show up in this process's physical footprint. The threshold
+    // derives from the node's actual owned shard (a fixed floor would false-fail small
+    // models and sharded splits); 90% slack covers allocator/OS accounting noise. A node
+    // that silently fell back to disk streaming sits at a few hundred MB and misses this by
+    // a wide margin. Footprint (not RSS) is the metric: macOS compresses untouched pages
+    // under memory pressure, which drops them out of RSS while they are still materialized.
+    let footprint = phys_footprint_bytes();
+    let min_footprint = report.resident_block_bytes / 10 * 9;
+    if footprint < min_footprint {
+        panic!(
+            "[{node}] memory footprint {:.2} GiB < required {:.2} GiB for {} retained Q8_0 \
+             tensors ({:.2} GiB of blocks) — weights did not actually materialize in RAM",
+            gib(footprint),
+            gib(min_footprint),
+            report.resident_tensors,
+            gib(report.resident_block_bytes)
+        );
+    }
+    println!(
+        "[{node}] Q8_0 residency OK: {} tensors, {:.2} GiB retained blocks, footprint {:.2} GiB",
+        report.resident_tensors,
+        gib(report.resident_block_bytes),
+        gib(footprint)
+    );
+}
+
+/// Current physical memory footprint of this process in bytes — the metric Activity Monitor
+/// and `/usr/bin/time -l`'s "memory footprint" report. Unlike RSS it includes pages the OS
+/// compressed under memory pressure, so freshly-materialized weights are counted even on a
+/// loaded machine. Falls back to peak RSS where unavailable.
+fn phys_footprint_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        let ret = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V2,
+                &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+            )
+        };
+        if ret == 0 && info.ri_phys_footprint > 0 {
+            return info.ri_phys_footprint;
+        }
+    }
+    peak_rss_bytes()
+}
+
 /// Peak resident set size of this process. macOS reports bytes; Linux kilobytes.
 fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
@@ -788,6 +855,7 @@ async fn run_distribute_worker(
         Some(layer_range.clone()),
     )?);
     let mut session = LlamaInferenceSession::new(config.clone(), weights)?;
+    assert_q8_0_weight_residency(&session.weights, "dist-worker");
 
     let listener = TcpListener::bind(addr)?;
     println!("Worker listening on {}...", addr);
@@ -801,9 +869,11 @@ async fn run_distribute_worker(
     let mut client_stream = accept_connection(&listener);
 
     println!("Cluster worker execution loop active!");
+    let trace = std::env::var_os("CAMELID_DISTRIBUTED_TRACE").is_some();
     let mut activations = Vec::new();
 
     loop {
+        let idle_started = Instant::now();
         let header = match recv_activation_packet(&mut client_stream, &mut activations) {
             Ok(h) => h,
             Err(e) => {
@@ -823,14 +893,18 @@ async fn run_distribute_worker(
             ));
         }
         let rows = activations.len() / hidden_dim;
+        let idle_us = idle_started.elapsed().as_micros();
         let hidden =
             CpuTensor::from_f32("activations", vec![rows, hidden_dim], activations.clone())?;
 
+        let forward_started = Instant::now();
         let out_hidden = session.forward_layer_range_from_hidden(
             &hidden,
             header.pos as usize,
             header.seq_len as usize,
         )?;
+        let forward_us = forward_started.elapsed().as_micros();
+        let tail_started = Instant::now();
 
         if let Some(ref mut ds) = downstream_stream {
             if forward_addr.is_some() {
@@ -851,6 +925,16 @@ async fn run_distribute_worker(
 
                 send_token_feedback(ds, token_id, is_finished)?;
             }
+        }
+        if trace {
+            eprintln!(
+                "[dist-worker] pos={} rows={} idle={}us forward={}us logits_send={}us",
+                header.pos,
+                rows,
+                idle_us,
+                forward_us,
+                tail_started.elapsed().as_micros()
+            );
         }
     }
 
@@ -884,6 +968,7 @@ async fn run_distribute_master(
         Some(layer_range.clone()),
     )?);
     let mut session = LlamaInferenceSession::new(config.clone(), weights)?;
+    assert_q8_0_weight_residency(&session.weights, "dist-master");
 
     let listener = TcpListener::bind(addr)?;
     println!("Master listening for feedback on {}...", addr);
@@ -921,22 +1006,33 @@ async fn run_distribute_master(
     pos += seq_len;
     seq_len = 1;
 
+    let trace = std::env::var_os("CAMELID_DISTRIBUTED_TRACE").is_some();
     let decode_start = Instant::now();
     let mut generated = 1;
     while !is_finished && generated < max_tokens {
+        let compute_started = Instant::now();
         let hidden = session
             .weights
             .token_embedding
             .embedding_lookup(&[current_token], "token_embedding")?;
         let out_hidden = session.forward_layer_range_from_hidden(&hidden, pos, seq_len)?;
+        let compute_us = compute_started.elapsed().as_micros();
+        let send_started = Instant::now();
         send_activation_packet(
             &mut downstream_stream,
             pos as u32,
             seq_len as u32,
             &out_hidden.data,
         )?;
-
+        let send_us = send_started.elapsed().as_micros();
+        let wait_started = Instant::now();
         let feedback = recv_token_feedback(&mut feedback_stream)?;
+        if trace {
+            eprintln!(
+                "[dist-master] pos={pos} compute={compute_us}us send={send_us}us wait={}us",
+                wait_started.elapsed().as_micros()
+            );
+        }
         current_token = feedback.token_id;
         is_finished = feedback.is_finished;
 

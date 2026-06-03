@@ -10530,3 +10530,45 @@ fn mixtral_moe_ffn_captures_router_logits_and_selected_experts() {
     let selected_sum = trace.rows[0].selected_weights.iter().sum::<f32>();
     assert!((selected_sum - 1.0).abs() < 1.0e-6, "{trace:?}");
 }
+
+#[test]
+fn q8_0_residency_report_counts_resident_blocks_and_flags_file_backed() {
+    let shape = TensorShape { dims: vec![2, 32] };
+    let blocks = vec![
+        Q8_0Block {
+            scale: 1.0,
+            quants: [0; 32],
+        };
+        2
+    ];
+    let resident = CpuTensor::from_q8_0_blocks("resident.weight", shape.clone(), blocks).unwrap();
+    let file_backed = CpuTensor::q8_0_file_backed_linear(
+        "lazy.weight",
+        shape,
+        Q8_0FileBacking::new(std::path::PathBuf::from("/nonexistent.gguf"), 0, 2),
+    );
+    let placeholder = CpuTensor::from_f32("placeholder", vec![0], vec![]).unwrap();
+
+    let weights = LlamaLoadedWeights {
+        token_embedding: resident,
+        output_norm: placeholder,
+        output: Some(file_backed),
+        rope_freqs: None,
+        layers: Vec::new(),
+        layer_range: None,
+    };
+
+    let report = weights.q8_0_residency_report();
+    assert_eq!(report.resident_tensors, 1);
+    assert_eq!(
+        report.resident_block_bytes,
+        (2 * std::mem::size_of::<Q8_0Block>()) as u64
+    );
+    assert_eq!(report.violations.len(), 1);
+    assert!(
+        report.violations[0].contains("lazy.weight")
+            && report.violations[0].contains("file-backed"),
+        "{:?}",
+        report.violations
+    );
+}
