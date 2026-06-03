@@ -2090,45 +2090,87 @@ fn encode_binary(
     e.end_encoding();
 }
 
-/// GPU-resident FFN block in a single command buffer (no CPU readback between ops):
-/// rms_norm -> quantize -> gate & up matmul -> silu_mul -> quantize -> down matmul ->
-/// residual add with the input. Weights are Q8_0 36-byte blocks (gate/up are
-/// [ffn_dim x hidden/32], down is [hidden x ffn_dim/32]). Returns [hidden]; None if
-/// Metal is unavailable. Bit-identical to running the standalone kernels in sequence.
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
-pub fn try_ffn_block_resident(
-    input: &[f32],
+fn encode_rope(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    data: &Buffer,
+    cos_t: &Buffer,
+    sin_t: &Buffer,
+    scalar: &Buffer,
+    head_count: usize,
+    half_rope: usize,
+) {
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&k.rope_rotate_pipeline);
+    e.set_buffer(0, Some(data), 0);
+    e.set_buffer(1, Some(cos_t), 0);
+    e.set_buffer(2, Some(sin_t), 0);
+    e.set_buffer(3, Some(scalar), 0); // head_count
+    e.set_buffer(4, Some(scalar), 4); // head_dim
+    e.set_buffer(5, Some(scalar), 8); // half_rope
+    e.set_buffer(6, Some(scalar), 12); // pairing
+    dispatch_1d(e, &k.rope_rotate_pipeline, head_count * half_rope);
+    e.end_encoding();
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_attention(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    scores: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_heads: usize,
+) {
+    let e = cb.new_compute_command_encoder();
+    e.set_compute_pipeline_state(&k.attention_decode_pipeline);
+    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(2, Some(values), 0);
+    e.set_buffer(3, Some(scores), 0);
+    e.set_buffer(4, Some(out), 0);
+    e.set_buffer(5, Some(scalar), 0); // n_heads
+    e.set_buffer(6, Some(scalar), 4); // head_dim
+    e.set_buffer(7, Some(scalar), 8); // position_count
+    e.set_buffer(8, Some(scalar), 12); // group
+    e.set_buffer(9, Some(scalar), 16); // scale (f32)
+    dispatch_1d(e, &k.attention_decode_pipeline, n_heads);
+    e.end_encoding();
+}
+
+/// Encode the FFN block op-chain into `cb` with no commit/readback: reads `in_buf`, writes
+/// the residual sum into `out_buf` (rms_norm -> quantize -> gate & up matmul -> silu_mul ->
+/// quantize -> down matmul -> residual add with `in_buf`). Allocates its own scratch/weight
+/// buffers and pushes them into `keep` so they outlive the command buffer. Dimensions are
+/// taken from the slice lengths; callers must pre-validate (see `try_ffn_block_resident`).
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_ffn_block(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    in_buf: &Buffer,
+    out_buf: &Buffer,
     ffn_norm: &[f32],
     eps: f32,
     gate_weight_blocks: &[u8],
     up_weight_blocks: &[u8],
     down_weight_blocks: &[u8],
     ffn_dim: usize,
-) -> Option<Vec<f32>> {
-    let hidden = input.len();
-    if hidden == 0
-        || !hidden.is_multiple_of(32)
-        || ffn_dim == 0
-        || !ffn_dim.is_multiple_of(32)
-        || ffn_norm.len() != hidden
-    {
-        return None;
-    }
+) {
+    let hidden = ffn_norm.len();
     let bpr_hidden = hidden / 32;
     let bpr_ffn = ffn_dim / 32;
-    if gate_weight_blocks.len() != ffn_dim * bpr_hidden * 36
-        || up_weight_blocks.len() != ffn_dim * bpr_hidden * 36
-        || down_weight_blocks.len() != hidden * bpr_ffn * 36
-    {
-        return None;
-    }
-    let k = metal_linear_kernel()?;
     let nb = |bytes: u64| {
         k.device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
     };
-    let in_buf = nb((hidden * 4) as u64);
     let norm_w_buf = nb((hidden * 4) as u64);
     let norm_buf = nb((hidden * 4) as u64);
     let rms_scalar = nb(8);
@@ -2148,10 +2190,8 @@ pub fn try_ffn_block_resident(
     let down_w = nb(down_weight_blocks.len() as u64);
     let down_buf = nb((hidden * 4) as u64);
     let down_scalar = nb(8);
-    let out_buf = nb((hidden * 4) as u64);
     let resid_n = nb(4);
 
-    write_buffer_f32(&in_buf, input);
     write_buffer_f32(&norm_w_buf, ffn_norm);
     write_buffer_u8(&gate_w, gate_weight_blocks);
     write_buffer_u8(&up_w, up_weight_blocks);
@@ -2172,8 +2212,7 @@ pub fn try_ffn_block_resident(
         *(resid_n.contents() as *mut u32) = hidden as u32;
     }
 
-    let cb = k.queue.new_command_buffer();
-    encode_rms_norm(cb, k, &in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
+    encode_rms_norm(cb, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
     encode_quantize(cb, k, &norm_buf, &scales1, &quants1, &nblocks1, bpr_hidden);
     encode_q8_matmul(
         cb,
@@ -2218,11 +2257,577 @@ pub fn try_ffn_block_resident(
     encode_binary(
         cb,
         &k.residual_add_pipeline,
-        &in_buf,
+        in_buf,
         &down_buf,
-        &out_buf,
+        out_buf,
         &resid_n,
         hidden,
+    );
+
+    keep.extend([
+        norm_w_buf,
+        norm_buf,
+        rms_scalar,
+        scales1,
+        quants1,
+        nblocks1,
+        gate_w,
+        up_w,
+        gate_buf,
+        up_buf,
+        gateup_scalar,
+        act_buf,
+        silu_n,
+        scales2,
+        quants2,
+        nblocks2,
+        down_w,
+        down_buf,
+        down_scalar,
+        resid_n,
+    ]);
+}
+
+/// Encode the attention block op-chain into `cb` with no commit/readback: reads `in_buf`,
+/// writes the residual sum into `out_buf` (rms_norm -> quantize -> q/k/v matmul -> RoPE(q,k)
+/// -> blit current k/v into the KV cache at the last position -> decode attention ->
+/// quantize -> o matmul -> residual add with `in_buf`). Allocates its own scratch/weight/
+/// cache buffers and pushes them into `keep` so they outlive the command buffer. Dimensions
+/// are taken from the slice lengths; callers must pre-validate.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_block(
+    cb: &metal::CommandBufferRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    in_buf: &Buffer,
+    out_buf: &Buffer,
+    attn_norm: &[f32],
+    eps: f32,
+    q_weight_blocks: &[u8],
+    k_weight_blocks: &[u8],
+    v_weight_blocks: &[u8],
+    o_weight_blocks: &[u8],
+    cos_t: &[f32],
+    sin_t: &[f32],
+    cache_k: &[f32],
+    cache_v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    scale: f32,
+    split_half_pairing: bool,
+) {
+    let hidden = attn_norm.len();
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let half_rope = cos_t.len();
+    let bpr_hidden = hidden / 32;
+    let bpr_q = q_dim / 32;
+    let pos = position_count - 1;
+    let group = (n_heads / n_kv_heads) as u32;
+    let nb = |bytes: u64| {
+        k.device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    };
+    let f32b = |n: usize| nb((n * 4) as u64);
+    let norm_w_buf = f32b(hidden);
+    let norm_buf = f32b(hidden);
+    let rms_scalar = nb(8);
+    let scales_norm = f32b(bpr_hidden);
+    let quants_norm = nb(hidden as u64);
+    let nblocks_norm = nb(4);
+    let q_w_buf = nb(q_weight_blocks.len() as u64);
+    let k_w_buf = nb(k_weight_blocks.len() as u64);
+    let v_w_buf = nb(v_weight_blocks.len() as u64);
+    let o_w_buf = nb(o_weight_blocks.len() as u64);
+    let query_buf = f32b(q_dim);
+    let key_buf = f32b(kv_dim);
+    let val_buf = f32b(kv_dim);
+    let q_mm_scalar = nb(8);
+    let kv_mm_scalar = nb(8);
+    let cos_buf = f32b(half_rope);
+    let sin_buf = f32b(half_rope);
+    let rope_q_scalar = nb(16);
+    let rope_k_scalar = nb(16);
+    let cache_k_buf = f32b(cache_k.len());
+    let cache_v_buf = f32b(cache_v.len());
+    let scores_buf = f32b(n_heads * position_count);
+    let ctx_buf = f32b(q_dim);
+    let attn_scalar = nb(20);
+    let scales_ctx = f32b(bpr_q);
+    let quants_ctx = nb(q_dim as u64);
+    let nblocks_ctx = nb(4);
+    let o_buf = f32b(hidden);
+    let o_mm_scalar = nb(8);
+    let resid_n = nb(4);
+
+    write_buffer_f32(&norm_w_buf, attn_norm);
+    write_buffer_u8(&q_w_buf, q_weight_blocks);
+    write_buffer_u8(&k_w_buf, k_weight_blocks);
+    write_buffer_u8(&v_w_buf, v_weight_blocks);
+    write_buffer_u8(&o_w_buf, o_weight_blocks);
+    write_buffer_f32(&cos_buf, cos_t);
+    write_buffer_f32(&sin_buf, sin_t);
+    write_buffer_f32(&cache_k_buf, cache_k);
+    write_buffer_f32(&cache_v_buf, cache_v);
+    unsafe {
+        let p = rms_scalar.contents() as *mut u8;
+        *(p as *mut u32) = hidden as u32;
+        *(p.add(4) as *mut f32) = eps;
+        *(nblocks_norm.contents() as *mut u32) = bpr_hidden as u32;
+        let q = q_mm_scalar.contents() as *mut u32;
+        *q = bpr_hidden as u32;
+        *q.add(1) = q_dim as u32;
+        let kv = kv_mm_scalar.contents() as *mut u32;
+        *kv = bpr_hidden as u32;
+        *kv.add(1) = kv_dim as u32;
+        let set_rope = |buf: &Buffer, hc: usize| {
+            let r = buf.contents() as *mut u32;
+            *r = hc as u32;
+            *r.add(1) = head_dim as u32;
+            *r.add(2) = half_rope as u32;
+            *r.add(3) = u32::from(split_half_pairing);
+        };
+        set_rope(&rope_q_scalar, n_heads);
+        set_rope(&rope_k_scalar, n_kv_heads);
+        let a = attn_scalar.contents() as *mut u8;
+        *(a as *mut u32) = n_heads as u32;
+        *(a.add(4) as *mut u32) = head_dim as u32;
+        *(a.add(8) as *mut u32) = position_count as u32;
+        *(a.add(12) as *mut u32) = group;
+        *(a.add(16) as *mut f32) = scale;
+        *(nblocks_ctx.contents() as *mut u32) = bpr_q as u32;
+        let o = o_mm_scalar.contents() as *mut u32;
+        *o = bpr_q as u32;
+        *o.add(1) = hidden as u32;
+        *(resid_n.contents() as *mut u32) = hidden as u32;
+    }
+
+    encode_rms_norm(cb, k, in_buf, &norm_w_buf, &norm_buf, &rms_scalar);
+    encode_quantize(
+        cb,
+        k,
+        &norm_buf,
+        &scales_norm,
+        &quants_norm,
+        &nblocks_norm,
+        bpr_hidden,
+    );
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales_norm,
+        &quants_norm,
+        &q_w_buf,
+        &query_buf,
+        &q_mm_scalar,
+        q_dim,
+    );
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales_norm,
+        &quants_norm,
+        &k_w_buf,
+        &key_buf,
+        &kv_mm_scalar,
+        kv_dim,
+    );
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales_norm,
+        &quants_norm,
+        &v_w_buf,
+        &val_buf,
+        &kv_mm_scalar,
+        kv_dim,
+    );
+    encode_rope(
+        cb,
+        k,
+        &query_buf,
+        &cos_buf,
+        &sin_buf,
+        &rope_q_scalar,
+        n_heads,
+        half_rope,
+    );
+    encode_rope(
+        cb,
+        k,
+        &key_buf,
+        &cos_buf,
+        &sin_buf,
+        &rope_k_scalar,
+        n_kv_heads,
+        half_rope,
+    );
+    // Write the current token's (roped) K and (raw) V into the cache at `pos`.
+    let blit = cb.new_blit_command_encoder();
+    for h in 0..n_kv_heads {
+        let src_off = (h * head_dim * 4) as u64;
+        let dst_off = ((h * position_count + pos) * head_dim * 4) as u64;
+        let size = (head_dim * 4) as u64;
+        blit.copy_from_buffer(&key_buf, src_off, &cache_k_buf, dst_off, size);
+        blit.copy_from_buffer(&val_buf, src_off, &cache_v_buf, dst_off, size);
+    }
+    blit.end_encoding();
+    encode_attention(
+        cb,
+        k,
+        &query_buf,
+        &cache_k_buf,
+        &cache_v_buf,
+        &scores_buf,
+        &ctx_buf,
+        &attn_scalar,
+        n_heads,
+    );
+    encode_quantize(
+        cb,
+        k,
+        &ctx_buf,
+        &scales_ctx,
+        &quants_ctx,
+        &nblocks_ctx,
+        bpr_q,
+    );
+    encode_q8_matmul(
+        cb,
+        k,
+        &scales_ctx,
+        &quants_ctx,
+        &o_w_buf,
+        &o_buf,
+        &o_mm_scalar,
+        hidden,
+    );
+    encode_binary(
+        cb,
+        &k.residual_add_pipeline,
+        in_buf,
+        &o_buf,
+        out_buf,
+        &resid_n,
+        hidden,
+    );
+
+    keep.extend([
+        norm_w_buf,
+        norm_buf,
+        rms_scalar,
+        scales_norm,
+        quants_norm,
+        nblocks_norm,
+        q_w_buf,
+        k_w_buf,
+        v_w_buf,
+        o_w_buf,
+        query_buf,
+        key_buf,
+        val_buf,
+        q_mm_scalar,
+        kv_mm_scalar,
+        cos_buf,
+        sin_buf,
+        rope_q_scalar,
+        rope_k_scalar,
+        cache_k_buf,
+        cache_v_buf,
+        scores_buf,
+        ctx_buf,
+        attn_scalar,
+        scales_ctx,
+        quants_ctx,
+        nblocks_ctx,
+        o_buf,
+        o_mm_scalar,
+        resid_n,
+    ]);
+}
+
+/// GPU-resident FFN block in a single command buffer (no CPU readback between ops):
+/// rms_norm -> quantize -> gate & up matmul -> silu_mul -> quantize -> down matmul ->
+/// residual add with the input. Weights are Q8_0 36-byte blocks (gate/up are
+/// [ffn_dim x hidden/32], down is [hidden x ffn_dim/32]). Returns [hidden]; None if
+/// Metal is unavailable. Bit-identical to running the standalone kernels in sequence.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_ffn_block_resident(
+    input: &[f32],
+    ffn_norm: &[f32],
+    eps: f32,
+    gate_weight_blocks: &[u8],
+    up_weight_blocks: &[u8],
+    down_weight_blocks: &[u8],
+    ffn_dim: usize,
+) -> Option<Vec<f32>> {
+    let hidden = input.len();
+    if hidden == 0
+        || !hidden.is_multiple_of(32)
+        || ffn_dim == 0
+        || !ffn_dim.is_multiple_of(32)
+        || ffn_norm.len() != hidden
+    {
+        return None;
+    }
+    let bpr_hidden = hidden / 32;
+    let bpr_ffn = ffn_dim / 32;
+    if gate_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+        || up_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+        || down_weight_blocks.len() != hidden * bpr_ffn * 36
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let nb = |n: usize| {
+        k.device
+            .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+    };
+    let in_buf = nb(hidden);
+    let out_buf = nb(hidden);
+    write_buffer_f32(&in_buf, input);
+    let mut keep = Vec::new();
+    let cb = k.queue.new_command_buffer();
+    encode_ffn_block(
+        cb,
+        k,
+        &mut keep,
+        &in_buf,
+        &out_buf,
+        ffn_norm,
+        eps,
+        gate_weight_blocks,
+        up_weight_blocks,
+        down_weight_blocks,
+        ffn_dim,
+    );
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; hidden];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+/// GPU-resident attention block in a single command buffer (no CPU readback): rms_norm
+/// -> quantize -> q/k/v matmul -> RoPE(q,k) -> write current k/v into the KV cache
+/// buffers at `position` (blit) -> decode attention over the cache -> quantize -> o
+/// matmul -> residual add with the input. `cache_k`/`cache_v` are laid out as
+/// `[n_kv * position_count * head_dim]`; positions 0..position-1 are caller-filled, this
+/// writes position `position_count-1`. cos/sin tables come from the CPU's RoPE math.
+/// Returns the `[hidden]` output, or None if Metal is unavailable. Bit-identical to
+/// running the standalone kernels.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_block_resident(
+    input: &[f32],
+    attn_norm: &[f32],
+    eps: f32,
+    q_weight_blocks: &[u8],
+    k_weight_blocks: &[u8],
+    v_weight_blocks: &[u8],
+    o_weight_blocks: &[u8],
+    cos_t: &[f32],
+    sin_t: &[f32],
+    cache_k: &[f32],
+    cache_v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    scale: f32,
+    split_half_pairing: bool,
+) -> Option<Vec<f32>> {
+    let hidden = input.len();
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let half_rope = cos_t.len();
+    if hidden == 0
+        || !hidden.is_multiple_of(32)
+        || !q_dim.is_multiple_of(32)
+        || head_dim == 0
+        || !head_dim.is_multiple_of(2)
+        || n_heads == 0
+        || n_kv_heads == 0
+        || !n_heads.is_multiple_of(n_kv_heads)
+        || position_count == 0
+        || attn_norm.len() != hidden
+        || sin_t.len() != half_rope
+        || half_rope * 2 > head_dim
+        || cache_k.len() != kv_dim * position_count
+        || cache_v.len() != cache_k.len()
+    {
+        return None;
+    }
+    let bpr_hidden = hidden / 32;
+    let bpr_q = q_dim / 32;
+    if q_weight_blocks.len() != q_dim * bpr_hidden * 36
+        || k_weight_blocks.len() != kv_dim * bpr_hidden * 36
+        || v_weight_blocks.len() != kv_dim * bpr_hidden * 36
+        || o_weight_blocks.len() != hidden * bpr_q * 36
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let nb = |n: usize| {
+        k.device
+            .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+    };
+    let in_buf = nb(hidden);
+    let out_buf = nb(hidden);
+    write_buffer_f32(&in_buf, input);
+    let mut keep = Vec::new();
+    let cb = k.queue.new_command_buffer();
+    encode_attention_block(
+        cb,
+        k,
+        &mut keep,
+        &in_buf,
+        &out_buf,
+        attn_norm,
+        eps,
+        q_weight_blocks,
+        k_weight_blocks,
+        v_weight_blocks,
+        o_weight_blocks,
+        cos_t,
+        sin_t,
+        cache_k,
+        cache_v,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        position_count,
+        scale,
+        split_half_pairing,
+    );
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; hidden];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+/// GPU-resident decode layer for one token in a SINGLE command buffer: runs the attention
+/// block then the FFN block with no CPU readback between them (the attention output stays
+/// in a GPU buffer and feeds the FFN block directly), so there is one commit/wait per layer
+/// instead of two. Bit-identical to `try_attention_block_resident` followed by
+/// `try_ffn_block_resident`. Returns the `[hidden]` layer output, or None if Metal is
+/// unavailable or the dimensions are invalid.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_layer_resident(
+    input: &[f32],
+    attn_norm: &[f32],
+    ffn_norm: &[f32],
+    eps: f32,
+    q_weight_blocks: &[u8],
+    k_weight_blocks: &[u8],
+    v_weight_blocks: &[u8],
+    o_weight_blocks: &[u8],
+    gate_weight_blocks: &[u8],
+    up_weight_blocks: &[u8],
+    down_weight_blocks: &[u8],
+    cos_t: &[f32],
+    sin_t: &[f32],
+    cache_k: &[f32],
+    cache_v: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    ffn_dim: usize,
+    scale: f32,
+    split_half_pairing: bool,
+) -> Option<Vec<f32>> {
+    let hidden = input.len();
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let half_rope = cos_t.len();
+    // Attention-block constraints.
+    if hidden == 0
+        || !hidden.is_multiple_of(32)
+        || !q_dim.is_multiple_of(32)
+        || head_dim == 0
+        || !head_dim.is_multiple_of(2)
+        || n_heads == 0
+        || n_kv_heads == 0
+        || !n_heads.is_multiple_of(n_kv_heads)
+        || position_count == 0
+        || attn_norm.len() != hidden
+        || sin_t.len() != half_rope
+        || half_rope * 2 > head_dim
+        || cache_k.len() != kv_dim * position_count
+        || cache_v.len() != cache_k.len()
+    {
+        return None;
+    }
+    // FFN-block constraints.
+    if ffn_dim == 0 || !ffn_dim.is_multiple_of(32) || ffn_norm.len() != hidden {
+        return None;
+    }
+    let bpr_hidden = hidden / 32;
+    let bpr_q = q_dim / 32;
+    let bpr_ffn = ffn_dim / 32;
+    if q_weight_blocks.len() != q_dim * bpr_hidden * 36
+        || k_weight_blocks.len() != kv_dim * bpr_hidden * 36
+        || v_weight_blocks.len() != kv_dim * bpr_hidden * 36
+        || o_weight_blocks.len() != hidden * bpr_q * 36
+        || gate_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+        || up_weight_blocks.len() != ffn_dim * bpr_hidden * 36
+        || down_weight_blocks.len() != hidden * bpr_ffn * 36
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let nb = |n: usize| {
+        k.device
+            .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+    };
+    let in_buf = nb(hidden);
+    let attn_buf = nb(hidden);
+    let out_buf = nb(hidden);
+    write_buffer_f32(&in_buf, input);
+    let mut keep = Vec::new();
+    let cb = k.queue.new_command_buffer();
+    encode_attention_block(
+        cb,
+        k,
+        &mut keep,
+        &in_buf,
+        &attn_buf,
+        attn_norm,
+        eps,
+        q_weight_blocks,
+        k_weight_blocks,
+        v_weight_blocks,
+        o_weight_blocks,
+        cos_t,
+        sin_t,
+        cache_k,
+        cache_v,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        position_count,
+        scale,
+        split_half_pairing,
+    );
+    encode_ffn_block(
+        cb,
+        k,
+        &mut keep,
+        &attn_buf,
+        &out_buf,
+        ffn_norm,
+        eps,
+        gate_weight_blocks,
+        up_weight_blocks,
+        down_weight_blocks,
+        ffn_dim,
     );
     cb.commit();
     cb.wait_until_completed();
@@ -2250,6 +2855,59 @@ pub fn try_ffn_block_resident(
     _up_weight_blocks: &[u8],
     _down_weight_blocks: &[u8],
     _ffn_dim: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_attention_block_resident(
+    _input: &[f32],
+    _attn_norm: &[f32],
+    _eps: f32,
+    _q_weight_blocks: &[u8],
+    _k_weight_blocks: &[u8],
+    _v_weight_blocks: &[u8],
+    _o_weight_blocks: &[u8],
+    _cos_t: &[f32],
+    _sin_t: &[f32],
+    _cache_k: &[f32],
+    _cache_v: &[f32],
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _position_count: usize,
+    _scale: f32,
+    _split_half_pairing: bool,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_decode_layer_resident(
+    _input: &[f32],
+    _attn_norm: &[f32],
+    _ffn_norm: &[f32],
+    _eps: f32,
+    _q_weight_blocks: &[u8],
+    _k_weight_blocks: &[u8],
+    _v_weight_blocks: &[u8],
+    _o_weight_blocks: &[u8],
+    _gate_weight_blocks: &[u8],
+    _up_weight_blocks: &[u8],
+    _down_weight_blocks: &[u8],
+    _cos_t: &[f32],
+    _sin_t: &[f32],
+    _cache_k: &[f32],
+    _cache_v: &[f32],
+    _n_heads: usize,
+    _n_kv_heads: usize,
+    _head_dim: usize,
+    _position_count: usize,
+    _ffn_dim: usize,
+    _scale: f32,
+    _split_half_pairing: bool,
 ) -> Option<Vec<f32>> {
     None
 }
@@ -2513,6 +3171,123 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_attention_block_resident_matches_standalone() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n_heads = 2usize;
+        let n_kv = 2usize;
+        let head_dim = 32usize;
+        let hidden = 64usize;
+        let position_count = 3usize;
+        let pos = position_count - 1;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.2)
+            .collect();
+        let attn_norm: Vec<f32> = (0..hidden).map(|i| 0.5 + (i as f32 % 3.0) * 0.1).collect();
+        let cos_t: Vec<f32> = (0..half).map(|p| (0.2 + p as f32 * 0.1).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|p| (0.2 + p as f32 * 0.1).sin()).collect();
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        let q_w = mkw(q_dim, bpr_hidden, 1);
+        let k_w = mkw(kv_dim, bpr_hidden, 2);
+        let v_w = mkw(kv_dim, bpr_hidden, 3);
+        let o_w = mkw(hidden, bpr_q, 4);
+        let cache_k: Vec<f32> = (0..kv_dim * position_count)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let cache_v: Vec<f32> = (0..kv_dim * position_count)
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.15)
+            .collect();
+
+        // Reference: standalone (CPU-verified) kernels in sequence.
+        let norm = try_rms_norm_f32(&input, &attn_norm, eps).unwrap();
+        let (sn, qn) = try_quantize_q8_0_f32(&norm).unwrap();
+        let mut query = vec![0.0f32; q_dim];
+        assert!(try_q8_0_block_linear_row(
+            &sn, &qn, &q_w, q_dim, bpr_hidden, &mut query
+        ));
+        let mut key = vec![0.0f32; kv_dim];
+        assert!(try_q8_0_block_linear_row(
+            &sn, &qn, &k_w, kv_dim, bpr_hidden, &mut key
+        ));
+        let mut val = vec![0.0f32; kv_dim];
+        assert!(try_q8_0_block_linear_row(
+            &sn, &qn, &v_w, kv_dim, bpr_hidden, &mut val
+        ));
+        let query_r =
+            try_rope_rotate_f32(&query, &cos_t, &sin_t, n_heads, head_dim, half, false).unwrap();
+        let key_r = try_rope_rotate_f32(&key, &cos_t, &sin_t, n_kv, head_dim, half, false).unwrap();
+        let mut ref_k = cache_k.clone();
+        let mut ref_v = cache_v.clone();
+        for h in 0..n_kv {
+            let dst = (h * position_count + pos) * head_dim;
+            ref_k[dst..dst + head_dim].copy_from_slice(&key_r[h * head_dim..(h + 1) * head_dim]);
+            ref_v[dst..dst + head_dim].copy_from_slice(&val[h * head_dim..(h + 1) * head_dim]);
+        }
+        let ctx = try_attention_decode_f32(
+            &query_r,
+            &ref_k,
+            &ref_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            scale,
+        )
+        .unwrap();
+        let (sc, qc) = try_quantize_q8_0_f32(&ctx).unwrap();
+        let mut o = vec![0.0f32; hidden];
+        assert!(try_q8_0_block_linear_row(
+            &sc, &qc, &o_w, hidden, bpr_q, &mut o
+        ));
+        let expected = try_residual_add_f32(&input, &o).unwrap();
+
+        let got = try_attention_block_resident(
+            &input,
+            &attn_norm,
+            eps,
+            &q_w,
+            &k_w,
+            &v_w,
+            &o_w,
+            &cos_t,
+            &sin_t,
+            &cache_k,
+            &cache_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            scale,
+            false,
+        )
+        .unwrap();
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_ffn_block_resident_matches_standalone() {
         if !detect_metal_device().available {
             return;
@@ -2566,6 +3341,120 @@ mod tests {
             try_ffn_block_resident(&input, &ffn_norm, eps, &gate_w, &up_w, &down_w, ffn).unwrap();
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_decode_layer_resident_matches_blocks() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // The fused decode layer (attention block + FFN block in ONE command buffer, with the
+        // attention output staying GPU-resident and feeding the FFN block) must equal running
+        // the two standalone resident blocks separately. Same kernels + same inputs, so this
+        // should be bit-identical; it guards the cross-block buffer handoff and lifetimes.
+        let n_heads = 2usize;
+        let n_kv = 2usize;
+        let head_dim = 32usize;
+        let hidden = 64usize;
+        let ffn = 128usize;
+        let position_count = 3usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.2)
+            .collect();
+        let attn_norm: Vec<f32> = (0..hidden).map(|i| 0.5 + (i as f32 % 3.0) * 0.1).collect();
+        let ffn_norm: Vec<f32> = (0..hidden).map(|i| 0.4 + (i as f32 % 5.0) * 0.07).collect();
+        let cos_t: Vec<f32> = (0..half).map(|p| (0.2 + p as f32 * 0.1).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|p| (0.2 + p as f32 * 0.1).sin()).collect();
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        let q_w = mkw(q_dim, bpr_hidden, 1);
+        let k_w = mkw(kv_dim, bpr_hidden, 2);
+        let v_w = mkw(kv_dim, bpr_hidden, 3);
+        let o_w = mkw(hidden, bpr_q, 4);
+        let gate_w = mkw(ffn, bpr_hidden, 5);
+        let up_w = mkw(ffn, bpr_hidden, 6);
+        let down_w = mkw(hidden, bpr_ffn, 7);
+        let cache_k: Vec<f32> = (0..kv_dim * position_count)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let cache_v: Vec<f32> = (0..kv_dim * position_count)
+            .map(|i| ((i as f32 % 7.0) - 3.0) * 0.15)
+            .collect();
+
+        // Reference: the two standalone resident blocks run separately, attention -> FFN.
+        let attn_out = try_attention_block_resident(
+            &input,
+            &attn_norm,
+            eps,
+            &q_w,
+            &k_w,
+            &v_w,
+            &o_w,
+            &cos_t,
+            &sin_t,
+            &cache_k,
+            &cache_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            scale,
+            false,
+        )
+        .unwrap();
+        let expected =
+            try_ffn_block_resident(&attn_out, &ffn_norm, eps, &gate_w, &up_w, &down_w, ffn)
+                .unwrap();
+
+        let got = try_decode_layer_resident(
+            &input,
+            &attn_norm,
+            &ffn_norm,
+            eps,
+            &q_w,
+            &k_w,
+            &v_w,
+            &o_w,
+            &gate_w,
+            &up_w,
+            &down_w,
+            &cos_t,
+            &sin_t,
+            &cache_k,
+            &cache_v,
+            n_heads,
+            n_kv,
+            head_dim,
+            position_count,
+            ffn,
+            scale,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.len(), hidden);
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
         }
     }
 
