@@ -25,27 +25,27 @@ For cross-surface wording discipline, see [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](..
 
 ### Apple Silicon same-host throughput: Camelid vs llama.cpp vs MLX-LM
 
-Prefill and TTFT come from `qa/evidence-bundles/apple-silicon-m4-3b-q8-throughput-camelid-llamacpp-mlx-20260604T201642Z-head-7311e0b/manifest.json`; the decode and peak-memory rows come from the prior same-host bundle `...-20260604T154728Z-head-b131f1a/manifest.json`.
+These results come from `qa/evidence-bundles/apple-silicon-m4-3b-q8-throughput-camelid-llamacpp-mlx-20260604T214257Z-head-0c6ec54/manifest.json`.
 
 Method summary:
 
 - host: one Apple M4 (10-core GPU, 16GB unified memory), warm
 - exact row: Llama 3.2 3B Instruct Q8_0 (GGUF for Camelid and llama.cpp; `mlx-community` 8-bit weights for MLX-LM)
-- workload: 601-token prompt, greedy sampling, bounded iterations
-- comparators: llama.cpp `llama-bench` (brew, Metal), MLX-LM (versions recorded in each bundle)
+- workload: 601-token prompt (prefill/TTFT) and a short prompt with 128 greedy tokens (decode), bounded iterations
+- comparators: llama.cpp `llama-bench` (brew, Metal; `-p 601 -n 128`), MLX-LM (versions recorded in the bundle)
 - method: three same-session rounds with alternating runtime order; the headline number is the per-runtime median across rounds (Camelid per-round value is the median of 5 measured iterations)
 
 | Lane | Camelid | llama.cpp | MLX-LM (8-bit) |
 | --- | ---: | ---: | ---: |
-| Prefill, 601-token prompt (tok/s, median of rounds) | 583.3 | 543.5 | 575.5 |
-| Decode, short context (tok/s) | 25.3 (128 tokens) | 28.7 (tg128) | 28.7 (two-point, 64) |
-| Time to first token, 601-token prompt (ms, median) | 1076 | - | - |
-| Peak process memory during the run (GB) | 4.28 | - | - |
+| Prefill, 601-token prompt (tok/s, median of rounds) | 587.3 | 543.7 | 577.9 |
+| Decode, short context (tok/s, median of rounds) | 29.74 (128 tokens) | 29.14 (tg128) | 29.13 (two-point, 64) |
+| Time to first token, 601-token prompt (ms, median) | 1068 | - | - |
 
 Reading boundary:
 
-- Prefill on this row and host reads above both comparators in every round of this session (Camelid 576.7 / 583.3 / 586.8; MLX-LM 575.5 / 575.4 / 579.9; llama.cpp 543.5 / 540.5 / 543.9). The +1.4% session-median margin over MLX-LM exceeds the observed inter-round spread of either runtime in this session, but it is narrow: this is a same-session win on this exact row, not a durable or general claim.
-- Camelid decode in the cited bundle reads below both comparators; decode tuning is tracked separately and this table makes no decode-speed claim.
+- Both lanes on this row and host read above both comparators in every round of this session (prefill: Camelid 587.3 / 587.3 / 587.4 vs MLX-LM 579.3 / 577.9 / 577.9 and llama.cpp 543.7 / 543.7 / 543.8; decode: Camelid 29.74 / 29.85 / 29.74 vs MLX-LM 29.54 / 29.13 / 29.01 and llama.cpp 29.08 / 29.14 / 29.22). Session-median margins are +1.6% (prefill) and +2.1% (decode) over MLX-LM; every Camelid round exceeds every comparator round, but the margins are narrow — a same-session win on this exact row, not a durable or general claim.
+- All three runtimes read faster on this host in this session than in the prior snapshot (llama.cpp tg128 28.7 -> 29.1, MLX-LM decode 28.7 -> 29.1), so cross-session comparisons are invalid; the claim rests on the same-session rounds only.
+- Camelid's greedy decode rides the resident GPU-sampling fast lane (the default at temperature 0); its 128-token continuation matches the CPU sampling path token-for-token in every iteration of every round.
 - This is one exact row on one host. Nothing here transfers to other models, quantizations, context shapes, or hosts.
 
 
