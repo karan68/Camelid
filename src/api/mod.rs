@@ -4278,6 +4278,8 @@ enum GenerationStepBlockingError {
 }
 
 struct StreamGenerationStepRequest {
+    /// Try the resident GPU-sampling greedy fast lane before the general step.
+    greedy_fast: bool,
     session: LlamaInferenceSession,
     input: Vec<u32>,
     sampler: LlamaSampler,
@@ -4289,10 +4291,37 @@ struct StreamGenerationStepRequest {
     generated_tokens: usize,
 }
 
+/// A generation step whose token was sampled ON the GPU (resident greedy fast lane): no
+/// logits crossed back to the CPU, so the logits/hidden fields are empty placeholders.
+/// Only valid on steps whose consumers do not read them (everything after the first
+/// generated token when no per-step logit diagnostics were requested).
+fn gpu_sampled_generation_step(
+    next_token_id: u32,
+    forward_us: u128,
+) -> crate::Result<LlamaGenerationStep> {
+    Ok(LlamaGenerationStep {
+        prompt_token_count: 1,
+        prefill_token_count: 0,
+        next_token_id,
+        logits: CpuTensor::from_f32("gpu_sampled_no_logits", vec![1, 0], Vec::new())?,
+        hidden_state: CpuTensor::from_f32("gpu_sampled_no_hidden", vec![1, 0], Vec::new())?,
+        output_norm_state: CpuTensor::from_f32("gpu_sampled_no_norm", vec![1, 0], Vec::new())?,
+        timings: LlamaForwardTimings {
+            total: forward_us,
+            ..LlamaForwardTimings::default()
+        },
+        prefill_timings: LlamaForwardTimings::default(),
+        first_token_timings: LlamaForwardTimings::default(),
+        sample: 0,
+        diagnostics: None,
+    })
+}
+
 async fn generate_stream_step_blocking(
     request: StreamGenerationStepRequest,
 ) -> std::result::Result<TimedGenerationStep, GenerationStepBlockingError> {
     let StreamGenerationStepRequest {
+        greedy_fast,
         session,
         input,
         sampler,
@@ -4309,6 +4338,29 @@ async fn generate_stream_step_blocking(
             std::thread::sleep(duration);
         }
         let mut session = session;
+        if greedy_fast {
+            if let Some((id, forward_us)) = session
+                .generate_next_token_greedy_resident(input[0])
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?
+            {
+                let step = gpu_sampled_generation_step(id, forward_us).map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?;
+                return Ok(TimedGenerationStep { session, step });
+            }
+        }
         let step = session
             .generate_next_token_with_history_diagnostics(
                 &input,
@@ -4506,6 +4558,12 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPro
 }
 
 fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
+    // A resident-GPU-prefilled session keeps its K/V history on the GPU only; the cached
+    // clone would drop it and resume from empty CPU buffers. Skip caching those sessions —
+    // a cache miss just re-runs the (fast, resident) prefill.
+    if !prepared.session.cpu_kv_authoritative() {
+        return;
+    }
     if let Ok(mut cached) = prepared.cached_prompt_prefix.lock() {
         *cached = Some(CachedPromptPrefix {
             model_id: prepared.model_id.clone(),
@@ -4697,22 +4755,56 @@ fn generate_token_ids(
         } else {
             LlamaSampler::Sampling(sampling)
         };
-        let step = prepared
-            .session
-            .generate_next_token_with_history_diagnostics(
-                &input,
-                sampler,
-                &history,
-                collect_dense_for_step,
-            )
-            .map_err(|err| {
-                Box::new(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "generation_step_failed",
-                    err.to_string(),
-                    None,
-                ))
-            })?;
+        // Greedy single-token continuations with no per-step logit consumers ride the
+        // resident GPU-sampling fast lane; everything else takes the general step.
+        let fast_step = if input.len() == 1
+            && matches!(sampler, LlamaSampler::Greedy)
+            && !collect_dense_for_step
+            && !collect_step_top_logits
+            && !top_logits.is_empty()
+        {
+            prepared
+                .session
+                .generate_next_token_greedy_resident(input[0])
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?
+        } else {
+            None
+        };
+        let step = match fast_step {
+            Some((id, forward_us)) => {
+                gpu_sampled_generation_step(id, forward_us).map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?
+            }
+            None => prepared
+                .session
+                .generate_next_token_with_history_diagnostics(
+                    &input,
+                    sampler,
+                    &history,
+                    collect_dense_for_step,
+                )
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "generation_step_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?,
+        };
         if !reused_prompt_prefix
             && generated.is_empty()
             && !prepared.collect_dense_diagnostics
@@ -5252,13 +5344,22 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
                 yield Ok(Event::default().data("[DONE]"));
                 return;
             };
+            // Greedy single-token continuations with no per-step logit consumers ride the
+            // resident GPU-sampling fast lane inside the blocking step.
+            let greedy_fast = input.len() == 1
+                && matches!(sampler, LlamaSampler::Greedy)
+                && !collect_dense_for_step
+                && !top_logits.is_empty();
             let TimedGenerationStep { session, step } = match generate_stream_step_blocking(
                 StreamGenerationStepRequest {
-                    session: prepared.session.clone(),
+                    // take_for_step (NOT clone): keeps the resident GPU session and its
+                    // on-GPU KV cache alive across the blocking hand-off.
+                    session: prepared.session.take_for_step(),
                     input: input.clone(),
                     sampler,
                     history: history.clone(),
                     collect_dense_diagnostics: collect_dense_for_step,
+                    greedy_fast,
                     step_timeout: remaining_timeout,
                     request_timeout,
                     request_started: stream_started,
@@ -6860,6 +6961,7 @@ mod tests {
         let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
 
         let result = generate_stream_step_blocking(StreamGenerationStepRequest {
+            greedy_fast: false,
             session,
             input: vec![1, 2],
             sampler: LlamaSampler::Greedy,

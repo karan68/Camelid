@@ -1359,6 +1359,42 @@ pub struct LlamaInferenceSession {
     resident_decode: Option<metal::ResidentDecodeState>,
 }
 
+impl LlamaInferenceSession {
+    /// Move the session out for a blocking generation step, leaving a hollow placeholder
+    /// behind (same identity, empty KV, no resident state). Unlike `clone`, this PRESERVES
+    /// the resident GPU session — the on-GPU KV cache and encode-ahead pipeline — which is
+    /// single-owner and dropped by `clone`. The caller must re-assign the returned session
+    /// when the step finishes or the sequence loses its KV state entirely.
+    pub fn take_for_step(&mut self) -> LlamaInferenceSession {
+        let plan = self.kv_cache.plan.clone();
+        LlamaInferenceSession {
+            config: self.config.clone(),
+            weights: Arc::clone(&self.weights),
+            kv_cache: std::mem::replace(
+                &mut self.kv_cache,
+                LlamaKvCache {
+                    plan,
+                    keys: Vec::new(),
+                    values: Vec::new(),
+                    allocated_sequence_length: 0,
+                    position: 0,
+                },
+            ),
+            resident_decode: self.resident_decode.take(),
+        }
+    }
+
+    /// Whether the CPU-side KV cache holds the real K/V history for this sequence. The
+    /// resident GPU prefill advances `position` while leaving the CPU buffers empty (the
+    /// history lives on the GPU), so a session in that state must not be cloned-and-resumed
+    /// from CPU state (e.g. by the prompt-prefix cache): the clone drops the GPU cache and
+    /// would reseed from zeros.
+    pub fn cpu_kv_authoritative(&self) -> bool {
+        self.kv_cache.position == 0
+            || self.kv_cache.allocated_sequence_length >= self.kv_cache.position
+    }
+}
+
 impl Clone for LlamaInferenceSession {
     fn clone(&self) -> Self {
         Self {
@@ -1410,11 +1446,21 @@ impl LlamaInferenceSession {
     /// row-major weight, and dims satisfying the kernel's modulo constraints. Anything else
     /// keeps the unchanged CPU layer loop.
     fn resident_decode_eligible(&self, want_logits: bool) -> Result<bool> {
+        // CAMELID_RESIDENT_TRACE=1: say WHICH gate keeps a session off the resident path.
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        macro_rules! bail {
+            ($why:expr) => {{
+                if trace {
+                    eprintln!("[resident-eligible] no: {}", $why);
+                }
+                return Ok(false);
+            }};
+        }
         if !resident_decode_metal_enabled() {
-            return Ok(false);
+            bail!("CAMELID_METAL_RESIDENT_DECODE not enabled");
         }
         if self.config.moe.is_some() {
-            return Ok(false);
+            bail!("moe config");
         }
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
@@ -1431,9 +1477,9 @@ impl LlamaInferenceSession {
             .clone()
             .unwrap_or(0..self.weights.layers.len());
         if range.end > self.weights.layers.len() || range.is_empty() {
-            return Ok(false);
+            bail!("layer range invalid/empty");
         }
-        for layer in &self.weights.layers[range] {
+        for (idx, layer) in self.weights.layers[range].iter().enumerate() {
             if layer.moe_router.is_some()
                 || !is_q8(&layer.attention_q)
                 || !is_q8(&layer.attention_k)
@@ -1443,7 +1489,16 @@ impl LlamaInferenceSession {
                 || !is_q8(&layer.ffn_up)
                 || !is_q8(&layer.ffn_down)
             {
-                return Ok(false);
+                bail!(format!(
+                    "layer {idx} not plain Q8_0 with materialized blocks (q8_0_blocks present: q={} k={} v={} o={} gate={} up={} down={})",
+                    layer.attention_q.q8_0_blocks.is_some(),
+                    layer.attention_k.q8_0_blocks.is_some(),
+                    layer.attention_v.q8_0_blocks.is_some(),
+                    layer.attention_output.q8_0_blocks.is_some(),
+                    layer.ffn_gate.q8_0_blocks.is_some(),
+                    layer.ffn_up.q8_0_blocks.is_some(),
+                    layer.ffn_down.q8_0_blocks.is_some(),
+                ));
             }
         }
         let dims = DenseLlamaDims::from_config(&self.config)?;
@@ -1453,7 +1508,7 @@ impl LlamaInferenceSession {
         // even own the output tensors).
         if want_logits {
             if !is_q8(self.weights.output_projection()) {
-                return Ok(false);
+                bail!("output projection not plain Q8_0 with materialized blocks");
             }
             if self
                 .weights

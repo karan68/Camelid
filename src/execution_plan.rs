@@ -181,6 +181,8 @@ pub struct PlanPlatform {
     pub platform_label: String,
     pub cpu_model: String,
     pub cpu_features: Vec<String>,
+    /// A usable Metal compute device exists on this host (always false off macOS).
+    pub metal_available: bool,
 }
 
 impl PlanPlatform {
@@ -190,12 +192,14 @@ impl PlanPlatform {
         let cpu_features = cpu_features();
         let cpu_model = cpu_model();
         let platform_label = platform_label(&operating_system, &architecture, &cpu_model);
+        let metal_available = crate::metal::detect_metal_device().available;
         Self {
             operating_system,
             architecture,
             platform_label,
             cpu_model,
             cpu_features,
+            metal_available,
         }
     }
 }
@@ -314,6 +318,35 @@ fn select_macos_q8_plan(
             .push("CAMELID_MAC_Q8_REPACK disables Mac repack; failing closed to safe path".into());
         env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
         return safe_q8_plan();
+    }
+
+    // The Metal-resident Q8_0 stack outranks the CPU repack when the host can run it.
+    // The GPU path requires plain RAM-resident Q8_0 blocks, which the rows4 repack
+    // replaces — the two are mutually exclusive on weight storage — so selecting Metal
+    // means loading plain blocks (the CPU plain-block reference path remains the
+    // in-process fallback for sessions the resident gates reject). Selection requires
+    // the resident-decode gate (on by default in the CLI entry; absent for embedders
+    // and test suites, which keep the validated CPU plans) plus an actual Metal
+    // device; CAMELID_MAC_Q8_METAL_PLAN=0 opts back into the CPU repack plan.
+    if env_flag_enabled("CAMELID_METAL_RESIDENT_DECODE")
+        && !env_flag_disabled("CAMELID_MAC_Q8_METAL_PLAN")
+        && platform.metal_available
+    {
+        env_updates.insert("CAMELID_MAC_Q8_REPACK", Some("off"));
+        env_updates.insert("CAMELID_PARALLEL_LINEAR", Some("on"));
+        reasons.push(
+            "Metal resident Q8_0 stack selected (Metal device present, resident decode              enabled); weights stay plain RAM-resident Q8_0 blocks — the rows4 CPU repack              is disabled because the GPU-resident path requires the plain blocks"
+                .into(),
+        );
+        reasons.push("parallel linear enabled by execution plan".into());
+        return (
+            "metal_resident_q8_runtime",
+            "metal_resident_q8_0_wire",
+            "q8_0_metal_resident_prefill",
+            "resident_single_command_buffer_prefill",
+            "q8_0_metal_resident_decode",
+            "retained_q8_reference_path",
+        );
     }
 
     let dotprod = has_feature(&platform.cpu_features, "dotprod");
@@ -919,6 +952,14 @@ mod tests {
             platform_label: platform_label(os, arch, "Apple M4"),
             cpu_model: "fixture cpu".into(),
             cpu_features: features.iter().map(|feature| (*feature).into()).collect(),
+            metal_available: false,
+        }
+    }
+
+    fn metal_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
+        PlanPlatform {
+            metal_available: true,
+            ..platform(os, arch, features)
         }
     }
 
@@ -1017,6 +1058,65 @@ mod tests {
             "always_retained_reference_path"
         );
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
+        clear_profile_env();
+    }
+
+    #[test]
+    fn mac_metal_resident_plan_selected_when_device_and_gate_present() {
+        let _guard = env_lock();
+        clear_profile_env();
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "metal_resident_q8_runtime");
+        assert_eq!(outcome.plan.decode_path, "q8_0_metal_resident_decode");
+        // The rows4 repack must stay OFF: the GPU path needs plain Q8_0 blocks.
+        assert_eq!(
+            outcome.env_updates.get("CAMELID_MAC_Q8_REPACK"),
+            Some(&Some("off"))
+        );
+        env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        clear_profile_env();
+    }
+
+    #[test]
+    fn mac_metal_plan_requires_device_and_gate() {
+        let _guard = env_lock();
+        clear_profile_env();
+        // Gate present but no Metal device: validated CPU repack plan.
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(10),
+            platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
+        env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        // Device present but gate absent (embedder/test default): CPU repack plan.
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
+        // Explicit opt-out returns the CPU repack plan even with device + gate.
+        env::set_var("CAMELID_METAL_RESIDENT_DECODE", "1");
+        env::set_var("CAMELID_MAC_Q8_METAL_PLAN", "0");
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf"),
+            &fixture("Llama 3.2 3B Instruct"),
+            Some(10),
+            metal_platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
+        env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        env::remove_var("CAMELID_MAC_Q8_METAL_PLAN");
         clear_profile_env();
     }
 
