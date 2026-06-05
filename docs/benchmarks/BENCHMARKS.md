@@ -49,6 +49,28 @@ Reading boundary:
 - This is one exact row on one host. Nothing here transfers to other models, quantizations, context shapes, or hosts.
 
 
+### Apple Silicon 1B / 8B rows (same host, three runtimes)
+
+Same method as the 3B table (three same-session alternating rounds; medians), from
+`qa/evidence-bundles/apple-silicon-m4-1b-8b-q8-throughput-camelid-llamacpp-mlx-20260605T043953Z-head-d7c2940/`:
+
+| Row / lane | Camelid | llama.cpp | MLX-LM (8-bit) |
+| --- | ---: | ---: | ---: |
+| Llama 3.2 1B Q8_0 prefill (tok/s) | 1664.3 | 1472.8 | 1670.0 |
+| Llama 3.2 1B Q8_0 decode (tok/s) | **74.8** | 67.2 | 69.7 |
+| Llama 3 8B Q8_0 prefill (tok/s) | **234.2** | 220.4 | 229.2 |
+| Llama 3 8B Q8_0 decode (tok/s) | 12.1 | 12.1 | 12.0 |
+
+Reading boundary:
+
+- 1B decode reads above both comparators in every round; 1B prefill reads above
+  llama.cpp and parity-level with MLX-LM (median difference below inter-round
+  spread — no win claimed on that lane).
+- 8B prefill reads narrowly above both; 8B decode is a three-way parity band — the
+  lane is weight-bandwidth-bound and no runtime separates from the others.
+- Greedy continuations were identical across every iteration of every round on
+  both rows. Same-session snapshots on exact rows; nothing transfers.
+
 ### Apple Silicon context-depth boundary (same host, Camelid vs llama.cpp)
 
 A 2026-06-04 context sweep — the first measurement past the published 601-token row —
