@@ -2801,9 +2801,12 @@ kernel void attention_prefill_flash_f32(
     threadgroup float* s_s =
         reinterpret_cast<threadgroup float*>(shmem + 2 * QT * head_dim); // QT x PT scores
     threadgroup half* p_s = shmem + 2 * QT * head_dim + QT * PT * 2; // QT x PT half
-    threadgroup half* diag_s = p_s + QT * PT; // 4 x 64
-    threadgroup float* linv_s =
-        reinterpret_cast<threadgroup float*>(diag_s + 4 * 64); // QT inv-l values
+    // Per-tile rescale diagonal in f32: a half-precision corr compounds its rounding
+    // once per kv tile (dozens of times at depth) into the O accumulators, which is
+    // what destroyed long-prompt recall on this kernel.
+    threadgroup float* diag_f =
+        reinterpret_cast<threadgroup float*>(p_s + QT * PT); // 4 x 64 f32
+    threadgroup float* linv_s = diag_f + 4 * 64; // QT inv-l values
 
     // Stage Q (q-major 8x8 blocks, pre-scaled), then pull this simdgroup's q-octet
     // into register fragments.
@@ -2932,23 +2935,23 @@ kernel void attention_prefill_flash_f32(
             l_state = l_state * corr + l_add;
             m_state = m_new;
             if (quarter == 0) {
-                diag_s[sg * 64 + row * 8 + row] = half(corr);
+                diag_f[sg * 64 + row * 8 + row] = corr;
             }
             // Zero off-diagonals once (they are never overwritten afterwards).
             if (kp0 == 0 && quarter != 0) {
                 for (uint c2 = quarter - 1; c2 < 8; c2 += 3) {
                     if (c2 != row) {
-                        diag_s[sg * 64 + row * 8 + c2] = half(0.0f);
+                        diag_f[sg * 64 + row * 8 + c2] = 0.0f;
                     }
                 }
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Rescale O by diag(corr), then O += P V.
+        // Rescale O by diag(corr) in f32, then O += P V.
         {
-            simdgroup_half8x8 dg;
-            simdgroup_load(dg, diag_s + sg * 64, 8, 0, false);
+            simdgroup_float8x8 dg;
+            simdgroup_load(dg, diag_f + sg * 64, 8, 0, false);
             for (uint i = 0; i < d_oct; ++i) {
                 simdgroup_float8x8 tmp;
                 simdgroup_multiply(tmp, dg, o_acc[i]);
@@ -7851,7 +7854,10 @@ impl ResidentDecodeState {
             // past ~1.6k positions on low-entropy prompts that quantization measurably
             // degrades attention (anchored-recall probes fail while the v3 kernel and the
             // CPU path agree), so v3 is the default beyond the attention-as-matmul cap and
-            // flash stays opt-in until it carries f32 P/state.
+            // flash stays opt-in. Moving the per-tile rescale diagonal to f32 was not
+            // sufficient (probes still fail at 2k/8k); the remaining sink is the half
+            // K/Q score staging, and fixing it needs an f32 staging layout that exceeds
+            // the current threadgroup-memory budget — a redesign, not a patch.
             let use_flash_attn = std::env::var_os("CAMELID_METAL_FLASH_PREFILL")
                 .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 && use_mm
@@ -8014,7 +8020,7 @@ impl ResidentDecodeState {
                 if use_flash_attn {
                     // Q + K/V half tiles (32 x head_dim each) | S 32x32 f32 | P 32x32 half
                     // | 4 x 8x8 half diag | 32 f32 inv-l.
-                    e.set_threadgroup_memory_length(0, (128 * self.head_dim + 6784) as u64);
+                    e.set_threadgroup_memory_length(0, (128 * self.head_dim + 7296) as u64);
                     e.dispatch_thread_groups(
                         metal::MTLSize {
                             width: self.n_heads as u64,
