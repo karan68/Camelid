@@ -5348,6 +5348,7 @@ fn splitk_attention_enabled() -> bool {
     })
 }
 
+#[cfg(target_os = "macos")]
 fn attn2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
