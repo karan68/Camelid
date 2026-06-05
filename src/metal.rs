@@ -5386,6 +5386,41 @@ fn wire_weights_enabled() -> bool {
 /// scalar k-split GEMM but not byte-exact: tile MMA accumulation order). Default on via
 /// the fast stack; CAMELID_METAL_MM=0 restores the byte-exact scalar GEMM.
 #[cfg(target_os = "macos")]
+/// Scratch budget for the attention-as-matmul prefill's materialized S/P panels
+/// (n_heads x n_pad^2, half each; the 4-byte factor in the gate covers both). The
+/// budget directly sets how deep the fast prefill path reaches: 256 MiB admits
+/// ~1.6k-token prompts at 24 heads, 2 GiB admits ~4.7k (anchored-recall checked
+/// through 4k). Default is RAM-aware — an eighth of physical memory, capped at
+/// 2 GiB — because the panels are transient prefill scratch in unified memory;
+/// CAMELID_METAL_ATTN_MM_CAP_MB overrides explicitly. Prompts past the admitted
+/// depth take the v3 attention path (correct, slower).
+#[cfg(target_os = "macos")]
+fn attn_mm_scratch_cap_bytes() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        if let Some(mb) = std::env::var("CAMELID_METAL_ATTN_MM_CAP_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return mb * 1024 * 1024;
+        }
+        let mut memsize: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        let name = std::ffi::CString::new("hw.memsize").expect("static name");
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut memsize as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        let phys = if rc == 0 { memsize as usize } else { 0 };
+        (phys / 8).clamp(256 * 1024 * 1024, 2048 * 1024 * 1024)
+    })
+}
+
 fn mm_prefill_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -7605,7 +7640,7 @@ impl ResidentDecodeState {
             && self.ffn_dim.is_multiple_of(128)
             && self.head_dim.is_multiple_of(8)
             && self.head_dim <= 128
-            && self.n_heads * n_pad * n_pad * 4 <= 256 * 1024 * 1024;
+            && self.n_heads * n_pad * n_pad * 4 <= attn_mm_scratch_cap_bytes();
         let use_h16 = use_attn_mm && half_rope * 2 == self.head_dim;
         let es = if use_h16 { 2 } else { 4 }; // element size of the activation stream
         let seq = nb(n_tokens * self.hidden * es);
