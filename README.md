@@ -10,6 +10,8 @@ Camelid is not a wrapper around Ollama or llama.cpp. It is its own inference/run
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
+The local web frontend: a dark, collapsed-rail chat surface that enables chat only for model rows the compatibility contract recognizes.
+
 ## Why Camelid?
 
 - **Rust-native inference** — the tokenizer, GGUF loader, CPU kernels, and Metal GPU path are all implemented in this repository; one static binary, no Python.
