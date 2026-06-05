@@ -26,7 +26,7 @@ The local web frontend: a dark, collapsed-rail chat surface that enables chat on
 | Feature | Status | Notes |
 |---|---|---|
 | GGUF loading | Working | Direct load with metadata/tensor inspection (`camelid inspect`). |
-| Q8_0 inference | Working | The validated quantization. Support is per exact model row — see [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) (TinyLlama 1.1B, Llama 3.2 1B/3B, Llama 3 8B; Mistral/Mixtral are validation-in-progress and fail closed). |
+| Q8_0 inference | Working | The validated quantization. Support is per exact model row — see [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) (TinyLlama 1.1B, Llama 3.2 1B/3B, Llama 3 8B, Mistral 7B v0.3; Mixtral is validation-in-progress and fails closed). |
 | OpenAI-style API | Working | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus local capability/health routes. |
 | Streaming chat | Working | SSE streaming on the chat endpoint. |
 | Apple Silicon Metal path | Working | GPU-resident prefill and decode, selected automatically when a Metal device is present; falls back to validated CPU paths otherwise. |
