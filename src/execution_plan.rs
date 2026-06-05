@@ -709,7 +709,7 @@ fn support_level(row: &str) -> String {
     {
         "supported_exact_row_smoke_512_1024_2048".into()
     } else if normalized.contains("mistral_7b_instruct_v0_3") {
-        "active_validation_unsupported".into()
+        "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
         "bounded_runtime_only_unsupported".into()
     } else {
@@ -1955,13 +1955,31 @@ mod tests {
         let _guard = env_lock();
         clear_profile_env();
         let outcome = plan_for_model_with_platform(
-            &PathBuf::from("/tmp/Mistral-7B-Instruct-v0.3.Q8_0.gguf"),
-            &fixture("Mistral-7B-Instruct-v0.3.Q8_0.gguf"),
+            &PathBuf::from("/tmp/Qwen2.5-7B-Instruct-Q8_0.gguf"),
+            &fixture("Qwen2.5-7B-Instruct-Q8_0.gguf"),
             None,
             platform("linux", "x86_64", &["avx2"]),
         );
-        assert_eq!(outcome.plan.support_level, "active_validation_unsupported");
+        assert_eq!(outcome.plan.support_level, "unknown_or_unvalidated");
         assert_eq!(outcome.plan.selected_backend, "cpu_reference");
+        clear_profile_env();
+    }
+
+    #[test]
+    fn mistral_row_selects_validated_q8_plan() {
+        let _guard = env_lock();
+        clear_profile_env();
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Mistral-7B-Instruct-v0.3.Q8_0.gguf"),
+            &fixture("Mistral-7B-Instruct-v0.3.Q8_0.gguf"),
+            None,
+            platform("macos", "aarch64", &["dotprod", "i8mm"]),
+        );
+        assert_eq!(
+            outcome.plan.support_level,
+            "supported_exact_row_smoke_512_1024_2048_4096_8192"
+        );
+        assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
         clear_profile_env();
     }
 }

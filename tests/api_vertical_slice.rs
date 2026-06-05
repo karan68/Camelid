@@ -350,7 +350,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["support_contract"]["current_gate"],
-        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 has evidence-only bring-up with checked tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context artifacts, but support remains fail-closed until API/WebUI support-surface proof is synchronized. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied."
+        "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied."
     );
     let q8 = body["supported_quantization"]
         .as_array()
@@ -406,16 +406,21 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert!(llama_bpe_notes.contains("Broader 50-token"));
     assert!(!llama_bpe_notes.contains("conditional"));
     assert!(!llama_bpe_notes.contains("gated"));
-    assert!(body["planned_model_families"]
+    assert!(body["supported_model_families"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "mistral"
-            && item["status"] == "active_validation_unsupported"
+        .any(|item| item["id"] == "mistral_instruct_exact_7b_v0_3_q8_0"
+            && item["status"] == "supported_exact_row_smoke_lane"
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("v0.1 support remains fail-closed")));
+                .contains("support-promotion API/WebUI smoke bundle")));
+    assert!(!body["planned_model_families"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["id"] == "mistral"));
     assert!(body["planned_model_families"]
         .as_array()
         .unwrap()
@@ -781,23 +786,20 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .iter()
         .find(|item| item["id"] == "mistral_7b_instruct_v0_3_q8_0")
         .unwrap();
-    assert_eq!(mistral["status"], "active_validation_unsupported");
-    assert_eq!(mistral["support_scope"], "bringup_exact_row_unsupported");
+    assert_eq!(mistral["status"], "supported_exact_row_smoke");
+    assert_eq!(mistral["support_scope"], "exact_row_smoke_only");
     assert_eq!(
         mistral["full_support_status"],
-        "blocked_unsupported_bringup"
+        "blocked_pending_normalized_full_support"
     );
     assert_eq!(mistral["metadata_parses"], "validated");
     assert_eq!(mistral["tokenizer_works"], "validated");
     assert_eq!(mistral["tensors_load"], "validated");
     assert_eq!(
         mistral["generation_runs"],
-        "evidence_only_completion_and_chat_smoke_plus_broader_50_token_api_smoke"
+        "api_completion_and_chat_smoke_plus_broader_50_token_api_smoke"
     );
-    assert_eq!(
-        mistral["frontend_load_path_verified"],
-        "fail_closed_pending_support_surface_sync"
-    );
+    assert_eq!(mistral["frontend_load_path_verified"], "validated");
     assert_eq!(
         mistral["tested_context"],
         "tokenizer_template_1tok_bounded_and_checked_512_1024_2048_4096_8192_context_packs"
@@ -821,7 +823,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     );
     assert_eq!(
         mistral["latest_checked_bucket"],
-        "current_head_api_webui_rss_fail_closed"
+        "support_promotion_api_webui_smoke"
     );
     assert_eq!(mistral["latest_checked_result"], "pass");
     assert_eq!(mistral["bounded_context_8192_pack"], "validated_fifth_pack");
@@ -830,10 +832,10 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         "mistral-context-8192-max-ladder-v1"
     );
     let mistral_evidence = mistral["evidence"].as_str().unwrap();
-    assert!(mistral_evidence.contains("Mistral v0.3 active validation only"));
-    assert!(mistral_evidence.contains("support-promotion evidence remains fail-closed"));
+    assert!(mistral_evidence.contains("GPU-vs-CPU greedy continuations match token-for-token"));
+    assert!(mistral_evidence.contains("support-promotion API/WebUI smoke bundle"));
     let mistral_next_step = mistral["next_step"].as_str().unwrap();
-    assert!(mistral_next_step.contains("produce a support-promotion manifest"));
+    assert!(mistral_next_step.contains("repeat the current-head promotion smoke"));
     let mixtral = compatibility
         .iter()
         .find(|item| item["id"] == "mixtral_8x7b_instruct_v0_1_q8_0")

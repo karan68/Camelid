@@ -1667,7 +1667,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 has evidence-only bring-up with checked tokenizer/template, parity, and bounded 512/1024/2048/4096/8192 context artifacts, but support remains fail-closed until API/WebUI support-surface proof is synchronized. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -1712,6 +1712,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 notes: "LLaMA-style decoder path validated on TinyLlama Q8_0 gate",
             },
             SupportItem {
+                id: "mistral_instruct_exact_7b_v0_3_q8_0",
+                status: "supported_exact_row_smoke_lane",
+                notes: "exact Mistral-7B-Instruct-v0.3 Q8_0 has row-specific smoke support: tokenizer/template, deterministic and broader 50-token parity, checked bounded 512/1024/2048/4096/8192-context packs, GPU-vs-CPU greedy parity on the exact row, and a support-promotion API/WebUI smoke bundle. Exact row only; broader Mistral-family, other quants, model-native context, and full support are not implied.",
+            },
+            SupportItem {
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
@@ -1722,11 +1727,6 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "larger_llama_instruct",
                 status: "planned",
                 notes: "broader LLaMA-family instruct support after row-specific parity, API, WebUI, memory/perf, and portability evidence",
-            },
-            SupportItem {
-                id: "mistral",
-                status: "active_validation_unsupported",
-                notes: "Mistral-7B-Instruct-v0.3.Q8_0.gguf has evidence-only tokenizer/template, parity, and bounded context artifacts, but v0.1 support remains fail-closed until API/WebUI support-surface proof, RSS/timing posture, current-head sync, and durable bundle evidence are synchronized",
             },
             SupportItem {
                 id: "mixtral_moe",
@@ -2000,18 +2000,18 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "mistral_7b_instruct_v0_3_q8_0",
                 family: "mistral",
                 quantization: "Q8_0",
-                status: "active_validation_unsupported",
-                support_scope: "bringup_exact_row_unsupported",
-                full_support_status: "blocked_unsupported_bringup",
-                full_support_blockers: "API/WebUI readiness, RSS/timing, current-head promotion sync, scrubbed manifest posture, support-surface proof, and durable promotion bundle evidence remain incomplete; exact tokenizer/template references plus row-specific 1-token/bounded/broader parity evidence alone do not promote support",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "model-native/larger context beyond checked packs, broader arbitrary/Jinja templates beyond the row-scoped renderer and template-shape evidence, production throughput beyond bounded perf/RSS evidence, portability, and durable repeated current-head bundles remain missing",
                 metadata_parses: "validated",
                 tokenizer_works: "validated",
                 tensors_load: "validated",
-                generation_runs: "evidence_only_completion_and_chat_smoke_plus_broader_50_token_api_smoke",
-                parity_audited: "tokenizer_template_1tok_bounded_and_broader_50_token_parity_pass",
-                performance_measured: "evidence_only_bounded_unique_chat_perf_rss",
-                frontend_load_path_verified: "fail_closed_pending_support_surface_sync",
-                frontend_readiness_gate: "fail-closed for v0.1: do not unlock chat for this row until API/WebUI support-surface proof is synchronized with the parity/context evidence",
+                generation_runs: "api_completion_and_chat_smoke_plus_broader_50_token_api_smoke",
+                parity_audited: "tokenizer_template_1tok_bounded_broader_50_token_and_gpu_vs_cpu_greedy_parity_pass",
+                performance_measured: "bounded_unique_chat_perf_rss_validated",
+                frontend_load_path_verified: "validated",
+                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
                 tested_context: "tokenizer_template_1tok_bounded_and_checked_512_1024_2048_4096_8192_context_packs",
                 chat_template_renderer: "mistral_instruct",
                 chat_template_shape_pack: "validated_bounded_pack",
@@ -2031,11 +2031,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "validated_fifth_pack",
                 bounded_context_8192_pack_id: "mistral-context-8192-max-ladder-v1",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "current_head_api_webui_rss_fail_closed",
+                latest_checked_bucket: "support_promotion_api_webui_smoke",
                 latest_checked_result: "pass",
                 latest_checked_output: "CMLD-M7B",
-                evidence: "Mistral v0.3 active validation only; exact tokenizer/template, deterministic 1-token/5-token, broader 50-token, and bounded 512/1024/2048/4096/8192 context evidence are green, but support-promotion evidence remains fail-closed",
-                next_step: "produce a support-promotion manifest proving API/WebUI readiness, support contract fields, RSS/timing posture, current-head sync, public scrub, and durable bundle evidence before any v0.1 support claim",
+                evidence: "exact tokenizer/template, deterministic 1-token/5-token, broader 50-token, and bounded 512/1024/2048/4096/8192 context evidence are green, GPU-vs-CPU greedy continuations match token-for-token on this exact row, and a support-promotion API/WebUI smoke bundle (qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-*) records the promoted contract surface",
+                next_step: "repeat the current-head promotion smoke on contract-affecting changes; broader/full support still needs separate proof",
             },
             ModelCompatibilityTarget {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
@@ -6656,27 +6656,25 @@ mod tests {
             .model_compatibility
             .iter()
             .find(|target| target.id == "mistral_7b_instruct_v0_3_q8_0")
-            .expect("Mistral exact-row bring-up lane should stay advertised");
-        assert_eq!(mistral.status, "active_validation_unsupported");
-        assert_eq!(mistral.support_scope, "bringup_exact_row_unsupported");
-        assert_eq!(mistral.full_support_status, "blocked_unsupported_bringup");
+            .expect("Mistral exact-row lane should stay advertised");
+        assert_eq!(mistral.status, "supported_exact_row_smoke");
+        assert_eq!(mistral.support_scope, "exact_row_smoke_only");
         assert_eq!(
-            mistral.frontend_load_path_verified,
-            "fail_closed_pending_support_surface_sync"
+            mistral.full_support_status,
+            "blocked_pending_normalized_full_support"
         );
+        assert_eq!(mistral.frontend_load_path_verified, "validated");
         assert_eq!(
             mistral.performance_measured,
-            "evidence_only_bounded_unique_chat_perf_rss"
+            "bounded_unique_chat_perf_rss_validated"
         );
         assert_eq!(
             mistral.latest_checked_bucket,
-            "current_head_api_webui_rss_fail_closed"
+            "support_promotion_api_webui_smoke"
         );
         assert_eq!(mistral.latest_checked_result, "pass");
         assert_eq!(mistral.latest_checked_output, "CMLD-M7B");
-        assert!(mistral
-            .frontend_readiness_gate
-            .contains("fail-closed for v0.1"));
+        assert!(mistral.frontend_readiness_gate.contains("green only when"));
         assert_eq!(mistral.bounded_context_8192_pack, "validated_fifth_pack");
         assert_eq!(
             mistral.bounded_context_8192_pack_id,
@@ -6684,7 +6682,7 @@ mod tests {
         );
         assert!(mistral
             .evidence
-            .contains("Mistral v0.3 active validation only"));
+            .contains("support-promotion API/WebUI smoke bundle"));
     }
 
     #[test]
@@ -6702,6 +6700,7 @@ mod tests {
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
+                "mistral_7b_instruct_v0_3_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
             ])
         );
@@ -6713,11 +6712,14 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             supported_family_ids,
-            BTreeSet::from(["llama_bpe_decoder_exact_1b_3b_8b_q8_0", "llama_spm_decoder",])
+            BTreeSet::from([
+                "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
+                "llama_spm_decoder",
+                "mistral_instruct_exact_7b_v0_3_q8_0",
+            ])
         );
 
         for id in [
-            "mistral_7b_instruct_v0_3_q8_0",
             "mixtral_8x7b_instruct_v0_1_q8_0",
             "qwen25_7b_instruct_q8_0",
             "gemma2_9b_it_q8_0",
