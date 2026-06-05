@@ -2,73 +2,46 @@
 
 [![CI][ci-badge]][ci-workflow]
 
-Camelid is a Rust-native local GGUF inference backend with an evidence-gated support contract. The v0.1 release candidate is intentionally narrow: it publishes exact model rows that have row-specific validation, and it keeps everything else behind explicit blockers.
+Camelid is a Rust-native local LLM inference engine focused on GGUF inference, correctness, and local performance.
 
-Camelid does not claim broad Llama, Mistral, Mixtral, distributed, production-throughput, or universal frontend support. If a model row, quantization, context window, comparator result, or UI readiness state is not backed by a cited artifact, it is outside the public v0.1 claim.
+It loads GGUF models directly, exposes an OpenAI-style local API, and is built around reproducible benchmark evidence instead of hype.
+
+Camelid is not a wrapper around Ollama or llama.cpp. It is its own inference/runtime project written in Rust.
 
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
-The WebUI is product-forward while still reflecting the local-first runtime contract: a dark, collapsed-rail chat surface with exact-row readiness gates instead of broad model support.
+## Why Camelid?
 
-## Performance
+- **Rust-native inference** — the tokenizer, GGUF loader, CPU kernels, and Metal GPU path are all implemented in this repository; one static binary, no Python.
+- **Direct GGUF loading** — point it at a `.gguf` file; no conversion or import step.
+- **OpenAI-style local API** — `/v1/chat/completions` and `/v1/completions` with streaming, served locally.
+- **Correctness-focused development** — optimized paths are gated on token-for-token parity with a reference implementation before they ship; unsupported configurations fail closed with typed errors instead of guessing.
+- **Reproducible benchmark evidence** — every published number comes from a committed evidence bundle with raw logs, commands, and versions. No raw log, no claim.
+- **Apple Silicon performance work** — a Metal-resident path (GPU prefill, GPU decode with on-GPU greedy sampling) that is measured against llama.cpp and MLX-LM on the same host, with wins, ties, and losses all stated.
 
-Same-host, same-prompt throughput snapshot on one Apple M4 (10-core GPU, 16GB unified memory), Llama 3.2 3B Instruct Q8_0, 601-token prompt, greedy sampling. Three same-session rounds with alternating runtime order; the headline number is the per-runtime median across rounds.
+## Status
 
-| Lane | Camelid | llama.cpp (Metal) | MLX-LM (8-bit) |
-| --- | ---: | ---: | ---: |
-| Prefill, 601-token prompt (tok/s) | **587.3** | 543.7 | 577.9 |
-| Decode, short context (tok/s) | **29.7** | 29.1 | 29.1 |
-| Time to first token, 601-token prompt | **1.07 s** | - | - |
-
-Reading boundary, in this repository's house style:
-
-- Both lanes on this row and host read **above both comparators in every round of this session** (prefill: camelid 587.3 / 587.3 / 587.4 vs MLX-LM 579.3 / 577.9 / 577.9 and llama.cpp 543.7; decode: camelid 29.74 / 29.85 / 29.74 vs MLX-LM 29.54 / 29.13 / 29.01 and llama.cpp 29.08 / 29.14 / 29.22). Session-median margins are +1.6% (prefill) and +2.1% (decode) over MLX-LM — every camelid round exceeds every comparator round, but the margins are narrow. This table claims a same-session win on this exact row, not a durable or general one.
-- All three runtimes read faster on this host in this session than in the prior snapshot, so cross-session numbers do not compare; the claim rests on the same-session rounds only.
-- One exact row, one host, bounded prompt depths. The fast prefill path tiles its score panels by query blocks and reaches 16k-token prompts; 2k/4k/8k probes read above llama.cpp's same-depth numbers (single warm runs, not protocol-grade). Decode slows with KV depth (parity-class with llama.cpp, behind MLX-LM at 8k). Boundaries in [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md). Nothing transfers to other models, quantizations, or machines.
-
-Full method, raw logs, and per-round detail: [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) and the committed evidence bundle `qa/evidence-bundles/apple-silicon-m4-3b-q8-throughput-camelid-llamacpp-mlx-20260604T214257Z-head-0c6ec54/`.
-
-For context: at the start of the current GPU-prefill work this same 601-token prompt prefilled at ~40 tok/s (15.1 s to first token), and decode read 25.3 tok/s two sessions ago. The prefill path now runs batched per-layer dispatch, a simdgroup-matrix Q8_0 GEMM, attention-as-batched-matmul, a final-layer cut that stops at the KV-cache writes, and host-side encode overlapped with GPU execution; greedy decode rides a resident fast lane where the sampler's argmax and the next token's embedding gather run on the GPU and consecutive token graphs execute back-to-back. All of it is greedy-token-parity-checked against the CPU reference path.
-
-## Current Release Boundary
-
-[`COMPATIBILITY.md`](COMPATIBILITY.md) is Camelid's durable support ledger, and [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) is the stricter v0.1 release-candidate slice. If broader repository docs drift, these two files win, with the support matrix setting the narrower rc boundary. The short version:
-
-| Exact row | v0.1 public status | Checked boundary |
-| --- | --- | --- |
-| TinyLlama 1.1B Chat Q8_0 | Verified support gate | Parity, API/WebUI, template-shape, bounded 512-context, and RSS/perf evidence. |
-| Llama 3.2 1B Instruct Q8_0 | Verified bounded support | Load, completions, chat completions, WebUI, parity, row-scoped template evidence, unique-chat RSS/perf, and checked bounded context packs through 8192 where cited. |
-| Llama 3.2 3B Instruct Q8_0 | Supported exact-row smoke | Canonical API/WebUI support-gate refresh, compact/broader parity, template evidence, bounded RSS/perf, and checked 512/1024/2048 context packs where cited. |
-| Llama 3 8B Instruct Q8_0 | Verified bounded support | Compact/broader parity, API/WebUI, bounded memory evidence, and checked 512/1024/2048 context packs where cited. |
-| Mistral-7B-Instruct-v0.3 Q8_0 | Active exact-row validation only | Load, tokenizer/template, one-token parity, broader 50-token parity, and checked 512/1024/2048/4096/8192 context evidence exist, but the API/WebUI support contract is still fail-closed for v0.1. |
-| Mixtral-8x7B-Instruct-v0.1 Q8_0 | Active validation / partial backend runtime only | Bounded one-token backend MoE runtime evidence exists, but later-generation parity and continuation/API/WebUI readiness remain blocked. |
-| Qwen2.5-7B-Instruct Q8_0 | Planned candidate only | No support claim. |
-| gemma-2-9b-it Q8_0 | Planned candidate only | No support claim. |
-
-Nothing adjacent inherits support across size, quantization, tokenizer, context, API surface, or frontend state.
-
-Compatibility routes, including partial llama-server-style model discovery and the narrow non-streaming native `/completion` alias, are not support promotions. They must stay privacy-safe where they expose public state, leave router-mode model management, native load/unload, streaming native completion, and WebUI readiness locked to the evidence-backed compatibility contract, and never broaden exact-row support by route presence alone.
-
-## What v0.1 Is For
-
-Camelid v0.1 is a release candidate for reviewers who care about reproducible local-inference evidence:
-
-- exact-row compatibility language instead of family-wide claims
-- committed parity, context, API/WebUI, RSS, and benchmark artifacts
-- explicit unsupported states for partial or blocked rows
-- small local gates that contributors can run before changing support-sensitive code
-
-The benchmark story is bounded the same way: Camelid publishes throughput, memory, and timing snapshots that are backed by committed evidence bundles (see [Performance](#performance)), and it does not yet publish an apples-to-apples throughput table for every headline row.
+| Feature | Status | Notes |
+|---|---|---|
+| GGUF loading | Working | Direct load with metadata/tensor inspection (`camelid inspect`). |
+| Q8_0 inference | Working | The validated quantization. Support is per exact model row — see [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) (TinyLlama 1.1B, Llama 3.2 1B/3B, Llama 3 8B; Mistral/Mixtral are validation-in-progress and fail closed). |
+| OpenAI-style API | Working | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus local capability/health routes. |
+| Streaming chat | Working | SSE streaming on the chat endpoint. |
+| Apple Silicon Metal path | Working | GPU-resident prefill and decode, selected automatically when a Metal device is present; falls back to validated CPU paths otherwise. |
+| Web frontend | Working | Local React/Vite chat surface; enables chat only for model rows the compatibility contract recognizes. |
+| Other quantizations | Not supported | Fail closed in v0.1. |
+| Distributed worker | Experimental | `serve-distributed` / pipeline worker-master commands exist; not part of the v0.1 support claim. |
+| Ghost mode (layer streaming) | Experimental | `ghost-run` executes one transformer block at a time from a repacked file for a strict memory ceiling; trades throughput for memory, no prefetch yet. |
 
 ## Quickstart
 
-Build the backend:
+Build:
 
 ```bash
 cargo build --release
 ```
 
-Serve a local GGUF model:
+Serve a local GGUF model (Q8_0):
 
 ```bash
 ./target/release/camelid serve \
@@ -76,25 +49,57 @@ Serve a local GGUF model:
   --threads 4
 ```
 
-Check local capability reporting:
+The server listens on `127.0.0.1:8181` by default. List the loaded model (its `id` comes from the GGUF metadata):
 
 ```bash
-curl -s http://127.0.0.1:8181/api/capabilities
+curl -s http://127.0.0.1:8181/v1/models
 ```
 
-Run the frontend development server:
+Chat (replace the model `id` with the one returned above):
 
 ```bash
-cd frontend
-npm ci
-npm run dev
+curl -s http://127.0.0.1:8181/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Llama 3.2 3B Instruct",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 64,
+    "temperature": 0
+  }'
 ```
 
-The frontend is a local React/Vite chat surface. Its readiness state should be read literally: chat is enabled only when the loaded model row is recognized as supported by the current compatibility contract.
+Add `"stream": true` for SSE streaming. To run the local web frontend:
 
-## Validation
+```bash
+cd frontend && npm ci && npm run dev
+```
 
-For normal code changes, start with:
+## Evidence
+
+Camelid benchmark claims are only listed when raw logs or reproducible commands are available in the repo. If there is no raw log, there is no benchmark claim.
+
+Same-host snapshot on one Apple M4 (10-core GPU, 16 GB), Llama 3.2 3B Instruct Q8_0, greedy sampling, three same-session rounds with alternating runtime order (medians):
+
+| Lane | Camelid | llama.cpp (Metal) | MLX-LM (8-bit) |
+| --- | ---: | ---: | ---: |
+| Prefill, 601-token prompt (tok/s) | **587.3** | 543.7 | 577.9 |
+| Decode, short context (tok/s) | **29.7** | 29.1 | 29.1 |
+
+Reading boundary: this is a same-session result on one exact model row and one machine, with narrow margins — not a durable or general claim. Some lanes read below the comparators (decode at long context trails MLX-LM); deeper prompt depths are covered by single warm probes rather than protocol-grade rounds. All of it — methods, raw logs, per-round detail, and the lanes where Camelid loses — is in [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) and the committed bundles under [`qa/evidence-bundles/`](qa/evidence-bundles/).
+
+Correctness evidence (token-parity gates, per-row validation artifacts) is indexed in [`COMPATIBILITY.md`](COMPATIBILITY.md) and [`CORRECTNESS_v0.1.md`](docs/release/CORRECTNESS_v0.1.md).
+
+## Documentation
+
+- [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) — which exact model rows are supported, and with what evidence
+- [`COMPATIBILITY.md`](COMPATIBILITY.md) — the durable support contract
+- [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) — benchmark snapshots and claim rules
+- [`STATUS.md`](STATUS.md) — current evidence snapshot and blockers
+- [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) — implementation architecture
+- [`RELEASE_NOTES_v0.1.md`](docs/release/RELEASE_NOTES_v0.1.md) — v0.1 release notes
+- [`ROADMAP.md`](ROADMAP.md) — planned engineering sequence
+
+Validation for code changes:
 
 ```bash
 cargo fmt --all -- --check
@@ -102,32 +107,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 ```
 
-For public evidence and release-doc changes, also run:
-
-```bash
-node scripts/check-public-evidence-claims.mjs
-bash scripts/check-public-scrub.sh
-cd frontend && npm ci && npm run build && npm run smoke:model-state
-```
-
-Real-model parity, comparator baselines, and full v0.1 evidence bundles require model files and comparator runtimes that are not vendored in this repository. Those runs must record the exact model row, hash, runtime versions, commands, timing, memory, and pass/fail status in a scrubbed evidence bundle.
-
-## Documentation Map
-
-- [`COMPATIBILITY.md`](COMPATIBILITY.md) - authoritative support contract
-- [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) - v0.1 release-candidate support boundary
-- [`CORRECTNESS_v0.1.md`](docs/release/CORRECTNESS_v0.1.md) - v0.1 correctness boundary
-- [`STATUS.md`](STATUS.md) - current evidence snapshot and blockers
-- [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) - committed benchmark snapshot and claim rules
-- [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) - claim-source order, evidence index, and public wording policy
-- [`RELEASE_NOTES_v0.1.md`](docs/release/RELEASE_NOTES_v0.1.md) - v0.1 release candidate notes
-- [`BENCHMARKS_v0.1.md`](docs/release/BENCHMARKS_v0.1.md) - v0.1 benchmark posture
-- [`MARKET_POSITIONING_v0.1.md`](docs/release/MARKET_POSITIONING_v0.1.md) - public positioning guardrails
-- [`RELEASE_GATE_v0.1.md`](docs/release/RELEASE_GATE_v0.1.md) - release gate commands and status
-- [`ROADMAP.md`](ROADMAP.md) - planned engineering sequence
-- [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) - implementation architecture
-
-## License and Reference Credits
+## License
 
 Camelid is licensed under the [MIT License](LICENSE).
 
