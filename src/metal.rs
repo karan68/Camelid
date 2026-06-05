@@ -73,6 +73,8 @@ struct MetalLinearKernel {
     rms_norm_quantize_pipeline: ComputePipelineState,
     silu_mul_quantize_pipeline: ComputePipelineState,
     argmax_f32_greedy_pipeline: ComputePipelineState,
+    attention_decode_splitk_pipeline: ComputePipelineState,
+    attention_decode_splitk_merge_pipeline: ComputePipelineState,
     embed_row_gather_q8_wire_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
 }
@@ -1614,6 +1616,136 @@ kernel void attention_decode_v2_f32(
             }
             output[q_base + d] = o * inv;
         }
+    }
+}
+
+// Split-K flash decode attention (the depth-scaling path): grid (kv_head, split).
+// Each threadgroup serves ALL query heads of one GQA group over one contiguous
+// position chunk, staging K/V tiles once into threadgroup memory — K/V rows are
+// read from device once per group instead of once per query head, and the
+// (kv_heads x splits) grid keeps every GPU core busy at depth, unlike the
+// one-threadgroup-per-head v2 kernel whose 24 threadgroups serialize long
+// position walks. Partial flash states (acc, m, l) land in `partials` and a
+// second kernel merges them exactly like v2 merges its per-simdgroup states.
+// Requires group <= 4 (one simdgroup per query head); the host falls back to v2
+// otherwise.
+kernel void attention_decode_splitk_f32(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* partials [[buffer(3)]], // [n_heads][n_splits][head_dim + 2]
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_splits [[buffer(13)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint PT = 8;      // staged positions per tile
+    constexpr uint MAX_DPL = 4; // head_dim <= 128 -> at most 4 dims per lane
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint dpl = head_dim / 32;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    // One simdgroup per query head of this KV group.
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float q[MAX_DPL];
+    if (active) {
+        for (uint i = 0; i < dpl; ++i) {
+            q[i] = query[qh * head_dim + lane + i * 32] * scale;
+        }
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    threadgroup float k_s[PT * 128];
+    threadgroup float v_s[PT * 128];
+    const uint tid = sg * 32 + lane;
+    for (uint pt = p0; pt < p1; pt += PT) {
+        const uint count = min(PT, p1 - pt);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx = tid; idx < count * head_dim; idx += 128) {
+            const uint p = idx / head_dim;
+            const uint d = idx % head_dim;
+            device const float* kr = keys + kv_base + (pt + p) * position_stride;
+            device const float* vr = values + kv_base + (pt + p) * position_stride;
+            k_s[p * head_dim + d] = kr[d];
+            v_s[p * head_dim + d] = vr[d];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint j = 0; j < count; ++j) {
+                float s = 0.0f;
+                for (uint i = 0; i < dpl; ++i) {
+                    s += q[i] * k_s[j * head_dim + lane + i * 32];
+                }
+                s = simd_sum(s);
+                const float m_new = max(m, s);
+                const float w = exp(s - m_new);
+                const float corr = exp(m - m_new);
+                for (uint i = 0; i < dpl; ++i) {
+                    acc[i] = acc[i] * corr + w * v_s[j * head_dim + lane + i * 32];
+                }
+                l = l * corr + w;
+                m = m_new;
+            }
+        }
+    }
+    if (active) {
+        device float* dst = partials + ((ulong)qh * n_splits + split) * (head_dim + 2);
+        for (uint i = 0; i < dpl; ++i) {
+            dst[lane + i * 32] = acc[i];
+        }
+        if (lane == 0) {
+            dst[head_dim] = m;
+            dst[head_dim + 1] = l;
+        }
+    }
+}
+
+// Merge the per-split flash states: out = sum_s acc_s * exp(m_s - M) / sum_s l_s * exp(m_s - M).
+kernel void attention_decode_splitk_merge_f32(
+    device const float* partials [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& head_dim [[buffer(2)]],
+    constant uint& n_splits [[buffer(3)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    device const float* base = partials + (ulong)head * n_splits * (head_dim + 2);
+    float m_tot = -INFINITY;
+    for (uint s2 = 0; s2 < n_splits; ++s2) {
+        m_tot = max(m_tot, base[s2 * (head_dim + 2) + head_dim]);
+    }
+    float l_tot = 0.0f;
+    for (uint s2 = 0; s2 < n_splits; ++s2) {
+        const float mi = base[s2 * (head_dim + 2) + head_dim];
+        if (mi != -INFINITY) {
+            l_tot += base[s2 * (head_dim + 2) + head_dim + 1] * exp(mi - m_tot);
+        }
+    }
+    const float inv = (l_tot > 0.0f) ? (1.0f / l_tot) : 0.0f;
+    for (uint d = tid; d < head_dim; d += 128) {
+        float o = 0.0f;
+        for (uint s2 = 0; s2 < n_splits; ++s2) {
+            const float mi = base[s2 * (head_dim + 2) + head_dim];
+            if (mi != -INFINITY) {
+                o += base[s2 * (head_dim + 2) + d] * exp(mi - m_tot);
+            }
+        }
+        output[head * head_dim + d] = o * inv;
     }
 }
 
@@ -3341,6 +3473,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let silu_mul_quantize_pipeline = device
                 .new_compute_pipeline_state_with_function(&silu_mul_quantize_function)
                 .ok()?;
+            let attention_decode_splitk_function = elementwise_library
+                .get_function("attention_decode_splitk_f32", None)
+                .ok()?;
+            let attention_decode_splitk_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_splitk_function)
+                .ok()?;
+            let attention_decode_splitk_merge_function = elementwise_library
+                .get_function("attention_decode_splitk_merge_f32", None)
+                .ok()?;
+            let attention_decode_splitk_merge_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_splitk_merge_function)
+                .ok()?;
             let argmax_f32_greedy_function = elementwise_library
                 .get_function("argmax_f32_greedy", None)
                 .ok()?;
@@ -3490,6 +3634,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_quantize_pipeline,
                 silu_mul_quantize_pipeline,
                 argmax_f32_greedy_pipeline,
+                attention_decode_splitk_pipeline,
+                attention_decode_splitk_merge_pipeline,
                 embed_row_gather_q8_wire_pipeline,
                 active_command_buffer: Mutex::new(None),
             })
@@ -5193,6 +5339,15 @@ fn kv16_enabled() -> bool {
 /// Opt-in: tiled decode attention with online softmax (4 simdgroups per head, coalesced
 /// K/V reads, no scores buffer). Requires head_dim % 32 == 0 and <= 128.
 #[cfg(target_os = "macos")]
+fn splitk_attention_enabled() -> bool {
+    // Default ON; CAMELID_METAL_ATTN_SPLITK=0 falls back to the v2 kernel at all depths.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CAMELID_METAL_ATTN_SPLITK")
+            .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+    })
+}
+
 fn attn2_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -5402,6 +5557,7 @@ fn encode_rope(
 fn encode_attention(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
     query: &Buffer,
     keys: &Buffer,
     values: &Buffer,
@@ -5409,11 +5565,83 @@ fn encode_attention(
     out: &Buffer,
     scalar: &Buffer,
     n_heads: usize,
+    n_kv_heads: usize,
     head_dim: usize,
+    position_count: usize,
 ) {
     // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
     // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
     let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
+    // Split-K flash decode for deeper contexts: the v2 kernel's one-threadgroup-per-head
+    // grid leaves the GPU mostly idle while each simdgroup walks a long position range
+    // serially, and GQA re-reads every K/V row once per query head. The split-K kernel
+    // covers (kv_heads x splits) threadgroups with the K/V tile staged once per group.
+    // Below the threshold the fixed scratch/merge cost outweighs the win.
+    let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    let splitk = v2
+        && !kv16_enabled()
+        && splitk_attention_enabled()
+        && (1..=4).contains(&group)
+        && position_count >= 128;
+    if splitk {
+        let n_splits = position_count.div_ceil(64).clamp(2, 64);
+        let partials = k.device.new_buffer(
+            (n_heads * n_splits * (head_dim + 2) * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let splits_scalar = k
+            .device
+            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        unsafe {
+            *(splits_scalar.contents() as *mut u32) = n_splits as u32;
+        }
+        e.set_compute_pipeline_state(&k.attention_decode_splitk_pipeline);
+        e.set_buffer(0, Some(query), 0);
+        e.set_buffer(1, Some(keys), 0);
+        e.set_buffer(2, Some(values), 0);
+        e.set_buffer(3, Some(&partials), 0);
+        e.set_buffer(5, Some(scalar), 0); // n_heads
+        e.set_buffer(6, Some(scalar), 4); // head_dim
+        e.set_buffer(7, Some(scalar), 8); // position_count
+        e.set_buffer(8, Some(scalar), 12); // group
+        e.set_buffer(9, Some(scalar), 16); // scale (f32)
+        e.set_buffer(10, Some(scalar), 20); // position_stride
+        e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+        e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+        e.set_buffer(13, Some(&splits_scalar), 0);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_kv_heads as u64,
+                height: n_splits as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_pipeline);
+        e.set_buffer(0, Some(&partials), 0);
+        e.set_buffer(1, Some(out), 0);
+        e.set_buffer(2, Some(scalar), 4); // head_dim
+        e.set_buffer(3, Some(&splits_scalar), 0);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        keep.push(partials);
+        keep.push(splits_scalar);
+        return;
+    }
     let attn_pipeline = match (v2, kv16_enabled()) {
         (true, true) => &k.attention_decode_v2_kv16_pipeline,
         (true, false) => &k.attention_decode_v2_pipeline,
@@ -5805,6 +6033,7 @@ fn encode_attention_block(
     encode_attention(
         e,
         k,
+        keep,
         &query_buf,
         cache_k_buf,
         cache_v_buf,
@@ -5812,7 +6041,9 @@ fn encode_attention_block(
         &ctx_buf,
         &attn_scalar,
         n_heads,
+        n_kv_heads,
         head_dim,
+        position_count,
     );
     if f32y_gemv_enabled() {
         encode_q8_matmul_f32y(e, k, &ctx_buf, o_w_buf, &o_buf, &o_mm_scalar, hidden);
