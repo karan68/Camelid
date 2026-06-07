@@ -385,6 +385,7 @@ async fn main() -> anyhow::Result<()> {
                 metal_q8,
             );
             apply_spec_decode_env(spec_decode, spec_draft_model, spec_draft_tokens);
+            apply_serve_nocopy_default();
             if log_acceleration {
                 log_acceleration_state();
             }
@@ -1295,6 +1296,40 @@ fn apply_default_fast_stack() {
             std::env::set_var(key, "1");
         }
     }
+}
+
+/// Default the single-node `serve` path to fast-load (CAMELID_METAL_NOCOPY): Q8_0
+/// weights map straight into page-aligned wire pages the GPU reads in place — same
+/// decode speed, ~36% lower peak RSS, and warm reloads in seconds instead of the
+/// full disk pass. Gated to exactly the configuration that can consume wire pages:
+/// macOS, the resident decode path active, and the wire kernel stack on. This is
+/// why it lives in the serve arm and not `apply_default_fast_stack` — speculative
+/// decoding disables resident decode (its CPU repack plan needs the materialized
+/// blocks), any wire-off override falls back to the block path, and the
+/// distributed nodes (whose CPU forward needs `q8_0_blocks`) never run this arm.
+/// Opt out with CAMELID_METAL_NOCOPY=0.
+fn apply_serve_nocopy_default() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let on = |key: &str| std::env::var(key).map(|v| v == "1").unwrap_or(false);
+    if should_default_serve_nocopy(
+        std::env::var_os("CAMELID_METAL_NOCOPY").is_some(),
+        on("CAMELID_METAL_RESIDENT_DECODE"),
+        on("CAMELID_METAL_WIRE"),
+        on("CAMELID_METAL_F32Y"),
+    ) {
+        std::env::set_var("CAMELID_METAL_NOCOPY", "1");
+    }
+}
+
+/// Pure decision for [`apply_serve_nocopy_default`]: default fast-load on only when
+/// the user has not set the flag either way AND the wire-resident stack that can
+/// consume wire pages is active. Speculative decoding turns resident decode off, so
+/// `resident == false` keeps NOCOPY off; an explicit `=0` sets `already_set` and is
+/// honored.
+fn should_default_serve_nocopy(already_set: bool, resident: bool, wire: bool, f32y: bool) -> bool {
+    !already_set && resident && wire && f32y
 }
 
 /// Hard residency gate for pipeline nodes: every owned Q8_0 linear must hold plain
@@ -3193,6 +3228,20 @@ mod tensor_dump_tests {
                 source_layout: "token_major_output_row",
             })
         );
+    }
+
+    #[test]
+    fn serve_nocopy_default_only_with_active_wire_resident_stack() {
+        // Default on: fresh (unset) + full wire-resident stack.
+        assert!(should_default_serve_nocopy(false, true, true, true));
+        // User set it either way (incl. an explicit =0): never override.
+        assert!(!should_default_serve_nocopy(true, true, true, true));
+        // Speculative decoding turns resident decode off -> stay off (its CPU
+        // repack plan needs materialized blocks, not wire pages).
+        assert!(!should_default_serve_nocopy(false, false, true, true));
+        // Any wire-stack component off -> the wire kernels can't consume pages.
+        assert!(!should_default_serve_nocopy(false, true, false, true));
+        assert!(!should_default_serve_nocopy(false, true, true, false));
     }
 
     #[test]
