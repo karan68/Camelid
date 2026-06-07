@@ -76,10 +76,17 @@ struct MetalLinearKernel {
     attention_decode_splitk_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_pipeline: ComputePipelineState,
     attention_decode_splitk_kv16_direct_pipeline: ComputePipelineState,
+    #[allow(dead_code)] // stage-bandwidth probe variant; exercised by the depth-probe test
     attention_splitk_kv16_stageonly_pipeline: ComputePipelineState,
     attention_decode_splitk_merge_pipeline: ComputePipelineState,
     embed_row_gather_q8_wire_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
+    /// Recycled per-token scratch buffers keyed by power-of-two byte class. The resident
+    /// decode loop allocates hundreds of small scratch/scalar buffers per token; fresh
+    /// MTLBuffer allocation crosses into IOGPU (a mach call per buffer, observed directly
+    /// in time-profile samples of the decode loop), so settled tokens return their scratch
+    /// here instead of dropping it.
+    scratch_pool: Mutex<HashMap<u64, Vec<Buffer>>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3949,6 +3956,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_merge_pipeline,
                 embed_row_gather_q8_wire_pipeline,
                 active_command_buffer: Mutex::new(None),
+                scratch_pool: Mutex::new(HashMap::new()),
             })
         })
         .as_ref()
@@ -6035,13 +6043,8 @@ fn encode_attention(
         && position_count >= 128;
     if splitk {
         let n_splits = position_count.div_ceil(64).clamp(2, 64);
-        let partials = k.device.new_buffer(
-            (n_heads * n_splits * (head_dim + 2) * 4) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let splits_scalar = k
-            .device
-            .new_buffer(4, MTLResourceOptions::StorageModeShared);
+        let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
+        let splits_scalar = pool_get(k, 4);
         unsafe {
             *(splits_scalar.contents() as *mut u32) = n_splits as u32;
         }
@@ -6174,10 +6177,7 @@ fn encode_ffn_block(
     let hidden = ffn_norm.len();
     let bpr_hidden = hidden / 32;
     let bpr_ffn = ffn_dim / 32;
-    let nb = |bytes: u64| {
-        k.device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-    };
+    let nb = |bytes: u64| pool_get(k, bytes);
     let norm_w_buf = nb((hidden * 4) as u64);
     let rms_scalar = nb(8);
     let scales1 = nb((bpr_hidden * 4) as u64);
@@ -6338,10 +6338,7 @@ fn encode_attention_block(
     let bpr_hidden = hidden / 32;
     let bpr_q = q_dim / 32;
     let group = (n_heads / n_kv_heads) as u32;
-    let nb = |bytes: u64| {
-        k.device
-            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-    };
+    let nb = |bytes: u64| pool_get(k, bytes);
     let f32b = |n: usize| nb((n * 4) as u64);
     let norm_w_buf = f32b(hidden);
     let rms_scalar = nb(8);
@@ -6592,6 +6589,35 @@ fn encode_attention_block(
         resid_n,
         scatter_scalar,
     ]);
+}
+
+/// Hand out a scratch buffer of at least `bytes` from the recycle pool, or allocate a
+/// fresh one at the pool's power-of-two class size. Pool-derived buffers are owned by the
+/// per-token `keep` vec and MUST come back via `pool_recycle` only after the command
+/// buffer that referenced them has completed.
+#[cfg(target_os = "macos")]
+fn pool_get(k: &MetalLinearKernel, bytes: u64) -> Buffer {
+    let class = bytes.max(32).next_power_of_two();
+    if let Some(buf) = k
+        .scratch_pool
+        .lock()
+        .unwrap()
+        .get_mut(&class)
+        .and_then(|v| v.pop())
+    {
+        return buf;
+    }
+    k.device
+        .new_buffer(class, MTLResourceOptions::StorageModeShared)
+}
+
+/// Return settled scratch buffers to the pool (keyed by their class-sized length).
+#[cfg(target_os = "macos")]
+fn pool_recycle<I: IntoIterator<Item = Buffer>>(k: &MetalLinearKernel, bufs: I) {
+    let mut pool = k.scratch_pool.lock().unwrap();
+    for b in bufs {
+        pool.entry(b.length()).or_default().push(b);
+    }
 }
 
 /// Allocate a fresh GPU buffer for a Q8_0 weight-block slice and upload it. Used by the
@@ -7581,9 +7607,15 @@ impl ResidentDecodeState {
         }
         if want_sample && prepared.sampled_buf.is_some() && !trace {
             // Settle the PREVIOUS fast-lane graph's bookkeeping (its GPU work finished at
-            // least one token ago) while this token still executes.
+            // least one token ago) while this token still executes. Its scratch goes back
+            // to the pool instead of dropping: several hundred MTLBuffer creates/releases
+            // per token otherwise cross into IOGPU on the decode loop's thread.
             if let Some(r) = self.retiring.take() {
                 r.cb.wait_until_completed();
+                pool_recycle(
+                    k,
+                    r._keep.into_iter().chain(r.sampled_buf).chain(r.logits_buf),
+                );
             }
             // Observe THIS graph's completion via the GPU-stamped event: a shared-memory
             // poll, no kernel wake-up on the critical path.
@@ -7593,6 +7625,10 @@ impl ResidentDecodeState {
         } else {
             if let Some(r) = self.retiring.take() {
                 r.cb.wait_until_completed();
+                pool_recycle(
+                    k,
+                    r._keep.into_iter().chain(r.sampled_buf).chain(r.logits_buf),
+                );
             }
             prepared.cb.wait_until_completed();
         }
@@ -7757,10 +7793,7 @@ impl ResidentDecodeState {
         // Optional final stage: RMSNorm + output (vocab) projection in the SAME command buffer,
         // so the large logits matmul runs on the GPU instead of falling to the slow CPU path.
         let logits_buf = if let (Some(s), Some((ow_buf, fnorm_buf))) = (logits_stage, &stage_bufs) {
-            let nb = |bytes: u64| {
-                k.device
-                    .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-            };
+            let nb = |bytes: u64| pool_get(k, bytes);
             let rms_scalar = nb(8);
             let lscales = nb((bpr_hidden * 4) as u64);
             let lquants = nb(self.hidden as u64);
@@ -7811,10 +7844,7 @@ impl ResidentDecodeState {
         // reads. Both are hazard-ordered after the logits matmul by Metal's tracking.
         let sampled_buf = match (&logits_buf, &emb_buf, logits_stage) {
             (Some(lb), Some(eb), Some(s)) => {
-                let nb = |bytes: u64| {
-                    k.device
-                        .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-                };
+                let nb = |bytes: u64| pool_get(k, bytes);
                 let id_buf = nb(4);
                 let am_scalar = nb(4);
                 let eg_scalar = nb(4);
@@ -9599,99 +9629,108 @@ mod tests {
                 *p.add(7) = 0; // kv_base_offset
             }
             for &n_splits in &[32usize, 64, 128, 256] {
-            let splits_scalar = device.new_buffer(4, opts);
-            unsafe { *(splits_scalar.contents() as *mut u32) = n_splits as u32 };
-            let partials: Vec<Buffer> = (0..layers)
-                .map(|_| {
-                    device.new_buffer((n_heads * n_splits * (head_dim + 2) * 4) as u64, opts)
-                })
-                .collect();
-            let variants: [(&str, &ComputePipelineState, &[Buffer], &[Buffer], usize); 4] = [
-                (
-                    "kv16 ",
-                    &kernel.attention_decode_splitk_kv16_pipeline,
-                    &k16,
-                    &v16,
-                    2,
-                ),
-                (
-                    "direc",
-                    &kernel.attention_decode_splitk_kv16_direct_pipeline,
-                    &k16,
-                    &v16,
-                    2,
-                ),
-                (
-                    "f32  ",
-                    &kernel.attention_decode_splitk_pipeline,
-                    &k32,
-                    &v32,
-                    4,
-                ),
-                (
-                    "stage",
-                    &kernel.attention_splitk_kv16_stageonly_pipeline,
-                    &k16,
-                    &v16,
-                    2,
-                ),
-            ];
-            for (label, pipeline, keys, values, elem) in variants {
-                let bytes = layers * 2 * kv_slots * elem;
-                for round in 0..2 {
-                    let cb = kernel.queue.new_command_buffer();
-                    let e = cb.new_compute_command_encoder();
-                    for l in 0..layers {
-                        e.set_compute_pipeline_state(pipeline);
-                        e.set_buffer(0, Some(&q), 0);
-                        e.set_buffer(1, Some(&keys[l]), 0);
-                        e.set_buffer(2, Some(&values[l]), 0);
-                        e.set_buffer(3, Some(&partials[l]), 0);
-                        for i in 0..8u64 {
-                            e.set_buffer(5 + i, Some(&scalar), i * 4);
+                let splits_scalar = device.new_buffer(4, opts);
+                unsafe { *(splits_scalar.contents() as *mut u32) = n_splits as u32 };
+                let partials: Vec<Buffer> = (0..layers)
+                    .map(|_| {
+                        device.new_buffer((n_heads * n_splits * (head_dim + 2) * 4) as u64, opts)
+                    })
+                    .collect();
+                #[allow(clippy::type_complexity)]
+                let variants: [(
+                    &str,
+                    &ComputePipelineState,
+                    &[Buffer],
+                    &[Buffer],
+                    usize,
+                ); 4] = [
+                    (
+                        "kv16 ",
+                        &kernel.attention_decode_splitk_kv16_pipeline,
+                        &k16,
+                        &v16,
+                        2,
+                    ),
+                    (
+                        "direc",
+                        &kernel.attention_decode_splitk_kv16_direct_pipeline,
+                        &k16,
+                        &v16,
+                        2,
+                    ),
+                    (
+                        "f32  ",
+                        &kernel.attention_decode_splitk_pipeline,
+                        &k32,
+                        &v32,
+                        4,
+                    ),
+                    (
+                        "stage",
+                        &kernel.attention_splitk_kv16_stageonly_pipeline,
+                        &k16,
+                        &v16,
+                        2,
+                    ),
+                ];
+                for (label, pipeline, keys, values, elem) in variants {
+                    let bytes = layers * 2 * kv_slots * elem;
+                    for round in 0..2 {
+                        let cb = kernel.queue.new_command_buffer();
+                        let e = cb.new_compute_command_encoder();
+                        for l in 0..layers {
+                            e.set_compute_pipeline_state(pipeline);
+                            e.set_buffer(0, Some(&q), 0);
+                            e.set_buffer(1, Some(&keys[l]), 0);
+                            e.set_buffer(2, Some(&values[l]), 0);
+                            e.set_buffer(3, Some(&partials[l]), 0);
+                            for i in 0..8u64 {
+                                e.set_buffer(5 + i, Some(&scalar), i * 4);
+                            }
+                            e.set_buffer(13, Some(&splits_scalar), 0);
+                            e.dispatch_thread_groups(
+                                metal::MTLSize {
+                                    width: n_kv_heads as u64,
+                                    height: n_splits as u64,
+                                    depth: 1,
+                                },
+                                metal::MTLSize {
+                                    width: 128,
+                                    height: 1,
+                                    depth: 1,
+                                },
+                            );
+                            e.set_compute_pipeline_state(
+                                &kernel.attention_decode_splitk_merge_pipeline,
+                            );
+                            e.set_buffer(0, Some(&partials[l]), 0);
+                            e.set_buffer(1, Some(&out), 0);
+                            e.set_buffer(2, Some(&scalar), 4);
+                            e.set_buffer(3, Some(&splits_scalar), 0);
+                            e.dispatch_thread_groups(
+                                metal::MTLSize {
+                                    width: n_heads as u64,
+                                    height: 1,
+                                    depth: 1,
+                                },
+                                metal::MTLSize {
+                                    width: 128,
+                                    height: 1,
+                                    depth: 1,
+                                },
+                            );
                         }
-                        e.set_buffer(13, Some(&splits_scalar), 0);
-                        e.dispatch_thread_groups(
-                            metal::MTLSize {
-                                width: n_kv_heads as u64,
-                                height: n_splits as u64,
-                                depth: 1,
-                            },
-                            metal::MTLSize {
-                                width: 128,
-                                height: 1,
-                                depth: 1,
-                            },
-                        );
-                        e.set_compute_pipeline_state(&kernel.attention_decode_splitk_merge_pipeline);
-                        e.set_buffer(0, Some(&partials[l]), 0);
-                        e.set_buffer(1, Some(&out), 0);
-                        e.set_buffer(2, Some(&scalar), 4);
-                        e.set_buffer(3, Some(&splits_scalar), 0);
-                        e.dispatch_thread_groups(
-                            metal::MTLSize {
-                                width: n_heads as u64,
-                                height: 1,
-                                depth: 1,
-                            },
-                            metal::MTLSize {
-                                width: 128,
-                                height: 1,
-                                depth: 1,
-                            },
-                        );
-                    }
-                    e.end_encoding();
-                    cb.commit();
-                    cb.wait_until_completed();
-                    let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
-                    println!(
+                        e.end_encoding();
+                        cb.commit();
+                        cb.wait_until_completed();
+                        let (busy_us, _) = command_buffer_gpu_times_us(&cb.to_owned());
+                        println!(
                         "attn probe {label} pos={positions} splits={n_splits}: round {round}: {:.2} ms/token, {:.1} GB/s",
                         busy_us as f64 / 1000.0,
                         bytes as f64 / (busy_us as f64 * 1e-6) / 1e9
                     );
+                    }
                 }
-            }
             }
         }
     }
