@@ -379,6 +379,7 @@ pub struct CompletionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    pub camelid_receipt: Option<bool>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -903,6 +904,9 @@ pub struct CompletionResponse {
     pub choices: Vec<CompletionChoice>,
     pub usage: CompletionUsage,
     pub camelid: GenerationDiagnostics,
+    /// Present only when the request opted in via `camelid_receipt: true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camelid_receipt: Option<ParityReceipt>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3202,6 +3206,24 @@ async fn completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    // Capture the receipt stamp before the request is consumed. Receipts are
+    // strictly opt-in and never silently attached.
+    let receipt_stamp = if req.camelid_receipt.unwrap_or(false) {
+        if req.stream.unwrap_or(false) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "camelid_receipt is not supported with stream:true; receipts record one complete non-streaming generation".to_string(),
+                Some("camelid_receipt"),
+            );
+        }
+        match receipt_completion_request_stamp(&req) {
+            Ok(stamp) => Some(stamp),
+            Err(response) => return *response,
+        }
+    } else {
+        None
+    };
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: req.prompt,
@@ -3239,8 +3261,16 @@ async fn completions(
 
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
+    let effective_max_tokens = prepared.max_tokens;
     match generate_decoded_tokens_blocking(prepared).await {
         Ok(generated) => {
+            let camelid_receipt = match receipt_stamp {
+                Some(stamp) => {
+                    build_server_receipt(&state, &model_id, stamp, effective_max_tokens, &generated)
+                        .await
+                }
+                None => None,
+            };
             let GeneratedText {
                 text,
                 prompt_token_ids,
@@ -3283,6 +3313,7 @@ async fn completions(
                         dense_diagnostic_generated_index,
                         timings_ms: timings,
                     },
+                    camelid_receipt,
                 }),
             )
                 .into_response()
@@ -3410,6 +3441,7 @@ async fn chat_completions(
 /// are recorded (e.g. the greedy default temperature 0.0 when omitted) so the
 /// verifier can replay the exact request.
 struct ReceiptRequestStamp {
+    endpoint: &'static str,
     messages_or_prompt: serde_json::Value,
     temperature: f64,
     top_p: Option<f64>,
@@ -3433,20 +3465,67 @@ fn receipt_request_stamp(
             )))
         }
     };
-    let temperature = f64::from(req.temperature.unwrap_or(0.0));
+    Ok(receipt_stamp_from_parts(
+        "/v1/chat/completions",
+        messages_or_prompt,
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.seed,
+        stop_spec_to_vec(req.stop.as_ref()),
+    ))
+}
+
+/// Receipt stamp for the raw `/v1/completions` endpoint. The receipt records the
+/// prompt string (not chat messages); the verifier replays the same endpoint and
+/// re-runs the reference engine on the receipt's exact prompt token ids.
+fn receipt_completion_request_stamp(
+    req: &CompletionRequest,
+) -> std::result::Result<ReceiptRequestStamp, Box<Response>> {
+    let prompt = req.prompt.clone().ok_or_else(|| {
+        Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt requires a prompt; receipts record one complete generation"
+                .to_string(),
+            Some("prompt"),
+        ))
+    })?;
+    Ok(receipt_stamp_from_parts(
+        "/v1/completions",
+        serde_json::Value::String(prompt),
+        req.temperature,
+        req.top_p,
+        req.top_k,
+        req.seed,
+        stop_spec_to_vec(req.stop.as_ref()),
+    ))
+}
+
+fn receipt_stamp_from_parts(
+    endpoint: &'static str,
+    messages_or_prompt: serde_json::Value,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    seed: Option<u64>,
+    stop: Vec<String>,
+) -> ReceiptRequestStamp {
+    let temperature = f64::from(temperature.unwrap_or(0.0));
     // Reproducible means byte-for-byte replayable: strict greedy decoding
     // with no top-p/top-k sampling in play. Anything else is stamped
     // `reproducible: false` and is never presented as verifiable.
-    let reproducible = temperature == 0.0 && req.top_p.is_none() && req.top_k.is_none();
-    Ok(ReceiptRequestStamp {
+    let reproducible = temperature == 0.0 && top_p.is_none() && top_k.is_none();
+    ReceiptRequestStamp {
+        endpoint,
         messages_or_prompt,
         temperature,
-        top_p: req.top_p.map(f64::from),
-        top_k: req.top_k,
-        seed: req.seed,
-        stop: stop_spec_to_vec(req.stop.as_ref()),
+        top_p: top_p.map(f64::from),
+        top_k,
+        seed,
+        stop,
         reproducible,
-    })
+    }
 }
 
 fn stop_spec_to_vec(stop: Option<&StopSpec>) -> Vec<String> {
@@ -3484,7 +3563,7 @@ async fn build_server_receipt(
             commit: None,
         },
         request: receipt::ReceiptRequest {
-            endpoint: "/v1/chat/completions".to_string(),
+            endpoint: stamp.endpoint.to_string(),
             messages_or_prompt: stamp.messages_or_prompt,
             max_tokens: effective_max_tokens,
             temperature: stamp.temperature,
@@ -6783,6 +6862,63 @@ mod tests {
     };
 
     use super::*;
+
+    fn completion_request_with(
+        prompt: Option<&str>,
+        temperature: Option<f32>,
+    ) -> CompletionRequest {
+        CompletionRequest {
+            model: None,
+            prompt: prompt.map(str::to_string),
+            stream: None,
+            max_tokens: Some(16),
+            temperature,
+            top_k: None,
+            top_p: None,
+            seed: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            logit_bias: None,
+            stop: None,
+            n: None,
+            best_of: None,
+            logprobs: None,
+            camelid_logit_token_ids: None,
+            camelid_prompt_token_ids: None,
+            camelid_dense_diagnostics: None,
+            camelid_dense_diagnostic_generated_index: None,
+            camelid_receipt: Some(true),
+            unsupported_fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn completion_receipt_stamp_records_prompt_endpoint_and_reproducibility() {
+        // Greedy (no temperature/top-p/top-k): records the prompt verbatim under the
+        // raw completions endpoint and is reproducible.
+        let stamp = receipt_completion_request_stamp(&completion_request_with(
+            Some("The three primary colors are"),
+            None,
+        ))
+        .expect("greedy completion stamp");
+        assert_eq!(stamp.endpoint, "/v1/completions");
+        assert_eq!(
+            stamp.messages_or_prompt,
+            serde_json::Value::String("The three primary colors are".to_string())
+        );
+        assert_eq!(stamp.temperature, 0.0);
+        assert!(stamp.reproducible);
+
+        // Non-zero temperature is recorded but never presented as reproducible.
+        let sampled =
+            receipt_completion_request_stamp(&completion_request_with(Some("hello"), Some(0.8)))
+                .expect("sampled completion stamp");
+        assert_eq!(sampled.temperature, f64::from(0.8_f32));
+        assert!(!sampled.reproducible);
+
+        // A receipt without a prompt is a request error, not a silent empty record.
+        assert!(receipt_completion_request_stamp(&completion_request_with(None, None)).is_err());
+    }
 
     #[test]
     fn stream_timing_diagnostics_env_is_default_off_and_opt_in() {

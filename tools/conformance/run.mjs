@@ -174,13 +174,14 @@ async function probeCamelid(port) {
       }
     }
 
-    // Provability probe: emit a sealed receipt for one greedy request, verify
-    // its self-digest (and the full replay + reference chain when a reference
-    // binary was supplied). Receipts ride the chat endpoint.
+    // Provability probe: emit a sealed receipt for one greedy request over the
+    // SAME raw-completions path the agreement matrix uses, then verify its
+    // self-digest (and the full replay + reference chain when a reference binary
+    // was supplied).
     let proof = null
     try {
-      const receiptResp = await postJson(`${base}/v1/chat/completions`, {
-        messages: [{ role: 'user', content: PROMPTS[0].text }],
+      const receiptResp = await postJson(`${base}/v1/completions`, {
+        prompt: PROMPTS[0].text,
         max_tokens: Math.min(maxTokens, 16),
         temperature: 0,
         camelid_receipt: true,
