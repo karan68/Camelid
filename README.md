@@ -107,6 +107,7 @@ The verifier recomputes the receipt's digest, confirms your GGUF is the named fi
 - [`COMPATIBILITY.md`](COMPATIBILITY.md) — the durable support contract
 - [`BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md) — benchmark snapshots and claim rules
 - [`RECEIPTS.md`](RECEIPTS.md) — verifiable single-request parity receipts (not a support ledger)
+- [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — measure any runtime by one ruler: determinism, cross-runtime agreement, tokenizer parity, and provability
 - [`STATUS.md`](STATUS.md) — current evidence snapshot and blockers
 - [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md) — implementation architecture
 - [`RELEASE_NOTES_v0.1.md`](docs/release/RELEASE_NOTES_v0.1.md) — v0.1 release notes

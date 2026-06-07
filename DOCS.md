@@ -21,6 +21,7 @@ Read these first:
 - [`docs/WAR_ROOM_EVIDENCE_INDEX.md`](docs/WAR_ROOM_EVIDENCE_INDEX.md) — war-room claim-source order, evidence index, and public wording policy
 - [`PARITY.md`](docs/benchmarks/PARITY.md) — exact-row parity proof map and audit trail
 - [`RECEIPTS.md`](RECEIPTS.md) — verifiable single-request parity receipts; a receipt never changes the support ledger
+- [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — cross-runtime conformance: determinism, agreement, tokenizer parity, provability; methodology and current findings
 - [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
 
 ## Contributor and project policy

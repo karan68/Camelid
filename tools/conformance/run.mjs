@@ -406,6 +406,7 @@ function renderScoreboard(results) {
   lines.push(`## Runtimes`)
   lines.push('')
   for (const r of results.runtimes) lines.push(`- **${r.label}** — ${r.version}`)
+  for (const u of results.unavailable) lines.push(`- _${u.label}_ — unavailable: ${u.reason}`)
   lines.push('')
   lines.push(`## Determinism (same request, ${rounds} rounds)`)
   lines.push('')
@@ -468,16 +469,29 @@ async function main() {
   const modelSha = shaOut.split(/\s+/)[0]
 
   const runtimes = []
+  const unavailable = []
   let port = basePort
+  // One runtime failing to start, load, or probe must never sink the whole
+  // scoreboard — it is recorded as unavailable and the rest still produce
+  // results. (A near-full disk, a missing binary, an OOM are all findings, not
+  // crashes.)
+  const tryProbe = async (label, fn) => {
+    try {
+      runtimes.push(await fn())
+    } catch (err) {
+      console.error(`[${label}] unavailable: ${String(err).slice(0, 300)}`)
+      unavailable.push({ label, reason: String(err).slice(0, 300) })
+    }
+  }
   if (includeCamelid) {
-    runtimes.push(await probeCamelid(port++))
+    await tryProbe('camelid', () => probeCamelid(port++))
   }
   for (const spec of argAll('llama-server')) {
     const [label, bin] = spec.includes('=') ? spec.split(/=(.*)/s) : [`llama-${port}`, spec]
-    runtimes.push(await probeLlamaServer(label, bin, port++))
+    await tryProbe(label, () => probeLlamaServer(label, bin, port++))
   }
   if (ollamaWanted) {
-    runtimes.push(await probeOllama(port++))
+    await tryProbe('ollama', () => probeOllama(port++))
   }
   if (runtimes.length < 2) {
     console.error('warning: fewer than two runtimes probed; agreement matrix will be empty')
@@ -489,6 +503,7 @@ async function main() {
     model: { label: modelLabel, path: modelPath, sha256: modelSha },
     settings: { max_tokens: maxTokens, rounds, prompts: PROMPTS },
     runtimes: runtimes.map(r => ({ label: r.label, version: r.version, proof: r.proof })),
+    unavailable,
     determinism: Object.fromEntries(runtimes.map(r => [r.label, scoreDeterminism(r)])),
     agreement: scoreAgreement(runtimes),
     tokenizers: scoreTokenizers(runtimes),
@@ -499,6 +514,12 @@ async function main() {
   const scoreboard = renderScoreboard(results)
   await writeFile(resolve(outDir, 'SCOREBOARD.md'), scoreboard)
   console.log(scoreboard)
+  // The scoreboard is the product. Once it is written, the run succeeded —
+  // unavailable runtimes are recorded findings, not failures. Exit explicitly
+  // (code 2 only when fewer than two runtimes were probed, so no agreement
+  // matrix exists) so a late child-process 'exit' event in the loop cannot
+  // turn a complete scoreboard into a spurious failure.
+  process.exit(runtimes.length >= 2 ? 0 : 2)
 }
 
 main().catch(err => {
