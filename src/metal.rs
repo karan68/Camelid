@@ -105,6 +105,12 @@ struct MetalLinearCache {
     /// SOURCE slice identity; the first source block is stored for the aliasing guard
     /// (the GPU contents are converted, so they cannot be probed against the source).
     q8_wire_weight_buffers: HashMap<(usize, usize), (Buffer, [u8; 36])>,
+    /// Offset-0 NoCopy buffers wrapped over page-aligned wire-page allocations
+    /// (fast-load). The Arc keeps each allocation alive for as long as the cache
+    /// holds its buffer, so a dropped model can never leave the GPU pointing at
+    /// freed memory.
+    q8_wire_nocopy_buffers:
+        HashMap<(usize, usize), (Buffer, std::sync::Arc<crate::wire_mmap::WirePages>)>,
 
     // Transient caches (activation buffers, scalars, deferred reads)
     activation_buffers: HashMap<(usize, usize), Buffer>,
@@ -120,6 +126,7 @@ impl MetalLinearCache {
             weight_buffers: HashMap::new(),
             q8_block_weight_buffers: HashMap::new(),
             q8_wire_weight_buffers: HashMap::new(),
+            q8_wire_nocopy_buffers: HashMap::new(),
             activation_buffers: HashMap::new(),
             scalar_buffers: Vec::new(),
             scalar_index: 0,
@@ -265,6 +272,29 @@ impl MetalLinearCache {
         }
         self.q8_wire_weight_buffers
             .insert(key, (buffer.to_owned(), probe));
+        buffer
+    }
+
+    /// Wrap a page-aligned wire-page allocation with an offset-0 NoCopy buffer:
+    /// the GPU reads the allocation in place — no upload, no conversion. Keyed by
+    /// (pointer, len); the stored Arc pins the allocation for the buffer's lifetime.
+    fn q8_wire_nocopy_buffer(
+        &mut self,
+        device: &Device,
+        pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+    ) -> Buffer {
+        let key = (pages.base_ptr() as usize, pages.byte_len());
+        if let Some((buffer, _)) = self.q8_wire_nocopy_buffers.get(&key) {
+            return buffer.to_owned();
+        }
+        let buffer = device.new_buffer_with_bytes_no_copy(
+            pages.base_ptr() as *const std::ffi::c_void,
+            pages.alloc_len() as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        self.q8_wire_nocopy_buffers
+            .insert(key, (buffer.to_owned(), std::sync::Arc::clone(pages)));
         buffer
     }
 }
@@ -5585,6 +5615,20 @@ fn wire_weights_enabled() -> bool {
     })
 }
 
+/// Whether the resident stack consumes weights in the raw GGUF wire layout
+/// (CAMELID_METAL_F32Y + CAMELID_METAL_WIRE, the default CLI stack). Wire-page
+/// (fast-load) weights require this: their bytes only exist in wire form.
+#[cfg(target_os = "macos")]
+pub fn wire_mode_active() -> bool {
+    f32y_gemv_enabled() && wire_weights_enabled()
+}
+
+/// Non-macOS stub: there is no Metal stack, so wire mode is never active.
+#[cfg(not(target_os = "macos"))]
+pub fn wire_mode_active() -> bool {
+    false
+}
+
 /// Prefill GEMMs use the simdgroup-matrix tiled kernel (numerically equivalent to the
 /// scalar k-split GEMM but not byte-exact: tile MMA accumulation order). Default on via
 /// the fast stack; CAMELID_METAL_MM=0 restores the byte-exact scalar GEMM.
@@ -7135,13 +7179,34 @@ pub fn try_decode_forward_resident(
 pub struct ResidentLayerWeights<'a> {
     pub attn_norm: &'a [f32],
     pub ffn_norm: &'a [f32],
-    pub q_weight_blocks: &'a [u8],
-    pub k_weight_blocks: &'a [u8],
-    pub v_weight_blocks: &'a [u8],
-    pub o_weight_blocks: &'a [u8],
-    pub gate_weight_blocks: &'a [u8],
-    pub up_weight_blocks: &'a [u8],
-    pub down_weight_blocks: &'a [u8],
+    pub q_weight_blocks: ResidentWeightBytes<'a>,
+    pub k_weight_blocks: ResidentWeightBytes<'a>,
+    pub v_weight_blocks: ResidentWeightBytes<'a>,
+    pub o_weight_blocks: ResidentWeightBytes<'a>,
+    pub gate_weight_blocks: ResidentWeightBytes<'a>,
+    pub up_weight_blocks: ResidentWeightBytes<'a>,
+    pub down_weight_blocks: ResidentWeightBytes<'a>,
+}
+
+/// Where a resident weight's bytes live on the CPU side.
+#[derive(Clone, Copy)]
+pub enum ResidentWeightBytes<'a> {
+    /// 36-byte f32-scale CPU blocks; uploaded (and wire-converted when wire mode is
+    /// on) through the buffer cache.
+    Blocks36(&'a [u8]),
+    /// Page-aligned 34-byte wire blocks (fast-load); wrapped in place by an offset-0
+    /// NoCopy buffer — the GPU reads this allocation directly, no upload copy.
+    WirePages(&'a std::sync::Arc<crate::wire_mmap::WirePages>),
+}
+
+impl ResidentWeightBytes<'_> {
+    /// Number of Q8_0 blocks the bytes describe, independent of layout.
+    pub fn block_count(&self) -> usize {
+        match self {
+            ResidentWeightBytes::Blocks36(bytes) => bytes.len() / 36,
+            ResidentWeightBytes::WirePages(pages) => pages.byte_len() / 34,
+        }
+    }
 }
 
 /// Optional final stage for `forward_token`: when present, the session also runs the final
@@ -7150,7 +7215,7 @@ pub struct ResidentLayerWeights<'a> {
 /// CPU. `output_weight_blocks` is the Q8_0 output/embedding projection.
 pub struct LogitsStage<'a> {
     pub final_norm: &'a [f32],
-    pub output_weight_blocks: &'a [u8],
+    pub output_weight_blocks: ResidentWeightBytes<'a>,
     pub vocab_size: usize,
 }
 
@@ -7158,8 +7223,9 @@ pub struct LogitsStage<'a> {
 /// tail argmaxes the logits and gathers the sampled token's embedding row into the next
 /// graph's input buffer, so the CPU never sits between two tokens on the critical path.
 pub struct SampleStage<'a> {
-    /// Token-embedding Q8_0 blocks (36-byte CPU layout; wire-converted in the buffer cache).
-    pub embedding_blocks: &'a [u8],
+    /// Token-embedding Q8_0 bytes (36-byte CPU blocks wire-converted in the buffer
+    /// cache, or page-aligned wire pages wrapped in place).
+    pub embedding_blocks: ResidentWeightBytes<'a>,
 }
 
 /// What a resident forward_token call produced: the raw logits/hidden vector (CPU
@@ -7503,13 +7569,13 @@ impl ResidentDecodeState {
         for l in layers {
             if l.attn_norm.len() != self.hidden
                 || l.ffn_norm.len() != self.hidden
-                || l.q_weight_blocks.len() != q_dim * bpr_hidden * 36
-                || l.k_weight_blocks.len() != kv_dim * bpr_hidden * 36
-                || l.v_weight_blocks.len() != kv_dim * bpr_hidden * 36
-                || l.o_weight_blocks.len() != self.hidden * bpr_q * 36
-                || l.gate_weight_blocks.len() != self.ffn_dim * bpr_hidden * 36
-                || l.up_weight_blocks.len() != self.ffn_dim * bpr_hidden * 36
-                || l.down_weight_blocks.len() != self.hidden * bpr_ffn * 36
+                || l.q_weight_blocks.block_count() != q_dim * bpr_hidden
+                || l.k_weight_blocks.block_count() != kv_dim * bpr_hidden
+                || l.v_weight_blocks.block_count() != kv_dim * bpr_hidden
+                || l.o_weight_blocks.block_count() != self.hidden * bpr_q
+                || l.gate_weight_blocks.block_count() != self.ffn_dim * bpr_hidden
+                || l.up_weight_blocks.block_count() != self.ffn_dim * bpr_hidden
+                || l.down_weight_blocks.block_count() != self.hidden * bpr_ffn
             {
                 return None;
             }
@@ -7517,7 +7583,7 @@ impl ResidentDecodeState {
         if let Some(s) = &logits_stage {
             if s.vocab_size == 0
                 || s.final_norm.len() != self.hidden
-                || s.output_weight_blocks.len() != s.vocab_size * bpr_hidden * 36
+                || s.output_weight_blocks.block_count() != s.vocab_size * bpr_hidden
             {
                 return None;
             }
@@ -7693,30 +7759,35 @@ impl ResidentDecodeState {
         {
             let mut cache = metal_linear_cache().lock().ok()?;
             let wire = f32y_gemv_enabled() && wire_weights_enabled();
-            let mut wb = |blocks: &[u8]| {
-                if wire {
+            let mut wb = |w: &ResidentWeightBytes| match w {
+                ResidentWeightBytes::Blocks36(blocks) => Some(if wire {
                     cache.q8_wire_weight_buffer(&k.device, blocks)
                 } else {
                     cache.q8_block_weight_buffer(&k.device, blocks)
+                }),
+                // Wire pages hold the 34-byte wire layout: only the wire kernels can
+                // consume them, so outside wire mode this graph cannot be built.
+                ResidentWeightBytes::WirePages(pages) => {
+                    wire.then(|| cache.q8_wire_nocopy_buffer(&k.device, pages))
                 }
             };
             resident = layers
                 .iter()
                 .map(|l| {
-                    [
-                        wb(l.q_weight_blocks),
-                        wb(l.k_weight_blocks),
-                        wb(l.v_weight_blocks),
-                        wb(l.o_weight_blocks),
-                        wb(l.gate_weight_blocks),
-                        wb(l.up_weight_blocks),
-                        wb(l.down_weight_blocks),
-                    ]
+                    Some([
+                        wb(&l.q_weight_blocks)?,
+                        wb(&l.k_weight_blocks)?,
+                        wb(&l.v_weight_blocks)?,
+                        wb(&l.o_weight_blocks)?,
+                        wb(&l.gate_weight_blocks)?,
+                        wb(&l.up_weight_blocks)?,
+                        wb(&l.down_weight_blocks)?,
+                    ])
                 })
-                .collect();
+                .collect::<Option<Vec<_>>>()?;
             stage_bufs = match logits_stage {
                 Some(s) => {
-                    let ow = wb(s.output_weight_blocks);
+                    let ow = wb(&s.output_weight_blocks)?;
                     Some((ow, cache.weight_buffer(&k.device, s.final_norm)))
                 }
                 None => None,
@@ -7724,7 +7795,14 @@ impl ResidentDecodeState {
             // The sampling tail needs the wire-format weight layout for the embedding
             // gather; outside wire mode the fast path is disabled by the caller.
             emb_buf = match sample_stage {
-                Some(s) if wire => Some(cache.q8_wire_weight_buffer(&k.device, s.embedding_blocks)),
+                Some(s) if wire => Some(match &s.embedding_blocks {
+                    ResidentWeightBytes::Blocks36(blocks) => {
+                        cache.q8_wire_weight_buffer(&k.device, blocks)
+                    }
+                    ResidentWeightBytes::WirePages(pages) => {
+                        cache.q8_wire_nocopy_buffer(&k.device, pages)
+                    }
+                }),
                 _ => None,
             };
         }
@@ -7942,17 +8020,25 @@ impl ResidentDecodeState {
         let resident: Vec<[Buffer; 7]>;
         {
             let mut cache = metal_linear_cache().lock().ok()?;
+            let mut wb = |w: &ResidentWeightBytes| match w {
+                ResidentWeightBytes::Blocks36(blocks) => {
+                    cache.q8_wire_weight_buffer(&k.device, blocks)
+                }
+                ResidentWeightBytes::WirePages(pages) => {
+                    cache.q8_wire_nocopy_buffer(&k.device, pages)
+                }
+            };
             resident = layers
                 .iter()
                 .map(|l| {
                     [
-                        cache.q8_wire_weight_buffer(&k.device, l.q_weight_blocks),
-                        cache.q8_wire_weight_buffer(&k.device, l.k_weight_blocks),
-                        cache.q8_wire_weight_buffer(&k.device, l.v_weight_blocks),
-                        cache.q8_wire_weight_buffer(&k.device, l.o_weight_blocks),
-                        cache.q8_wire_weight_buffer(&k.device, l.gate_weight_blocks),
-                        cache.q8_wire_weight_buffer(&k.device, l.up_weight_blocks),
-                        cache.q8_wire_weight_buffer(&k.device, l.down_weight_blocks),
+                        wb(&l.q_weight_blocks),
+                        wb(&l.k_weight_blocks),
+                        wb(&l.v_weight_blocks),
+                        wb(&l.o_weight_blocks),
+                        wb(&l.gate_weight_blocks),
+                        wb(&l.up_weight_blocks),
+                        wb(&l.down_weight_blocks),
                     ]
                 })
                 .collect();
@@ -10526,13 +10612,13 @@ mod tests {
             .map(|d| ResidentLayerWeights {
                 attn_norm: &d.attn_norm,
                 ffn_norm: &d.ffn_norm,
-                q_weight_blocks: &d.q,
-                k_weight_blocks: &d.k,
-                v_weight_blocks: &d.v,
-                o_weight_blocks: &d.o,
-                gate_weight_blocks: &d.gate,
-                up_weight_blocks: &d.up,
-                down_weight_blocks: &d.down,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
             })
             .collect();
 

@@ -885,6 +885,8 @@ pub struct CpuTensor {
     pub q8_0_packed_rows4_4x8: Option<Q8_0PackedRows4>,
     pub q8_0_runtime_storage: Option<Q8_0RuntimeStorage>,
     pub q8_0_file_backing: Option<Q8_0FileBacking>,
+    pub q8_0_wire_mmap: Option<crate::wire_mmap::WireMmapTensor>,
+    pub q8_0_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
     pub q8_0_split_file_backing: Option<Vec<Q8_0FileBacking>>,
     pub data: Vec<f32>,
 }
@@ -1034,6 +1036,8 @@ impl Q8_0TensorBlocks {
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
             q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             data,
         })
@@ -1099,6 +1103,8 @@ impl CpuTensor {
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
             q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             data,
         })
@@ -1180,6 +1186,8 @@ impl CpuTensor {
             q8_0_packed_rows4_4x8,
             q8_0_runtime_storage: None,
             q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             data: Vec::new(),
         })
@@ -1205,6 +1213,8 @@ impl CpuTensor {
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
             q8_0_file_backing: Some(backing),
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             data: Vec::new(),
         }
@@ -1225,6 +1235,8 @@ impl CpuTensor {
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: Some(Q8_0RuntimeStorage::PackedRows4(packed)),
             q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             data: Vec::new(),
         }
@@ -1245,6 +1257,8 @@ impl CpuTensor {
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage: None,
             q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: Some(backings),
             data: Vec::new(),
         }
@@ -1771,6 +1785,9 @@ impl CpuTensor {
         require_rank(self, 2, "embedding weight")?;
         let vocab = self.dim(0)?;
         let width = self.dim(1)?;
+        if let Some(pages) = self.q8_0_wire_pages.as_ref() {
+            return self.embedding_lookup_q8_0_wire_pages(token_ids, name, vocab, width, pages);
+        }
         if let Some(backing) = self.q8_0_file_backing.as_ref() {
             return self.embedding_lookup_q8_0_file_backed(token_ids, name, vocab, width, backing);
         }
@@ -1803,6 +1820,52 @@ impl CpuTensor {
                 BackendError::RuntimeShapeMismatch("embedding lookup row end overflow".to_string())
             })?;
             out.extend_from_slice(&self.data[start..end]);
+        }
+        Self::from_f32(name, vec![token_ids.len(), width], out)
+    }
+
+    /// Decode embedding rows straight from page-aligned wire bytes (34-byte
+    /// f16-scale blocks) — the fast-load path's memory-speed CPU gather.
+    fn embedding_lookup_q8_0_wire_pages(
+        &self,
+        token_ids: &[u32],
+        name: impl Into<String>,
+        vocab: usize,
+        width: usize,
+        pages: &crate::wire_mmap::WirePages,
+    ) -> Result<Self> {
+        if !width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "embedding width {width} is not a multiple of {Q8_0_BLOCK_VALUES}"
+            )));
+        }
+        let blocks_per_row = width / Q8_0_BLOCK_VALUES;
+        let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
+        let bytes = pages.bytes();
+        if bytes.len() != vocab * row_bytes {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "embedding wire pages hold {} bytes, expected {} for [{vocab}, {width}]",
+                bytes.len(),
+                vocab * row_bytes
+            )));
+        }
+        let mut out = Vec::with_capacity(token_ids.len() * width);
+        for token_id in token_ids {
+            let token_idx = usize::try_from(*token_id).map_err(|_| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} does not fit usize"
+                ))
+            })?;
+            if token_idx >= vocab {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} out of range for vocab size {vocab}"
+                )));
+            }
+            let row = &bytes[token_idx * row_bytes..(token_idx + 1) * row_bytes];
+            for block in row.chunks_exact(Q8_0_BLOCK_BYTES) {
+                let scale = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+                out.extend(block[2..].iter().map(|&q| scale * f32::from(q as i8)));
+            }
         }
         Self::from_f32(name, vec![token_ids.len(), width], out)
     }
@@ -2995,6 +3058,48 @@ impl TensorStore {
         self.load_q8_0_block_backed_linear_as(name, name)
     }
 
+    /// Fast-load: read the tensor's wire-format bytes once into a page-aligned
+    /// allocation (page cache enabled, no decode) that the Metal stack wraps with
+    /// an offset-0 NoCopy buffer — the only resident copy of the weight. The
+    /// tensor also carries file backing so CPU fallback paths stay correct.
+    pub fn load_q8_0_wire_pages_linear(&self, name: &str) -> Result<CpuTensor> {
+        self.load_q8_0_wire_pages_linear_as(name, name)
+    }
+
+    pub fn load_q8_0_wire_pages_linear_as(
+        &self,
+        source_name: &str,
+        tensor_name: &str,
+    ) -> Result<CpuTensor> {
+        let desc = self.descriptor(source_name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if desc.tensor_type != GgufTensorType::Q8_0 || shape.dims.len() != 2 {
+            let mut tensor = self.load_cpu_f32(source_name)?;
+            tensor.name = tensor_name.to_string();
+            return Ok(tensor);
+        }
+        let expected_elements = shape.element_count()?;
+        if expected_elements % 32 != 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "tensor {source_name} Q8_0 element count {expected_elements} is not block aligned"
+            )));
+        }
+        let wire_bytes = expected_elements / Q8_0_BLOCK_VALUES * Q8_0_BLOCK_BYTES;
+        let mut tensor = self.load_q8_0_file_backed_tensor_as(source_name, tensor_name)?;
+        let file = File::open(&self.path).map_err(|err| {
+            BackendError::InvalidTensorData(format!(
+                "wire pages open failed for {}: {err}",
+                self.path.display()
+            ))
+        })?;
+        tensor.q8_0_wire_pages = Some(crate::wire_mmap::WirePages::read_from_file(
+            &file,
+            desc.absolute_offset,
+            wire_bytes,
+        )?);
+        Ok(tensor)
+    }
+
     pub fn load_q8_0_block_backed_linear_as(
         &self,
         source_name: &str,
@@ -3219,6 +3324,8 @@ impl TensorStore {
             q8_0_packed_rows4_4x8,
             q8_0_runtime_storage: None,
             q8_0_file_backing,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             data,
         })
@@ -4736,6 +4843,83 @@ mod tests {
         );
 
         std::env::remove_var("CAMELID_X86_Q8_REPACK");
+    }
+
+    #[test]
+    fn wire_pages_linear_carries_wire_bytes_and_file_backing() {
+        let _env_guard = env_lock();
+        std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+        std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+
+        let rows = 8;
+        let blocks_per_row = 2;
+        let mut bytes = Vec::with_capacity(rows * blocks_per_row * Q8_0_BLOCK_BYTES);
+        for block in 0..rows * blocks_per_row {
+            bytes.extend_from_slice(&(0x3400_u16 + block as u16).to_le_bytes());
+            bytes.extend((0..32).map(|idx| ((idx * 7 + block) % 251) as u8));
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "camelid-wire-pages-linear-{}-{}.bin",
+            std::process::id(),
+            rows
+        ));
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(&bytes).unwrap();
+        }
+        let gguf = crate::gguf::GgufFile {
+            path: path.clone(),
+            version: 3,
+            tensor_count: 1,
+            metadata_count: 0,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata: std::collections::BTreeMap::new(),
+            tensors: vec![crate::gguf::GgufTensorDescriptor {
+                name: "blk.0.attn_q.weight".to_string(),
+                dimensions: vec![(blocks_per_row * 32) as u64, rows as u64],
+                tensor_type: crate::gguf::GgufTensorType::Q8_0,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: bytes.len() as u64,
+            }],
+        };
+        let store = super::TensorStore::open(&path, &gguf);
+
+        let tensor = store
+            .load_q8_0_wire_pages_linear("blk.0.attn_q.weight")
+            .unwrap();
+        // Wire pages hold the file's exact wire bytes, page-aligned, and the tensor
+        // keeps file backing for CPU fallback paths; nothing is materialized.
+        let pages = tensor
+            .q8_0_wire_pages
+            .as_ref()
+            .expect("wire pages attached");
+        assert_eq!(pages.bytes(), &bytes[..]);
+        assert_eq!(pages.base_ptr() as usize % crate::wire_mmap::page_size(), 0);
+        assert!(tensor.q8_0_file_backing.is_some());
+        assert!(tensor.q8_0_blocks.is_none());
+        assert!(tensor.data.is_empty());
+
+        // The embedding gather decodes rows straight from the wire pages.
+        let mut shaped = tensor.clone();
+        shaped.shape = TensorShape {
+            dims: vec![rows, blocks_per_row * 32],
+        };
+        let row = shaped.embedding_lookup(&[3], "row").unwrap();
+        let backed = store
+            .load_q8_0_file_backed_tensor("blk.0.attn_q.weight")
+            .unwrap();
+        let mut backed_shaped = backed;
+        backed_shaped.shape = TensorShape {
+            dims: vec![rows, blocks_per_row * 32],
+        };
+        let expected = backed_shaped.embedding_lookup(&[3], "expected").unwrap();
+        assert_eq!(row.data, expected.data);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

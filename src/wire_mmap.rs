@@ -168,7 +168,114 @@ impl GgufWireMmap {
     }
 }
 
-/// One tensor's data range inside a mapped GGUF file, in wire layout.
+/// A page-aligned, heap-owned copy of one tensor's wire-format bytes, suitable
+/// for an offset-0 `newBufferWithBytesNoCopy` Metal buffer: the GPU reads this
+/// allocation in place, so it is the ONLY resident copy of the weight (no
+/// 36-byte CPU decode, no GPU upload copy). Filled by one sequential read of
+/// the tensor's file range with the page cache enabled, so reloading a model
+/// runs at page-cache speed instead of re-streaming the disk.
+#[derive(Debug)]
+pub struct WirePages {
+    ptr: *mut u8,
+    /// Allocation length: `byte_len` rounded up to a page multiple
+    /// (`newBufferWithBytesNoCopy` requires a page-multiple length).
+    alloc_len: usize,
+    /// Exact wire byte length of the tensor (rows * blocks_per_row * 34 for Q8_0).
+    byte_len: usize,
+}
+
+// SAFETY: the allocation is written once during construction and immutable
+// afterwards; concurrent reads are safe.
+unsafe impl Send for WirePages {}
+unsafe impl Sync for WirePages {}
+
+impl Drop for WirePages {
+    fn drop(&mut self) {
+        // SAFETY: ptr/alloc_len describe the live allocation created in `read_from_file`.
+        unsafe {
+            std::alloc::dealloc(
+                self.ptr,
+                std::alloc::Layout::from_size_align_unchecked(self.alloc_len, page_size()),
+            );
+        }
+    }
+}
+
+impl WirePages {
+    /// Allocate page-aligned storage and fill it with `byte_len` bytes read from
+    /// `file` at `offset` (one sequential read, page cache enabled).
+    pub fn read_from_file(file: &File, offset: u64, byte_len: usize) -> Result<Arc<Self>> {
+        use std::os::unix::fs::FileExt;
+        if byte_len == 0 {
+            return Err(BackendError::InvalidTensorData(
+                "wire pages refused for an empty tensor range".to_string(),
+            ));
+        }
+        let page = page_size();
+        let alloc_len = byte_len.div_ceil(page) * page;
+        let layout = std::alloc::Layout::from_size_align(alloc_len, page).map_err(|err| {
+            BackendError::InvalidTensorData(format!("wire pages layout error: {err}"))
+        })?;
+        // SAFETY: layout is non-zero and valid.
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(BackendError::InvalidTensorData(format!(
+                "wire pages allocation of {alloc_len} bytes failed"
+            )));
+        }
+        let pages = Self {
+            ptr,
+            alloc_len,
+            byte_len,
+        };
+        // SAFETY: the allocation is alloc_len >= byte_len bytes and exclusively owned here.
+        let fill = unsafe { std::slice::from_raw_parts_mut(ptr, byte_len) };
+        file.read_exact_at(fill, offset).map_err(|err| {
+            BackendError::InvalidTensorData(format!(
+                "wire pages read of {byte_len} bytes at offset {offset} failed: {err}"
+            ))
+        })?;
+        // Zero the page-rounding tail so NoCopy buffer contents are deterministic.
+        // SAFETY: byte_len..alloc_len is within the allocation.
+        unsafe {
+            std::ptr::write_bytes(ptr.add(byte_len), 0, alloc_len - byte_len);
+        }
+        Ok(Arc::new(pages))
+    }
+
+    /// The tensor's wire bytes (exact length, excluding the page-rounding tail).
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: immutable after construction.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.byte_len) }
+    }
+
+    /// Page-aligned base pointer.
+    pub fn base_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// Page-multiple allocation length for the NoCopy buffer.
+    pub fn alloc_len(&self) -> usize {
+        self.alloc_len
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+}
+
+impl PartialEq for WirePages {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.ptr, other.ptr)
+    }
+}
+
+/// One tensor's data range inside a mapped GGUF file, in wire layout, plus the
+/// page-aligned window a Metal NoCopy buffer wraps to reach it. Tensors that
+/// share a window share the buffer.
+///
+/// Equality is identity of the mapped range (same mapping, same offsets) — the
+/// mapping is immutable, so identical ranges are identical bytes.
 #[derive(Debug, Clone)]
 pub struct WireMmapTensor {
     pub mmap: Arc<GgufWireMmap>,
@@ -176,12 +283,48 @@ pub struct WireMmapTensor {
     pub absolute_offset: u64,
     /// Tensor data length in bytes (rows * blocks_per_row * 34 for Q8_0).
     pub byte_len: usize,
+    /// The page-aligned window containing this tensor's bytes.
+    pub window: WireWindow,
+    /// Byte offset of the tensor's data within its window.
+    pub window_offset: usize,
+}
+
+impl PartialEq for WireMmapTensor {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.mmap, &other.mmap)
+            && self.absolute_offset == other.absolute_offset
+            && self.byte_len == other.byte_len
+    }
 }
 
 impl WireMmapTensor {
     pub fn bytes(&self) -> Result<&[u8]> {
         self.mmap.bytes(self.absolute_offset, self.byte_len)
     }
+}
+
+/// Build a [`WireMmapTensor`] per input range, sharing windows planned by
+/// [`plan_wire_windows`]. `ranges` are (absolute_offset, byte_len) pairs in any
+/// order; results match the input order.
+pub fn wire_mmap_tensors(
+    mapping: &Arc<GgufWireMmap>,
+    ranges: &[(u64, usize)],
+    max_window_len: usize,
+) -> Result<Vec<WireMmapTensor>> {
+    let plan = plan_wire_windows(mapping, ranges, max_window_len)?;
+    Ok(ranges
+        .iter()
+        .zip(plan.placements)
+        .map(
+            |(&(absolute_offset, byte_len), (window_index, window_offset))| WireMmapTensor {
+                mmap: Arc::clone(mapping),
+                absolute_offset,
+                byte_len,
+                window: plan.windows[window_index],
+                window_offset,
+            },
+        )
+        .collect())
 }
 
 /// A page-aligned window over the mapping, sized for one Metal buffer
@@ -315,6 +458,27 @@ mod tests {
         let mut file = File::create(&path).unwrap();
         file.write_all(bytes).unwrap();
         path
+    }
+
+    #[test]
+    fn wire_pages_are_page_aligned_and_match_file_bytes() {
+        let payload: Vec<u8> = (0..50_000usize).map(|i| (i % 199) as u8).collect();
+        let path = write_temp(&payload);
+        let file = File::open(&path).unwrap();
+        let pages = WirePages::read_from_file(&file, 1234, 40_000).unwrap();
+        assert_eq!(pages.base_ptr() as usize % page_size(), 0);
+        assert_eq!(pages.alloc_len() % page_size(), 0);
+        assert_eq!(pages.byte_len(), 40_000);
+        assert_eq!(pages.bytes(), &payload[1234..1234 + 40_000]);
+        // Page-rounding tail is zeroed.
+        let tail = unsafe {
+            std::slice::from_raw_parts(
+                pages.base_ptr().add(pages.byte_len()),
+                pages.alloc_len() - pages.byte_len(),
+            )
+        };
+        assert!(tail.iter().all(|&b| b == 0));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

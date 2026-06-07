@@ -224,13 +224,17 @@ impl LlamaLoadedWeights {
             if tensor.source_type != Some(GgufTensorType::Q8_0) {
                 return;
             }
-            match &tensor.q8_0_blocks {
-                Some(blocks) => {
+            match (&tensor.q8_0_blocks, &tensor.q8_0_wire_pages) {
+                (Some(blocks), _) => {
                     report.resident_tensors += 1;
                     report.resident_block_bytes +=
                         (blocks.len() * mem::size_of::<Q8_0Block>()) as u64;
                 }
-                None => {
+                (None, Some(pages)) => {
+                    report.resident_tensors += 1;
+                    report.resident_block_bytes += pages.byte_len() as u64;
+                }
+                (None, None) => {
                     let how = if tensor.q8_0_file_backing.is_some()
                         || tensor.q8_0_split_file_backing.is_some()
                     {
@@ -353,6 +357,16 @@ impl LlamaLoadedWeights {
         // streaming when the estimate crossed a cap: ~100x slower decode, and it disqualified
         // the GPU-resident path (which requires q8_0_blocks). The only way off the resident
         // path now is the explicit CAMELID_LAZY_Q8_0_LINEAR opt-out, and it is loud.
+        // Fast-load (CAMELID_METAL_NOCOPY): Q8_0 linears read their wire bytes once
+        // into page-aligned allocations the GPU wraps in place — no 36-byte decode, no
+        // upload copy, and the page cache stays warm so reloading a model is fast.
+        let nocopy_fast_load = metal_nocopy_fast_load_enabled();
+        if nocopy_fast_load {
+            eprintln!(
+                "[camelid] CAMELID_METAL_NOCOPY: loading Q8_0 weights as page-aligned wire \
+                 pages (GPU reads them in place; requires the wire kernel stack)"
+            );
+        }
         let force_lazy_q8_0 = lazy_q8_0_linear_forced();
         if force_lazy_q8_0 {
             eprintln!(
@@ -361,7 +375,9 @@ impl LlamaLoadedWeights {
             );
         }
         let load_linear = |name: &str| {
-            if force_lazy_q8_0 {
+            if nocopy_fast_load {
+                store.load_q8_0_wire_pages_linear(name)
+            } else if force_lazy_q8_0 {
                 store.load_q8_0_file_backed_linear(name)
             } else {
                 store.load_q8_0_block_backed_linear(name)
@@ -402,7 +418,15 @@ impl LlamaLoadedWeights {
 
         let output = if load_output {
             if binding.output_is_tied_embedding {
-                if force_lazy_q8_0 {
+                if nocopy_fast_load {
+                    let mut output = store.load_q8_0_file_backed_tensor_as(
+                        &binding.token_embedding.name,
+                        "output.weight",
+                    )?;
+                    // Tied projection: share the embedding's wire pages (same bytes).
+                    output.q8_0_wire_pages = token_embedding.q8_0_wire_pages.clone();
+                    Some(output)
+                } else if force_lazy_q8_0 {
                     Some(store.load_q8_0_file_backed_tensor_as(
                         &binding.token_embedding.name,
                         "output.weight",
@@ -1515,8 +1539,13 @@ impl LlamaInferenceSession {
         {
             return Ok(false);
         }
-        let is_q8 =
-            |t: &CpuTensor| t.source_type == Some(GgufTensorType::Q8_0) && t.q8_0_blocks.is_some();
+        // Wire-page (fast-load) weights satisfy residency too, but only when the wire
+        // kernels are active — their bytes exist solely in the 34-byte wire layout.
+        let wire_ok = metal::wire_mode_active();
+        let is_q8 = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q8_0)
+                && (t.q8_0_blocks.is_some() || (wire_ok && t.q8_0_wire_pages.is_some()))
+        };
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
             .weights
@@ -1537,14 +1566,21 @@ impl LlamaInferenceSession {
                 || !is_q8(&layer.ffn_down)
             {
                 bail!(format!(
-                    "layer {idx} not plain Q8_0 with materialized blocks (q8_0_blocks present: q={} k={} v={} o={} gate={} up={} down={})",
+                    "layer {idx} not plain Q8_0 with materialized blocks or wire pages (blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
                     layer.attention_q.q8_0_blocks.is_some(),
+                    layer.attention_q.q8_0_wire_pages.is_some(),
                     layer.attention_k.q8_0_blocks.is_some(),
+                    layer.attention_k.q8_0_wire_pages.is_some(),
                     layer.attention_v.q8_0_blocks.is_some(),
+                    layer.attention_v.q8_0_wire_pages.is_some(),
                     layer.attention_output.q8_0_blocks.is_some(),
+                    layer.attention_output.q8_0_wire_pages.is_some(),
                     layer.ffn_gate.q8_0_blocks.is_some(),
+                    layer.ffn_gate.q8_0_wire_pages.is_some(),
                     layer.ffn_up.q8_0_blocks.is_some(),
+                    layer.ffn_up.q8_0_wire_pages.is_some(),
                     layer.ffn_down.q8_0_blocks.is_some(),
+                    layer.ffn_down.q8_0_wire_pages.is_some(),
                 ));
             }
         }
@@ -1666,15 +1702,13 @@ impl LlamaInferenceSession {
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
                 ffn_norm: &l.ffn_norm.data,
-                q_weight_blocks: q8_0_blocks_as_bytes(l.attention_q.q8_0_blocks.as_ref().unwrap()),
-                k_weight_blocks: q8_0_blocks_as_bytes(l.attention_k.q8_0_blocks.as_ref().unwrap()),
-                v_weight_blocks: q8_0_blocks_as_bytes(l.attention_v.q8_0_blocks.as_ref().unwrap()),
-                o_weight_blocks: q8_0_blocks_as_bytes(
-                    l.attention_output.q8_0_blocks.as_ref().unwrap(),
-                ),
-                gate_weight_blocks: q8_0_blocks_as_bytes(l.ffn_gate.q8_0_blocks.as_ref().unwrap()),
-                up_weight_blocks: q8_0_blocks_as_bytes(l.ffn_up.q8_0_blocks.as_ref().unwrap()),
-                down_weight_blocks: q8_0_blocks_as_bytes(l.ffn_down.q8_0_blocks.as_ref().unwrap()),
+                q_weight_blocks: resident_weight_bytes(&l.attention_q),
+                k_weight_blocks: resident_weight_bytes(&l.attention_k),
+                v_weight_blocks: resident_weight_bytes(&l.attention_v),
+                o_weight_blocks: resident_weight_bytes(&l.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
 
@@ -1846,15 +1880,13 @@ impl LlamaInferenceSession {
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
                 ffn_norm: &l.ffn_norm.data,
-                q_weight_blocks: q8_0_blocks_as_bytes(l.attention_q.q8_0_blocks.as_ref().unwrap()),
-                k_weight_blocks: q8_0_blocks_as_bytes(l.attention_k.q8_0_blocks.as_ref().unwrap()),
-                v_weight_blocks: q8_0_blocks_as_bytes(l.attention_v.q8_0_blocks.as_ref().unwrap()),
-                o_weight_blocks: q8_0_blocks_as_bytes(
-                    l.attention_output.q8_0_blocks.as_ref().unwrap(),
-                ),
-                gate_weight_blocks: q8_0_blocks_as_bytes(l.ffn_gate.q8_0_blocks.as_ref().unwrap()),
-                up_weight_blocks: q8_0_blocks_as_bytes(l.ffn_up.q8_0_blocks.as_ref().unwrap()),
-                down_weight_blocks: q8_0_blocks_as_bytes(l.ffn_down.q8_0_blocks.as_ref().unwrap()),
+                q_weight_blocks: resident_weight_bytes(&l.attention_q),
+                k_weight_blocks: resident_weight_bytes(&l.attention_k),
+                v_weight_blocks: resident_weight_bytes(&l.attention_v),
+                o_weight_blocks: resident_weight_bytes(&l.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
             })
             .collect();
 
@@ -1863,9 +1895,7 @@ impl LlamaInferenceSession {
         let logits_stage = if compute_logits {
             Some(metal::LogitsStage {
                 final_norm: &weights.output_norm.data,
-                output_weight_blocks: q8_0_blocks_as_bytes(
-                    weights.output_projection().q8_0_blocks.as_ref().unwrap(),
-                ),
+                output_weight_blocks: resident_weight_bytes(weights.output_projection()),
                 vocab_size: vocab,
             })
         } else {
@@ -1875,17 +1905,16 @@ impl LlamaInferenceSession {
         // GPU-side greedy sampling stage: only when the caller asked for it, logits run on
         // the GPU, and the token embedding table is plain Q8_0 (the gather reads its rows).
         let sample_stage = match gpu_sample_token {
-            Some(_) if compute_logits => weights
-                .token_embedding
-                .q8_0_blocks
-                .as_ref()
-                .filter(|blocks| {
-                    weights.token_embedding.source_type == Some(GgufTensorType::Q8_0)
-                        && q8_0_blocks_as_bytes(blocks).len() == vocab * (hidden / 32) * 36
-                })
-                .map(|blocks| metal::SampleStage {
-                    embedding_blocks: q8_0_blocks_as_bytes(blocks),
-                }),
+            Some(_)
+                if compute_logits
+                    && weights.token_embedding.source_type == Some(GgufTensorType::Q8_0)
+                    && (weights.token_embedding.q8_0_blocks.is_some()
+                        || weights.token_embedding.q8_0_wire_pages.is_some()) =>
+            {
+                let embedding_blocks = resident_weight_bytes(&weights.token_embedding);
+                (embedding_blocks.block_count() == vocab * (hidden / 32))
+                    .then_some(metal::SampleStage { embedding_blocks })
+            }
             _ => None,
         };
 
@@ -8365,6 +8394,13 @@ fn lazy_q8_0_linear_forced() -> bool {
     )
 }
 
+/// Fast-load gate: CAMELID_METAL_NOCOPY loads Q8_0 linears as page-aligned wire
+/// pages for in-place GPU consumption. macOS only — the storage is consumed by
+/// the Metal wire kernels.
+fn metal_nocopy_fast_load_enabled() -> bool {
+    cfg!(target_os = "macos") && env_flag_enabled("CAMELID_METAL_NOCOPY")
+}
+
 const Q8_0_BLOCK_VALUES: usize = 32;
 const X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS: usize = 1024;
 const X86_Q8_PACKED_ROWS4_MATMUL_PARALLEL_MIN_GROUPS: usize = 64;
@@ -13152,6 +13188,18 @@ fn q8_0_blocks_as_bytes(blocks: &[Q8_0Block]) -> &[u8] {
     // The Metal retained-Q8 kernel treats this exact byte layout as immutable input.
     unsafe {
         std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), std::mem::size_of_val(blocks))
+    }
+}
+
+/// The resident stack's view of one weight's bytes: page-aligned wire pages when
+/// the fast-load path attached them (the GPU wraps them in place), else the
+/// materialized 36-byte CPU blocks.
+fn resident_weight_bytes(tensor: &CpuTensor) -> metal::ResidentWeightBytes<'_> {
+    match tensor.q8_0_wire_pages.as_ref() {
+        Some(pages) => metal::ResidentWeightBytes::WirePages(pages),
+        None => metal::ResidentWeightBytes::Blocks36(q8_0_blocks_as_bytes(
+            tensor.q8_0_blocks.as_ref().unwrap(),
+        )),
     }
 }
 
