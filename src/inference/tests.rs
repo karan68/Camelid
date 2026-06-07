@@ -6154,6 +6154,86 @@ fn q8_0_runtime_packed_prefill_i8mm_matches_current_gemv_path() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
+fn q8_0_small_m_i8mm_kernel_matches_prefill_i8mm_kernel() {
+    // i8mm is ARMv8.6; Apple M1 (and virtualized CI runners) lack it. This test
+    // executes the i8mm kernels directly, so skip when the feature is absent
+    // rather than SIGILL on an illegal instruction.
+    if !std::arch::is_aarch64_feature_detected!("i8mm") {
+        return;
+    }
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::set_var("CAMELID_Q8_0_BLOCK_DOT", "on");
+    std::env::set_var("CAMELID_MAC_Q8_REPACK", "on");
+
+    let output_width = 16;
+    let blocks_per_row = 3;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    // 13 rows: three packed 4-row groups through the small-M kernel plus a
+    // conservative GEMV tail row, matching a speculative verify chunk shape.
+    let input_rows = 13;
+    let weight_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|block_idx| Q8_0Block {
+            scale: 0.0546875 + block_idx as f32 * 0.0009765625,
+            quants: std::array::from_fn(|idx| {
+                ((block_idx as i32 * 13 + idx as i32 * 7) % 63 - 31) as i8
+            }),
+        })
+        .collect();
+    let input = CpuTensor::from_f32(
+        "input",
+        vec![input_rows, input_width],
+        (0..input_rows * input_width)
+            .map(|idx| (idx as f32 - 311.0) * 0.0048828125)
+            .collect(),
+    )
+    .unwrap();
+    let packed_weight = CpuTensor::q8_0_runtime_packed_rows4_linear(
+        "blk.0.attn_q.weight",
+        TensorShape {
+            dims: vec![output_width, input_width],
+        },
+        Q8_0PackedRows4::from_rows(
+            output_width,
+            blocks_per_row,
+            Q8_0PackedRows4Interleave::I8,
+            &weight_blocks,
+        )
+        .unwrap(),
+    );
+
+    std::env::remove_var("CAMELID_MAC_Q8_PREFILL_I8MM");
+    let expected =
+        matmul_rhs_transposed_q8_0_block_dot(&input, &packed_weight, "expected").unwrap();
+
+    std::env::set_var("CAMELID_MAC_Q8_PREFILL_I8MM", "on");
+    // Force the input-outer prefill kernel by setting the small-M ceiling to zero rows.
+    std::env::set_var("CAMELID_MAC_Q8_I8MM_SMALL_M_MAX_ROWS", "0");
+    let prefill = matmul_rhs_transposed_q8_0_block_dot(&input, &packed_weight, "prefill").unwrap();
+    // Default ceiling (64 rows) routes 13 rows through the weight-resident small-M kernel.
+    std::env::remove_var("CAMELID_MAC_Q8_I8MM_SMALL_M_MAX_ROWS");
+    let small_m = matmul_rhs_transposed_q8_0_block_dot(&input, &packed_weight, "small_m").unwrap();
+
+    assert_eq!(small_m.shape.dims, expected.shape.dims);
+    assert_eq!(prefill.shape.dims, expected.shape.dims);
+    // The two i8mm kernels perform identical block arithmetic in a different
+    // order-of-loops, so the full 4-row groups must agree bit-for-bit. The final
+    // partial row rides the zero-padded i8mm group on the small-M path but the
+    // per-row GEMV tail on the prefill path, so it is compared by tolerance only.
+    let full_group_values = 12 * output_width;
+    assert_eq!(
+        small_m.data[..full_group_values],
+        prefill.data[..full_group_values]
+    );
+    assert_slice_close_with_tolerance(&small_m.data, &prefill.data, 1.0e-3);
+    assert_slice_close_with_tolerance(&small_m.data, &expected.data, 1.0e-3);
+    std::env::remove_var("CAMELID_MAC_Q8_PREFILL_I8MM");
+    std::env::remove_var("CAMELID_MAC_Q8_REPACK");
+    std::env::remove_var("CAMELID_Q8_0_BLOCK_DOT");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
 fn q8_0_runtime_packed_prefill_i8mm_respects_min_row_threshold() {
     assert!(!mac_q8_prefill_i8mm_row_threshold_met(
         MAC_Q8_PREFILL_I8MM_MIN_ROWS - 1

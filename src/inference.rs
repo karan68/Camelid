@@ -7615,7 +7615,10 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
     let (mut gate, up) = if mac_q8_prefill_i8mm_enabled() && rows >= 4 {
         let mut gate = vec![0.0_f32; rows * gate_width];
         let mut up = vec![0.0_f32; rows * up_width];
-        let packed_rows = rows / 4 * 4;
+        // Small-M chunks absorb the partial final row group as zero-padded lanes so
+        // the per-row GEMV tail (a full gate+up weight pass per tail row) never runs.
+        let small_m = rows.div_ceil(4) <= mac_q8_i8mm_small_m_max_input_groups();
+        let packed_rows = if small_m { rows } else { rows / 4 * 4 };
         if collect_q8_schedule {
             add_q8_schedule_counter(&Q8_SCHED_I8MM_FUSED_GATE_UP_CALLS, 1);
         }
@@ -7626,13 +7629,23 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
                 packed_inputs.clear();
                 let before_capacity = packed_inputs.capacity();
                 let pack_started = collect_q8_schedule.then(Instant::now);
-                quantize_pack_q8_0_rows4_i8_direct_into(
-                    &input.data[..packed_rows * input_width],
-                    packed_rows,
-                    input_width,
-                    blocks_per_row,
-                    &mut packed_inputs,
-                );
+                if small_m {
+                    quantize_pack_q8_0_rows4_i8_padded_into(
+                        &input.data[..packed_rows * input_width],
+                        packed_rows,
+                        input_width,
+                        blocks_per_row,
+                        &mut packed_inputs,
+                    );
+                } else {
+                    quantize_pack_q8_0_rows4_i8_direct_into(
+                        &input.data[..packed_rows * input_width],
+                        packed_rows,
+                        input_width,
+                        blocks_per_row,
+                        &mut packed_inputs,
+                    );
+                }
                 if let Some(pack_started) = pack_started {
                     record_q8_schedule_activation_pack(
                         &mut packed_inputs,
@@ -7643,15 +7656,28 @@ fn try_gated_ffn_activation_batch_packed_prefill_i8mm(
                     );
                 }
                 let gemm_started = collect_q8_schedule.then(Instant::now);
-                run_q8_0_packed_rows4_prefill_i8mm_two_kernel(
-                    gate_packed,
-                    up_packed,
-                    &packed_inputs,
-                    packed_rows / 4,
-                    &mut gate,
-                    &mut up,
-                    collect_q8_schedule,
-                );
+                if small_m {
+                    run_q8_0_packed_rows4_small_m_i8mm_two_kernel(
+                        gate_packed,
+                        up_packed,
+                        &packed_inputs,
+                        packed_rows.div_ceil(4),
+                        packed_rows,
+                        &mut gate,
+                        &mut up,
+                        collect_q8_schedule,
+                    );
+                } else {
+                    run_q8_0_packed_rows4_prefill_i8mm_two_kernel(
+                        gate_packed,
+                        up_packed,
+                        &packed_inputs,
+                        packed_rows / 4,
+                        &mut gate,
+                        &mut up,
+                        collect_q8_schedule,
+                    );
+                }
                 if let Some(gemm_started) = gemm_started {
                     add_q8_schedule_counter(
                         &Q8_SCHED_Q8_GEMM_COMPUTE_US,
@@ -15188,10 +15214,14 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
     }
 
     let mut output = vec![0.0_f32; rows * output_width];
-    let packed_rows = rows / 4 * 4;
+    // The small-M weight-resident kernel absorbs the partial final row group as a
+    // zero-padded lane set so the conservative per-row GEMV tail (a full weight pass
+    // per tail row — ruinous for 5-20 row speculative verify chunks) never runs.
+    let small_m = rows >= 4 && rows.div_ceil(4) <= mac_q8_i8mm_small_m_max_input_groups();
+    let packed_rows = if small_m { rows } else { rows / 4 * 4 };
     let collect_q8_schedule = q8_schedule_telemetry_enabled();
     if collect_q8_schedule {
-        let row_groups = (packed_rows / 4) as u64;
+        let row_groups = packed_rows.div_ceil(4) as u64;
         add_q8_schedule_counter(&Q8_SCHED_I8MM_SINGLE_PROJECTION_CALLS, 1);
         record_q8_schedule_i8mm_single_projection_role_call(q8_role, rows as u64, row_groups);
         if q8_role == "ffn_down" && mac_q8_ffn_down_single_projection_scheduler_counters_enabled() {
@@ -15211,13 +15241,23 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
             packed_inputs.clear();
             let before_capacity = packed_inputs.capacity();
             let pack_started = collect_q8_schedule.then(Instant::now);
-            quantize_pack_q8_0_rows4_i8_direct_into(
-                &input.data[..packed_rows * input_width],
-                packed_rows,
-                input_width,
-                blocks_per_row,
-                &mut packed_inputs,
-            );
+            if small_m {
+                quantize_pack_q8_0_rows4_i8_padded_into(
+                    &input.data[..packed_rows * input_width],
+                    packed_rows,
+                    input_width,
+                    blocks_per_row,
+                    &mut packed_inputs,
+                );
+            } else {
+                quantize_pack_q8_0_rows4_i8_direct_into(
+                    &input.data[..packed_rows * input_width],
+                    packed_rows,
+                    input_width,
+                    blocks_per_row,
+                    &mut packed_inputs,
+                );
+            }
             if let Some(pack_started) = pack_started {
                 let elapsed_us = pack_started.elapsed().as_micros();
                 record_q8_schedule_activation_pack(
@@ -15230,13 +15270,24 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
                 record_q8_schedule_i8mm_single_projection_role_pack(q8_role, elapsed_us);
             }
             let gemm_started = collect_q8_schedule.then(Instant::now);
-            run_q8_0_packed_rows4_prefill_i8mm_kernel(
-                packed_weight,
-                &packed_inputs,
-                packed_rows / 4,
-                &mut output,
-                collect_q8_schedule,
-            );
+            if small_m {
+                run_q8_0_packed_rows4_small_m_i8mm_kernel(
+                    packed_weight,
+                    &packed_inputs,
+                    packed_rows.div_ceil(4),
+                    packed_rows,
+                    &mut output,
+                    collect_q8_schedule,
+                );
+            } else {
+                run_q8_0_packed_rows4_prefill_i8mm_kernel(
+                    packed_weight,
+                    &packed_inputs,
+                    packed_rows / 4,
+                    &mut output,
+                    collect_q8_schedule,
+                );
+            }
             if let Some(gemm_started) = gemm_started {
                 let elapsed_us = gemm_started.elapsed().as_micros();
                 add_q8_schedule_counter(&Q8_SCHED_Q8_GEMM_COMPUTE_US, elapsed_us as u64);
@@ -15307,6 +15358,52 @@ fn quantize_pack_q8_0_rows4_i8_direct_into(
     }
 }
 
+/// Like [`quantize_pack_q8_0_rows4_i8_direct_into`], but accepts a row count that is
+/// not a multiple of 4: the final partial group is padded with zero lanes (scale 0,
+/// quants 0), which contribute nothing to the i8mm sums. Callers must guard output
+/// writes for the padded lanes (see the small-M kernels' `total_rows`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn quantize_pack_q8_0_rows4_i8_padded_into(
+    row_major_input: &[f32],
+    rows_to_pack: usize,
+    input_width: usize,
+    blocks_per_row: usize,
+    output: &mut Vec<Q8_0PackedRows4Block>,
+) {
+    debug_assert_eq!(row_major_input.len(), rows_to_pack * input_width);
+    let full_rows = rows_to_pack / 4 * 4;
+    quantize_pack_q8_0_rows4_i8_direct_into(
+        &row_major_input[..full_rows * input_width],
+        full_rows,
+        input_width,
+        blocks_per_row,
+        output,
+    );
+    let partial_lanes = rows_to_pack - full_rows;
+    if partial_lanes == 0 {
+        return;
+    }
+    output.reserve(blocks_per_row);
+    for block_idx in 0..blocks_per_row {
+        let mut scales = [0.0_f32; 4];
+        let mut quants = [0_i8; 128];
+        for (lane, scale) in scales.iter_mut().enumerate().take(partial_lanes) {
+            let row_start = (full_rows + lane) * input_width;
+            let block_start = row_start + block_idx * Q8_0_BLOCK_VALUES;
+            let block =
+                quantize_q8_0_block(&row_major_input[block_start..block_start + Q8_0_BLOCK_VALUES]);
+            *scale = block.scale;
+            for chunk in 0..4 {
+                let src_start = chunk * 8;
+                let dst_start = chunk * 32 + lane * 8;
+                quants[dst_start..dst_start + 8]
+                    .copy_from_slice(&block.quants[src_start..src_start + 8]);
+            }
+        }
+        output.push(Q8_0PackedRows4Block { scales, quants });
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_q8_0_packed_rows4_prefill_i8mm_kernel(
     packed_weight: &Q8_0PackedRows4,
@@ -15363,6 +15460,192 @@ fn run_q8_0_packed_rows4_prefill_i8mm_kernel(
                 },
             );
     }
+}
+
+/// Input-row count at or below which the weight-resident small-M kernels take over
+/// from the input-outer prefill kernels. The prefill kernels re-stream the full
+/// packed weight once per 4 input rows, which is irrelevant when M is in the
+/// hundreds (compute-bound) but costs a 5-20 token speculative verify chunk 2-5
+/// full weight passes for what is fundamentally one.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MAC_Q8_I8MM_SMALL_M_MAX_ROWS_DEFAULT: usize = 64;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn mac_q8_i8mm_small_m_max_input_groups() -> usize {
+    env::var("CAMELID_MAC_Q8_I8MM_SMALL_M_MAX_ROWS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(MAC_Q8_I8MM_SMALL_M_MAX_ROWS_DEFAULT)
+        / 4
+}
+
+/// Weight-resident i8mm GEMM for small input batches (speculative verify chunks).
+/// Parallelizes over output row groups instead of input groups: each task's weight
+/// slice (`blocks_per_row` packed blocks, ~9 KB at K=2048) stays L1-resident across
+/// every input group, so the packed weight streams from memory exactly once
+/// regardless of M.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn run_q8_0_packed_rows4_small_m_i8mm_kernel(
+    packed_weight: &Q8_0PackedRows4,
+    packed_inputs: &[Q8_0PackedRows4Block],
+    input_groups: usize,
+    total_rows: usize,
+    output: &mut [f32],
+    collect_q8_schedule: bool,
+) {
+    if collect_q8_schedule {
+        add_q8_schedule_counter(&Q8_SCHED_RAYON_FANOUT_BOUNDARIES, 1);
+    }
+    let rows = packed_weight.rows;
+    let blocks_per_row = packed_weight.blocks_per_row;
+    debug_assert_eq!(packed_inputs.len(), input_groups * blocks_per_row);
+    debug_assert!(total_rows > (input_groups - 1) * 4 && total_rows <= input_groups * 4);
+    debug_assert!(output.len() >= total_rows * rows);
+    let out_base = output.as_mut_ptr() as usize;
+    (0..rows / 4).into_par_iter().for_each(|output_group| {
+        let weight_group = &packed_weight.blocks
+            [output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
+        let output_start = output_group * 4;
+        for input_group in 0..input_groups {
+            let input_blocks =
+                &packed_inputs[input_group * blocks_per_row..(input_group + 1) * blocks_per_row];
+            let mut sums = [[0.0_f32; 4]; 4];
+            for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
+                // SAFETY: mac_q8_prefill_i8mm_enabled checked runtime I8MM support before
+                // this path; both operands are q8_0_4x8 packed blocks with 4 rows/columns
+                // and 32 K values.
+                let int_sums = unsafe {
+                    q8_0_packed_4x8_gemm4_block_i8mm(
+                        input_block.quants.as_ptr(),
+                        weight_block.quants.as_ptr(),
+                    )
+                };
+                for input_lane in 0..4 {
+                    for output_lane in 0..4 {
+                        sums[input_lane][output_lane] += int_sums[input_lane][output_lane] as f32
+                            * weight_block.scales[output_lane]
+                            * input_block.scales[input_lane];
+                    }
+                }
+            }
+            for (lane, lane_sums) in sums.iter().enumerate() {
+                let row = input_group * 4 + lane;
+                // Zero-padded lanes in a partial final group have no output row.
+                if row >= total_rows {
+                    break;
+                }
+                // SAFETY: each parallel output_group writes a disjoint 4-column range in
+                // every input-row lane; out_base points to the caller's output slice,
+                // which holds total_rows rows of `rows` columns.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        lane_sums.as_ptr(),
+                        (out_base as *mut f32).add(row * rows + output_start),
+                        4,
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Fused gate/up counterpart of [`run_q8_0_packed_rows4_small_m_i8mm_kernel`]: one
+/// weight-resident pass computes both FFN projections for every input group.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn run_q8_0_packed_rows4_small_m_i8mm_two_kernel(
+    gate_weight: &Q8_0PackedRows4,
+    up_weight: &Q8_0PackedRows4,
+    packed_inputs: &[Q8_0PackedRows4Block],
+    input_groups: usize,
+    total_rows: usize,
+    gate_output: &mut [f32],
+    up_output: &mut [f32],
+    collect_q8_schedule: bool,
+) {
+    if collect_q8_schedule {
+        add_q8_schedule_counter(&Q8_SCHED_RAYON_FANOUT_BOUNDARIES, 1);
+    }
+    let rows = gate_weight.rows;
+    let blocks_per_row = gate_weight.blocks_per_row;
+    debug_assert_eq!(up_weight.rows, rows);
+    debug_assert_eq!(up_weight.blocks_per_row, blocks_per_row);
+    debug_assert_eq!(packed_inputs.len(), input_groups * blocks_per_row);
+    debug_assert!(total_rows > (input_groups - 1) * 4 && total_rows <= input_groups * 4);
+    debug_assert!(gate_output.len() >= total_rows * rows);
+    debug_assert!(up_output.len() >= total_rows * rows);
+    let gate_base = gate_output.as_mut_ptr() as usize;
+    let up_base = up_output.as_mut_ptr() as usize;
+    (0..rows / 4).into_par_iter().for_each(|output_group| {
+        let gate_weight_group =
+            &gate_weight.blocks[output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
+        let up_weight_group =
+            &up_weight.blocks[output_group * blocks_per_row..(output_group + 1) * blocks_per_row];
+        let output_start = output_group * 4;
+        for input_group in 0..input_groups {
+            let input_blocks =
+                &packed_inputs[input_group * blocks_per_row..(input_group + 1) * blocks_per_row];
+            let mut gate_sums = [[0.0_f32; 4]; 4];
+            let mut up_sums = [[0.0_f32; 4]; 4];
+            for ((input_block, gate_block), up_block) in input_blocks
+                .iter()
+                .zip(gate_weight_group)
+                .zip(up_weight_group)
+            {
+                // SAFETY: mac_q8_prefill_i8mm_enabled checked runtime I8MM support before
+                // this path; all operands are q8_0_4x8 packed blocks with 4 rows/columns
+                // and 32 K values.
+                let gate_int_sums = unsafe {
+                    q8_0_packed_4x8_gemm4_block_i8mm(
+                        input_block.quants.as_ptr(),
+                        gate_block.quants.as_ptr(),
+                    )
+                };
+                // SAFETY: same I8MM/layout preconditions as gate_int_sums above.
+                let up_int_sums = unsafe {
+                    q8_0_packed_4x8_gemm4_block_i8mm(
+                        input_block.quants.as_ptr(),
+                        up_block.quants.as_ptr(),
+                    )
+                };
+                for input_lane in 0..4 {
+                    for output_lane in 0..4 {
+                        let input_scale = input_block.scales[input_lane];
+                        gate_sums[input_lane][output_lane] += gate_int_sums[input_lane][output_lane]
+                            as f32
+                            * gate_block.scales[output_lane]
+                            * input_scale;
+                        up_sums[input_lane][output_lane] += up_int_sums[input_lane][output_lane]
+                            as f32
+                            * up_block.scales[output_lane]
+                            * input_scale;
+                    }
+                }
+            }
+            for lane in 0..4 {
+                let row = input_group * 4 + lane;
+                // Zero-padded lanes in a partial final group have no output row.
+                if row >= total_rows {
+                    break;
+                }
+                // SAFETY: each parallel output_group writes a disjoint 4-column range in
+                // every input-row lane; gate_base/up_base point to the callers' output
+                // slices, which hold total_rows rows of `rows` columns.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        gate_sums[lane].as_ptr(),
+                        (gate_base as *mut f32).add(row * rows + output_start),
+                        4,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        up_sums[lane].as_ptr(),
+                        (up_base as *mut f32).add(row * rows + output_start),
+                        4,
+                    );
+                }
+            }
+        }
+    });
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
