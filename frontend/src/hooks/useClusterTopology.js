@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  autoLayout, createConnection, createNode, loadTopology, nowIso, sampleTopology, saveTopology,
-  summarizeCluster, validateTopology,
+  autoLayout, createConnection, createNode, loadTopology, mergeImport, nowIso, sampleTopology, saveTopology,
+  specsToNodePatch, summarizeCluster, validateTopology,
 } from '../lib/clusterModel'
-import { discoverDevices, probeNode } from '../lib/devCluster'
+import { discoverDevices, fetchNodeTelemetry, probeNode } from '../lib/devCluster'
 
 const DEFAULT_PORT = { ssh: 22, winrm: 5985, agent: 8181, manual: null }
 
@@ -19,6 +19,8 @@ export function useClusterTopology({ showNotice } = {}) {
   const [events, setEvents] = useState(() => [makeEvent('info', 'Cluster topology loaded.')])
   const [busyIds, setBusyIds] = useState({}) // id -> action label
   const saveTimer = useRef(null)
+  const topoRef = useRef(topology)
+  topoRef.current = topology // always-latest snapshot for async actions/effects
 
   // Debounced persistence (covers edits + node drags uniformly).
   useEffect(() => {
@@ -30,6 +32,25 @@ export function useClusterTopology({ showNotice } = {}) {
   const pushEvent = useCallback((level, message) => {
     setEvents((prev) => [makeEvent(level, message), ...prev].slice(0, 200))
   }, [])
+
+  // One-time merge of a discovered/shared topology fragment (public/cluster-import.json),
+  // tracked by import_id so it applies once per browser and never duplicates nodes.
+  useEffect(() => {
+    let cancelled = false
+    fetch('/cluster-import.json', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((imp) => {
+        if (cancelled || !imp || !imp.import_id) return
+        let done = []
+        try { done = JSON.parse(window.localStorage.getItem('camelid.clusterImports') || '[]') } catch { /* noop */ }
+        if (done.includes(imp.import_id)) return
+        setTopology((prev) => mergeImport(prev, imp))
+        try { window.localStorage.setItem('camelid.clusterImports', JSON.stringify([...done, imp.import_id])) } catch { /* noop */ }
+        pushEvent('ok', `Imported ${imp.nodes?.length || 0} discovered node(s) into the fabric.`)
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [pushEvent])
 
   const setNodeBusy = useCallback((id, label) => {
     setBusyIds((prev) => {
@@ -149,6 +170,48 @@ export function useClusterTopology({ showNotice } = {}) {
 
   // ---- Real-ish actions via the dev hook ----
   const portFor = (node) => node.port || DEFAULT_PORT[node.connection_method] || 22
+  // camelid's HTTP API port (agent nodes may set it explicitly; else the default 8181).
+  const camelidPortFor = (node) => (node.connection_method === 'agent' && node.port ? node.port : DEFAULT_PORT.agent)
+
+  // Pull live camelid telemetry straight from the node's API (real specs + online status).
+  // Tries hostname then IP; updates the node in place. Returns true if the node answered.
+  const syncNode = useCallback(async (id, { quiet = false } = {}) => {
+    const node = topoRef.current.nodes.find((n) => n.id === id)
+    if (!node) return false
+    const hosts = [node.hostname, node.ip_address].filter(Boolean)
+    if (!hosts.length) return false
+    let tel = { online: false }
+    for (const host of hosts) {
+      tel = await fetchNodeTelemetry({ host, port: camelidPortFor(node) })
+      if (tel.online) break
+    }
+    if (!tel.online) return false
+    updateNode(id, { status: 'online', last_seen: nowIso(), ...specsToNodePatch(tel.specs) })
+    if (!quiet) {
+      const s = tel.specs || {}
+      pushEvent('ok', `${node.display_name} online via camelid — ${s.cpu_model || tel.engine}${s.cpu_cores ? ` · ${s.cpu_cores} cores` : ''}.`)
+    }
+    return true
+  }, [updateNode, pushEvent])
+
+  // On load, quietly detect which nodes are actually running camelid (real online + specs).
+  // Guard lives inside the timer (not at effect entry) so StrictMode's dev remount,
+  // which clears the first timer, reschedules instead of silently skipping.
+  const autoSynced = useRef(false)
+  useEffect(() => {
+    const timer = window.setTimeout(async () => {
+      if (autoSynced.current) return
+      autoSynced.current = true
+      const addressed = topoRef.current.nodes.filter((n) => n.hostname || n.ip_address)
+      if (!addressed.length) return
+      pushEvent('info', 'Auto-detecting live camelid nodes…')
+      const results = await Promise.allSettled(addressed.map((n) => syncNode(n.id, { quiet: true })))
+      const online = results.filter((r) => r.status === 'fulfilled' && r.value === true).length
+      pushEvent(online ? 'ok' : 'info', `Live scan: ${online} of ${addressed.length} node(s) reporting camelid telemetry.`)
+    }, 600) // let the one-time import merge settle first
+    return () => window.clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const testNode = useCallback(async (id) => {
     const node = topology.nodes.find((n) => n.id === id)
@@ -156,22 +219,26 @@ export function useClusterTopology({ showNotice } = {}) {
     const host = node.hostname || node.ip_address
     if (!host) { showNotice?.('Add a hostname or IP first.', 'error'); return }
     setNodeBusy(id, 'Testing…')
-    pushEvent('info', `Testing ${node.display_name} (${host}:${portFor(node)})…`)
+    pushEvent('info', `Testing ${node.display_name} (${host})…`)
+    // Prefer live camelid telemetry — confirms online AND reads real hardware specs.
+    const online = await syncNode(id)
+    if (online) { setNodeBusy(id, null); return }
+    // Otherwise fall back to a raw TCP reachability probe via the dev hook.
     const result = await probeNode({ host, port: portFor(node) })
     setNodeBusy(id, null)
     if (!result.available) {
       updateNode(id, { status: 'unknown', last_seen: nowIso() })
-      pushEvent('warn', `${node.display_name}: live probe needs the local dev server (npm run dev). Marked Unknown.`)
+      pushEvent('warn', `${node.display_name}: camelid API not detected on :${camelidPortFor(node)}; TCP probe needs the dev server (npm run dev). Marked Unknown.`)
       return
     }
     if (result.reachable) {
       updateNode(id, { status: 'online', last_seen: nowIso() })
-      pushEvent('ok', `${node.display_name} is reachable — ${Math.round(result.latencyMs)}ms.`)
+      pushEvent('ok', `${node.display_name} reachable on :${portFor(node)} — ${Math.round(result.latencyMs)}ms (camelid API not detected, so specs are unavailable).`)
     } else {
       updateNode(id, { status: 'offline', last_seen: nowIso() })
-      pushEvent('error', `${node.display_name} (${host}:${portFor(node)}) is not reachable.`)
+      pushEvent('error', `${node.display_name} offline — no camelid on :${camelidPortFor(node)} and :${portFor(node)} unreachable.`)
     }
-  }, [topology.nodes, updateNode, pushEvent, setNodeBusy, showNotice])
+  }, [topology.nodes, updateNode, pushEvent, setNodeBusy, showNotice, syncNode])
 
   const testConnection = useCallback(async (id) => {
     const link = topology.connections.find((c) => c.id === id)
@@ -228,7 +295,7 @@ export function useClusterTopology({ showNotice } = {}) {
     addNode, updateNode, moveNode, removeNode,
     addConnection, updateConnection, removeConnection,
     applyAutoLayout, resetTopology, loadSample, exportTopology, save,
-    testNode, testConnection, validateCluster,
+    testNode, testConnection, validateCluster, syncNode,
     startWorker, stopWorker, restartWorker,
     discover, pushEvent,
   }

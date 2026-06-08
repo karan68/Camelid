@@ -245,6 +245,72 @@ export function sampleTopology() {
   return { nodes: autoLayout(nodes), connections, updated_at: nowIso() }
 }
 
+/* Merge an imported topology fragment (from discovery / a shared config) into the
+   current one. Dedups nodes by id or hostname/IP so re-importing or importing a
+   machine you already have won't create duplicates; remaps connection endpoints. */
+export function mergeImport(topology, imp) {
+  if (!imp || !Array.isArray(imp.nodes)) return topology
+  const nodes = topology.nodes.map((n) => ({ ...n }))
+  const hostKey = (n) => String(n.hostname || n.ip_address || '').trim().toLowerCase()
+  const byHost = new Map(nodes.filter((n) => hostKey(n)).map((n) => [hostKey(n), n.id]))
+  const byId = new Set(nodes.map((n) => n.id))
+  const idMap = {}
+  imp.nodes.forEach((impNode) => {
+    const hk = hostKey(impNode)
+    const existingId = (hk && byHost.has(hk)) ? byHost.get(hk) : (byId.has(impNode.id) ? impNode.id : null)
+    if (existingId) {
+      idMap[impNode.id] = existingId
+      // Apply provided fields (e.g. a corrected address/status/specs) without clobbering with empties.
+      const target = nodes.find((n) => n.id === existingId)
+      if (target) {
+        Object.entries(impNode).forEach(([k, v]) => {
+          if (k === 'id' || v === undefined || v === null || v === '') return
+          target[k] = v
+        })
+        const tk = hostKey(target)
+        if (tk) byHost.set(tk, target.id)
+      }
+      return
+    }
+    const node = createNode(impNode)
+    nodes.push(node)
+    byId.add(node.id)
+    if (hk) byHost.set(hk, node.id)
+    idMap[impNode.id] = node.id
+  })
+  const connections = topology.connections.map((c) => ({ ...c }))
+  ;(imp.connections || []).forEach((impConn) => {
+    const s = idMap[impConn.source_node_id]
+    const t = idMap[impConn.target_node_id]
+    if (!s || !t || s === t) return
+    const existing = connections.find((c) => (c.source_node_id === s && c.target_node_id === t) || (c.source_node_id === t && c.target_node_id === s))
+    if (existing) {
+      // Apply only the fields the import specifies (e.g. correcting a link's
+      // connection_type/bandwidth), keeping the existing id + endpoints intact.
+      const { id, source_node_id, target_node_id, ...patch } = impConn
+      Object.assign(existing, patch)
+      return
+    }
+    connections.push(createConnection({ ...impConn, source_node_id: s, target_node_id: t }))
+  })
+  return { nodes, connections, updated_at: nowIso() }
+}
+
+// Map live camelid telemetry specs onto a node patch, normalizing for display.
+// (On Apple Silicon the chip is both CPU and GPU, so cpu_model populates `gpu`,
+// which the node card renders as the chip line. RAM isn't reported, so it's left as-is.)
+export function specsToNodePatch(specs) {
+  if (!specs) return {}
+  const osMap = { macos: 'macOS', windows: 'Windows', linux: 'Linux' }
+  const archMap = { aarch64: 'arm64', arm64: 'arm64', x86_64: 'x86_64', amd64: 'x86_64' }
+  const patch = {}
+  if (specs.os) patch.os = osMap[String(specs.os).toLowerCase()] || specs.os
+  if (specs.arch) patch.arch = archMap[String(specs.arch).toLowerCase()] || specs.arch
+  if (specs.cpu_cores) patch.cpu_cores = specs.cpu_cores
+  if (specs.cpu_model) patch.gpu = specs.cpu_model
+  return patch
+}
+
 export function summarizeCluster(topology) {
   const { nodes } = topology
   const totalCores = nodes.reduce((sum, n) => sum + (Number(n.cpu_cores) || 0), 0)

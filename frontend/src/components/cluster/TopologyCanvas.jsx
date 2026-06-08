@@ -9,13 +9,6 @@ const MIN_SCALE = 0.3
 const MAX_SCALE = 2.2
 const GRID = 40
 
-const STATUS_STROKE = {
-  ready: 'var(--color-ready)',
-  warn: 'var(--color-warning)',
-  error: 'var(--color-error)',
-  neutral: 'var(--color-border-strong)',
-}
-
 function linkPath(ax, ay, bx, by) {
   const dx = bx - ax
   const dy = by - ay
@@ -25,6 +18,18 @@ function linkPath(ax, ay, bx, by) {
   }
   const off = Math.max(40, Math.abs(dx) * 0.4)
   return `M ${ax} ${ay} C ${ax + Math.sign(dx) * off} ${ay} ${bx - Math.sign(dx) * off} ${by} ${bx} ${by}`
+}
+
+// Point on a node card's edge in the direction of (tx,ty), so links visibly
+// emanate from the card border (not from hidden centers). +margin pushes just outside.
+const HALF_W = NODE_W / 2 + 4
+const HALF_H = NODE_H / 2 + 4
+function rectEdge(cx, cy, tx, ty) {
+  const dx = tx - cx
+  const dy = ty - cy
+  if (!dx && !dy) return [cx, cy]
+  const t = Math.min(HALF_W / (Math.abs(dx) || 1e-6), HALF_H / (Math.abs(dy) || 1e-6))
+  return [cx + dx * t, cy + dy * t]
 }
 
 export const TopologyCanvas = forwardRef(function TopologyCanvas({
@@ -40,7 +45,7 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
   const drag = useRef(null)
   const viewRef = useRef(view)
   viewRef.current = view
-  const didInitialFit = useRef(false)
+  const interacted = useRef(false)
 
   const nodeById = useCallback((id) => nodes.find((n) => n.id === id), [nodes])
 
@@ -79,10 +84,11 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
     zoomBy: (factor) => setView((v) => zoomAround(v, factor, size.w / 2, size.h / 2)),
   }), [fit, size])
 
-  // initial fit once nodes + size are known
+  // Auto-fit until the user first interacts — re-runs as the canvas size settles
+  // (so the view stays centered even before the layout's final width is measured).
   useEffect(() => {
-    if (!didInitialFit.current && nodes.length && size.w > 1) { didInitialFit.current = true; fit() }
-  }, [nodes.length, size.w, fit])
+    if (!interacted.current && nodes.length && size.w > 1) fit()
+  }, [nodes.length, size.w, size.h, fit])
 
   function zoomAround(v, factor, cx, cy) {
     const scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, v.scale * factor))
@@ -93,12 +99,14 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
 
   const onWheel = useCallback((e) => {
     e.preventDefault()
+    interacted.current = true
     const rect = containerRef.current.getBoundingClientRect()
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
     setView((v) => zoomAround(v, factor, e.clientX - rect.left, e.clientY - rect.top))
   }, [])
 
   const onPointerDown = useCallback((e) => {
+    interacted.current = true
     const rect = containerRef.current.getBoundingClientRect()
     const sx = e.clientX - rect.left
     const sy = e.clientY - rect.top
@@ -203,23 +211,29 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
       onPointerUp={onPointerUp}
       onWheel={onWheel}
     >
-      <div className="cluster-canvas__world" style={worldStyle}>
-        <svg className="cluster-canvas__links" width="1" height="1" overflow="visible">
+      <svg className="cluster-canvas__links" width={size.w} height={size.h}>
+        <g transform={`translate(${view.x} ${view.y}) scale(${view.scale})`}>
           {connections.map((c) => {
             const a = nodeById(c.source_node_id)
             const b = nodeById(c.target_node_id)
             if (!a || !b) return null
             const tone = statusTone(c.status)
             const selected = selection.kind === 'connection' && selection.id === c.id
-            const mx = (a.layout_x + b.layout_x) / 2
-            const my = (a.layout_y + b.layout_y) / 2
+            const [ax, ay] = rectEdge(a.layout_x, a.layout_y, b.layout_x, b.layout_y)
+            const [bx, by] = rectEdge(b.layout_x, b.layout_y, a.layout_x, a.layout_y)
+            const mx = (ax + bx) / 2
+            const my = (ay + by) / 2
+            const d = linkPath(ax, ay, bx, by)
             const label = c.label || CONNECTION_TYPE_BY[c.connection_type]?.label || 'Link'
-            const lat = c.latency_ms != null ? ` · ${c.latency_ms}ms` : ''
-            const text = `${label}${lat}`
+            const lat = c.latency_ms != null ? ` · ${c.latency_ms} ms` : ''
+            const bw = c.bandwidth_mbps != null ? ` · ${c.bandwidth_mbps >= 1000 ? `${(c.bandwidth_mbps / 1000).toFixed(0)} Gbps` : `${c.bandwidth_mbps} Mbps`}` : ''
+            const text = `${label}${lat}${bw}`
+            const live = tone === 'ready'
             return (
-              <g key={c.id} className={`cluster-link is-${tone} ${selected ? 'is-selected' : ''}`}>
-                <path className="cluster-link__hit" data-link-id={c.id} d={linkPath(a.layout_x, a.layout_y, b.layout_x, b.layout_y)} />
-                <path className="cluster-link__line" d={linkPath(a.layout_x, a.layout_y, b.layout_x, b.layout_y)} style={{ stroke: STATUS_STROKE[tone] }} />
+              <g key={c.id} className={`cluster-link is-${tone} cluster-link--${c.connection_type} ${selected ? 'is-selected' : ''}`}>
+                <path className="cluster-link__hit" data-link-id={c.id} d={d} />
+                <path className="cluster-link__line" d={d} />
+                {live && <path className="cluster-link__flow" d={d} />}
                 <g className="cluster-link__label" transform={`translate(${mx}, ${my})`} data-link-id={c.id}>
                   <rect x={-(text.length * 3.4 + 10)} y={-11} width={text.length * 6.8 + 20} height={22} rx={11} />
                   <text x={0} y={4} textAnchor="middle">{text}</text>
@@ -232,8 +246,10 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
             if (!src) return null
             return <path className="cluster-link__pending" d={linkPath(src.layout_x, src.layout_y, pending.toX, pending.toY)} />
           })()}
-        </svg>
+        </g>
+      </svg>
 
+      <div className="cluster-canvas__world" style={worldStyle}>
         {nodes.map((node) => (
           <div
             key={node.id}

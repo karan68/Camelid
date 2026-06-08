@@ -3,8 +3,8 @@ import { DeviceIcon } from './DeviceIcon'
 import { NODE_TYPE_BY, roleLabel, statusTone, NODE_STATUS_BY } from '../../lib/clusterModel'
 import { IconCpu, IconBolt } from '../ui/icons'
 
-export const NODE_W = 220
-export const NODE_H = 124
+export const NODE_W = 248
+export const NODE_H = 152
 
 function fmtRam(gb) {
   const n = Number(gb)
@@ -45,13 +45,15 @@ export const NodeCard = memo(function NodeCard({ node, selected, busyLabel, onSe
         {!roles.length && <span className="cluster-node__role cluster-node__role--more">No role</span>}
       </div>
 
+      {(node.os || node.arch)
+        ? <div className="cluster-node__os" title={[node.os, node.arch].filter(Boolean).join(' · ')}>{[node.os, node.arch].filter(Boolean).join(' · ')}</div>
+        : <div className="cluster-node__os cluster-node__os--muted">specs not detected</div>}
+
       <div className="cluster-node__meta">
-        <span className="cluster-node__metric" title="CPU cores">
-          <IconCpu size={13} />{node.cpu_cores ? `${node.cpu_cores}c` : '—'}
-        </span>
+        <span className="cluster-node__metric" title="CPU cores"><IconCpu size={13} />{node.cpu_cores ? `${node.cpu_cores} cores` : '—'}</span>
         <span className="cluster-node__metric" title="Memory">{ram || '—'}</span>
-        {node.gpu && <span className="cluster-node__metric cluster-node__metric--gpu" title={node.gpu}><IconBolt size={13} />GPU</span>}
-        {node.worker_state === 'running' && <span className="cluster-node__worker" title="Worker running">worker</span>}
+        {node.gpu && <span className="cluster-node__metric cluster-node__metric--gpu" title={node.gpu}><IconBolt size={13} />{node.gpu.replace(/^Apple\s+/, '')}</span>}
+        {node.worker_state === 'running' && <span className="cluster-node__worker" title="Worker running">live</span>}
       </div>
 
       {busyLabel && <span className="cluster-node__busy">{busyLabel}</span>}
