@@ -1,6 +1,8 @@
 import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportNextStepCopy } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getRuntimeRequestModelId } from '../lib/modelState'
+import { StatusDot } from '../components/ui/StatusDot'
+import { IconSystem } from '../components/ui/icons'
 
 function runtimeReadinessLabel(runtime) {
   if (runtime?.generation_ready) return 'Loaded for local generation'
@@ -12,6 +14,13 @@ function supportLaneTitle(lane) {
   if (lane.key === 'template') return 'Template/Jinja readiness'
   if (lane.key === 'context') return 'Checked context readiness'
   return 'Throughput readiness'
+}
+
+function statusTagClass(status) {
+  const tone = capabilityStatusTone(status)
+  if (tone === 'ready') return 'cxv-tag cxv-tag--ready'
+  if (tone === 'warm') return 'cxv-tag cxv-tag--warn'
+  return 'cxv-tag'
 }
 
 export default function SystemView({ runtime, selectedModel, capabilities }) {
@@ -73,110 +82,101 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
     ? `${q8Runtime.policy}${Number.isFinite(q8Runtime.file_cache_bytes) ? ` · cache ${q8Runtime.file_cache_bytes} bytes` : ''}`
     : 'Start the local runtime to inspect Q8 storage policy.'
 
+  const runtimeState = runtime?.generation_ready ? 'Ready' : runtime?.loaded_now ? 'Loaded' : 'Offline'
+  const runtimeTone = runtime?.generation_ready ? 'ready' : runtime?.loaded_now ? 'warn' : 'neutral'
+  const gateStat = selectedExactRowReady ? 'Ready' : selectedChatGate.runtimeReady ? 'Gated' : 'Blocked'
+  const gateStatSub = selectedExactRowReady ? 'chat + API unlocked' : selectedChatGate.runtimeReady ? 'runtime ready, support gated' : 'exact row required'
+
   return (
-    <section className="view-stack system-layout-single view-shell">
-      <div className="panel panel-hero system-hero system-hero-separated">
-        <div className="view-hero-copy">
-          <p className="panel-kicker">System</p>
-          <h2>Runtime, readiness, and local API access</h2>
-          <p className="hero-summary">This is the operational view. It keeps runtime health, model readiness, and developer connection details in one calmer place while Library stays focused on browsing and setup.</p>
+    <section className="system-view cxv">
+      <header className="cxv-head">
+        <div className="cxv-head__copy">
+          <p className="cxv-kicker"><IconSystem size={14} /> System</p>
+          <h1>Runtime &amp; API</h1>
+          <p className="cxv-sub">The operational view — runtime health, model readiness, and developer connection details in one calm place. Support always comes from /api/capabilities and COMPATIBILITY.md, never inferred from runtime health alone.</p>
         </div>
-        <div className="view-hero-stats system-hero-pills system-hero-pills-polished">
-          <div className={`status-pill ${runtime?.generation_ready ? 'ready' : 'warm'}`}>{runtimePill}</div>
-          <div className="status-pill">{apiBase}</div>
+        <div className="cxv-head__actions">
+          <StatusDot tone={runtimeTone} pulse={runtime?.generation_ready} label={runtimePill} />
         </div>
+      </header>
+
+      <div className="cxv-stat-grid">
+        <div className="cxv-stat"><span>Runtime</span><strong>{runtimeState}</strong><small>{runtime?.engine || 'engine unknown'}</small></div>
+        <div className="cxv-stat"><span>Generation</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong><small>{runtimePill}</small></div>
+        <div className="cxv-stat"><span>Loaded model</span><strong>{runtime?.loaded_now ? 'Active' : 'None'}</strong><small title={runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</small></div>
+        <div className="cxv-stat"><span>Selected gate</span><strong>{gateStat}</strong><small>{gateStatSub}</small></div>
+        <div className="cxv-stat"><span>Local API</span><strong>{runtime?.api_base ? 'Online' : 'Offline'}</strong><small>{apiBase}</small></div>
       </div>
 
-      <div className="runtime-grid runtime-grid-polished">
-        <div className="panel panel-section">
-          <div className="section-heading">
-            <div>
-              <p className="panel-kicker">Runtime</p>
-              <h2>What Camelid can do right now</h2>
-            </div>
-            <p className="model-summary">A quick operational summary of the local engine, loaded model, and what is actually ready for local completions.</p>
+      <div className="cxv-grid cxv-grid--two">
+        <section className="cxv-card cxv-panel">
+          <div className="cxv-section__head"><h2>Runtime</h2><span className="cxv-section__count">local engine</span></div>
+          <div className="sys-defs">
+            <div><span>Runtime state</span><strong>{runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not generation-ready' : 'No generation-ready model'}</strong></div>
+            <div><span>Local engine</span><strong>{runtime?.engine || 'Unknown'}</strong></div>
+            <div><span>Loaded model</span><strong>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</strong></div>
+            <div><span>Generation ready</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong></div>
+            <div><span>Selected exact-row gate</span><strong>{selectedExactRowReady ? 'Ready for chat/API' : selectedChatGate.runtimeReady ? 'Runtime ready; support gated' : selectedChatGate.label}</strong></div>
+            <div><span>Q8 storage</span><strong>{q8RuntimeLabel}</strong></div>
+            <div><span>Next chat selection</span><strong>{selectedModelName}</strong></div>
+            <div><span>API base</span><strong>{apiBase}</strong></div>
           </div>
-          <div className="runtime-stat-grid">
-            <div className="runtime-stat"><span>Runtime state</span><strong>{runtime?.generation_ready ? 'Generation-ready' : runtime?.loaded_now ? 'Loaded, not generation-ready' : 'No generation-ready model'}</strong></div>
-            <div className="runtime-stat"><span>Local engine</span><strong>{runtime?.engine || 'Unknown'}</strong></div>
-            <div className="runtime-stat"><span>Loaded model</span><strong>{runtime?.loaded_now ? runtime?.active_model_id : 'Nothing loaded'}</strong></div>
-            <div className="runtime-stat"><span>Generation ready</span><strong>{runtime?.generation_ready ? 'Yes' : 'No'}</strong></div>
-            <div className="runtime-stat"><span>Selected exact-row gate</span><strong>{selectedExactRowReady ? 'Ready for chat/API' : selectedChatGate.runtimeReady ? 'Runtime ready; support gated' : selectedChatGate.label}</strong></div>
-            <div className="runtime-stat"><span>Q8 storage</span><strong>{q8RuntimeLabel}</strong></div>
-            <div className="runtime-stat"><span>Next chat selection</span><strong>{selectedModelName}</strong></div>
-            <div className="runtime-stat"><span>API base</span><strong>{apiBase}</strong></div>
-          </div>
-        </div>
+        </section>
 
-        <div className="panel panel-section">
-          <div className="section-heading">
-            <div>
-              <p className="panel-kicker">Capability</p>
-              <h2>What Camelid is handling locally</h2>
-            </div>
-            <p className="model-summary">A plain-language snapshot of what is already available without reaching outside this machine.</p>
-          </div>
-          <div className="activity-feed activity-feed-polished">
-            <div className="activity-item">Persistent conversations are already available from local storage.</div>
-            <div className="activity-item">Saved memory remains on-device and can be recalled in later chats.</div>
-            <div className="activity-item">Camelid is using the local CPU generation path today; GPU acceleration remains future work.</div>
-            <div className="activity-item">Q8 runtime policy: {q8RuntimeDetail}. {q8Runtime?.note || ''}</div>
-            <div className="activity-item">Current next-chat model state: {describeModelState(selectedModel)}</div>
-            <div className="activity-item">Chat stays blocked until loaded_now=true, generation_ready=true, active_model_id matches the selected local GGUF, and COMPATIBILITY.md plus /api/capabilities expose an exact supported row.</div>
-            <div className="activity-item">The standard /v1-compatible local API is exposed at {apiBase}.</div>
-          </div>
-        </div>
+        <section className="cxv-card cxv-panel">
+          <div className="cxv-section__head"><h2>Handling locally</h2><span className="cxv-section__count">on-device</span></div>
+          <ul className="sys-feed">
+            <li>Persistent conversations are already available from local storage.</li>
+            <li>Saved memory remains on-device and can be recalled in later chats.</li>
+            <li>Camelid is using the local CPU generation path today; GPU acceleration remains future work.</li>
+            <li>Q8 runtime policy: {q8RuntimeDetail}. {q8Runtime?.note || ''}</li>
+            <li>Current next-chat model state: {describeModelState(selectedModel)}</li>
+            <li>Chat stays blocked until loaded_now=true, generation_ready=true, active_model_id matches the selected local GGUF, and COMPATIBILITY.md plus /api/capabilities expose an exact supported row.</li>
+            <li>The standard /v1-compatible local API is exposed at {apiBase}.</li>
+          </ul>
+        </section>
       </div>
 
-      <section className="panel api-panel panel-section">
-        <div className="panel-header-row panel-header-row-wide">
-          <div>
-            <p className="panel-kicker">Developer</p>
-            <h2>Standard /v1-compatible local API</h2>
-            <p className="hero-summary">Use the same local runtime through standard endpoints for apps, scripts, and quick terminal checks.</p>
-          </div>
-          <div className={`status-pill ${selectedExactRowReady ? 'ready' : 'warm'}`}>{endpointReadinessLabel}</div>
+      <section className="cxv-card cxv-panel">
+        <div className="cxv-section__head">
+          <h2>Local API access</h2>
+          <StatusDot tone={selectedExactRowReady ? 'ready' : 'warn'} label={endpointReadinessLabel} />
         </div>
-        <div className="api-grid api-grid-polished">
-          <div className="api-card">
-            <strong>Chat completions</strong>
+        <p className="cxv-sub">Use the same local runtime through standard /v1-compatible endpoints for apps, scripts, and quick terminal checks.</p>
+        <div className="sys-endpoints">
+          <div className="sys-endpoint">
+            <div className="sys-endpoint__head"><strong>Chat completions</strong><span className="cxv-tag">POST</span></div>
             <code>{runtime?.api_base ? `${runtime.api_base}/v1/chat/completions` : 'Unavailable until the local API is running'}</code>
             <p>{chatCompletionsCopy}</p>
           </div>
-          <div className="api-card">
-            <strong>Models</strong>
+          <div className="sys-endpoint">
+            <div className="sys-endpoint__head"><strong>Models</strong><span className="cxv-tag">GET</span></div>
             <code>{runtime?.api_base ? `${runtime.api_base}/v1/models` : 'Unavailable until the local API is running'}</code>
             <p>Lists the currently loaded runtime model; this is not a broad model catalog.</p>
           </div>
-          <div className="api-card">
-            <strong>Health</strong>
+          <div className="sys-endpoint">
+            <div className="sys-endpoint__head"><strong>Health</strong><span className="cxv-tag">GET</span></div>
             <code>{runtime?.api_base ? `${runtime.api_base}/v1/health` : 'Unavailable until the local API is running'}</code>
             <p>Source of truth for active_model_id and generation_ready.</p>
           </div>
-          <div className="api-card">
-            <strong>Capabilities</strong>
+          <div className="sys-endpoint">
+            <div className="sys-endpoint__head"><strong>Capabilities</strong><span className="cxv-tag">GET</span></div>
             <code>{runtime?.api_base ? `${runtime.api_base}/api/capabilities` : 'Unavailable until the local API is running'}</code>
             <p>Support contract for model families, quantization, API features, and compatibility rows.</p>
           </div>
-          <div className="api-card wide api-card-code">
-            <strong>Readiness-gated curl</strong>
-            <pre>{runtime?.api_base ? curlExample : 'Start the local runtime to see an exact-row readiness check.'}</pre>
-          </div>
+        </div>
+        <div className="sys-curl">
+          <div className="sys-curl__head"><strong>Readiness-gated request</strong><span className="cxv-tag">curl</span></div>
+          <pre>{runtime?.api_base ? curlExample : 'Start the local runtime to see an exact-row readiness check.'}</pre>
         </div>
       </section>
 
-      <section className="panel api-panel panel-section">
-        <div className="panel-header-row panel-header-row-wide">
-          <div>
-            <p className="panel-kicker">Support contract</p>
-            <h2>Evidence-based compatibility</h2>
-            <p className="hero-summary">This mirrors /api/capabilities so the UI does not imply unvalidated model families, quantization formats, or API features.</p>
-          </div>
-          <div className="status-pill">{supportContractCurrentGate}</div>
-        </div>
+      <section className="cxv-card cxv-panel">
+        <div className="cxv-section__head"><h2>Support contract</h2><span className="cxv-section__count">evidence-based</span></div>
+        <p className="cxv-sub">This mirrors /api/capabilities so the UI never implies unvalidated model families, quantization formats, or API features.</p>
 
-        <div className="api-grid api-grid-polished api-capabilities-grid" aria-label="Capabilities support contract">
-          <div className="api-card wide">
+        <div className="cxv-grid cxv-grid--two">
+          <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Current contract</strong>
             {supportContract ? (
               <>
@@ -189,11 +189,11 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
             )}
           </div>
 
-          <div className="api-card">
+          <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Selected exact-row evidence</strong>
             {selectedCompatibilityTarget ? (
               <>
-                <code>{selectedCompatibilityTarget.id}</code>
+                <code className="a-code">{selectedCompatibilityTarget.id}</code>
                 <p>{formatCapabilityStatus(selectedCompatibilityTarget.status)} · {selectedCompatibilityTarget.family} · {selectedCompatibilityTarget.quantization}</p>
                 <p><b>Readiness gate:</b> {displayCapabilityCopy(selectedCompatibilityTarget.frontend_readiness_gate || 'not advertised')}</p>
                 <p><b>Endpoint/chat gate:</b> {selectedExactRowReady ? 'Ready: runtime readiness and exact-row support both match.' : `${selectedChatGate.label}; loaded_now=${selectedChatGate.runtimeLoaded ? 'true' : 'false'}, generation_ready=${selectedChatGate.runtimeGenerationReady ? 'true' : 'false'}, exact row supported=${selectedChatGate.contractSupported ? 'true' : 'false'}.`}</p>
@@ -206,40 +206,46 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
               <p>No selected model exact row matched, so System will not promote runtime health, families, or quant lists into support.</p>
             )}
           </div>
+        </div>
 
-          <div className="api-card">
+        <div className="cxv-grid cxv-grid--two">
+          <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Exact-row quant evidence</strong>
             <p>{exactRowQuantEvidence}</p>
             <p>Quant labels here come only from compatibility rows and do not unlock chat without a matching loaded model.</p>
           </div>
-
-          <div className="api-card">
+          <div className="cxv-card cxv-card--flat sys-evidence">
             <strong>Exact-row family evidence</strong>
             <p>{exactRowFamilyEvidence}</p>
             <p>Family labels remain row-scoped evidence boundaries, not broad support for neighboring files.</p>
           </div>
+        </div>
 
-          <div className="api-card">
-            <strong>Validated API features</strong>
-            {supportedFeatures.length ? (
-              <>
-                {supportedFeatures.map((feature) => (
-                  <p key={feature.id}><b>{displayCapabilityId(feature.id)}:</b> {displayCapabilityCopy(feature.notes)}</p>
-                ))}
-              </>
-            ) : (
-              <p>No supported API feature rows advertised yet.</p>
-            )}
-          </div>
+        <div className="cxv-card cxv-card--flat sys-evidence">
+          <strong>Validated API features</strong>
+          {supportedFeatures.length ? (
+            supportedFeatures.map((feature) => (
+              <p key={feature.id}><b>{displayCapabilityId(feature.id)}:</b> {displayCapabilityCopy(feature.notes)}</p>
+            ))
+          ) : (
+            <p>No supported API feature rows advertised yet.</p>
+          )}
+        </div>
+      </section>
 
-          <div className="api-card wide">
+      <details className="cxv-disclosure">
+        <summary>Full compatibility evidence — every row and guarded feature from /api/capabilities</summary>
+        <div className="cxv-disclosure__body">
+          <div className="sys-rows-block">
             <strong>COMPATIBILITY.md rows from /api/capabilities</strong>
             {compatibilityTargets.length ? (
-              <div className="api-feature-list capability-target-list">
+              <div className="sys-rows">
                 {compatibilityTargets.map((target) => (
-                  <div key={target.id}>
-                    <span>{target.family} · {target.quantization}</span>
-                    <strong className={capabilityStatusTone(target.status)}>{target.id}: {formatCapabilityStatus(target.status)}</strong>
+                  <div key={target.id} className="sys-row">
+                    <div className="sys-row__head">
+                      <span>{target.family} · {target.quantization}</span>
+                      <span className={statusTagClass(target.status)}>{target.id}: {formatCapabilityStatus(target.status)}</span>
+                    </div>
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)}</small>
                     <small>{exactRowSupportLanes(target, apiFeatures).map((lane) => `${supportLaneTitle(lane).replace(' readiness', '')}: ${lane.label}`).join(' · ')}</small>
                     <small>{displayCapabilityCopy(rowSupportNextStepCopy(target, apiFeatures))}</small>
@@ -247,28 +253,30 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
                 ))}
               </div>
             ) : (
-              <p>No compatibility rows advertised yet.</p>
+              <p className="cxv-sub">No compatibility rows advertised yet.</p>
             )}
           </div>
 
-          <div className="api-card wide">
+          <div className="sys-rows-block">
             <strong>Unsupported / partial API features</strong>
             {unsupportedFeatures.length ? (
-              <div className="api-feature-list">
+              <div className="sys-rows">
                 {unsupportedFeatures.map((feature) => (
-                  <div key={feature.id}>
-                    <span>{displayCapabilityId(feature.id)}</span>
-                    <strong className={capabilityStatusTone(feature.status)}>{formatCapabilityStatus(feature.status)}</strong>
+                  <div key={feature.id} className="sys-row">
+                    <div className="sys-row__head">
+                      <span>{displayCapabilityId(feature.id)}</span>
+                      <span className={statusTagClass(feature.status)}>{formatCapabilityStatus(feature.status)}</span>
+                    </div>
                     <small>{displayCapabilityCopy(guardedCapabilityCopy(feature, 'System/API controls'))}</small>
                   </div>
                 ))}
               </div>
             ) : (
-              <p>No unsupported or partial API rows advertised.</p>
+              <p className="cxv-sub">No unsupported or partial API rows advertised.</p>
             )}
           </div>
         </div>
-      </section>
+      </details>
     </section>
   )
 }

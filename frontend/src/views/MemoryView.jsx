@@ -1,5 +1,8 @@
 import { useMemo, useState } from 'react'
 import { clampText, formatDate } from '../lib/formatters'
+import { Button } from '../components/ui/Button'
+import { EmptyState } from '../components/ui/EmptyState'
+import { IconMemory, IconPin, IconCopy, IconEdit, IconTrash, IconChat, IconPlus, IconSearch } from '../components/ui/icons'
 
 export default function MemoryView({
   memories,
@@ -50,9 +53,7 @@ export default function MemoryView({
     if (busyAction) return
     setBusyAction('create')
     const saved = await createMemory(newMemory)
-    if (saved) {
-      setNewMemory({ title: '', scope: newMemory.scope || 'General', body: '' })
-    }
+    if (saved) setNewMemory({ title: '', scope: newMemory.scope || 'General', body: '' })
     setBusyAction('')
   }
 
@@ -84,21 +85,12 @@ export default function MemoryView({
   }
 
   const handleCopy = async (memory) => {
-    try {
-      await navigator.clipboard.writeText(`${memory.title}\n\n${memory.body}`)
-    } catch {
-      // noop; updateMemory/createMemory flows already carry user-facing notices for real actions
-    }
+    try { await navigator.clipboard.writeText(`${memory.title}\n\n${memory.body}`) } catch { /* notices handled elsewhere */ }
   }
 
   const handleDelete = async (memoryId) => {
     if (busyAction) return
-
-    if (pendingDeleteId !== memoryId) {
-      setPendingDeleteId(memoryId)
-      return
-    }
-
+    if (pendingDeleteId !== memoryId) { setPendingDeleteId(memoryId); return }
     setBusyAction(`delete:${memoryId}`)
     const deleted = await deleteMemory(memoryId, { successMessage: 'Memory removed from local memory.' })
     if (deleted) {
@@ -109,171 +101,142 @@ export default function MemoryView({
   }
 
   return (
-    <section className="view-stack memory-view view-shell">
-      <div className="panel panel-hero view-hero">
-        <div className="view-hero-copy">
-          <p className="panel-kicker">Memory layer</p>
-          <h2>Useful context you can actually manage</h2>
-          <p className="hero-summary">Capture durable notes, keep the important ones pinned, and clean up stale context without leaving the app.</p>
+    <section className="memory-view cxv">
+      <header className="cxv-head">
+        <div className="cxv-head__copy">
+          <p className="cxv-kicker"><IconMemory size={14} /> Memory</p>
+          <h1>Memory</h1>
+          <p className="cxv-sub">Capture durable notes, keep the important ones pinned, and clean up stale context — all without leaving the app.</p>
         </div>
-        <div className="view-hero-stats memory-hero-stats">
-          <div className="context-chip context-chip-emphasis">
-            <span>Total memories</span>
+        <div className="cxv-stats">
+          <div className="cxv-stat">
+            <span>Memories</span>
             <strong>{memories.length}</strong>
-            <small>{visibleMemories.length} visible right now</small>
+            <small>{visibleMemories.length} visible now</small>
           </div>
-          <div className="context-chip">
+          <div className="cxv-stat">
             <span>Pinned</span>
             <strong>{pinnedCount}</strong>
-            <small>{availableScopes.length - 1} scopes represented</small>
+            <small>{Math.max(availableScopes.length - 1, 0)} scopes</small>
+          </div>
+        </div>
+      </header>
+
+      <div className="cxv-grid cxv-grid--two">
+        <div className="cxv-card cxv-form">
+          <div className="cxv-card__titles">
+            <strong>Quick capture</strong>
+            <span className="cxv-card__sub-plain">Save a fact, decision, or preference</span>
+          </div>
+          <input value={newMemory.title} onChange={(e) => setNewMemory((c) => ({ ...c, title: e.target.value }))} placeholder="Short title" />
+          <input value={newMemory.scope} onChange={(e) => setNewMemory((c) => ({ ...c, scope: e.target.value }))} placeholder="Scope (e.g. General, Project)" />
+          <textarea value={newMemory.body} onChange={(e) => setNewMemory((c) => ({ ...c, body: e.target.value }))} placeholder="What should Camelid remember?" rows={4} />
+          <div className="cxv-form__actions">
+            <Button variant="primary" icon={<IconPlus size={16} />} onClick={handleCreateMemory} loading={busyAction === 'create'}>Save memory</Button>
+          </div>
+        </div>
+
+        <div className="cxv-card cxv-form">
+          <div className="cxv-card__titles">
+            <strong>From this chat</strong>
+            <span className="cxv-card__sub-plain">Pull a useful reply straight into memory</span>
+          </div>
+          <div className="cxv-mem__context">
+            <strong title={selectedConversation?.title || 'No chat selected'}>{selectedConversation ? latestChatLabel : 'No chat selected'}</strong>
+            <span>{canSaveLatestReply ? 'Latest assistant reply is ready to save.' : 'Open a conversation with an assistant reply to save it here.'}</span>
+          </div>
+          <div className="cxv-form__actions">
+            <Button variant="ghost" icon={<IconChat size={16} />} onClick={() => setTab('chat')}>Open chat</Button>
+            <Button variant="primary" onClick={saveToMemory} disabled={!canSaveLatestReply}>Save latest reply</Button>
           </div>
         </div>
       </div>
 
-      <div className="memory-layout-grid">
-        <section className="panel panel-section memory-capture-panel">
-          <div className="panel-header-row panel-header-row-wide">
-            <div>
-              <p className="panel-kicker">Quick capture</p>
-              <h2>Add a memory from here</h2>
-              <p className="hero-summary">Save a fact, decision, preference, or useful note without needing to go back into chat first.</p>
-            </div>
-          </div>
-
-          <div className="memory-form-grid">
-            <input
-              value={newMemory.title}
-              onChange={(event) => setNewMemory((current) => ({ ...current, title: event.target.value }))}
-              placeholder="Short title"
-            />
-            <input
-              value={newMemory.scope}
-              onChange={(event) => setNewMemory((current) => ({ ...current, scope: event.target.value }))}
-              placeholder="Scope"
-            />
-            <textarea
-              className="memory-form-textarea"
-              value={newMemory.body}
-              onChange={(event) => setNewMemory((current) => ({ ...current, body: event.target.value }))}
-              placeholder="What should Camelid remember?"
-              rows={5}
-            />
-            <div className="memory-inline-actions">
-              <button className="primary-button" onClick={handleCreateMemory} disabled={busyAction === 'create'}>
-                {busyAction === 'create' ? 'Saving…' : 'Save memory'}
-              </button>
-            </div>
-          </div>
-        </section>
-
-        <section className="panel panel-section memory-capture-panel">
-          <div className="panel-header-row panel-header-row-wide">
-            <div>
-              <p className="panel-kicker">Current chat</p>
-              <h2>Pull useful replies into memory</h2>
-              <p className="hero-summary">When a reply is worth keeping, save it here and turn the Memory page into a real working set instead of a dead archive.</p>
-            </div>
-          </div>
-
-          <div className="memory-context-card">
-            <div className="memory-context-meta">
-              <strong title={selectedConversation?.title || 'No chat selected'}>{selectedConversation ? latestChatLabel : 'No chat selected'}</strong>
-              <span>{canSaveLatestReply ? 'Latest assistant reply is ready to save.' : 'Open a conversation with an assistant reply to save it here.'}</span>
-            </div>
-            <div className="memory-inline-actions">
-              <button className="ghost-button" onClick={() => setTab('chat')}>Open chat</button>
-              <button className="primary-button" onClick={saveToMemory} disabled={!canSaveLatestReply}>Save latest reply</button>
-            </div>
-          </div>
-        </section>
+      <div className="cxv-toolbar">
+        <label className="cxv-search">
+          <IconSearch size={16} />
+          <input value={memorySearch} onChange={(e) => setMemorySearch(e.target.value)} placeholder="Search memories" />
+        </label>
+        <select value={scopeFilter} onChange={(e) => setScopeFilter(e.target.value)}>
+          {availableScopes.map((scope) => (
+            <option key={scope} value={scope}>{scope === 'all' ? 'All scopes' : scope}</option>
+          ))}
+        </select>
+        <Button variant="ghost" icon={<IconPin size={15} />} className={showPinnedOnly ? 'is-active' : ''} onClick={() => setShowPinnedOnly((c) => !c)}>
+          Pinned only
+        </Button>
       </div>
 
-      <div className="panel panel-section memory-toolbar-panel">
-        <div className="panel-header-row panel-header-row-wide memory-toolbar-row">
-          <div>
-            <p className="panel-kicker">Browse</p>
-            <h2>Search, filter, pin, and clean up</h2>
-            <p className="hero-summary">Find what matters fast, then keep the memory set tidy from the same page.</p>
-          </div>
-          <div className="memory-toolbar-controls">
-            <div className="storage-badge">{visibleMemories.length} results</div>
-            <input className="memory-search" value={memorySearch} onChange={(e) => setMemorySearch(e.target.value)} placeholder="Search memories" />
-            <select className="memory-scope-filter" value={scopeFilter} onChange={(event) => setScopeFilter(event.target.value)}>
-              {availableScopes.map((scope) => (
-                <option key={scope} value={scope}>{scope === 'all' ? 'All scopes' : scope}</option>
-              ))}
-            </select>
-            <button className={`ghost-button ${showPinnedOnly ? 'memory-filter-active' : ''}`} onClick={() => setShowPinnedOnly((current) => !current)}>
-              {showPinnedOnly ? 'Pinned only' : 'Show pinned only'}
-            </button>
-          </div>
+      {visibleMemories.length === 0 ? (
+        <EmptyState
+          icon={<IconMemory size={26} />}
+          title={memories.length === 0 ? 'No memories yet' : 'Nothing matched'}
+          description={memories.length === 0
+            ? 'Add one above, or save a useful assistant reply from chat — the Memory page becomes your working set, not a dead archive.'
+            : 'No memories matched those filters. Try a broader search or clear the pinned / scope filter.'}
+        />
+      ) : (
+        <div className="cxv-grid">
+          {visibleMemories.map((memory) => {
+            const isEditing = editingId === memory.id
+            const isDeleting = busyAction === `delete:${memory.id}`
+            const isPinning = busyAction === `pin:${memory.id}`
+            const isSavingEdit = busyAction === `edit:${memory.id}`
+            const confirming = pendingDeleteId === memory.id
+
+            return (
+              <article key={memory.id} className={`cxv-card cxv-mem ${memory.pinned ? 'is-pinned' : ''}`}>
+                <div className="cxv-card__head">
+                  <div className="cxv-card__titles">
+                    <strong>{memory.title}</strong>
+                    <div className="cxv-mem__meta">
+                      <span className="cxv-tag">{memory.scope}</span>
+                      {memory.pinned && <span className="cxv-tag cxv-tag--accent"><IconPin size={11} /> Pinned</span>}
+                    </div>
+                  </div>
+                  <div className="cxv-card__actions">
+                    <Button variant="ghost" size="sm" icon={<IconPin size={15} />} aria-label={memory.pinned ? 'Unpin' : 'Pin'} className={memory.pinned ? 'is-active' : ''} loading={isPinning} onClick={() => handleTogglePin(memory)} disabled={Boolean(busyAction)} />
+                    <Button variant="ghost" size="sm" icon={<IconCopy size={15} />} aria-label="Copy" onClick={() => handleCopy(memory)} />
+                  </div>
+                </div>
+
+                {isEditing ? (
+                  <div className="cxv-edit">
+                    <input value={editDraft.title} onChange={(e) => setEditDraft((c) => ({ ...c, title: e.target.value }))} placeholder="Title" />
+                    <input value={editDraft.scope} onChange={(e) => setEditDraft((c) => ({ ...c, scope: e.target.value }))} placeholder="Scope" />
+                    <textarea value={editDraft.body} onChange={(e) => setEditDraft((c) => ({ ...c, body: e.target.value }))} rows={5} placeholder="Memory body" />
+                    <div className="cxv-form__actions">
+                      <Button variant="primary" onClick={() => handleSaveEdit(memory.id)} loading={isSavingEdit}>Save changes</Button>
+                      <Button variant="ghost" onClick={cancelEditing} disabled={isSavingEdit}>Cancel</Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <p className="cxv-mem__body">{memory.body}</p>
+                    <footer className="cxv-card__foot">
+                      <span className="cxv-card__meta">Updated {formatDate(memory.updated_at) || 'Unknown'}</span>
+                      <div className="cxv-card__actions">
+                        <Button variant="ghost" size="sm" icon={<IconEdit size={15} />} onClick={() => startEditing(memory)} disabled={Boolean(busyAction)}>Edit</Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className={confirming ? 'cxv-danger is-armed' : 'cxv-danger'}
+                          icon={<IconTrash size={15} />}
+                          loading={isDeleting}
+                          onClick={() => handleDelete(memory.id)}
+                          disabled={isDeleting || (Boolean(busyAction) && !confirming)}
+                        >
+                          {confirming ? 'Confirm' : ''}
+                        </Button>
+                      </div>
+                    </footer>
+                  </>
+                )}
+              </article>
+            )
+          })}
         </div>
-      </div>
-
-      <div className="memory-grid memory-grid-polished memory-grid-productive">
-        {visibleMemories.length === 0 && (
-          <div className="empty-state">
-            {memories.length === 0
-              ? 'No memories saved yet. Add one above or save a useful assistant reply from chat.'
-              : 'No memories matched those filters. Try a broader search or clear the pinned/scope filter.'}
-          </div>
-        )}
-
-        {visibleMemories.map((memory) => {
-          const isEditing = editingId === memory.id
-          const isDeleting = busyAction === `delete:${memory.id}`
-          const isPinning = busyAction === `pin:${memory.id}`
-          const isSavingEdit = busyAction === `edit:${memory.id}`
-
-          return (
-            <article key={memory.id} className={`memory-card memory-card-polished memory-card-productive ${memory.pinned ? 'memory-card-pinned' : ''}`}>
-              <div className="memory-topline memory-topline-productive">
-                <div className="memory-title-block">
-                  <strong>{memory.title}</strong>
-                  <div className="memory-meta-row">
-                    <span className="memory-scope-pill">{memory.scope}</span>
-                    {memory.pinned && <div className="pin-badge">Pinned</div>}
-                  </div>
-                </div>
-                <div className="memory-card-actions-top">
-                  <button className="ghost-button subtle-action" onClick={() => handleTogglePin(memory)} disabled={Boolean(busyAction)}>
-                    {isPinning ? 'Saving…' : memory.pinned ? 'Unpin' : 'Pin'}
-                  </button>
-                  <button className="ghost-button subtle-action" onClick={() => handleCopy(memory)}>Copy</button>
-                </div>
-              </div>
-
-              {isEditing ? (
-                <div className="memory-edit-stack">
-                  <input value={editDraft.title} onChange={(event) => setEditDraft((current) => ({ ...current, title: event.target.value }))} placeholder="Title" />
-                  <input value={editDraft.scope} onChange={(event) => setEditDraft((current) => ({ ...current, scope: event.target.value }))} placeholder="Scope" />
-                  <textarea className="memory-form-textarea" value={editDraft.body} onChange={(event) => setEditDraft((current) => ({ ...current, body: event.target.value }))} rows={6} placeholder="Memory body" />
-                  <div className="memory-inline-actions">
-                    <button className="primary-button" onClick={() => handleSaveEdit(memory.id)} disabled={isSavingEdit}>{isSavingEdit ? 'Saving…' : 'Save changes'}</button>
-                    <button className="ghost-button" onClick={cancelEditing} disabled={isSavingEdit}>Cancel</button>
-                  </div>
-                </div>
-              ) : (
-                <>
-                  <p className="memory-body-copy">{memory.body}</p>
-                  <div className="memory-card-footer memory-card-footer-productive">
-                    <div className="history-metric-pill">
-                      <span>Updated</span>
-                      <strong>{formatDate(memory.updated_at) || 'Unknown'}</strong>
-                    </div>
-                    <div className="memory-inline-actions memory-inline-actions-end">
-                      <button className="ghost-button" onClick={() => startEditing(memory)} disabled={Boolean(busyAction)}>Edit</button>
-                      <button className={`ghost-button ${pendingDeleteId === memory.id ? 'danger-button' : 'history-delete-button'}`} onClick={() => handleDelete(memory.id)} disabled={isDeleting || (Boolean(busyAction) && pendingDeleteId !== memory.id)}>
-                        {isDeleting ? 'Deleting…' : pendingDeleteId === memory.id ? 'Confirm delete' : 'Delete'}
-                      </button>
-                    </div>
-                  </div>
-                </>
-              )}
-            </article>
-          )
-        })}
-      </div>
+      )}
     </section>
   )
 }
