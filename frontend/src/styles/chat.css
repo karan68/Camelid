@@ -355,3 +355,14 @@
   .cxchat__suggestions { grid-template-columns: 1fr; }
   .cxturn__user-chip { max-width: 90%; }
 }
+
+/* ---- Ported from legacy components.css: streaming-loader + diagnostics-trigger
+   cosmetics, so chat.css fully owns the chat surface once legacy is dropped. ---- */
+.streaming-loader-compact { padding: 0 0 8px; }
+.streaming-loader-dot-1 { animation-delay: 0ms; }
+.developer-diagnostics-trigger .trigger-icon { font-size: 0.88rem; }
+.developer-diagnostics-trigger.is-open {
+  background: color-mix(in srgb, var(--color-chip) 80%, transparent);
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}

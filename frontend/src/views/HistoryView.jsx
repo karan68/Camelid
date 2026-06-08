@@ -52,7 +52,7 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
           {filteredConversations.map((conversation) => {
             const { messageCount, assistantCount, latestMessage } = getConversationStats(conversation)
             return (
-              <article key={conversation.id} className="cxv-card history-card">
+              <article key={conversation.id} className="cxv-card">
                 <header className="cxv-card__head">
                   <div className="cxv-card__titles">
                     <strong title={conversation.title || 'Untitled chat'}>{clampText(conversation.title || 'Untitled chat', 70) || 'Untitled chat'}</strong>

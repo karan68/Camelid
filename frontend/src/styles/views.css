@@ -806,3 +806,31 @@
 .models-view.cxv .cxv-panel > .models-truth-strip,
 .models-view.cxv .cxv-panel > .models-compatibility-strip,
 .models-view.cxv .cxv-panel > .models-summary-strip { margin: 0; }
+
+/* Models grid/form helpers ported from legacy components.css/layout.css so the
+   view's setup forms, readiness grids, and catalog grid keep their layout once
+   the legacy sheets are dropped. */
+.camelid-view--page .models-setup-grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.camelid-view--page .models-form-stack { display: grid; gap: var(--space-3); }
+.camelid-view--page .import-grid,
+.camelid-view--page .import-grid-advanced,
+.camelid-view--page .composer-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; }
+.camelid-view--page .import-grid-advanced { padding-top: 2px; }
+.camelid-view--page .import-callout-row { display: grid; gap: var(--space-3); grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.camelid-view--page .import-advanced-toggle { justify-self: start; }
+.camelid-view--page .models-readiness-grid { grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); }
+.camelid-view--page .models-readiness-grid .models-readiness-path { grid-column: 1 / -1; }
+.camelid-view--page .models-catalog-grid-clean { grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); }
+.camelid-view--page .models-section-heading-catalog { align-items: end; }
+.camelid-view--page .library-load-more-row { display: grid; gap: var(--space-3); justify-items: center; }
+.camelid-view--page .models-summary-pill-static { cursor: default; }
+.camelid-view--page .models-refresh-button { min-height: 44px; }
+.camelid-view--page .models-planned-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.camelid-view--page .models-planned-fieldset:disabled { opacity: 0.72; }
+@media (max-width: 760px) {
+  .camelid-view--page .models-setup-grid,
+  .camelid-view--page .import-grid,
+  .camelid-view--page .import-grid-advanced,
+  .camelid-view--page .composer-actions,
+  .camelid-view--page .import-callout-row { grid-template-columns: 1fr; }
+}

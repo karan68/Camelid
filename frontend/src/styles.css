@@ -1,11 +1,9 @@
 @import './styles/tokens.css';
 @import './styles/base.css';
-@import './styles/layout.css';
-@import './styles/components.css';
 
-/* Redesign layer — new modular stylesheets, imported last so they take
-   precedence over the legacy rules above during the transition. The legacy
-   layout.css/components.css are removed in the final cleanup pass. */
+/* Modular stylesheets. The legacy layout.css/components.css were removed once
+   every live surface (shell + all six dashboard views + chat) was confirmed
+   self-sufficient on these sheets; tokens.css + base.css carry the foundation. */
 @import './styles/ui.css';
 @import './styles/shell.css';
 @import './styles/chat.css';
