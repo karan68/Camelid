@@ -200,7 +200,12 @@ export function useClusterTopology({ showNotice } = {}) {
     }
     // 2) Non-HTTP services (e.g. a NanoCamelid pipeline stage on :9100): a TCP probe
     //    on the service port confirms it's listening. Needs the dev hook (npm run dev).
-    const probe = await probeNode({ host: hosts[0], port: portFor(node) })
+    //    Try each address (hostname then IP) so a cold .local/mDNS miss falls back to the IP.
+    let probe = { available: false }
+    for (const host of hosts) {
+      probe = await probeNode({ host, port: portFor(node) })
+      if (probe.available && probe.reachable) break
+    }
     if (probe.available && probe.reachable) {
       updateNode(id, { status: 'online', last_seen: nowIso() })
       if (!quiet) pushEvent('ok', `${node.display_name} reachable on :${portFor(node)} — ${Math.round(probe.latencyMs)}ms.`)

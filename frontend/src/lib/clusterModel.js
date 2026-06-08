@@ -293,7 +293,24 @@ export function mergeImport(topology, imp) {
     }
     connections.push(createConnection({ ...impConn, source_node_id: s, target_node_id: t }))
   })
-  return { nodes, connections, updated_at: nowIso() }
+  // Optional removals: drop connections (by id or endpoint pair) and nodes (by id).
+  const resolve = (id) => idMap[id] || id
+  let outConnections = connections
+  if (Array.isArray(imp.remove_connections)) {
+    outConnections = outConnections.filter((c) => !imp.remove_connections.some((r) => {
+      if (r.id) return c.id === r.id
+      const s = resolve(r.source_node_id)
+      const t = resolve(r.target_node_id)
+      return (c.source_node_id === s && c.target_node_id === t) || (c.source_node_id === t && c.target_node_id === s)
+    }))
+  }
+  let outNodes = nodes
+  if (Array.isArray(imp.remove_nodes)) {
+    const rm = new Set(imp.remove_nodes.map(resolve))
+    outNodes = outNodes.filter((n) => !rm.has(n.id))
+    outConnections = outConnections.filter((c) => !rm.has(c.source_node_id) && !rm.has(c.target_node_id))
+  }
+  return { nodes: outNodes, connections: outConnections, updated_at: nowIso() }
 }
 
 // Map live camelid telemetry specs onto a node patch, normalizing for display.
