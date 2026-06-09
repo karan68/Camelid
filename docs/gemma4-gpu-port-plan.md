@@ -145,11 +145,18 @@ New kernels required:
     window_start); PLE via `Gemma4ResidentPle`. Validated
     (`metal_gemma4_forward_matches_composed_pieces`) against the same pipeline built
     from the individually-validated `try_*` pieces. The GPU forward is complete.
-  - **9b NEXT (real-model wiring + the payoff)** — in `gemma4_runtime.rs`:
-    1. **Weight residency**: load each Q8 tensor as page-aligned
-       `wire_mmap::WirePages` and build `Gemma4ResidentLayer` via a NEW nocopy ctor
-       (`from_wire_pages`, wrapping `q8_wire_nocopy_buffer`) — NOT `from_wire`'s copy
-       (8GB copy won't fit 16GB). token_embd + per_layer_token_embd also as WirePages.
+  - **9b (real-model wiring + the payoff) — IN PROGRESS**:
+    1. **Weight residency DONE** — `Gemma4ResidentLayer::from_wire_pages` builds a
+       layer's weights from per-tensor `WirePages` via `q8_wire_nocopy_buffer` (GPU
+       reads in place, no 8GB copy). Validated identical to `from_wire`
+       (`metal_gemma4_layer_from_wire_pages_matches_copy`). token_embd +
+       per_layer_token_embd will load the same way in the runtime.
+    1b. **Still needed — stateful resident forward**: a `Gemma4ResidentModel` holding
+       resident weights + token_embd + PERSISTENT caches (allocated once, scattered
+       per token) + a `forward_token(h0, inputs, position) -> logits`. Refactor of
+       `try_gemma4_forward` to stateful (no per-token weight/embd copy — required for
+       both correctness across tokens AND a valid benchmark; `try_gemma4_forward`
+       copies the 0.7GB token_embd per call).
     2. **Per-token CPU prep** (reuse `step()` math): embedding gather × √hidden → h0;
        `pli` (per_layer_token_embd Q8 gather + per_layer_model_proj f32 matvec +
        per_layer_proj_norm); per-layer cos/sin from `rope_freq_base_at` + position;
