@@ -5111,6 +5111,60 @@ pub fn try_rms_norm_per_head_f32(
     Some(out)
 }
 
+/// Standalone gemma4 f32-activation × wire-Q8 GEMV (builds buffers, one dispatch,
+/// reads back). `weight_wire` is row-major 34-byte Q8_0 wire blocks
+/// (`rows * blocks_per_row` of them); `y` is the f32 activation
+/// (`blocks_per_row * 32`). This is the workhorse the gemma resident decode graph
+/// runs 8× per layer, validated here against a CPU f32×dequant reference. None if
+/// Metal is unavailable or shapes are invalid.
+#[cfg(target_os = "macos")]
+pub fn try_gemma4_q8_matmul_f32y(
+    y: &[f32],
+    weight_wire: &[u8],
+    rows: usize,
+    blocks_per_row: usize,
+) -> Option<Vec<f32>> {
+    const WIRE: usize = 34;
+    if rows == 0
+        || blocks_per_row == 0
+        || y.len() != blocks_per_row * 32
+        || weight_wire.len() != rows * blocks_per_row * WIRE
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let y_buf = k.device.new_buffer(
+        std::mem::size_of_val(y) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let w_buf = k.device.new_buffer(
+        weight_wire.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let out_buf = k
+        .device
+        .new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let scalar_buf = k
+        .device
+        .new_buffer(8, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&y_buf, y);
+    write_buffer_u8(&w_buf, weight_wire);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u32;
+        *p = blocks_per_row as u32;
+        *p.add(1) = rows as u32;
+    }
+    let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    encode_gemma4_q8_matmul(e, k, &y_buf, &w_buf, &out_buf, &scalar_buf, rows);
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; rows];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
 /// GPU elementwise binary op helper for residual add / silu-mul (same buffer shape).
 #[cfg(target_os = "macos")]
 fn try_binary_elementwise_f32(
@@ -5953,6 +6007,43 @@ fn encode_q8_matmul_f32y(
         },
         metal::MTLSize {
             width: threads_per_tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Encode one f32-activation × wire-Q8 GEMV into the shared encoder:
+/// `out[r] = Σ_b w_scale[b] · Σ_j (w_i8[b][j] · y[b*32+j])`. The weight is the raw
+/// 34-byte GGUF wire layout (f16 scale + 32 i8). Gemma's resident decode always
+/// uses the nocopy wire weights, so — unlike [`encode_q8_matmul_f32y`] — this is
+/// NOT gated on `CAMELID_METAL_WIRE`; it always binds the wire f32y K-split kernel.
+/// `scalar` holds [blocks_per_row: u32 @0, rows: u32 @4].
+#[cfg(target_os = "macos")]
+fn encode_gemma4_q8_matmul(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    e.set_compute_pipeline_state(&k.q8_0_block_ksplit_f32y_wire_pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (rows as u64).div_ceil(2),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 128,
             height: 1,
             depth: 1,
         },
@@ -9627,6 +9718,16 @@ pub fn try_rms_norm_per_head_f32(
 }
 
 #[cfg(not(target_os = "macos"))]
+pub fn try_gemma4_q8_matmul_f32y(
+    _y: &[f32],
+    _weight_wire: &[u8],
+    _rows: usize,
+    _blocks_per_row: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub fn try_attention_decode_f32(
     _query: &[f32],
@@ -10591,6 +10692,51 @@ mod tests {
         assert_eq!(st.cache_k_len(3), None); // shared global
                                              // Bad shapes are rejected.
         assert!(Gemma4ResidentState::new(vec![], 1, 16, 1.0e-6, 8, 16).is_none());
+    }
+
+    // The gemma4 GPU GEMV workhorse (f32 activation × 34-byte wire Q8) must match a
+    // CPU f32×dequant reference — this is the op the resident decode runs 8x/layer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_q8_matmul_f32y_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        let blocks_per_row = 5usize; // in_dim = 160
+        let in_dim = blocks_per_row * 32;
+        let rows = 7usize;
+        let y: Vec<f32> = (0..in_dim)
+            .map(|i| ((i as f32 % 11.0) - 5.0) * 0.1)
+            .collect();
+        let mut wire = Vec::with_capacity(rows * blocks_per_row * 34);
+        let mut want = vec![0.0f32; rows];
+        for (r, w) in want.iter_mut().enumerate() {
+            let row: Vec<f32> = (0..in_dim)
+                .map(|i| (((r * in_dim + i) as f32 % 23.0) - 11.0) * 0.05)
+                .collect();
+            // Quantize with the same Q8_0 quantizer the model uses; emit 34-byte wire
+            // (f16 scale + 32 i8) and accumulate the f32×dequant reference.
+            let mut acc = 0.0f32;
+            for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
+                wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                for (j, &q) in blk.quants.iter().enumerate() {
+                    wire.push(q as u8);
+                    acc += blk.scale * q as f32 * y[b * 32 + j];
+                }
+            }
+            *w = acc;
+        }
+        let got =
+            try_gemma4_q8_matmul_f32y(&y, &wire, rows, blocks_per_row).expect("gemma4 q8 matmul");
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1.0e-2, "{a} != {b}");
+        }
+        // Shape guards.
+        assert!(try_gemma4_q8_matmul_f32y(&y, &wire, 0, blocks_per_row).is_none());
+        assert!(
+            try_gemma4_q8_matmul_f32y(&y, &wire[..wire.len() - 1], rows, blocks_per_row).is_none()
+        );
     }
 
     #[cfg(target_os = "macos")]
