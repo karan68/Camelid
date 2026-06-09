@@ -577,3 +577,274 @@ impl Gemma4Runtime {
         Ok((emitted, generated))
     }
 }
+
+/// GPU-resident gemma4 decode runtime: the Q8 layer weights live on the GPU (nocopy
+/// `WirePages`), the per-layer KV caches persist on the GPU, and each token's forward
+/// runs in one Metal command buffer ([`crate::metal::Gemma4ResidentModel`]). The
+/// per-token embedding, PLE `pli`, and dual-θ RoPE tables are computed on the CPU and
+/// uploaded. Gated by `crate::metal::gemma4_gpu_enabled()` at the call site. Numerics
+/// follow the CPU [`Gemma4Runtime`] (attention score scale = 1.0 — gemma folds it in).
+#[cfg(target_os = "macos")]
+pub struct Gemma4GpuRuntime {
+    model: crate::metal::Gemma4ResidentModel,
+    tokenizer: Tokenizer,
+    g: Gemma4Metadata,
+    token_embd: WireQ8,
+    per_layer_token_embd: Option<WireQ8>,
+    per_layer_model_proj: Option<Vec<f32>>,
+    per_layer_proj_norm: Option<Vec<f32>>,
+    _mmap: Arc<GgufWireMmap>,
+    hidden: usize,
+    ple_dim: usize,
+    n_layers: usize,
+    eps: f32,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4GpuRuntime {
+    /// Load the model with the Q8 layer weights resident on the GPU. `max_positions`
+    /// is the KV-cache capacity (must cover prompt + generated tokens).
+    pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
+        let gguf = read_metadata(path)?;
+        let config = LlamaModelConfig::from_gguf(&gguf)?;
+        let g = config.gemma4.clone().ok_or_else(|| {
+            BackendError::UnsupportedModelArchitecture("not a gemma4 model".into())
+        })?;
+        let binding = Gemma4Binding::bind(&gguf, &config)?;
+        let store = TensorStore::open(path, &gguf);
+        let tokenizer = Tokenizer::from_gguf(&gguf)?;
+        // The mmap backs token_embd + per_layer_token_embd (CPU gathers); the GPU layer
+        // weights are loaded separately as page-aligned WirePages for nocopy residency.
+        let mmap = GgufWireMmap::map(path)?;
+        let q8 = |name: &str| WireQ8::new(&store, &mmap, name);
+        let f32t = |name: &str| -> Result<Vec<f32>> { Ok(store.load_cpu_f32(name)?.data) };
+
+        let hidden = config.embedding_length as usize;
+        let ffn_dim = config.feed_forward_length as usize;
+        let heads = config.attention_head_count as usize;
+        let kv_heads = config.attention_head_count_kv as usize;
+        let n_layers = config.block_count as usize;
+        let vocab = config.vocab_size.unwrap() as usize;
+        let eps = config.rms_norm_epsilon;
+        let ple_dim = g.per_layer_input_dim as usize;
+        let softcap = g.final_logit_softcapping.unwrap_or(0.0);
+
+        let file = std::fs::File::open(path).map_err(|e| BackendError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        let pages = |name: &str| -> Result<Arc<crate::wire_mmap::WirePages>> {
+            let desc = store.descriptor(name)?;
+            crate::wire_mmap::WirePages::read_from_file(
+                &file,
+                desc.absolute_offset,
+                desc.n_bytes as usize,
+            )
+        };
+
+        let plan = g.layer_plan(n_layers, heads, kv_heads);
+        let mut layers = Vec::with_capacity(n_layers);
+        let mut ple = Vec::with_capacity(n_layers);
+        let mut owns_kv = Vec::with_capacity(n_layers);
+        let mut kv_source = Vec::with_capacity(n_layers);
+        for (l, lb) in binding.layers.iter().enumerate() {
+            let hd = g.head_dim_at(l) as usize;
+            let layer = crate::metal::Gemma4ResidentLayer::from_wire_pages(
+                f32t(&lb.attn_norm.name)?,
+                f32t(&lb.attn_q_norm.name)?,
+                f32t(&lb.attn_k_norm.name)?,
+                f32t(&lb.post_attention_norm.name)?,
+                f32t(&lb.ffn_norm.name)?,
+                f32t(&lb.post_ffw_norm.name)?,
+                &pages(&lb.attn_q.name)?,
+                &pages(&lb.attn_k.name)?,
+                &pages(&lb.attn_v.name)?,
+                &pages(&lb.attn_output.name)?,
+                &pages(&lb.ffn_gate.name)?,
+                &pages(&lb.ffn_up.name)?,
+                &pages(&lb.ffn_down.name)?,
+                heads,
+                kv_heads,
+                hd,
+                ffn_dim,
+                eps,
+            )
+            .ok_or_else(|| {
+                BackendError::UnsupportedModelArchitecture("Metal unavailable".into())
+            })?;
+            layers.push(layer);
+            ple.push(match (&lb.ple_inp_gate, &lb.ple_proj, &lb.post_norm) {
+                (Some(ig), Some(pj), Some(pn)) => Some(crate::metal::Gemma4ResidentPle {
+                    inp_gate: f32t(&ig.name)?,
+                    proj: f32t(&pj.name)?,
+                    post_norm: f32t(&pn.name)?,
+                    output_scale: lb
+                        .ple_output_scale
+                        .as_ref()
+                        .map(|d| f32t(&d.name))
+                        .transpose()?
+                        .and_then(|v| v.first().copied())
+                        .unwrap_or(1.0),
+                }),
+                _ => None,
+            });
+            owns_kv.push(plan[l].owns_kv);
+            kv_source.push(plan[l].kv_source_layer);
+        }
+
+        let token_embd = q8(&binding.token_embedding.name)?;
+        let output_norm = f32t(&binding.output_norm.name)?;
+        let model = crate::metal::Gemma4ResidentModel::new(
+            layers,
+            ple,
+            owns_kv,
+            kv_source,
+            token_embd.bytes(),
+            output_norm,
+            hidden,
+            vocab,
+            softcap,
+            eps,
+            max_positions,
+            1.0, // gemma folds the attention scale into the (QK-normed) query
+        )
+        .ok_or_else(|| BackendError::UnsupportedModelArchitecture("Metal unavailable".into()))?;
+
+        Ok(Self {
+            model,
+            tokenizer,
+            per_layer_token_embd: binding
+                .per_layer_token_embd
+                .as_ref()
+                .map(|d| q8(&d.name))
+                .transpose()?,
+            per_layer_model_proj: binding
+                .per_layer_model_proj
+                .as_ref()
+                .map(|d| f32t(&d.name))
+                .transpose()?,
+            per_layer_proj_norm: binding
+                .per_layer_proj_norm
+                .as_ref()
+                .map(|d| f32t(&d.name))
+                .transpose()?,
+            token_embd,
+            g,
+            _mmap: mmap,
+            hidden,
+            ple_dim,
+            n_layers,
+            eps,
+        })
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Run one token's forward on the GPU and return the next-token logits.
+    fn forward(&self, token: u32, position: usize) -> Result<Vec<f32>> {
+        let hidden = self.hidden;
+        let ple_dim = self.ple_dim;
+        let ple_total = self.n_layers * ple_dim;
+        let filled = position + 1;
+        // Scaled input embedding (CPU gather).
+        let h0: Vec<f32> = self
+            .token_embd
+            .dequantize_elements(token as usize * hidden, hidden)?
+            .iter()
+            .map(|v| v * (hidden as f32).sqrt())
+            .collect();
+        // Per-layer PLE input `pli` (same math as Gemma4Runtime::step).
+        let pli: Vec<Vec<f32>> = if let (Some(te), Some(proj), Some(pn)) = (
+            self.per_layer_token_embd.as_ref(),
+            self.per_layer_model_proj.as_ref(),
+            self.per_layer_proj_norm.as_ref(),
+        ) {
+            let ti = te.dequantize_elements(token as usize * ple_total, ple_total)?;
+            let ctx = f32_matvec(proj, hidden, ple_total, &h0);
+            let proj_scale = (hidden as f32).powf(-0.5);
+            let ple_embed_scale = (ple_dim as f32).sqrt();
+            (0..self.n_layers)
+                .map(|l| {
+                    let ctx_l: Vec<f32> = (0..ple_dim)
+                        .map(|d| ctx[l * ple_dim + d] * proj_scale)
+                        .collect();
+                    let ctx_n = rms_norm(&ctx_l, Some(pn), self.eps);
+                    (0..ple_dim)
+                        .map(|d| {
+                            (ctx_n[d] + ti[l * ple_dim + d] * ple_embed_scale)
+                                * std::f32::consts::FRAC_1_SQRT_2
+                        })
+                        .collect()
+                })
+                .collect()
+        } else {
+            vec![Vec::new(); self.n_layers]
+        };
+        // Per-layer RoPE tables (dual θ, per-type head_dim) + sliding window start.
+        let win = self.g.sliding_window as usize;
+        let inputs: Vec<crate::metal::Gemma4TokenLayerInput> = (0..self.n_layers)
+            .map(|l| {
+                let hd = self.g.head_dim_at(l) as usize;
+                let theta = self.g.rope_freq_base_at(l);
+                let half = hd / 2;
+                let (mut cos_t, mut sin_t) = (vec![0f32; half], vec![0f32; half]);
+                for i in 0..half {
+                    let freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                    let (s, c) = (position as f32 * freq).sin_cos();
+                    cos_t[i] = c;
+                    sin_t[i] = s;
+                }
+                let window_start = if self.g.is_sliding_layer(l) {
+                    filled.saturating_sub(win)
+                } else {
+                    0
+                };
+                crate::metal::Gemma4TokenLayerInput {
+                    cos_t,
+                    sin_t,
+                    pli: pli[l].clone(),
+                    window_start,
+                }
+            })
+            .collect();
+        self.model
+            .forward_token(&h0, &inputs, position)
+            .ok_or_else(|| BackendError::UnsupportedModelArchitecture("gpu forward failed".into()))
+    }
+
+    /// Greedy generate up to `max_new` tokens from `prompt` on the GPU.
+    pub fn generate_greedy(&self, prompt: &str, max_new: usize) -> Result<(String, Vec<u32>)> {
+        let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
+        let eot: Vec<u32> = self
+            .tokenizer
+            .encode("<end_of_turn>", false, true)
+            .ok()
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.forward(tok, pos)?;
+        }
+        let mut generated = Vec::new();
+        let mut pos = prompt_tokens.len();
+        for _ in 0..max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            logits = self.forward(next, pos)?;
+            pos += 1;
+        }
+        let text = self.tokenizer.decode(&generated, true)?;
+        Ok((text, generated))
+    }
+}

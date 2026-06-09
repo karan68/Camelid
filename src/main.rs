@@ -134,6 +134,14 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
     },
+    /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
+    Gemma4GenerateGpu {
+        path: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 24)]
+        max_tokens: usize,
+    },
     /// Dump focused tensor descriptor, raw block, and f32 dequantization diagnostics.
     TensorDump {
         path: PathBuf,
@@ -522,6 +530,41 @@ async fn main() -> anyhow::Result<()> {
             );
             eprintln!("[gemma4] token_ids: {ids:?}");
             println!("{prompt}{out}");
+        }
+        Command::Gemma4GenerateGpu {
+            path,
+            prompt,
+            max_tokens,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                let max_positions = 512.max(max_tokens + 64);
+                eprintln!("[gemma4-gpu] loading {} (resident)...", path.display());
+                let t0 = std::time::Instant::now();
+                let runtime =
+                    camelid::gemma4_runtime::Gemma4GpuRuntime::load(&path, max_positions)?;
+                eprintln!(
+                    "[gemma4-gpu] loaded in {:.1}s; generating {max_tokens} tokens...",
+                    t0.elapsed().as_secs_f32()
+                );
+                let t1 = std::time::Instant::now();
+                let (out, ids) = runtime.generate_greedy(&prompt, max_tokens)?;
+                let gen = t1.elapsed().as_secs_f32();
+                eprintln!(
+                    "[gemma4-gpu] generated in {gen:.1}s ({:.2} tok/s)",
+                    ids.len() as f32 / gen
+                );
+                eprintln!("[gemma4-gpu] token_ids: {ids:?}");
+                println!("{prompt}{out}");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (&path, &prompt, max_tokens);
+                return Err(camelid::BackendError::UnsupportedModelArchitecture(
+                    "gemma4 GPU runtime requires macOS/Metal".into(),
+                )
+                .into());
+            }
         }
         Command::TensorDump {
             path,

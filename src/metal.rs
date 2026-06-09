@@ -1459,7 +1459,10 @@ kernel void gelu_mul_f32(
     if (gid >= n) return;
     float x = gate[gid];
     float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
-    float gelu = 0.5f * x * (1.0f + tanh(inner));
+    // tanh saturates to +/-1 well before |arg| = 15; clamp so the MSL implementation
+    // (which can compute exp(2*arg) and overflow to inf/inf = NaN for large args)
+    // matches the saturating CPU libm tanh on real-scale activations.
+    float gelu = 0.5f * x * (1.0f + tanh(clamp(inner, -15.0f, 15.0f)));
     output[gid] = gelu * up[gid];
 }
 
@@ -1474,7 +1477,9 @@ kernel void soft_cap_f32(
 ) {
     if (gid >= n) return;
     float v = input[gid];
-    output[gid] = cap * tanh(v / cap);
+    // Clamp like gelu_mul: tanh saturates well before |arg| = 15, and the MSL
+    // implementation can overflow (inf/inf = NaN) for large arguments.
+    output[gid] = cap * tanh(clamp(v / cap, -15.0f, 15.0f));
 }
 
 // Scale a vector by a constant: output = input * s. Used for Gemma's PLE per-layer
@@ -5691,6 +5696,83 @@ impl Gemma4ResidentModel {
         cb.wait_until_completed();
         let mut out = vec![0.0f32; self.vocab];
         read_buffer_f32(&self.logits, &mut out);
+        drop(keep);
+        Some(out)
+    }
+
+    /// Debug: run only layers `[0..stop_after)` (+ their PLE) and read back the hidden
+    /// state. Used to binary-search a non-finite layer on the real model.
+    pub fn forward_hidden(
+        &self,
+        h0: &[f32],
+        inputs: &[Gemma4TokenLayerInput],
+        position: usize,
+        stop_after: usize,
+    ) -> Option<Vec<f32>> {
+        let n = stop_after.min(self.layers.len());
+        let k = metal_linear_kernel()?;
+        let filled = position + 1;
+        write_buffer_f32(&self.buf_a, h0);
+        let mut keep = Vec::new();
+        let cb = k.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut from_a = true;
+        for l in 0..n {
+            let (in_buf, out_buf) = if from_a {
+                (&self.buf_a, &self.buf_b)
+            } else {
+                (&self.buf_b, &self.buf_a)
+            };
+            let src = if self.owns_kv[l] {
+                l
+            } else {
+                self.kv_source[l]
+            };
+            let (ck, cv) = self.caches[src].as_ref()?;
+            let inp = &inputs[l];
+            encode_gemma4_layer(
+                e,
+                k,
+                &mut keep,
+                &self.layers[l],
+                in_buf,
+                &self.mid,
+                out_buf,
+                &inp.cos_t,
+                &inp.sin_t,
+                ck,
+                cv,
+                self.max_positions,
+                position,
+                filled,
+                inp.window_start,
+                self.scale,
+                self.owns_kv[l],
+            );
+            if let Some(p) = &self.ple[l] {
+                encode_gemma4_ple(
+                    e,
+                    k,
+                    &mut keep,
+                    out_buf,
+                    &inp.pli,
+                    &p.inp_gate,
+                    &p.proj,
+                    &p.post_norm,
+                    p.output_scale,
+                    self.eps,
+                    self.hidden,
+                    inp.pli.len(),
+                );
+            }
+            from_a = !from_a;
+        }
+        let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let mut out = vec![0.0f32; self.hidden];
+        read_buffer_f32(final_buf, &mut out);
         drop(keep);
         Some(out)
     }
@@ -11254,6 +11336,16 @@ impl Gemma4ResidentModel {
     ) -> Option<Vec<f32>> {
         None
     }
+
+    pub fn forward_hidden(
+        &self,
+        _h0: &[f32],
+        _inputs: &[Gemma4TokenLayerInput],
+        _position: usize,
+        _stop_after: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -12228,13 +12320,19 @@ mod tests {
             return;
         }
         let n = 257usize; // non-multiple of the execution width
-        let gate: Vec<f32> = (0..n).map(|i| ((i as f32 % 13.0) - 6.0) * 0.4).collect();
+                          // Include large-magnitude gate values (±300): the x^3 term drives tanh's
+                          // argument to ~1e6, where an unclamped MSL tanh overflows to NaN. The kernel
+                          // clamps the tanh arg; this must still match the saturating CPU gelu.
+        let gate: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * if i % 7 == 0 { 50.0 } else { 0.4 })
+            .collect();
         let up: Vec<f32> = (0..n).map(|i| ((i as f32 % 5.0) - 2.0) * 0.5).collect();
         let mut expected = vec![0.0f32; n];
         crate::inference::gemma4::geglu_into(&gate, &up, &mut expected);
         let got = try_gelu_mul_f32(&gate, &up).expect("metal gelu_mul");
         for (a, b) in got.iter().zip(&expected) {
-            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+            assert!(a.is_finite(), "gpu gelu produced non-finite {a}");
+            assert!((a - b).abs() < 1.0e-2, "{a} != {b}");
         }
     }
 
@@ -12246,12 +12344,15 @@ mod tests {
         }
         let cap = 30.0f32;
         let n = 263usize;
-        let input: Vec<f32> = (0..n).map(|i| ((i as f32 % 91.0) - 45.0) * 8.0).collect();
+        // Include |logit| up to ~2000 (v/cap ~ 66): exp(2*v/cap) overflows f32, so an
+        // unclamped tanh would NaN. The kernel clamps; result must still saturate to ±cap.
+        let input: Vec<f32> = (0..n).map(|i| ((i as f32 % 91.0) - 45.0) * 45.0).collect();
         let mut expected = input.clone();
         crate::inference::gemma4::soft_cap_in_place(&mut expected, cap);
         let got = try_soft_cap_f32(&input, cap).expect("metal soft_cap");
         for (a, b) in got.iter().zip(&expected) {
-            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+            assert!(a.is_finite(), "gpu soft_cap produced non-finite {a}");
+            assert!((a - b).abs() < 1.0e-2, "{a} != {b}");
         }
         // Disabled cap is a passthrough.
         let passthrough = try_soft_cap_f32(&input, 0.0).expect("metal soft_cap passthrough");
@@ -12472,36 +12573,44 @@ mod tests {
             return;
         }
         use crate::inference::quantize_q8_0_blocks;
-        let blocks_per_row = 5usize; // in_dim = 160
+        // Cover both the single-simdgroup case (<=8 blocks) AND realistic gemma sizes
+        // (80 = hidden/32, 320 = ffn_dim/32) that exercise the 4-way k-split reduction.
+        for blocks_per_row in [5usize, 80, 320] {
+            let in_dim = blocks_per_row * 32;
+            let rows = 7usize;
+            let y: Vec<f32> = (0..in_dim)
+                .map(|i| ((i as f32 % 11.0) - 5.0) * 0.1)
+                .collect();
+            let mut wire = Vec::with_capacity(rows * blocks_per_row * 34);
+            let mut want = vec![0.0f32; rows];
+            for (r, w) in want.iter_mut().enumerate() {
+                let row: Vec<f32> = (0..in_dim)
+                    .map(|i| (((r * in_dim + i) as f32 % 23.0) - 11.0) * 0.05)
+                    .collect();
+                let mut acc = 0.0f32;
+                for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
+                    wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                    for (j, &q) in blk.quants.iter().enumerate() {
+                        wire.push(q as u8);
+                        acc += blk.scale * q as f32 * y[b * 32 + j];
+                    }
+                }
+                *w = acc;
+            }
+            let got = try_gemma4_q8_matmul_f32y(&y, &wire, rows, blocks_per_row)
+                .expect("gemma4 q8 matmul");
+            for (a, b) in got.iter().zip(&want) {
+                assert!((a - b).abs() < 2.0e-2, "bpr={blocks_per_row} {a} != {b}");
+            }
+        }
+        // Shape guards.
+        let blocks_per_row = 5usize;
         let in_dim = blocks_per_row * 32;
-        let rows = 7usize;
         let y: Vec<f32> = (0..in_dim)
             .map(|i| ((i as f32 % 11.0) - 5.0) * 0.1)
             .collect();
-        let mut wire = Vec::with_capacity(rows * blocks_per_row * 34);
-        let mut want = vec![0.0f32; rows];
-        for (r, w) in want.iter_mut().enumerate() {
-            let row: Vec<f32> = (0..in_dim)
-                .map(|i| (((r * in_dim + i) as f32 % 23.0) - 11.0) * 0.05)
-                .collect();
-            // Quantize with the same Q8_0 quantizer the model uses; emit 34-byte wire
-            // (f16 scale + 32 i8) and accumulate the f32×dequant reference.
-            let mut acc = 0.0f32;
-            for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
-                wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
-                for (j, &q) in blk.quants.iter().enumerate() {
-                    wire.push(q as u8);
-                    acc += blk.scale * q as f32 * y[b * 32 + j];
-                }
-            }
-            *w = acc;
-        }
-        let got =
-            try_gemma4_q8_matmul_f32y(&y, &wire, rows, blocks_per_row).expect("gemma4 q8 matmul");
-        for (a, b) in got.iter().zip(&want) {
-            assert!((a - b).abs() < 1.0e-2, "{a} != {b}");
-        }
-        // Shape guards.
+        let wire = vec![0u8; 7 * blocks_per_row * 34];
+        let rows = 7usize;
         assert!(try_gemma4_q8_matmul_f32y(&y, &wire, 0, blocks_per_row).is_none());
         assert!(
             try_gemma4_q8_matmul_f32y(&y, &wire[..wire.len() - 1], rows, blocks_per_row).is_none()
@@ -12929,11 +13038,11 @@ mod tests {
             return;
         }
         use crate::inference::quantize_q8_0_blocks;
-        let hidden = 128usize;
-        let n_heads = 2usize;
-        let n_kv_heads = 1usize;
+        let hidden = 2560usize;
+        let n_heads = 8usize;
+        let n_kv_heads = 2usize;
         let head_dim = 256usize;
-        let ffn_dim = 256usize;
+        let ffn_dim = 10240usize;
         let group = n_heads / n_kv_heads;
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
@@ -13082,8 +13191,24 @@ mod tests {
         let want: Vec<f32> = h_mid.iter().zip(&dn).map(|(a, b)| a + b).collect();
 
         let layer = Gemma4ResidentLayer::from_wire(
-            attn_norm, q_norm, k_norm, post_attn, ffn_norm, post_ffw, &q_wire, &k_wire, &v_wire,
-            &o_wire, &gate_wire, &up_wire, &down_wire, n_heads, n_kv_heads, head_dim, ffn_dim, eps,
+            attn_norm.clone(),
+            q_norm.clone(),
+            k_norm.clone(),
+            post_attn.clone(),
+            ffn_norm.clone(),
+            post_ffw.clone(),
+            &q_wire,
+            &k_wire,
+            &v_wire,
+            &o_wire,
+            &gate_wire,
+            &up_wire,
+            &down_wire,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
         )
         .expect("layer weights");
         let got = try_gemma4_layer(
