@@ -79,6 +79,10 @@ static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environ
 #[derive(Clone)]
 pub struct AppState {
     loaded_models: Arc<RwLock<HashMap<String, LoadedModel>>>,
+    /// Gemma 4 runtimes, keyed by model id. Populated only when the gemma4 serve
+    /// path is enabled (`CAMELID_GEMMA4_SERVE`) and a gemma4 model is loaded. This
+    /// is an additive, parallel path: the Llama/3B backend is untouched.
+    gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<crate::gemma4_runtime::Gemma4Runtime>>>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
@@ -93,6 +97,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
+            gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
             active_model_id: Arc::new(RwLock::new(None)),
@@ -210,6 +215,13 @@ pub struct HealthResponse {
     pub active_model_id: Option<String>,
     pub q8_runtime: Q8RuntimeHealth,
     pub execution_plan: Option<ExecutionPlan>,
+    /// Which backend serves the active model: "gemma4-runtime", "llama", or "none".
+    pub backend: &'static str,
+    /// Model family of the active model ("gemma4", "llama-family", ...), if loaded.
+    pub model_family: Option<&'static str>,
+    /// True when the gemma4 serve path is built (CAMELID_GEMMA4_SERVE) and a gemma4
+    /// runtime is loaded for the active model.
+    pub gemma4_available: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1168,7 +1180,23 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     let loaded_models = state.loaded_models.read().await;
     let model = active_id_lock.as_ref().and_then(|id| loaded_models.get(id));
     let loaded_now = !loaded_models.is_empty();
-    let generation_ready = model.is_some_and(loaded_model_generation_ready);
+    // Is the active model served by a gemma4 runtime?
+    let gemma4_available = match active_id_lock.as_ref() {
+        Some(id) => state.gemma4_runtimes.read().await.contains_key(id),
+        None => false,
+    };
+    let model_family = model.map(|m| model_family(&m.gguf));
+    let backend = if gemma4_available {
+        "gemma4-runtime"
+    } else if model.is_some() {
+        "llama"
+    } else {
+        "none"
+    };
+    // The gemma4 runtime (Q8-resident) is ready as soon as it is loaded; the Llama
+    // f32-budget check does not apply to it.
+    let generation_ready =
+        gemma4_available || model.is_some_and(loaded_model_generation_ready);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
@@ -1182,6 +1210,9 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         active_model_id: active_id_lock.clone(),
         q8_runtime: q8_runtime_health(),
         execution_plan,
+        backend,
+        model_family,
+        gemma4_available,
     })
 }
 
@@ -2311,6 +2342,236 @@ async fn load_model_from_path(
     load_model_from_path_with_activation(state, path, id, true).await
 }
 
+/// The Gemma 4 serve path is gated behind `CAMELID_GEMMA4_SERVE` (1/true/yes).
+/// When off, the existing Llama/3B backend behaves exactly as before.
+fn gemma4_serve_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_GEMMA4_SERVE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// Model family from the GGUF `general.architecture`.
+fn model_family(gguf: &GgufFile) -> &'static str {
+    match gguf.architecture() {
+        Some("gemma4") => "gemma4",
+        Some(
+            "llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "phi3" | "lfm2",
+        ) => "llama-family",
+        Some(_) => "other",
+        None => "unknown",
+    }
+}
+
+/// Build the Gemma chat prompt from OpenAI-style messages. Gemma turns are
+/// `<start_of_turn>{user|model}\n…<end_of_turn>\n`, and generation follows a
+/// trailing `<start_of_turn>model\n`. The tokenizer prepends `<bos>`
+/// (add_special). Gemma has no system role, so system text is folded into the
+/// next user turn. This is the single place the Gemma chat template lives.
+fn gemma4_chat_prompt(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    let mut pending_system = String::new();
+    for m in messages {
+        match m.role.as_str() {
+            "system" => {
+                if !pending_system.is_empty() {
+                    pending_system.push_str("\n\n");
+                }
+                pending_system.push_str(&m.content);
+            }
+            "assistant" => {
+                out.push_str("<start_of_turn>model\n");
+                out.push_str(&m.content);
+                out.push_str("<end_of_turn>\n");
+            }
+            _ => {
+                out.push_str("<start_of_turn>user\n");
+                if !pending_system.is_empty() {
+                    out.push_str(&pending_system);
+                    out.push_str("\n\n");
+                    pending_system.clear();
+                }
+                out.push_str(&m.content);
+                out.push_str("<end_of_turn>\n");
+            }
+        }
+    }
+    if !pending_system.is_empty() {
+        out.push_str("<start_of_turn>user\n");
+        out.push_str(&pending_system);
+        out.push_str("<end_of_turn>\n");
+    }
+    out.push_str("<start_of_turn>model\n");
+    out
+}
+
+/// Resolve the Gemma 4 runtime for a chat request, if this request targets one.
+/// Returns `Err(response)` to short-circuit with a clear error (a gemma4 model is
+/// loaded but its runtime is missing), `Ok(None)` to fall through to the Llama
+/// path, or `Ok(Some(runtime))` to serve via Gemma 4.
+async fn resolve_gemma4_runtime(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+) -> std::result::Result<Option<(String, Arc<crate::gemma4_runtime::Gemma4Runtime>)>, Response> {
+    let id = match req.model.clone() {
+        Some(m) => m,
+        None => match state.active_model_id.read().await.clone() {
+            Some(m) => m,
+            None => return Ok(None),
+        },
+    };
+    if let Some(runtime) = state.gemma4_runtimes.read().await.get(&id).cloned() {
+        return Ok(Some((id, runtime)));
+    }
+    // No runtime: if the model itself is gemma4, fail clearly rather than letting
+    // the Llama path produce garbage.
+    let is_gemma4 = state
+        .loaded_models
+        .read()
+        .await
+        .get(&id)
+        .map(|m| model_family(&m.gguf) == "gemma4")
+        .unwrap_or(false);
+    if is_gemma4 {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model_not_ready",
+            format!(
+                "gemma4 model '{id}' is loaded but its serve runtime is unavailable; \
+                 set CAMELID_GEMMA4_SERVE=1 and reload the model"
+            ),
+            None,
+        ));
+    }
+    Ok(None)
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Non-streaming Gemma 4 chat. Builds the gemma prompt, generates greedily on a
+/// blocking thread, and returns a minimal OpenAI-compatible response.
+async fn gemma4_chat_nonstreaming(
+    id: String,
+    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let prompt = gemma4_chat_prompt(&messages);
+    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let result =
+        tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
+    let (text, ids) = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                e.to_string(),
+                None,
+            )
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                format!("gemma4 generation task panicked: {e}"),
+                None,
+            )
+        }
+    };
+    let body = serde_json::json!({
+        "id": "chatcmpl-gemma4",
+        "object": "chat.completion",
+        "created": unix_secs(),
+        "model": id,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": "stop",
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Streaming Gemma 4 chat (SSE). Mirrors the OpenAI `chat.completion.chunk`
+/// shape: a role chunk, one content delta per generated token, a final
+/// finish_reason chunk, then `[DONE]`. Generation runs on a blocking thread and
+/// pushes deltas through an mpsc channel that this stream forwards.
+async fn gemma4_chat_streaming(
+    id: String,
+    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let prompt = gemma4_chat_prompt(&messages);
+    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let created = unix_secs();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+    tokio::task::spawn_blocking(move || {
+        let send_tx = tx.clone();
+        let result = runtime.generate_greedy_streaming(&prompt, max_tokens, |delta| {
+            let _ = send_tx.send(Ok(delta.to_string()));
+        });
+        if let Err(e) = result {
+            let _ = tx.send(Err(e.to_string()));
+        }
+    });
+
+    let events = async_stream::stream! {
+        // Role chunk.
+        let role = serde_json::json!({
+            "id": "chatcmpl-gemma4",
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": id,
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+        });
+        yield Ok::<Event, std::convert::Infallible>(Event::default().data(role.to_string()));
+
+        let mut errored = false;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(delta) => {
+                    let chunk = serde_json::json!({
+                        "id": "chatcmpl-gemma4",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": id,
+                        "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": null }],
+                    });
+                    yield Ok(Event::default().data(chunk.to_string()));
+                }
+                Err(e) => {
+                    let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
+                    yield Ok(Event::default().data(err.to_string()));
+                    errored = true;
+                    break;
+                }
+            }
+        }
+
+        if !errored {
+            let done = serde_json::json!({
+                "id": "chatcmpl-gemma4",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": id,
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+            });
+            yield Ok(Event::default().data(done.to_string()));
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(events).into_response()
+}
+
 async fn load_model_from_path_with_activation(
     state: &AppState,
     path: PathBuf,
@@ -2383,6 +2644,27 @@ async fn load_model_from_path_with_activation(
         *state.active_model_id.write().await = Some(id.clone());
         clear_prompt_prefix_cache(state);
     }
+
+    // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): load a
+    // Gemma4Runtime so /v1/chat can route to it. Fail clearly on error — never
+    // silently fall back to the Llama path (which would produce garbage here).
+    if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
+        let load_path = loaded.path.clone();
+        let runtime = tokio::task::spawn_blocking(move || {
+            crate::gemma4_runtime::Gemma4Runtime::load(&load_path)
+        })
+        .await
+        .map_err(|e| {
+            BackendError::InvalidModelMetadata(format!("gemma4 runtime load task panicked: {e}"))
+        })??;
+        state
+            .gemma4_runtimes
+            .write()
+            .await
+            .insert(id.clone(), Arc::new(runtime));
+        tracing::info!(model = %id, "gemma4 runtime loaded for serve path");
+    }
+
     Ok(loaded)
 }
 
@@ -3330,6 +3612,20 @@ async fn chat_completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE). Short-circuits
+    // if this request targets a loaded gemma4 runtime; otherwise falls through to
+    // the existing Llama/3B path unchanged.
+    match resolve_gemma4_runtime(&state, &req).await {
+        Ok(Some((id, runtime))) => {
+            return if req.stream.unwrap_or(false) {
+                gemma4_chat_streaming(id, runtime, &req).await
+            } else {
+                gemma4_chat_nonstreaming(id, runtime, &req).await
+            };
+        }
+        Ok(None) => {}
+        Err(resp) => return resp,
+    }
     // Capture the receipt stamp before the request is consumed. Receipts are
     // strictly opt-in and never silently attached.
     let receipt_stamp = if req.camelid_receipt.unwrap_or(false) {

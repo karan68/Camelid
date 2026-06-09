@@ -380,4 +380,59 @@ impl Gemma4Runtime {
         let text = self.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
     }
+
+    /// Greedy decode that emits the incremental decoded-text delta after each new
+    /// token via `on_delta`. The delta is computed by decoding the cumulative
+    /// generated sequence and yielding the newly-appended suffix, which keeps
+    /// SentencePiece spacing/multi-byte pieces correct (token-at-a-time decode
+    /// would mangle them). Returns the same `(text, ids)` as `generate_greedy`.
+    pub fn generate_greedy_streaming<F: FnMut(&str)>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        mut on_delta: F,
+    ) -> Result<(String, Vec<u32>)> {
+        let n_layers = self.layers.len();
+        let mut kc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let mut vc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
+        let eot: Vec<u32> = self
+            .tokenizer
+            .encode("<end_of_turn>", false, true)
+            .ok()
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.step(tok, pos, &mut kc, &mut vc)?;
+        }
+        let mut generated = Vec::new();
+        let mut emitted = String::new();
+        let mut pos = prompt_tokens.len();
+        for _ in 0..max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            // Decode cumulatively and emit only the newly-appended suffix.
+            let full = self.tokenizer.decode(&generated, true)?;
+            if let Some(delta) = full.strip_prefix(&emitted) {
+                if !delta.is_empty() {
+                    on_delta(delta);
+                }
+            }
+            emitted = full;
+            logits = self.step(next, pos, &mut kc, &mut vc)?;
+            pos += 1;
+        }
+        Ok((emitted, generated))
+    }
 }
