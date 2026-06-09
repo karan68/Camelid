@@ -99,14 +99,21 @@ New kernels required:
     `try_gemma4_ffn` + `metal_gemma4_ffn_matches_cpu` validate the whole sub-graph
     vs CPU. First composed gemma GPU sub-graph — proves dependent dispatches chain
     correctly without manual barriers.
-  - **5c NEXT** — attention sub-block (rms_norm → qkv GEMV → per-head QK/V norm →
-    rope → kv scatter → windowed attn → o GEMV → post_attn_norm → residual). Needs
-    encode helpers reusing: `rms_norm_per_head_pipeline`, `rope_rotate_pipeline`
-    (per-layer CPU cos/sin tables, pairing mode 1), `kv_scatter_pipeline`,
-    `attention_decode_pipeline` (windowed via kv_base_offset+count). Model on the
-    Llama `encode_attention_block` (line ~6660) but f32y + QK/V norm + post_attn_norm.
-  - **5d** — chain 5b+5c into the full single layer; parity vs CPU `step()`.
-- **STEP 6 — cross-layer KV sharing + sliding window across all 42 layers.**
+  - **5c DONE** — `encode_gemma4_attention` (rms_norm → qkv GEMV → per-head QK/V
+    norm → RoPE → KV scatter → windowed decode attn → o GEMV → post_attn_norm →
+    residual) + `encode_rms_norm_per_head` helper. `try_gemma4_attention` (prefilled
+    cache) + `metal_gemma4_attention_matches_cpu` validate the whole sub-graph vs a
+    full CPU attention reference (head_dim 256, GQA 2:1). Passed first try.
+  - **5b + 5c together cover every op in a gemma layer.** The full-layer chain (5d)
+    is mechanical composition — attention(in→mid) then ffn(mid→out) in one encoder —
+    but a 40-arg wrapper is ugly, so it folds into STEP 6 with a proper per-layer
+    weight-bundle struct (`Gemma4ResidentLayer`). Done there alongside the resident
+    weight residency + multi-layer orchestration.
+- **STEP 6 — full-layer chain (5d) + cross-layer KV sharing + sliding window across
+  all 42 layers.** Introduce a `Gemma4ResidentLayer` weight bundle so
+  `encode_gemma4_layer` = attention(in→mid) + ffn(mid→out) isn't a 40-arg call;
+  then drive all 42 layers with per-layer plan (head_dim/θ/window) + cross-layer KV
+  source from `Gemma4Metadata::layer_plan`.
 - **STEP 7 — PLE stream** (per-token `pli` at token start + per-layer 7-step
   injection on GPU with f32 GEMVs + geglu + norm + scale).
 - **STEP 8 — logits + soft-cap + sampling tail**, end-to-end resident token.
