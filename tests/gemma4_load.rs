@@ -52,9 +52,24 @@ fn gemma4_load_stages() {
         "final layer must be full attention"
     );
 
-    eprintln!("== stage 2: Tokenizer::from_gguf ==");
+    eprintln!("== stage 2: Tokenizer::from_gguf + parity vs llama.cpp ==");
     match Tokenizer::from_gguf(&gguf) {
-        Ok(_) => eprintln!("  tokenizer: OK"),
+        Ok(tok) => {
+            eprintln!("  tokenizer: OK");
+            // llama.cpp tokenized "The capital of France is" (add_special) to:
+            const ORACLE: &[u32] = &[2, 818, 5279, 529, 7001, 563];
+            match tok.encode("The capital of France is", true, false) {
+                Ok(ids) => {
+                    eprintln!("  encode -> {ids:?}");
+                    eprintln!("  oracle -> {ORACLE:?}");
+                    eprintln!(
+                        "  tokenizer parity: {}",
+                        if ids == ORACLE { "MATCH ✅" } else { "MISMATCH ❌" }
+                    );
+                }
+                Err(e) => eprintln!("  encode ERR -> {e}"),
+            }
+        }
         Err(e) => eprintln!("  tokenizer: ERR -> {e}"),
     }
 
