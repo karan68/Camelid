@@ -186,11 +186,15 @@ impl Tokenizer {
             .metadata_string("tokenizer.ggml.model")
             .ok_or(BackendError::TokenizerNotAvailable)?;
         let model = match model_name {
-            "llama" => TokenizerModel::LlamaSpm,
+            // Gemma uses a SentencePiece (unigram) tokenizer, the same mechanism as
+            // Llama SPM — tokens, scores, and the bos/eos/unk ids are all read from
+            // the GGUF below. (Gemma sets tokenizer.ggml.add_space_prefix=0; exact
+            // leading-space parity is a follow-up, construction works on the SPM path.)
+            "llama" | "gemma4" => TokenizerModel::LlamaSpm,
             "gpt2" => TokenizerModel::Gpt2Bpe,
             other => {
                 return Err(BackendError::UnsupportedTokenizer(format!(
-                    "unsupported tokenizer model {other:?}; currently supported: llama/SPM and GPT-2/BPE llama-bpe"
+                    "unsupported tokenizer model {other:?}; currently supported: llama/SPM, gemma4/SPM, and GPT-2/BPE llama-bpe"
                 )))
             }
         };
