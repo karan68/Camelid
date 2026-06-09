@@ -94,10 +94,17 @@ New kernels required:
     / residual via residual_add_pipeline). Metal's default compute encoder is
     SERIAL, so dependent dispatches chain in one encoder with no manual barriers
     (confirmed: `encode_ffn_block`).
-  - **5b NEXT** — `encode_gemma4_ffn` sub-block (rms_norm → gate/up GEMV → geglu →
-    down GEMV → post_ffw_norm → residual) in one command buffer, validated vs CPU.
-  - **5c** — attention sub-block (rms_norm → qkv GEMV → per-head QK/V norm → rope →
-    kv scatter → windowed attn → o GEMV → post_attn_norm → residual).
+  - **5b DONE** — `encode_gemma4_ffn` (rms_norm → gate/up GEMV → GeGLU → down GEMV
+    → post_ffw_norm → residual) as one serial command buffer, no readback;
+    `try_gemma4_ffn` + `metal_gemma4_ffn_matches_cpu` validate the whole sub-graph
+    vs CPU. First composed gemma GPU sub-graph — proves dependent dispatches chain
+    correctly without manual barriers.
+  - **5c NEXT** — attention sub-block (rms_norm → qkv GEMV → per-head QK/V norm →
+    rope → kv scatter → windowed attn → o GEMV → post_attn_norm → residual). Needs
+    encode helpers reusing: `rms_norm_per_head_pipeline`, `rope_rotate_pipeline`
+    (per-layer CPU cos/sin tables, pairing mode 1), `kv_scatter_pipeline`,
+    `attention_decode_pipeline` (windowed via kv_base_offset+count). Model on the
+    Llama `encode_attention_block` (line ~6660) but f32y + QK/V norm + post_attn_norm.
   - **5d** — chain 5b+5c into the full single layer; parity vs CPU `step()`.
 - **STEP 6 — cross-layer KV sharing + sliding window across all 42 layers.**
 - **STEP 7 — PLE stream** (per-token `pli` at token start + per-layer 7-step
