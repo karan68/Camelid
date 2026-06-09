@@ -5446,6 +5446,65 @@ pub fn try_gemma4_ple(
     Some(out)
 }
 
+/// Standalone gemma4 logits head: builds buffers, runs [`encode_gemma4_head`] in one
+/// command buffer, reads back the `vocab` soft-capped logits. `token_embd_wire` is
+/// the vocab-major Q8 embedding table in 34-byte wire blocks (`vocab * hidden/32`
+/// blocks). None if Metal unavailable or shapes invalid.
+#[cfg(target_os = "macos")]
+pub fn try_gemma4_head(
+    h_in: &[f32],
+    output_norm: &[f32],
+    token_embd_wire: &[u8],
+    vocab: usize,
+    softcap: f32,
+    eps: f32,
+) -> Option<Vec<f32>> {
+    const WIRE: usize = 34;
+    let hidden = h_in.len();
+    if hidden == 0 || !hidden.is_multiple_of(32) || vocab == 0 || output_norm.len() != hidden {
+        return None;
+    }
+    let bpr_hidden = hidden / 32;
+    if token_embd_wire.len() != vocab * bpr_hidden * WIRE {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let h_buf = k
+        .device
+        .new_buffer((hidden * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let logits_buf = k
+        .device
+        .new_buffer((vocab * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let embd_buf = k.device.new_buffer(
+        token_embd_wire.len() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    write_buffer_f32(&h_buf, h_in);
+    write_buffer_u8(&embd_buf, token_embd_wire);
+    let mut keep = Vec::new();
+    let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    encode_gemma4_head(
+        e,
+        k,
+        &mut keep,
+        &h_buf,
+        &logits_buf,
+        output_norm,
+        &embd_buf,
+        vocab,
+        softcap,
+        eps,
+    );
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; vocab];
+    read_buffer_f32(&logits_buf, &mut out);
+    drop(keep);
+    Some(out)
+}
+
 /// Standalone full gemma4 layer: builds buffers (incl. a prefilled cache), runs
 /// [`encode_gemma4_layer`] (attention → FFN) in one command buffer, reads back the
 /// hidden output. For validating the full-layer chain against CPU. None if Metal
@@ -7079,6 +7138,72 @@ fn encode_gemma4_ple(
         resid_n,
         scale_scalar,
     ]);
+}
+
+/// `output = cap * tanh(input / cap)` into the encoder (in-place safe). `scalar` =
+/// [n: u32 @0, cap: f32 @4].
+#[cfg(target_os = "macos")]
+fn encode_soft_cap_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    n: usize,
+) {
+    e.set_compute_pipeline_state(&k.soft_cap_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(output), 0);
+    e.set_buffer(2, Some(scalar), 0);
+    e.set_buffer(3, Some(scalar), 4);
+    dispatch_1d(e, &k.soft_cap_pipeline, n);
+}
+
+/// Encode the gemma4 logits head into the (serial) encoder, no readback: the final
+/// hidden `h_buf` → `logits_buf` (`vocab`): `normf = rms_norm(h, output_norm)`;
+/// `logits = token_embd · normf` (the tied embedding as the output projection — a
+/// single Q8 wire GEMV over the vocab-major table); `logits = cap·tanh(logits/cap)`
+/// in place when `softcap > 0`. Scratch goes into `keep`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_head(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    h_buf: &Buffer,
+    logits_buf: &Buffer,
+    output_norm: &[f32],
+    token_embd_w: &Buffer,
+    vocab: usize,
+    softcap: f32,
+    eps: f32,
+) {
+    let hidden = output_norm.len();
+    let bpr_hidden = hidden / 32;
+    let nb = |bytes: u64| pool_get(k, bytes);
+    let norm_w = nb((hidden * 4) as u64);
+    let normf = nb((hidden * 4) as u64);
+    let rms_scalar = nb(8);
+    let mm_scalar = nb(8);
+    let cap_scalar = nb(8);
+    write_buffer_f32(&norm_w, output_norm);
+    unsafe {
+        let r = rms_scalar.contents() as *mut u8;
+        *(r as *mut u32) = hidden as u32;
+        *(r.add(4) as *mut f32) = eps;
+        let m = mm_scalar.contents() as *mut u32;
+        *m = bpr_hidden as u32;
+        *m.add(1) = vocab as u32;
+        let c = cap_scalar.contents() as *mut u8;
+        *(c as *mut u32) = vocab as u32;
+        *(c.add(4) as *mut f32) = softcap;
+    }
+    encode_rms_norm_f32(e, k, h_buf, &norm_w, &normf, &rms_scalar);
+    encode_gemma4_q8_matmul(e, k, &normf, token_embd_w, logits_buf, &mm_scalar, vocab);
+    if softcap.is_finite() && softcap > 0.0 {
+        encode_soft_cap_f32(e, k, logits_buf, logits_buf, &cap_scalar, vocab);
+    }
+    keep.extend([norm_w, normf, rms_scalar, mm_scalar, cap_scalar]);
 }
 
 /// Opt-in: store the resident KV cache in f16 (half the KV bytes read per token at
@@ -10628,6 +10753,18 @@ pub fn try_gemma4_ple(
 }
 
 #[cfg(not(target_os = "macos"))]
+pub fn try_gemma4_head(
+    _h_in: &[f32],
+    _output_norm: &[f32],
+    _token_embd_wire: &[u8],
+    _vocab: usize,
+    _softcap: f32,
+    _eps: f32,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 pub struct ResidentDecodeState;
 
 #[cfg(not(target_os = "macos"))]
@@ -12826,6 +12963,73 @@ mod tests {
         for (a, b) in got.iter().zip(&want) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
         }
+    }
+
+    // Gemma's logits head on GPU (rms_norm(output_norm) -> tied token_embd GEMV ->
+    // soft_cap) must match the CPU reference, and the argmax (greedy next token) must
+    // agree.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_head_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        let hidden = 128usize;
+        let vocab = 160usize;
+        let eps = 1.0e-6f32;
+        let softcap = 30.0f32;
+        let h_in: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.12)
+            .collect();
+        let output_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.85 + (i as f32 % 5.0) * 0.05)
+            .collect();
+        // Vocab-major Q8 embedding table: row v is token v's embedding.
+        let mut wire = Vec::new();
+        let mut deq = Vec::new();
+        for v in 0..vocab {
+            let row: Vec<f32> = (0..hidden)
+                .map(|i| ((((v * hidden + i) % 31) as f32) - 15.0) * 0.05)
+                .collect();
+            let mut drow = vec![0.0f32; hidden];
+            for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
+                wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                for (j, &q) in blk.quants.iter().enumerate() {
+                    wire.push(q as u8);
+                    drow[b * 32 + j] = blk.scale * q as f32;
+                }
+            }
+            deq.push(drow);
+        }
+        // CPU reference: rms_norm -> matvec -> soft_cap.
+        let mss = h_in.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = (mss + eps).powf(-0.5);
+        let normf: Vec<f32> = (0..hidden)
+            .map(|i| h_in[i] * inv * output_norm[i])
+            .collect();
+        let want: Vec<f32> = deq
+            .iter()
+            .map(|row| {
+                let logit: f32 = row.iter().zip(&normf).map(|(a, b)| a * b).sum();
+                softcap * (logit / softcap).tanh()
+            })
+            .collect();
+
+        let got =
+            try_gemma4_head(&h_in, &output_norm, &wire, vocab, softcap, eps).expect("gemma4 head");
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 5.0e-3, "{a} != {b}");
+        }
+        // Greedy argmax must agree.
+        let amax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        assert_eq!(amax(&got), amax(&want));
     }
 
     #[cfg(target_os = "macos")]
