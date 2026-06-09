@@ -7752,6 +7752,10 @@ mod tests {
         assert_eq!(
             supported_row_ids,
             BTreeSet::from([
+                // `gemma4_e4b_it_q8_0` is `supported_exact_row_smoke`: exact-row
+                // generation + serve smoke only (token-identical to the reference),
+                // not bounded-context/perf/full support. Deliberately allowlisted.
+                "gemma4_e4b_it_q8_0",
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
