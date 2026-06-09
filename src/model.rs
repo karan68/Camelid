@@ -257,6 +257,83 @@ impl Gemma4Metadata {
             self.rope_freq_base_global
         }
     }
+
+    /// Per-layer decode plan for the GPU-resident runtime: resolves each layer's
+    /// per-type dims, RoPE θ, sliding window, and — for the trailing
+    /// `num_kv_shared_layers` layers that don't project their own K/V — which
+    /// earlier same-type layer's KV cache it reads. This is the single source of
+    /// truth for gemma's per-layer-type attention + cross-layer KV sharing, mirrored
+    /// from the CPU `Gemma4Runtime` (`first_kv_shared`, `last_sliding/full_layer`).
+    pub fn layer_plan(
+        &self,
+        block_count: usize,
+        heads: usize,
+        kv_heads: usize,
+    ) -> Vec<Gemma4LayerPlan> {
+        let first_kv_shared = block_count.saturating_sub(self.num_kv_shared_layers as usize);
+        // The last owning (non-shared) layer of each attention type — the cache a
+        // trailing shared layer of that type reads.
+        let last_sliding = (0..first_kv_shared)
+            .rev()
+            .find(|&l| self.is_sliding_layer(l))
+            .unwrap_or(0);
+        let last_global = (0..first_kv_shared)
+            .rev()
+            .find(|&l| !self.is_sliding_layer(l))
+            .unwrap_or(0);
+        (0..block_count)
+            .map(|l| {
+                let sliding = self.is_sliding_layer(l);
+                let head_dim = self.head_dim_at(l) as usize;
+                let owns_kv = l < first_kv_shared;
+                let kv_source_layer = if owns_kv {
+                    l
+                } else if sliding {
+                    last_sliding
+                } else {
+                    last_global
+                };
+                Gemma4LayerPlan {
+                    sliding,
+                    head_dim,
+                    q_dim: heads * head_dim,
+                    kv_dim: kv_heads * head_dim,
+                    theta: self.rope_freq_base_at(l),
+                    window: if sliding {
+                        Some(self.sliding_window as usize)
+                    } else {
+                        None
+                    },
+                    owns_kv,
+                    kv_source_layer,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Resolved per-layer attention geometry for the gemma4 GPU-resident decode graph
+/// (see [`Gemma4Metadata::layer_plan`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Gemma4LayerPlan {
+    /// Sliding (local) vs full (global) attention.
+    pub sliding: bool,
+    /// Per-head dim for this layer (256 sliding / 512 global on E4B).
+    pub head_dim: usize,
+    /// Query projection width = `heads * head_dim`.
+    pub q_dim: usize,
+    /// K/V projection width = `kv_heads * head_dim`.
+    pub kv_dim: usize,
+    /// RoPE base (θ) for this layer's type.
+    pub theta: f32,
+    /// `Some(window)` for sliding layers (attend `[pos+1-window ..= pos]`), `None`
+    /// for global layers (attend `[0 ..= pos]`).
+    pub window: Option<usize>,
+    /// True if this layer projects + caches its own K/V; false for the trailing
+    /// `num_kv_shared_layers` layers, which read `kv_source_layer`'s cache.
+    pub owns_kv: bool,
+    /// Layer whose KV cache this layer reads (itself when `owns_kv`).
+    pub kv_source_layer: usize,
 }
 
 /// Gemma 4's per-layer attention schedule: a 5:1 sliding:full repeat (every 6th
@@ -276,7 +353,63 @@ fn gemma4_sliding_schedule(block_count: u32) -> Vec<bool> {
 
 #[cfg(test)]
 mod gemma4_tests {
-    use super::gemma4_sliding_schedule;
+    use super::{gemma4_sliding_schedule, Gemma4Metadata};
+
+    fn e4b_meta() -> Gemma4Metadata {
+        Gemma4Metadata {
+            head_dim_sliding: 256,
+            head_dim_global: 512,
+            rope_freq_base_global: 1_000_000.0,
+            rope_freq_base_sliding: 10_000.0,
+            rope_dim_global: 512,
+            rope_dim_sliding: 256,
+            sliding_window: 512,
+            num_kv_shared_layers: 18,
+            per_layer_input_dim: 256,
+            final_logit_softcapping: Some(30.0),
+            layer_is_sliding: gemma4_sliding_schedule(42),
+        }
+    }
+
+    #[test]
+    fn layer_plan_resolves_dims_window_and_kv_sharing() {
+        let meta = e4b_meta();
+        let plan = meta.layer_plan(42, 8, 2);
+        assert_eq!(plan.len(), 42);
+        // first_kv_shared = 42 - 18 = 24.
+        for (l, p) in plan.iter().enumerate() {
+            assert_eq!(p.owns_kv, l < 24, "owns_kv layer {l}");
+            assert_eq!(p.q_dim, 8 * p.head_dim);
+            assert_eq!(p.kv_dim, 2 * p.head_dim);
+            if p.sliding {
+                assert_eq!(p.head_dim, 256);
+                assert_eq!(p.window, Some(512));
+                assert_eq!(p.theta, 10_000.0);
+            } else {
+                assert_eq!(p.head_dim, 512);
+                assert_eq!(p.window, None);
+                assert_eq!(p.theta, 1_000_000.0);
+            }
+            // Owning layers read their own cache; the trailing shared layers read an
+            // earlier OWNING layer of the SAME attention type.
+            if p.owns_kv {
+                assert_eq!(p.kv_source_layer, l);
+            } else {
+                let src = &plan[p.kv_source_layer];
+                assert!(
+                    src.owns_kv,
+                    "layer {l} source {} must own KV",
+                    p.kv_source_layer
+                );
+                assert_eq!(src.sliding, p.sliding, "layer {l} source must match type");
+                assert!(p.kv_source_layer < 24);
+            }
+        }
+        // Spot checks: last sliding/global owning layer before the shared block is 22/23.
+        assert_eq!(plan[24].kv_source_layer, 22); // layer 24 sliding -> last owning sliding
+        assert_eq!(plan[41].kv_source_layer, 23); // layer 41 (forced global) -> last owning global
+        assert!(!plan[41].sliding);
+    }
 
     #[test]
     fn sliding_schedule_is_5to1_with_full_final_layer() {

@@ -9318,6 +9318,129 @@ impl Drop for ResidentDecodeState {
     }
 }
 
+/// Gate for the gemma4 GPU-resident decode path (off by default until the full
+/// graph is assembled and end-to-end parity is proven).
+#[cfg(target_os = "macos")]
+pub fn gemma4_gpu_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CAMELID_GEMMA4_GPU")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
+/// GPU-resident decode session state for gemma4 — allocation scaffolding. Holds the
+/// per-layer KV cache (each sized to that layer's per-type head_dim, and allocated
+/// ONLY for layers that own their K/V; the trailing cross-shared layers read an
+/// earlier same-type layer's cache, so their slot is `None`), the ping-pong hidden
+/// buffers, and the gate/done events. The per-token forward graph is layered on in a
+/// later port step; until then most fields are intentionally unread.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)] // fields consumed by the forward graph (later port step)
+pub struct Gemma4ResidentState {
+    plan: Vec<crate::model::Gemma4LayerPlan>,
+    n_kv_heads: usize,
+    hidden: usize,
+    eps: f32,
+    /// Positions the KV cache is currently allocated for; grown toward `cap` later.
+    max_positions: usize,
+    /// Hard ceiling on `max_positions` (the model context length).
+    cap: usize,
+    /// KV positions currently materialized (seeded history + appended tokens).
+    filled: usize,
+    /// Per layer: `Some` for owning layers, `None` for the shared (read-source) layers.
+    cache_k: Vec<Option<Buffer>>,
+    cache_v: Vec<Option<Buffer>>,
+    buf_a: Buffer,
+    buf_b: Buffer,
+    mid: Buffer,
+    gate_event: metal::SharedEvent,
+    done_event: metal::SharedEvent,
+    event_counter: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl Gemma4ResidentState {
+    /// Allocate the resident KV cache + scratch for a gemma4 decode session.
+    /// `max_positions` is the initial KV capacity; `cap` is the hard ceiling
+    /// (context length). Returns None if Metal is unavailable or shapes are invalid.
+    pub fn new(
+        plan: Vec<crate::model::Gemma4LayerPlan>,
+        n_kv_heads: usize,
+        hidden: usize,
+        eps: f32,
+        max_positions: usize,
+        cap: usize,
+    ) -> Option<Self> {
+        if plan.is_empty()
+            || n_kv_heads == 0
+            || hidden == 0
+            || max_positions == 0
+            || cap < max_positions
+        {
+            return None;
+        }
+        let k = metal_linear_kernel()?;
+        let fbuf = |n: usize| {
+            k.device
+                .new_buffer((n * 4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        // Owning layers get a cache sized to their per-type head_dim; shared layers
+        // hold None and read their `kv_source_layer`'s cache at attention time.
+        let kv_buf = |p: &crate::model::Gemma4LayerPlan| {
+            p.owns_kv
+                .then(|| fbuf(n_kv_heads * max_positions * p.head_dim))
+        };
+        let cache_k: Vec<Option<Buffer>> = plan.iter().map(kv_buf).collect();
+        let cache_v: Vec<Option<Buffer>> = plan.iter().map(kv_buf).collect();
+        Some(Self {
+            plan,
+            n_kv_heads,
+            hidden,
+            eps,
+            max_positions,
+            cap,
+            filled: 0,
+            cache_k,
+            cache_v,
+            buf_a: fbuf(hidden),
+            buf_b: fbuf(hidden),
+            mid: fbuf(hidden),
+            gate_event: k.device.new_shared_event(),
+            done_event: k.device.new_shared_event(),
+            event_counter: 0,
+        })
+    }
+
+    /// Byte length of layer `l`'s K-cache buffer, or None for a shared layer.
+    #[cfg(test)]
+    fn cache_k_len(&self, l: usize) -> Option<u64> {
+        self.cache_k[l].as_ref().map(|b| b.length())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn gemma4_gpu_enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+pub struct Gemma4ResidentState;
+
+#[cfg(not(target_os = "macos"))]
+impl Gemma4ResidentState {
+    pub fn new(
+        _plan: Vec<crate::model::Gemma4LayerPlan>,
+        _n_kv_heads: usize,
+        _hidden: usize,
+        _eps: f32,
+        _max_positions: usize,
+        _cap: usize,
+    ) -> Option<Self> {
+        None
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 pub struct ResidentDecodeState;
 
@@ -10427,6 +10550,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Gemma4ResidentState allocates a per-layer KV cache sized to each layer's
+    // per-type head_dim, and only for layers that own their K/V — the trailing
+    // cross-shared layers hold None and read an earlier layer's cache.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_resident_state_allocates_per_layer_kv() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::model::Gemma4LayerPlan;
+        let mk = |sliding, head_dim, owns_kv, src| Gemma4LayerPlan {
+            sliding,
+            head_dim,
+            q_dim: 2 * head_dim,
+            kv_dim: head_dim,
+            theta: 1.0,
+            window: if sliding { Some(16) } else { None },
+            owns_kv,
+            kv_source_layer: src,
+        };
+        // 2 owning (sliding hd=4, global hd=8), then 2 shared reading them.
+        let plan = vec![
+            mk(true, 4, true, 0),
+            mk(false, 8, true, 1),
+            mk(true, 4, false, 0),
+            mk(false, 8, false, 1),
+        ];
+        let n_kv_heads = 1usize;
+        let hidden = 16usize;
+        let max_positions = 32usize;
+        let st = Gemma4ResidentState::new(plan, n_kv_heads, hidden, 1.0e-6, max_positions, 64)
+            .expect("resident state");
+        let bytes = |head_dim: usize| (n_kv_heads * max_positions * head_dim * 4) as u64;
+        assert_eq!(st.cache_k_len(0), Some(bytes(4))); // owning sliding
+        assert_eq!(st.cache_k_len(1), Some(bytes(8))); // owning global
+        assert_eq!(st.cache_k_len(2), None); // shared sliding
+        assert_eq!(st.cache_k_len(3), None); // shared global
+                                             // Bad shapes are rejected.
+        assert!(Gemma4ResidentState::new(vec![], 1, 16, 1.0e-6, 8, 16).is_none());
     }
 
     #[cfg(target_os = "macos")]
