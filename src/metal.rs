@@ -5775,6 +5775,7 @@ impl Gemma4ResidentModel {
     /// its K/V into the PERSISTENT cache at `position`) + PLE + head in ONE command
     /// buffer, and returns the `vocab` soft-capped logits. `inputs[l]` carries this
     /// layer's RoPE tables, `pli`, and window start (CPU-computed for `position`).
+    #[allow(clippy::needless_range_loop)] // layer index `l` indexes several parallel arrays
     pub fn forward_token(
         &self,
         h0: &[f32],

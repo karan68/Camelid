@@ -9,6 +9,11 @@
 //! Run: `CAMELID_GEMMA4_GGUF=/path/gemma-4-E4B-it-Q8_0.gguf \
 //!       cargo test --test gemma4_forward -- --nocapture`
 
+// Reference test: clarity over clippy idioms. The index loops mirror the math 1:1,
+// the float constants are full-precision to match llama.cpp, and PROMPT_TOKENS
+// documents the prompt even when only the count is used.
+#![allow(clippy::needless_range_loop, clippy::excessive_precision, dead_code)]
+
 use std::path::PathBuf;
 
 use camelid::gguf::read_metadata;

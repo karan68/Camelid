@@ -34,6 +34,9 @@ pub(crate) fn embedding_scale(hidden_size: u32) -> f32 {
 /// `gelu_pytorch_tanh` — the tanh approximation of GELU used by Gemma's GeGLU MLP.
 ///
 /// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
+// The constants are written to full precision to match the reference exactly; the
+// extra digits are intentional (don't let clippy round them and shift the output).
+#[allow(clippy::excessive_precision)]
 pub(crate) fn gelu_tanh(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_56; // sqrt(2/pi)
     const COEFF: f32 = 0.044_715;
