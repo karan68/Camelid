@@ -145,28 +145,28 @@ New kernels required:
     window_start); PLE via `Gemma4ResidentPle`. Validated
     (`metal_gemma4_forward_matches_composed_pieces`) against the same pipeline built
     from the individually-validated `try_*` pieces. The GPU forward is complete.
-  - **9b (real-model wiring + the payoff) — IN PROGRESS**:
-    1. **Weight residency DONE** — `Gemma4ResidentLayer::from_wire_pages` builds a
-       layer's weights from per-tensor `WirePages` via `q8_wire_nocopy_buffer` (GPU
-       reads in place, no 8GB copy). Validated identical to `from_wire`
-       (`metal_gemma4_layer_from_wire_pages_matches_copy`). token_embd +
-       per_layer_token_embd will load the same way in the runtime.
-    1b. **Still needed — stateful resident forward**: a `Gemma4ResidentModel` holding
-       resident weights + token_embd + PERSISTENT caches (allocated once, scattered
-       per token) + a `forward_token(h0, inputs, position) -> logits`. Refactor of
-       `try_gemma4_forward` to stateful (no per-token weight/embd copy — required for
-       both correctness across tokens AND a valid benchmark; `try_gemma4_forward`
-       copies the 0.7GB token_embd per call).
-    2. **Per-token CPU prep** (reuse `step()` math): embedding gather × √hidden → h0;
-       `pli` (per_layer_token_embd Q8 gather + per_layer_model_proj f32 matvec +
-       per_layer_proj_norm); per-layer cos/sin from `rope_freq_base_at` + position;
-       window_start per `layer_plan`.
-    3. **Drive** `try_gemma4_forward` per token (or add `Gemma4ResidentState::
-       forward_token`), readback logits, argmax. Gate on `gemma4_gpu_enabled()`.
-    4. **Validate**: `tests/gemma4_forward.rs` greedy decode emits identical token
-       ids; then decode **benchmark** (target ~13–15 tok/s vs the ~6 CPU baseline).
-    Risk: the WirePages path is memory-critical on the 16GB box (8GB anonymous,
-    single-copy); verify residency before trusting the bench. Off by default.
+  - **9b (real-model wiring) — DONE: bit-parity achieved.**
+    - **Weight residency**: `Gemma4ResidentLayer::from_wire_pages` (nocopy `WirePages`
+      via `q8_wire_nocopy_buffer`, no 8GB copy; validated vs `from_wire`).
+    - **Stateful runtime**: `Gemma4ResidentModel` (resident weights + token_embd +
+      PERSISTENT caches + `forward_token`); `Gemma4GpuRuntime` in gemma4_runtime.rs
+      loads the model and drives it. CLI `camelid gemma4-generate-gpu`.
+    - **Per-token CPU prep** reuses `step()` math: embedding × √hidden → h0; `pli`;
+      per-layer dual-θ cos/sin; window_start. **Attention score scale = 1.0** (gemma
+      folds it into the QK-normed query — `step()` uses no explicit scale).
+    - **THE BUG (real-scale only)**: gelu_mul/soft_cap drove `tanh`'s arg to ~1e6 on
+      real activations → MSL `tanh` does `exp(2*arg)` → inf/inf = NaN (CPU libm
+      saturates). Fix: clamp the tanh arg to [-15,15]. Synthetic tests had small
+      activations so never hit it — now regression-tested (gelu/soft_cap large-arg,
+      layer test at real dims, GEMV at 80/320 blocks/row).
+    - **RESULT**: `The capital of France is` →
+      `[9079, 236761, 108, 1018, 14977, 53121, 2900, 563, 506, 5279, 529, 7001]` =
+      "Paris." — **token-identical to CPU/llama.cpp.**
+    - **Perf (open)**: ~4.77 tok/s (decode ~57 GB/s) — parity with the CPU sdot path,
+      NOT yet the ~120 GB/s wall. Next: recycle scratch (pool_recycle) instead of
+      realloc/token; pipeline tokens (encode-ahead, skip commit+wait stall); move the
+      per-token `pli` off the critical path; consider a GPU argmax tail to drop the
+      262k-logit readback. The forward graph itself is correct & complete.
 
 ## CI / safety notes
 
