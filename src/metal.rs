@@ -47,6 +47,7 @@ struct MetalLinearKernel {
     silu_mul_pipeline: ComputePipelineState,
     gelu_mul_pipeline: ComputePipelineState,
     soft_cap_pipeline: ComputePipelineState,
+    scale_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
     attention_decode_kv16_pipeline: ComputePipelineState,
@@ -1474,6 +1475,19 @@ kernel void soft_cap_f32(
     if (gid >= n) return;
     float v = input[gid];
     output[gid] = cap * tanh(v / cap);
+}
+
+// Scale a vector by a constant: output = input * s. Used for Gemma's PLE per-layer
+// output scale: h <- (h + ple_proj) * ple_output_scale.
+kernel void scale_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant float& s [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    output[gid] = input[gid] * s;
 }
 
 // Forward RoPE rotation in-place across all heads. The per-pair cos/sin tables are
@@ -3732,6 +3746,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let soft_cap_pipeline = device
                 .new_compute_pipeline_state_with_function(&soft_cap_function)
                 .ok()?;
+            let scale_function = elementwise_library.get_function("scale_f32", None).ok()?;
+            let scale_pipeline = device
+                .new_compute_pipeline_state_with_function(&scale_function)
+                .ok()?;
             let rope_rotate_function = elementwise_library
                 .get_function("rope_rotate_f32", None)
                 .ok()?;
@@ -4047,6 +4065,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 silu_mul_pipeline,
                 gelu_mul_pipeline,
                 soft_cap_pipeline,
+                scale_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
                 attention_decode_kv16_pipeline,
@@ -5364,6 +5383,65 @@ pub fn try_gemma4_attention(
     cb.wait_until_completed();
     let mut out = vec![0.0f32; hidden];
     read_buffer_f32(&out_buf, &mut out);
+    drop(keep);
+    Some(out)
+}
+
+/// Standalone gemma4 PLE per-layer injection: builds buffers, runs
+/// [`encode_gemma4_ple`] in one command buffer, reads back the updated hidden.
+/// `pli_l` is this layer's per-token Per-Layer-Embedding input (CPU-computed);
+/// `ple_inp_gate` (output-major `[ple_dim][hidden]`) and `ple_proj`
+/// (`[hidden][ple_dim]`) are the f32 PLE matrices. None if Metal unavailable or
+/// shapes invalid.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+pub fn try_gemma4_ple(
+    h_in: &[f32],
+    pli_l: &[f32],
+    ple_inp_gate: &[f32],
+    ple_proj: &[f32],
+    post_norm: &[f32],
+    output_scale: f32,
+    eps: f32,
+    ple_dim: usize,
+) -> Option<Vec<f32>> {
+    let hidden = h_in.len();
+    if hidden == 0
+        || ple_dim == 0
+        || pli_l.len() != ple_dim
+        || ple_inp_gate.len() != ple_dim * hidden
+        || ple_proj.len() != hidden * ple_dim
+        || post_norm.len() != hidden
+    {
+        return None;
+    }
+    let k = metal_linear_kernel()?;
+    let h_buf = k
+        .device
+        .new_buffer((hidden * 4) as u64, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&h_buf, h_in);
+    let mut keep = Vec::new();
+    let cb = k.queue.new_command_buffer();
+    let e = cb.new_compute_command_encoder();
+    encode_gemma4_ple(
+        e,
+        k,
+        &mut keep,
+        &h_buf,
+        pli_l,
+        ple_inp_gate,
+        ple_proj,
+        post_norm,
+        output_scale,
+        eps,
+        hidden,
+        ple_dim,
+    );
+    e.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    let mut out = vec![0.0f32; hidden];
+    read_buffer_f32(&h_buf, &mut out);
     drop(keep);
     Some(out)
 }
@@ -6856,6 +6934,151 @@ fn encode_gemma4_layer(
         &layer.down_w,
         layer.ffn_dim,
     );
+}
+
+/// f32 dense output-major GEMV into the encoder: `out[o] = Σ_i w[o*rows + i]·input[i]`
+/// for `o in 0..cols`. Matches gemma's `f32_matvec(w, in_dim=rows, out_dim=cols, x)`
+/// (the PLE matrices are stored output-major). `scalar` = [rows: u32 @0, cols: u32 @4].
+#[cfg(target_os = "macos")]
+fn encode_linear_transposed_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    weights: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    cols: usize,
+) {
+    e.set_compute_pipeline_state(&k.transposed_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weights), 0);
+    e.set_buffer(2, Some(output), 0);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 4);
+    dispatch_1d(e, &k.transposed_pipeline, cols);
+}
+
+/// `output = input * s` into the encoder. `scalar` = [n: u32 @0, s: f32 @4].
+#[cfg(target_os = "macos")]
+fn encode_scale_f32(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    input: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    n: usize,
+) {
+    e.set_compute_pipeline_state(&k.scale_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(output), 0);
+    e.set_buffer(2, Some(scalar), 0);
+    e.set_buffer(3, Some(scalar), 4);
+    dispatch_1d(e, &k.scale_pipeline, n);
+}
+
+/// Encode Gemma's per-layer Per-Layer-Embedding injection into the (serial) encoder,
+/// updating `h_buf` in place: `h <- (h + ple_proj·gelu(ple_inp_gate·h ⊙ pli)) * scale`.
+/// Concretely: `gated = ple_inp_gate · h` (f32 GEMV, hidden→ple_dim); `gated =
+/// gelu_tanh(gated) · pli`; `proj = ple_proj · gated` (f32 GEMV, ple_dim→hidden);
+/// `pnv = rms_norm(proj, post_norm)`; `h = (h + pnv) * output_scale`. `pli` (the
+/// per-layer input for this token) is computed on the CPU once per token and passed
+/// in. The PLE matrices are f32. Scratch goes into `keep`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_ple(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    h_buf: &Buffer,
+    pli_l: &[f32],
+    ple_inp_gate: &[f32],
+    ple_proj: &[f32],
+    post_norm: &[f32],
+    output_scale: f32,
+    eps: f32,
+    hidden: usize,
+    ple_dim: usize,
+) {
+    let nb = |bytes: u64| pool_get(k, bytes);
+    let f32b = |n: usize| nb((n * 4) as u64);
+    let inp_gate_buf = f32b(ple_inp_gate.len());
+    let proj_w_buf = f32b(ple_proj.len());
+    let postnorm_buf = f32b(hidden);
+    let pli_buf = f32b(ple_dim);
+    let gate_buf = f32b(ple_dim);
+    let gated_buf = f32b(ple_dim);
+    let proj_buf = f32b(hidden);
+    let pnv_buf = f32b(hidden);
+    let summed_buf = f32b(hidden);
+    let ig_scalar = nb(8);
+    let pj_scalar = nb(8);
+    let geglu_n = nb(4);
+    let rms_scalar = nb(8);
+    let resid_n = nb(4);
+    let scale_scalar = nb(8);
+
+    write_buffer_f32(&inp_gate_buf, ple_inp_gate);
+    write_buffer_f32(&proj_w_buf, ple_proj);
+    write_buffer_f32(&postnorm_buf, post_norm);
+    write_buffer_f32(&pli_buf, pli_l);
+    unsafe {
+        let set2 = |buf: &Buffer, a: u32, b: u32| {
+            let p = buf.contents() as *mut u32;
+            *p = a;
+            *p.add(1) = b;
+        };
+        set2(&ig_scalar, hidden as u32, ple_dim as u32); // rows, cols
+        set2(&pj_scalar, ple_dim as u32, hidden as u32);
+        *(geglu_n.contents() as *mut u32) = ple_dim as u32;
+        let r = rms_scalar.contents() as *mut u8;
+        *(r as *mut u32) = hidden as u32;
+        *(r.add(4) as *mut f32) = eps;
+        *(resid_n.contents() as *mut u32) = hidden as u32;
+        let s = scale_scalar.contents() as *mut u8;
+        *(s as *mut u32) = hidden as u32;
+        *(s.add(4) as *mut f32) = output_scale;
+    }
+
+    encode_linear_transposed_f32(e, k, h_buf, &inp_gate_buf, &gate_buf, &ig_scalar, ple_dim);
+    encode_binary(
+        e,
+        &k.gelu_mul_pipeline,
+        &gate_buf,
+        &pli_buf,
+        &gated_buf,
+        &geglu_n,
+        ple_dim,
+    );
+    encode_linear_transposed_f32(e, k, &gated_buf, &proj_w_buf, &proj_buf, &pj_scalar, hidden);
+    encode_rms_norm_f32(e, k, &proj_buf, &postnorm_buf, &pnv_buf, &rms_scalar);
+    encode_binary(
+        e,
+        &k.residual_add_pipeline,
+        h_buf,
+        &pnv_buf,
+        &summed_buf,
+        &resid_n,
+        hidden,
+    );
+    encode_scale_f32(e, k, &summed_buf, h_buf, &scale_scalar, hidden);
+
+    keep.extend([
+        inp_gate_buf,
+        proj_w_buf,
+        postnorm_buf,
+        pli_buf,
+        gate_buf,
+        gated_buf,
+        proj_buf,
+        pnv_buf,
+        summed_buf,
+        ig_scalar,
+        pj_scalar,
+        geglu_n,
+        rms_scalar,
+        resid_n,
+        scale_scalar,
+    ]);
 }
 
 /// Opt-in: store the resident KV cache in f16 (half the KV bytes read per token at
@@ -10390,6 +10613,21 @@ pub fn try_gemma4_layer(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub fn try_gemma4_ple(
+    _h_in: &[f32],
+    _pli_l: &[f32],
+    _ple_inp_gate: &[f32],
+    _ple_proj: &[f32],
+    _post_norm: &[f32],
+    _output_scale: f32,
+    _eps: f32,
+    _ple_dim: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 pub struct ResidentDecodeState;
 
 #[cfg(not(target_os = "macos"))]
@@ -12523,6 +12761,70 @@ mod tests {
         drop(keep);
         for (a, b) in got.iter().zip(&want) {
             assert!((a - b).abs() < 4.0e-2, "{a} != {b}");
+        }
+    }
+
+    // Gemma's PLE per-layer injection on GPU (ple_inp_gate GEMV -> gelu*pli ->
+    // ple_proj GEMV -> rms_norm(post_norm) -> residual -> output_scale) must match the
+    // CPU reference (gemma4_runtime's per-layer PLE step).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ple_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let hidden = 128usize;
+        let ple_dim = 64usize;
+        let eps = 1.0e-6f32;
+        let output_scale = 0.061f32;
+        let h_in: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let pli: Vec<f32> = (0..ple_dim)
+            .map(|i| ((i as f32 % 9.0) - 4.0) * 0.2)
+            .collect();
+        // Output-major: inp_gate[o*hidden + i] (o in 0..ple_dim), proj[o*ple_dim + i].
+        let inp_gate: Vec<f32> = (0..ple_dim * hidden)
+            .map(|n| (((n % 29) as f32) - 14.0) * 0.02)
+            .collect();
+        let proj_w: Vec<f32> = (0..hidden * ple_dim)
+            .map(|n| (((n % 23) as f32) - 11.0) * 0.03)
+            .collect();
+        let post_norm: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 % 5.0) * 0.04).collect();
+
+        // CPU reference.
+        let mut gated = vec![0.0f32; ple_dim];
+        for (o, g) in gated.iter_mut().enumerate() {
+            let dot: f32 = (0..hidden)
+                .map(|i| inp_gate[o * hidden + i] * h_in[i])
+                .sum();
+            *g = crate::inference::gemma4::gelu_tanh(dot) * pli[o];
+        }
+        let mut proj = vec![0.0f32; hidden];
+        for (o, pr) in proj.iter_mut().enumerate() {
+            *pr = (0..ple_dim)
+                .map(|i| proj_w[o * ple_dim + i] * gated[i])
+                .sum();
+        }
+        let mss = proj.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = (mss + eps).powf(-0.5);
+        let want: Vec<f32> = (0..hidden)
+            .map(|i| (h_in[i] + proj[i] * inv * post_norm[i]) * output_scale)
+            .collect();
+
+        let got = try_gemma4_ple(
+            &h_in,
+            &pli,
+            &inp_gate,
+            &proj_w,
+            &post_norm,
+            output_scale,
+            eps,
+            ple_dim,
+        )
+        .expect("gemma4 ple");
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
         }
     }
 
