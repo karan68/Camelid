@@ -130,7 +130,13 @@ New kernels required:
   per-token `pli` (per_layer_token_embd Q8 gather + per_layer_model_proj f32 matvec
   + norms) is computed on CPU once per token (depends only on the input embedding)
   and passed in — wired in the runtime (STEP 9).
-- **STEP 8 — logits + soft-cap + sampling tail**, end-to-end resident token.
+- **STEP 8 — logits + soft-cap. DONE.** `encode_gemma4_head`:
+  `normf = rms_norm(h, output_norm)` → `logits = token_embd · normf` (tied
+  vocab-major Q8 embedding as output projection, one wire GEMV) →
+  `cap·tanh(logits/cap)` in place. New `encode_soft_cap_f32` helper. Validated by
+  `metal_gemma4_head_matches_cpu` (logits + greedy-argmax agreement). Greedy
+  sampling reads logits back + argmaxes on CPU (the one end-of-token readback);
+  GPU `argmax_f32_greedy` is a later fast-path option.
 - **STEP 9 — end-to-end parity** (`tests/gemma4_forward.rs` greedy decode must
   emit identical token ids) + **benchmark** vs the 6 tok/s CPU baseline. Gate the
   whole path behind `CAMELID_GEMMA4_GPU` (off by default until proven).
