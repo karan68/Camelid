@@ -44,6 +44,8 @@ struct MetalLinearKernel {
     rms_norm_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
+    gelu_mul_pipeline: ComputePipelineState,
+    soft_cap_pipeline: ComputePipelineState,
     rope_rotate_pipeline: ComputePipelineState,
     attention_decode_pipeline: ComputePipelineState,
     attention_decode_kv16_pipeline: ComputePipelineState,
@@ -1399,6 +1401,37 @@ kernel void silu_mul_f32(
     if (gid >= n) return;
     float g = gate[gid];
     output[gid] = (g / (1.0 + exp(-g))) * up[gid];
+}
+
+// GeGLU activation for Gemma's MLP: gelu_pytorch_tanh(gate) * up. Mirrors the CPU
+// reference inference::gemma4::gelu_tanh exactly (same constants), so the GPU FFN
+// stays parity-locked to llama.cpp.
+kernel void gelu_mul_f32(
+    device const float* gate [[buffer(0)]],
+    device const float* up [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float x = gate[gid];
+    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    float gelu = 0.5f * x * (1.0f + tanh(inner));
+    output[gid] = gelu * up[gid];
+}
+
+// Final-logit soft-cap: output = cap * tanh(input / cap). Mirrors the CPU
+// reference inference::gemma4::soft_cap_in_place (cap = 30 for Gemma 4).
+kernel void soft_cap_f32(
+    device const float* input [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    constant float& cap [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= n) return;
+    float v = input[gid];
+    output[gid] = cap * tanh(v / cap);
 }
 
 // Forward RoPE rotation in-place across all heads. The per-pair cos/sin tables are
@@ -3639,6 +3672,18 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let silu_mul_pipeline = device
                 .new_compute_pipeline_state_with_function(&silu_mul_function)
                 .ok()?;
+            let gelu_mul_function = elementwise_library
+                .get_function("gelu_mul_f32", None)
+                .ok()?;
+            let gelu_mul_pipeline = device
+                .new_compute_pipeline_state_with_function(&gelu_mul_function)
+                .ok()?;
+            let soft_cap_function = elementwise_library
+                .get_function("soft_cap_f32", None)
+                .ok()?;
+            let soft_cap_pipeline = device
+                .new_compute_pipeline_state_with_function(&soft_cap_function)
+                .ok()?;
             let rope_rotate_function = elementwise_library
                 .get_function("rope_rotate_f32", None)
                 .ok()?;
@@ -3951,6 +3996,8 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 rms_norm_pipeline,
                 residual_add_pipeline,
                 silu_mul_pipeline,
+                gelu_mul_pipeline,
+                soft_cap_pipeline,
                 rope_rotate_pipeline,
                 attention_decode_pipeline,
                 attention_decode_kv16_pipeline,
@@ -5010,6 +5057,72 @@ pub fn try_residual_add_f32(a: &[f32], b: &[f32]) -> Option<Vec<f32>> {
 pub fn try_silu_mul_f32(gate: &[f32], up: &[f32]) -> Option<Vec<f32>> {
     let kernel = metal_linear_kernel()?;
     try_binary_elementwise_f32(&kernel.silu_mul_pipeline, gate, up)
+}
+
+/// GPU GeGLU activation (Gemma MLP): output = gelu_pytorch_tanh(gate) * up. Same
+/// buffer shape as silu-mul. None if Metal unavailable.
+#[cfg(target_os = "macos")]
+pub fn try_gelu_mul_f32(gate: &[f32], up: &[f32]) -> Option<Vec<f32>> {
+    let kernel = metal_linear_kernel()?;
+    try_binary_elementwise_f32(&kernel.gelu_mul_pipeline, gate, up)
+}
+
+/// GPU final-logit soft-cap: output = cap * tanh(input / cap). A non-finite or
+/// non-positive cap returns the input unchanged (matches the CPU reference). None
+/// if Metal unavailable.
+#[cfg(target_os = "macos")]
+pub fn try_soft_cap_f32(input: &[f32], cap: f32) -> Option<Vec<f32>> {
+    if input.is_empty() {
+        return None;
+    }
+    if !cap.is_finite() || cap <= 0.0 {
+        return Some(input.to_vec());
+    }
+    let kernel = metal_linear_kernel()?;
+    let n = input.len();
+    let byte_len = std::mem::size_of_val(input) as u64;
+    let in_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let out_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let n_buf = kernel
+        .device
+        .new_buffer(4, MTLResourceOptions::StorageModeShared);
+    let cap_buf = kernel
+        .device
+        .new_buffer(4, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&in_buf, input);
+    unsafe {
+        *(n_buf.contents() as *mut u32) = n as u32;
+        *(cap_buf.contents() as *mut f32) = cap;
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.soft_cap_pipeline);
+    encoder.set_buffer(0, Some(&in_buf), 0);
+    encoder.set_buffer(1, Some(&out_buf), 0);
+    encoder.set_buffer(2, Some(&n_buf), 0);
+    encoder.set_buffer(3, Some(&cap_buf), 0);
+    let width = kernel.soft_cap_pipeline.thread_execution_width().max(1);
+    let threads_per_group = metal::MTLSize {
+        width,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroups = metal::MTLSize {
+        width: (n as u64).div_ceil(width),
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; n];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
 }
 
 /// GPU forward RoPE rotation across all heads, applied to a copy of `data`. The
@@ -9314,6 +9427,16 @@ pub fn try_silu_mul_f32(_gate: &[f32], _up: &[f32]) -> Option<Vec<f32>> {
 }
 
 #[cfg(not(target_os = "macos"))]
+pub fn try_gelu_mul_f32(_gate: &[f32], _up: &[f32]) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn try_soft_cap_f32(_input: &[f32], _cap: f32) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn start_inference_session() {}
 
 #[cfg(not(target_os = "macos"))]
@@ -9969,6 +10092,43 @@ mod tests {
         for (a, b) in got.iter().zip(&expected) {
             assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gelu_mul_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let n = 257usize; // non-multiple of the execution width
+        let gate: Vec<f32> = (0..n).map(|i| ((i as f32 % 13.0) - 6.0) * 0.4).collect();
+        let up: Vec<f32> = (0..n).map(|i| ((i as f32 % 5.0) - 2.0) * 0.5).collect();
+        let mut expected = vec![0.0f32; n];
+        crate::inference::gemma4::geglu_into(&gate, &up, &mut expected);
+        let got = try_gelu_mul_f32(&gate, &up).expect("metal gelu_mul");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_soft_cap_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let cap = 30.0f32;
+        let n = 263usize;
+        let input: Vec<f32> = (0..n).map(|i| ((i as f32 % 91.0) - 45.0) * 8.0).collect();
+        let mut expected = input.clone();
+        crate::inference::gemma4::soft_cap_in_place(&mut expected, cap);
+        let got = try_soft_cap_f32(&input, cap).expect("metal soft_cap");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1.0e-3, "{a} != {b}");
+        }
+        // Disabled cap is a passthrough.
+        let passthrough = try_soft_cap_f32(&input, 0.0).expect("metal soft_cap passthrough");
+        assert_eq!(passthrough, input);
     }
 
     #[cfg(target_os = "macos")]
