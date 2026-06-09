@@ -42,6 +42,7 @@ struct MetalLinearKernel {
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
     rms_norm_pipeline: ComputePipelineState,
+    rms_norm_per_head_pipeline: ComputePipelineState,
     residual_add_pipeline: ComputePipelineState,
     silu_mul_pipeline: ComputePipelineState,
     gelu_mul_pipeline: ComputePipelineState,
@@ -1389,6 +1390,47 @@ kernel void residual_add_f32(
 ) {
     if (gid >= n) return;
     output[gid] = a[gid] + b[gid];
+}
+
+// Per-head RMSNorm for Gemma's QK-norm (and weightless V-norm): one threadgroup
+// per head independently normalizes that head's `head_dim` chunk, reusing the
+// exact reduction + `1/sqrt(mean_sq + eps)` of rms_norm_f32. `use_weight == 0`
+// skips the post-scale weight (weightless V-norm); otherwise weight is [head_dim]
+// and shared across heads (q_norm / k_norm).
+kernel void rms_norm_per_head_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant uint& head_dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    constant uint& use_weight [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    threadgroup float partial[256];
+    uint base = head * head_dim;
+    float local = 0.0;
+    for (uint i = tid; i < head_dim; i += tgsize) {
+        float v = input[base + i];
+        local += v * v;
+    }
+    partial[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tgsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            partial[tid] += partial[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv = 1.0 / sqrt(partial[0] / float(head_dim) + eps);
+    for (uint i = tid; i < head_dim; i += tgsize) {
+        float v = input[base + i] * inv;
+        if (use_weight != 0) {
+            v *= weight[i];
+        }
+        output[base + i] = v;
+    }
 }
 
 kernel void silu_mul_f32(
@@ -3660,6 +3702,12 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let rms_norm_pipeline = device
                 .new_compute_pipeline_state_with_function(&rms_norm_function)
                 .ok()?;
+            let rms_norm_per_head_function = elementwise_library
+                .get_function("rms_norm_per_head_f32", None)
+                .ok()?;
+            let rms_norm_per_head_pipeline = device
+                .new_compute_pipeline_state_with_function(&rms_norm_per_head_function)
+                .ok()?;
             let residual_add_function = elementwise_library
                 .get_function("residual_add_f32", None)
                 .ok()?;
@@ -3994,6 +4042,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
                 rms_norm_pipeline,
+                rms_norm_per_head_pipeline,
                 residual_add_pipeline,
                 silu_mul_pipeline,
                 gelu_mul_pipeline,
@@ -4984,6 +5033,80 @@ pub fn try_rms_norm_f32(input: &[f32], weight: &[f32], eps: f32) -> Option<Vec<f
     command_buffer.commit();
     command_buffer.wait_until_completed();
     let mut out = vec![0.0f32; width];
+    read_buffer_f32(&out_buf, &mut out);
+    Some(out)
+}
+
+/// GPU per-head RMSNorm for Gemma QK-norm / weightless V-norm. `input` is
+/// `head_count * head_dim`; each head's chunk is normalized independently with the
+/// same reduction as `try_rms_norm_f32`. `weight` is `head_dim` (shared across
+/// heads, e.g. q_norm/k_norm) or None for the weightless V-norm. None if Metal
+/// unavailable or shapes mismatch.
+#[cfg(target_os = "macos")]
+pub fn try_rms_norm_per_head_f32(
+    input: &[f32],
+    weight: Option<&[f32]>,
+    head_count: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Option<Vec<f32>> {
+    if head_dim == 0 || head_count == 0 || input.len() != head_count * head_dim {
+        return None;
+    }
+    if let Some(w) = weight {
+        if w.len() != head_dim {
+            return None;
+        }
+    }
+    let kernel = metal_linear_kernel()?;
+    let byte_len = std::mem::size_of_val(input) as u64;
+    let in_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    let out_buf = kernel
+        .device
+        .new_buffer(byte_len, MTLResourceOptions::StorageModeShared);
+    // Weight buffer is always bound; a dummy when weightless (kernel won't read it).
+    let weight_buf = kernel
+        .device
+        .new_buffer((head_dim * 4) as u64, MTLResourceOptions::StorageModeShared);
+    if let Some(w) = weight {
+        write_buffer_f32(&weight_buf, w);
+    }
+    let scalar_buf = kernel
+        .device
+        .new_buffer(12, MTLResourceOptions::StorageModeShared);
+    write_buffer_f32(&in_buf, input);
+    unsafe {
+        let p = scalar_buf.contents() as *mut u8;
+        *(p as *mut u32) = head_dim as u32;
+        *(p.add(4) as *mut f32) = eps;
+        *(p.add(8) as *mut u32) = u32::from(weight.is_some());
+    }
+    let command_buffer = kernel.queue.new_command_buffer();
+    let encoder = command_buffer.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&kernel.rms_norm_per_head_pipeline);
+    encoder.set_buffer(0, Some(&in_buf), 0);
+    encoder.set_buffer(1, Some(&weight_buf), 0);
+    encoder.set_buffer(2, Some(&out_buf), 0);
+    encoder.set_buffer(3, Some(&scalar_buf), 0);
+    encoder.set_buffer(4, Some(&scalar_buf), 4);
+    encoder.set_buffer(5, Some(&scalar_buf), 8);
+    let threads = metal::MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let groups = metal::MTLSize {
+        width: head_count as u64,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(groups, threads);
+    encoder.end_encoding();
+    command_buffer.commit();
+    command_buffer.wait_until_completed();
+    let mut out = vec![0.0f32; input.len()];
     read_buffer_f32(&out_buf, &mut out);
     Some(out)
 }
@@ -9370,6 +9493,17 @@ pub fn try_rms_norm_f32(_input: &[f32], _weight: &[f32], _eps: f32) -> Option<Ve
 }
 
 #[cfg(not(target_os = "macos"))]
+pub fn try_rms_norm_per_head_f32(
+    _input: &[f32],
+    _weight: Option<&[f32]>,
+    _head_count: usize,
+    _head_dim: usize,
+    _eps: f32,
+) -> Option<Vec<f32>> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub fn try_attention_decode_f32(
     _query: &[f32],
@@ -10129,6 +10263,70 @@ mod tests {
         // Disabled cap is a passthrough.
         let passthrough = try_soft_cap_f32(&input, 0.0).expect("metal soft_cap passthrough");
         assert_eq!(passthrough, input);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_rms_norm_per_head_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        let eps = 1.0e-6f32;
+        // Reference: standard RMSNorm applied independently per head_dim chunk.
+        fn cpu_per_head(
+            input: &[f32],
+            weight: Option<&[f32]>,
+            head_count: usize,
+            head_dim: usize,
+            eps: f32,
+        ) -> Vec<f32> {
+            let mut out = vec![0.0f32; input.len()];
+            for h in 0..head_count {
+                let base = h * head_dim;
+                let mss: f32 = input[base..base + head_dim]
+                    .iter()
+                    .map(|v| v * v)
+                    .sum::<f32>()
+                    / head_dim as f32;
+                let inv = (mss + eps).powf(-0.5);
+                for d in 0..head_dim {
+                    let mut v = input[base + d] * inv;
+                    if let Some(w) = weight {
+                        v *= w[d];
+                    }
+                    out[base + d] = v;
+                }
+            }
+            out
+        }
+        // Exercise both gemma layer-type shapes: sliding (8x256) and global (8x512).
+        for (head_count, head_dim) in [(8usize, 256usize), (8, 512)] {
+            let n = head_count * head_dim;
+            let input: Vec<f32> = (0..n).map(|i| ((i as f32 % 17.0) - 8.0) * 0.3).collect();
+            let weight: Vec<f32> = (0..head_dim)
+                .map(|d| 0.5 + (d as f32 % 7.0) * 0.1)
+                .collect();
+            // Weighted (QK-norm).
+            let want_w = cpu_per_head(&input, Some(&weight), head_count, head_dim, eps);
+            let got_w = try_rms_norm_per_head_f32(&input, Some(&weight), head_count, head_dim, eps)
+                .expect("metal per-head rms_norm (weighted)");
+            for (a, b) in got_w.iter().zip(&want_w) {
+                assert!(
+                    (a - b).abs() < 1.0e-3,
+                    "weighted {a} != {b} ({head_count}x{head_dim})"
+                );
+            }
+            // Weightless (V-norm).
+            let want_n = cpu_per_head(&input, None, head_count, head_dim, eps);
+            let got_n = try_rms_norm_per_head_f32(&input, None, head_count, head_dim, eps)
+                .expect("metal per-head rms_norm (weightless)");
+            for (a, b) in got_n.iter().zip(&want_n) {
+                assert!(
+                    (a - b).abs() < 1.0e-3,
+                    "weightless {a} != {b} ({head_count}x{head_dim})"
+                );
+            }
+        }
     }
 
     #[cfg(target_os = "macos")]
