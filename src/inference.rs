@@ -18,7 +18,7 @@ use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 
 mod diagnostic_config;
-mod gemma4;
+pub(crate) mod gemma4;
 mod kv_cache;
 mod q8_block_reader;
 mod q8_runtime;

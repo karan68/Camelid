@@ -126,6 +126,14 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Generate text with a Gemma 4 model (correctness-first runtime).
+    Gemma4Generate {
+        path: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 24)]
+        max_tokens: usize,
+    },
     /// Dump focused tensor descriptor, raw block, and f32 dequantization diagnostics.
     TensorDump {
         path: PathBuf,
@@ -492,6 +500,17 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::Gemma4Generate {
+            path,
+            prompt,
+            max_tokens,
+        } => {
+            eprintln!("[gemma4] loading {}...", path.display());
+            let runtime = camelid::gemma4_runtime::Gemma4Runtime::load(&path)?;
+            eprintln!("[gemma4] generating (max {max_tokens} tokens)...");
+            let out = runtime.generate_greedy(&prompt, max_tokens)?;
+            println!("{prompt}{out}");
         }
         Command::TensorDump {
             path,
