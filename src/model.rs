@@ -596,6 +596,172 @@ impl LlamaTensorBinding {
     }
 }
 
+/// Per-layer tensor descriptors for a Gemma 4 decoder block.
+///
+/// Captures everything the Gemma 4 forward pass needs beyond the Llama set: the
+/// per-layer-type attention projections (their widths vary with the sliding/full
+/// schedule), QK-norm, the extra Gemma norms (post-attention, post-FFN, and the
+/// Gemma 4 per-layer `post_norm`), and — for the elastic "E" variants — the
+/// Per-Layer-Embedding injection (`inp_gate`, `proj`, `layer_output_scale`).
+/// Dense variants (12B/31B) carry no PLE tensors, so those are `None`.
+#[derive(Debug, Clone)]
+pub struct Gemma4LayerTensors {
+    pub attn_norm: GgufTensorDescriptor,
+    pub attn_q: GgufTensorDescriptor,
+    pub attn_k: GgufTensorDescriptor,
+    pub attn_v: GgufTensorDescriptor,
+    pub attn_output: GgufTensorDescriptor,
+    pub attn_q_norm: GgufTensorDescriptor,
+    pub attn_k_norm: GgufTensorDescriptor,
+    pub post_attention_norm: GgufTensorDescriptor,
+    pub ffn_norm: GgufTensorDescriptor,
+    pub post_ffw_norm: GgufTensorDescriptor,
+    pub post_norm: Option<GgufTensorDescriptor>,
+    pub ffn_gate: GgufTensorDescriptor,
+    pub ffn_up: GgufTensorDescriptor,
+    pub ffn_down: GgufTensorDescriptor,
+    pub ple_inp_gate: Option<GgufTensorDescriptor>,
+    pub ple_proj: Option<GgufTensorDescriptor>,
+    pub ple_output_scale: Option<GgufTensorDescriptor>,
+}
+
+/// Full Gemma 4 weight binding (the gemma4 counterpart to [`LlamaTensorBinding`]).
+#[derive(Debug, Clone)]
+pub struct Gemma4Binding {
+    pub token_embedding: GgufTensorDescriptor,
+    pub output_norm: GgufTensorDescriptor,
+    pub output: GgufTensorDescriptor,
+    pub output_is_tied_embedding: bool,
+    pub rope_freqs: Option<GgufTensorDescriptor>,
+    /// Per-Layer-Embedding tables (E-series only; `None` for dense variants).
+    pub per_layer_token_embd: Option<GgufTensorDescriptor>,
+    pub per_layer_model_proj: Option<GgufTensorDescriptor>,
+    pub per_layer_proj_norm: Option<GgufTensorDescriptor>,
+    pub layers: Vec<Gemma4LayerTensors>,
+}
+
+impl Gemma4Binding {
+    /// Bind every Gemma 4 tensor by name and validate the per-layer-type shapes.
+    pub fn bind(gguf: &GgufFile, config: &LlamaModelConfig) -> Result<Self> {
+        let gemma4 = config.gemma4.as_ref().ok_or_else(|| {
+            BackendError::InvalidModelMetadata(
+                "Gemma4Binding requires the gemma4 architecture".into(),
+            )
+        })?;
+
+        let token_embedding = required_tensor(gguf, "token_embd.weight")?;
+        let output_norm = required_tensor(gguf, "output_norm.weight")?;
+        let (output, output_is_tied_embedding) = match find_tensor(gguf, "output.weight") {
+            Some(desc) => (desc.clone(), false),
+            None => (token_embedding.clone(), true),
+        };
+
+        let mut layers = Vec::with_capacity(config.block_count as usize);
+        for layer_idx in 0..config.block_count {
+            let req = |suffix: &str| required_tensor(gguf, &format!("blk.{layer_idx}.{suffix}.weight"));
+            let opt = |suffix: &str| {
+                find_tensor(gguf, &format!("blk.{layer_idx}.{suffix}.weight")).cloned()
+            };
+            layers.push(Gemma4LayerTensors {
+                attn_norm: req("attn_norm")?,
+                attn_q: req("attn_q")?,
+                attn_k: req("attn_k")?,
+                attn_v: req("attn_v")?,
+                attn_output: req("attn_output")?,
+                attn_q_norm: req("attn_q_norm")?,
+                attn_k_norm: req("attn_k_norm")?,
+                post_attention_norm: req("post_attention_norm")?,
+                ffn_norm: req("ffn_norm")?,
+                post_ffw_norm: req("post_ffw_norm")?,
+                post_norm: opt("post_norm"),
+                ffn_gate: req("ffn_gate")?,
+                ffn_up: req("ffn_up")?,
+                ffn_down: req("ffn_down")?,
+                ple_inp_gate: opt("inp_gate"),
+                ple_proj: opt("proj"),
+                ple_output_scale: opt("layer_output_scale"),
+            });
+        }
+
+        let binding = Self {
+            token_embedding,
+            output_norm,
+            output,
+            output_is_tied_embedding,
+            rope_freqs: find_tensor(gguf, "rope_freqs.weight").cloned(),
+            per_layer_token_embd: find_tensor(gguf, "per_layer_token_embd.weight").cloned(),
+            per_layer_model_proj: find_tensor(gguf, "per_layer_model_proj.weight").cloned(),
+            per_layer_proj_norm: find_tensor(gguf, "per_layer_proj_norm.weight").cloned(),
+            layers,
+        };
+        binding.validate(config, gemma4)?;
+        Ok(binding)
+    }
+
+    /// `true` when this is an elastic "E" variant carrying a Per-Layer-Embedding
+    /// stream (E2B/E4B); `false` for the dense 12B/31B.
+    pub fn has_per_layer_embeddings(&self) -> bool {
+        self.per_layer_token_embd.is_some()
+            && self.layers.iter().all(|l| l.ple_proj.is_some())
+    }
+
+    fn validate(&self, config: &LlamaModelConfig, gemma4: &Gemma4Metadata) -> Result<()> {
+        if self.layers.len() != config.block_count as usize {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "gemma4 block count {} does not match bound layer count {}",
+                config.block_count,
+                self.layers.len()
+            )));
+        }
+        let emb = config.embedding_length as usize;
+        let heads = config.attention_head_count as usize;
+        let kv_heads = config.attention_head_count_kv as usize;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let head_dim = gemma4.head_dim_at(idx) as usize;
+            require_descriptor_matrix_shape(
+                &layer.attn_q,
+                emb,
+                heads * head_dim,
+                &format!("gemma4 layer {idx} attention q"),
+            )?;
+            require_descriptor_matrix_shape(
+                &layer.attn_k,
+                emb,
+                kv_heads * head_dim,
+                &format!("gemma4 layer {idx} attention k"),
+            )?;
+            require_descriptor_matrix_shape(
+                &layer.attn_v,
+                emb,
+                kv_heads * head_dim,
+                &format!("gemma4 layer {idx} attention v"),
+            )?;
+            require_descriptor_matrix_shape(
+                &layer.attn_output,
+                heads * head_dim,
+                emb,
+                &format!("gemma4 layer {idx} attention output"),
+            )?;
+            require_descriptor_shape(
+                &layer.attn_q_norm,
+                &[head_dim],
+                &format!("gemma4 layer {idx} q_norm"),
+            )?;
+            require_descriptor_shape(
+                &layer.attn_k_norm,
+                &[head_dim],
+                &format!("gemma4 layer {idx} k_norm"),
+            )?;
+            require_descriptor_shape(
+                &layer.attn_norm,
+                &[emb],
+                &format!("gemma4 layer {idx} attn_norm"),
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DenseLlamaDims {
     pub embedding_length: usize,

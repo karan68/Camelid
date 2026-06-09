@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use camelid::gguf::read_metadata;
-use camelid::model::{LlamaModelConfig, LlamaTensorBinding};
+use camelid::model::{Gemma4Binding, LlamaModelConfig, LlamaTensorBinding};
 use camelid::tokenizer::Tokenizer;
 
 #[test]
@@ -66,6 +66,17 @@ fn gemma4_load_stages() {
             binding.output_is_tied_embedding
         ),
         Err(e) => eprintln!("  bind: ERR -> {e}"),
+    }
+    eprintln!("== stage 4: Gemma4Binding::bind (full gemma4 weight set) ==");
+    match Gemma4Binding::bind(&gguf, &config) {
+        Ok(binding) => eprintln!(
+            "  gemma4 bind: OK ({} layers, tied_output={}, per_layer_embeddings={}, has_post_norm={})",
+            binding.layers.len(),
+            binding.output_is_tied_embedding,
+            binding.has_per_layer_embeddings(),
+            binding.layers.first().map(|l| l.post_norm.is_some()).unwrap_or(false),
+        ),
+        Err(e) => eprintln!("  gemma4 bind: ERR -> {e}"),
     }
     eprintln!("== done ==");
 }
