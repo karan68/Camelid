@@ -229,6 +229,34 @@ impl Gemma4Metadata {
     pub fn is_sliding_layer(&self, idx: usize) -> bool {
         self.layer_is_sliding.get(idx).copied().unwrap_or(false)
     }
+
+    /// Per-head attention dim for layer `idx`. Gemma 4 uses a smaller head dim on
+    /// sliding (local) layers than on full (global) layers.
+    pub fn head_dim_at(&self, idx: usize) -> u32 {
+        if self.is_sliding_layer(idx) {
+            self.head_dim_sliding
+        } else {
+            self.head_dim_global
+        }
+    }
+
+    /// Per-head rotary dim for layer `idx` (sliding vs global).
+    pub fn rope_dim_at(&self, idx: usize) -> u32 {
+        if self.is_sliding_layer(idx) {
+            self.rope_dim_sliding
+        } else {
+            self.rope_dim_global
+        }
+    }
+
+    /// RoPE base (theta) for layer `idx` (sliding θ vs global θ).
+    pub fn rope_freq_base_at(&self, idx: usize) -> f32 {
+        if self.is_sliding_layer(idx) {
+            self.rope_freq_base_sliding
+        } else {
+            self.rope_freq_base_global
+        }
+    }
 }
 
 /// Gemma 4's per-layer attention schedule: a 5:1 sliding:full repeat (every 6th
@@ -429,11 +457,20 @@ impl LlamaTensorBinding {
             dims.vocab_size,
         )?;
         if let Some(rope_freqs) = &self.rope_freqs {
-            let rope_dim = config.rope_dimension_count.unwrap_or(dims.head_dim as u32) as usize;
-            if rope_dim == 0 || rope_dim > dims.head_dim || !rope_dim.is_multiple_of(2) {
+            // Gemma 4 carries a single rope_freqs table sized for the global
+            // (full-attention) layers; sliding layers derive their own shorter
+            // rotary from rope.freq_base_swa at runtime. Validate against the
+            // global rope dim there, and against the uniform head dim otherwise.
+            let (rope_dim, head_dim_bound) = match config.gemma4.as_ref() {
+                Some(g) => (g.rope_dim_global as usize, g.head_dim_global as usize),
+                None => (
+                    config.rope_dimension_count.unwrap_or(dims.head_dim as u32) as usize,
+                    dims.head_dim,
+                ),
+            };
+            if rope_dim == 0 || rope_dim > head_dim_bound || !rope_dim.is_multiple_of(2) {
                 return Err(BackendError::InvalidModelMetadata(format!(
-                    "RoPE dimension count {rope_dim} must be even and within head dimension {}",
-                    dims.head_dim
+                    "RoPE dimension count {rope_dim} must be even and within head dimension {head_dim_bound}"
                 )));
             }
             require_descriptor_shape(rope_freqs, &[rope_dim / 2], "rope frequencies")?;
@@ -453,27 +490,37 @@ impl LlamaTensorBinding {
                 &[dims.embedding_length],
                 &format!("layer {idx} attention norm"),
             )?;
+            // Per-layer-type attention widths. For Llama these collapse to the
+            // uniform case (head_dim = embedding/heads, so q_width = embedding);
+            // for Gemma 4 the sliding and full layers use different head dims, so
+            // the projection widths vary per layer.
+            let head_dim = match config.gemma4.as_ref() {
+                Some(g) => g.head_dim_at(idx) as usize,
+                None => dims.head_dim,
+            };
+            let q_width = config.attention_head_count as usize * head_dim;
+            let kv_width = config.attention_head_count_kv as usize * head_dim;
             require_descriptor_matrix_shape(
                 &layer.attention_q,
                 dims.embedding_length,
-                dims.embedding_length,
+                q_width,
                 &format!("layer {idx} attention q"),
             )?;
             require_descriptor_matrix_shape(
                 &layer.attention_k,
                 dims.embedding_length,
-                dims.kv_width,
+                kv_width,
                 &format!("layer {idx} attention k"),
             )?;
             require_descriptor_matrix_shape(
                 &layer.attention_v,
                 dims.embedding_length,
-                dims.kv_width,
+                kv_width,
                 &format!("layer {idx} attention v"),
             )?;
             require_descriptor_matrix_shape(
                 &layer.attention_output,
-                dims.embedding_length,
+                q_width,
                 dims.embedding_length,
                 &format!("layer {idx} attention output"),
             )?;
