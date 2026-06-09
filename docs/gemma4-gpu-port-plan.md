@@ -72,12 +72,17 @@ New kernels required:
   is `kv_base_offset += lo*position_stride` with `position_count = pos-lo+1`
   (sliding `lo = max(0, pos+1-512)`, global `lo = 0`). Locked in by
   `metal_sliding_window_attention_matches_cpu` (head_dim 256 windowed + 512 full).
-- **STEP 4 — Gemma4ResidentState scaffolding.** New struct (do NOT extend the
-  Llama `ResidentDecodeState` — gemma's per-layer head_dim, cross-layer KV, and
-  PLE diverge too far). Holds: per-tensor wire nocopy buffers (weights resident),
-  per-layer KV cache sized to that layer's head_dim, ping-pong hidden buffers,
-  gate/done events. Weights loaded as `wire_mmap::WirePages` (page-aligned, GPU
-  reads nocopy — fits 16GB, no 2nd copy).
+- **STEP 4 — Gemma4ResidentState scaffolding. DONE (allocation only).**
+  `Gemma4Metadata::layer_plan` (model.rs) is the single source of truth for
+  per-layer-type dims, RoPE θ, sliding window, and cross-layer KV source
+  resolution (unit-tested on the E4B 42-layer / 18-shared schedule).
+  `metal::Gemma4ResidentState::new` allocates the per-layer KV cache (sized to
+  each layer's head_dim, only for owning layers — shared layers hold `None`),
+  ping-pong hidden buffers, and gate/done events, behind `gemma4_gpu_enabled()`
+  (`CAMELID_GEMMA4_GPU`). STILL TODO here: resident WEIGHT buffers — load each
+  Q8 tensor as `wire_mmap::WirePages` (page-aligned, GPU reads nocopy, fits
+  16GB) + f32 norm/PLE buffers; wired alongside STEP 5's forward so they're
+  validated by actually being consumed.
 - **STEP 5 — single-layer resident forward** (no PLE, no KV sharing): norm → qkv →
   QK-norm → rope → scatter → attn → o → post-attn-norm → residual → ffn-norm →
   gate/up → geglu → down → post-ffw-norm → residual. Parity vs CPU `step()` for
