@@ -27,6 +27,11 @@ use camelid::gemma4_runtime::Gemma4Runtime;
 struct Pack {
     pack_id: String,
     prompts: Vec<PackPrompt>,
+    /// Context packs carry their target window; used to size the GPU runtime's
+    /// KV capacity. Absent on the short packs.
+    #[serde(default)]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    target_context_window: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -62,6 +67,15 @@ struct OracleResult {
 struct CpuKnownFrontier {
     parity_prefix_tokens: usize,
     reason: String,
+    /// When camelid CPU and GPU agree with each other and BOTH sit on the other
+    /// side of the reference's knife-edge, the frontier bounds the GPU
+    /// assertion too. Default false (GPU asserts the full budget).
+    #[serde(default)]
+    applies_to_gpu: bool,
+    /// GPU-specific verified prefix when it differs from the CPU one (the two
+    /// runtimes can flip at different knife-edge positions).
+    #[serde(default)]
+    gpu_parity_prefix_tokens: Option<usize>,
 }
 
 fn repo_path(rel: &str) -> PathBuf {
@@ -85,12 +99,18 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
         return;
     };
     let row = row_id(&model);
+    // Pack selection: CAMELID_GEMMA4_PACK names the pack file stem under
+    // qa/gemma4/prompt_packs/ (default basic_v1). The oracle is keyed by BOTH
+    // the row and the pack stem, so mismatched artifacts can never pair up.
+    let pack_stem = std::env::var("CAMELID_GEMMA4_PACK").unwrap_or_else(|_| "basic_v1".to_string());
     let pack: Pack = serde_json::from_str(
-        &std::fs::read_to_string(repo_path("qa/gemma4/prompt_packs/basic_v1.json"))
-            .expect("prompt pack"),
+        &std::fs::read_to_string(repo_path(&format!(
+            "qa/gemma4/prompt_packs/{pack_stem}.json"
+        )))
+        .expect("prompt pack"),
     )
     .expect("prompt pack json");
-    let oracle_path = repo_path(&format!("qa/gemma4/oracle/{row}.{}.json", "basic_v1"));
+    let oracle_path = repo_path(&format!("qa/gemma4/oracle/{row}.{pack_stem}.json"));
     let oracle: Oracle =
         serde_json::from_str(&std::fs::read_to_string(&oracle_path).unwrap_or_else(|_| {
             panic!(
@@ -117,8 +137,17 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
     };
     #[cfg(target_os = "macos")]
     let gpu_runtime = if use_gpu {
+        // KV capacity: the context window when the pack declares one, else
+        // enough for the longest prompt + budget.
+        let max_positions = pack.target_context_window.unwrap_or_else(|| {
+            pack.prompts
+                .iter()
+                .map(|p| p.text.len() / 2 + p.max_new_tokens)
+                .max()
+                .unwrap_or(192)
+        }) + 64;
         Some(
-            camelid::gemma4_runtime::Gemma4GpuRuntime::load(&model, 256)
+            camelid::gemma4_runtime::Gemma4GpuRuntime::load(&model, max_positions)
                 .expect("load gemma4 gpu runtime"),
         )
     } else {
@@ -177,8 +206,18 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
 
         // A recorded CPU knife-edge frontier bounds the CPU assertion to its
         // measured prefix; the GPU runtime always asserts the full budget.
-        if let (false, Some(frontier)) = (use_gpu, expected.cpu_known_frontier.as_ref()) {
-            let n = frontier.parity_prefix_tokens;
+        let frontier_active = expected
+            .cpu_known_frontier
+            .as_ref()
+            .filter(|f| !use_gpu || f.applies_to_gpu || f.gpu_parity_prefix_tokens.is_some());
+        if let Some(frontier) = frontier_active {
+            let n = if use_gpu {
+                frontier
+                    .gpu_parity_prefix_tokens
+                    .unwrap_or(frontier.parity_prefix_tokens)
+            } else {
+                frontier.parity_prefix_tokens
+            };
             if generated.len() < n || generated[..n] != expected.generated_tokens[..n] {
                 failures.push(format!(
                     "{}: generated tokens diverge INSIDE the recorded {n}-token frontier\n  \

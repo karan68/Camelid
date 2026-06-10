@@ -381,6 +381,11 @@ pub struct ChatCompletionRequest {
     /// receipt is a claim of output for the verifier to check — no reference
     /// runs here, so its parity block is emitted as not-compared.
     pub camelid_receipt: Option<bool>,
+    /// Opt-in gemma4 thinking mode: renders the reference's enable_thinking
+    /// template (system turn opens with the `<|think|>` token). Thinking
+    /// channels are stripped from chat output either way. Default: false (the
+    /// reference's `enable_thinking:false` rendering).
+    pub camelid_enable_thinking: Option<bool>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -2546,11 +2551,12 @@ fn model_family(gguf: &GgufFile) -> &'static str {
     }
 }
 
-/// Build the Gemma chat prompt from OpenAI-style messages. Gemma turns are
-/// `<start_of_turn>{user|model}\n…<end_of_turn>\n`, and generation follows a
-/// trailing `<start_of_turn>model\n`. The tokenizer prepends `<bos>`
-/// (add_special). Gemma has no system role, so system text is folded into the
-/// next user turn. This is the single place the Gemma chat template lives.
+/// Gemma 4 chat template constants + renderer. Turns are
+/// `<|turn>{system|user|model}\n…<turn|>\n` and generation follows a trailing
+/// `<|turn>model\n`; a leading system message gets its own system turn, and
+/// thinking mode injects `<|think|>` (see `gemma4_chat_prompt`). The renderer
+/// is locked byte-for-byte to the reference rendering by
+/// `qa/gemma4/template_shapes_v1.json`.
 /// Gemma 4 turn markers. Gemma 4 RENAMED them from Gemma 3's
 /// `<start_of_turn>`/`<end_of_turn>` to `<|turn>` (id 105) / `<turn|>` (id 106)
 /// — verified against the E2B/E4B/12B GGUF vocab and the GGUF-embedded Jinja
@@ -2565,6 +2571,9 @@ pub(crate) const GEMMA4_TURN_END: &str = "<turn|>";
 /// leaks to the client.
 pub(crate) const GEMMA4_CHANNEL_START: &str = "<|channel>";
 pub(crate) const GEMMA4_CHANNEL_END: &str = "<channel|>";
+/// Thinking-mode token (id 98), injected at the top of the system turn when
+/// the reference template runs with `enable_thinking` (its `--jinja` default).
+pub(crate) const GEMMA4_THINK: &str = "<|think|>";
 
 #[cfg(test)]
 mod gemma4_template_tests {
@@ -2577,7 +2586,7 @@ mod gemma4_template_tests {
             role: "user".to_string(),
             content: "hi".to_string(),
         }];
-        let prompt = gemma4_chat_prompt(&messages);
+        let prompt = gemma4_chat_prompt(&messages, false);
         assert_eq!(prompt, "<|turn>user\nhi<turn|>\n<|turn>model\n");
         // Gemma 3 marker spellings tokenize as plain text on gemma4 vocabs and
         // must never appear.
@@ -2614,42 +2623,60 @@ mod gemma4_template_tests {
     }
 }
 
-fn gemma4_chat_prompt(messages: &[ChatMessage]) -> String {
+/// Test-only re-export of the gemma4 marker renderer (the template-shapes
+/// integration test asserts byte parity against the committed reference pack).
+pub fn gemma4_chat_prompt_for_tests(messages: &[ChatMessage], thinking: bool) -> String {
+    gemma4_chat_prompt(messages, thinking)
+}
+
+fn gemma4_chat_prompt(messages: &[ChatMessage], thinking: bool) -> String {
+    // Mirrors the reference (GGUF-embedded Jinja, verified against llama.cpp's
+    // /apply-template for both modes):
+    // - thinking=false: a leading system message gets its OWN `<|turn>system`
+    //   turn (never folded into the user turn); no synthetic system turn
+    //   otherwise.
+    // - thinking=true (the reference's --jinja default): a system turn is
+    //   ALWAYS emitted and opens with the `<|think|>` token, then any system
+    //   text.
     let mut out = String::new();
-    let mut pending_system = String::new();
+    let mut system_text = String::new();
+    let mut rest_start = 0;
     for m in messages {
-        match m.role.as_str() {
-            "system" => {
-                if !pending_system.is_empty() {
-                    pending_system.push_str("\n\n");
-                }
-                pending_system.push_str(&m.content);
+        if m.role == "system" {
+            if !system_text.is_empty() {
+                system_text.push_str("\n\n");
             }
-            "assistant" => {
-                out.push_str(GEMMA4_TURN_START);
-                out.push_str("model\n");
-                out.push_str(&m.content);
-                out.push_str(GEMMA4_TURN_END);
-                out.push('\n');
-            }
-            _ => {
-                out.push_str(GEMMA4_TURN_START);
-                out.push_str("user\n");
-                if !pending_system.is_empty() {
-                    out.push_str(&pending_system);
-                    out.push_str("\n\n");
-                    pending_system.clear();
-                }
-                out.push_str(&m.content);
-                out.push_str(GEMMA4_TURN_END);
-                out.push('\n');
-            }
+            system_text.push_str(&m.content);
+            rest_start += 1;
+        } else {
+            break;
         }
     }
-    if !pending_system.is_empty() {
+    if thinking {
         out.push_str(GEMMA4_TURN_START);
-        out.push_str("user\n");
-        out.push_str(&pending_system);
+        out.push_str("system\n");
+        out.push_str(GEMMA4_THINK);
+        out.push('\n');
+        out.push_str(&system_text);
+        out.push_str(GEMMA4_TURN_END);
+        out.push('\n');
+    } else if !system_text.is_empty() {
+        out.push_str(GEMMA4_TURN_START);
+        out.push_str("system\n");
+        out.push_str(&system_text);
+        out.push_str(GEMMA4_TURN_END);
+        out.push('\n');
+    }
+    for m in &messages[rest_start..] {
+        let role = if m.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
+        out.push_str(GEMMA4_TURN_START);
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&m.content);
         out.push_str(GEMMA4_TURN_END);
         out.push('\n');
     }
@@ -2790,8 +2817,10 @@ async fn gemma4_completion_nonstreaming(
         );
     };
     let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let t_generate = std::time::Instant::now();
     let result =
         tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
+    let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -2823,7 +2852,17 @@ async fn gemma4_completion_nonstreaming(
             "finish_reason": "stop",
         }],
         "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
-        "camelid": { "generated_token_ids": ids },
+        "camelid": {
+            "generated_token_ids": ids,
+            // Wall-clock totals only: the gemma4 lane does not (yet) report
+            // per-layer timing buckets like the Llama diagnostics do.
+            "timings_ms": {
+                "generate": generate_ms,
+                "generation": { "forward_total": generate_ms },
+                "prompt_evaluation": {},
+                "lane": "gemma4_wall_clock_total_only",
+            },
+        },
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -2899,10 +2938,12 @@ async fn gemma4_chat_nonstreaming(
     req: &ChatCompletionRequest,
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
-    let prompt = gemma4_chat_prompt(&messages);
+    let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let t_generate = std::time::Instant::now();
     let result =
         tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
+    let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -2935,6 +2976,17 @@ async fn gemma4_chat_nonstreaming(
             "finish_reason": "stop",
         }],
         "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "camelid": {
+            "generated_token_ids": ids,
+            // Wall-clock totals only: the gemma4 lane does not (yet) report
+            // per-layer timing buckets like the Llama diagnostics do.
+            "timings_ms": {
+                "generate": generate_ms,
+                "generation": { "forward_total": generate_ms },
+                "prompt_evaluation": {},
+                "lane": "gemma4_wall_clock_total_only",
+            },
+        },
     });
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -2949,7 +3001,7 @@ async fn gemma4_chat_streaming(
     req: &ChatCompletionRequest,
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
-    let prompt = gemma4_chat_prompt(&messages);
+    let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let created = unix_secs();
 
@@ -3025,6 +3077,23 @@ async fn load_model_from_path_with_activation(
     id: Option<String>,
     set_active: bool,
 ) -> Result<LoadedModel, BackendError> {
+    // Idempotent fast path: the same id already loaded from the same file
+    // returns the existing record instead of re-running the full load pipeline
+    // (an 8 GB row re-reads the whole file for its receipt otherwise; repeat
+    // loads from smoke tooling were timing out on it).
+    if let Some(requested_id) = id.as_deref() {
+        let loaded = state.loaded_models.read().await;
+        if let Some(existing) = loaded.get(requested_id) {
+            if existing.path == path {
+                let existing = existing.clone();
+                drop(loaded);
+                if set_active {
+                    *state.active_model_id.write().await = Some(requested_id.to_string());
+                }
+                return Ok(existing);
+            }
+        }
+    }
     let gguf = read_metadata(&path)?;
     let outcome = plan_for_model(&path, &gguf, state.configured_threads);
     state.planner_env.apply(&outcome.env_updates);
