@@ -230,6 +230,52 @@ impl GgufFile {
         }
     }
 
+    pub fn metadata_array_u32_optional(&self, key: &str) -> Result<Option<Vec<u32>>> {
+        match self.metadata.get(key) {
+            Some(GgufMetadataValue::Array(values)) => values
+                .iter()
+                .map(|value| match value {
+                    GgufMetadataValue::U32(value) => Ok(*value),
+                    GgufMetadataValue::I32(value) => u32::try_from(*value).map_err(|_| {
+                        BackendError::InvalidGguf(format!("metadata {key} contains negative int"))
+                    }),
+                    GgufMetadataValue::U64(value) => u32::try_from(*value).map_err(|_| {
+                        BackendError::InvalidGguf(format!(
+                            "metadata {key} contains u64 too large for u32"
+                        ))
+                    }),
+                    _ => Err(BackendError::InvalidGguf(format!(
+                        "metadata {key} must be array<uint>"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some),
+            Some(_) => Err(BackendError::InvalidGguf(format!(
+                "metadata {key} must be array<uint>"
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn metadata_array_bools_optional(&self, key: &str) -> Result<Option<Vec<bool>>> {
+        match self.metadata.get(key) {
+            Some(GgufMetadataValue::Array(values)) => values
+                .iter()
+                .map(|value| match value {
+                    GgufMetadataValue::Bool(value) => Ok(*value),
+                    _ => Err(BackendError::InvalidGguf(format!(
+                        "metadata {key} must be array<bool>"
+                    ))),
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some),
+            Some(_) => Err(BackendError::InvalidGguf(format!(
+                "metadata {key} must be array<bool>"
+            ))),
+            None => Ok(None),
+        }
+    }
+
     pub fn metadata_array_i32_optional(&self, key: &str) -> Result<Option<Vec<i32>>> {
         match self.metadata.get(key) {
             Some(GgufMetadataValue::Array(values)) => values

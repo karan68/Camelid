@@ -12723,6 +12723,7 @@ mod tests {
             sliding,
             head_dim,
             q_dim: 2 * head_dim,
+            kv_heads: 1,
             kv_dim: head_dim,
             theta: 1.0,
             window: if sliding { Some(16) } else { None },

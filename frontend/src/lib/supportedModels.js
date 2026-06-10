@@ -49,4 +49,13 @@ export const SUPPORTED_MODELS = [
     quant: 'Q8_0',
     blurb: 'Gemma 4 (E-series matformer) — from-scratch gemma4 engine, greedy-identical to the reference. Serve with CAMELID_GEMMA4_SERVE=1.',
   },
+  {
+    catalog_id: 'gemma4_e2b_it_q8_0',
+    name: 'Gemma 4 E2B-It',
+    repo_id: 'unsloth/gemma-4-E2B-it-GGUF',
+    filename: 'gemma-4-E2B-it-Q8_0.gguf',
+    size_bytes: 5048350848,
+    quant: 'Q8_0',
+    blurb: 'Gemma 4 E2B (E-series matformer) — greedy parity with the reference on the committed basic_v1 prompt pack. Text-token generation only; serve with CAMELID_GEMMA4_SERVE=1.',
+  },
 ]

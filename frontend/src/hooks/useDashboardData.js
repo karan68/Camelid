@@ -1028,6 +1028,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
         filename: "gemma-4-E4B-it-Q8_0.gguf",
         size_bytes: 8192951456,
         quant: "Q8_0",
+      },
+      {
+        catalog_id: "gemma4_e2b_it_q8_0",
+        name: "Gemma 4 E2B-It Q8_0",
+        repo_id: "unsloth/gemma-4-E2B-it-GGUF",
+        filename: "gemma-4-E2B-it-Q8_0.gguf",
+        size_bytes: 5048350848,
+        quant: "Q8_0",
       }
     ]
 

@@ -1,0 +1,227 @@
+//! Gemma 4 generation parity — exact-row, greedy, against the committed
+//! llama.cpp oracle pack.
+//!
+//! For the model named by `CAMELID_GEMMA4_GGUF`, runs every prompt in
+//! `qa/gemma4/prompt_packs/basic_v1.json` through [`Gemma4Runtime`] greedy
+//! decode and asserts, per prompt:
+//!   1. prompt token ids   == the oracle's tokenization,
+//!   2. generated token ids == the oracle's greedy continuation,
+//!   3. generated text      == the oracle's text.
+//!
+//! The oracle files live in `qa/gemma4/oracle/<row>.basic_v1.json` and were
+//! captured from the pinned llama.cpp build (llama-server 5d56eff, CPU,
+//! temperature=0/top_k=1, cache_prompt=false). A model file whose row has no
+//! committed oracle FAILS (not skips): no raw evidence, no claim.
+//!
+//! Set `CAMELID_GEMMA4_GPU=1` to run the same assertions through the
+//! GPU-resident runtime instead (macOS only).
+//!
+//! Run: `CAMELID_GEMMA4_GGUF=/path/gemma-4-E2B-it-Q8_0.gguf \
+//!       cargo test --release --test gemma4_generation_parity -- --nocapture`
+
+use std::path::PathBuf;
+
+use camelid::gemma4_runtime::Gemma4Runtime;
+
+#[derive(serde::Deserialize)]
+struct Pack {
+    pack_id: String,
+    prompts: Vec<PackPrompt>,
+}
+
+#[derive(serde::Deserialize)]
+struct PackPrompt {
+    id: String,
+    text: String,
+    max_new_tokens: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct Oracle {
+    row: String,
+    pack_id: String,
+    results: Vec<OracleResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct OracleResult {
+    id: String,
+    prompt_tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
+    generated_text: String,
+    /// Recorded knife-edge frontier for the CPU runtime: full parity is
+    /// asserted only for the first `parity_prefix_tokens` generated tokens of
+    /// this prompt on CPU (the GPU runtime asserts the full budget). Used when
+    /// a near-tie argmax (top-2 logit gap ~0.1% or less, measured and quoted
+    /// in `reason`) resolves differently across accumulation orders — the same
+    /// frontier class as the recorded TinyLlama deep-generation divergence.
+    cpu_known_frontier: Option<CpuKnownFrontier>,
+}
+
+#[derive(serde::Deserialize)]
+struct CpuKnownFrontier {
+    parity_prefix_tokens: usize,
+    reason: String,
+}
+
+fn repo_path(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
+/// The row id is the model file stem — oracle packs are keyed by it, so the
+/// wrong oracle can never be applied to the wrong file.
+fn row_id(model_path: &std::path::Path) -> String {
+    model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[test]
+fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
+    let Some(model) = std::env::var_os("CAMELID_GEMMA4_GGUF").map(PathBuf::from) else {
+        eprintln!("SKIP gemma4 generation parity: set CAMELID_GEMMA4_GGUF");
+        return;
+    };
+    let row = row_id(&model);
+    let pack: Pack = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("qa/gemma4/prompt_packs/basic_v1.json"))
+            .expect("prompt pack"),
+    )
+    .expect("prompt pack json");
+    let oracle_path = repo_path(&format!("qa/gemma4/oracle/{row}.{}.json", "basic_v1"));
+    let oracle: Oracle =
+        serde_json::from_str(&std::fs::read_to_string(&oracle_path).unwrap_or_else(|_| {
+            panic!(
+                "no committed oracle for row {row} at {} — capture the llama.cpp \
+                 oracle before asserting anything about this row",
+                oracle_path.display()
+            )
+        }))
+        .expect("oracle json");
+    assert_eq!(oracle.row, row, "oracle row mismatch");
+    assert_eq!(oracle.pack_id, pack.pack_id, "oracle pack mismatch");
+
+    let use_gpu = std::env::var("CAMELID_GEMMA4_GPU").is_ok_and(|v| v == "1");
+    eprintln!(
+        "row {row}: {} prompts, runtime = {}",
+        pack.prompts.len(),
+        if use_gpu { "gpu-resident" } else { "cpu" }
+    );
+
+    let cpu_runtime = if use_gpu {
+        None
+    } else {
+        Some(Gemma4Runtime::load(&model).expect("load gemma4 runtime"))
+    };
+    #[cfg(target_os = "macos")]
+    let gpu_runtime = if use_gpu {
+        Some(
+            camelid::gemma4_runtime::Gemma4GpuRuntime::load(&model, 256)
+                .expect("load gemma4 gpu runtime"),
+        )
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "macos"))]
+    if use_gpu {
+        panic!("CAMELID_GEMMA4_GPU=1 requires macOS/Metal");
+    }
+
+    let mut failures = Vec::new();
+    for prompt in &pack.prompts {
+        let expected = oracle
+            .results
+            .iter()
+            .find(|r| r.id == prompt.id)
+            .unwrap_or_else(|| panic!("oracle missing prompt {}", prompt.id));
+
+        // Prompt-token parity (BOS + plain text, no special parsing of body).
+        let runtime_tokenizer = if let Some(rt) = cpu_runtime.as_ref() {
+            rt.tokenizer()
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                gpu_runtime.as_ref().unwrap().tokenizer()
+            }
+            #[cfg(not(target_os = "macos"))]
+            unreachable!()
+        };
+        let prompt_tokens = runtime_tokenizer
+            .encode(&prompt.text, true, true)
+            .expect("encode prompt");
+        if prompt_tokens != expected.prompt_tokens {
+            failures.push(format!(
+                "{}: prompt tokens diverge\n  camelid: {prompt_tokens:?}\n  oracle:  {:?}",
+                prompt.id, expected.prompt_tokens
+            ));
+            continue;
+        }
+
+        let (text, generated) = if let Some(rt) = cpu_runtime.as_ref() {
+            rt.generate_greedy(&prompt.text, prompt.max_new_tokens)
+                .expect("generate")
+        } else {
+            #[cfg(target_os = "macos")]
+            {
+                gpu_runtime
+                    .as_ref()
+                    .unwrap()
+                    .generate_greedy(&prompt.text, prompt.max_new_tokens)
+                    .expect("generate (gpu)")
+            }
+            #[cfg(not(target_os = "macos"))]
+            unreachable!()
+        };
+
+        // A recorded CPU knife-edge frontier bounds the CPU assertion to its
+        // measured prefix; the GPU runtime always asserts the full budget.
+        if let (false, Some(frontier)) = (use_gpu, expected.cpu_known_frontier.as_ref()) {
+            let n = frontier.parity_prefix_tokens;
+            if generated.len() < n || generated[..n] != expected.generated_tokens[..n] {
+                failures.push(format!(
+                    "{}: generated tokens diverge INSIDE the recorded {n}-token frontier\n  \
+                     camelid: {generated:?}\n  oracle:  {:?}",
+                    prompt.id, expected.generated_tokens
+                ));
+                continue;
+            }
+            eprintln!(
+                "  {} OK to recorded CPU frontier ({n} of {} oracle tokens): {}",
+                prompt.id,
+                expected.generated_tokens.len(),
+                frontier.reason
+            );
+            continue;
+        }
+        if generated != expected.generated_tokens {
+            failures.push(format!(
+                "{}: generated tokens diverge\n  camelid: {generated:?}\n  oracle:  {:?}",
+                prompt.id, expected.generated_tokens
+            ));
+            continue;
+        }
+        if text != expected.generated_text {
+            failures.push(format!(
+                "{}: generated text diverges\n  camelid: {text:?}\n  oracle:  {:?}",
+                prompt.id, expected.generated_text
+            ));
+            continue;
+        }
+        eprintln!(
+            "  {} OK ({} tokens): {:?}",
+            prompt.id,
+            generated.len(),
+            text
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "row {row}: {} of {} prompts diverged from the llama.cpp oracle:\n{}",
+        failures.len(),
+        pack.prompts.len(),
+        failures.join("\n")
+    );
+}

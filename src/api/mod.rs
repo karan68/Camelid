@@ -117,6 +117,21 @@ impl AppState {
             ..Self::default()
         }
     }
+
+    /// Register a loaded gemma4 runtime under a model id, exactly as the
+    /// `CAMELID_GEMMA4_SERVE` load path would. For integration tests that drive
+    /// the live chat routes against a real runtime without the full
+    /// model-install flow.
+    pub async fn insert_gemma4_runtime_for_tests(
+        &self,
+        id: &str,
+        runtime: crate::gemma4_runtime::Gemma4Runtime,
+    ) {
+        self.gemma4_runtimes
+            .write()
+            .await
+            .insert(id.to_string(), Arc::new(runtime));
+    }
 }
 
 #[derive(Clone)]
@@ -403,10 +418,97 @@ pub enum StopSpec {
     Many(Vec<String>),
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Content-part types from the OpenAI parts form that Camelid cannot honor
+    /// (`image_url`, `input_audio`, `video_url`, …). Camelid generates text
+    /// tokens only — vision/audio towers are never loaded — so the chat
+    /// handlers fail closed with a typed `unsupported_multimodal_content`
+    /// error whenever this is non-empty. Plain-string content and `text` parts
+    /// never populate it.
+    #[serde(skip)]
+    pub unsupported_content_parts: Vec<String>,
+}
+
+/// Wire shape for `ChatMessage` deserialization: accepts the OpenAI plain
+/// string form and the content-parts array form. `text` parts are concatenated
+/// in order; every non-text part records its `type` so the handler can reject
+/// the request with a typed error instead of a generic JSON parse failure.
+#[derive(Deserialize)]
+struct ChatMessageWire {
+    role: String,
+    content: ChatContentWire,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatContentWire {
+    Text(String),
+    Parts(Vec<ChatContentPartWire>),
+}
+
+#[derive(Deserialize)]
+struct ChatContentPartWire {
+    #[serde(rename = "type")]
+    part_type: String,
+    text: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ChatMessageWire::deserialize(deserializer)?;
+        let (content, unsupported_content_parts) = match wire.content {
+            ChatContentWire::Text(text) => (text, Vec::new()),
+            ChatContentWire::Parts(parts) => {
+                let mut text = String::new();
+                let mut unsupported = Vec::new();
+                for part in parts {
+                    if part.part_type == "text" {
+                        text.push_str(part.text.as_deref().unwrap_or(""));
+                    } else {
+                        unsupported.push(part.part_type);
+                    }
+                }
+                (text, unsupported)
+            }
+        };
+        Ok(ChatMessage {
+            role: wire.role,
+            content,
+            unsupported_content_parts,
+        })
+    }
+}
+
+/// Fail-closed guard for multimodal chat input. Returns the typed error
+/// response when any message carries non-text content parts.
+fn reject_unsupported_multimodal_content(messages: &[ChatMessage]) -> Option<Response> {
+    let mut part_types: Vec<&str> = messages
+        .iter()
+        .flat_map(|m| m.unsupported_content_parts.iter().map(String::as_str))
+        .collect();
+    if part_types.is_empty() {
+        return None;
+    }
+    part_types.sort_unstable();
+    part_types.dedup();
+    Some(api_error(
+        StatusCode::BAD_REQUEST,
+        "unsupported_multimodal_content",
+        format!(
+            "unsupported multimodal content part(s): {}. Camelid is a text-token \
+             inference engine; image/audio/video inputs are fail-closed for every \
+             model row (Gemma 4 vision/audio towers are never loaded). Send content \
+             as a string or as {{\"type\":\"text\"}} parts.",
+            part_types.join(", ")
+        ),
+        Some("messages"),
+    ))
 }
 
 enum PromptInput {
@@ -2021,7 +2123,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 tokenizer_works: "validated_for_gemma4_spm",
                 tensors_load: "validated_mmap_wire_backed_q8_instant_load",
                 generation_runs: "api_nonstreaming_and_streaming_chat_smoke_plus_cli_greedy",
-                parity_audited: "greedy_token_identical_to_reference_llama_cpp_b9430",
+                parity_audited: "basic_v1_pack_5of5_full_budget_cpu_and_gpu_vs_pinned_plain_f32_gemv_comparator_llama_cpp_5d56eff",
                 performance_measured: "functional_milestone_only_not_perf_validated",
                 frontend_load_path_verified: "served_via_gemma4_runtime_flag",
                 frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1)",
@@ -2047,7 +2149,48 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 latest_checked_bucket: "not_selected",
                 latest_checked_result: "pass",
                 latest_checked_output: "Paris",
-                evidence: "the exact tracked gemma-4-E4B-it-Q8_0 GGUF (8,192,951,456 bytes, general.architecture=gemma4, gemma4 SPM tokenizer) loads through the mmap wire-backed Q8 lane (no eager decode; ~instant load) and generates greedily with token IDs identical to the reference llama.cpp b9430 greedy decode ([9079, 236761, 108, 1018, 14977, 53121, 2900, 563, 506, 5279, 529, 7001] for 'The capital of France is'). Served live through /v1/chat/completions both non-streaming and streaming (OpenAI chat.completion.chunk shape) behind CAMELID_GEMMA4_SERVE; non-streaming returns 'Paris' with finish_reason stop and no prompt echo, streaming yields incremental token deltas then [DONE], /v1/health reports backend=gemma4-runtime/model_family=gemma4/gemma4_available=true, and the CLI greedy output matches the API for the same templated prompt. See docs/gemma4-engine-status.md. Camelid supports exact-row generation + serve smoke for this row only; no bounded-context, performance, portability, or full support is implied",
+                evidence: "the exact tracked gemma-4-E4B-it-Q8_0 GGUF (8,192,951,456 bytes, general.architecture=gemma4, gemma4 SPM tokenizer) loads through the mmap wire-backed Q8 lane (no eager decode; ~instant load) and generates greedily with token IDs identical to the reference llama.cpp b9430 greedy decode ([9079, 236761, 108, 1018, 14977, 53121, 2900, 563, 506, 5279, 529, 7001] for 'The capital of France is'). Served live through /v1/chat/completions both non-streaming and streaming (OpenAI chat.completion.chunk shape) behind CAMELID_GEMMA4_SERVE; non-streaming returns 'Paris' with finish_reason stop and no prompt echo, streaming yields incremental token deltas then [DONE], /v1/health reports backend=gemma4-runtime/model_family=gemma4/gemma4_available=true, and the CLI greedy output matches the API for the same templated prompt. Committed basic_v1 pack parity vs the pinned plain-f32 GEMV comparator (llama.cpp 5d56eff, --no-repack -fa off -ctk f32 -ctv f32 -ub 1): CPU and GPU both match all five prompts full-budget with no frontier annotations (the previously recorded knife-edge was the missing rope_freqs proportional-rope semantics, since implemented from the reference graph). Distributed layer-sharding greedy output is token-identical to the oracle with fail-closed handshake/checksum/shared-KV guards. Raw logs: qa/evidence-bundles/gemma4-e4b-it-q8-0-20260610T103400Z-head-96a75007b156. See docs/gemma4-engine-status.md. Camelid supports exact-row text-token generation + serve smoke for this row only; no bounded-context, performance, portability, multimodal, or full support is implied",
+                next_step: "promote bounded context packs, add performance/RSS gates and durable current-head QA bundles, and broaden template coverage before any wider gemma4 claim",
+            },
+            ModelCompatibilityTarget {
+                id: "gemma4_e2b_it_q8_0",
+                family: "gemma4_ple_matformer_decoder",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "bounded context packs, performance/RSS gates, portability, arbitrary/Jinja template coverage beyond the gemma4 marker template, and durable current-head QA bundles remain missing; multimodal input is fail-closed (text-token generation only)",
+                metadata_parses: "validated_including_4to1_sliding_pattern_and_per_layer_ffn_widths",
+                tokenizer_works: "validated_for_gemma4_spm",
+                tensors_load: "validated_mmap_wire_backed_q8_instant_load",
+                generation_runs: "api_nonstreaming_and_streaming_chat_smoke_plus_cli_greedy",
+                parity_audited: "basic_v1_pack_5of5_full_budget_cpu_and_gpu_vs_pinned_plain_f32_gemv_comparator_llama_cpp_5d56eff",
+                performance_measured: "functional_milestone_only_not_perf_validated",
+                frontend_load_path_verified: "served_via_gemma4_runtime_flag",
+                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1)",
+                tested_context: "five_prompt_basic_v1_pack_greedy_parity_plus_api_webui_chat_smoke",
+                chat_template_renderer: "gemma4_marker",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "gemma4-basic-v1",
+                latest_checked_result: "pass",
+                latest_checked_output: "Paris",
+                evidence: "the exact tracked gemma-4-E2B-it-Q8_0 GGUF (5,048,350,848 bytes, general.architecture=gemma4, 35 layers with the 4:1 sliding_window_pattern and per-layer feed_forward_length array parsed from the GGUF, gemma4 SPM tokenizer) loads through the mmap wire-backed Q8 lane and generates greedily with prompt token ids, generated token ids, and generated text identical to the pinned reference llama.cpp 5d56eff for every prompt in qa/gemma4/prompt_packs/basic_v1.json (oracle at qa/gemma4/oracle/gemma-4-E2B-it-Q8_0.basic_v1.json). The Metal GPU-resident runtime matches the same five prompts token-for-token, and distributed layer-sharding greedy output (TCP split 13/35) is token-identical to the oracle with fail-closed handshake/checksum/shared-KV guards. Parity verified under both the repacked and plain-Q8 oracle kernel variants. Served through /v1/chat/completions and /v1/completions (streaming + non-streaming) behind CAMELID_GEMMA4_SERVE. Raw logs: qa/evidence-bundles/gemma4-e2b-it-q8-0-20260610T103119Z-head-96a75007b156. Camelid supports exact-row text-token generation + serve smoke for this row only; no bounded-context, performance, portability, multimodal, or full support is implied",
                 next_step: "promote bounded context packs, add performance/RSS gates and durable current-head QA bundles, and broaden template coverage before any wider gemma4 claim",
             },
             ModelCompatibilityTarget {
@@ -2408,6 +2551,69 @@ fn model_family(gguf: &GgufFile) -> &'static str {
 /// trailing `<start_of_turn>model\n`. The tokenizer prepends `<bos>`
 /// (add_special). Gemma has no system role, so system text is folded into the
 /// next user turn. This is the single place the Gemma chat template lives.
+/// Gemma 4 turn markers. Gemma 4 RENAMED them from Gemma 3's
+/// `<start_of_turn>`/`<end_of_turn>` to `<|turn>` (id 105) / `<turn|>` (id 106)
+/// — verified against the E2B/E4B/12B GGUF vocab and the GGUF-embedded Jinja
+/// chat template (`'<|turn>' + role + '\n'` … `'<turn|>\n'`). Using the old
+/// spellings tokenizes as PLAIN TEXT: the model mimics them back and the stop
+/// token never matches.
+pub(crate) const GEMMA4_TURN_START: &str = "<|turn>";
+pub(crate) const GEMMA4_TURN_END: &str = "<turn|>";
+/// Thinking-channel markers (ids 100/101): the model may wrap hidden reasoning
+/// in `<|channel>…<channel|>`. The GGUF template strips these spans from chat
+/// history; Camelid strips them from chat OUTPUT so hidden reasoning never
+/// leaks to the client.
+pub(crate) const GEMMA4_CHANNEL_START: &str = "<|channel>";
+pub(crate) const GEMMA4_CHANNEL_END: &str = "<channel|>";
+
+#[cfg(test)]
+mod gemma4_template_tests {
+    use super::*;
+
+    #[test]
+    fn chat_prompt_uses_gemma4_turn_markers() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let prompt = gemma4_chat_prompt(&messages);
+        assert_eq!(prompt, "<|turn>user\nhi<turn|>\n<|turn>model\n");
+        // Gemma 3 marker spellings tokenize as plain text on gemma4 vocabs and
+        // must never appear.
+        assert!(!prompt.contains("<start_of_turn>"));
+        assert!(!prompt.contains("<end_of_turn>"));
+    }
+
+    #[test]
+    fn strip_channels_removes_thinking_spans() {
+        assert_eq!(
+            gemma4_strip_channels("<|channel>secret plan<channel|>Paris"),
+            "Paris"
+        );
+        assert_eq!(
+            gemma4_strip_channels("a<|channel>x<channel|>b<|channel>y<channel|>c"),
+            "abc"
+        );
+        // Unterminated channel (token budget hit mid-thought): nothing leaks.
+        assert_eq!(gemma4_strip_channels("ok<|channel>still thinking"), "ok");
+        assert_eq!(gemma4_strip_channels("plain"), "plain");
+    }
+
+    #[test]
+    fn streaming_channel_filter_suppresses_thinking_deltas() {
+        let mut f = Gemma4ChannelFilter::new();
+        assert_eq!(f.filter("Hello "), "Hello ");
+        assert_eq!(f.filter("<|channel>"), "");
+        assert_eq!(f.filter("hidden reasoning"), "");
+        assert_eq!(f.filter("<channel|>"), "");
+        assert_eq!(f.filter("Paris"), "Paris");
+        // Markers and text inside one delta.
+        let mut g = Gemma4ChannelFilter::new();
+        assert_eq!(g.filter("A<|channel>h<channel|>B"), "AB");
+    }
+}
+
 fn gemma4_chat_prompt(messages: &[ChatMessage]) -> String {
     let mut out = String::new();
     let mut pending_system = String::new();
@@ -2420,29 +2626,95 @@ fn gemma4_chat_prompt(messages: &[ChatMessage]) -> String {
                 pending_system.push_str(&m.content);
             }
             "assistant" => {
-                out.push_str("<start_of_turn>model\n");
+                out.push_str(GEMMA4_TURN_START);
+                out.push_str("model\n");
                 out.push_str(&m.content);
-                out.push_str("<end_of_turn>\n");
+                out.push_str(GEMMA4_TURN_END);
+                out.push('\n');
             }
             _ => {
-                out.push_str("<start_of_turn>user\n");
+                out.push_str(GEMMA4_TURN_START);
+                out.push_str("user\n");
                 if !pending_system.is_empty() {
                     out.push_str(&pending_system);
                     out.push_str("\n\n");
                     pending_system.clear();
                 }
                 out.push_str(&m.content);
-                out.push_str("<end_of_turn>\n");
+                out.push_str(GEMMA4_TURN_END);
+                out.push('\n');
             }
         }
     }
     if !pending_system.is_empty() {
-        out.push_str("<start_of_turn>user\n");
+        out.push_str(GEMMA4_TURN_START);
+        out.push_str("user\n");
         out.push_str(&pending_system);
-        out.push_str("<end_of_turn>\n");
+        out.push_str(GEMMA4_TURN_END);
+        out.push('\n');
     }
-    out.push_str("<start_of_turn>model\n");
+    out.push_str(GEMMA4_TURN_START);
+    out.push_str("model\n");
     out
+}
+
+/// Strip `<|channel>…<channel|>` thinking spans from a complete gemma4 chat
+/// response. An unterminated span (generation hit the token budget inside the
+/// channel) is stripped to its start — hidden reasoning must never leak.
+fn gemma4_strip_channels(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(GEMMA4_CHANNEL_START) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + GEMMA4_CHANNEL_START.len()..];
+        match after.find(GEMMA4_CHANNEL_END) {
+            Some(end) => rest = &after[end + GEMMA4_CHANNEL_END.len()..],
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Streaming-side channel suppressor: feed decoded deltas in, get the
+/// client-visible portion out. Marker pieces decode atomically (single vocab
+/// tokens), so state flips on exact marker occurrences within a delta.
+struct Gemma4ChannelFilter {
+    in_channel: bool,
+}
+
+impl Gemma4ChannelFilter {
+    fn new() -> Self {
+        Self { in_channel: false }
+    }
+
+    fn filter(&mut self, delta: &str) -> String {
+        let mut out = String::new();
+        let mut rest = delta;
+        loop {
+            if self.in_channel {
+                match rest.find(GEMMA4_CHANNEL_END) {
+                    Some(end) => {
+                        self.in_channel = false;
+                        rest = &rest[end + GEMMA4_CHANNEL_END.len()..];
+                    }
+                    None => return out,
+                }
+            } else {
+                match rest.find(GEMMA4_CHANNEL_START) {
+                    Some(start) => {
+                        out.push_str(&rest[..start]);
+                        self.in_channel = true;
+                        rest = &rest[start + GEMMA4_CHANNEL_START.len()..];
+                    }
+                    None => {
+                        out.push_str(rest);
+                        return out;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Resolve the Gemma 4 runtime for a chat request, if this request targets one.
@@ -2453,7 +2725,14 @@ async fn resolve_gemma4_runtime(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> std::result::Result<Option<(String, Arc<crate::gemma4_runtime::Gemma4Runtime>)>, Response> {
-    let id = match req.model.clone() {
+    resolve_gemma4_runtime_for_model(state, &req.model).await
+}
+
+async fn resolve_gemma4_runtime_for_model(
+    state: &AppState,
+    model: &Option<String>,
+) -> std::result::Result<Option<(String, Arc<crate::gemma4_runtime::Gemma4Runtime>)>, Response> {
+    let id = match model.clone() {
         Some(m) => m,
         None => match state.active_model_id.read().await.clone() {
             Some(m) => m,
@@ -2495,6 +2774,125 @@ fn unix_secs() -> u64 {
 
 /// Non-streaming Gemma 4 chat. Builds the gemma prompt, generates greedily on a
 /// blocking thread, and returns a minimal OpenAI-compatible response.
+/// Gemma 4 raw completion (non-streaming): BOS + plain prompt text through the
+/// greedy runtime — the same envelope the committed basic_v1 oracle pack checks.
+async fn gemma4_completion_nonstreaming(
+    id: String,
+    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    req: &CompletionRequest,
+) -> Response {
+    let Some(prompt) = req.prompt.clone() else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "prompt is required".to_string(),
+            Some("prompt"),
+        );
+    };
+    let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let result =
+        tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
+    let (text, ids) = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                e.to_string(),
+                None,
+            )
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                format!("gemma4 generation task panicked: {e}"),
+                None,
+            )
+        }
+    };
+    let body = serde_json::json!({
+        "id": "cmpl-gemma4",
+        "object": "text_completion",
+        "created": unix_secs(),
+        "model": id,
+        "choices": [{
+            "index": 0,
+            "text": text,
+            "logprobs": null,
+            "finish_reason": "stop",
+        }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "camelid": { "generated_token_ids": ids },
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Gemma 4 raw completion, streaming (SSE `text_completion` chunks + [DONE]).
+async fn gemma4_completion_streaming(
+    id: String,
+    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    req: &CompletionRequest,
+) -> Response {
+    let Some(prompt) = req.prompt.clone() else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "prompt is required".to_string(),
+            Some("prompt"),
+        );
+    };
+    let max_tokens = req.max_tokens.unwrap_or(64).min(4096) as usize;
+    let created = unix_secs();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
+    tokio::task::spawn_blocking(move || {
+        let send_tx = tx.clone();
+        let result = runtime.generate_greedy_streaming(&prompt, max_tokens, |delta| {
+            let _ = send_tx.send(Ok(delta.to_string()));
+        });
+        if let Err(e) = result {
+            let _ = tx.send(Err(e.to_string()));
+        }
+    });
+
+    let events = async_stream::stream! {
+        let mut errored = false;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(delta) => {
+                    let chunk = serde_json::json!({
+                        "id": "cmpl-gemma4",
+                        "object": "text_completion",
+                        "created": created,
+                        "model": id,
+                        "choices": [{ "index": 0, "text": delta, "logprobs": null, "finish_reason": null }],
+                    });
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+                }
+                Err(e) => {
+                    let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
+                    yield Ok(Event::default().data(err.to_string()));
+                    errored = true;
+                    break;
+                }
+            }
+        }
+        if !errored {
+            let done = serde_json::json!({
+                "id": "cmpl-gemma4",
+                "object": "text_completion",
+                "created": created,
+                "model": id,
+                "choices": [{ "index": 0, "text": "", "logprobs": null, "finish_reason": "stop" }],
+            });
+            yield Ok(Event::default().data(done.to_string()));
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(events).into_response()
+}
+
 async fn gemma4_chat_nonstreaming(
     id: String,
     runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
@@ -2531,7 +2929,9 @@ async fn gemma4_chat_nonstreaming(
         "model": id,
         "choices": [{
             "index": 0,
-            "message": { "role": "assistant", "content": text },
+            // Thinking channels are stripped: hidden reasoning never reaches
+            // the client or re-enters chat history.
+            "message": { "role": "assistant", "content": gemma4_strip_channels(&text) },
             "finish_reason": "stop",
         }],
         "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
@@ -2576,15 +2976,22 @@ async fn gemma4_chat_streaming(
         yield Ok::<Event, std::convert::Infallible>(Event::default().data(role.to_string()));
 
         let mut errored = false;
+        let mut channel_filter = Gemma4ChannelFilter::new();
         while let Some(item) = rx.recv().await {
             match item {
                 Ok(delta) => {
+                    // Suppress thinking-channel spans; an empty visible delta
+                    // emits nothing.
+                    let visible = channel_filter.filter(&delta);
+                    if visible.is_empty() {
+                        continue;
+                    }
                     let chunk = serde_json::json!({
                         "id": "chatcmpl-gemma4",
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": id,
-                        "choices": [{ "index": 0, "delta": { "content": delta }, "finish_reason": null }],
+                        "choices": [{ "index": 0, "delta": { "content": visible }, "finish_reason": null }],
                     });
                     yield Ok(Event::default().data(chunk.to_string()));
                 }
@@ -3528,6 +3935,19 @@ async fn completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): raw greedy
+    // completion against the gemma4 runtime, mirroring the chat short-circuit.
+    match resolve_gemma4_runtime_for_model(&state, &req.model).await {
+        Ok(Some((id, runtime))) => {
+            return if req.stream.unwrap_or(false) {
+                gemma4_completion_streaming(id, runtime, &req).await
+            } else {
+                gemma4_completion_nonstreaming(id, runtime, &req).await
+            };
+        }
+        Ok(None) => {}
+        Err(resp) => return resp,
+    }
     // Capture the receipt stamp before the request is consumed. Receipts are
     // strictly opt-in and never silently attached.
     let receipt_stamp = if req.camelid_receipt.unwrap_or(false) {
@@ -3652,6 +4072,14 @@ async fn chat_completions(
         Ok(payload) => payload,
         Err(err) => return malformed_json_error(err),
     };
+    // Fail closed on multimodal input before any routing: no Camelid row loads
+    // a vision/audio tower, so image/audio/video parts must produce a typed
+    // error, never a silent text-only generation.
+    if let Some(messages) = req.messages.as_deref() {
+        if let Some(response) = reject_unsupported_multimodal_content(messages) {
+            return response;
+        }
+    }
     // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE). Short-circuits
     // if this request targets a loaded gemma4 runtime; otherwise falls through to
     // the existing Llama/3B path unchanged.
@@ -7752,9 +8180,12 @@ mod tests {
         assert_eq!(
             supported_row_ids,
             BTreeSet::from([
-                // `gemma4_e4b_it_q8_0` is `supported_exact_row_smoke`: exact-row
+                // The gemma4 rows are `supported_exact_row_smoke`: exact-row
                 // generation + serve smoke only (token-identical to the reference),
                 // not bounded-context/perf/full support. Deliberately allowlisted.
+                // E2B additionally has committed basic_v1 pack parity vs the
+                // pinned llama.cpp 5d56eff oracle.
+                "gemma4_e2b_it_q8_0",
                 "gemma4_e4b_it_q8_0",
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
@@ -8378,6 +8809,7 @@ mod tests {
         assert_eq!(
             render_chat_prompt(
                 &[ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
                 }],
@@ -8418,6 +8850,7 @@ mod tests {
         assert_eq!(
             render_chat_prompt(
                 &[ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " hello ".to_string(),
                 }],
@@ -8437,18 +8870,22 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "system".to_string(),
                         content: "Answer briefly.".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Say alpha.".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "assistant".to_string(),
                         content: "alpha".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Now say beta.".to_string(),
                     },
@@ -8469,10 +8906,12 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Complete cam".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "assistant".to_string(),
                         content: "elid".to_string(),
                     },
@@ -8492,6 +8931,7 @@ mod tests {
         assert_eq!(
             render_chat_prompt(
                 &[ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "Line one.\n\n  Indented line two.  ".to_string(),
                 }],
@@ -8515,10 +8955,12 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "system".to_string(),
                         content: " Be brief. ".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: " Hello there. ".to_string(),
                     },
@@ -8537,6 +8979,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "Hello there.".to_string(),
             }],
@@ -8558,14 +9001,17 @@ mod tests {
             render_chat_prompt(
                 &[
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Complete cam".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "assistant".to_string(),
                         content: " elid ".to_string(),
                     },
                     ChatMessage {
+                        unsupported_content_parts: Vec::new(),
                         role: "user".to_string(),
                         content: "Now say hi".to_string(),
                     },
@@ -8584,6 +9030,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -8606,6 +9053,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -8630,10 +9078,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "  Be brief.  ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "  hello  ".to_string(),
                 },
@@ -8659,10 +9109,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "  Be brief.  ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "  hello  ".to_string(),
                 },
@@ -8688,14 +9140,17 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
                 },
@@ -8721,14 +9176,17 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
                 },
@@ -8754,10 +9212,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "  Be brief.  ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "  hello  ".to_string(),
                 },
@@ -8782,6 +9242,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -8805,18 +9266,22 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: " Answer tersely. ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
                 },
@@ -8841,10 +9306,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "Complete cam".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " elid ".to_string(),
                 },
@@ -8868,6 +9335,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -8890,6 +9358,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization_for_model(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -8913,10 +9382,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "Complete cam".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " elid ".to_string(),
                 },
@@ -8943,6 +9414,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -8967,18 +9439,22 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: " Answer tersely. ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Alpha? ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "assistant".to_string(),
                     content: " alpha ".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: " Beta? ".to_string(),
                 },
@@ -9006,10 +9482,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "system".to_string(),
                     content: "Be brief.".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
                 },
@@ -9034,10 +9512,12 @@ mod tests {
         let rendered = render_chat_prompt_for_tokenization(
             &[
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: " system ".to_string(),
                     content: "Be brief.".to_string(),
                 },
                 ChatMessage {
+                    unsupported_content_parts: Vec::new(),
                     role: "user".to_string(),
                     content: "hello".to_string(),
                 },
@@ -9060,6 +9540,7 @@ mod tests {
             "{% for message in messages %}{{ message['role'] }}={{ message['content'] }}\n{% endfor %}",
         );
         let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
             role: "user".to_string(),
             content: "hello".to_string(),
         }];
@@ -9086,6 +9567,7 @@ mod tests {
 
         let rendered = render_chat_prompt_for_tokenization(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9104,6 +9586,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9125,6 +9608,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -9151,6 +9635,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9175,6 +9660,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9200,6 +9686,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9225,6 +9712,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "  hello  ".to_string(),
             }],
@@ -9266,6 +9754,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9287,6 +9776,7 @@ mod tests {
 
         let err = render_chat_prompt_for_tokenization_for_model_result(
             &[ChatMessage {
+                unsupported_content_parts: Vec::new(),
                 role: "user".to_string(),
                 content: "hello".to_string(),
             }],
@@ -9915,6 +10405,17 @@ fn curated_catalog() -> Vec<CatalogItem> {
             repo_id: "unsloth/gemma-4-E4B-it-GGUF",
             filename: "gemma-4-E4B-it-Q8_0.gguf",
             size_bytes: 8192951456,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "gemma",
+        },
+        CatalogItem {
+            catalog_id: "gemma4_e2b_it_q8_0",
+            name: "Gemma 4 E2B-It Q8_0",
+            repo_id: "unsloth/gemma-4-E2B-it-GGUF",
+            filename: "gemma-4-E2B-it-Q8_0.gguf",
+            size_bytes: 5048350848,
             downloads: 0,
             likes: 0,
             quant: "Q8_0",

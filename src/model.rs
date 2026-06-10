@@ -38,6 +38,24 @@ impl LlamaModelConfig {
                 architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3"
                 | "gemma4" | "phi3" | "lfm2"),
             ) => architecture,
+            // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
+            // The tensor map parses (q-only attention layers, per-layer
+            // `layer_output_scale`, `nextn.pre/post_projection`), but the file
+            // carries no K/V projections — all layers declare shared KV sourced
+            // from the HOST model, and the host-hidden handoff plus the
+            // speculative acceptance contract are undocumented. Fail closed with
+            // the exact blocker rather than mis-binding it as a standalone model.
+            Some("gemma4-assistant") => {
+                return Err(BackendError::UnsupportedModelArchitecture(
+                    "gemma4-assistant (Gemma 4 MTP/drafter head): blocked — the GGUF \
+                     has no attn_k/attn_v tensors (KV is sourced from the host gemma4 \
+                     model under an undocumented contract) and the nextn pre/post \
+                     projection + acceptance semantics have no reference oracle yet; \
+                     Camelid fails closed until lossless speculative decode can be \
+                     proven token-identical to vanilla greedy"
+                        .into(),
+                ))
+            }
             Some(other) => return Err(BackendError::UnsupportedModelArchitecture(other.into())),
             None => {
                 return Err(BackendError::InvalidModelMetadata(
@@ -53,8 +71,19 @@ impl LlamaModelConfig {
             gguf,
             &architecture_key(architecture, "attention.head_count"),
         )?;
-        let attention_head_count_kv =
-            llama_attention_head_count_kv(gguf, architecture, attention_head_count);
+        // Gemma 4 rows carry per-layer arrays for `feed_forward_length` (E2B) and
+        // `attention.head_count_kv` (12B). The per-layer truth lives in
+        // `Gemma4Metadata` (`ffn_length_at`/`kv_heads_at`); these config scalars
+        // hold the per-layer MAX so generic sizing stays safe. Gemma 4 forward
+        // paths must use the per-layer accessors, never these scalars.
+        let attention_head_count_kv = match gemma4.as_ref() {
+            Some(g) => g.max_kv_heads(),
+            None => llama_attention_head_count_kv(gguf, architecture, attention_head_count),
+        };
+        let feed_forward_length = match gemma4.as_ref() {
+            Some(g) if g.max_ffn_length() > 0 => g.max_ffn_length(),
+            _ => required_u32(gguf, &architecture_key(architecture, "feed_forward_length"))?,
+        };
         Ok(Self {
             context_length: required_u32(gguf, &architecture_key(architecture, "context_length"))?,
             embedding_length: required_u32(
@@ -62,10 +91,7 @@ impl LlamaModelConfig {
                 &architecture_key(architecture, "embedding_length"),
             )?,
             block_count: required_u32(gguf, &architecture_key(architecture, "block_count"))?,
-            feed_forward_length: required_u32(
-                gguf,
-                &architecture_key(architecture, "feed_forward_length"),
-            )?,
+            feed_forward_length,
             attention_head_count,
             attention_head_count_kv,
             rope_dimension_count: gguf
@@ -178,6 +204,14 @@ pub struct Gemma4Metadata {
     /// Derived from the 5:1 schedule with a forced full final layer, matching the
     /// Gemma 4 reference and the observed `attention.sliding_window_pattern`.
     pub layer_is_sliding: Vec<bool>,
+    /// Per-layer FFN width. Gemma 4 rows are NOT uniform here: E2B carries a
+    /// per-layer `feed_forward_length` array (6144 for the first 15 layers,
+    /// 12288 for the rest), while E4B/12B carry a scalar (broadcast).
+    pub ffn_lengths: Vec<u32>,
+    /// Per-layer KV head count. The 12B row carries a per-layer
+    /// `attention.head_count_kv` array (8 on sliding layers, 1 on global
+    /// layers); E2B/E4B carry a scalar (broadcast).
+    pub kv_heads_per_layer: Vec<u32>,
 }
 
 impl Gemma4Metadata {
@@ -195,7 +229,32 @@ impl Gemma4Metadata {
             .metadata_u32(&key("attention.key_length"))
             .unwrap_or(head_dim_sliding);
         let block_count = gguf.metadata_u32(&key("block_count")).unwrap_or(0);
-        let layer_is_sliding = gemma4_sliding_schedule(block_count);
+        // The GGUF's own `attention.sliding_window_pattern` bool array is the
+        // authoritative per-layer schedule when it covers every layer; the 5:1
+        // formula is the fallback for files that omit it. A row whose pattern
+        // diverges from the formula (anything other than E4B's 42-layer layout
+        // has never been proven) must not be silently mis-scheduled.
+        let layer_is_sliding =
+            match gguf.metadata_array_bools_optional(&key("attention.sliding_window_pattern")) {
+                Ok(Some(pattern)) if pattern.len() == block_count as usize => pattern,
+                _ => gemma4_sliding_schedule(block_count),
+            };
+        // Per-layer-or-scalar keys: a scalar broadcasts to every layer; an array
+        // must cover every layer to be honored (anything else falls back to the
+        // scalar default so the shape validation in Gemma4Binding fails loudly
+        // instead of silently mis-binding).
+        let per_layer_or_scalar = |suffix: &str, default: u32| -> Vec<u32> {
+            if let Some(scalar) = gguf.metadata_u32(&key(suffix)) {
+                return vec![scalar; block_count as usize];
+            }
+            match gguf.metadata_array_u32_optional(&key(suffix)) {
+                Ok(Some(values)) if values.len() == block_count as usize => values,
+                _ => vec![default; block_count as usize],
+            }
+        };
+        let ffn_lengths = per_layer_or_scalar("feed_forward_length", 0);
+        let head_count = gguf.metadata_u32(&key("attention.head_count")).unwrap_or(0);
+        let kv_heads_per_layer = per_layer_or_scalar("attention.head_count_kv", head_count);
         Some(Self {
             head_dim_sliding,
             head_dim_global,
@@ -222,7 +281,29 @@ impl Gemma4Metadata {
                 .unwrap_or(0),
             final_logit_softcapping: gguf.metadata_f32(&key("final_logit_softcapping")),
             layer_is_sliding,
+            ffn_lengths,
+            kv_heads_per_layer,
         })
+    }
+
+    /// Per-layer FFN width (E2B varies this across layers).
+    pub fn ffn_length_at(&self, idx: usize) -> u32 {
+        self.ffn_lengths.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Per-layer KV head count (12B varies this across layers).
+    pub fn kv_heads_at(&self, idx: usize) -> u32 {
+        self.kv_heads_per_layer.get(idx).copied().unwrap_or(0)
+    }
+
+    /// Largest per-layer FFN width — for code that needs a single bound.
+    pub fn max_ffn_length(&self) -> u32 {
+        self.ffn_lengths.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Largest per-layer KV head count — for code that needs a single bound.
+    pub fn max_kv_heads(&self) -> u32 {
+        self.kv_heads_per_layer.iter().copied().max().unwrap_or(0)
     }
 
     /// True if decoder layer `idx` uses sliding (local) attention.
@@ -264,12 +345,7 @@ impl Gemma4Metadata {
     /// earlier same-type layer's KV cache it reads. This is the single source of
     /// truth for gemma's per-layer-type attention + cross-layer KV sharing, mirrored
     /// from the CPU `Gemma4Runtime` (`first_kv_shared`, `last_sliding/full_layer`).
-    pub fn layer_plan(
-        &self,
-        block_count: usize,
-        heads: usize,
-        kv_heads: usize,
-    ) -> Vec<Gemma4LayerPlan> {
+    pub fn layer_plan(&self, block_count: usize, heads: usize) -> Vec<Gemma4LayerPlan> {
         let first_kv_shared = block_count.saturating_sub(self.num_kv_shared_layers as usize);
         // The last owning (non-shared) layer of each attention type — the cache a
         // trailing shared layer of that type reads.
@@ -293,10 +369,15 @@ impl Gemma4Metadata {
                 } else {
                     last_global
                 };
+                // A shared layer reads its SOURCE layer's cache, so its KV
+                // geometry must be the source's (same-type layers share head_dim,
+                // but per-layer kv head counts make this explicit).
+                let kv_heads = self.kv_heads_at(kv_source_layer) as usize;
                 Gemma4LayerPlan {
                     sliding,
                     head_dim,
                     q_dim: heads * head_dim,
+                    kv_heads,
                     kv_dim: kv_heads * head_dim,
                     theta: self.rope_freq_base_at(l),
                     window: if sliding {
@@ -322,6 +403,9 @@ pub struct Gemma4LayerPlan {
     pub head_dim: usize,
     /// Query projection width = `heads * head_dim`.
     pub q_dim: usize,
+    /// KV head count for the cache this layer READS (the source layer's when
+    /// KV is shared; 12B varies kv heads per layer).
+    pub kv_heads: usize,
     /// K/V projection width = `kv_heads * head_dim`.
     pub kv_dim: usize,
     /// RoPE base (θ) for this layer's type.
@@ -368,13 +452,15 @@ mod gemma4_tests {
             per_layer_input_dim: 256,
             final_logit_softcapping: Some(30.0),
             layer_is_sliding: gemma4_sliding_schedule(42),
+            ffn_lengths: vec![10240; 42],
+            kv_heads_per_layer: vec![2; 42],
         }
     }
 
     #[test]
     fn layer_plan_resolves_dims_window_and_kv_sharing() {
         let meta = e4b_meta();
-        let plan = meta.layer_plan(42, 8, 2);
+        let plan = meta.layer_plan(42, 8);
         assert_eq!(plan.len(), 42);
         // first_kv_shared = 42 - 18 = 24.
         for (l, p) in plan.iter().enumerate() {
@@ -742,7 +828,11 @@ pub struct Gemma4LayerTensors {
     pub attn_norm: GgufTensorDescriptor,
     pub attn_q: GgufTensorDescriptor,
     pub attn_k: GgufTensorDescriptor,
-    pub attn_v: GgufTensorDescriptor,
+    /// `None` on V-less layers: the 12B row's full-attention layers carry no
+    /// `attn_v` tensor — the reference (llama.cpp `gemma4-iswa`) uses the K
+    /// projection output as V (`if v_proj is not present, use Kcur as Vcur`),
+    /// then applies the usual weightless V norm and no RoPE.
+    pub attn_v: Option<GgufTensorDescriptor>,
     pub attn_output: GgufTensorDescriptor,
     pub attn_q_norm: GgufTensorDescriptor,
     pub attn_k_norm: GgufTensorDescriptor,
@@ -782,6 +872,32 @@ impl Gemma4Binding {
             )
         })?;
 
+        // Fail closed on the Gemma 4 MoE rows (26B A4B): this binding models the
+        // dense FFN only. A MoE GGUF advertises `gemma4.expert_count` and carries
+        // router/expert tensors (`ffn_gate_inp`, `ffn_*_exps`) that have no
+        // binding or decode runtime here — and the Mixtral MoE path cannot be
+        // reused blindly (gemma4 layers add QK-norm, per-layer-type attention,
+        // and post-FFN norms around the expert block). Name the blocker exactly
+        // instead of surfacing a generic missing-tensor error.
+        if let Some(moe) = config.moe.as_ref() {
+            return Err(BackendError::UnsupportedModelArchitecture(format!(
+                "gemma4 MoE row (expert_count={}, expert_used_count={}): blocked — \
+                 router/expert FFN binding and a gemma4 MoE decode runtime are not \
+                 implemented; dense gemma4 rows remain the only bindable rows",
+                moe.expert_count, moe.expert_used_count
+            )));
+        }
+        if find_tensor(gguf, "blk.0.ffn_gate_inp.weight").is_some()
+            || find_tensor(gguf, "blk.0.ffn_gate_exps.weight").is_some()
+        {
+            return Err(BackendError::UnsupportedModelArchitecture(
+                "gemma4 MoE row: blocked — the tensor map carries router/expert FFN \
+                 tensors (ffn_gate_inp/ffn_*_exps) but no gemma4.expert_count \
+                 metadata; no MoE binding or decode runtime exists for gemma4"
+                    .into(),
+            ));
+        }
+
         let token_embedding = required_tensor(gguf, "token_embd.weight")?;
         let output_norm = required_tensor(gguf, "output_norm.weight")?;
         let (output, output_is_tied_embedding) = match find_tensor(gguf, "output.weight") {
@@ -800,7 +916,7 @@ impl Gemma4Binding {
                 attn_norm: req("attn_norm")?,
                 attn_q: req("attn_q")?,
                 attn_k: req("attn_k")?,
-                attn_v: req("attn_v")?,
+                attn_v: opt("attn_v"),
                 attn_output: req("attn_output")?,
                 attn_q_norm: req("attn_q_norm")?,
                 attn_k_norm: req("attn_k_norm")?,
@@ -848,9 +964,10 @@ impl Gemma4Binding {
         }
         let emb = config.embedding_length as usize;
         let heads = config.attention_head_count as usize;
-        let kv_heads = config.attention_head_count_kv as usize;
         for (idx, layer) in self.layers.iter().enumerate() {
             let head_dim = gemma4.head_dim_at(idx) as usize;
+            let kv_heads = gemma4.kv_heads_at(idx) as usize;
+            let ffn_len = gemma4.ffn_length_at(idx) as usize;
             require_descriptor_matrix_shape(
                 &layer.attn_q,
                 emb,
@@ -863,12 +980,16 @@ impl Gemma4Binding {
                 kv_heads * head_dim,
                 &format!("gemma4 layer {idx} attention k"),
             )?;
-            require_descriptor_matrix_shape(
-                &layer.attn_v,
-                emb,
-                kv_heads * head_dim,
-                &format!("gemma4 layer {idx} attention v"),
-            )?;
+            // V-less layers (12B full-attention) reuse the K projection as V;
+            // when the tensor exists it must match the K geometry.
+            if let Some(attn_v) = layer.attn_v.as_ref() {
+                require_descriptor_matrix_shape(
+                    attn_v,
+                    emb,
+                    kv_heads * head_dim,
+                    &format!("gemma4 layer {idx} attention v"),
+                )?;
+            }
             require_descriptor_matrix_shape(
                 &layer.attn_output,
                 heads * head_dim,
@@ -889,6 +1010,24 @@ impl Gemma4Binding {
                 &layer.attn_norm,
                 &[emb],
                 &format!("gemma4 layer {idx} attn_norm"),
+            )?;
+            require_descriptor_matrix_shape(
+                &layer.ffn_gate,
+                emb,
+                ffn_len,
+                &format!("gemma4 layer {idx} ffn gate"),
+            )?;
+            require_descriptor_matrix_shape(
+                &layer.ffn_up,
+                emb,
+                ffn_len,
+                &format!("gemma4 layer {idx} ffn up"),
+            )?;
+            require_descriptor_matrix_shape(
+                &layer.ffn_down,
+                ffn_len,
+                emb,
+                &format!("gemma4 layer {idx} ffn down"),
             )?;
         }
         Ok(())

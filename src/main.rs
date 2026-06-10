@@ -142,6 +142,31 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
     },
+    /// Serve the TAIL layers of a Gemma 4 model as a distributed worker
+    /// (layer sharding over TCP; pair with gemma4-master on the other Mac).
+    Gemma4Worker {
+        path: PathBuf,
+        #[arg(long, default_value = "0.0.0.0:5005")]
+        addr: String,
+        /// First (global) layer this worker owns; it owns through the final
+        /// layer plus the output head. Must not split the shared-KV block.
+        #[arg(long)]
+        first_layer: usize,
+    },
+    /// Run the HEAD layers of a Gemma 4 model and drive a distributed worker
+    /// for the tail (greedy decode; distributed layer sharding, not shared memory).
+    Gemma4Master {
+        path: PathBuf,
+        #[arg(long)]
+        worker_addr: String,
+        /// Layers [0, split) run locally; [split, block_count) on the worker.
+        #[arg(long)]
+        split: usize,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 24)]
+        max_tokens: usize,
+    },
     /// Dump focused tensor descriptor, raw block, and f32 dequantization diagnostics.
     TensorDump {
         path: PathBuf,
@@ -565,6 +590,45 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .into());
             }
+        }
+        Command::Gemma4Worker {
+            path,
+            addr,
+            first_layer,
+        } => {
+            // Blocks forever serving sessions; honest claim: distributed layer
+            // sharding (memory headroom), not shared memory.
+            let gguf = camelid::gguf::read_metadata(&path)?;
+            let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
+            let block_count = config.block_count as usize;
+            camelid::gemma4_distributed::run_worker(&path, &addr, first_layer..block_count)?;
+        }
+        Command::Gemma4Master {
+            path,
+            worker_addr,
+            split,
+            prompt,
+            max_tokens,
+        } => {
+            eprintln!(
+                "[gemma4-master] layers 0..{split} local, {split}.. on {worker_addr}; loading..."
+            );
+            let t0 = std::time::Instant::now();
+            let (out, ids, stats) = camelid::gemma4_distributed::run_master(
+                &path,
+                &worker_addr,
+                split,
+                &prompt,
+                max_tokens,
+                false,
+            )?;
+            eprintln!(
+                "[gemma4-master] done in {:.1}s; stats: {}",
+                t0.elapsed().as_secs_f32(),
+                serde_json::to_string(&stats)?
+            );
+            eprintln!("[gemma4-master] token_ids: {ids:?}");
+            println!("{prompt}{out}");
         }
         Command::TensorDump {
             path,
