@@ -827,7 +827,11 @@ impl LlamaTensorBinding {
 pub struct Gemma4LayerTensors {
     pub attn_norm: GgufTensorDescriptor,
     pub attn_q: GgufTensorDescriptor,
-    pub attn_k: GgufTensorDescriptor,
+    /// `None` on shared-KV layers in exports that trim unused projections:
+    /// the QAT GGUFs omit `attn_k`/`attn_v`/`attn_k_norm` on layers that source
+    /// their cache from an earlier layer (the Q8_0 exports carry them unused).
+    /// Owning layers (`idx < first_kv_shared`) must always bind them.
+    pub attn_k: Option<GgufTensorDescriptor>,
     /// `None` on V-less layers: the 12B row's full-attention layers carry no
     /// `attn_v` tensor — the reference (llama.cpp `gemma4-iswa`) uses the K
     /// projection output as V (`if v_proj is not present, use Kcur as Vcur`),
@@ -835,7 +839,7 @@ pub struct Gemma4LayerTensors {
     pub attn_v: Option<GgufTensorDescriptor>,
     pub attn_output: GgufTensorDescriptor,
     pub attn_q_norm: GgufTensorDescriptor,
-    pub attn_k_norm: GgufTensorDescriptor,
+    pub attn_k_norm: Option<GgufTensorDescriptor>,
     pub post_attention_norm: GgufTensorDescriptor,
     pub ffn_norm: GgufTensorDescriptor,
     pub post_ffw_norm: GgufTensorDescriptor,
@@ -915,11 +919,11 @@ impl Gemma4Binding {
             layers.push(Gemma4LayerTensors {
                 attn_norm: req("attn_norm")?,
                 attn_q: req("attn_q")?,
-                attn_k: req("attn_k")?,
+                attn_k: opt("attn_k"),
                 attn_v: opt("attn_v"),
                 attn_output: req("attn_output")?,
                 attn_q_norm: req("attn_q_norm")?,
-                attn_k_norm: req("attn_k_norm")?,
+                attn_k_norm: opt("attn_k_norm"),
                 post_attention_norm: req("post_attention_norm")?,
                 ffn_norm: req("ffn_norm")?,
                 post_ffw_norm: req("post_ffw_norm")?,
@@ -974,12 +978,29 @@ impl Gemma4Binding {
                 heads * head_dim,
                 &format!("gemma4 layer {idx} attention q"),
             )?;
-            require_descriptor_matrix_shape(
-                &layer.attn_k,
-                emb,
-                kv_heads * head_dim,
-                &format!("gemma4 layer {idx} attention k"),
-            )?;
+            let first_kv_shared =
+                config.block_count as usize - gemma4.num_kv_shared_layers as usize;
+            match layer.attn_k.as_ref() {
+                Some(attn_k) => require_descriptor_matrix_shape(
+                    attn_k,
+                    emb,
+                    kv_heads * head_dim,
+                    &format!("gemma4 layer {idx} attention k"),
+                )?,
+                None if idx < first_kv_shared => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "gemma4 layer {idx} owns its KV cache but binds no attn_k tensor                          (only shared-KV layers may omit K/V projections)"
+                    )))
+                }
+                // Shared-KV layers source K/V from an earlier layer; trimmed
+                // exports (QAT) legitimately omit the unused projections.
+                None => {}
+            }
+            if layer.attn_k_norm.is_none() && idx < first_kv_shared {
+                return Err(BackendError::InvalidModelMetadata(format!(
+                    "gemma4 layer {idx} owns its KV cache but binds no attn_k_norm tensor"
+                )));
+            }
             // V-less layers (12B full-attention) reuse the K projection as V;
             // when the tensor exists it must match the K geometry.
             if let Some(attn_v) = layer.attn_v.as_ref() {
@@ -1001,11 +1022,13 @@ impl Gemma4Binding {
                 &[head_dim],
                 &format!("gemma4 layer {idx} q_norm"),
             )?;
-            require_descriptor_shape(
-                &layer.attn_k_norm,
-                &[head_dim],
-                &format!("gemma4 layer {idx} k_norm"),
-            )?;
+            if let Some(attn_k_norm) = layer.attn_k_norm.as_ref() {
+                require_descriptor_shape(
+                    attn_k_norm,
+                    &[head_dim],
+                    &format!("gemma4 layer {idx} k_norm"),
+                )?;
+            }
             require_descriptor_shape(
                 &layer.attn_norm,
                 &[emb],

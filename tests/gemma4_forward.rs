@@ -227,18 +227,40 @@ fn gemma4_prefill_matches_oracle() {
             };
             stat(&attn_norm_w, "attn_norm[0]");
             let (qn, _) = load_f32(&store, &lt.attn_q_norm.name);
-            let (kn, _) = load_f32(&store, &lt.attn_k_norm.name);
+            let (kn, _) = load_f32(
+                &store,
+                &lt.attn_k_norm
+                    .as_ref()
+                    .expect("owning layer binds attn_k_norm")
+                    .name,
+            );
             stat(&qn, "q_norm[0]");
             stat(&kn, "k_norm[0]");
         }
         let (q_w, _) = load_f32(&store, &lt.attn_q.name);
-        let (k_w, _) = load_f32(&store, &lt.attn_k.name);
+        let (k_w, _) = load_f32(
+            &store,
+            &lt.attn_k.as_ref().expect("owning layer binds attn_k").name,
+        );
         // V-less layers (12B full attention) reuse the K projection as V; this
         // reference test exercises the E-series rows, which always carry V.
-        let (v_w, _) = load_f32(&store, &lt.attn_v.as_ref().unwrap_or(&lt.attn_k).name);
+        let (v_w, _) = load_f32(
+            &store,
+            &lt.attn_v
+                .as_ref()
+                .or(lt.attn_k.as_ref())
+                .expect("owning layer binds attn_k")
+                .name,
+        );
         let (o_w, _) = load_f32(&store, &lt.attn_output.name);
         let (qn_w, _) = load_f32(&store, &lt.attn_q_norm.name);
-        let (kn_w, _) = load_f32(&store, &lt.attn_k_norm.name);
+        let (kn_w, _) = load_f32(
+            &store,
+            &lt.attn_k_norm
+                .as_ref()
+                .expect("owning layer binds attn_k_norm")
+                .name,
+        );
         let (post_attn_w, _) = load_f32(&store, &lt.post_attention_norm.name);
         let (ffn_norm_w, _) = load_f32(&store, &lt.ffn_norm.name);
         let (gate_w, _) = load_f32(&store, &lt.ffn_gate.name);

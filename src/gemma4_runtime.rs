@@ -342,11 +342,12 @@ fn apply_rope(
 struct LayerWeights {
     attn_norm: Vec<f32>,
     attn_q: WireQuant,
-    attn_k: WireQuant,
+    /// `None` on shared-KV layers in trimmed (QAT) exports — never read there.
+    attn_k: Option<WireQuant>,
     attn_v: Option<WireQuant>, // None on V-less layers (V = K projection)
     attn_output: WireQuant,
     q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
+    k_norm: Option<Vec<f32>>,
     post_attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
     ffn_gate: WireQuant,
@@ -479,11 +480,11 @@ impl Gemma4Runtime {
             layers.push(LayerWeights {
                 attn_norm: f32t(&l.attn_norm.name)?,
                 attn_q: q8(&l.attn_q.name)?,
-                attn_k: q8(&l.attn_k.name)?,
+                attn_k: l.attn_k.as_ref().map(|d| q8(&d.name)).transpose()?,
                 attn_v: l.attn_v.as_ref().map(|d| q8(&d.name)).transpose()?,
                 attn_output: q8(&l.attn_output.name)?,
                 q_norm: f32t(&l.attn_q_norm.name)?,
-                k_norm: f32t(&l.attn_k_norm.name)?,
+                k_norm: l.attn_k_norm.as_ref().map(|d| f32t(&d.name)).transpose()?,
                 post_attn_norm: f32t(&l.post_attention_norm.name)?,
                 ffn_norm: f32t(&l.ffn_norm.name)?,
                 ffn_gate: q8(&l.ffn_gate.name)?,
@@ -735,7 +736,11 @@ impl Gemma4Runtime {
             }
 
             if l < self.first_kv_shared {
-                let mut k = lw.attn_k.matvec_q(kv_dim, &xnq);
+                let mut k = lw
+                    .attn_k
+                    .as_ref()
+                    .expect("validate() guarantees owning layers bind attn_k")
+                    .matvec_q(kv_dim, &xnq);
                 // V-less layers (12B full attention) reuse the raw K projection
                 // as V — reference: `if v_proj is not present, use Kcur as Vcur`.
                 // V then takes the usual weightless norm and never RoPE.
@@ -745,7 +750,15 @@ impl Gemma4Runtime {
                 };
                 for hh in 0..kv_heads {
                     let s = &mut k[hh * head_dim..(hh + 1) * head_dim];
-                    s.copy_from_slice(&rms_norm(s, Some(&lw.k_norm), eps));
+                    s.copy_from_slice(&rms_norm(
+                        s,
+                        Some(
+                            lw.k_norm
+                                .as_deref()
+                                .expect("validate() guarantees owning layers bind attn_k_norm"),
+                        ),
+                        eps,
+                    ));
                     let sv = &mut v[hh * head_dim..(hh + 1) * head_dim];
                     sv.copy_from_slice(&rms_norm(sv, None, eps));
                 }
@@ -1070,12 +1083,32 @@ impl Gemma4GpuRuntime {
             let layer = crate::metal::Gemma4ResidentLayer::from_wire_pages(
                 f32t(&lb.attn_norm.name)?,
                 f32t(&lb.attn_q_norm.name)?,
-                f32t(&lb.attn_k_norm.name)?,
+                f32t(
+                    &lb.attn_k_norm
+                        .as_ref()
+                        .ok_or_else(|| {
+                            BackendError::UnsupportedTensorType(format!(
+                                "gemma4 GPU runtime requires attn_k_norm on every layer; \
+                             layer {l} omits it (trimmed shared-KV export)"
+                            ))
+                        })?
+                        .name,
+                )?,
                 f32t(&lb.post_attention_norm.name)?,
                 f32t(&lb.ffn_norm.name)?,
                 f32t(&lb.post_ffw_norm.name)?,
                 &pages(&lb.attn_q.name)?,
-                &pages(&lb.attn_k.name)?,
+                &pages(
+                    &lb.attn_k
+                        .as_ref()
+                        .ok_or_else(|| {
+                            BackendError::UnsupportedTensorType(format!(
+                                "gemma4 GPU runtime requires attn_k on every layer; \
+                             layer {l} omits it (trimmed shared-KV export)"
+                            ))
+                        })?
+                        .name,
+                )?,
                 lb.attn_v
                     .as_ref()
                     .map(|d| pages(&d.name))

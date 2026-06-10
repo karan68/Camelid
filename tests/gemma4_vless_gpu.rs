@@ -68,13 +68,18 @@ fn vless_gpu_layer_matches_cpu_on_real_12b_weights() {
 
     let attn_norm = f32t(&lb.attn_norm.name);
     let q_norm = f32t(&lb.attn_q_norm.name);
-    let k_norm = f32t(&lb.attn_k_norm.name);
+    let k_norm = f32t(
+        &lb.attn_k_norm
+            .as_ref()
+            .expect("12B layers bind attn_k_norm")
+            .name,
+    );
     let post_attn = f32t(&lb.post_attention_norm.name);
     let ffn_norm = f32t(&lb.ffn_norm.name);
     let post_ffw = f32t(&lb.post_ffw_norm.name);
     // (attn_q is loaded for the GPU side only — at position 0 the CPU reference
     // never needs Q: softmax over one position makes the attention weight 1.0.)
-    let k_w = f32t(&lb.attn_k.name);
+    let k_w = f32t(&lb.attn_k.as_ref().expect("12B layers bind attn_k").name);
     let o_w = f32t(&lb.attn_output.name);
     let gate_w = f32t(&lb.ffn_gate.name);
     let up_w = f32t(&lb.ffn_up.name);
@@ -148,7 +153,7 @@ fn vless_gpu_layer_matches_cpu_on_real_12b_weights() {
         ffn_norm.clone(),
         post_ffw.clone(),
         &wire(&lb.attn_q.name),
-        &wire(&lb.attn_k.name),
+        &wire(&lb.attn_k.as_ref().expect("12B layers bind attn_k").name),
         None, // V-less
         &wire(&lb.attn_output.name),
         &wire(&lb.ffn_gate.name),
