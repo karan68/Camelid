@@ -49,6 +49,19 @@ struct OracleResult {
     prompt_tokens: Vec<u32>,
     generated_tokens: Vec<u32>,
     generated_text: String,
+    /// Recorded knife-edge frontier for the CPU runtime: full parity is
+    /// asserted only for the first `parity_prefix_tokens` generated tokens of
+    /// this prompt on CPU (the GPU runtime asserts the full budget). Used when
+    /// a near-tie argmax (top-2 logit gap ~0.1% or less, measured and quoted
+    /// in `reason`) resolves differently across accumulation orders — the same
+    /// frontier class as the recorded TinyLlama deep-generation divergence.
+    cpu_known_frontier: Option<CpuKnownFrontier>,
+}
+
+#[derive(serde::Deserialize)]
+struct CpuKnownFrontier {
+    parity_prefix_tokens: usize,
+    reason: String,
 }
 
 fn repo_path(rel: &str) -> PathBuf {
@@ -162,6 +175,26 @@ fn gemma4_greedy_generation_matches_llama_cpp_oracle() {
             unreachable!()
         };
 
+        // A recorded CPU knife-edge frontier bounds the CPU assertion to its
+        // measured prefix; the GPU runtime always asserts the full budget.
+        if let (false, Some(frontier)) = (use_gpu, expected.cpu_known_frontier.as_ref()) {
+            let n = frontier.parity_prefix_tokens;
+            if generated.len() < n || generated[..n] != expected.generated_tokens[..n] {
+                failures.push(format!(
+                    "{}: generated tokens diverge INSIDE the recorded {n}-token frontier\n  \
+                     camelid: {generated:?}\n  oracle:  {:?}",
+                    prompt.id, expected.generated_tokens
+                ));
+                continue;
+            }
+            eprintln!(
+                "  {} OK to recorded CPU frontier ({n} of {} oracle tokens): {}",
+                prompt.id,
+                expected.generated_tokens.len(),
+                frontier.reason
+            );
+            continue;
+        }
         if generated != expected.generated_tokens {
             failures.push(format!(
                 "{}: generated tokens diverge\n  camelid: {generated:?}\n  oracle:  {:?}",

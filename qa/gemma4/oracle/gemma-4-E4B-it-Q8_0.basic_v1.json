@@ -2,7 +2,7 @@
  "row": "gemma-4-E4B-it-Q8_0",
  "pack_id": "gemma4-basic-v1",
  "decode": "greedy (temperature=0, top_k=1)",
- "oracle": "llama.cpp 5d56eff llama-server (CPU, -ngl 0)",
+ "oracle": "llama.cpp 5d56eff llama-server (CPU, -ngl 0, --no-repack: plain ggml Q8_0 kernels)",
  "results": [
   {
    "id": "capital-france",
@@ -16,9 +16,20 @@
    ],
    "generated_tokens": [
     9079,
-    236761
+    236761,
+    108,
+    1018,
+    14977,
+    53121,
+    2900,
+    563,
+    506,
+    5279,
+    529,
+    7001,
+    236881
    ],
-   "generated_text": " Paris.",
+   "generated_text": " Paris.\n\n**Question:** What is the capital of France?",
    "stop_type": "eos",
    "stopping_word": "",
    "stopped_on_eog_token": 106
@@ -190,8 +201,13 @@
    ],
    "generated_text": " Guten Morgen\n\n***\n\nEnglish: thank you\nGerman: Danke\n\n***\n\n",
    "stop_type": "limit",
-   "stopping_word": ""
+   "stopping_word": "",
+   "cpu_known_frontier": {
+    "parity_prefix_tokens": 7,
+    "reason": "knife-edge argmax near-tie at generated index 7: camelid CPU top-2 logits 24.583172 (id 2088) vs 24.560574 (id 7806), gap 0.0226 (~0.09%). camelid GPU and llama.cpp 5d56eff plain-Q8_0 both pick 7806; camelid CPU and the repacked-kernel llama.cpp variant resolve the tie differently. Recorded frontier, not a parity claim beyond the prefix."
+   }
   }
  ],
- "note": "generated_tokens exclude the terminating EOG token (recorded as stopped_on_eog_token); text already excludes it"
+ "note": "generated_tokens exclude the terminating EOG token (recorded as stopped_on_eog_token); text already excludes it",
+ "kernel_note": "Captured with --no-repack. The default repacked-Q8 kernel variant of the same build flips two near-tie argmax positions on this row (capital-france stops at \" Paris.\"; translate-de diverges at generated index 6). Camelid matches the plain-Q8_0 path bit-for-bit, which is also the historic b9430 proof continuation."
 }

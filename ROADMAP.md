@@ -21,7 +21,7 @@ Current program posture:
 - **1B promoted lane:** Llama 3.2 1B Instruct Q8_0 is verified through checked bounded 512/1024/2048/4096/8192 packs where row-specific PASS artifacts exist; this does not promote model-native/larger context, neighboring rows, production throughput, or portability.
 - **3B promoted lane:** Llama 3.2 3B Instruct Q8_0 is supported as exact-row smoke with canonical Ubuntu API/WebUI refresh at source head `e9f926ed1a65`, compact/broader parity, bounded unique-chat RSS/perf, and checked 512/1024/2048 packs; broader/full support remains gated.
 - **8B promoted lane:** Llama 3 8B Instruct Q8_0 has verified bounded support through compact parity, a three-prompt 50-token Ubuntu parity run, API/frontend smoke, bounded memory evidence, checked bounded 512/1024/2048 context packs, and one bounded compact chat-template-shapes pack for the exact tracked Q8_0 GGUF; broader/full 8B support remains gated.
-- **Next-family posture:** Mistral 7B Instruct v0.3 Q8_0 remains evidence-only active validation, Mixtral 8x7B Instruct v0.1 Q8_0 is blocked partial runtime evidence only, and Qwen/Gemma remain planned exact-row candidates.
+- **Next-family posture:** Mistral 7B Instruct v0.3 Q8_0 remains evidence-only active validation, Mixtral 8x7B Instruct v0.1 Q8_0 is blocked partial runtime evidence only, and Qwen/Gemma 2 remain planned exact-row candidates; Gemma 4 E2B-It/E4B-It Q8_0 are promoted exact-row text-generation smoke lanes with 12B-it in active validation behind the two-node sharding lane.
 - **Performance posture:** Ubuntu x86 Q8 work remains default-off and evidence-gated. It may guide runtime architecture, but it does not widen support language or promise user-visible speed until same-host parity and repeated timing evidence justify it.
 - **Explicit non-claim:** no broad Llama-family support exists today; neighboring variants remain unsupported unless they have their own exact row and evidence.
 
@@ -123,7 +123,7 @@ Current required discipline:
 - Llama 3 8B Q8_0 has verified bounded support with compact parity, the three-prompt 50-token pass, API/frontend smoke, bounded memory evidence, checked bounded 512/1024/2048 context packs, and one compact chat-template-shapes pack; model-native/larger context beyond checked packs, broader chat-template, production performance, and portability expansion remain gated.
 - Mistral 7B Instruct v0.3 Q8_0 remains active exact-row validation only. Tokenizer/template, generation, and checked context evidence exist, but the fail-closed API/WebUI/RSS bundle still requires explicit support-contract promotion before README, compatibility, status, API, and frontend surfaces may call the row supported.
 - Mixtral 8x7B Instruct v0.1 Q8_0 is active validation / partial backend runtime only. Later-generation divergence and the continuation hang block readiness.
-- Qwen 2.5 7B and Gemma 2 9B remain planned exact-row candidates only.
+- Qwen 2.5 7B and Gemma 2 9B remain planned exact-row candidates only; Gemma 4 exact rows (E2B-It/E4B-It Q8_0) carry their own committed parity packs and capability rows.
 - Frontend readiness must remain exact-row and exact-quant aware.
 - Support-language updates should point first to the committed `qa/evidence-bundles/...` manifests/checksums and only then to raw `target/` drill-down artifacts.
 

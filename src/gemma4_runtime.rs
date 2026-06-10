@@ -295,6 +295,10 @@ pub enum Gemma4StepOutput {
     Logits(Vec<f32>),
 }
 
+/// Per-layer incremental KV cache: `cache[local_layer][position]` is one
+/// position's packed `[kv_heads * head_dim]` K (or V) row.
+pub type Gemma4KvCache = Vec<Vec<Vec<f32>>>;
+
 impl Gemma4Runtime {
     pub fn load(path: &Path) -> Result<Self> {
         Self::load_layer_range(path, None)
@@ -433,7 +437,7 @@ impl Gemma4Runtime {
     }
 
     /// Fresh per-LOCAL-layer KV caches for one sequence.
-    pub fn empty_kv_caches(&self) -> (Vec<Vec<Vec<f32>>>, Vec<Vec<Vec<f32>>>) {
+    pub fn empty_kv_caches(&self) -> (Gemma4KvCache, Gemma4KvCache) {
         (
             vec![Vec::new(); self.layers.len()],
             vec![Vec::new(); self.layers.len()],

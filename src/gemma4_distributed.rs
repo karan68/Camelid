@@ -427,8 +427,8 @@ pub fn run_master(
     let mut last_next = 0u32;
     let feed = |token: u32,
                 pos: usize,
-                kc: &mut Vec<Vec<Vec<f32>>>,
-                vc: &mut Vec<Vec<Vec<f32>>>,
+                kc: &mut crate::gemma4_runtime::Gemma4KvCache,
+                vc: &mut crate::gemma4_runtime::Gemma4KvCache,
                 client: &mut Gemma4WorkerClient,
                 local_ms: &mut f64,
                 wire_ms: &mut f64|
@@ -464,9 +464,9 @@ pub fn run_master(
     stats.ttft_ms = t_start.elapsed().as_secs_f64() * 1e3;
 
     let mut generated = Vec::new();
-    let mut pos = prompt_tokens.len();
     let t_decode = std::time::Instant::now();
-    for _ in 0..max_new {
+    // `pos` is the absolute sequence position of the token being fed back.
+    for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
         if stop.contains(&last_next) {
             break;
         }
@@ -481,7 +481,6 @@ pub fn run_master(
             &mut wire_ms,
         )?;
         stats.total_wire_round_trips += 1;
-        pos += 1;
     }
     let decode_s = t_decode.elapsed().as_secs_f64();
     stats.generated_tokens = generated.len();

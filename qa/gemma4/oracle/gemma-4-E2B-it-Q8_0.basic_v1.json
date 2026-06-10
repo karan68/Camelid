@@ -173,5 +173,6 @@
    "stopped_on_eog_token": 106
   }
  ],
- "note": "generated_tokens exclude the terminating EOG token (recorded as stopped_on_eog_token); text already excludes it"
+ "note": "generated_tokens exclude the terminating EOG token (recorded as stopped_on_eog_token); text already excludes it",
+ "kernel_note": "Verified token-identical under BOTH the default repacked-Q8 kernels and --no-repack plain Q8_0 kernels of llama.cpp 5d56eff for every pack prompt."
 }
