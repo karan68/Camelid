@@ -19,52 +19,52 @@
   "logs": [
     {
       "name": "single-node-parity-mini2",
-      "file": "logs/single-node-parity-mini2.log",
+      "file": "logs/single-node-parity-mini2.txt",
       "sha256": "c1e52c173b7a22d6873683500b22470560387353c7ddc30f24c63fcde2bd4099"
     },
     {
       "name": "two-mac-capital-france",
-      "file": "logs/two-mac-capital-france.log",
+      "file": "logs/two-mac-capital-france.txt",
       "sha256": "d865a28afbcd491d5e63363131078e72026cd462a81399713ac0ac97914598eb"
     },
     {
       "name": "two-mac-count-primes",
-      "file": "logs/two-mac-count-primes.log",
+      "file": "logs/two-mac-count-primes.txt",
       "sha256": "e9fc2d5cd580bce19b9db1391698f0bf6c1ea23bab22e8503c550c54bcae016a"
     },
     {
       "name": "two-mac-haiku-sea",
-      "file": "logs/two-mac-haiku-sea.log",
+      "file": "logs/two-mac-haiku-sea.txt",
       "sha256": "af624778c8abbe1781b6ce13712d453edeb1c613161e76b67a9cfcd5bc218f3c"
     },
     {
       "name": "two-mac-rust-fn",
-      "file": "logs/two-mac-rust-fn.log",
+      "file": "logs/two-mac-rust-fn.txt",
       "sha256": "7f154c157bdbe4f191578336a3623e7cbd078c0d8135901cf8e792d747a655d2"
     },
     {
       "name": "two-mac-translate-de",
-      "file": "logs/two-mac-translate-de.log",
+      "file": "logs/two-mac-translate-de.txt",
       "sha256": "a4b344890a9923a39096e4a80e01d094e6922efc54eebc08d5bda4d09c91950f"
     },
     {
       "name": "two-mac-summary",
-      "file": "logs/two-mac-summary.log",
+      "file": "logs/two-mac-summary.txt",
       "sha256": "8ac9d9b7d7b8958d78fb330ef881252db1225d917c156acf8487a39a68c0bef8"
     },
     {
       "name": "worker-rss",
-      "file": "logs/worker-rss.log",
+      "file": "logs/worker-rss.txt",
       "sha256": "d2b21c7808f3408d0c6a05f7b08b8852fbde53f316f0a4adf0d498be9da3607e"
     },
     {
       "name": "metadata-load",
-      "file": "logs/metadata-load.log",
+      "file": "logs/metadata-load.txt",
       "sha256": "4275293e67fc550965ee9e4d65c61ab97689e76e7655c355016ab34152d885b9"
     },
     {
       "name": "single-node-blocker-primary-host",
-      "file": "logs/single-node-blocker-primary-host.log",
+      "file": "logs/single-node-blocker-primary-host.txt",
       "sha256": "de97e91a6712f3f854e59e14d93db887ec22356a7c8aa64c4e00ddb38302ae60"
     }
   ],

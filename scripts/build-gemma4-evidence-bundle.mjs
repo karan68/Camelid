@@ -60,9 +60,9 @@ const modelBytes = fs.statSync(modelPath).size
 
 const logEntries = []
 for (const { name, path: src } of logs) {
-  const dst = path.join(bundleDir, 'logs', `${name}.log`)
+  const dst = path.join(bundleDir, 'logs', `${name}.txt`)
   fs.copyFileSync(src, dst)
-  logEntries.push({ name, file: `logs/${name}.log`, sha256: sha256(dst) })
+  logEntries.push({ name, file: `logs/${name}.txt`, sha256: sha256(dst) })
 }
 
 const manifest = {
