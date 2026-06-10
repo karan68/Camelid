@@ -79,10 +79,11 @@ static JINJA_CHAT_TEMPLATE_ENV_CACHE: OnceLock<Mutex<HashMap<String, Arc<Environ
 #[derive(Clone)]
 pub struct AppState {
     loaded_models: Arc<RwLock<HashMap<String, LoadedModel>>>,
-    /// Gemma 4 runtimes, keyed by model id. Populated only when the gemma4 serve
-    /// path is enabled (`CAMELID_GEMMA4_SERVE`) and a gemma4 model is loaded. This
-    /// is an additive, parallel path: the Llama/3B backend is untouched.
-    gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<crate::gemma4_runtime::Gemma4Runtime>>>>,
+    /// Gemma 4 serve runtimes (local single-node or distributed layer-sharding),
+    /// keyed by model id. Populated only when the gemma4 serve path is enabled
+    /// (`CAMELID_GEMMA4_SERVE`) and a gemma4 model is loaded. This is an
+    /// additive, parallel path: the Llama/3B backend is untouched.
+    gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<Gemma4ServeRuntime>>>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
@@ -130,7 +131,22 @@ impl AppState {
         self.gemma4_runtimes
             .write()
             .await
-            .insert(id.to_string(), Arc::new(runtime));
+            .insert(id.to_string(), Arc::new(Gemma4ServeRuntime::Local(runtime)));
+    }
+
+    /// Register a distributed gemma4 runtime under a model id, exactly as the
+    /// `CAMELID_GEMMA4_WORKER`/`CAMELID_GEMMA4_SPLIT` load path would. For
+    /// integration tests that drive the live chat routes against a loopback
+    /// worker without the full model-install flow.
+    pub async fn insert_gemma4_distributed_runtime_for_tests(
+        &self,
+        id: &str,
+        runtime: crate::gemma4_distributed::Gemma4DistributedRuntime,
+    ) {
+        self.gemma4_runtimes.write().await.insert(
+            id.to_string(),
+            Arc::new(Gemma4ServeRuntime::Distributed(runtime)),
+        );
     }
 }
 
@@ -2748,17 +2764,75 @@ impl Gemma4ChannelFilter {
 /// Returns `Err(response)` to short-circuit with a clear error (a gemma4 model is
 /// loaded but its runtime is missing), `Ok(None)` to fall through to the Llama
 /// path, or `Ok(Some(runtime))` to serve via Gemma 4.
+/// The serve-lane gemma4 runtime: single-node local decode, or the two-node
+/// distributed layer-sharding lane (master shard in-process, tail layers on a
+/// worker over TCP). Both expose the same greedy contract, so the chat and
+/// completion handlers are lane-agnostic. The distributed lane is configured
+/// at model-load time via `CAMELID_GEMMA4_WORKER` + `CAMELID_GEMMA4_SPLIT`
+/// (alongside `CAMELID_GEMMA4_SERVE=1`).
+pub enum Gemma4ServeRuntime {
+    Local(crate::gemma4_runtime::Gemma4Runtime),
+    Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
+}
+
+impl Gemma4ServeRuntime {
+    fn generate_greedy(&self, prompt: &str, max_new: usize) -> crate::Result<(String, Vec<u32>)> {
+        match self {
+            Self::Local(r) => r.generate_greedy(prompt, max_new),
+            Self::Distributed(r) => r.generate_greedy(prompt, max_new),
+        }
+    }
+
+    fn generate_greedy_streaming<F: FnMut(&str)>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        on_delta: F,
+    ) -> crate::Result<(String, Vec<u32>)> {
+        match self {
+            Self::Local(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
+            Self::Distributed(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
+        }
+    }
+}
+
+/// Distributed gemma4 serve config from the environment: both vars must be
+/// present and well-formed, or the pair is rejected loudly — a half-configured
+/// distributed lane must never silently fall back to a partial local load.
+fn gemma4_distributed_serve_config() -> std::result::Result<Option<(String, usize)>, String> {
+    let worker = std::env::var("CAMELID_GEMMA4_WORKER").ok();
+    let split = std::env::var("CAMELID_GEMMA4_SPLIT").ok();
+    match (worker, split) {
+        (None, None) => Ok(None),
+        (Some(w), Some(s)) => {
+            let split: usize = s.parse().map_err(|_| {
+                format!("CAMELID_GEMMA4_SPLIT must be a positive layer index, got {s:?}")
+            })?;
+            if split == 0 {
+                return Err("CAMELID_GEMMA4_SPLIT must be >= 1".to_string());
+            }
+            Ok(Some((w, split)))
+        }
+        (Some(_), None) => {
+            Err("CAMELID_GEMMA4_WORKER is set but CAMELID_GEMMA4_SPLIT is missing".to_string())
+        }
+        (None, Some(_)) => {
+            Err("CAMELID_GEMMA4_SPLIT is set but CAMELID_GEMMA4_WORKER is missing".to_string())
+        }
+    }
+}
+
 async fn resolve_gemma4_runtime(
     state: &AppState,
     req: &ChatCompletionRequest,
-) -> std::result::Result<Option<(String, Arc<crate::gemma4_runtime::Gemma4Runtime>)>, Response> {
+) -> std::result::Result<Option<(String, Arc<Gemma4ServeRuntime>)>, Response> {
     resolve_gemma4_runtime_for_model(state, &req.model).await
 }
 
 async fn resolve_gemma4_runtime_for_model(
     state: &AppState,
     model: &Option<String>,
-) -> std::result::Result<Option<(String, Arc<crate::gemma4_runtime::Gemma4Runtime>)>, Response> {
+) -> std::result::Result<Option<(String, Arc<Gemma4ServeRuntime>)>, Response> {
     let id = match model.clone() {
         Some(m) => m,
         None => match state.active_model_id.read().await.clone() {
@@ -2805,7 +2879,7 @@ fn unix_secs() -> u64 {
 /// greedy runtime — the same envelope the committed basic_v1 oracle pack checks.
 async fn gemma4_completion_nonstreaming(
     id: String,
-    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    runtime: Arc<Gemma4ServeRuntime>,
     req: &CompletionRequest,
 ) -> Response {
     let Some(prompt) = req.prompt.clone() else {
@@ -2870,7 +2944,7 @@ async fn gemma4_completion_nonstreaming(
 /// Gemma 4 raw completion, streaming (SSE `text_completion` chunks + [DONE]).
 async fn gemma4_completion_streaming(
     id: String,
-    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    runtime: Arc<Gemma4ServeRuntime>,
     req: &CompletionRequest,
 ) -> Response {
     let Some(prompt) = req.prompt.clone() else {
@@ -2934,7 +3008,7 @@ async fn gemma4_completion_streaming(
 
 async fn gemma4_chat_nonstreaming(
     id: String,
-    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
@@ -2997,7 +3071,7 @@ async fn gemma4_chat_nonstreaming(
 /// pushes deltas through an mpsc channel that this stream forwards.
 async fn gemma4_chat_streaming(
     id: String,
-    runtime: Arc<crate::gemma4_runtime::Gemma4Runtime>,
+    runtime: Arc<Gemma4ServeRuntime>,
     req: &ChatCompletionRequest,
 ) -> Response {
     let messages = req.messages.clone().unwrap_or_default();
@@ -3162,23 +3236,41 @@ async fn load_model_from_path_with_activation(
     }
 
     // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): load a
-    // Gemma4Runtime so /v1/chat can route to it. Fail clearly on error — never
+    // serve runtime so /v1/chat can route to it. Fail clearly on error — never
     // silently fall back to the Llama path (which would produce garbage here).
+    // With CAMELID_GEMMA4_WORKER + CAMELID_GEMMA4_SPLIT set, the runtime is the
+    // distributed layer-sharding lane (master shard locally, tail layers on the
+    // worker); a half-configured or unreachable pair fails the load.
     if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
+        let distributed =
+            gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
         let load_path = loaded.path.clone();
-        let runtime = tokio::task::spawn_blocking(move || {
-            crate::gemma4_runtime::Gemma4Runtime::load(&load_path)
+        let runtime = tokio::task::spawn_blocking(move || match distributed {
+            Some((worker_addr, split)) => {
+                crate::gemma4_distributed::Gemma4DistributedRuntime::connect(
+                    &load_path,
+                    &worker_addr,
+                    split,
+                )
+                .map(Gemma4ServeRuntime::Distributed)
+            }
+            None => crate::gemma4_runtime::Gemma4Runtime::load(&load_path)
+                .map(Gemma4ServeRuntime::Local),
         })
         .await
         .map_err(|e| {
             BackendError::InvalidModelMetadata(format!("gemma4 runtime load task panicked: {e}"))
         })??;
+        let lane = match &runtime {
+            Gemma4ServeRuntime::Local(_) => "local",
+            Gemma4ServeRuntime::Distributed(_) => "distributed",
+        };
         state
             .gemma4_runtimes
             .write()
             .await
             .insert(id.clone(), Arc::new(runtime));
-        tracing::info!(model = %id, "gemma4 runtime loaded for serve path");
+        tracing::info!(model = %id, lane, "gemma4 runtime loaded for serve path");
     }
 
     Ok(loaded)

@@ -188,3 +188,92 @@ fn distributed_wire_version_mismatch_fails_closed() {
         "error names the mismatch: {err}"
     );
 }
+
+/// The serve-lane distributed runtime (persistent master shard + per-request
+/// worker session) must produce the same greedy ids/text as the committed
+/// oracle, and its streaming deltas must concatenate to exactly the final
+/// text (the same contract the single-node streaming runtime keeps).
+#[test]
+fn distributed_serve_runtime_streaming_matches_oracle() {
+    let Some(model) = std::env::var_os("CAMELID_GEMMA4_GGUF").map(PathBuf::from) else {
+        eprintln!("SKIP distributed serve runtime: set CAMELID_GEMMA4_GGUF");
+        return;
+    };
+    let row = model
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let oracle_path = repo_path(&format!("qa/gemma4/oracle/{row}.basic_v1.json"));
+    let oracle: Oracle = serde_json::from_str(
+        &std::fs::read_to_string(&oracle_path)
+            .unwrap_or_else(|_| panic!("no committed oracle for row {row}")),
+    )
+    .expect("oracle json");
+
+    let gguf = camelid::gguf::read_metadata(&model).expect("gguf");
+    let config = camelid::model::LlamaModelConfig::from_gguf(&gguf).expect("config");
+    let block_count = config.block_count as usize;
+    let g = config.gemma4.as_ref().expect("gemma4");
+    let first_shared = block_count - g.num_kv_shared_layers as usize;
+    let default_split = (block_count / 2).min(if g.num_kv_shared_layers > 0 {
+        first_shared.saturating_sub(2)
+    } else {
+        block_count / 2
+    });
+    let split = std::env::var("CAMELID_GEMMA4_SPLIT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default_split.max(1));
+
+    let port = 39413;
+    let addr = format!("127.0.0.1:{port}");
+    let worker_model = model.clone();
+    let worker_addr = addr.clone();
+    std::thread::spawn(move || {
+        let _ = run_worker(&worker_model, &worker_addr, split..block_count);
+    });
+    for _ in 0..100 {
+        if std::net::TcpStream::connect(&addr).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let runtime =
+        camelid::gemma4_distributed::Gemma4DistributedRuntime::connect(&model, &addr, split)
+            .expect("distributed serve runtime connect");
+    assert_eq!(runtime.split(), split);
+
+    let expected = oracle
+        .results
+        .iter()
+        .find(|r| r.id == "capital-france")
+        .expect("capital-france in oracle");
+    let mut deltas = String::new();
+    let (text, ids) = runtime
+        .generate_greedy_streaming("The capital of France is", 24, |d| deltas.push_str(d))
+        .expect("distributed streaming generate");
+    eprintln!("distributed serve runtime: {text:?} ids {ids:?}");
+    assert_eq!(
+        ids, expected.generated_tokens,
+        "distributed serve greedy ids must match the llama.cpp oracle"
+    );
+    assert_eq!(
+        text, expected.generated_text,
+        "distributed serve greedy text must match the llama.cpp oracle"
+    );
+    assert_eq!(
+        deltas, text,
+        "streaming deltas must concatenate to the final text"
+    );
+
+    // A second request on the same runtime must reconnect cleanly (fresh
+    // worker KV) and produce identical output — serve handles requests
+    // back-to-back on one persistent master shard.
+    let (text2, ids2) = runtime
+        .generate_greedy("The capital of France is", 24)
+        .expect("second distributed generate");
+    assert_eq!(ids2, ids, "second request must be deterministic");
+    assert_eq!(text2, text);
+}

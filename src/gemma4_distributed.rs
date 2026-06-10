@@ -496,3 +496,114 @@ pub fn run_master(
     let text = runtime.tokenizer().decode(&generated, true)?;
     Ok((text, generated, stats))
 }
+
+/// Persistent serve-lane distributed runtime: the master shard (layers
+/// `[0, split)`) stays loaded for the life of the server; each generation
+/// request opens a fresh worker session (the worker allocates fresh KV caches
+/// per connection), runs the same per-step wire protocol as [`run_master`],
+/// and closes the session. Greedy semantics (stop set, cumulative streaming
+/// decode) mirror [`Gemma4Runtime::generate_greedy_streaming`] exactly, so
+/// distributed serve output stays token-comparable to single-node serve.
+///
+/// Requests are serialized by the worker (it serves one session at a time);
+/// concurrent requests queue on the worker's accept backlog.
+pub struct Gemma4DistributedRuntime {
+    runtime: Gemma4Runtime,
+    worker_addr: String,
+    handshake: Gemma4Handshake,
+}
+
+impl Gemma4DistributedRuntime {
+    /// Load the master shard and validate the worker handshake once, so a
+    /// misconfigured pair fails at load time rather than on the first request.
+    /// The probe session is closed immediately; each request reconnects.
+    pub fn connect(model: &Path, worker_addr: &str, split: usize) -> Result<Self> {
+        let runtime = Gemma4Runtime::load_layer_range(model, Some(0..split))?;
+        let handshake = Gemma4Handshake {
+            wire_version: GEMMA4_WIRE_VERSION,
+            block_count: runtime.block_count() as u32,
+            hidden: runtime.hidden_size() as u32,
+            worker_first_layer: split as u32,
+            worker_last_layer: runtime.block_count() as u32,
+            model_file_len: model_file_len(model)?,
+            return_logits: false,
+        };
+        drop(Gemma4WorkerClient::connect(worker_addr, &handshake)?);
+        Ok(Self {
+            runtime,
+            worker_addr: worker_addr.to_string(),
+            handshake,
+        })
+    }
+
+    pub fn tokenizer(&self) -> &crate::tokenizer::Tokenizer {
+        self.runtime.tokenizer()
+    }
+
+    pub fn worker_addr(&self) -> &str {
+        &self.worker_addr
+    }
+
+    pub fn split(&self) -> usize {
+        self.handshake.worker_first_layer as usize
+    }
+
+    pub fn generate_greedy(&self, prompt: &str, max_new: usize) -> Result<(String, Vec<u32>)> {
+        self.generate_greedy_streaming(prompt, max_new, |_| {})
+    }
+
+    /// Greedy decode over the wire with the same incremental-delta contract as
+    /// [`Gemma4Runtime::generate_greedy_streaming`]: the delta is the
+    /// newly-appended suffix of the cumulative decode (SentencePiece-safe).
+    pub fn generate_greedy_streaming<F: FnMut(&str)>(
+        &self,
+        prompt: &str,
+        max_new: usize,
+        mut on_delta: F,
+    ) -> Result<(String, Vec<u32>)> {
+        let mut client = Gemma4WorkerClient::connect(&self.worker_addr, &self.handshake)?;
+        let prompt_tokens = self.runtime.tokenizer().encode(prompt, true, true)?;
+        let stop = self.runtime.stop_token_ids();
+        let (mut kc, mut vc) = self.runtime.empty_kv_caches();
+
+        let feed = |token: u32,
+                    pos: usize,
+                    kc: &mut crate::gemma4_runtime::Gemma4KvCache,
+                    vc: &mut crate::gemma4_runtime::Gemma4KvCache,
+                    client: &mut Gemma4WorkerClient|
+         -> Result<u32> {
+            let h = match self.runtime.step_range(token, pos, None, kc, vc)? {
+                Gemma4StepOutput::Hidden(h) => h,
+                Gemma4StepOutput::Logits(_) => {
+                    return Err(BackendError::InvalidModelMetadata(
+                        "gemma4 master unexpectedly owns the full model; use single-node".into(),
+                    ))
+                }
+            };
+            Ok(client.step(token, pos, &h)?.next_token)
+        };
+
+        let mut last_next = 0u32;
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            last_next = feed(tok, pos, &mut kc, &mut vc, &mut client)?;
+        }
+
+        let mut generated = Vec::new();
+        let mut emitted = String::new();
+        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
+            if stop.contains(&last_next) {
+                break;
+            }
+            generated.push(last_next);
+            let full = self.runtime.tokenizer().decode(&generated, true)?;
+            if let Some(delta) = full.strip_prefix(&emitted) {
+                if !delta.is_empty() {
+                    on_delta(delta);
+                }
+            }
+            emitted = full;
+            last_next = feed(last_next, pos, &mut kc, &mut vc, &mut client)?;
+        }
+        Ok((emitted, generated))
+    }
+}
