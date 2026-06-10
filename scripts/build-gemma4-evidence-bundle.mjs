@@ -42,8 +42,15 @@ const bundleDir = path.join(repo, 'qa', 'evidence-bundles', bundleName)
 fs.mkdirSync(path.join(bundleDir, 'logs'), { recursive: true })
 
 function sha256(file) {
+  // Stream in 64 MiB chunks — model files exceed Node's 2 GiB readFileSync cap.
   const h = createHash('sha256')
-  h.update(fs.readFileSync(file))
+  const fd = fs.openSync(file, 'r')
+  const buf = Buffer.alloc(64 * 1024 * 1024)
+  let read
+  while ((read = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+    h.update(buf.subarray(0, read))
+  }
+  fs.closeSync(fd)
   return h.digest('hex')
 }
 

@@ -1,0 +1,36 @@
+{
+  "schema": "camelid.gemma4_exact_row_public_evidence.v1",
+  "generated_utc": "2026-06-10T00:22:31.414Z",
+  "git_head": "45619cf992a7",
+  "checkout_clean": false,
+  "row_id": "gemma4_12b_it_q8_0_blocked",
+  "model": {
+    "filename": "gemma-4-12b-it-Q8_0.gguf",
+    "size_bytes": 12669646240,
+    "sha256": "74d2d4f0b5b08ca8589d1a5f50e689c0984469f3cedbdc7d67458c6e9e35496a",
+    "quantization": "Q8_0",
+    "architecture": "gemma4"
+  },
+  "oracle": {
+    "build": "llama.cpp 5d56eff (llama-server, CPU, temperature=0/top_k=1, cache_prompt=false)",
+    "prompt_pack": "qa/gemma4/prompt_packs/basic_v1.json",
+    "oracle_artifact": "qa/gemma4/oracle/gemma-4-12b-it-Q8_0.basic_v1.json"
+  },
+  "logs": [
+    {
+      "name": "metadata-load",
+      "file": "logs/metadata-load.log",
+      "sha256": "b2b8631d38f5ba949aabd60c373f069a72463494767c0b9fed8994fa42b18037"
+    },
+    {
+      "name": "single-node-blocker",
+      "file": "logs/single-node-blocker.log",
+      "sha256": "a2f943fb7c3773c99be31af0fa265d850d9eb1b40093f968d5879c62b52a5fd7"
+    }
+  ],
+  "fields": {
+    "status": "active validation only: metadata/binding/load validated (per-layer kv-head array, window 1024); generation parity NOT claimed \u2014 single-node oracle capture is memory-infeasible on a 16 GB host and the two-node distributed run was blocked by second-Mac unavailability this session",
+    "host": "Mac mini M4 16GB, macOS 25.5.0"
+  },
+  "claim_boundary": "Exact-row text-token generation within the checked basic_v1 prompt pack and API smoke envelope only. No bounded-context promotion, no performance claim beyond the raw logs, no multimodal input (fails closed with a typed error), no neighboring-row or Gemma-family support, no shared-memory claim (distributed mode is layer sharding)."
+}
