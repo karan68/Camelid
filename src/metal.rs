@@ -5282,7 +5282,7 @@ pub fn try_gemma4_attention(
     eps: f32,
     q_wire: &[u8],
     k_wire: &[u8],
-    v_wire: &[u8],
+    v_wire: Option<&[u8]>,
     o_wire: &[u8],
     cos_t: &[f32],
     sin_t: &[f32],
@@ -5326,7 +5326,7 @@ pub fn try_gemma4_attention(
     let bpr_q = q_dim / 32;
     if q_wire.len() != q_dim * bpr_hidden * WIRE
         || k_wire.len() != kv_dim * bpr_hidden * WIRE
-        || v_wire.len() != kv_dim * bpr_hidden * WIRE
+        || v_wire.is_some_and(|w| w.len() != kv_dim * bpr_hidden * WIRE)
         || o_wire.len() != hidden * bpr_q * WIRE
     {
         return None;
@@ -5340,14 +5340,16 @@ pub fn try_gemma4_attention(
     let out_buf = mkbuf(hidden * 4);
     let q_buf = mkbuf(q_wire.len());
     let kw_buf = mkbuf(k_wire.len());
-    let vw_buf = mkbuf(v_wire.len());
+    let vw_buf = v_wire.map(|w| mkbuf(w.len()));
     let o_buf = mkbuf(o_wire.len());
     let cache_k = mkbuf(cache_len * 4);
     let cache_v = mkbuf(cache_len * 4);
     write_buffer_f32(&in_buf, h_in);
     write_buffer_u8(&q_buf, q_wire);
     write_buffer_u8(&kw_buf, k_wire);
-    write_buffer_u8(&vw_buf, v_wire);
+    if let (Some(buf), Some(wire)) = (&vw_buf, v_wire) {
+        write_buffer_u8(buf, wire);
+    }
     write_buffer_u8(&o_buf, o_wire);
     write_buffer_f32(&cache_k, cache_k_init);
     write_buffer_f32(&cache_v, cache_v_init);
@@ -5367,7 +5369,7 @@ pub fn try_gemma4_attention(
         eps,
         &q_buf,
         &kw_buf,
-        &vw_buf,
+        vw_buf.as_ref(),
         &o_buf,
         cos_t,
         sin_t,
@@ -5622,6 +5624,11 @@ struct Gemma4PliResident {
 pub struct Gemma4ResidentModel {
     layers: Vec<Gemma4ResidentLayer>,
     ple: Vec<Option<Gemma4ResidentPle>>,
+    /// Per-layer `layer_output_scale` (1.0 when the tensor is absent). E-series
+    /// layers apply it inside the PLE encode (`Gemma4ResidentPle.output_scale`,
+    /// same tensor); dense rows (12B-class, no PLE) apply it standalone at the
+    /// end of the layer — the reference multiplies it UNCONDITIONALLY.
+    layer_scales: Vec<f32>,
     /// Per-layer resident PLE matrix buffers (inp_gate, proj, post_norm), uploaded
     /// once so forward_token doesn't re-copy ~220MB of f32 matrices every token.
     ple_bufs: Vec<Option<(Buffer, Buffer, Buffer)>>,
@@ -5655,6 +5662,7 @@ impl Gemma4ResidentModel {
     pub fn new(
         layers: Vec<Gemma4ResidentLayer>,
         ple: Vec<Option<Gemma4ResidentPle>>,
+        layer_scales: Vec<f32>,
         owns_kv: Vec<bool>,
         kv_source: Vec<usize>,
         token_embd_wire: &[u8],
@@ -5669,6 +5677,7 @@ impl Gemma4ResidentModel {
         let n = layers.len();
         if n == 0
             || ple.len() != n
+            || layer_scales.len() != n
             || owns_kv.len() != n
             || kv_source.len() != n
             || output_norm.len() != hidden
@@ -5709,6 +5718,7 @@ impl Gemma4ResidentModel {
         Some(Self {
             layers,
             ple,
+            layer_scales,
             ple_bufs,
             pli_res: None,
             owns_kv,
@@ -5868,6 +5878,17 @@ impl Gemma4ResidentModel {
                     self.hidden,
                     pr.ple_dim,
                 );
+            } else if self.layer_scales[l] != 1.0 {
+                // Dense rows (no PLE) still carry layer_output_scale — the
+                // reference multiplies the layer output unconditionally.
+                let sc = pool_get(k, 8);
+                unsafe {
+                    let p = sc.contents() as *mut u8;
+                    *(p as *mut u32) = self.hidden as u32;
+                    *(p.add(4) as *mut f32) = self.layer_scales[l];
+                }
+                encode_scale_f32(e, k, out_buf, out_buf, &sc, self.hidden);
+                keep.push(sc);
             }
             from_a = !from_a;
         }
@@ -7198,7 +7219,7 @@ fn encode_gemma4_attention(
     eps: f32,
     q_w: &Buffer,
     k_w: &Buffer,
-    v_w: &Buffer,
+    v_w: Option<&Buffer>,
     o_w: &Buffer,
     cos_t: &[f32],
     sin_t: &[f32],
@@ -7327,10 +7348,20 @@ fn encode_gemma4_attention(
     // (`cache_k_buf`/`cache_v_buf` are the source's, already holding this token).
     if owns_kv {
         encode_gemma4_q8_matmul(e, k, &normf, k_w, &key_buf, &kv_mm, kv_dim);
-        encode_gemma4_q8_matmul(e, k, &normf, v_w, &val_buf, &kv_mm, kv_dim);
+        // V source: the layer's own V projection, or — on V-less layers (12B-class
+        // full attention, no attn_v tensor) — the RAW K projection output, before
+        // k_norm/RoPE touch it (reference: `if v_proj is not present, use Kcur as
+        // Vcur`). `key_buf` is never mutated (norms/rope write to kn_buf), so
+        // reading it as the V source is safe in the serial encoder.
+        let v_src = if let Some(v_w) = v_w {
+            encode_gemma4_q8_matmul(e, k, &normf, v_w, &val_buf, &kv_mm, kv_dim);
+            &val_buf
+        } else {
+            &key_buf
+        };
         encode_rms_norm_per_head(e, k, &key_buf, &knorm_w, &kn_buf, &perhead_k, n_kv_heads);
         // Weightless V-norm: qnorm_w is bound as a dummy (use_weight = 0, never read).
-        encode_rms_norm_per_head(e, k, &val_buf, &qnorm_w, &vn_buf, &perhead_v, n_kv_heads);
+        encode_rms_norm_per_head(e, k, v_src, &qnorm_w, &vn_buf, &perhead_v, n_kv_heads);
         encode_rope(
             e, k, &kn_buf, &cos_buf, &sin_buf, &rope_k, n_kv_heads, half_rope,
         );
@@ -7429,7 +7460,10 @@ pub struct Gemma4ResidentLayer {
     pub post_ffw_norm: Vec<f32>,
     q_w: Buffer,
     k_w: Buffer,
-    v_w: Buffer,
+    /// `None` on V-less layers (12B-class full attention): V is the raw K
+    /// projection output, weightless-normed — the reference's `if v_proj is
+    /// not present, use Kcur as Vcur`.
+    v_w: Option<Buffer>,
     o_w: Buffer,
     gate_w: Buffer,
     up_w: Buffer,
@@ -7455,7 +7489,7 @@ impl Gemma4ResidentLayer {
         post_ffw_norm: Vec<f32>,
         q_wire: &[u8],
         k_wire: &[u8],
-        v_wire: &[u8],
+        v_wire: Option<&[u8]>,
         o_wire: &[u8],
         gate_wire: &[u8],
         up_wire: &[u8],
@@ -7483,7 +7517,7 @@ impl Gemma4ResidentLayer {
             post_ffw_norm,
             q_w: buf(q_wire),
             k_w: buf(k_wire),
-            v_w: buf(v_wire),
+            v_w: v_wire.map(buf),
             o_w: buf(o_wire),
             gate_w: buf(gate_wire),
             up_w: buf(up_wire),
@@ -7510,7 +7544,7 @@ impl Gemma4ResidentLayer {
         post_ffw_norm: Vec<f32>,
         q_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
         k_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
-        v_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        v_pages: Option<&std::sync::Arc<crate::wire_mmap::WirePages>>,
         o_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
         gate_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
         up_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
@@ -7535,7 +7569,7 @@ impl Gemma4ResidentLayer {
             post_ffw_norm,
             q_w: buf(q_pages),
             k_w: buf(k_pages),
-            v_w: buf(v_pages),
+            v_w: v_pages.map(&mut buf),
             o_w: buf(o_pages),
             gate_w: buf(gate_pages),
             up_w: buf(up_pages),
@@ -7587,7 +7621,7 @@ fn encode_gemma4_layer(
         layer.eps,
         &layer.q_w,
         &layer.k_w,
-        &layer.v_w,
+        layer.v_w.as_ref(),
         &layer.o_w,
         cos_t,
         sin_t,
@@ -11372,7 +11406,7 @@ impl Gemma4ResidentLayer {
         _post_ffw_norm: Vec<f32>,
         _q_wire: &[u8],
         _k_wire: &[u8],
-        _v_wire: &[u8],
+        _v_wire: Option<&[u8]>,
         _o_wire: &[u8],
         _gate_wire: &[u8],
         _up_wire: &[u8],
@@ -11396,7 +11430,7 @@ impl Gemma4ResidentLayer {
         _post_ffw_norm: Vec<f32>,
         _q_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
         _k_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
-        _v_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
+        _v_pages: Option<&std::sync::Arc<crate::wire_mmap::WirePages>>,
         _o_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
         _gate_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
         _up_pages: &std::sync::Arc<crate::wire_mmap::WirePages>,
@@ -11505,6 +11539,7 @@ impl Gemma4ResidentModel {
     pub fn new(
         _layers: Vec<Gemma4ResidentLayer>,
         _ple: Vec<Option<Gemma4ResidentPle>>,
+        _layer_scales: Vec<f32>,
         _owns_kv: Vec<bool>,
         _kv_source: Vec<usize>,
         _token_embd_wire: &[u8],
@@ -11755,7 +11790,7 @@ pub fn try_gemma4_attention(
     _eps: f32,
     _q_wire: &[u8],
     _k_wire: &[u8],
-    _v_wire: &[u8],
+    _v_wire: Option<&[u8]>,
     _o_wire: &[u8],
     _cos_t: &[f32],
     _sin_t: &[f32],
@@ -12751,6 +12786,149 @@ mod tests {
         assert!(Gemma4ResidentState::new(vec![], 1, 16, 1.0e-6, 8, 16).is_none());
     }
 
+    // A DENSE (no-PLE) resident model must apply layer_output_scale standalone at
+    // the end of each layer (the reference multiplies it unconditionally; E-series
+    // applies it inside the PLE encode). The layer here is also V-LESS, so this
+    // covers the full 12B-class global-layer path through forward_token: V from
+    // the raw K projection + standalone output scale + head.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_dense_layer_scale_and_vless_forward_token() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        let hidden = 64usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 32usize;
+        let ffn_dim = 96usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let half = head_dim / 2;
+        let vocab = 96usize;
+        let max_positions = 8usize;
+        let eps = 1.0e-6f32;
+        let softcap = 30.0f32;
+        let attn_scale = 1.0f32;
+        let layer_scale = 0.37f32;
+
+        let mw = |rows: usize, in_dim: usize, seed: usize| -> Vec<u8> {
+            let mut wire = Vec::new();
+            for r in 0..rows {
+                let row: Vec<f32> = (0..in_dim)
+                    .map(|i| ((((r * in_dim + i + seed) % 29) as f32) - 14.0) * 0.03)
+                    .collect();
+                for blk in quantize_q8_0_blocks(&row).iter() {
+                    wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                    for &q in blk.quants.iter() {
+                        wire.push(q as u8);
+                    }
+                }
+            }
+            wire
+        };
+        let build_layer = || {
+            let an: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 % 5.0) * 0.05).collect();
+            let pa: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 % 3.0) * 0.03).collect();
+            let fnw: Vec<f32> = (0..hidden)
+                .map(|i| 0.85 + (i as f32 % 4.0) * 0.04)
+                .collect();
+            let pf: Vec<f32> = (0..hidden)
+                .map(|i| 0.95 + (i as f32 % 6.0) * 0.02)
+                .collect();
+            let qn: Vec<f32> = (0..head_dim)
+                .map(|i| 0.7 + (i as f32 % 11.0) * 0.02)
+                .collect();
+            let kn: Vec<f32> = (0..head_dim)
+                .map(|i| 0.6 + (i as f32 % 7.0) * 0.03)
+                .collect();
+            Gemma4ResidentLayer::from_wire(
+                an,
+                qn,
+                kn,
+                pa,
+                fnw,
+                pf,
+                &mw(q_dim, hidden, 1),
+                &mw(kv_dim, hidden, 5),
+                None, // V-less
+                &mw(hidden, q_dim, 13),
+                &mw(ffn_dim, hidden, 17),
+                &mw(ffn_dim, hidden, 21),
+                &mw(hidden, ffn_dim, 25),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                ffn_dim,
+                eps,
+            )
+            .expect("layer")
+        };
+        let cos_t: Vec<f32> = (0..half).map(|i| (0.3 + i as f32 * 0.01).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|i| (0.3 + i as f32 * 0.01).sin()).collect();
+        let h0: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let output_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.88 + (i as f32 % 5.0) * 0.03)
+            .collect();
+        let embd_wire = mw(vocab, hidden, 99);
+        let cache_len = n_kv_heads * max_positions * head_dim;
+        let zeros = vec![0.0f32; cache_len];
+
+        // Expected: validated layer wrapper, CPU scale, validated head wrapper.
+        let h1 = try_gemma4_layer(
+            &build_layer(),
+            &h0,
+            &cos_t,
+            &sin_t,
+            &zeros,
+            &zeros,
+            max_positions,
+            0,
+            1,
+            0,
+            attn_scale,
+            true,
+        )
+        .expect("layer fwd");
+        let h1s: Vec<f32> = h1.iter().map(|v| v * layer_scale).collect();
+        let want =
+            try_gemma4_head(&h1s, &output_norm, &embd_wire, vocab, softcap, eps).expect("head");
+
+        // Got: the resident model with layer_scales = [0.37] and no PLE.
+        let model = Gemma4ResidentModel::new(
+            vec![build_layer()],
+            vec![None],
+            vec![layer_scale],
+            vec![true],
+            vec![0],
+            &embd_wire,
+            output_norm.clone(),
+            hidden,
+            vocab,
+            softcap,
+            eps,
+            max_positions,
+            attn_scale,
+        )
+        .expect("model");
+        let inputs = vec![Gemma4TokenLayerInput {
+            cos_t: cos_t.clone(),
+            sin_t: sin_t.clone(),
+            pli: Vec::new(),
+            window_start: 0,
+        }];
+        let got = model.forward_token(&h0, &inputs, &[], 0).expect("forward");
+        let argmax =
+            |v: &[f32]| -> usize { (0..v.len()).max_by(|&a, &b| v[a].total_cmp(&v[b])).unwrap() };
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 2.0e-2, "{a} != {b}");
+        }
+        assert_eq!(argmax(&got), argmax(&want));
+    }
+
     // The gemma4 GPU GEMV workhorse (f32 activation × 34-byte wire Q8) must match a
     // CPU f32×dequant reference — this is the op the resident decode runs 8x/layer.
     #[cfg(target_os = "macos")]
@@ -13031,7 +13209,7 @@ mod tests {
             eps,
             &q_wire,
             &k_wire,
-            &v_wire,
+            Some(&v_wire),
             &o_wire,
             &cos_t,
             &sin_t,
@@ -13048,6 +13226,180 @@ mod tests {
             true, // owning layer
         )
         .expect("gemma4 attention");
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 2.0e-2, "{a} != {b}");
+        }
+    }
+
+    // V-less attention (12B-class full-attention layers carry no attn_v): the GPU
+    // graph must use the RAW K projection (pre-norm, pre-rope) as the V source —
+    // reference: `if v_proj is not present, use Kcur as Vcur`. Geometry mirrors a
+    // real 12B global layer: kv_heads = 1, head_dim = 512.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_vless_attention_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        let hidden = 256usize;
+        let n_heads = 4usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 512usize;
+        let group = n_heads / n_kv_heads;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let half = head_dim / 2;
+        let max_positions = 8usize;
+        let write_position = 3usize;
+        let filled = 4usize;
+        let window_start = 0usize;
+        let eps = 1.0e-6f32;
+        let scale = 1.0f32; // gemma folds the attention scale into the normed query
+
+        let make_weight = |rows: usize, in_dim: usize, seed: usize| -> (Vec<u8>, Vec<Vec<f32>>) {
+            let mut wire = Vec::new();
+            let mut deq = Vec::new();
+            for r in 0..rows {
+                let row: Vec<f32> = (0..in_dim)
+                    .map(|i| ((((r * in_dim + i + seed) % 29) as f32) - 14.0) * 0.03)
+                    .collect();
+                let mut drow = vec![0.0f32; in_dim];
+                for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
+                    wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                    for (j, &q) in blk.quants.iter().enumerate() {
+                        wire.push(q as u8);
+                        drow[b * 32 + j] = blk.scale * q as f32;
+                    }
+                }
+                deq.push(drow);
+            }
+            (wire, deq)
+        };
+        let (q_wire, q_deq) = make_weight(q_dim, hidden, 3);
+        let (k_wire, k_deq) = make_weight(kv_dim, hidden, 7);
+        let (o_wire, o_deq) = make_weight(hidden, q_dim, 11);
+        let h_in: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let attn_norm: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 % 5.0) * 0.05).collect();
+        let post_norm: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 % 3.0) * 0.03).collect();
+        let q_norm: Vec<f32> = (0..head_dim)
+            .map(|i| 0.7 + (i as f32 % 11.0) * 0.02)
+            .collect();
+        let k_norm: Vec<f32> = (0..head_dim)
+            .map(|i| 0.6 + (i as f32 % 7.0) * 0.03)
+            .collect();
+        let cos_t: Vec<f32> = (0..half).map(|i| (0.3 + i as f32 * 0.01).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|i| (0.3 + i as f32 * 0.01).sin()).collect();
+        let cache_len = n_kv_heads * max_positions * head_dim;
+        let cache_k_init: Vec<f32> = (0..cache_len)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
+        let cache_v_init: Vec<f32> = (0..cache_len)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.04)
+            .collect();
+
+        // ---- CPU reference (V = weightless-normed RAW K projection) ----
+        let rms = |x: &[f32], w: Option<&[f32]>| -> Vec<f32> {
+            let mss = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            let inv = (mss + eps).powf(-0.5);
+            (0..x.len())
+                .map(|i| x[i] * inv * w.map_or(1.0, |w| w[i]))
+                .collect()
+        };
+        let matmul = |deq: &[Vec<f32>], x: &[f32]| -> Vec<f32> {
+            deq.iter()
+                .map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum())
+                .collect()
+        };
+        let per_head = |x: &[f32], heads: usize, w: Option<&[f32]>| -> Vec<f32> {
+            let mut out = vec![0.0f32; x.len()];
+            for h in 0..heads {
+                let n = rms(&x[h * head_dim..(h + 1) * head_dim], w);
+                out[h * head_dim..(h + 1) * head_dim].copy_from_slice(&n);
+            }
+            out
+        };
+        let rope = |x: &mut [f32], heads: usize| {
+            for h in 0..heads {
+                let base = h * head_dim;
+                for i in 0..half {
+                    let (x0, x1) = (x[base + i], x[base + half + i]);
+                    x[base + i] = x0 * cos_t[i] - x1 * sin_t[i];
+                    x[base + half + i] = x0 * sin_t[i] + x1 * cos_t[i];
+                }
+            }
+        };
+        let normf = rms(&h_in, Some(&attn_norm));
+        let k_raw = matmul(&k_deq, &normf);
+        let mut q = per_head(&matmul(&q_deq, &normf), n_heads, Some(&q_norm));
+        let mut kk = per_head(&k_raw, n_kv_heads, Some(&k_norm));
+        // V from the RAW K projection, weightless norm, never roped.
+        let vv = per_head(&k_raw, n_kv_heads, None);
+        rope(&mut q, n_heads);
+        rope(&mut kk, n_kv_heads);
+        let kv_at = |init: &[f32], cur: &[f32], kvh: usize, p: usize| -> Vec<f32> {
+            if p == write_position {
+                cur[kvh * head_dim..(kvh + 1) * head_dim].to_vec()
+            } else {
+                let base = kvh * max_positions * head_dim + p * head_dim;
+                init[base..base + head_dim].to_vec()
+            }
+        };
+        let mut ctx = vec![0.0f32; q_dim];
+        for h in 0..n_heads {
+            let kvh = h / group;
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::new();
+            for p in window_start..filled {
+                let kp = kv_at(&cache_k_init, &kk, kvh, p);
+                scores.push(scale * qh.iter().zip(&kp).map(|(a, b)| a * b).sum::<f32>());
+            }
+            let m = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut den = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - m).exp();
+                den += *s;
+            }
+            for (idx, p) in (window_start..filled).enumerate() {
+                let vp = kv_at(&cache_v_init, &vv, kvh, p);
+                let w = scores[idx] / den;
+                for d in 0..head_dim {
+                    ctx[h * head_dim + d] += w * vp[d];
+                }
+            }
+        }
+        let o = matmul(&o_deq, &ctx);
+        let on = rms(&o, Some(&post_norm));
+        let want: Vec<f32> = h_in.iter().zip(&on).map(|(a, b)| a + b).collect();
+
+        let got = try_gemma4_attention(
+            &h_in,
+            &attn_norm,
+            &q_norm,
+            &k_norm,
+            &post_norm,
+            eps,
+            &q_wire,
+            &k_wire,
+            None, // V-less: no attn_v weight
+            &o_wire,
+            &cos_t,
+            &sin_t,
+            &cache_k_init,
+            &cache_v_init,
+            max_positions,
+            write_position,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            filled,
+            window_start,
+            scale,
+            true, // owning layer
+        )
+        .expect("gemma4 v-less attention");
         for (a, b) in got.iter().zip(&want) {
             assert!((a - b).abs() < 2.0e-2, "{a} != {b}");
         }
@@ -13193,7 +13545,7 @@ mod tests {
             eps,
             &q_wire,
             &k_wire,
-            &v_wire,
+            Some(&v_wire),
             &o_wire,
             &cos_t,
             &sin_t,
@@ -13386,7 +13738,7 @@ mod tests {
             post_ffw.clone(),
             &q_wire,
             &k_wire,
-            &v_wire,
+            Some(&v_wire),
             &o_wire,
             &gate_wire,
             &up_wire,
@@ -13629,13 +13981,45 @@ mod tests {
 
         // ---- GPU: two layers, one command buffer, persistent shared cache ----
         let layer0 = Gemma4ResidentLayer::from_wire(
-            an0, qn0, kn0, pa0, fn0, pf0, &w0.0 .0, &w0.1 .0, &w0.2 .0, &w0.3 .0, &w0.4 .0,
-            &w0.5 .0, &w0.6 .0, n_heads, n_kv_heads, head_dim, ffn_dim, eps,
+            an0,
+            qn0,
+            kn0,
+            pa0,
+            fn0,
+            pf0,
+            &w0.0 .0,
+            &w0.1 .0,
+            Some(&w0.2 .0),
+            &w0.3 .0,
+            &w0.4 .0,
+            &w0.5 .0,
+            &w0.6 .0,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
         )
         .expect("layer0");
         let layer1 = Gemma4ResidentLayer::from_wire(
-            an1, qn1, kn1, pa1, fn1, pf1, &w1.0 .0, &w1.1 .0, &w1.2 .0, &w1.3 .0, &w1.4 .0,
-            &w1.5 .0, &w1.6 .0, n_heads, n_kv_heads, head_dim, ffn_dim, eps,
+            an1,
+            qn1,
+            kn1,
+            pa1,
+            fn1,
+            pf1,
+            &w1.0 .0,
+            &w1.1 .0,
+            Some(&w1.2 .0),
+            &w1.3 .0,
+            &w1.4 .0,
+            &w1.5 .0,
+            &w1.6 .0,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
         )
         .expect("layer1");
         let kk = metal_linear_kernel().expect("metal");
@@ -13967,7 +14351,7 @@ mod tests {
                 pf,
                 &mw(q_dim, hidden, off + 1),
                 &mw(kv_dim, hidden, off + 5),
-                &mw(kv_dim, hidden, off + 9),
+                Some(&mw(kv_dim, hidden, off + 9)),
                 &mw(hidden, q_dim, off + 13),
                 &mw(ffn_dim, hidden, off + 17),
                 &mw(ffn_dim, hidden, off + 21),
@@ -14214,7 +14598,7 @@ mod tests {
             pf.clone(),
             &weights[0],
             &weights[1],
-            &weights[2],
+            Some(&weights[2]),
             &weights[3],
             &weights[4],
             &weights[5],
@@ -14227,8 +14611,24 @@ mod tests {
         )
         .expect("copy");
         let nocopy = Gemma4ResidentLayer::from_wire_pages(
-            an, qn, kn, pa, fnw, pf, &pages[0], &pages[1], &pages[2], &pages[3], &pages[4],
-            &pages[5], &pages[6], n_heads, n_kv_heads, head_dim, ffn_dim, eps,
+            an,
+            qn,
+            kn,
+            pa,
+            fnw,
+            pf,
+            &pages[0],
+            &pages[1],
+            Some(&pages[2]),
+            &pages[3],
+            &pages[4],
+            &pages[5],
+            &pages[6],
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
         )
         .expect("nocopy");
 
@@ -14332,7 +14732,7 @@ mod tests {
                 pf,
                 &mw(q_dim, hidden, off + 1),
                 &mw(kv_dim, hidden, off + 5),
-                &mw(kv_dim, hidden, off + 9),
+                Some(&mw(kv_dim, hidden, off + 9)),
                 &mw(hidden, q_dim, off + 13),
                 &mw(ffn_dim, hidden, off + 17),
                 &mw(ffn_dim, hidden, off + 21),
@@ -14408,6 +14808,7 @@ mod tests {
         let model = Gemma4ResidentModel::new(
             vec![build_layer(0), build_layer(50)],
             vec![None, None],
+            vec![1.0, 1.0],
             vec![true, true],
             vec![0, 1],
             &embd_wire,

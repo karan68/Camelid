@@ -948,6 +948,7 @@ impl Gemma4GpuRuntime {
         let plan = g.layer_plan(n_layers, heads);
         let mut layers = Vec::with_capacity(n_layers);
         let mut ple = Vec::with_capacity(n_layers);
+        let mut layer_scales = Vec::with_capacity(n_layers);
         let mut owns_kv = Vec::with_capacity(n_layers);
         let mut kv_source = Vec::with_capacity(n_layers);
         for (l, lb) in binding.layers.iter().enumerate() {
@@ -964,18 +965,11 @@ impl Gemma4GpuRuntime {
                 f32t(&lb.post_ffw_norm.name)?,
                 &pages(&lb.attn_q.name)?,
                 &pages(&lb.attn_k.name)?,
-                &pages(
-                    &lb.attn_v
-                        .as_ref()
-                        .ok_or_else(|| {
-                            BackendError::UnsupportedModelArchitecture(format!(
-                                "gemma4 layer {l} has no attn_v (V-less full attention, \
-                                 12B-class row): the GPU-resident path has no K-as-V \
-                                 kernels yet; use the CPU or distributed runtime"
-                            ))
-                        })?
-                        .name,
-                )?,
+                lb.attn_v
+                    .as_ref()
+                    .map(|d| pages(&d.name))
+                    .transpose()?
+                    .as_ref(),
                 &pages(&lb.attn_output.name)?,
                 &pages(&lb.ffn_gate.name)?,
                 &pages(&lb.ffn_up.name)?,
@@ -990,18 +984,23 @@ impl Gemma4GpuRuntime {
                 BackendError::UnsupportedModelArchitecture("Metal unavailable".into())
             })?;
             layers.push(layer);
+            // layer_output_scale is unconditional in the reference. E-series
+            // layers apply it inside the PLE encode; dense layers (no PLE) get
+            // it standalone via `layer_scales`.
+            let output_scale = lb
+                .ple_output_scale
+                .as_ref()
+                .map(|d| f32t(&d.name))
+                .transpose()?
+                .and_then(|v| v.first().copied())
+                .unwrap_or(1.0);
+            layer_scales.push(output_scale);
             ple.push(match (&lb.ple_inp_gate, &lb.ple_proj, &lb.post_norm) {
                 (Some(ig), Some(pj), Some(pn)) => Some(crate::metal::Gemma4ResidentPle {
                     inp_gate: f32t(&ig.name)?,
                     proj: f32t(&pj.name)?,
                     post_norm: f32t(&pn.name)?,
-                    output_scale: lb
-                        .ple_output_scale
-                        .as_ref()
-                        .map(|d| f32t(&d.name))
-                        .transpose()?
-                        .and_then(|v| v.first().copied())
-                        .unwrap_or(1.0),
+                    output_scale,
                 }),
                 _ => None,
             });
@@ -1014,6 +1013,7 @@ impl Gemma4GpuRuntime {
         let model = crate::metal::Gemma4ResidentModel::new(
             layers,
             ple,
+            layer_scales,
             owns_kv,
             kv_source,
             token_embd.bytes(),
