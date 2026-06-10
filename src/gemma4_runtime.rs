@@ -469,9 +469,16 @@ impl Gemma4Runtime {
 
         // Memory-map the GGUF once. Q8 weights are referenced in place (no eager
         // decode); kick off background readahead so the first generation does not
-        // pay the whole cold-fault cost serially.
+        // pay the whole cold-fault cost serially. The advisory MUST run off the
+        // loading thread: on macOS madvise(MADV_WILLNEED) over a USB-backed
+        // volume blocks until the kernel has paged in the advised range —
+        // observed live as a 12.7 GB 12B mapping stalling a serve-lane model
+        // load for 10+ minutes while loading a half-model shard.
         let mmap = GgufWireMmap::map(path)?;
-        mmap.advise_willneed();
+        {
+            let mmap = mmap.clone();
+            std::thread::spawn(move || mmap.advise_willneed());
+        }
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
         let f32t = |name: &str| -> Result<Vec<f32>> { Ok(store.load_cpu_f32(name)?.data) };
 

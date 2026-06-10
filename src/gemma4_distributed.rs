@@ -303,7 +303,9 @@ impl Gemma4WorkerClient {
     /// hang a serve request forever. 30s covers worker shard-load pauses and
     /// the slowest observed wire step by two orders of magnitude.
     pub fn connect(addr: &str, handshake: &Gemma4Handshake) -> Result<Self> {
-        const ATTEMPTS: usize = 3;
+        // The recorded flap windows last seconds, not milliseconds — spread
+        // the attempts over ~30s so one bad window cannot fail a model load.
+        const ATTEMPTS: usize = 10;
         let mut last_err = None;
         for attempt in 0..ATTEMPTS {
             match Self::connect_once(addr, handshake) {
@@ -314,7 +316,7 @@ impl Gemma4WorkerClient {
                         attempt + 1
                     );
                     last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    std::thread::sleep(std::time::Duration::from_secs(3));
                 }
             }
         }
