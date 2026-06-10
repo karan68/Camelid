@@ -202,12 +202,39 @@ fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
     }
 }
 
-fn apply_rope(vec: &mut [f32], heads: usize, head_dim: usize, position: usize, theta: f32) {
+/// Camelid's gemma4 KV cache is f32. The reference's DEFAULT cache is f16
+/// (+ flash attention with an f16-rounded Q path), which flips near-tie argmax
+/// positions relative to plain-f32 math — llama.cpp's own `-ctk/-ctv/-fa`
+/// settings flip the same positions. Parity oracles are therefore captured with
+/// the pinned comparator configuration `-ctk f32 -ctv f32 -fa off --no-repack`
+/// (the plain-f32 numeric path this runtime implements); the oracle artifacts
+/// record that configuration. `f32_to_f16_bits` (tensor module) remains
+/// available for cache-precision experiments.
+/// RoPE with optional per-frequency factors (GGUF `rope_freqs.weight`).
+///
+/// Gemma 4 applies the factor table on FULL-attention layers only ("proportional
+/// rope", mirroring llama.cpp's `gemma4-iswa`: `freq_factors` is the layer's
+/// `rope_freqs` when `!is_swa`, null otherwise). The shipped table is 1.0 for
+/// pair indices 0..64 and 1e30 beyond — dividing the frequency by 1e30 zeroes
+/// the rotation, so only the first 64 frequency pairs of a global head carry
+/// position. Skipping the factors is numerically close on short prompts but is
+/// NOT the reference math (it measurably shifts near-tie logits).
+fn apply_rope(
+    vec: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    position: usize,
+    theta: f32,
+    factors: Option<&[f32]>,
+) {
     let half = head_dim / 2;
     for h in 0..heads {
         let base = h * head_dim;
         for i in 0..half {
-            let freq = theta.powf(-(2.0 * i as f32) / head_dim as f32);
+            let mut freq = theta.powf(-(2.0 * i as f32) / head_dim as f32);
+            if let Some(factors) = factors {
+                freq /= factors[i];
+            }
             let (s, c) = (position as f32 * freq).sin_cos();
             let (a, b) = (vec[base + i], vec[base + half + i]);
             vec[base + i] = a * c - b * s;
@@ -220,7 +247,7 @@ struct LayerWeights {
     attn_norm: Vec<f32>,
     attn_q: WireQ8,
     attn_k: WireQ8,
-    attn_v: WireQ8,
+    attn_v: Option<WireQ8>, // None on V-less layers (V = K projection)
     attn_output: WireQ8,
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
@@ -283,6 +310,9 @@ pub struct Gemma4Runtime {
     per_layer_model_proj: Option<Vec<f32>>, // BF16 -> f32
     per_layer_proj_norm: Option<Vec<f32>>,
     output_norm: Vec<f32>,
+    /// GGUF `rope_freqs.weight` — per-frequency factors applied on FULL
+    /// attention layers only (None when absent).
+    rope_factors: Option<Vec<f32>>,
     first_kv_shared: usize,
     last_sliding_layer: usize,
     last_full_layer: usize,
@@ -354,7 +384,7 @@ impl Gemma4Runtime {
                 attn_norm: f32t(&l.attn_norm.name)?,
                 attn_q: q8(&l.attn_q.name)?,
                 attn_k: q8(&l.attn_k.name)?,
-                attn_v: q8(&l.attn_v.name)?,
+                attn_v: l.attn_v.as_ref().map(|d| q8(&d.name)).transpose()?,
                 attn_output: q8(&l.attn_output.name)?,
                 q_norm: f32t(&l.attn_q_norm.name)?,
                 k_norm: f32t(&l.attn_k_norm.name)?,
@@ -398,6 +428,11 @@ impl Gemma4Runtime {
                 .map(|d| f32t(&d.name))
                 .transpose()?,
             output_norm: f32t(&binding.output_norm.name)?,
+            rope_factors: binding
+                .rope_freqs
+                .as_ref()
+                .map(|d| f32t(&d.name))
+                .transpose()?,
             first_kv_shared,
             last_sliding_layer: (0..first_kv_shared)
                 .rev()
@@ -577,6 +612,14 @@ impl Gemma4Runtime {
             let q_dim = heads * head_dim;
             let kv_dim = kv_heads * head_dim;
 
+            // RoPE frequency factors apply on FULL attention layers only
+            // (reference: gemma4-iswa attaches rope_freqs when !is_swa).
+            let rope_factors = if sliding {
+                None
+            } else {
+                self.rope_factors.as_deref()
+            };
+
             let xn = rms_norm(&h, Some(&lw.attn_norm), eps);
             // q/k/v all project the same normed input — quantize it once.
             let xnq = quantize_q8_0_blocks(&xn);
@@ -585,18 +628,24 @@ impl Gemma4Runtime {
                 let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
                 s.copy_from_slice(&rms_norm(s, Some(&lw.q_norm), eps));
             }
-            apply_rope(&mut q, heads, head_dim, pos, theta);
+            apply_rope(&mut q, heads, head_dim, pos, theta, rope_factors);
 
             if l < self.first_kv_shared {
                 let mut k = lw.attn_k.matvec_q(kv_dim, &xnq);
-                let mut v = lw.attn_v.matvec_q(kv_dim, &xnq);
+                // V-less layers (12B full attention) reuse the raw K projection
+                // as V — reference: `if v_proj is not present, use Kcur as Vcur`.
+                // V then takes the usual weightless norm and never RoPE.
+                let mut v = match lw.attn_v.as_ref() {
+                    Some(wv) => wv.matvec_q(kv_dim, &xnq),
+                    None => k.clone(),
+                };
                 for hh in 0..kv_heads {
                     let s = &mut k[hh * head_dim..(hh + 1) * head_dim];
                     s.copy_from_slice(&rms_norm(s, Some(&lw.k_norm), eps));
                     let sv = &mut v[hh * head_dim..(hh + 1) * head_dim];
                     sv.copy_from_slice(&rms_norm(sv, None, eps));
                 }
-                apply_rope(&mut k, kv_heads, head_dim, pos, theta);
+                apply_rope(&mut k, kv_heads, head_dim, pos, theta, rope_factors);
                 kc[li].push(k);
                 vc[li].push(v);
             }
@@ -679,11 +728,26 @@ impl Gemma4Runtime {
                 for (a, b) in h.iter_mut().zip(&pnv) {
                     *a += b;
                 }
+            }
+            // `layer_output_scale` multiplies the layer output UNCONDITIONALLY
+            // when present (reference applies it outside the PLE block; the
+            // dense 12B carries it on every layer with no PLE at all). 1.0 when
+            // the tensor is absent.
+            if lw.ple_output_scale != 1.0 {
                 for v in h.iter_mut() {
                     *v *= lw.ple_output_scale;
                 }
             }
             ffn_us += t_ffn.elapsed().as_micros() as u64;
+            // Diagnostics only: per-layer hidden-state fingerprint for
+            // cross-runtime layer bisection (CAMELID_GEMMA4_DUMP_LAYERS=1).
+            if std::env::var("CAMELID_GEMMA4_DUMP_LAYERS").is_ok_and(|v| v == "1") {
+                let l2 = h.iter().map(|v| v * v).sum::<f32>().sqrt();
+                eprintln!(
+                    "[h] pos {pos} layer {l} l2 {l2:.6} first4 [{:.6}, {:.6}, {:.6}, {:.6}]",
+                    h[0], h[1], h[2], h[3]
+                );
+            }
         }
 
         if !is_tail {
@@ -823,6 +887,9 @@ pub struct Gemma4GpuRuntime {
     /// per-token row gather.
     token_embd: WireQ8,
     per_layer_token_embd: Option<WireQ8>,
+    /// GGUF `rope_freqs.weight` factors — applied on FULL attention layers'
+    /// cos/sin tables only (the reference's proportional rope).
+    rope_factors: Option<Vec<f32>>,
     _mmap: Arc<GgufWireMmap>,
     hidden: usize,
     ple_dim: usize,
@@ -889,7 +956,18 @@ impl Gemma4GpuRuntime {
                 f32t(&lb.post_ffw_norm.name)?,
                 &pages(&lb.attn_q.name)?,
                 &pages(&lb.attn_k.name)?,
-                &pages(&lb.attn_v.name)?,
+                &pages(
+                    &lb.attn_v
+                        .as_ref()
+                        .ok_or_else(|| {
+                            BackendError::UnsupportedModelArchitecture(format!(
+                                "gemma4 layer {l} has no attn_v (V-less full attention, \
+                                 12B-class row): the GPU-resident path has no K-as-V \
+                                 kernels yet; use the CPU or distributed runtime"
+                            ))
+                        })?
+                        .name,
+                )?,
                 &pages(&lb.attn_output.name)?,
                 &pages(&lb.ffn_gate.name)?,
                 &pages(&lb.ffn_up.name)?,
@@ -966,6 +1044,11 @@ impl Gemma4GpuRuntime {
                 .as_ref()
                 .map(|d| q8(&d.name))
                 .transpose()?,
+            rope_factors: binding
+                .rope_freqs
+                .as_ref()
+                .map(|d| f32t(&d.name))
+                .transpose()?,
             token_embd,
             g,
             _mmap: mmap,
@@ -1012,9 +1095,18 @@ impl Gemma4GpuRuntime {
                 let hd = self.g.head_dim_at(l) as usize;
                 let theta = self.g.rope_freq_base_at(l);
                 let half = hd / 2;
+                // Frequency factors (proportional rope) on FULL layers only.
+                let factors = if self.g.is_sliding_layer(l) {
+                    None
+                } else {
+                    self.rope_factors.as_deref()
+                };
                 let (mut cos_t, mut sin_t) = (vec![0f32; half], vec![0f32; half]);
                 for i in 0..half {
-                    let freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                    let mut freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                    if let Some(factors) = factors {
+                        freq /= factors[i];
+                    }
                     let (s, c) = (position as f32 * freq).sin_cos();
                     cos_t[i] = c;
                     sin_t[i] = s;

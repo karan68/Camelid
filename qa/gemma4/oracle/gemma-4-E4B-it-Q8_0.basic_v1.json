@@ -2,7 +2,7 @@
  "row": "gemma-4-E4B-it-Q8_0",
  "pack_id": "gemma4-basic-v1",
  "decode": "greedy (temperature=0, top_k=1)",
- "oracle": "llama.cpp 5d56eff llama-server (CPU, -ngl 0, --no-repack: plain ggml Q8_0 kernels)",
+ "oracle": "llama.cpp 5d56eff llama-server (CPU, -ngl 0, --no-repack -fa off -ctk f32 -ctv f32 -ub 1: plain-f32 GEMV numeric path)",
  "results": [
   {
    "id": "capital-france",
@@ -201,13 +201,9 @@
    ],
    "generated_text": " Guten Morgen\n\n***\n\nEnglish: thank you\nGerman: Danke\n\n***\n\n",
    "stop_type": "limit",
-   "stopping_word": "",
-   "cpu_known_frontier": {
-    "parity_prefix_tokens": 7,
-    "reason": "knife-edge argmax near-tie at generated index 7: camelid CPU top-2 logits 24.583172 (id 2088) vs 24.560574 (id 7806), gap 0.0226 (~0.09%). camelid GPU and llama.cpp 5d56eff plain-Q8_0 both pick 7806; camelid CPU and the repacked-kernel llama.cpp variant resolve the tie differently. Recorded frontier, not a parity claim beyond the prefix."
-   }
+   "stopping_word": ""
   }
  ],
  "note": "generated_tokens exclude the terminating EOG token (recorded as stopped_on_eog_token); text already excludes it",
- "kernel_note": "Captured with --no-repack. The default repacked-Q8 kernel variant of the same build flips two near-tie argmax positions on this row (capital-france stops at \" Paris.\"; translate-de diverges at generated index 6). Camelid matches the plain-Q8_0 path bit-for-bit, which is also the historic b9430 proof continuation."
+ "kernel_note": "Pinned comparator configuration: --no-repack -fa off -ctk f32 -ctv f32 -ub 1 (plain-f32 GEMV numeric path matching the from-scratch runtime: no repacked kernels, no flash attention, f32 KV cache, token-at-a-time prefill). The reference DEFAULTS (f16 KV + flash attention + repacked kernels + batched prefill GEMM) flip near-tie argmax positions relative to this path \u2014 measured flips at top-2 gaps of 0.02-0.2 logits; the comparator config is part of the recorded envelope."
 }

@@ -3471,6 +3471,49 @@ fn decode_q8_0_blocks(
     Ok(blocks)
 }
 
+/// f32 -> IEEE f16 bits with round-to-nearest-even — the same conversion the
+/// reference runtime's f16 KV cache applies on store (ARM `vcvt` semantics).
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf / NaN (preserve a NaN payload bit so NaN stays NaN).
+        let nan = if frac != 0 {
+            0x0200 | ((frac >> 13) as u16 & 0x03ff)
+        } else {
+            0
+        };
+        return sign | 0x7c00 | nan;
+    }
+    let half_exp = exp - 127 + 15;
+    if half_exp >= 0x1f {
+        return sign | 0x7c00; // overflow -> +/-inf
+    }
+    if half_exp <= 0 {
+        // Subnormal half (or zero): shift the implicit-1 mantissa down.
+        if half_exp < -10 {
+            return sign; // underflow -> +/-0
+        }
+        let mant = frac | 0x0080_0000;
+        let shift = (14 - half_exp) as u32; // 14..=24
+        let mut half = (mant >> shift) as u16;
+        let rem = mant & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        if rem > halfway || (rem == halfway && (half & 1) == 1) {
+            half += 1;
+        }
+        return sign | half;
+    }
+    let mut half = ((half_exp as u32) << 10) | (frac >> 13);
+    let rem = frac & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        half += 1; // mantissa carry propagates into the exponent correctly
+    }
+    sign | half as u16
+}
+
 pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = (u32::from(bits & 0x8000)) << 16;
     let exp = (bits & 0x7c00) >> 10;
@@ -4448,6 +4491,38 @@ fn decode_iq4_nl_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> R
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn f32_f16_roundtrip_matches_ieee_rne() {
+        use super::{f16_bits_to_f32, f32_to_f16_bits};
+        // Exact halves roundtrip exactly.
+        for v in [0.0f32, 1.0, -1.0, 0.5, -0.25, 65504.0, -65504.0] {
+            assert_eq!(f16_bits_to_f32(f32_to_f16_bits(v)), v);
+        }
+        // Observed reference KV-cache roundings (f32 value -> f16-stored value).
+        let cases = [
+            (-0.2714f32, -0.27148438f32),
+            (-0.6571, -0.65722656),
+            (0.0809, 0.080871582),
+        ];
+        for (input, expect) in cases {
+            let got = f16_bits_to_f32(f32_to_f16_bits(input));
+            assert!(
+                (got - expect).abs() < 2e-6,
+                "{input} -> {got}, want {expect}"
+            );
+        }
+        // Round-to-nearest-EVEN tie: 1 + 2^-11 is exactly halfway between
+        // half(1.0) and half(1.0009766); RNE picks the even mantissa (1.0).
+        let tie = 1.0f32 + 2.0f32.powi(-11);
+        assert_eq!(f16_bits_to_f32(f32_to_f16_bits(tie)), 1.0);
+        // Just above the tie rounds up.
+        let above = 1.0f32 + 2.0f32.powi(-11) + 2.0f32.powi(-20);
+        assert_eq!(f16_bits_to_f32(f32_to_f16_bits(above)), 1.0009766);
+        // Overflow saturates to inf; tiny values flush toward subnormals/zero.
+        assert_eq!(f32_to_f16_bits(1.0e6) & 0x7fff, 0x7c00);
+        assert_eq!(f16_bits_to_f32(f32_to_f16_bits(1.0e-8)), 0.0);
+    }
+
     use super::{
         f16_bits_to_f32, parse_byte_count, q8_0_file_read_stats, q8_file_cache_get,
         q8_file_cache_insert, q8_repack_tensor_enabled_for_flags, q8_repack_x86_tensor_enabled,

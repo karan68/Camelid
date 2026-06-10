@@ -233,7 +233,9 @@ fn gemma4_prefill_matches_oracle() {
         }
         let (q_w, _) = load_f32(&store, &lt.attn_q.name);
         let (k_w, _) = load_f32(&store, &lt.attn_k.name);
-        let (v_w, _) = load_f32(&store, &lt.attn_v.name);
+        // V-less layers (12B full attention) reuse the K projection as V; this
+        // reference test exercises the E-series rows, which always carry V.
+        let (v_w, _) = load_f32(&store, &lt.attn_v.as_ref().unwrap_or(&lt.attn_k).name);
         let (o_w, _) = load_f32(&store, &lt.attn_output.name);
         let (qn_w, _) = load_f32(&store, &lt.attn_q_norm.name);
         let (kn_w, _) = load_f32(&store, &lt.attn_k_norm.name);

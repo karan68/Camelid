@@ -44,5 +44,22 @@ fn gemma4_teacher_forced_top2_logits() {
             logits[b],
             logits[a] - logits[b]
         );
+        // Optional: full top-10 + specific requested ids, for cross-runtime
+        // logit-structure comparison at a divergence position.
+        if std::env::var("CAMELID_GEMMA4_PROBE_VERBOSE").is_ok_and(|v| v == "1") {
+            let top: Vec<String> = idx[..10]
+                .iter()
+                .map(|&i| format!("{i}:{:.4}", logits[i]))
+                .collect();
+            eprintln!("  top10: {}", top.join(" "));
+            if let Ok(ids) = std::env::var("CAMELID_GEMMA4_PROBE_REPORT_IDS") {
+                let report: Vec<String> = ids
+                    .split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .map(|i| format!("{i}:{:.4}", logits[i]))
+                    .collect();
+                eprintln!("  report: {}", report.join(" "));
+            }
+        }
     }
 }

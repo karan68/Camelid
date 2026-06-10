@@ -828,7 +828,11 @@ pub struct Gemma4LayerTensors {
     pub attn_norm: GgufTensorDescriptor,
     pub attn_q: GgufTensorDescriptor,
     pub attn_k: GgufTensorDescriptor,
-    pub attn_v: GgufTensorDescriptor,
+    /// `None` on V-less layers: the 12B row's full-attention layers carry no
+    /// `attn_v` tensor — the reference (llama.cpp `gemma4-iswa`) uses the K
+    /// projection output as V (`if v_proj is not present, use Kcur as Vcur`),
+    /// then applies the usual weightless V norm and no RoPE.
+    pub attn_v: Option<GgufTensorDescriptor>,
     pub attn_output: GgufTensorDescriptor,
     pub attn_q_norm: GgufTensorDescriptor,
     pub attn_k_norm: GgufTensorDescriptor,
@@ -912,7 +916,7 @@ impl Gemma4Binding {
                 attn_norm: req("attn_norm")?,
                 attn_q: req("attn_q")?,
                 attn_k: req("attn_k")?,
-                attn_v: req("attn_v")?,
+                attn_v: opt("attn_v"),
                 attn_output: req("attn_output")?,
                 attn_q_norm: req("attn_q_norm")?,
                 attn_k_norm: req("attn_k_norm")?,
@@ -976,12 +980,16 @@ impl Gemma4Binding {
                 kv_heads * head_dim,
                 &format!("gemma4 layer {idx} attention k"),
             )?;
-            require_descriptor_matrix_shape(
-                &layer.attn_v,
-                emb,
-                kv_heads * head_dim,
-                &format!("gemma4 layer {idx} attention v"),
-            )?;
+            // V-less layers (12B full-attention) reuse the K projection as V;
+            // when the tensor exists it must match the K geometry.
+            if let Some(attn_v) = layer.attn_v.as_ref() {
+                require_descriptor_matrix_shape(
+                    attn_v,
+                    emb,
+                    kv_heads * head_dim,
+                    &format!("gemma4 layer {idx} attention v"),
+                )?;
+            }
             require_descriptor_matrix_shape(
                 &layer.attn_output,
                 heads * head_dim,
