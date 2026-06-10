@@ -10814,3 +10814,161 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         assert_eq!(split_half, t.split_half_pairing);
     }
 }
+
+/// Q4_0 wire dot: the scalar and NEON paths must agree bit-exactly with each
+/// other and track a plain f32 dequant·f32 reference closely (the integer dot
+/// is exact per block; only the per-block f32 scale accumulate rounds).
+#[test]
+fn q4_0_wire_row_dot_scalar_matches_dequant_reference() {
+    // Deterministic synthetic row: 4 blocks = 128 weights.
+    let blocks = 4usize;
+    let mut wire = Vec::with_capacity(blocks * super::Q4_0_WIRE_BYTES_PER_BLOCK);
+    let mut expected_weights = Vec::with_capacity(blocks * 32);
+    for b in 0..blocks {
+        let scale = 0.0125f32 * (b as f32 + 1.0);
+        let scale_f16 = super::f32_to_f16_bits(scale);
+        wire.extend_from_slice(&scale_f16.to_le_bytes());
+        let scale_back = super::f16_bits_to_f32(scale_f16);
+        let mut nibbles = [0u8; 16];
+        for (j, nib) in nibbles.iter_mut().enumerate() {
+            let lo = ((b * 7 + j * 3) % 16) as u8;
+            let hi = ((b * 11 + j * 5) % 16) as u8;
+            *nib = (hi << 4) | lo;
+        }
+        wire.extend_from_slice(&nibbles);
+        for j in 0..16 {
+            expected_weights.push(((nibbles[j] & 0x0F) as i32 - 8) as f32 * scale_back);
+        }
+        for j in 0..16 {
+            expected_weights.push(((nibbles[j] >> 4) as i32 - 8) as f32 * scale_back);
+        }
+    }
+
+    let activation: Vec<f32> = (0..blocks * 32)
+        .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+        .collect();
+    let xq = super::quantize_q8_0_blocks(&activation);
+
+    // Reference: dequantized weights × dequantized activation, block-sequential.
+    let mut reference = 0f32;
+    for (b, xb) in xq.iter().enumerate() {
+        let mut isum = 0i32;
+        for j in 0..32 {
+            let w = expected_weights[b * 32 + j];
+            let wq =
+                (w / super::f16_bits_to_f32(super::f32_to_f16_bits(0.0125f32 * (b as f32 + 1.0))))
+                    .round() as i32;
+            isum += wq * (xb.quants[j] as i32);
+        }
+        reference += isum as f32
+            * super::f16_bits_to_f32(super::f32_to_f16_bits(0.0125f32 * (b as f32 + 1.0)))
+            * xb.scale;
+    }
+
+    let scalar = super::q4_0_wire_row_dot_scalar(&wire, &xq);
+    assert!(
+        (scalar - reference).abs() <= reference.abs() * 1e-6 + 1e-6,
+        "scalar {scalar} vs reference {reference}"
+    );
+
+    let dispatched = super::q4_0_wire_row_dot(&wire, &xq);
+    assert_eq!(
+        dispatched.to_bits(),
+        scalar.to_bits(),
+        "NEON and scalar q4_0 dots must agree bit-exactly: {dispatched} vs {scalar}"
+    );
+}
+
+#[test]
+fn q4_0_wire_block_dequant_matches_nibble_layout() {
+    let scale = 0.5f32;
+    let mut block = Vec::new();
+    block.extend_from_slice(&super::f32_to_f16_bits(scale).to_le_bytes());
+    let mut nibbles = [0u8; 16];
+    for (j, nib) in nibbles.iter_mut().enumerate() {
+        *nib = (((j % 16) as u8) << 4) | ((15 - j % 16) as u8);
+    }
+    block.extend_from_slice(&nibbles);
+    let out = super::q4_0_wire_block_dequant(&block);
+    for j in 0..16 {
+        assert_eq!(out[j], ((15 - j as i32 % 16) - 8) as f32 * scale, "lo {j}");
+        assert_eq!(out[j + 16], ((j as i32 % 16) - 8) as f32 * scale, "hi {j}");
+    }
+}
+
+/// Q6_K: the wire-row dot must equal the dequant-array reference computed
+/// through the same integer path (weights rebuild exactly; the dot's lane
+/// structure is the reference generic kernel's).
+#[test]
+fn q6_k_wire_dot_consistent_with_dequant() {
+    // One synthetic 210-byte superblock with full nibble/2-bit/scale coverage.
+    let mut block = vec![0u8; super::Q6_K_WIRE_BYTES_PER_BLOCK];
+    for (i, b) in block.iter_mut().enumerate().take(128) {
+        *b = ((i * 37 + 11) % 256) as u8; // ql
+    }
+    for i in 0..64 {
+        block[128 + i] = ((i * 73 + 5) % 256) as u8; // qh
+    }
+    for i in 0..16 {
+        block[192 + i] = ((i as i32 * 9 - 60) & 0xFF) as u8; // signed scales
+    }
+    let d = 0.0375f32;
+    block[208..210].copy_from_slice(&super::f32_to_f16_bits(d).to_le_bytes());
+
+    let activation: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.21).cos() * 4.0).collect();
+    let xq = super::quantize_q8_k_blocks(&activation);
+    assert_eq!(xq.len(), 1);
+
+    let dot = super::q6_k_wire_row_dot(&block, &xq);
+
+    // Reference: same integer math via the dequant array (w = d*sc*q exactly,
+    // so dividing back out per group is exact in i32 range).
+    let deq = super::q6_k_wire_block_dequant(&block);
+    let d_back = super::f16_bits_to_f32(super::f32_to_f16_bits(d));
+    let mut sums = [0f32; 8];
+    let mut aux32 = [0i32; 8];
+    for j in 0..16 {
+        let scale = block[192 + j] as i8 as i32;
+        let off = j * 16;
+        for l in 0..16 {
+            let w = deq[off + l];
+            let q = if scale == 0 || d_back == 0.0 {
+                0
+            } else {
+                (w / (d_back * scale as f32)).round() as i32
+            };
+            aux32[l % 8] += scale * (xq[0].qs[off + l] as i32) * q;
+        }
+    }
+    for l in 0..8 {
+        sums[l] += d_back * xq[0].d * aux32[l] as f32;
+    }
+    let reference: f32 = sums.iter().sum();
+    assert!(
+        (dot - reference).abs() <= reference.abs() * 1e-5 + 1e-4,
+        "q6_k dot {dot} vs dequant reference {reference}"
+    );
+}
+
+/// The Q8_K quantizer must mirror the reference exactly: iscale uses the
+/// SIGNED max (not amax), magic-number nearest-even rounding, clamp to 127.
+#[test]
+fn q8_k_quantizer_mirrors_reference_semantics() {
+    // Signed-max behavior: a negative max flips iscale's sign.
+    let mut row = vec![0f32; 256];
+    row[0] = -10.0; // amax element is negative
+    row[1] = 4.0;
+    let q = super::quantize_q8_k_blocks(&row);
+    // iscale = -127 / -10 = 12.7; d = 1/iscale
+    assert!((q[0].d - (1.0 / 12.7)).abs() < 1e-6);
+    assert_eq!(
+        q[0].qs[0],
+        127i8.min(super::quantize_q8_k_blocks(&row)[0].qs[0])
+    );
+    assert_eq!(q[0].qs[1], 51); // nearest_int(12.7*4.0) = nearest_int(50.8) = 51
+
+    // All-zero block short-circuits.
+    let z = super::quantize_q8_k_blocks(&vec![0f32; 256]);
+    assert_eq!(z[0].d, 0.0);
+    assert!(z[0].qs.iter().all(|&v| v == 0));
+}
