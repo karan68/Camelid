@@ -22,6 +22,7 @@ Read these first:
 - [`PARITY.md`](docs/benchmarks/PARITY.md) — exact-row parity proof map and audit trail
 - [`RECEIPTS.md`](RECEIPTS.md) — verifiable single-request parity receipts; a receipt never changes the support ledger
 - [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — cross-runtime conformance: determinism, agreement, tokenizer parity, provability; methodology and current findings
+- [`docs/TELEMETRY.md`](docs/TELEMETRY.md) — live inference telemetry stream (`/api/telemetry/stream`): event schema, truthfulness contract, lane coverage; drives the UI's Inference Observatory
 - [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
 
 ## Contributor and project policy

@@ -15,6 +15,7 @@ const TITLES = {
   system: 'System',
   settings: 'Settings',
   cluster: 'Cluster Topology',
+  observatory: 'Inference Observatory',
 }
 
 /* Slim top bar. Chat tab shows the conversation title + a compact model status

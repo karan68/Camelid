@@ -47,6 +47,7 @@ use crate::{
         self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
         RECEIPT_SCHEMA_V1,
     },
+    telemetry,
     tensor::{parse_byte_count_env, CpuTensor, Q8_0Block, TensorStore},
     tokenizer::Tokenizer,
     BackendError,
@@ -1118,6 +1119,9 @@ struct PreparedGeneration {
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     speculative: Option<PreparedSpeculative>,
+    /// Captured request identity for the live telemetry stream; taken by the
+    /// generation path that actually runs (streaming or blocking).
+    telemetry: Option<telemetry::RequestStart>,
 }
 
 /// Server-level speculative decoding mode (`CAMELID_SPEC_DECODE`).
@@ -1226,6 +1230,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/api/telemetry/stream", get(telemetry_stream))
         .route("/execution-plan", get(execution_plan))
         .route("/api/execution-plan", get(execution_plan))
         .route("/api/models/load", post(load_model))
@@ -1296,6 +1301,41 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "camelid server listening");
     axum::serve(listener, router_with_state(state)).await
+}
+
+/// Live inference telemetry stream (SSE). Subscribers receive only events
+/// emitted by real inference work (see `crate::telemetry`); an idle server
+/// sends nothing beyond the initial hello and keep-alive comments.
+async fn telemetry_stream() -> Response {
+    let mut rx = telemetry::hub().subscribe();
+    let events = async_stream::stream! {
+        let hello = serde_json::json!({
+            "event": "hello",
+            "schema": telemetry::TELEMETRY_SCHEMA,
+            "engine": "camelid",
+        });
+        yield Ok::<Event, Infallible>(Event::default().event("telemetry").data(hello.to_string()));
+        loop {
+            match rx.recv().await {
+                Ok(envelope) => match serde_json::to_string(&envelope) {
+                    Ok(json) => yield Ok(Event::default().event("telemetry").data(json)),
+                    Err(_) => continue,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let notice = serde_json::json!({ "event": "lagged", "skipped": skipped });
+                    yield Ok(Event::default().event("telemetry").data(notice.to_string()));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(events)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -3097,28 +3137,45 @@ async fn gemma4_chat_nonstreaming(
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let t_generate = std::time::Instant::now();
+    // Lifecycle telemetry only on this lane: the gemma4 runtime does not
+    // (yet) report prompt token counts or per-layer events, so those fields
+    // stay at their "not reported" zero values rather than being estimated.
+    let telemetry_guard =
+        telemetry::RequestGuard::begin(gemma4_telemetry_start(&id, max_tokens as u32, false));
     let result =
         tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
+            telemetry_guard.finish(gemma4_telemetry_error(e.to_string()));
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "generation_error",
                 e.to_string(),
                 None,
-            )
+            );
         }
         Err(e) => {
+            let message = format!("gemma4 generation task panicked: {e}");
+            telemetry_guard.finish(gemma4_telemetry_error(message.clone()));
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "generation_error",
-                format!("gemma4 generation task panicked: {e}"),
+                message,
                 None,
-            )
+            );
         }
     };
+    telemetry_guard.finish(telemetry::RequestFinish {
+        status: "ok",
+        finish_reason: Some("stop".to_string()),
+        completion_tokens: ids.len(),
+        ttft_ms: None,
+        decode_tps: None,
+        prefill_tps: None,
+        error: None,
+    });
     let body = serde_json::json!({
         "id": "chatcmpl-gemma4",
         "object": "chat.completion",
@@ -3147,6 +3204,40 @@ async fn gemma4_chat_nonstreaming(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Telemetry request identity for the gemma4 serve lane. Prompt token count
+/// and context length are not reported by this runtime, so they are recorded
+/// as 0 ("not reported") instead of being estimated.
+fn gemma4_telemetry_start(
+    model_id: &str,
+    max_tokens: u32,
+    stream: bool,
+) -> telemetry::RequestStart {
+    telemetry::RequestStart {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        model_id: model_id.to_string(),
+        backend: "gemma4-runtime".to_string(),
+        quantization: String::new(),
+        architecture: "gemma4".to_string(),
+        prompt_tokens: 0,
+        max_tokens,
+        context_length: 0,
+        temperature: 0.0,
+        stream,
+    }
+}
+
+fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
+    telemetry::RequestFinish {
+        status: "error",
+        finish_reason: None,
+        completion_tokens: 0,
+        ttft_ms: None,
+        decode_tps: None,
+        prefill_tps: None,
+        error: Some(message),
+    }
+}
+
 /// Streaming Gemma 4 chat (SSE). Mirrors the OpenAI `chat.completion.chunk`
 /// shape: a role chunk, one content delta per generated token, a final
 /// finish_reason chunk, then `[DONE]`. Generation runs on a blocking thread and
@@ -3173,6 +3264,14 @@ async fn gemma4_chat_streaming(
     });
 
     let events = async_stream::stream! {
+        // Lifecycle telemetry; a dropped stream (client disconnect) closes
+        // the run via the guard's Drop.
+        let mut telemetry_guard = Some(telemetry::RequestGuard::begin(gemma4_telemetry_start(
+            &id,
+            max_tokens as u32,
+            true,
+        )));
+        let mut telemetry_tokens = 0usize;
         // Role chunk.
         let role = serde_json::json!({
             "id": "chatcmpl-gemma4",
@@ -3188,6 +3287,15 @@ async fn gemma4_chat_streaming(
         while let Some(item) = rx.recv().await {
             match item {
                 Ok(delta) => {
+                    // One delta per really-decoded token on this lane (the
+                    // runtime invokes the callback per generated token), so
+                    // this pulse maps 1:1 to real decode work.
+                    telemetry_tokens += 1;
+                    telemetry::emit(telemetry::Event::TokenDecoded {
+                        token_id: None,
+                        context_position: None,
+                        layers_total: None,
+                    });
                     // Suppress thinking-channel spans; an empty visible delta
                     // emits nothing.
                     let visible = channel_filter.filter(&delta);
@@ -3204,6 +3312,9 @@ async fn gemma4_chat_streaming(
                     yield Ok(Event::default().data(chunk.to_string()));
                 }
                 Err(e) => {
+                    if let Some(guard) = telemetry_guard.take() {
+                        guard.finish(gemma4_telemetry_error(e.clone()));
+                    }
                     let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
                     yield Ok(Event::default().data(err.to_string()));
                     errored = true;
@@ -3213,6 +3324,17 @@ async fn gemma4_chat_streaming(
         }
 
         if !errored {
+            if let Some(guard) = telemetry_guard.take() {
+                guard.finish(telemetry::RequestFinish {
+                    status: "ok",
+                    finish_reason: Some("stop".to_string()),
+                    completion_tokens: telemetry_tokens,
+                    ttft_ms: None,
+                    decode_tps: None,
+                    prefill_tps: None,
+                    error: None,
+                });
+            }
             let done = serde_json::json!({
                 "id": "chatcmpl-gemma4",
                 "object": "chat.completion.chunk",
@@ -4618,6 +4740,11 @@ async fn build_server_receipt(
         tracing::warn!(error = %err, "failed to seal camelid_receipt; omitting receipt");
         return None;
     }
+    telemetry::emit(telemetry::Event::ReceiptWritten {
+        receipt_id: receipt.receipt_id.clone(),
+        reproducible: receipt.reproducible,
+        gguf_sha256: Some(receipt.lane.gguf_sha256.clone()),
+    });
     Some(receipt)
 }
 
@@ -5248,6 +5375,26 @@ async fn prepare_generation(
     // session stays off the GPU-resident prefill/decode paths.
     session.set_resident_paths_disabled(speculative.is_some());
 
+    let telemetry_backend = {
+        let plans = state.execution_plans.read().await;
+        plans
+            .get(&model.id)
+            .map(|plan| plan.selected_backend.clone())
+            .unwrap_or_else(|| "llama".to_string())
+    };
+    let telemetry_start = telemetry::RequestStart {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        model_id: model.id.clone(),
+        backend: telemetry_backend,
+        quantization: model.lane.quantization.clone(),
+        architecture: model.lane.architecture.clone(),
+        prompt_tokens: token_ids.len(),
+        max_tokens,
+        context_length,
+        temperature: f64::from(req.temperature.unwrap_or(0.0)),
+        stream: req.stream.unwrap_or(false),
+    };
+
     Ok(PreparedGeneration {
         model_id: model.id,
         model_path: model.path,
@@ -5266,6 +5413,7 @@ async fn prepare_generation(
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
         speculative,
+        telemetry: Some(telemetry_start),
     })
 }
 
@@ -5859,6 +6007,13 @@ fn gpu_sampled_generation_step(
     next_token_id: u32,
     forward_us: u128,
 ) -> crate::Result<LlamaGenerationStep> {
+    // This step's token was really sampled (on the GPU); the engine-level
+    // sampler hook never runs for it, so the decode pulse is emitted here.
+    telemetry::emit(telemetry::Event::TokenDecoded {
+        token_id: Some(next_token_id),
+        context_position: None,
+        layers_total: None,
+    });
     Ok(LlamaGenerationStep {
         prompt_token_count: 1,
         prefill_token_count: 0,
@@ -6041,11 +6196,28 @@ fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>>
 }
 
 fn generate_decoded_tokens(
-    prepared: PreparedGeneration,
+    mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
+    // Lifecycle telemetry for the blocking (non-streaming) path. If the
+    // generation errors out, the guard's Drop closes the run on the stream.
+    let telemetry_guard = prepared
+        .telemetry
+        .take()
+        .map(telemetry::RequestGuard::begin);
     let tokenizer = prepared.tokenizer.clone();
     let stop_sequences = prepared.stop_sequences.clone();
     let generated = generate_token_ids(prepared)?;
+    if let Some(guard) = telemetry_guard {
+        guard.finish(telemetry::RequestFinish {
+            status: "ok",
+            finish_reason: Some(generated.finish_reason.to_string()),
+            completion_tokens: generated.token_ids.len(),
+            ttft_ms: None,
+            decode_tps: None,
+            prefill_tps: None,
+            error: None,
+        });
+    }
     let mut text = tokenizer
         .decode(&generated.token_ids, true)
         .map_err(|err| {
@@ -6919,6 +7091,10 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     };
     let events = async_stream::stream! {
         let stream_started = Instant::now();
+        // Lifecycle telemetry for the streaming path. Dropping the stream
+        // (client disconnect, error return) closes the run via the guard's
+        // Drop, so the observatory never shows a stale "running" state.
+        let telemetry_guard = prepared.telemetry.take().map(telemetry::RequestGuard::begin);
         let mut stream_event_timings = StreamEventTimings {
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
@@ -7174,6 +7350,25 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         prepared.timings.memory = forward_timings.memory;
         if collect_q8_schedule {
             prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+        }
+        if let Some(guard) = telemetry_guard {
+            let ttft_ms = first_content_ms.map(|ms| ms as u64);
+            let decode_tps = match (first_content_ms, generated.len()) {
+                (Some(first_ms), count) if count > 1 => {
+                    let decode_ms = generation_started.elapsed().as_millis().saturating_sub(first_ms);
+                    (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
+                }
+                _ => None,
+            };
+            guard.finish(telemetry::RequestFinish {
+                status: "ok",
+                finish_reason: Some(finish_reason.to_string()),
+                completion_tokens: generated.len(),
+                ttft_ms,
+                decode_tps,
+                prefill_tps: None,
+                error: None,
+            });
         }
         stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
         let camelid_diagnostics = stream_timing_diagnostics
@@ -7786,6 +7981,16 @@ fn api_error(
     message: String,
     param: Option<&'static str>,
 ) -> Response {
+    // Surface failures that happen while a generation is live on the
+    // telemetry stream. Errors raised outside an active generation
+    // (request validation, model management) are not inference errors and
+    // stay off the stream.
+    if telemetry::hub().request_active() {
+        telemetry::emit(telemetry::Event::InferenceError {
+            code: code.to_string(),
+            message: message.clone(),
+        });
+    }
     let error_type = match status {
         StatusCode::NOT_IMPLEMENTED => "not_implemented",
         StatusCode::SERVICE_UNAVAILABLE => "runtime_unavailable",
@@ -10320,6 +10525,7 @@ mod tests {
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             speculative: None,
+            telemetry: None,
         }
     }
 

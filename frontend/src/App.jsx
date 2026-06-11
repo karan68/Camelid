@@ -18,9 +18,10 @@ import ApiView from './views/ApiView'
 import SystemView from './views/SystemView'
 import SettingsView from './views/SettingsView'
 import ClusterView from './views/ClusterView'
+import InferenceObservatoryView from './views/InferenceObservatoryView'
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster'])
+const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -199,7 +200,7 @@ function App() {
           <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div className={`camelid-view ${(tab === 'chat' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
           {tab === 'chat' && (
             <ChatWorkspace
               selectedConversation={selectedConversation}
@@ -296,6 +297,8 @@ function App() {
           )}
 
           {tab === 'cluster' && <ClusterView showNotice={showNotice} />}
+
+          {tab === 'observatory' && <InferenceObservatoryView apiBase={apiBase} />}
         </div>
       </main>
 

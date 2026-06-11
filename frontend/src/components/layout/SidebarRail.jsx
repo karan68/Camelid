@@ -6,7 +6,7 @@ import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import {
   IconAnalytics, IconApi, IconChat, IconHistory, IconMemory, IconModels,
-  IconNetwork, IconNewChat, IconSearch, IconSettings, IconSidebar, IconSystem,
+  IconNetwork, IconNewChat, IconObservatory, IconSearch, IconSettings, IconSidebar, IconSystem,
 } from '../ui/icons'
 
 const NAV = [
@@ -17,6 +17,7 @@ const NAV = [
   { tab: 'system', label: 'System', Icon: IconSystem },
   { tab: 'api', label: 'API', Icon: IconApi },
   { tab: 'cluster', label: 'Cluster', Icon: IconNetwork },
+  { tab: 'observatory', label: 'Inference Observatory', Icon: IconObservatory },
   { tab: 'settings', label: 'Settings', Icon: IconSettings },
 ]
 

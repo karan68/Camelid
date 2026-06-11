@@ -12,6 +12,7 @@ pub mod metal;
 pub mod model;
 pub mod model_source;
 pub mod receipt;
+pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;
 pub mod wire_mmap;

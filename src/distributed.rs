@@ -100,6 +100,7 @@ pub fn deserialize_tensor<R: Read>(reader: &mut R, name: String) -> std::io::Res
 
 pub struct DistributedClient {
     stream: Mutex<TcpStream>,
+    addr: String,
 }
 
 impl DistributedClient {
@@ -108,10 +109,42 @@ impl DistributedClient {
         stream.set_nodelay(true)?;
         Ok(Self {
             stream: Mutex::new(stream),
+            addr: addr.to_string(),
         })
     }
 
     pub fn forward_to_worker(
+        &self,
+        hidden: &CpuTensor,
+        is_prefill: bool,
+        seq_len: usize,
+        position: usize,
+    ) -> Result<CpuTensor> {
+        // Worker telemetry wraps the real TCP roundtrip: active when the
+        // activation ships out, idle when the response lands, error on any
+        // wire failure.
+        crate::telemetry::emit(crate::telemetry::Event::WorkerNodeActive {
+            node: self.addr.clone(),
+            detail: Some(if is_prefill {
+                format!("prefill seq_len {seq_len} @ position {position}")
+            } else {
+                format!("decode @ position {position}")
+            }),
+        });
+        let result = self.forward_to_worker_inner(hidden, is_prefill, seq_len, position);
+        match &result {
+            Ok(_) => crate::telemetry::emit(crate::telemetry::Event::WorkerNodeIdle {
+                node: self.addr.clone(),
+            }),
+            Err(err) => crate::telemetry::emit(crate::telemetry::Event::WorkerNodeError {
+                node: self.addr.clone(),
+                error: err.to_string(),
+            }),
+        }
+        result
+    }
+
+    fn forward_to_worker_inner(
         &self,
         hidden: &CpuTensor,
         is_prefill: bool,

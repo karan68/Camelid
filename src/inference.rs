@@ -16,6 +16,7 @@ use serde::Serialize;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
+use crate::telemetry;
 
 mod diagnostic_config;
 pub(crate) mod gemma4;
@@ -2492,6 +2493,11 @@ impl LlamaInferenceSession {
             if next_hidden.len() != hidden.data.len() {
                 next_hidden.resize(hidden.data.len(), 0.0);
             }
+            telemetry::emit(telemetry::Event::LayerStarted {
+                layer: layer_idx,
+                layers_total: self.weights.layers.len(),
+            });
+            let layer_telemetry_started = Instant::now();
             let mut layer_timings = LlamaLayerTimings {
                 layer_index: layer_idx,
                 ..LlamaLayerTimings::default()
@@ -2572,6 +2578,11 @@ impl LlamaInferenceSession {
             hidden.q8_0_packed_rows4_4x8 = None;
             hidden.q8_0_runtime_storage = None;
             hidden.q8_0_file_backing = None;
+            telemetry::emit(telemetry::Event::LayerCompleted {
+                layer: layer_idx,
+                layers_total: self.weights.layers.len(),
+                duration_us: layer_telemetry_started.elapsed().as_micros() as u64,
+            });
             trace_forward_memory(&format!("prefill_layer_major_layer_{layer_idx}_done"));
         }
         timings.layers_total = layers_started.elapsed().as_micros();
@@ -2681,6 +2692,10 @@ impl LlamaInferenceSession {
                     }
                 }
                 trace_forward_memory(&format!("layer_{layer_idx}_start"));
+                telemetry::emit(telemetry::Event::LayerStarted {
+                    layer: layer_idx,
+                    layers_total: self.weights.layers.len(),
+                });
                 let timed = forward_layer_timed(
                     &hidden,
                     layer,
@@ -2695,6 +2710,11 @@ impl LlamaInferenceSession {
                     &mut self.kv_cache,
                 )?;
                 hidden = timed.output;
+                telemetry::emit(telemetry::Event::LayerCompleted {
+                    layer: layer_idx,
+                    layers_total: self.weights.layers.len(),
+                    duration_us: timed.timings.total as u64,
+                });
                 trace_forward_memory(&format!("layer_{layer_idx}_done"));
                 if let (Some(memory), Some(layer_memory)) = (&mut memory, &timed.timings.memory) {
                     memory.record_layer(layer_memory.clone());
@@ -2855,6 +2875,17 @@ impl LlamaInferenceSession {
         let mut first_token_timings = LlamaForwardTimings::default();
         let prefill_count = token_ids.len().saturating_sub(1);
         let prefill_chunk_tokens = prefill_chunk_token_count(prefill_count);
+        let telemetry_layers_total = self.weights.layers.len();
+        if prefill_count > 0 {
+            telemetry::emit(telemetry::Event::PrefillStarted {
+                prefill_tokens: prefill_count,
+                // The lane resolves just below (GPU-resident first, then
+                // layer-major / chunked / single-token); the progress and
+                // layer events that follow come from the lane that ran.
+                path: "auto",
+                layers_total: telemetry_layers_total,
+            });
+        }
         let resident_prefill_started = Instant::now();
         if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
@@ -2863,6 +2894,10 @@ impl LlamaInferenceSession {
             let resident_prefill_us = resident_prefill_started.elapsed().as_micros();
             timings.total += resident_prefill_us;
             prefill_timings.total += resident_prefill_us;
+            telemetry::emit(telemetry::Event::PrefillProgress {
+                tokens_done: prefill_count,
+                tokens_total: prefill_count,
+            });
         } else if prefill_count > 0
             && prefill_chunk_tokens > 1
             && prefill_layer_major_enabled(&self.weights)
@@ -2874,18 +2909,33 @@ impl LlamaInferenceSession {
             timings.add_assign(&layer_major_timings);
             prefill_timings.add_assign(&layer_major_timings);
         } else if prefill_count > 0 && prefill_chunk_tokens > 1 {
+            let mut telemetry_tokens_done = 0usize;
             for chunk in token_ids[..prefill_count].chunks(prefill_chunk_tokens) {
                 let chunk_timings = self.forward_prefill_chunk_timed_fast(chunk)?;
                 timings.add_assign(&chunk_timings);
                 prefill_timings.add_assign(&chunk_timings);
+                telemetry_tokens_done += chunk.len();
+                telemetry::emit(telemetry::Event::PrefillProgress {
+                    tokens_done: telemetry_tokens_done,
+                    tokens_total: prefill_count,
+                });
             }
         } else {
-            for token_id in &token_ids[..prefill_count] {
+            for (telemetry_done, token_id) in token_ids[..prefill_count].iter().enumerate() {
                 add_q8_schedule_counter(&Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS, 1);
                 let timed = self.forward_single_token_timed_internal(*token_id, false, false)?;
                 timings.add_assign(&timed.timings);
                 prefill_timings.add_assign(&timed.timings);
+                telemetry::emit(telemetry::Event::PrefillProgress {
+                    tokens_done: telemetry_done + 1,
+                    tokens_total: prefill_count,
+                });
             }
+        }
+        if prefill_count > 0 {
+            telemetry::emit(telemetry::Event::DecodeStarted {
+                context_position: self.kv_cache.position,
+            });
         }
 
         let last_token_id = *token_ids.last().expect("non-empty token_ids checked above");
@@ -2904,6 +2954,35 @@ impl LlamaInferenceSession {
         let sample_started = Instant::now();
         let next_token_id = sampler.sample_with_history(&logits, token_history)?;
         let sample = sample_started.elapsed().as_micros();
+        if telemetry::active() {
+            // Candidate probabilities are computed from the real logits of
+            // this step, and only while a telemetry subscriber is connected.
+            telemetry::emit(telemetry::Event::SamplerStep {
+                chosen_token_id: next_token_id,
+                mode: match &sampler {
+                    LlamaSampler::Greedy => "greedy",
+                    LlamaSampler::Sampling(_) => "sampling",
+                },
+                candidates: telemetry::top_k_candidates(&logits.data, 8),
+            });
+        }
+        telemetry::emit(telemetry::Event::TokenDecoded {
+            token_id: Some(next_token_id),
+            context_position: Some(self.kv_cache.position),
+            layers_total: Some(telemetry_layers_total),
+        });
+        telemetry::emit(telemetry::Event::KvCacheUpdated {
+            position: self.kv_cache.position,
+            capacity: self.kv_cache.plan.max_sequence_length,
+            approx_bytes: Some(
+                (self.kv_cache.position
+                    * self.kv_cache.plan.layer_count
+                    * self.kv_cache.plan.kv_head_count
+                    * self.kv_cache.plan.head_dim
+                    * 2
+                    * std::mem::size_of::<f32>()) as u64,
+            ),
+        });
         Ok(LlamaGenerationStep {
             prompt_token_count: token_ids.len(),
             prefill_token_count: token_ids.len().saturating_sub(1),
