@@ -52,6 +52,12 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 
 > **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
 
+### Experimental lanes (not supported)
+
+| Model row | Quant | Status | Evidence |
+|---|---|---|---|
+| DiffusionGemma 26B-A4B-It | Q4_K_M | **Active development — recon/evidence-only. Not supported.** | [Phase 0 recon](docs/recon/DIFFUSIONGEMMA_RECON.md) (tensor inventory, pinned llama.cpp diffusion reference, sampler recon); no runtime exists |
+
 Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) and [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
 ---

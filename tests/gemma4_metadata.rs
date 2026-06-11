@@ -142,7 +142,15 @@ fn diffusiongemma_architecture_fails_closed() {
     // block-diffusion encoder-decoder, not an autoregressive model. Camelid must
     // fail closed by name on any `*diffusion*` architecture spelling rather than
     // mis-binding the shared gemma4 tensors.
-    for arch in ["diffusion_gemma", "diffusiongemma", "gemma-diffusion"] {
+    // "diffusion-gemma" is the ground-truth spelling: it is the actual
+    // general.architecture value in the tracked unsloth Q4_K_M GGUF
+    // (llama.cpp arch string, see docs/recon/DIFFUSIONGEMMA_RECON.md).
+    for arch in [
+        "diffusion-gemma",
+        "diffusion_gemma",
+        "diffusiongemma",
+        "gemma-diffusion",
+    ] {
         let mut gguf = synthetic_gemma4_gguf(4);
         gguf.metadata.insert(
             "general.architecture".into(),

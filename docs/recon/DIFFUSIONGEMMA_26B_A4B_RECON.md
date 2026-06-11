@@ -7,6 +7,14 @@
 > closed** with a typed blocker; it is **not** a supported runtime row, and
 > nothing here is a support claim.
 
+> [!NOTE]
+> **Update (2026-06-11):** the "no parity oracle" premise below is no longer
+> true — llama.cpp gained a DiffusionGemma runtime (PR #24423), which
+> unblocked an experimental recon lane. Where the two disagree,
+> [`DIFFUSIONGEMMA_RECON.md`](DIFFUSIONGEMMA_RECON.md) (the lane recon, with
+> the pinned reference) supersedes this document. The fail-closed runtime
+> posture on `main` is unchanged; the lane is evidence-only and not supported.
+
 ## What it is
 
 `google/diffusiongemma-26B-A4B-it` — config `architectures:
