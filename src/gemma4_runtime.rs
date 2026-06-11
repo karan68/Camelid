@@ -1228,6 +1228,15 @@ impl Gemma4GpuRuntime {
         // it never forces the anonymous GPU WirePages to swap). GPU layer weights load
         // separately as page-aligned WirePages.
         let mmap = GgufWireMmap::map(path)?;
+        // Warm the embedding mmap off the loading thread (matching the CPU lane): the
+        // QAT hybrid head reads the whole Q6_K tied table every token on the CPU, and
+        // every row gather hits this mapping, so the first token would otherwise pay the
+        // cold page-fault cost serially. madvise(WILLNEED) on a USB-backed volume blocks
+        // until the range is paged in, so it MUST NOT run on the loading thread.
+        {
+            let mmap = mmap.clone();
+            std::thread::spawn(move || mmap.advise_willneed());
+        }
         let q8 = |name: &str| WireQuant::new(&store, &mmap, name);
         let f32t = |name: &str| -> Result<Vec<f32>> { Ok(store.load_cpu_f32(name)?.data) };
 
