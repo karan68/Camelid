@@ -309,8 +309,22 @@ pub(crate) fn rope_neox(
     }
 }
 
-/// `ggml_vec_sum_f32`: sequential DOUBLE accumulation collapsed to f32
-/// (used for the MoE selected-weight normalization sum).
+/// `ggml_vec_sum_f32`: under GGML_USE_ACCELERATE (on in the pinned build)
+/// this is Apple's `vDSP_sve`, NOT the double-precision fallback loop — bind
+/// the real framework symbol for exactness (used for the MoE selected-weight
+/// normalization sum).
+#[cfg(target_os = "macos")]
+pub(crate) fn vec_sum_f32(x: &[f32]) -> f32 {
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn vDSP_sve(x: *const f32, stride: isize, out: *mut f32, n: usize);
+    }
+    let mut out = 0f32;
+    unsafe { vDSP_sve(x.as_ptr(), 1, &mut out, x.len()) };
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn vec_sum_f32(x: &[f32]) -> f32 {
     let mut sum = 0f64;
     for &v in x {

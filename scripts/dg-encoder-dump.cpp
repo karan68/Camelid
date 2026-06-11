@@ -47,7 +47,10 @@ static bool want_name(const char * name, int n_layer) {
         return true;
     }
     static const char * per_layer[] = {
-        "Kcur_pos", "Vcur_normed", "attn_out", "ffn_moe_logits", "ffn_moe_topk", "l_out",
+        "Kcur_pos",      "Vcur_normed", "attn_out", "ffn_moe_logits",
+        "ffn_moe_topk",  "l_out",
+        // FFN-branch bisection points (labels survive cb renames)
+        "ffn_mlp",       "ffn_moe",     "ffn_moe_weights",
     };
     for (const char * base : per_layer) {
         const size_t blen = strlen(base);

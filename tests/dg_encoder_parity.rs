@@ -205,6 +205,9 @@ fn dg_encoder_prefill_matches_pinned_llamacpp() {
             write_f32(&format!("attn_out-{l}"), &lt.attn_out);
             write_f32(&format!("ffn_moe_logits-{l}"), &lt.moe_logits);
             write_f32(&format!("l_out-{l}"), &lt.out_scaled);
+            write_f32(&format!("ffn_mlp-{l}"), &lt.ffn_mlp);
+            write_f32(&format!("ffn_moe-{l}"), &lt.ffn_moe);
+            write_f32(&format!("ffn_moe_weights-{l}"), &lt.moe_weights);
             let tk: Vec<u8> = lt.moe_topk.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(dir.join(format!("ffn_moe_topk-{l}.bin")), tk).expect("write topk");
         }
@@ -296,6 +299,30 @@ fn dg_encoder_prefill_matches_pinned_llamacpp() {
             &format!("ffn_moe_logits-{l}"),
             Some(l),
             &lt.moe_logits,
+            &mut rows,
+            &mut failures,
+            &mut first_divergent_layer,
+        );
+        check(
+            &format!("ffn_mlp-{l}"),
+            Some(l),
+            &lt.ffn_mlp,
+            &mut rows,
+            &mut failures,
+            &mut first_divergent_layer,
+        );
+        check(
+            &format!("ffn_moe-{l}"),
+            Some(l),
+            &lt.ffn_moe,
+            &mut rows,
+            &mut failures,
+            &mut first_divergent_layer,
+        );
+        check(
+            &format!("ffn_moe_weights-{l}"),
+            Some(l),
+            &lt.moe_weights,
             &mut rows,
             &mut failures,
             &mut first_divergent_layer,

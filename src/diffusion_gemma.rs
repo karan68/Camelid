@@ -284,6 +284,14 @@ pub struct DgLayerTrace {
     pub moe_logits: Vec<f32>,
     pub moe_topk: Vec<i32>,
     pub out_scaled: Vec<f32>,
+    /// dense (shared-expert) branch output after its post-norm — the
+    /// reference's surviving "ffn_mlp" label.
+    pub ffn_mlp: Vec<f32>,
+    /// MoE branch output after its post-norm — "ffn_moe".
+    pub ffn_moe: Vec<f32>,
+    /// RAW selected-expert probabilities in slot order (pre-normalization) —
+    /// "ffn_moe_weights".
+    pub moe_weights: Vec<f32>,
 }
 
 pub struct DgEncoderTrace {
@@ -628,6 +636,9 @@ impl DgEncoderRuntime {
             let mut moe_logits_all = Vec::with_capacity(n * self.n_expert);
             let mut moe_topk_all = Vec::with_capacity(n * self.n_expert_used);
             let mut out_scaled = Vec::with_capacity(n * hidden);
+            let mut ffn_mlp_all = Vec::with_capacity(n * hidden);
+            let mut ffn_moe_all = Vec::with_capacity(n * hidden);
+            let mut moe_weights_all = Vec::with_capacity(n * self.n_expert_used);
             for (pos, hp) in h.iter_mut().enumerate() {
                 let attn_resid = hp.clone();
                 let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
@@ -638,6 +649,7 @@ impl DgEncoderRuntime {
                 let actq = DgActivation::new(&act);
                 let mlp = lw.ffn_down.matvec_dense(&actq)?;
                 let mlp = refmath::rms_norm(&mlp, Some(&lw.post_norm_1), eps);
+                ffn_mlp_all.extend_from_slice(&mlp);
 
                 // Router: weightless RMS of the post-attention residual,
                 // scaled by 1/sqrt(n_embd), then the elementwise input scale.
@@ -653,13 +665,10 @@ impl DgEncoderRuntime {
                     .collect();
                 moe_logits_all.extend_from_slice(&logits);
 
-                // softmax over all experts, then top-k by probability
-                let maxl = logits.iter().cloned().fold(f32::MIN, f32::max);
-                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-                let sum: f32 = probs.iter().sum();
-                for p in probs.iter_mut() {
-                    *p /= sum;
-                }
+                // softmax over all experts (the reference's ggml_soft_max —
+                // same kernel semantics as the attention softmax), then top-k
+                let mut probs: Vec<f32> = logits.clone();
+                refmath::softmax_row(&mut probs);
                 let mut idx: Vec<usize> = (0..self.n_expert).collect();
                 idx.sort_unstable_by(|&a, &b| {
                     probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b))
@@ -667,6 +676,7 @@ impl DgEncoderRuntime {
                 idx.truncate(self.n_expert_used);
                 for &e in &idx {
                     moe_topk_all.push(e as i32);
+                    moe_weights_all.push(probs[e]);
                 }
                 // Diagnostic pinned routing: execute the supplied expert set
                 // instead of our own (probabilities renormalize over the
@@ -707,6 +717,7 @@ impl DgEncoderRuntime {
                     }
                 }
                 let moe_out = refmath::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
+                ffn_moe_all.extend_from_slice(&moe_out);
 
                 let mut combined = mlp;
                 for (c, m) in combined.iter_mut().zip(&moe_out) {
@@ -736,6 +747,9 @@ impl DgEncoderRuntime {
                 moe_logits: moe_logits_all,
                 moe_topk: moe_topk_all,
                 out_scaled,
+                ffn_mlp: ffn_mlp_all,
+                ffn_moe: ffn_moe_all,
+                moe_weights: moe_weights_all,
             });
         }
 
