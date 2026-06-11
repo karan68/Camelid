@@ -79,3 +79,26 @@ This is a substantial new lane, not a row addition. In rough order:
 
 Until 1–4 exist and are proven against a diffusion-aware oracle, DiffusionGemma
 stays recognized-and-blocked — which is the correct, honest state for it now.
+
+## Real-build status (2026-06-11)
+
+Starting the actual diffusion runtime is gated on two things that do not exist
+yet, so the honest first deliverable is the design/contract, not unvalidatable
+engine code:
+
+1. **No parity oracle.** llama.cpp's autoregressive path cannot produce a
+   reference for diffusion sampling. The only reference today is the HF
+   `transformers` `DiffusionGemmaForBlockDiffusion` model (Python). Camelid's
+   engine stays Rust/no-Python, but *validation* tooling may shell out to a
+   Python reference to capture a determinism-pinned oracle — that capture rig is
+   prerequisite step 0.
+2. **No runnable weights in a supported format/size.** Published GGUFs are
+   BF16 50.5 GB, Q8_0 26.9 GB (two-Mac-distributed territory, like the regular
+   26B A4B Q8_0 — blocked single-node), and K-quants Q4_K_M/Q5_K_M/Q6_K — wire
+   formats Camelid does not implement. A genuine bring-up needs either the Q8_0
+   row over the two-Mac lane or new K-quant wire kernels.
+
+Until (0) a determinism-pinned diffusion oracle exists and (1) weights load,
+DiffusionGemma stays **recognized + fail-closed** — the accurate state. The
+engine work (bidirectional decoder, cross-attention, multi-canvas EB sampler)
+is scoped in the section above and is a multi-stage lane, not a status flip.

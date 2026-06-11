@@ -10970,3 +10970,36 @@ fn q8_k_quantizer_mirrors_reference_semantics() {
     assert_eq!(z[0].d, 0.0);
     assert!(z[0].qs.iter().all(|&v| v == 0));
 }
+
+#[test]
+#[ignore] // perf micro-bench, run explicitly: cargo test --release perf_q4_q8_q6_dot -- --ignored --nocapture
+fn perf_q4_q8_q6_dot() {
+    use std::time::Instant;
+    let in_dim = 2560usize;
+    let nblk = in_dim / 32; // 80
+    let act: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.013).sin()).collect();
+    let xq = super::quantize_q8_0_blocks(&act);
+    // Q8_0 weight row: 34 bytes/block
+    let mut q8row: Vec<u8> = (0..nblk * 34).map(|i| (i % 251) as u8).collect();
+    for b in 0..nblk { q8row[b*34]=0x66; q8row[b*34+1]=0x2e; } // valid f16 ~0.1 scale
+    // Q4_0 weight row: 18 bytes/block
+    let mut q4row: Vec<u8> = (0..nblk * 18).map(|i| (i % 251) as u8).collect();
+    for b in 0..nblk { q4row[b*18]=0x66; q4row[b*18+1]=0x2e; }
+    // Q6_K: 210 bytes / 256-block; in_dim 2560 = 10 superblocks
+    let q6blk = in_dim / 256;
+    let mut q6row: Vec<u8> = (0..q6blk * 210).map(|i| (i % 251) as u8).collect();
+    for b in 0..q6blk { q6row[b*210+208]=0x66; q6row[b*210+209]=0x2e; } // f16 super-scale
+    let xqk = super::quantize_q8_k_blocks(&act);
+    let iters = 200_000usize;
+    let t = Instant::now(); let mut s = 0f32;
+    for _ in 0..iters { s += super::q8_0_wire_row_dot(&q8row, &xq); }
+    let q8 = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    for _ in 0..iters { s += super::q4_0_wire_row_dot(&q4row, &xq); }
+    let q4 = t.elapsed().as_secs_f64();
+    let t = Instant::now();
+    for _ in 0..iters { s += super::q6_k_wire_row_dot(&q6row, &xqk); }
+    let q6 = t.elapsed().as_secs_f64();
+    eprintln!("[dotbench] {iters} iters @ in_dim {in_dim}: q8={:.3}s ({:.1} Mrow/s)  q4={:.3}s ({:.1} Mrow/s, {:.1}x q8)  q6={:.3}s ({:.1} Mrow/s, {:.1}x q8)  sink={s}",
+        q8, iters as f64/q8/1e6, q4, iters as f64/q4/1e6, q4/q8, q6, iters as f64/q6/1e6, q6/q8);
+}
