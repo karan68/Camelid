@@ -215,3 +215,33 @@ reference dylibs — `clang++ -std=c++17 -I common -I include -I ggml/include
 examples/eval-callback/eval-callback.cpp -Lbuild/bin -lllama -lllama-common
 -lggml -lggml-base -lggml-cpu` — and prints every named tensor per op, which is
 how the 6-vs-5 token mismatch was caught in one run.
+
+## Full basic_v1 distributed parity pack — VALIDATED (two-Mac)
+
+Ran the 5-prompt basic_v1 pack distributed across both 16GB M4 Macs (master
+0..15 local, worker 15..30 + head on mini2; model staged over Thunderbolt,
+full-file sha256 verified identical; wire over the ssh tunnel) and compared to
+the pinned reference oracle (`qa/gemma4/oracle/gemma-4-26B_q4_0-it.basic_v1.json`):
+
+| Prompt | Result |
+| --- | --- |
+| count-primes | FULL (24 tok token-identical to reference) |
+| translate-de | FULL (16 tok token-identical) |
+| capital-france | prefix to idx 6, then knife-edge near-tie (top-2 gap 0.138) |
+| haiku-sea | prefix to idx 11, then near-tie (gap 0.203) |
+| rust-fn | prefix to idx 15, then near-tie (gap 0.419) |
+
+All three divergences are probe-verified knife-edge near-ties: the reference's
+greedy token is camelid's immediate #2 within ~0.14–0.42 logits, in the
+low-information continuation regions (numbers/dates/code) where greedy ties
+flip. `count-primes`/`translate-de` matching full-budget proves the A4B MoE
+forward is complete and correct — nothing is missing (contrast the E-series,
+whose "frontier" was a real missing rope-factors feature). Distributed output
+equals single-node (f32 wire); the probe (single-node) top-1 equals the
+distributed token in every case.
+
+This is the established promotable standard (same shape as the E4B QAT pack:
+full-budget where deterministic + probe-verified frontiers on near-ties).
+Evidence bundle: `qa/evidence-bundles/gemma4-26b-it-q4-0-qat-distributed-parity-*`.
+Comparator: llama.cpp 5d56eff `--no-repack -fa off -ctk f32 -ctv f32 -ub 1`
+(plain-f32 path; 26B is V-full so `-ub 1` is sound, unlike the 12B V-less case).
