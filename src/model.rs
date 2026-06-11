@@ -56,6 +56,29 @@ impl LlamaModelConfig {
                         .into(),
                 ))
             }
+            // DiffusionGemma (general.architecture spellings: diffusion_gemma /
+            // diffusiongemma / gemma-diffusion). Despite the Gemma 4 26B-A4B MoE
+            // foundation, this is NOT an autoregressive model: it is a discrete
+            // block-diffusion encoder-decoder that generates by iteratively
+            // denoising a token "canvas" with bidirectional decoder attention and
+            // cross-attention to an encoder KV cache (multi-canvas sampling +
+            // Entropy-Bound diffusion sampler), and it is multimodal (image/video
+            // inputs). Camelid is a decoder-only autoregressive engine (causal
+            // attention, KV cache, greedy next-token decode) and cannot run the
+            // diffusion decode loop; there is also no autoregressive reference
+            // runtime to prove token parity against. Fail closed with the exact
+            // blocker rather than mis-binding the shared gemma4 tensors.
+            Some(other) if other.to_ascii_lowercase().contains("diffusion") => {
+                return Err(BackendError::UnsupportedModelArchitecture(format!(
+                    "{other} (DiffusionGemma): blocked — DiffusionGemma is a discrete \
+                     block-diffusion encoder-decoder (bidirectional attention over a \
+                     denoising token canvas, multi-canvas iterative sampling, \
+                     cross-attention, Entropy-Bound diffusion sampler) and is \
+                     multimodal; Camelid's autoregressive decoder-only engine cannot \
+                     run the diffusion decode loop, and there is no autoregressive \
+                     reference comparator to prove parity against. Fails closed by design"
+                )))
+            }
             Some(other) => return Err(BackendError::UnsupportedModelArchitecture(other.into())),
             None => {
                 return Err(BackendError::InvalidModelMetadata(

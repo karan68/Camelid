@@ -137,6 +137,35 @@ fn per_layer_head_count_kv_array_parses() {
 }
 
 #[test]
+fn diffusiongemma_architecture_fails_closed() {
+    // DiffusionGemma reuses the Gemma 4 26B-A4B MoE foundation but is a discrete
+    // block-diffusion encoder-decoder, not an autoregressive model. Camelid must
+    // fail closed by name on any `*diffusion*` architecture spelling rather than
+    // mis-binding the shared gemma4 tensors.
+    for arch in ["diffusion_gemma", "diffusiongemma", "gemma-diffusion"] {
+        let mut gguf = synthetic_gemma4_gguf(4);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetadataValue::String(arch.into()),
+        );
+        let err = LlamaModelConfig::from_gguf(&gguf)
+            .err()
+            .unwrap_or_else(|| panic!("DiffusionGemma arch {arch} must fail closed"));
+        match err {
+            BackendError::UnsupportedModelArchitecture(msg) => {
+                assert!(msg.contains("DiffusionGemma"), "names the model: {msg}");
+                assert!(msg.contains("blocked"), "states it is blocked: {msg}");
+                assert!(
+                    msg.contains("diffusion") || msg.contains("autoregressive"),
+                    "explains the paradigm mismatch: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedModelArchitecture for {arch}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn gemma4_assistant_mtp_architecture_fails_closed() {
     let mut gguf = synthetic_gemma4_gguf(4);
     gguf.metadata.insert(
