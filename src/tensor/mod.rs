@@ -29,6 +29,8 @@ use crate::{
     BackendError, Result,
 };
 
+pub mod wire_dequant;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn disable_file_cache_best_effort(file: &File) {
     use std::{os::fd::AsRawFd, os::raw::c_int};

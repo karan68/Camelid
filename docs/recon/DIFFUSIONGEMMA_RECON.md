@@ -94,10 +94,15 @@ Tensor inventory: 692 tensors, **zero unclassified**
 `attn_v`** (V reuses the K projection, `src/models/gemma4-common.h:48-50`).
 
 Quant types present: Q4K (194), Q5_0 (33), Q6K (14), Q8_0 (28), F32 (423).
-Camelid already eager-decodes all five; the missing piece is the
-**lazy/file-backed path for Q4K/Q5_0 (+ confirm Q6K CPU)** plus
-reference-block parity tests — that is the whole of Phase 0.5
-(`quant-coverage.json`).
+Camelid already eager-decodes all five; what Phase 0.5 added is the
+**lazy/file-backed dequant path** (`src/tensor/wire_dequant.rs`: bounded
+block-range reads off the GGUF mmap, no whole-tensor f32 materialization,
+fail-closed outside the proven format set) plus reference-block parity:
+**bit-exact vs llama.cpp's own dequant at the pin** across all five formats,
+18 ranges (head + middle of 9 tensors), 155,648 values, zero bit mismatches —
+artifact `target/dg-quant-parity-20260611T165546Z.json`, runner
+`scripts/dg-quant-parity.sh` + `scripts/dg-dequant-dump.cpp` (the reference
+side is ggml's `to_float`, credited).
 
 ## 4. Forward pass (pinned source: `src/models/diffusion-gemma.cpp`)
 
