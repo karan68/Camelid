@@ -1172,6 +1172,14 @@ pub struct Gemma4GpuRuntime {
     hidden: usize,
     ple_dim: usize,
     n_layers: usize,
+    /// QAT hybrid lane: the tied head is Q6_K (no GPU kernel), so the GPU runs the
+    /// decoder layers (Q4_0) and the CPU runs the head. False for the all-Q8 path,
+    /// where the head is encoded on the GPU inside `forward_token`.
+    head_on_cpu: bool,
+    /// Held for the CPU head (`head_on_cpu`): output RMS-norm weights + vocab.
+    output_norm: Vec<f32>,
+    vocab: usize,
+    eps: f32,
 }
 
 #[cfg(target_os = "macos")]
@@ -1186,21 +1194,35 @@ impl Gemma4GpuRuntime {
         })?;
         let binding = Gemma4Binding::bind(&gguf, &config)?;
         let store = TensorStore::open(path, &gguf);
-        // The GPU-resident kernels read 34-byte Q8_0 wire blocks in place; QAT
-        // rows (Q4_0 weights, Q6_K embeddings) fail closed here until GPU
-        // Q4_0/Q6_K kernels exist. CPU is the supported lane for those rows.
-        for name in [
-            &binding.token_embedding.name,
-            &binding.layers[0].attn_q.name,
-        ] {
-            let t = store.descriptor(name)?.tensor_type;
-            if t != GgufTensorType::Q8_0 {
+        // The GPU-resident decode kernels run the layer projections as either Q8_0
+        // (34-byte wire blocks) or Q4_0 (18-byte QAT wire blocks) — both are
+        // parity-gated GPU GEMVs. The tied head is read separately: Q8_0 runs on the
+        // GPU (inside forward_token); Q6_K (the QAT tied head, no GPU kernel) runs on
+        // the CPU via the held WireQuant. Layer 0's attn_q is representative of the
+        // projection format (the export quantizes every layer's projections alike).
+        let layer_fmt = match store
+            .descriptor(&binding.layers[0].attn_q.name)?
+            .tensor_type
+        {
+            GgufTensorType::Q8_0 => crate::metal::GemmaWireFmt::Q8_0,
+            GgufTensorType::Q4_0 => crate::metal::GemmaWireFmt::Q4_0,
+            other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "gemma4 GPU runtime requires Q8_0 weights; tensor {name} is {t:?} \
-                     (QAT Q4_0/Q6_K rows are CPU-only until GPU kernels land)"
+                    "gemma4 GPU runtime supports Q8_0 or Q4_0 layer projections; \
+                     layer 0 attn_q is {other:?}"
                 )));
             }
-        }
+        };
+        let head_on_cpu = match store.descriptor(&binding.token_embedding.name)?.tensor_type {
+            GgufTensorType::Q8_0 => false, // GPU Q8 head
+            GgufTensorType::Q6K => true,   // CPU Q6_K head (QAT tied head)
+            other => {
+                return Err(BackendError::UnsupportedTensorType(format!(
+                    "gemma4 GPU runtime supports a Q8_0 or Q6_K tied head; \
+                     token embedding is {other:?}"
+                )));
+            }
+        };
         let tokenizer = Tokenizer::from_gguf(&gguf)?;
         // The mmap backs token_embd + per_layer_token_embd (file-backed = evictable, so
         // it never forces the anonymous GPU WirePages to swap). GPU layer weights load
@@ -1241,38 +1263,43 @@ impl Gemma4GpuRuntime {
             // Per-layer geometry (12B varies kv heads, E2B varies FFN width).
             let kv_heads = plan[l].kv_heads;
             let ffn_dim = g.ffn_length_at(l) as usize;
+            let owns = plan[l].owns_kv;
+            // Trimmed shared-KV exports (e.g. E4B QAT) omit attn_k / attn_k_norm /
+            // attn_v on non-owning layers: those layers project no K/V and run
+            // attention against the source layer's cache, so the resident attention
+            // never reads these tensors. Pass never-read placeholders to keep the
+            // layer shape uniform. A KV-owning layer that omits them is a real error.
+            let q_pages_arc = pages(&lb.attn_q.name)?;
+            let k_pages_arc = match &lb.attn_k {
+                Some(d) => pages(&d.name)?,
+                None if !owns => Arc::clone(&q_pages_arc),
+                None => {
+                    return Err(BackendError::UnsupportedTensorType(format!(
+                        "gemma4 GPU runtime requires attn_k on KV-owning layers; \
+                         layer {l} omits it"
+                    )));
+                }
+            };
+            let k_norm_v = match &lb.attn_k_norm {
+                Some(d) => f32t(&d.name)?,
+                None if !owns => vec![0.0f32; hd],
+                None => {
+                    return Err(BackendError::UnsupportedTensorType(format!(
+                        "gemma4 GPU runtime requires attn_k_norm on KV-owning layers; \
+                         layer {l} omits it"
+                    )));
+                }
+            };
             let layer = crate::metal::Gemma4ResidentLayer::from_wire_pages(
-                // The GPU-resident lane is gated to Q8_0 weights above; QAT (Q4_0)
-                // rows fail closed before reaching here. Pass Q8_0 explicitly.
-                crate::metal::GemmaWireFmt::Q8_0,
+                layer_fmt,
                 f32t(&lb.attn_norm.name)?,
                 f32t(&lb.attn_q_norm.name)?,
-                f32t(
-                    &lb.attn_k_norm
-                        .as_ref()
-                        .ok_or_else(|| {
-                            BackendError::UnsupportedTensorType(format!(
-                                "gemma4 GPU runtime requires attn_k_norm on every layer; \
-                             layer {l} omits it (trimmed shared-KV export)"
-                            ))
-                        })?
-                        .name,
-                )?,
+                k_norm_v,
                 f32t(&lb.post_attention_norm.name)?,
                 f32t(&lb.ffn_norm.name)?,
                 f32t(&lb.post_ffw_norm.name)?,
-                &pages(&lb.attn_q.name)?,
-                &pages(
-                    &lb.attn_k
-                        .as_ref()
-                        .ok_or_else(|| {
-                            BackendError::UnsupportedTensorType(format!(
-                                "gemma4 GPU runtime requires attn_k on every layer; \
-                             layer {l} omits it (trimmed shared-KV export)"
-                            ))
-                        })?
-                        .name,
-                )?,
+                &q_pages_arc,
+                &k_pages_arc,
                 lb.attn_v
                     .as_ref()
                     .map(|d| pages(&d.name))
@@ -1325,7 +1352,7 @@ impl Gemma4GpuRuntime {
             owns_kv,
             kv_source,
             token_embd.bytes(),
-            output_norm,
+            output_norm.clone(),
             hidden,
             vocab,
             softcap,
@@ -1371,6 +1398,10 @@ impl Gemma4GpuRuntime {
             hidden,
             ple_dim,
             n_layers,
+            head_on_cpu,
+            output_norm,
+            vocab,
+            eps,
         })
     }
 
@@ -1442,12 +1473,30 @@ impl Gemma4GpuRuntime {
             .collect();
         let prep_us = t_prep.elapsed().as_micros();
         let t_gpu = std::time::Instant::now();
-        let logits = self
-            .model
-            .forward_token(&h0, &inputs, &ti, position)
-            .ok_or_else(|| {
-                BackendError::UnsupportedModelArchitecture("gpu forward failed".into())
-            })?;
+        // All-Q8 path: the GPU encodes the head and returns logits directly. QAT hybrid
+        // path: the GPU returns the final hidden state and the CPU runs the Q6_K tied
+        // head (rms_norm -> Q6_K logits matvec -> final_logit_softcap), matching the CPU
+        // runtime's head exactly.
+        let logits = if self.head_on_cpu {
+            let last_hidden = self
+                .model
+                .forward_token_hidden(&h0, &inputs, &ti, position)
+                .ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture("gpu forward failed".into())
+                })?;
+            let last = rms_norm(&last_hidden, Some(&self.output_norm), self.eps);
+            let mut logits = self.token_embd.matvec(self.hidden, self.vocab, &last);
+            if let Some(cap) = self.g.final_logit_softcapping {
+                soft_cap_in_place(&mut logits, cap);
+            }
+            logits
+        } else {
+            self.model
+                .forward_token(&h0, &inputs, &ti, position)
+                .ok_or_else(|| {
+                    BackendError::UnsupportedModelArchitecture("gpu forward failed".into())
+                })?
+        };
         if std::env::var("CAMELID_GEMMA4_GPU_TIMING").is_ok() {
             PREP_US.fetch_add(prep_us as u64, std::sync::atomic::Ordering::Relaxed);
             GPU_US.fetch_add(

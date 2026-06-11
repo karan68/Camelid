@@ -5929,13 +5929,37 @@ impl Gemma4ResidentModel {
     /// its K/V into the PERSISTENT cache at `position`) + PLE + head in ONE command
     /// buffer, and returns the `vocab` soft-capped logits. `inputs[l]` carries this
     /// layer's RoPE tables, `pli`, and window start (CPU-computed for `position`).
-    #[allow(clippy::needless_range_loop)] // layer index `l` indexes several parallel arrays
     pub fn forward_token(
         &self,
         h0: &[f32],
         inputs: &[Gemma4TokenLayerInput],
         ti: &[f32],
         position: usize,
+    ) -> Option<Vec<f32>> {
+        self.forward_inner(h0, inputs, ti, position, true)
+    }
+
+    /// Like [`Self::forward_token`] but stops BEFORE the GPU logits head and returns the
+    /// final decoder hidden state (the head's input). The QAT hybrid lane uses this: the
+    /// tied head is Q6_K, which has no GPU kernel, so the head runs on the CPU instead.
+    pub fn forward_token_hidden(
+        &self,
+        h0: &[f32],
+        inputs: &[Gemma4TokenLayerInput],
+        ti: &[f32],
+        position: usize,
+    ) -> Option<Vec<f32>> {
+        self.forward_inner(h0, inputs, ti, position, false)
+    }
+
+    #[allow(clippy::needless_range_loop)] // layer index `l` indexes several parallel arrays
+    fn forward_inner(
+        &self,
+        h0: &[f32],
+        inputs: &[Gemma4TokenLayerInput],
+        ti: &[f32],
+        position: usize,
+        want_head: bool,
     ) -> Option<Vec<f32>> {
         let n = self.layers.len();
         if h0.len() != self.hidden || inputs.len() != n || position >= self.max_positions {
@@ -6037,23 +6061,35 @@ impl Gemma4ResidentModel {
             from_a = !from_a;
         }
         let final_buf = if from_a { &self.buf_a } else { &self.buf_b };
-        encode_gemma4_head(
-            e,
-            k,
-            &mut keep,
-            final_buf,
-            &self.logits,
-            &self.output_norm,
-            &self.token_embd,
-            self.vocab,
-            self.softcap,
-            self.eps,
-        );
+        // QAT hybrid (`want_head == false`): skip the GPU head and read the final hidden
+        // back so the CPU can run the Q6_K tied head. Otherwise encode the Q8 head and
+        // read the soft-capped logits.
+        if want_head {
+            encode_gemma4_head(
+                e,
+                k,
+                &mut keep,
+                final_buf,
+                &self.logits,
+                &self.output_norm,
+                &self.token_embd,
+                self.vocab,
+                self.softcap,
+                self.eps,
+            );
+        }
         e.end_encoding();
         cb.commit();
         cb.wait_until_completed();
-        let mut out = vec![0.0f32; self.vocab];
-        read_buffer_f32(&self.logits, &mut out);
+        let out = if want_head {
+            let mut out = vec![0.0f32; self.vocab];
+            read_buffer_f32(&self.logits, &mut out);
+            out
+        } else {
+            let mut h = vec![0.0f32; self.hidden];
+            read_buffer_f32(final_buf, &mut h);
+            h
+        };
         // Return the per-token scratch to the pool so the next token reuses it instead
         // of allocating ~hundreds of fresh Metal buffers (safe: the command buffer has
         // completed). Persistent weights/caches/token_embd are NOT in `keep`.
@@ -11811,6 +11847,16 @@ impl Gemma4ResidentModel {
     ) -> Option<Vec<f32>> {
         None
     }
+
+    pub fn forward_token_hidden(
+        &self,
+        _h0: &[f32],
+        _inputs: &[Gemma4TokenLayerInput],
+        _ti: &[f32],
+        _position: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -15671,6 +15717,161 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(amax(&got), amax(&want), "greedy argmax must agree");
+    }
+
+    // The QAT hybrid split point: forward_token_hidden (GPU layers, no head) followed by
+    // the CPU head (rms_norm -> token_embd matvec -> soft_cap) must reproduce exactly
+    // what forward_token computes with the head encoded on the GPU. Proves the runtime's
+    // "GPU layers + CPU Q6_K head" lane is byte-faithful to the all-GPU path; here the
+    // head is Q8 so the same dequantized table drives both sides.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_forward_token_hidden_plus_cpu_head_matches_forward_token() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::quantize_q8_0_blocks;
+        let hidden = 128usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 256usize;
+        let ffn_dim = 256usize;
+        let vocab = 160usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let half = head_dim / 2;
+        let max_positions = 8usize;
+        let eps = 1.0e-6f32;
+        let softcap = 30.0f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mw = |rows: usize, in_dim: usize, seed: usize| -> Vec<u8> {
+            let mut wire = Vec::new();
+            for r in 0..rows {
+                let row: Vec<f32> = (0..in_dim)
+                    .map(|i| ((((r * in_dim + i + seed) % 29) as f32) - 14.0) * 0.03)
+                    .collect();
+                for blk in quantize_q8_0_blocks(&row).iter() {
+                    wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                    for &q in blk.quants.iter() {
+                        wire.push(q as u8);
+                    }
+                }
+            }
+            wire
+        };
+        let an: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 % 5.0) * 0.05).collect();
+        let pa: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 % 3.0) * 0.03).collect();
+        let fnw: Vec<f32> = (0..hidden)
+            .map(|i| 0.85 + (i as f32 % 4.0) * 0.04)
+            .collect();
+        let pf: Vec<f32> = (0..hidden)
+            .map(|i| 0.95 + (i as f32 % 6.0) * 0.02)
+            .collect();
+        let qn: Vec<f32> = (0..head_dim)
+            .map(|i| 0.7 + (i as f32 % 11.0) * 0.02)
+            .collect();
+        let kn: Vec<f32> = (0..head_dim)
+            .map(|i| 0.6 + (i as f32 % 7.0) * 0.03)
+            .collect();
+        let output_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.88 + (i as f32 % 5.0) * 0.03)
+            .collect();
+        let h0: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+
+        // Q8 vocab-major head table -> wire + dequant (drives the CPU head reference).
+        let mut embd_wire = Vec::new();
+        let mut embd_deq = Vec::new();
+        for v in 0..vocab {
+            let row: Vec<f32> = (0..hidden)
+                .map(|i| ((((v * hidden + i) % 31) as f32) - 15.0) * 0.05)
+                .collect();
+            let mut drow = vec![0.0f32; hidden];
+            for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
+                embd_wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                for (j, &qq) in blk.quants.iter().enumerate() {
+                    embd_wire.push(qq as u8);
+                    drow[b * 32 + j] = blk.scale * qq as f32;
+                }
+            }
+            embd_deq.push(drow);
+        }
+
+        let build = || {
+            let layer = Gemma4ResidentLayer::from_wire(
+                GemmaWireFmt::Q8_0,
+                an.clone(),
+                qn.clone(),
+                kn.clone(),
+                pa.clone(),
+                fnw.clone(),
+                pf.clone(),
+                &mw(q_dim, hidden, 1),
+                &mw(kv_dim, hidden, 5),
+                Some(&mw(kv_dim, hidden, 9)),
+                &mw(hidden, q_dim, 13),
+                &mw(ffn_dim, hidden, 17),
+                &mw(ffn_dim, hidden, 21),
+                &mw(hidden, ffn_dim, 25),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                ffn_dim,
+                eps,
+            )
+            .expect("layer");
+            Gemma4ResidentModel::new(
+                vec![layer],
+                vec![None],
+                vec![1.0],
+                vec![true],
+                vec![0],
+                &embd_wire,
+                output_norm.clone(),
+                hidden,
+                vocab,
+                softcap,
+                eps,
+                max_positions,
+                scale,
+            )
+            .expect("model")
+        };
+        let input = || Gemma4TokenLayerInput {
+            cos_t: (0..half).map(|i| (0.3 + i as f32 * 0.01).cos()).collect(),
+            sin_t: (0..half).map(|i| (0.3 + i as f32 * 0.01).sin()).collect(),
+            pli: Vec::new(),
+            window_start: 0,
+        };
+
+        let gpu_head = build();
+        let logits_gpu = gpu_head
+            .forward_token(&h0, &[input()], &[], 0)
+            .expect("forward_token");
+        let cpu_head = build();
+        let hidden_only = cpu_head
+            .forward_token_hidden(&h0, &[input()], &[], 0)
+            .expect("forward_token_hidden");
+
+        // CPU head over the returned hidden state.
+        let mss = hidden_only.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = (mss + eps).powf(-0.5);
+        let last: Vec<f32> = (0..hidden)
+            .map(|i| hidden_only[i] * inv * output_norm[i])
+            .collect();
+        let logits_cpu: Vec<f32> = embd_deq
+            .iter()
+            .map(|row| {
+                let logit: f32 = row.iter().zip(&last).map(|(a, b)| a * b).sum();
+                softcap * (logit / softcap).tanh()
+            })
+            .collect();
+
+        for (a, b) in logits_gpu.iter().zip(&logits_cpu) {
+            assert!((a - b).abs() < 5.0e-3, "{a} != {b}");
+        }
     }
 
     #[cfg(target_os = "macos")]
