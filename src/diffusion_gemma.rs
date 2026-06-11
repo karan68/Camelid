@@ -21,18 +21,19 @@
 
 use std::path::Path;
 
+mod refmath;
+
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
 use crate::inference::{
     q4_k_wire_row_dot, q5_0_wire_row_dot, q6_k_wire_block_dequant, q6_k_wire_row_dot,
-    q8_0_wire_row_dot, quantize_q8_0_blocks, quantize_q8_k_blocks, Q8KBlock,
-    Q4_K_WIRE_BYTES_PER_BLOCK, Q5_0_WIRE_BYTES_PER_BLOCK, Q6_K_VALUES_PER_BLOCK,
-    Q6_K_WIRE_BYTES_PER_BLOCK,
+    q8_0_wire_row_dot, quantize_q8_k_blocks, Q8KBlock, Q4_K_WIRE_BYTES_PER_BLOCK,
+    Q5_0_WIRE_BYTES_PER_BLOCK, Q6_K_VALUES_PER_BLOCK, Q6_K_WIRE_BYTES_PER_BLOCK,
 };
 use crate::model::Gemma4Metadata;
 use crate::tensor::{Q8_0Block, TensorStore};
 use crate::wire_mmap::GgufWireMmap;
-use crate::{gemma4_runtime, BackendError, Result};
+use crate::{BackendError, Result};
 
 const Q8_0_WIRE_BYTES_PER_BLOCK: usize = 34;
 
@@ -119,17 +120,13 @@ impl DgActivation {
         } else {
             None
         };
-        // The reference stores the Q8_0 activation scale as FP16
-        // (block_q8_0.d is ggml_half; the int8 values are computed from the
-        // unrounded reciprocal). Mirror that rounding here so Q8_0/Q5_0 dots
-        // see the same effective scale — keeping camelid's f32 scale is a
-        // systematic per-block divergence. DG-lane local: the proven gemma4
-        // rows keep their committed behavior.
-        let mut q8_0 = quantize_q8_0_blocks(x);
-        for b in q8_0.iter_mut() {
-            b.scale = crate::tensor::f16_round(b.scale);
+        // ARM reference semantics (refmath::quantize_q8_0_arm): nearest-even
+        // rounding (vcvtnq) and the scale stored at f16 precision. DG-lane
+        // local: the proven gemma4 rows keep their committed behavior.
+        Self {
+            q8_0: refmath::quantize_q8_0_arm(x),
+            q8_k,
         }
-        Self { q8_0, q8_k }
     }
 }
 
@@ -234,7 +231,20 @@ impl DgWire {
         Ok(out)
     }
 
-    fn matvec(&self, x: &DgActivation) -> Result<Vec<f32>> {
+    /// Dense `mul_mat` semantics: Q8_0 weights route through the
+    /// tinyBLAS_Q0_ARM element order (llamafile engages for dense Q8_0 GEMMs
+    /// at the pin); every other format uses the vec_dot path. The MoE expert
+    /// path (`mul_mat_id`) never uses tinyBLAS — experts call `matvec_rows`.
+    fn matvec_dense(&self, x: &DgActivation) -> Result<Vec<f32>> {
+        if self.format == DgFormat::Q8_0 {
+            let rb = self.row_bytes();
+            let bytes = self.mmap.bytes(self.offset, self.rows * rb)?;
+            let mut out = vec![0f32; self.rows];
+            for (r, y) in out.iter_mut().enumerate() {
+                *y = refmath::tinyblas_q8_0_dot(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
+            }
+            return Ok(out);
+        }
         self.matvec_rows(0, self.rows, x)
     }
 }
@@ -542,35 +552,45 @@ impl DgEncoderRuntime {
             let mut ks: Vec<Vec<f32>> = Vec::with_capacity(n);
             let mut vs: Vec<Vec<f32>> = Vec::with_capacity(n);
             for (pos, hp) in h.iter().enumerate() {
-                let xn = gemma4_runtime::rms_norm(hp, Some(&lw.attn_norm), eps);
+                let xn = refmath::rms_norm(hp, Some(&lw.attn_norm), eps);
                 let xq = DgActivation::new(&xn);
-                let mut q = lw.attn_q.matvec(&xq)?;
+                let mut q = lw.attn_q.matvec_dense(&xq)?;
                 for hh in 0..heads {
                     let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
-                    s.copy_from_slice(&gemma4_runtime::rms_norm(s, Some(&lw.q_norm), eps));
+                    s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.q_norm), eps));
                 }
-                gemma4_runtime::apply_rope(&mut q, heads, head_dim, pos, theta, rope_factors);
+                refmath::rope_neox(&mut q, heads, head_dim, pos, theta, rope_factors);
 
-                let mut k = lw.attn_k.matvec(&xq)?;
+                let mut k = lw.attn_k.matvec_dense(&xq)?;
                 // V-less layers reuse the RAW K projection as V; V then takes
                 // the weightless norm and never RoPE.
                 let mut v = match lw.attn_v.as_ref() {
-                    Some(wv) => wv.matvec(&xq)?,
+                    Some(wv) => wv.matvec_dense(&xq)?,
                     None => k.clone(),
                 };
                 for hh in 0..kv_heads {
                     let s = &mut k[hh * head_dim..(hh + 1) * head_dim];
-                    s.copy_from_slice(&gemma4_runtime::rms_norm(s, Some(&lw.k_norm), eps));
+                    s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.k_norm), eps));
                     let sv = &mut v[hh * head_dim..(hh + 1) * head_dim];
-                    sv.copy_from_slice(&gemma4_runtime::rms_norm(sv, None, eps));
+                    sv.copy_from_slice(&refmath::rms_norm(sv, None, eps));
                 }
-                gemma4_runtime::apply_rope(&mut k, kv_heads, head_dim, pos, theta, rope_factors);
+                refmath::rope_neox(&mut k, kv_heads, head_dim, pos, theta, rope_factors);
                 qs.push(q);
                 ks.push(k);
                 vs.push(v);
             }
 
             // ---- causal attention (SWA-clipped on sliding layers) ----
+            // V columns, contiguous over positions — the reference makes V
+            // contiguous (cont∘transpose) so each KQV output element is one
+            // vec_dot_f32 over n_kv; replicate that memory shape.
+            let mut v_cols: Vec<Vec<f32>> = vec![vec![0f32; n]; kv_heads * head_dim];
+            for (p, vp) in vs.iter().enumerate() {
+                for (di, &val) in vp.iter().enumerate() {
+                    v_cols[di][p] = val;
+                }
+            }
+
             let mut attn_out = Vec::with_capacity(n * hidden);
             for pos in 0..n {
                 let lo = if sliding {
@@ -582,30 +602,28 @@ impl DgEncoderRuntime {
                 for hh in 0..heads {
                     let kvh = hh / group;
                     let qh = &qs[pos][hh * head_dim..(hh + 1) * head_dim];
-                    let mut scores: Vec<f32> = (lo..=pos)
+                    // reference shape: KQ over the FULL row, additive -inf
+                    // mask, then one softmax over the whole row (the masked
+                    // slots' exp is exactly 0 in the reference's v_expf)
+                    let mut row: Vec<f32> = (0..n)
                         .map(|p| {
-                            let kp = &ks[p][kvh * head_dim..(kvh + 1) * head_dim];
-                            qh.iter().zip(kp).map(|(a, b)| a * b).sum()
+                            if p < lo || p > pos {
+                                f32::NEG_INFINITY
+                            } else {
+                                let kp = &ks[p][kvh * head_dim..(kvh + 1) * head_dim];
+                                refmath::vec_dot_f32(qh, kp)
+                            }
                         })
                         .collect();
-                    let m = scores.iter().cloned().fold(f32::MIN, f32::max);
-                    let mut den = 0f32;
-                    for s in scores.iter_mut() {
-                        *s = (*s - m).exp();
-                        den += *s;
-                    }
+                    refmath::softmax_row(&mut row);
                     let out = &mut attn[hh * head_dim..(hh + 1) * head_dim];
-                    for (idx, p) in (lo..=pos).enumerate() {
-                        let w = scores[idx] / den;
-                        let vp = &vs[p][kvh * head_dim..(kvh + 1) * head_dim];
-                        for d in 0..head_dim {
-                            out[d] += w * vp[d];
-                        }
+                    for (d, o) in out.iter_mut().enumerate() {
+                        *o = refmath::vec_dot_f32(&v_cols[kvh * head_dim + d], &row);
                     }
                 }
                 let aq = DgActivation::new(&attn);
-                let o = lw.attn_output.matvec(&aq)?;
-                let on = gemma4_runtime::rms_norm(&o, Some(&lw.post_attn_norm), eps);
+                let o = lw.attn_output.matvec_dense(&aq)?;
+                let on = refmath::rms_norm(&o, Some(&lw.post_attn_norm), eps);
                 for (a, b) in h[pos].iter_mut().zip(&on) {
                     *a += b;
                 }
@@ -618,23 +636,28 @@ impl DgEncoderRuntime {
             let mut out_scaled = Vec::with_capacity(n * hidden);
             for (pos, hp) in h.iter_mut().enumerate() {
                 let attn_resid = hp.clone();
-                let xn = gemma4_runtime::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
+                let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
                 let xq = DgActivation::new(&xn);
-                let gate = lw.ffn_gate.matvec(&xq)?;
-                let up = lw.ffn_up.matvec(&xq)?;
+                let gate = lw.ffn_gate.matvec_dense(&xq)?;
+                let up = lw.ffn_up.matvec_dense(&xq)?;
                 let act: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| dg_gelu(*g) * u).collect();
                 let actq = DgActivation::new(&act);
-                let mlp = lw.ffn_down.matvec(&actq)?;
-                let mlp = gemma4_runtime::rms_norm(&mlp, Some(&lw.post_norm_1), eps);
+                let mlp = lw.ffn_down.matvec_dense(&actq)?;
+                let mlp = refmath::rms_norm(&mlp, Some(&lw.post_norm_1), eps);
 
                 // Router: weightless RMS of the post-attention residual,
                 // scaled by 1/sqrt(n_embd), then the elementwise input scale.
-                let mut r = gemma4_runtime::rms_norm(&attn_resid, None, eps);
+                let mut r = refmath::rms_norm(&attn_resid, None, eps);
                 let inv = 1.0f32 / (hidden as f32).sqrt();
                 for (rv, sv) in r.iter_mut().zip(&lw.gate_inp_scale) {
                     *rv = *rv * inv * sv;
                 }
-                let logits = gemma4_runtime::f32_matvec(&lw.gate_inp, hidden, self.n_expert, &r);
+                // tinyBLAS f32 engages for this GEMM (m=128 %4==0, n=17>=4, k 4-aligned)
+                let logits: Vec<f32> = (0..self.n_expert)
+                    .map(|e| {
+                        refmath::tinyblas_f32_dot(&lw.gate_inp[e * hidden..(e + 1) * hidden], &r)
+                    })
+                    .collect();
                 moe_logits_all.extend_from_slice(&logits);
 
                 // softmax over all experts, then top-k by probability
@@ -663,10 +686,13 @@ impl DgEncoderRuntime {
                         .map(|&e| e as usize)
                         .collect();
                 }
-                let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
-                wsum = wsum.max(6.103_515e-5);
+                // ggml_sum_rows accumulates in double; the clamp constant is
+                // exactly 2^-14 (6.103515625e-5)
+                let selected: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+                let mut wsum = refmath::vec_sum_f32(&selected);
+                wsum = wsum.max(f32::from_bits(0x3880_0000));
 
-                let cur_moe = gemma4_runtime::rms_norm(&attn_resid, Some(&lw.pre_norm_2), eps);
+                let cur_moe = refmath::rms_norm(&attn_resid, Some(&lw.pre_norm_2), eps);
                 let cur_moe_q = DgActivation::new(&cur_moe);
                 let two_nff = 2 * self.n_ff_exp;
                 let mut moe_acc = vec![0f32; hidden];
@@ -680,18 +706,20 @@ impl DgEncoderRuntime {
                         .collect();
                     let hexp_q = DgActivation::new(&hexp);
                     let y = lw.down_exps.matvec_rows(e * hidden, hidden, &hexp_q)?;
-                    let scale = lw.down_exps_scale[e] * w;
+                    // reference order: down → ×per-expert scale → ×weight,
+                    // separate multiplies, slots summed in selection order
+                    let s_e = lw.down_exps_scale[e];
                     for (a, yv) in moe_acc.iter_mut().zip(&y) {
-                        *a += yv * scale;
+                        *a += yv * s_e * w;
                     }
                 }
-                let moe_out = gemma4_runtime::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
+                let moe_out = refmath::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
 
                 let mut combined = mlp;
                 for (c, m) in combined.iter_mut().zip(&moe_out) {
                     *c += m;
                 }
-                let ffn_out = gemma4_runtime::rms_norm(&combined, Some(&lw.post_ffw_norm), eps);
+                let ffn_out = refmath::rms_norm(&combined, Some(&lw.post_ffw_norm), eps);
                 for (a, b) in hp.iter_mut().zip(&ffn_out) {
                     *a += b;
                 }
@@ -718,7 +746,7 @@ impl DgEncoderRuntime {
             });
         }
 
-        let result_norm_last = gemma4_runtime::rms_norm(&h[n - 1], Some(&self.output_norm), eps);
+        let result_norm_last = refmath::rms_norm(&h[n - 1], Some(&self.output_norm), eps);
 
         Ok(DgEncoderTrace {
             n_pos: n,
