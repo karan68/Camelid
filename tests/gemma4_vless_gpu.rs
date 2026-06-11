@@ -146,6 +146,7 @@ fn vless_gpu_layer_matches_cpu_on_real_12b_weights() {
 
     // ---- GPU ----
     let layer = camelid::metal::Gemma4ResidentLayer::from_wire(
+        camelid::metal::GemmaWireFmt::Q8_0,
         attn_norm.clone(),
         q_norm.clone(),
         k_norm.clone(),
