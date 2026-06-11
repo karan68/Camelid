@@ -2215,6 +2215,47 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "add performance/RSS gates and durable current-head QA bundles, and broaden template coverage before any wider gemma4 claim; bounded 512-8192 context packs are checked",
             },
             ModelCompatibilityTarget {
+                id: "gemma4_12b_it_q8_0",
+                family: "gemma4_dense_decoder",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_distributed_serve_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "single-node 16GB hosts are memory-bound (the supported lane is two-Mac distributed layer sharding); the reference has no sound bit-exact comparator mode for this row (two recorded comparator frontiers); no bounded context bucket, performance/RSS gate, portability, or durable current-head refresh exists yet; full-row GPU residency is untested and memory-infeasible on 16GB hosts",
+                metadata_parses: "validated_including_per_layer_kv_head_array_and_vless_layers",
+                tokenizer_works: "validated_for_gemma4_spm",
+                tensors_load: "validated_mmap_wire_backed_q8_layer_range_shards",
+                generation_runs: "distributed_two_node_api_chat_completions_and_sse_smoke",
+                parity_audited: "basic_v1_pack_5of5_distributed_token_identical_to_single_node_3of5_full_budget_vs_pinned_comparator_with_two_recorded_frontiers",
+                performance_measured: "two_mac_pair_cadence_6_2_to_6_75_tok_s_recorded_in_cli_bundle_only",
+                frontend_load_path_verified: "served_via_gemma4_runtime_flag_distributed_lane",
+                frontend_readiness_gate: "green only when this exact gemma4 GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id (serve requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER and CAMELID_GEMMA4_SPLIT pointing at a live gemma4-worker holding the tail layers)",
+                tested_context: "short_api_chat_completions_sse_smoke_through_the_two_mac_distributed_lane",
+                chat_template_renderer: "gemma4_marker",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "distributed_serve_api_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "Paris",
+                evidence: "the exact tracked gemma-4-12b-it-Q8_0 GGUF (12,669,646,240 bytes, general.architecture=gemma4, 48 layers with the per-layer attention.head_count_kv array and V-less full-attention layers parsed from the GGUF) runs as two-Mac distributed layer sharding: the CLI lane is token-identical to single-node camelid on all five basic_v1 prompts (qa/evidence-bundles/gemma4-12b-it-q8-0-two-mac-20260610T103711Z-head-96a75007b156; decode 6.2-6.75 tok/s across the pair, both 16GB nodes within budget; 3/5 prompts match the pinned comparator full-budget with two recorded reference-comparator frontiers), and the distributed SERVE lane answers /v1/chat/completions (non-streaming and SSE) and /v1/completions end-to-end across the pair (qa/evidence-bundles/gemma4-12b-it-q8-0-distributed-serve-20260610T235155Z-head-80e3dddfbdb4; master shard 0..24 + worker 24..48, wire protocol v1 with per-request worker sessions). Camelid supports exact-row text-token generation + serve smoke for this row only, and only through the two-Mac distributed lane; no single-node, bounded-context, performance, portability, multimodal, or full support is implied",
+                next_step: "durable current-head refresh, bounded context buckets through the distributed lane, and performance/RSS gates before any wider 12B claim; single-node support is not a goal on 16GB hosts",
+            },
+            ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
                 family: "llama_spm_decoder",
                 quantization: "Q4_0/Q5_0",
@@ -3164,6 +3205,21 @@ async fn load_model_from_path_with_activation(
                 if set_active {
                     *state.active_model_id.write().await = Some(requested_id.to_string());
                 }
+                // Heal a missing gemma4 serve runtime: a client that
+                // disconnects mid-load cancels the handler future AFTER the
+                // loaded_models insert but BEFORE the runtime insert, and the
+                // fast path would otherwise return a record whose chat routes
+                // 503 forever.
+                if gemma4_serve_enabled()
+                    && model_family(&existing.gguf) == "gemma4"
+                    && !state
+                        .gemma4_runtimes
+                        .read()
+                        .await
+                        .contains_key(requested_id)
+                {
+                    load_gemma4_serve_runtime(state, requested_id, &existing.path).await?;
+                }
                 return Ok(existing);
             }
         }
@@ -3238,42 +3294,51 @@ async fn load_model_from_path_with_activation(
     // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): load a
     // serve runtime so /v1/chat can route to it. Fail clearly on error — never
     // silently fall back to the Llama path (which would produce garbage here).
-    // With CAMELID_GEMMA4_WORKER + CAMELID_GEMMA4_SPLIT set, the runtime is the
-    // distributed layer-sharding lane (master shard locally, tail layers on the
-    // worker); a half-configured or unreachable pair fails the load.
     if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
-        let distributed =
-            gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
-        let load_path = loaded.path.clone();
-        let runtime = tokio::task::spawn_blocking(move || match distributed {
-            Some((worker_addr, split)) => {
-                crate::gemma4_distributed::Gemma4DistributedRuntime::connect(
-                    &load_path,
-                    &worker_addr,
-                    split,
-                )
-                .map(Gemma4ServeRuntime::Distributed)
-            }
-            None => crate::gemma4_runtime::Gemma4Runtime::load(&load_path)
-                .map(Gemma4ServeRuntime::Local),
-        })
-        .await
-        .map_err(|e| {
-            BackendError::InvalidModelMetadata(format!("gemma4 runtime load task panicked: {e}"))
-        })??;
-        let lane = match &runtime {
-            Gemma4ServeRuntime::Local(_) => "local",
-            Gemma4ServeRuntime::Distributed(_) => "distributed",
-        };
-        state
-            .gemma4_runtimes
-            .write()
-            .await
-            .insert(id.clone(), Arc::new(runtime));
-        tracing::info!(model = %id, lane, "gemma4 runtime loaded for serve path");
+        load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
     }
 
     Ok(loaded)
+}
+
+/// Load (or reload) the gemma4 serve runtime for a model id. With
+/// CAMELID_GEMMA4_WORKER + CAMELID_GEMMA4_SPLIT set, the runtime is the
+/// distributed layer-sharding lane (master shard locally, tail layers on the
+/// worker); a half-configured or unreachable pair fails the load.
+async fn load_gemma4_serve_runtime(
+    state: &AppState,
+    id: &str,
+    model_path: &std::path::Path,
+) -> std::result::Result<(), BackendError> {
+    let distributed =
+        gemma4_distributed_serve_config().map_err(BackendError::InvalidModelMetadata)?;
+    let load_path = model_path.to_path_buf();
+    let runtime = tokio::task::spawn_blocking(move || match distributed {
+        Some((worker_addr, split)) => crate::gemma4_distributed::Gemma4DistributedRuntime::connect(
+            &load_path,
+            &worker_addr,
+            split,
+        )
+        .map(Gemma4ServeRuntime::Distributed),
+        None => {
+            crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
+        }
+    })
+    .await
+    .map_err(|e| {
+        BackendError::InvalidModelMetadata(format!("gemma4 runtime load task panicked: {e}"))
+    })??;
+    let lane = match &runtime {
+        Gemma4ServeRuntime::Local(_) => "local",
+        Gemma4ServeRuntime::Distributed(_) => "distributed",
+    };
+    state
+        .gemma4_runtimes
+        .write()
+        .await
+        .insert(id.to_string(), Arc::new(runtime));
+    tracing::info!(model = %id, lane, "gemma4 runtime loaded for serve path");
+    Ok(())
 }
 
 fn log_selected_execution_plan(plan: &ExecutionPlan) {
@@ -8348,6 +8413,10 @@ mod tests {
                 // pinned llama.cpp 5d56eff oracle.
                 "gemma4_e2b_it_q8_0",
                 "gemma4_e4b_it_q8_0",
+                // 12B is supported_exact_row_smoke SCOPED TO the two-Mac
+                // distributed layer-sharding serve lane (single-node 16GB is
+                // memory-bound); promotion bundle + WebUI closure committed.
+                "gemma4_12b_it_q8_0",
                 "llama32_1b_instruct_q8_0",
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
@@ -10577,6 +10646,17 @@ fn curated_catalog() -> Vec<CatalogItem> {
             repo_id: "unsloth/gemma-4-E2B-it-GGUF",
             filename: "gemma-4-E2B-it-Q8_0.gguf",
             size_bytes: 5048350848,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "gemma",
+        },
+        CatalogItem {
+            catalog_id: "gemma4_12b_it_q8_0",
+            name: "Gemma 4 12B-It Q8_0 (two-Mac distributed)",
+            repo_id: "unsloth/gemma-4-12b-it-GGUF",
+            filename: "gemma-4-12b-it-Q8_0.gguf",
+            size_bytes: 12669646240,
             downloads: 0,
             likes: 0,
             quant: "Q8_0",

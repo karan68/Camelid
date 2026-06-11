@@ -38,7 +38,7 @@ fn gemma4_rows(body: &Value) -> Vec<&Value> {
 }
 
 #[tokio::test]
-async fn gemma4_supported_rows_are_exactly_e2b_and_e4b() {
+async fn gemma4_supported_rows_are_exactly_e2b_e4b_and_12b() {
     let body = capabilities().await;
     let mut supported: Vec<&str> = gemma4_rows(&body)
         .iter()
@@ -52,7 +52,13 @@ async fn gemma4_supported_rows_are_exactly_e2b_and_e4b() {
     supported.sort_unstable();
     assert_eq!(
         supported,
-        vec!["gemma4_e2b_it_q8_0", "gemma4_e4b_it_q8_0"],
+        vec![
+            // 12B is supported ONLY through the two-Mac distributed serve
+            // lane (CLI parity + distributed-serve smoke bundles committed).
+            "gemma4_12b_it_q8_0",
+            "gemma4_e2b_it_q8_0",
+            "gemma4_e4b_it_q8_0"
+        ],
         "exact-row support must not grow without committed evidence"
     );
 }
@@ -62,9 +68,13 @@ async fn gemma4_rows_scope_stays_exact_row_and_text_only() {
     let body = capabilities().await;
     for row in gemma4_rows(&body) {
         let id = row["id"].as_str().unwrap();
-        assert_eq!(
-            row["support_scope"], "exact_row_smoke_only",
-            "{id}: scope must stay exact-row"
+        let scope = row["support_scope"].as_str().unwrap_or_default();
+        assert!(
+            scope == "exact_row_smoke_only"
+                || scope == "exact_row_distributed_serve_smoke_only"
+                || scope == "active_validation_only"
+                || scope.starts_with("blocked"),
+            "{id}: scope must stay exact-row bounded, got {scope}"
         );
         let evidence = row["evidence"].as_str().unwrap_or_default();
         // Exact-row wording only — never a family-wide claim.

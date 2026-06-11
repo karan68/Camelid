@@ -322,7 +322,10 @@ if (webuiChatEnabled || qaChatBypass) {
   const { result: streamingChat, elapsedMs: streamingChatMs } = await timed('chat_completion_stream', () => fetchStreamingChatCompletion(`${apiBase}/v1/chat/completions`, {
     model: health.active_model_id || modelIds[0],
     messages: [{ role: 'user', content: 'hello' }],
-    max_tokens: 4,
+    // 24, not 4: rows that open a thinking channel (gemma4 12B) spend their
+    // first tokens inside the suppressed <|channel> span; a 4-token budget can
+    // legitimately produce zero VISIBLE deltas and fail require-generation.
+    max_tokens: 24,
     stream: true,
     temperature: 0,
   }))

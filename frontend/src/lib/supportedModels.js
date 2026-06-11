@@ -58,4 +58,13 @@ export const SUPPORTED_MODELS = [
     quant: 'Q8_0',
     blurb: 'Gemma 4 E2B (E-series matformer) — greedy parity with the reference on the committed basic_v1 prompt pack. Text-token generation only; serve with CAMELID_GEMMA4_SERVE=1.',
   },
+  {
+    catalog_id: 'gemma4_12b_it_q8_0',
+    name: 'Gemma 4 12B-It (two-Mac distributed)',
+    repo_id: 'unsloth/gemma-4-12b-it-GGUF',
+    filename: 'gemma-4-12b-it-Q8_0.gguf',
+    size_bytes: 12669646240,
+    quant: 'Q8_0',
+    blurb: 'Gemma 4 12B served as two-Mac distributed layer sharding (master shard local, tail on a worker over TCP). Requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT and a live gemma4-worker; memory-infeasible on a single 16GB host.',
+  },
 ]
