@@ -265,9 +265,8 @@ mod tests {
     /// finite and non-degenerate.
     fn sanitize_f16_scale(bytes: &mut [u8], block_bytes: usize, scale_offset: usize) {
         for block in bytes.chunks_exact_mut(block_bytes) {
-            // exponent bits 10..15 -> clamp to 0x3C00..0x43FF range (1.0..~8)
-            let lo = block[scale_offset];
-            block[scale_offset] = lo;
+            // exponent bits 10..15 -> clamp to 0x3C00..0x43FF range (1.0..~8);
+            // the low byte (mantissa) keeps its pattern value
             block[scale_offset + 1] = 0x3c | (block[scale_offset + 1] & 0x03);
         }
     }

@@ -56,7 +56,7 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 
 | Model row | Quant | Status | Evidence |
 |---|---|---|---|
-| DiffusionGemma 26B-A4B-It | Q4_K_M | **Active development — recon/evidence-only. Not supported.** | [Phase 0 recon](docs/recon/DIFFUSIONGEMMA_RECON.md) (tensor inventory, pinned llama.cpp diffusion reference, sampler recon) + Phase 0.5 bit-exact lazy dequant parity vs the pinned reference (Q4_K/Q5_0/Q6_K/Q8_0/F32); no runtime exists |
+| DiffusionGemma 26B-A4B-It | Q4_K_M | **Active development — recon/evidence-only. Not supported.** | [Phase 0 recon](docs/recon/DIFFUSIONGEMMA_RECON.md) (tensor inventory, pinned llama.cpp diffusion reference, sampler recon) + Phase 0.5 bit-exact lazy dequant parity (Q4_K/Q5_0/Q6_K/Q8_0/F32) + Phase 1 tokenizer parity (12/12 cases, 100% token-id match incl. chat template) vs the pinned reference; no runtime exists |
 
 Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) and [`COMPATIBILITY.md`](COMPATIBILITY.md).
 

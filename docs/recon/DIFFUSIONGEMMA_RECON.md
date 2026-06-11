@@ -78,7 +78,26 @@ Three binaries matter:
 - Tokenizer: `tokenizer.ggml.model = "gemma4"`, vocab 262144, merges 514906,
   BOS 2 / EOS 1 / PAD 0 / UNK 3 / **MASK 4**, `add_bos_token = true`,
   `add_space_prefix = false`, chat template 17.5k chars (tool-calling macros).
-  Phase 1 owns the details; nothing is inherited from the SPM-LLaMA lane.
+  **Phase 1 recon verdict:** at the pin this is `LLAMA_VOCAB_TYPE_BPE` with
+  pre-type `GEMMA4` (`src/llama-vocab.cpp:2043,506`): SPM-style **rank-based
+  BPE** — spaces escaped to `▁`, merges run over raw UTF-8 (no GPT-2 byte
+  encoding), pre-split only on newline runs (`[^\n]+|[\n]+`), all-newline
+  words emitted directly when in vocab (the file has `\n`,`\n\n`,… tokens),
+  `add_bos` force-overridden true, byte fallback to `<0xXX>` tokens (type 6).
+  The file's `tokenizer.ggml.scores` are **all -1000.0 placeholders**, so a
+  score-greedy SPM merge cannot reproduce it — the merges list is the only
+  merge authority. Phase 1 gate: 12/12 cases (raw edges + newline runs +
+  byte-fallback emoji + 5 chat-template prompts rendered by llama.cpp minja)
+  with 100% token-id match and decode == per-token pieces == detokenize —
+  artifact `target/dg-tokenizer-parity-20260611T171928Z.json`, runner
+  `scripts/dg-tokenizer-parity.sh` + `scripts/dg-tokenize-dump.cpp`
+  (credited), pack `qa/prompt-packs/diffusiongemma-tokenizer-parity-v1.json`.
+  One shared-path fix fell out: the tokenizer's multi-space (`▁▁`) deferral is
+  now scoped to the score-merge path only — rank-based BPE merges multi-space
+  runs into single tokens (e.g. `▁▁`/`▁▁▁`), as the reference does; the
+  supported gemma-4 family rows (same tokenizer construction: merges +
+  placeholder scores) get the same correction, and their committed packs never
+  pinned the old multi-space behavior.
 - **No `diffusion.eb_*` keys in the file** — the reference sampler runs on its
   in-code defaults (§6).
 - **No vision/video/audio tensors in this file at all** (inventory class
