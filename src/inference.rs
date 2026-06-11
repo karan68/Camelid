@@ -13353,6 +13353,136 @@ pub(crate) fn q4_0_wire_block_dequant(block_bytes: &[u8]) -> [f32; 32] {
     out
 }
 
+pub(crate) const Q4_K_WIRE_BYTES_PER_BLOCK: usize = 144;
+pub(crate) const Q5_0_WIRE_BYTES_PER_BLOCK: usize = 22;
+
+/// Q4_K×Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel's numeric shape exactly
+/// (`ggml_vec_dot_q4_K_q8_K_generic`): per superblock the nibbles expand
+/// low-then-high in 64-value groups, the packed 6-bit scales/mins unpack via
+/// the kmask scheme, per-32-group `scale * Σ(q8·q4)` products accumulate into
+/// 8 integer lanes scaled by `d_w·d_act`, and the mins side subtracts
+/// `dmin·d_act · Σ(min_g · bsum_g)` with per-16 activation sums (computed
+/// inline; the reference precomputes them as Q8_K `bsums` — identical
+/// integers). DiffusionGemma lane: correctness-first scalar, no SIMD.
+// index-based loops intentionally mirror the reference C kernel's structure
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    const WIRE: usize = Q4_K_WIRE_BYTES_PER_BLOCK;
+    let mut sums = [0f32; 8];
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_bits_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales_raw = &block[4..16];
+        let qs = &block[16..144];
+
+        // expand nibbles: 4 groups of 32 q4 bytes, each yielding 32 low then
+        // 32 high nibbles (the reference's QK_K/64 loop)
+        let mut a = [0i8; Q6_K_VALUES_PER_BLOCK];
+        for j in 0..4 {
+            let q4 = &qs[j * 32..(j + 1) * 32];
+            for l in 0..32 {
+                a[j * 64 + l] = (q4[l] & 0xF) as i8;
+                a[j * 64 + 32 + l] = (q4[l] >> 4) as i8;
+            }
+        }
+
+        // unpack the 8 packed 6-bit (scale, min) pairs — kmask scheme
+        let mut utmp = [0u32; 4];
+        utmp[0] = u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]);
+        utmp[1] = u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]);
+        utmp[2] =
+            u32::from_le_bytes([scales_raw[8], scales_raw[9], scales_raw[10], scales_raw[11]]);
+        const KMASK1: u32 = 0x3f3f3f3f;
+        const KMASK2: u32 = 0x0f0f0f0f;
+        const KMASK3: u32 = 0x03030303;
+        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+        let uaux = utmp[1] & KMASK1;
+        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= KMASK1;
+        let scales: [u8; 8] = [
+            (utmp[0] & 0xff) as u8,
+            ((utmp[0] >> 8) & 0xff) as u8,
+            ((utmp[0] >> 16) & 0xff) as u8,
+            ((utmp[0] >> 24) & 0xff) as u8,
+            (utmp[1] & 0xff) as u8,
+            ((utmp[1] >> 8) & 0xff) as u8,
+            ((utmp[1] >> 16) & 0xff) as u8,
+            ((utmp[1] >> 24) & 0xff) as u8,
+        ];
+        let mins: [u8; 8] = [
+            (utmp[2] & 0xff) as u8,
+            ((utmp[2] >> 8) & 0xff) as u8,
+            ((utmp[2] >> 16) & 0xff) as u8,
+            ((utmp[2] >> 24) & 0xff) as u8,
+            (utmp[3] & 0xff) as u8,
+            ((utmp[3] >> 8) & 0xff) as u8,
+            ((utmp[3] >> 16) & 0xff) as u8,
+            ((utmp[3] >> 24) & 0xff) as u8,
+        ];
+
+        // mins side: Σ over the 16 per-16 activation sums × min of their group
+        let mut sumi = 0i32;
+        for j in 0..16 {
+            let bsum: i32 = y.qs[j * 16..(j + 1) * 16].iter().map(|&q| q as i32).sum();
+            sumi += bsum * mins[j / 2] as i32;
+        }
+
+        // main side: per-32-group integer dots into 8 lanes
+        let mut aux32 = [0i32; 8];
+        for j in 0..8 {
+            let scale = scales[j] as i32;
+            for k in 0..4 {
+                let off = j * 32 + k * 8;
+                for l in 0..8 {
+                    aux32[l] += scale * (y.qs[off + l] as i32) * (a[off + l] as i32);
+                }
+            }
+        }
+
+        let dd = d * y.d;
+        for l in 0..8 {
+            sums[l] += dd * aux32[l] as f32;
+        }
+        sumf -= dmin * y.d * sumi as f32;
+    }
+    sumf + sums.iter().sum::<f32>()
+}
+
+/// Q5_0×Q8_0 dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel (`ggml_vec_dot_q5_0_q8_0_generic`):
+/// per 32-value block, rebuild the signed 5-bit weights from the nibble plus
+/// its qh bit, accumulate the two half-block integer dots, then scale by
+/// `d_w·d_act`. DiffusionGemma lane: correctness-first scalar, no SIMD.
+// index-based loops intentionally mirror the reference C kernel's structure
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn q5_0_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
+    const WIRE: usize = Q5_0_WIRE_BYTES_PER_BLOCK;
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let qs = &block[6..22];
+
+        let mut sumi0 = 0i32;
+        let mut sumi1 = 0i32;
+        for j in 0..16 {
+            let xh_0 = (((qh >> j) & 1) << 4) as u8;
+            let xh_1 = (((qh >> (j + 16)) & 1) << 4) as u8;
+            let x0 = ((qs[j] & 0x0F) | xh_0) as i32 - 16;
+            let x1 = ((qs[j] >> 4) | xh_1) as i32 - 16;
+            sumi0 += x0 * y.quants[j] as i32;
+            sumi1 += x1 * y.quants[j + 16] as i32;
+        }
+        sumf += d * y.scale * (sumi0 + sumi1) as f32;
+    }
+    sumf
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[target_feature(enable = "dotprod")]
 unsafe fn q8_0_two_dot_rows_neon_dotprod(

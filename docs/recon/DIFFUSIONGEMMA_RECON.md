@@ -222,7 +222,26 @@ simply the next block's forward over the grown prefix (re-prefill; in cached
 mode a new PREFILL of the full prefix). The RNG stream continues across blocks
 (no reseed). Phase 5's gate is parity over ≥ 2 blocks of exactly this loop.
 
-## 8. Phase 0 gate status
+## 8. Phase 2 status — encoder implemented; gate FAILED honestly (stopped)
+
+`src/diffusion_gemma.rs` implements the encoder prefill (lazy mmap weights,
+reference-mirroring quantized-activation kernels incl. new Q4_K×Q8_K and
+Q5_0×Q8_0 row dots, encoder per-layer scalars, 128-expert MoE) and runs the
+tracked 26B file end-to-end. Against per-layer reference checkpoints
+(`scripts/dg-encoder-dump.cpp`, CPU, no repack): embeddings **bit-exact**,
+layer-0 K/V ~1e-6 — but the charter's exact-expert-match clause fails on
+72/510 knife-edge rank-8/9 router ties (reference probability margins
+3.8e-6–2e-4), and accumulation-order noise amplified by per-layer activation
+re-quantization compounds to ~4–12% mean relative error by layer 29. A
+control run proved the pinned reference **bit-deterministic across thread
+counts**, so the gap is cross-implementation FP semantics; one confirmed
+mismatch was fixed and kept (the reference's CPU GELU is an f16 lookup
+table — mirrored as `dg_gelu`). Full evidence, debugging-pass history, and
+maintainer options:
+`target/dg-encoder-parity-20260611T194014Z/FAILURE_REPORT.md`. Phase 2 is
+**stopped pending a maintainer decision**; nothing beyond Phase 1 is claimed.
+
+## 9. Phase 0 gate status
 
 - `tensor-inventory.json` + `metadata.json` exist; **zero** unclassified
   tensors; vision/video disposition: not present in the file.

@@ -384,7 +384,7 @@ fn gemma4_stop_token_ids(tokenizer: &Tokenizer) -> Vec<u32> {
     ids
 }
 
-fn f32_matvec(w: &[f32], in_dim: usize, out_dim: usize, x: &[f32]) -> Vec<f32> {
+pub(crate) fn f32_matvec(w: &[f32], in_dim: usize, out_dim: usize, x: &[f32]) -> Vec<f32> {
     (0..out_dim)
         .into_par_iter()
         .map(|o| {
@@ -397,7 +397,7 @@ fn f32_matvec(w: &[f32], in_dim: usize, out_dim: usize, x: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
+pub(crate) fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
     let mss = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
     let inv = (mss + eps).powf(-0.5);
     match weight {
@@ -423,7 +423,7 @@ fn rms_norm(x: &[f32], weight: Option<&[f32]>, eps: f32) -> Vec<f32> {
 /// the rotation, so only the first 64 frequency pairs of a global head carry
 /// position. Skipping the factors is numerically close on short prompts but is
 /// NOT the reference math (it measurably shifts near-tie logits).
-fn apply_rope(
+pub(crate) fn apply_rope(
     vec: &mut [f32],
     heads: usize,
     head_dim: usize,

@@ -238,9 +238,14 @@ pub struct Gemma4Metadata {
 }
 
 impl Gemma4Metadata {
-    /// Returns `Some` only for the `gemma4` architecture; `None` otherwise.
+    /// Returns `Some` only for the `gemma4` and `diffusion-gemma`
+    /// architectures; `None` otherwise. `diffusion-gemma` shares the Gemma 4
+    /// backbone and key suffixes (different prefix). Parsing here is
+    /// metadata-layer only: the AR runtime still fails closed on any
+    /// diffusion architecture in `LlamaModelConfig::from_gguf`; only the
+    /// experimental DiffusionGemma lane consumes this struct for that arch.
     pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Option<Self> {
-        if architecture != "gemma4" {
+        if architecture != "gemma4" && architecture != "diffusion-gemma" {
             return None;
         }
         let key = |suffix: &str| architecture_key(architecture, suffix);
