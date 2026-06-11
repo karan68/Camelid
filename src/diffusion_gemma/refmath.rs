@@ -333,6 +333,35 @@ pub(crate) fn vec_sum_f32(x: &[f32]) -> f32 {
     sum as f32
 }
 
+/// `ggml_compute_forward_div` on macOS routes f32 division through Apple's
+/// `vDSP_vdiv` (binary-ops.cpp), which is reciprocal-based and NOT
+/// correctly-rounded IEEE division (observed ≤1 ulp deviations). Bind the
+/// real symbol with the reference's exact call shape (broadcast divisor →
+/// per-element calls with N matching ne10).
+#[cfg(target_os = "macos")]
+pub(crate) fn vdsp_div(a: f32, b: f32) -> f32 {
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn vDSP_vdiv(
+            b: *const f32,
+            ib: isize,
+            a: *const f32,
+            ia: isize,
+            c: *mut f32,
+            ic: isize,
+            n: usize,
+        );
+    }
+    let mut out = 0f32;
+    unsafe { vDSP_vdiv(&b, 1, &a, 1, &mut out, 1, 1) };
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn vdsp_div(a: f32, b: f32) -> f32 {
+    a / b
+}
+
 /// Per-16 activation sums (the reference precomputes these as Q8_K `bsums`;
 /// camelid's block lacks them — identical integers either way).
 fn bsums16(y: &crate::inference::Q8KBlock) -> [i32; 16] {

@@ -53,6 +53,10 @@ static bool want_name(const char * name, int n_layer) {
         "ffn_mlp",       "ffn_moe",     "ffn_moe_weights",
         // expert-chain bisection points (merged gate_up path)
         "ffn_moe_gate_up", "ffn_moe_geglu", "ffn_moe_down", "ffn_moe_down_scaled",
+        // combine-chain bisection: normalized weights + PRE-norm slot sum
+        "ffn_moe_weights_norm", "ffn_moe_out",
+        // ground-truth weight sums (pre/post clamp)
+        "ffn_moe_weights_sum", "ffn_moe_weights_sum_clamped",
     };
     for (const char * base : per_layer) {
         const size_t blen = strlen(base);

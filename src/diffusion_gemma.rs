@@ -57,9 +57,10 @@ fn dg_gelu(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_560_802_865_4;
     const GELU_COEF_A: f32 = 0.044_715;
     let v = crate::tensor::f16_round(x);
-    // literal port of ggml_gelu_f32 (a contraction probe of the inner
-    // polynomial produced identical results on real activations)
-    let g = 0.5 * v * (1.0 + refmath::libm_tanhf(SQRT_2_OVER_PI * v * (1.0 + GELU_COEF_A * v * v)));
+    // table-init contraction probe: clang fuses `1.0f + A*x*x` into
+    // fma((A*x), x, 1.0) in the compiled table builder
+    let inner = (GELU_COEF_A * v).mul_add(v, 1.0);
+    let g = 0.5 * v * (1.0 + refmath::libm_tanhf(SQRT_2_OVER_PI * v * inner));
     crate::tensor::f16_round(g)
 }
 
@@ -298,14 +299,20 @@ pub struct DgLayerTrace {
     pub moe_geglu: Vec<f32>,
     pub moe_down: Vec<f32>,
     pub moe_down_scaled: Vec<f32>,
+    /// Normalized per-slot weights — "ffn_moe_weights_norm".
+    pub moe_weights_norm: Vec<f32>,
+    /// PRE-norm weighted slot sum — "ffn_moe_out".
+    pub moe_pre_norm: Vec<f32>,
 }
 
 pub struct DgEncoderTrace {
     pub n_pos: usize,
     pub inp_scaled: Vec<f32>,
     pub layers: Vec<DgLayerTrace>,
-    /// `output_norm` of the LAST position only (the reference PREFILL
-    /// requests logits for the final row, so `result_norm` has one row).
+    /// `output_norm` of every position (reference dumps have carried both
+    /// one-row and all-rows shapes; the comparator slices to match).
+    pub result_norm_all: Vec<f32>,
+    /// `output_norm` of the LAST position only.
     pub result_norm_last: Vec<f32>,
 }
 
@@ -649,6 +656,8 @@ impl DgEncoderRuntime {
             let mut moe_geglu_all = Vec::new();
             let mut moe_down_all = Vec::new();
             let mut moe_down_scaled_all = Vec::new();
+            let mut moe_weights_norm_all = Vec::new();
+            let mut moe_pre_norm_all = Vec::new();
             for (pos, hp) in h.iter_mut().enumerate() {
                 let attn_resid = hp.clone();
                 let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
@@ -710,7 +719,10 @@ impl DgEncoderRuntime {
                 let two_nff = 2 * self.n_ff_exp;
                 let mut moe_acc = vec![0f32; hidden];
                 for &e in &idx {
-                    let w = probs[e] / wsum;
+                    // the reference's weight normalization divides via
+                    // Apple's vDSP_vdiv (not IEEE division) — bind it
+                    let w = refmath::vdsp_div(probs[e], wsum);
+                    moe_weights_norm_all.push(w);
                     let gate_up = lw
                         .gate_up_exps
                         .matvec_rows(e * two_nff, two_nff, &cur_moe_q)?;
@@ -730,6 +742,7 @@ impl DgEncoderRuntime {
                         *a += yv * s_e * w;
                     }
                 }
+                moe_pre_norm_all.extend_from_slice(&moe_acc);
                 let moe_out = refmath::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
                 ffn_moe_all.extend_from_slice(&moe_out);
 
@@ -768,15 +781,23 @@ impl DgEncoderRuntime {
                 moe_geglu: moe_geglu_all,
                 moe_down: moe_down_all,
                 moe_down_scaled: moe_down_scaled_all,
+                moe_weights_norm: moe_weights_norm_all,
+                moe_pre_norm: moe_pre_norm_all,
             });
         }
 
-        let result_norm_last = refmath::rms_norm(&h[n - 1], Some(&self.output_norm), eps);
+        let mut result_norm_all = Vec::with_capacity(n * hidden);
+        for hp in &h {
+            result_norm_all.extend_from_slice(&refmath::rms_norm(hp, Some(&self.output_norm), eps));
+        }
+        let result_norm_last = result_norm_all[(n - 1) * hidden..].to_vec();
+        let _ = &result_norm_last;
 
         Ok(DgEncoderTrace {
             n_pos: n,
             inp_scaled,
             layers: traces,
+            result_norm_all,
             result_norm_last,
         })
     }

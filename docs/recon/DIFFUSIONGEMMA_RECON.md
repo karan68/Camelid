@@ -222,24 +222,30 @@ simply the next block's forward over the grown prefix (re-prefill; in cached
 mode a new PREFILL of the full prefix). The RNG stream continues across blocks
 (no reseed). Phase 5's gate is parity over ≥ 2 blocks of exactly this loop.
 
-## 8. Phase 2 status — encoder implemented; gate FAILED honestly (stopped)
+## 8. Phase 2 status — encoder checkpoint parity: PASSED, BIT-EXACT
 
-`src/diffusion_gemma.rs` implements the encoder prefill (lazy mmap weights,
-reference-mirroring quantized-activation kernels incl. new Q4_K×Q8_K and
-Q5_0×Q8_0 row dots, encoder per-layer scalars, 128-expert MoE) and runs the
-tracked 26B file end-to-end. Against per-layer reference checkpoints
-(`scripts/dg-encoder-dump.cpp`, CPU, no repack): embeddings **bit-exact**,
-layer-0 K/V ~1e-6 — but the charter's exact-expert-match clause fails on
-72/510 knife-edge rank-8/9 router ties (reference probability margins
-3.8e-6–2e-4), and accumulation-order noise amplified by per-layer activation
-re-quantization compounds to ~4–12% mean relative error by layer 29. A
-control run proved the pinned reference **bit-deterministic across thread
-counts**, so the gap is cross-implementation FP semantics; one confirmed
-mismatch was fixed and kept (the reference's CPU GELU is an f16 lookup
-table — mirrored as `dg_gelu`). Full evidence, debugging-pass history, and
-maintainer options:
-`target/dg-encoder-parity-20260611T194014Z/FAILURE_REPORT.md`. Phase 2 is
-**stopped pending a maintainer decision**; nothing beyond Phase 1 is claimed.
+`src/diffusion_gemma.rs` implements the encoder prefill and, under the
+maintainer's option A, was driven to **bit-exact parity with the pinned
+reference at ZERO tolerance**: sealed bundle
+`target/dg-encoder-parity-20260611T223204Z/` — 242/242 checkpoints
+(embeddings, per-layer K/V, attention residuals, router logits, both FFN
+branches, every expert-chain stage, layer outputs, final norm) with
+max-abs 0.0 and 510/510 expert selections exact on the `hello` chat prompt
+(CPU backend, no repack, flash attention off).
+
+Getting there required reproducing the exact float semantics the pinned
+build executes on this machine, discovered by checkpoint-ladder forensics
+and, twice, by disassembling the pinned dylib: the reference-order kernel
+set in `src/diffusion_gemma/refmath.rs` (double-sum rms_norm, ggml_v_expf
+chunked softmax, vec_dot trees, ARM nrc=1 quant dots, nearest-even Q8_0
+activation quantize, iterative-theta rope with the decoded rotation fusion),
+Apple's `__sincosf_stret` for the rope trig, the table-contraction form of
+GELU, and two Accelerate diversions that are NOT IEEE-equivalent
+(`vDSP_sve` for weight sums, `vDSP_vdiv` — reciprocal-based — for the MoE
+weight normalization). An earlier honest stop and its analysis are
+preserved in `target/dg-encoder-parity-20260611T194014Z/FAILURE_REPORT.md`
+and the loop log. The pinned reference itself is bit-deterministic across
+thread counts (control in that bundle).
 
 ## 9. Phase 0 gate status
 

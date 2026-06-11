@@ -212,6 +212,8 @@ fn dg_encoder_prefill_matches_pinned_llamacpp() {
             write_f32(&format!("ffn_moe_geglu-{l}"), &lt.moe_geglu);
             write_f32(&format!("ffn_moe_down-{l}"), &lt.moe_down);
             write_f32(&format!("ffn_moe_down_scaled-{l}"), &lt.moe_down_scaled);
+            write_f32(&format!("ffn_moe_weights_norm-{l}"), &lt.moe_weights_norm);
+            write_f32(&format!("ffn_moe_out-{l}"), &lt.moe_pre_norm);
             let tk: Vec<u8> = lt.moe_topk.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(dir.join(format!("ffn_moe_topk-{l}.bin")), tk).expect("write topk");
         }
@@ -415,15 +417,28 @@ fn dg_encoder_prefill_matches_pinned_llamacpp() {
         }
     }
 
-    // final norm: reference PREFILL emits the last row only
-    check(
-        "result_norm",
-        None,
-        &trace.result_norm_last,
-        &mut rows,
-        &mut failures,
-        &mut first_divergent_layer,
-    );
+    // final norm: reference dumps have carried one-row and all-rows shapes —
+    // compare whichever extent the reference provides
+    {
+        let cam_full = &trace.result_norm_all;
+        let ref_len = by_name
+            .get("result_norm")
+            .map(|t| t.bytes.len() / 4)
+            .unwrap_or(0);
+        let cam_slice: &[f32] = if ref_len == cam_full.len() {
+            cam_full
+        } else {
+            &trace.result_norm_last
+        };
+        check(
+            "result_norm",
+            None,
+            cam_slice,
+            &mut rows,
+            &mut failures,
+            &mut first_divergent_layer,
+        );
+    }
 
     let report = format!(
         "{{\n  \"comparison\": \"camelid DgEncoderRuntime::encoder_prefill vs pinned llama.cpp PREFILL checkpoints (scripts/dg-encoder-dump.cpp, CPU backend, flash attention off)\",\n  \"mode\": \"{}\",\n  \"llamacpp_pinned_commit\": \"{}\",\n  \"gguf\": \"{}\",\n  \"prompt_ids\": {:?},\n  \"tolerance\": {{\"atol\": {atol:e}, \"rtol\": {rtol:e}, \"note\": \"same quantized-activation math in a different accumulation order (sequential per-position matvec vs batched reference); expert indices are exact-match, not tolerated\"}},\n  \"expert_index_sets_equal\": {expert_sets_equal},\n  \"expert_index_order_equal\": {expert_order_equal},\n  \"first_divergent_layer\": {},\n  \"checkpoints\": [\n{}\n  ],\n  \"pass\": {}\n}}\n",
