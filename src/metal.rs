@@ -7701,6 +7701,9 @@ pub struct Gemma4ResidentLayer {
     gate_w: Buffer,
     up_w: Buffer,
     down_w: Buffer,
+    /// Wire format of the q/k/v/o/gate/up/down projection weights. Q8_0 for the
+    /// supported dense rows; Q4_0 for QAT rows (the GPU GEMV dispatches on this).
+    fmt: GemmaWireFmt,
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
@@ -7710,10 +7713,11 @@ pub struct Gemma4ResidentLayer {
 
 #[cfg(target_os = "macos")]
 impl Gemma4ResidentLayer {
-    /// Build a layer's resident weights from row-major 34-byte Q8 wire bytes and the
-    /// f32 norms. None if Metal is unavailable.
+    /// Build a layer's resident weights from row-major wire bytes (34-byte Q8_0 or
+    /// 18-byte Q4_0 blocks per `fmt`) and the f32 norms. None if Metal is unavailable.
     #[allow(clippy::too_many_arguments)]
     pub fn from_wire(
+        fmt: GemmaWireFmt,
         attn_norm: Vec<f32>,
         q_norm: Vec<f32>,
         k_norm: Vec<f32>,
@@ -7755,6 +7759,7 @@ impl Gemma4ResidentLayer {
             gate_w: buf(gate_wire),
             up_w: buf(up_wire),
             down_w: buf(down_wire),
+            fmt,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -7769,6 +7774,7 @@ impl Gemma4ResidentLayer {
     /// copy). The nocopy cache pins each `WirePages` Arc for the buffer's lifetime.
     #[allow(clippy::too_many_arguments)]
     pub fn from_wire_pages(
+        fmt: GemmaWireFmt,
         attn_norm: Vec<f32>,
         q_norm: Vec<f32>,
         k_norm: Vec<f32>,
@@ -7807,6 +7813,7 @@ impl Gemma4ResidentLayer {
             gate_w: buf(gate_pages),
             up_w: buf(up_pages),
             down_w: buf(down_pages),
+            fmt,
             n_heads,
             n_kv_heads,
             head_dim,
@@ -7842,7 +7849,7 @@ fn encode_gemma4_layer(
     owns_kv: bool,
 ) {
     encode_gemma4_attention(
-        GemmaWireFmt::Q8_0,
+        layer.fmt,
         e,
         k,
         keep,
@@ -7872,7 +7879,7 @@ fn encode_gemma4_layer(
         owns_kv,
     );
     encode_gemma4_ffn(
-        GemmaWireFmt::Q8_0,
+        layer.fmt,
         e,
         k,
         keep,
@@ -11633,6 +11640,7 @@ pub struct Gemma4ResidentLayer;
 impl Gemma4ResidentLayer {
     #[allow(clippy::too_many_arguments)]
     pub fn from_wire(
+        _fmt: GemmaWireFmt,
         _attn_norm: Vec<f32>,
         _q_norm: Vec<f32>,
         _k_norm: Vec<f32>,
@@ -11657,6 +11665,7 @@ impl Gemma4ResidentLayer {
 
     #[allow(clippy::too_many_arguments)]
     pub fn from_wire_pages(
+        _fmt: GemmaWireFmt,
         _attn_norm: Vec<f32>,
         _q_norm: Vec<f32>,
         _k_norm: Vec<f32>,
@@ -13091,6 +13100,7 @@ mod tests {
                 .map(|i| 0.6 + (i as f32 % 7.0) * 0.03)
                 .collect();
             Gemma4ResidentLayer::from_wire(
+                GemmaWireFmt::Q8_0,
                 an,
                 qn,
                 kn,
@@ -14310,6 +14320,7 @@ mod tests {
         let want: Vec<f32> = h_mid.iter().zip(&dn).map(|(a, b)| a + b).collect();
 
         let layer = Gemma4ResidentLayer::from_wire(
+            GemmaWireFmt::Q8_0,
             attn_norm.clone(),
             q_norm.clone(),
             k_norm.clone(),
@@ -14561,6 +14572,7 @@ mod tests {
 
         // ---- GPU: two layers, one command buffer, persistent shared cache ----
         let layer0 = Gemma4ResidentLayer::from_wire(
+            GemmaWireFmt::Q8_0,
             an0,
             qn0,
             kn0,
@@ -14582,6 +14594,7 @@ mod tests {
         )
         .expect("layer0");
         let layer1 = Gemma4ResidentLayer::from_wire(
+            GemmaWireFmt::Q8_0,
             an1,
             qn1,
             kn1,
@@ -14923,6 +14936,7 @@ mod tests {
         let build_layer = |off: usize| {
             let (an, pa, fnw, pf, qn, kn) = mk_norms(off);
             Gemma4ResidentLayer::from_wire(
+                GemmaWireFmt::Q8_0,
                 an,
                 qn,
                 kn,
@@ -15170,6 +15184,7 @@ mod tests {
         };
         let (an, pa, fnw, pf, qn, kn) = norms();
         let copy = Gemma4ResidentLayer::from_wire(
+            GemmaWireFmt::Q8_0,
             an.clone(),
             qn.clone(),
             kn.clone(),
@@ -15191,6 +15206,7 @@ mod tests {
         )
         .expect("copy");
         let nocopy = Gemma4ResidentLayer::from_wire_pages(
+            GemmaWireFmt::Q8_0,
             an,
             qn,
             kn,
@@ -15304,6 +15320,7 @@ mod tests {
         let build_layer = |off: usize| {
             let (an, pa, fnw, pf, qn, kn) = mk_norms(off);
             Gemma4ResidentLayer::from_wire(
+                GemmaWireFmt::Q8_0,
                 an,
                 qn,
                 kn,
@@ -15416,6 +15433,244 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(amax(&got), amax(&want));
+    }
+
+    // QAT integration gate (visible): a Gemma4ResidentModel built with Q4_0 projection
+    // weights must decode a token on the GPU matching the CPU f32×dequant reference of
+    // the SAME model. Exercises the resident path end-to-end with GemmaWireFmt::Q4_0
+    // routed through encode_gemma4_layer (attention + FFN Q4_0 GEMV) plus the Q8 head.
+    // One owning V-ful layer, no PLE, position 0 (fresh cache). The supported dense
+    // rows are untouched (they pass Q8_0); this proves the Q4_0 layer routing is real.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_resident_q4_forward_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{gemma4::gelu_tanh, q4_0_wire_block_dequant, quantize_q8_0_blocks};
+        let hidden = 128usize;
+        let n_heads = 2usize;
+        let n_kv_heads = 1usize;
+        let head_dim = 256usize;
+        let ffn_dim = 256usize;
+        let vocab = 160usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let half = head_dim / 2;
+        let max_positions = 8usize;
+        let eps = 1.0e-6f32;
+        let softcap = 30.0f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        // Q4_0 projection weight -> (wire bytes, dequantized rows). The CPU reference
+        // dots the SAME values the GPU's f32×dequant Q4_0 GEMV reads.
+        let mw4 = |rows: usize, in_dim: usize, seed: usize| -> (Vec<u8>, Vec<Vec<f32>>) {
+            let mut wire = Vec::new();
+            let mut deq = Vec::new();
+            for r in 0..rows {
+                let mut drow = vec![0.0f32; in_dim];
+                for b in 0..(in_dim / 32) {
+                    let sc = (((r + b + seed) % 7) as f32 + 1.0) * 0.015;
+                    let mut blk = [0u8; 18];
+                    blk[0..2].copy_from_slice(&f32_to_f16_bits(sc).to_le_bytes());
+                    for (j, slot) in blk[2..].iter_mut().enumerate() {
+                        *slot = ((r * 13 + b * 7 + j * 5 + seed) % 256) as u8;
+                    }
+                    let d = q4_0_wire_block_dequant(&blk);
+                    for (i, &val) in d.iter().enumerate() {
+                        drow[b * 32 + i] = val;
+                    }
+                    wire.extend_from_slice(&blk);
+                }
+                deq.push(drow);
+            }
+            (wire, deq)
+        };
+        let (q_wire, q_deq) = mw4(q_dim, hidden, 1);
+        let (k_wire, k_deq) = mw4(kv_dim, hidden, 5);
+        let (v_wire, v_deq) = mw4(kv_dim, hidden, 9);
+        let (o_wire, o_deq) = mw4(hidden, q_dim, 13);
+        let (gate_wire, gate_deq) = mw4(ffn_dim, hidden, 17);
+        let (up_wire, up_deq) = mw4(ffn_dim, hidden, 21);
+        let (down_wire, down_deq) = mw4(hidden, ffn_dim, 25);
+
+        let attn_norm: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 % 5.0) * 0.05).collect();
+        let post_attn_norm: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 % 3.0) * 0.03).collect();
+        let ffn_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.85 + (i as f32 % 4.0) * 0.04)
+            .collect();
+        let post_ffw_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.95 + (i as f32 % 6.0) * 0.02)
+            .collect();
+        let q_norm: Vec<f32> = (0..head_dim)
+            .map(|i| 0.7 + (i as f32 % 11.0) * 0.02)
+            .collect();
+        let k_norm: Vec<f32> = (0..head_dim)
+            .map(|i| 0.6 + (i as f32 % 7.0) * 0.03)
+            .collect();
+        let output_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.88 + (i as f32 % 5.0) * 0.03)
+            .collect();
+        let h0: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let cos_t: Vec<f32> = (0..half).map(|i| (0.3 + i as f32 * 0.01).cos()).collect();
+        let sin_t: Vec<f32> = (0..half).map(|i| (0.3 + i as f32 * 0.01).sin()).collect();
+
+        // Q8 vocab-major embedding table (the head is unchanged Q8) -> wire + dequant.
+        let mut embd_wire = Vec::new();
+        let mut embd_deq = Vec::new();
+        for v in 0..vocab {
+            let row: Vec<f32> = (0..hidden)
+                .map(|i| ((((v * hidden + i) % 31) as f32) - 15.0) * 0.05)
+                .collect();
+            let mut drow = vec![0.0f32; hidden];
+            for (b, blk) in quantize_q8_0_blocks(&row).iter().enumerate() {
+                embd_wire.extend_from_slice(&f32_to_f16_bits(blk.scale).to_le_bytes());
+                for (j, &qq) in blk.quants.iter().enumerate() {
+                    embd_wire.push(qq as u8);
+                    drow[b * 32 + j] = blk.scale * qq as f32;
+                }
+            }
+            embd_deq.push(drow);
+        }
+
+        // ---- CPU reference over the dequantized weights ----
+        let rms = |x: &[f32], w: Option<&[f32]>| -> Vec<f32> {
+            let mss = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            let inv = (mss + eps).powf(-0.5);
+            (0..x.len())
+                .map(|i| x[i] * inv * w.map_or(1.0, |w| w[i]))
+                .collect()
+        };
+        let matmul = |deq: &[Vec<f32>], x: &[f32]| -> Vec<f32> {
+            deq.iter()
+                .map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum())
+                .collect()
+        };
+        let per_head = |x: &[f32], heads: usize, w: Option<&[f32]>| -> Vec<f32> {
+            let mut out = vec![0.0f32; x.len()];
+            for h in 0..heads {
+                let n = rms(&x[h * head_dim..(h + 1) * head_dim], w);
+                out[h * head_dim..(h + 1) * head_dim].copy_from_slice(&n);
+            }
+            out
+        };
+        let rope = |x: &mut [f32], heads: usize| {
+            for h in 0..heads {
+                let base = h * head_dim;
+                for i in 0..half {
+                    let (x0, x1) = (x[base + i], x[base + half + i]);
+                    x[base + i] = x0 * cos_t[i] - x1 * sin_t[i];
+                    x[base + half + i] = x0 * sin_t[i] + x1 * cos_t[i];
+                }
+            }
+        };
+        // Attention at position 0 (fresh cache): only the current token's K/V, so the
+        // single-element softmax weight is 1 and ctx is just V.
+        let normf = rms(&h0, Some(&attn_norm));
+        let mut q = per_head(&matmul(&q_deq, &normf), n_heads, Some(&q_norm));
+        let _kk = per_head(&matmul(&k_deq, &normf), n_kv_heads, Some(&k_norm));
+        let vv = per_head(&matmul(&v_deq, &normf), n_kv_heads, None);
+        rope(&mut q, n_heads);
+        let group = n_heads / n_kv_heads;
+        let mut ctx = vec![0.0f32; q_dim];
+        for h in 0..n_heads {
+            let kvh = h / group;
+            for d in 0..head_dim {
+                ctx[h * head_dim + d] = vv[kvh * head_dim + d];
+            }
+        }
+        let attn_out = matmul(&o_deq, &ctx);
+        let mid: Vec<f32> = h0
+            .iter()
+            .zip(rms(&attn_out, Some(&post_attn_norm)))
+            .map(|(a, b)| a + b)
+            .collect();
+        // FFN.
+        let normf2 = rms(&mid, Some(&ffn_norm));
+        let gate = matmul(&gate_deq, &normf2);
+        let up = matmul(&up_deq, &normf2);
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| gelu_tanh(*g) * u)
+            .collect();
+        let down = matmul(&down_deq, &act);
+        let h_final: Vec<f32> = mid
+            .iter()
+            .zip(rms(&down, Some(&post_ffw_norm)))
+            .map(|(a, b)| a + b)
+            .collect();
+        // Head: rms -> logits -> soft_cap.
+        let normh = rms(&h_final, Some(&output_norm));
+        let want: Vec<f32> = embd_deq
+            .iter()
+            .map(|row| {
+                let logit: f32 = row.iter().zip(&normh).map(|(a, b)| a * b).sum();
+                softcap * (logit / softcap).tanh()
+            })
+            .collect();
+
+        // ---- GPU resident model (Q4_0 layer) ----
+        let layer = Gemma4ResidentLayer::from_wire(
+            GemmaWireFmt::Q4_0,
+            attn_norm,
+            q_norm,
+            k_norm,
+            post_attn_norm,
+            ffn_norm,
+            post_ffw_norm,
+            &q_wire,
+            &k_wire,
+            Some(&v_wire),
+            &o_wire,
+            &gate_wire,
+            &up_wire,
+            &down_wire,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_dim,
+            eps,
+        )
+        .expect("q4 layer");
+        let model = Gemma4ResidentModel::new(
+            vec![layer],
+            vec![None],
+            vec![1.0],
+            vec![true],
+            vec![0],
+            &embd_wire,
+            output_norm,
+            hidden,
+            vocab,
+            softcap,
+            eps,
+            max_positions,
+            scale,
+        )
+        .expect("q4 model");
+        let input = Gemma4TokenLayerInput {
+            cos_t,
+            sin_t,
+            pli: Vec::new(),
+            window_start: 0,
+        };
+        let got = model
+            .forward_token(&h0, &[input], &[], 0)
+            .expect("forward_token q4");
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 2.0e-2, "{a} != {b}");
+        }
+        let amax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
+        assert_eq!(amax(&got), amax(&want), "greedy argmax must agree");
     }
 
     #[cfg(target_os = "macos")]
