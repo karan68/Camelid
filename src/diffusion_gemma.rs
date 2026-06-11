@@ -292,6 +292,12 @@ pub struct DgLayerTrace {
     /// RAW selected-expert probabilities in slot order (pre-normalization) —
     /// "ffn_moe_weights".
     pub moe_weights: Vec<f32>,
+    /// Expert-chain bisection traces (diagnostic), `[pos][slot][dim]`
+    /// flattened to match the reference's ne2-major layout.
+    pub moe_gate_up: Vec<f32>,
+    pub moe_geglu: Vec<f32>,
+    pub moe_down: Vec<f32>,
+    pub moe_down_scaled: Vec<f32>,
 }
 
 pub struct DgEncoderTrace {
@@ -639,6 +645,10 @@ impl DgEncoderRuntime {
             let mut ffn_mlp_all = Vec::with_capacity(n * hidden);
             let mut ffn_moe_all = Vec::with_capacity(n * hidden);
             let mut moe_weights_all = Vec::with_capacity(n * self.n_expert_used);
+            let mut moe_gate_up_all = Vec::new();
+            let mut moe_geglu_all = Vec::new();
+            let mut moe_down_all = Vec::new();
+            let mut moe_down_scaled_all = Vec::new();
             for (pos, hp) in h.iter_mut().enumerate() {
                 let attn_resid = hp.clone();
                 let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
@@ -712,6 +722,10 @@ impl DgEncoderRuntime {
                     // reference order: down → ×per-expert scale → ×weight,
                     // separate multiplies, slots summed in selection order
                     let s_e = lw.down_exps_scale[e];
+                    moe_gate_up_all.extend_from_slice(&gate_up);
+                    moe_geglu_all.extend_from_slice(&hexp);
+                    moe_down_all.extend_from_slice(&y);
+                    moe_down_scaled_all.extend(y.iter().map(|yv| yv * s_e));
                     for (a, yv) in moe_acc.iter_mut().zip(&y) {
                         *a += yv * s_e * w;
                     }
@@ -750,6 +764,10 @@ impl DgEncoderRuntime {
                 ffn_mlp: ffn_mlp_all,
                 ffn_moe: ffn_moe_all,
                 moe_weights: moe_weights_all,
+                moe_gate_up: moe_gate_up_all,
+                moe_geglu: moe_geglu_all,
+                moe_down: moe_down_all,
+                moe_down_scaled: moe_down_scaled_all,
             });
         }
 

@@ -51,6 +51,8 @@ static bool want_name(const char * name, int n_layer) {
         "ffn_moe_topk",  "l_out",
         // FFN-branch bisection points (labels survive cb renames)
         "ffn_mlp",       "ffn_moe",     "ffn_moe_weights",
+        // expert-chain bisection points (merged gate_up path)
+        "ffn_moe_gate_up", "ffn_moe_geglu", "ffn_moe_down", "ffn_moe_down_scaled",
     };
     for (const char * base : per_layer) {
         const size_t blen = strlen(base);

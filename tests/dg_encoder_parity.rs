@@ -208,6 +208,10 @@ fn dg_encoder_prefill_matches_pinned_llamacpp() {
             write_f32(&format!("ffn_mlp-{l}"), &lt.ffn_mlp);
             write_f32(&format!("ffn_moe-{l}"), &lt.ffn_moe);
             write_f32(&format!("ffn_moe_weights-{l}"), &lt.moe_weights);
+            write_f32(&format!("ffn_moe_gate_up-{l}"), &lt.moe_gate_up);
+            write_f32(&format!("ffn_moe_geglu-{l}"), &lt.moe_geglu);
+            write_f32(&format!("ffn_moe_down-{l}"), &lt.moe_down);
+            write_f32(&format!("ffn_moe_down_scaled-{l}"), &lt.moe_down_scaled);
             let tk: Vec<u8> = lt.moe_topk.iter().flat_map(|v| v.to_le_bytes()).collect();
             std::fs::write(dir.join(format!("ffn_moe_topk-{l}.bin")), tk).expect("write topk");
         }
