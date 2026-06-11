@@ -1242,6 +1242,9 @@ impl Gemma4GpuRuntime {
             let kv_heads = plan[l].kv_heads;
             let ffn_dim = g.ffn_length_at(l) as usize;
             let layer = crate::metal::Gemma4ResidentLayer::from_wire_pages(
+                // The GPU-resident lane is gated to Q8_0 weights above; QAT (Q4_0)
+                // rows fail closed before reaching here. Pass Q8_0 explicitly.
+                crate::metal::GemmaWireFmt::Q8_0,
                 f32t(&lb.attn_norm.name)?,
                 f32t(&lb.attn_q_norm.name)?,
                 f32t(
