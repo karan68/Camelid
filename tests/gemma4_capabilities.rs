@@ -38,7 +38,7 @@ fn gemma4_rows(body: &Value) -> Vec<&Value> {
 }
 
 #[tokio::test]
-async fn gemma4_supported_rows_are_exactly_e2b_e4b_and_12b() {
+async fn gemma4_supported_rows_are_exactly_the_committed_set() {
     let body = capabilities().await;
     let mut supported: Vec<&str> = gemma4_rows(&body)
         .iter()
@@ -53,9 +53,11 @@ async fn gemma4_supported_rows_are_exactly_e2b_e4b_and_12b() {
     assert_eq!(
         supported,
         vec![
-            // 12B is supported ONLY through the two-Mac distributed serve
-            // lane (CLI parity + distributed-serve smoke bundles committed).
+            // 12B and 26B A4B QAT are supported ONLY through the two-Mac
+            // distributed serve lane (parity packs + distributed-serve smoke
+            // bundles committed); E2B/E4B are single-node supported rows.
             "gemma4_12b_it_q8_0",
+            "gemma4_26b_a4b_it_q4_0",
             "gemma4_e2b_it_q8_0",
             "gemma4_e4b_it_q8_0"
         ],

@@ -307,6 +307,7 @@ async fn live_gemma4_distributed_chat_serve_smoke() {
         Some(name) if name.contains("E2B") => "gemma4_e2b_it_q8_0",
         Some(name) if name.contains("E4B") => "gemma4_e4b_it_q8_0",
         Some(name) if name.contains("12b") || name.contains("12B") => "gemma4_12b_it_q8_0",
+        Some(name) if name.contains("26B") || name.contains("26b") => "gemma4_26b_a4b_it_q4_0",
         other => panic!("no catalog row for {other:?}"),
     };
     state

@@ -245,3 +245,16 @@ full-budget where deterministic + probe-verified frontiers on near-ties).
 Evidence bundle: `qa/evidence-bundles/gemma4-26b-it-q4-0-qat-distributed-parity-*`.
 Comparator: llama.cpp 5d56eff `--no-repack -fa off -ctk f32 -ctv f32 -ub 1`
 (plain-f32 path; 26B is V-full so `-ub 1` is sound, unlike the 12B V-less case).
+
+## PROMOTED — supported exact-row smoke (two-Mac distributed lane)
+
+The 26B A4B QAT row is promoted to `supported_exact_row_smoke` scoped to the
+two-Mac distributed serve lane, mirroring the 12B treatment. Evidence:
+- Distributed parity pack: `qa/evidence-bundles/gemma4-26b-it-q4-0-qat-distributed-parity-20260611T084039Z-head-b117d40cb7c3` (2/5 full-budget + 3/5 probe-verified frontiers).
+- Distributed serve/WebUI promotion smoke: `qa/evidence-bundles/gemma4-26b-a4b-it-q4-0-distributed-serve-20260611T092520Z-head-6482254fca12` (model-promotion-smoke-bundle passed=true: load, /v1/completions, /v1/chat/completions, capabilities expectations, generation timings, frontend WebUI closure with streaming).
+
+Capabilities row `gemma4_26b_a4b_it_q4_0` (status `supported_exact_row_smoke`,
+scope `exact_row_distributed_serve_smoke_only`), curated catalog + frontend
+`supportedModels` row, and the supported-row allowlist guard are updated
+together; COMPATIBILITY/STATUS/README carry the synchronized exact-row wording.
+The Q8_0 26B A4B (26.9 GB), 31B, and `gemma4-assistant` MTP rows stay blocked.

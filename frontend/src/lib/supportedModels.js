@@ -67,4 +67,13 @@ export const SUPPORTED_MODELS = [
     quant: 'Q8_0',
     blurb: 'Gemma 4 12B served as two-Mac distributed layer sharding (master shard local, tail on a worker over TCP). Requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT and a live gemma4-worker; memory-infeasible on a single 16GB host.',
   },
+  {
+    catalog_id: 'gemma4_26b_a4b_it_q4_0',
+    name: 'Gemma 4 26B-A4B-It QAT (two-Mac distributed, MoE)',
+    repo_id: 'google/gemma-4-26B-A4B-it-qat-q4_0-gguf',
+    filename: 'gemma-4-26B_q4_0-it.gguf',
+    size_bytes: 14439361440,
+    quant: 'Q4_0',
+    blurb: 'Gemma 4 26B A4B (128-expert MoE, QAT Q4_0 + Q6_K head) served as two-Mac distributed layer sharding. Requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT and a live gemma4-worker; the 13.4GB row is memory-infeasible on a single 16GB host.',
+  },
 ]
