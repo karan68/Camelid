@@ -207,6 +207,53 @@ impl WireQuant {
         out
     }
 
+    /// Batched [`matvec_q`]: dot each output row against EACH of the `xqs`
+    /// activations, reading the weight row from the wire bytes ONCE per row and
+    /// reusing it across all `xqs`. For K activations this reads the whole weight
+    /// matrix once instead of K times — the speculative-decode bandwidth win, since
+    /// verifying K draft tokens then costs a single weight pass. The returned
+    /// `out[k]` is bit-identical to `matvec_q(out_dim, xqs[k])` (same row_dot, same
+    /// order), so greedy parity is preserved.
+    fn matmul_q(&self, out_dim: usize, xqs: &[Vec<Q8_0Block>]) -> Vec<Vec<f32>> {
+        const ROW_CHUNK: usize = 64;
+        let k = xqs.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        let row_bytes = xqs[0].len() * self.format.bytes_per_block();
+        let bytes = self.bytes();
+        let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
+            WireFormat::Q8_0 => q8_0_wire_row_dot,
+            WireFormat::Q4_0 => q4_0_wire_row_dot,
+            WireFormat::Q6K => unreachable!("Q6_K matmul routes through matmul_q8k"),
+        };
+        // out[ki][o]; one Vec per activation. Chunk over output rows (the same fixed
+        // chunking matvec_q uses) so each weight row is read once and dotted against
+        // all k activations. We fill a flat [out_dim * k] buffer in row-chunk order,
+        // then transpose into per-activation rows.
+        let mut flat = vec![0f32; out_dim * k];
+        flat.par_chunks_mut(ROW_CHUNK * k)
+            .enumerate()
+            .for_each(|(chunk_idx, dst)| {
+                let base = chunk_idx * ROW_CHUNK;
+                let rows = dst.len() / k;
+                for r in 0..rows {
+                    let o = base + r;
+                    let w = &bytes[o * row_bytes..(o + 1) * row_bytes];
+                    for (ki, xq) in xqs.iter().enumerate() {
+                        dst[r * k + ki] = row_dot(w, xq);
+                    }
+                }
+            });
+        let mut out: Vec<Vec<f32>> = (0..k).map(|_| vec![0f32; out_dim]).collect();
+        for o in 0..out_dim {
+            for (ki, row) in out.iter_mut().enumerate() {
+                row[o] = flat[o * k + ki];
+            }
+        }
+        out
+    }
+
     /// [`matvec`] for Q6_K rows against a Q8_K-quantized activation. Same fixed
     /// row chunking as [`Self::matvec_q`] (greedy-parity-safe ordering).
     fn matvec_q8k(&self, out_dim: usize, xq: &[crate::inference::Q8KBlock]) -> Vec<f32> {
@@ -223,6 +270,40 @@ impl WireQuant {
                     *d = q6_k_wire_row_dot(&bytes[o * row_bytes..(o + 1) * row_bytes], xq);
                 }
             });
+        out
+    }
+
+    /// Batched [`matvec_q8k`]: each Q6_K output row is read once and dotted against
+    /// every Q8_K activation in `xqs`. The QAT tied head over K verify positions in a
+    /// single weight pass; `out[k]` is bit-identical to `matvec_q8k(out_dim, xqs[k])`.
+    fn matmul_q8k(&self, out_dim: usize, xqs: &[Vec<crate::inference::Q8KBlock>]) -> Vec<Vec<f32>> {
+        const ROW_CHUNK: usize = 64;
+        let k = xqs.len();
+        if k == 0 {
+            return Vec::new();
+        }
+        let row_bytes = xqs[0].len() * self.format.bytes_per_block();
+        let bytes = self.bytes();
+        let mut flat = vec![0f32; out_dim * k];
+        flat.par_chunks_mut(ROW_CHUNK * k)
+            .enumerate()
+            .for_each(|(chunk_idx, dst)| {
+                let base = chunk_idx * ROW_CHUNK;
+                let rows = dst.len() / k;
+                for r in 0..rows {
+                    let o = base + r;
+                    let w = &bytes[o * row_bytes..(o + 1) * row_bytes];
+                    for (ki, xq) in xqs.iter().enumerate() {
+                        dst[r * k + ki] = q6_k_wire_row_dot(w, xq);
+                    }
+                }
+            });
+        let mut out: Vec<Vec<f32>> = (0..k).map(|_| vec![0f32; out_dim]).collect();
+        for o in 0..out_dim {
+            for (ki, row) in out.iter_mut().enumerate() {
+                row[o] = flat[o * k + ki];
+            }
+        }
         out
     }
 
@@ -686,6 +767,287 @@ impl Gemma4Runtime {
         }
     }
 
+    /// True when the batched [`Self::step_chunk`] forward is usable: single-node
+    /// (this runtime owns every layer including the head) and no MoE layer. The
+    /// speculative-decode lane needs the head shard; MoE rows are distributed-only.
+    fn supports_chunk_forward(&self) -> bool {
+        self.first_layer == 0
+            && self.first_layer + self.layers.len() == self.config.block_count as usize
+            && self.layers.iter().all(|lw| lw.moe.is_none())
+    }
+
+    /// Batched forward over `tokens` at consecutive positions `start_pos +
+    /// 0..tokens.len()`, appending all K K/V rows to the caches and returning the
+    /// next-token logits at EACH position. Numerically identical to calling
+    /// [`Self::step`] once per token (same dots, same order) — the only difference is
+    /// that each weight matrix is read ONCE for the whole chunk via [`matmul_q`]
+    /// instead of once per token, which is the speculative-decode verify win.
+    /// Requires [`Self::supports_chunk_forward`]; caller guarantees it.
+    #[allow(clippy::needless_range_loop)]
+    fn step_chunk(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+    ) -> Result<Vec<Vec<f32>>> {
+        let kk = tokens.len();
+        debug_assert!(kk > 0);
+        let hidden = self.config.embedding_length as usize;
+        let heads = self.config.attention_head_count as usize;
+        let ple_dim = self.g.per_layer_input_dim as usize;
+        let eps = self.config.rms_norm_epsilon;
+        let n_local = self.layers.len();
+        let block_count = self.config.block_count as usize;
+        let ple_total = block_count * ple_dim;
+        let win = self.g.sliding_window as usize;
+
+        // Per-token scaled embedding (== step_range's h0) and the PLE per-layer input.
+        let mut hs: Vec<Vec<f32>> = Vec::with_capacity(kk);
+        // pli_tok[i][li] is layer li's per-layer input for token i.
+        let mut pli_tok: Vec<Vec<Vec<f32>>> = Vec::with_capacity(kk);
+        for &token in tokens {
+            let h0: Vec<f32> = self
+                .token_embd
+                .dequantize_elements(token as usize * hidden, hidden)?
+                .iter()
+                .map(|v| v * (hidden as f32).sqrt())
+                .collect();
+            let pli: Vec<Vec<f32>> = if let (Some(te), Some(proj), Some(pn)) = (
+                self.per_layer_token_embd.as_ref(),
+                self.per_layer_model_proj.as_ref(),
+                self.per_layer_proj_norm.as_ref(),
+            ) {
+                let local_span = n_local * ple_dim;
+                let ti = te.dequantize_elements(token as usize * ple_total, local_span)?;
+                let proj_local = &proj[0..local_span * hidden];
+                let ctx = f32_matvec(proj_local, hidden, local_span, &h0);
+                let proj_scale = (hidden as f32).powf(-0.5);
+                let ple_embed_scale = (ple_dim as f32).sqrt();
+                (0..n_local)
+                    .map(|li| {
+                        let ctx_l: Vec<f32> = (0..ple_dim)
+                            .map(|d| ctx[li * ple_dim + d] * proj_scale)
+                            .collect();
+                        let ctx_n = rms_norm(&ctx_l, Some(pn), eps);
+                        (0..ple_dim)
+                            .map(|d| {
+                                (ctx_n[d] + ti[li * ple_dim + d] * ple_embed_scale)
+                                    * std::f32::consts::FRAC_1_SQRT_2
+                            })
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            hs.push(h0);
+            pli_tok.push(pli);
+        }
+
+        for li in 0..n_local {
+            let l = li; // single-node: global == local
+            let lw = &self.layers[li];
+            let sliding = self.g.is_sliding_layer(l);
+            let head_dim = self.g.head_dim_at(l) as usize;
+            let theta = self.g.rope_freq_base_at(l);
+            let kv_heads = self.g.kv_heads_at(l) as usize;
+            let ffn_dim = self.g.ffn_length_at(l) as usize;
+            let q_dim = heads * head_dim;
+            let kv_dim = kv_heads * head_dim;
+            let rope_factors = if sliding {
+                None
+            } else {
+                self.rope_factors.as_deref()
+            };
+
+            // --- attention projections, batched (one weight pass each) ---
+            let xnq: Vec<Vec<Q8_0Block>> = hs
+                .iter()
+                .map(|h| quantize_q8_0_blocks(&rms_norm(h, Some(&lw.attn_norm), eps)))
+                .collect();
+            let mut q_rows = lw.attn_q.matmul_q(q_dim, &xnq);
+            for q in q_rows.iter_mut() {
+                for hh in 0..heads {
+                    let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
+                    s.copy_from_slice(&rms_norm(s, Some(&lw.q_norm), eps));
+                }
+            }
+            for (i, q) in q_rows.iter_mut().enumerate() {
+                apply_rope(q, heads, head_dim, start_pos + i, theta, rope_factors);
+            }
+
+            if l < self.first_kv_shared {
+                let mut k_rows = lw
+                    .attn_k
+                    .as_ref()
+                    .expect("validate() guarantees owning layers bind attn_k")
+                    .matmul_q(kv_dim, &xnq);
+                let mut v_rows = match lw.attn_v.as_ref() {
+                    Some(wv) => wv.matmul_q(kv_dim, &xnq),
+                    None => k_rows.clone(),
+                };
+                for i in 0..kk {
+                    for hh in 0..kv_heads {
+                        let s = &mut k_rows[i][hh * head_dim..(hh + 1) * head_dim];
+                        s.copy_from_slice(&rms_norm(
+                            s,
+                            Some(
+                                lw.k_norm
+                                    .as_deref()
+                                    .expect("validate() guarantees owning layers bind attn_k_norm"),
+                            ),
+                            eps,
+                        ));
+                        let sv = &mut v_rows[i][hh * head_dim..(hh + 1) * head_dim];
+                        sv.copy_from_slice(&rms_norm(sv, None, eps));
+                    }
+                    apply_rope(
+                        &mut k_rows[i],
+                        kv_heads,
+                        head_dim,
+                        start_pos + i,
+                        theta,
+                        rope_factors,
+                    );
+                }
+                // Append all K rows in position order; query i (below) then reads the
+                // cache only up to its own position, so causality holds.
+                for i in 0..kk {
+                    kc[li].push(std::mem::take(&mut k_rows[i]));
+                    vc[li].push(std::mem::take(&mut v_rows[i]));
+                }
+            }
+
+            let src_global = if l < self.first_kv_shared {
+                l
+            } else if sliding {
+                self.last_sliding_layer
+            } else {
+                self.last_full_layer
+            };
+            let src = src_global - self.first_layer;
+            let group = heads / self.g.kv_heads_at(src_global) as usize;
+
+            // --- per-position attention (cheap; no big weight read) ---
+            let mut attn_q_rows: Vec<Vec<Q8_0Block>> = Vec::with_capacity(kk);
+            for i in 0..kk {
+                let pos = start_pos + i;
+                let lo = if sliding {
+                    (pos + 1).saturating_sub(win)
+                } else {
+                    0
+                };
+                let q = &q_rows[i];
+                let mut attn = vec![0f32; q_dim];
+                for hh in 0..heads {
+                    let kvh = hh / group;
+                    let qh = &q[hh * head_dim..(hh + 1) * head_dim];
+                    let mut scores: Vec<f32> = (lo..=pos)
+                        .map(|p| {
+                            let kp = &kc[src][p][kvh * head_dim..(kvh + 1) * head_dim];
+                            qh.iter().zip(kp).map(|(a, b)| a * b).sum()
+                        })
+                        .collect();
+                    let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+                    let mut den = 0f32;
+                    for s in &mut scores {
+                        *s = (*s - m).exp();
+                        den += *s;
+                    }
+                    let out = &mut attn[hh * head_dim..(hh + 1) * head_dim];
+                    for (idx, p) in (lo..=pos).enumerate() {
+                        let w = scores[idx] / den;
+                        let vp = &vc[src][p][kvh * head_dim..(kvh + 1) * head_dim];
+                        for d in 0..head_dim {
+                            out[d] += w * vp[d];
+                        }
+                    }
+                }
+                attn_q_rows.push(quantize_q8_0_blocks(&attn));
+            }
+            // o-projection batched, then residual + post-attn norm per token.
+            let o_rows = lw.attn_output.matmul_q(hidden, &attn_q_rows);
+            for i in 0..kk {
+                let on = rms_norm(&o_rows[i], Some(&lw.post_attn_norm), eps);
+                for (a, b) in hs[i].iter_mut().zip(&on) {
+                    *a += b;
+                }
+            }
+
+            // --- FFN (dense), batched ---
+            let ffnq: Vec<Vec<Q8_0Block>> = hs
+                .iter()
+                .map(|h| quantize_q8_0_blocks(&rms_norm(h, Some(&lw.ffn_norm), eps)))
+                .collect();
+            let gate_rows = lw.ffn_gate.matmul_q(ffn_dim, &ffnq);
+            let up_rows = lw.ffn_up.matmul_q(ffn_dim, &ffnq);
+            let actq: Vec<Vec<Q8_0Block>> = (0..kk)
+                .map(|i| {
+                    let act: Vec<f32> = gate_rows[i]
+                        .iter()
+                        .zip(&up_rows[i])
+                        .map(|(g, u)| gelu_tanh(*g) * u)
+                        .collect();
+                    quantize_q8_0_blocks(&act)
+                })
+                .collect();
+            let mlp_rows = lw.ffn_down.matmul_q(hidden, &actq);
+            for i in 0..kk {
+                let ffn_out = rms_norm(&mlp_rows[i], Some(&lw.post_ffw_norm), eps);
+                for (a, b) in hs[i].iter_mut().zip(&ffn_out) {
+                    *a += b;
+                }
+                // PLE residual (per token, cheap f32 matvecs).
+                if let (Some(ig), Some(pj), Some(pnn)) = (
+                    lw.ple_inp_gate.as_ref(),
+                    lw.ple_proj.as_ref(),
+                    lw.post_norm.as_ref(),
+                ) {
+                    let mut gated = f32_matvec(ig, hidden, ple_dim, &hs[i]);
+                    for (gv, pv) in gated.iter_mut().zip(&pli_tok[i][li]) {
+                        *gv = gelu_tanh(*gv) * pv;
+                    }
+                    let proj = f32_matvec(pj, ple_dim, hidden, &gated);
+                    let pnv = rms_norm(&proj, Some(pnn), eps);
+                    for (a, b) in hs[i].iter_mut().zip(&pnv) {
+                        *a += b;
+                    }
+                }
+                if lw.ple_output_scale != 1.0 {
+                    for v in hs[i].iter_mut() {
+                        *v *= lw.ple_output_scale;
+                    }
+                }
+            }
+        }
+
+        // --- head, batched over the K positions ---
+        let vocab = self.config.vocab_size.unwrap() as usize;
+        let lastq: Vec<Vec<f32>> = hs
+            .iter()
+            .map(|h| rms_norm(h, Some(&self.output_norm), eps))
+            .collect();
+        let mut logits_rows: Vec<Vec<f32>> = match self.token_embd.format {
+            WireFormat::Q6K => {
+                let xqs: Vec<Vec<crate::inference::Q8KBlock>> =
+                    lastq.iter().map(|l| quantize_q8_k_blocks(l)).collect();
+                self.token_embd.matmul_q8k(vocab, &xqs)
+            }
+            _ => {
+                let xqs: Vec<Vec<Q8_0Block>> =
+                    lastq.iter().map(|l| quantize_q8_0_blocks(l)).collect();
+                self.token_embd.matmul_q(vocab, &xqs)
+            }
+        };
+        if let Some(cap) = self.g.final_logit_softcapping {
+            for logits in logits_rows.iter_mut() {
+                soft_cap_in_place(logits, cap);
+            }
+        }
+        Ok(logits_rows)
+    }
+
     /// One token's forward over the locally-loaded layer range.
     ///
     /// `h_in` is the hidden state arriving from the upstream shard (`None` on
@@ -1069,6 +1431,19 @@ impl Gemma4Runtime {
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
             logits = self.step(tok, pos, &mut kc, &mut vc)?;
         }
+        // Lossless n-gram speculative decode (opt-in, single-node non-MoE rows): verify
+        // a batch of drafted tokens in ONE weight pass via `step_chunk`. Output is
+        // token-for-token identical to the greedy loop below — every committed token is
+        // the target's own argmax — so it makes no support/parity claim, only speed.
+        if std::env::var("CAMELID_GEMMA4_SPEC_DECODE").is_ok() && self.supports_chunk_forward() {
+            let generated =
+                self.spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)?;
+            if cpu_timing_enabled() {
+                report_cpu_timing();
+            }
+            let text = self.tokenizer.decode(&generated, true)?;
+            return Ok((text, generated));
+        }
         let mut generated = Vec::new();
         let mut pos = prompt_tokens.len();
         for _ in 0..max_new {
@@ -1090,6 +1465,132 @@ impl Gemma4Runtime {
         }
         let text = self.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
+    }
+
+    /// Lossless n-gram speculative decode, forced on (no env var). Returns the SAME
+    /// `(text, ids)` as [`Self::generate_greedy`] token-for-token — speculation only
+    /// changes how many tokens fall out of one weight read. Requires a single-node
+    /// non-MoE row ([`Self::supports_chunk_forward`]); falls back to the plain greedy
+    /// loop otherwise. Exposed for the spec-vs-greedy parity test and the CLI flag.
+    pub fn generate_greedy_speculative(
+        &self,
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<(String, Vec<u32>)> {
+        if !self.supports_chunk_forward() {
+            return self.generate_greedy(prompt, max_new);
+        }
+        let n_layers = self.layers.len();
+        let mut kc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let mut vc: Vec<Vec<Vec<f32>>> = vec![Vec::new(); n_layers];
+        let prompt_tokens = self.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.tokenizer);
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.step(tok, pos, &mut kc, &mut vc)?;
+        }
+        let generated =
+            self.spec_decode_generate(&mut kc, &mut vc, logits, &prompt_tokens, &eot, max_new)?;
+        let text = self.tokenizer.decode(&generated, true)?;
+        Ok((text, generated))
+    }
+
+    /// Lossless greedy n-gram speculative decode for single-node non-MoE gemma4 rows.
+    /// Given the prefilled caches and the prefill `logits` (predicting the first new
+    /// position), repeatedly: commit `t0 = argmax(logits)`, draft its continuation from
+    /// history (prompt-lookup), verify `[t0, drafts..]` in ONE batched `step_chunk`,
+    /// accept the longest prefix of drafts that equals the target's own argmax, roll the
+    /// KV cache back to the accepted length, and carry the divergence position's logits
+    /// into the next round. Emits exactly the greedy token stream; drafts only change how
+    /// many tokens fall out of a single weight read.
+    #[allow(clippy::needless_range_loop)]
+    fn spec_decode_generate(
+        &self,
+        kc: &mut [Vec<Vec<f32>>],
+        vc: &mut [Vec<Vec<f32>>],
+        mut logits: Vec<f32>,
+        prompt_tokens: &[u32],
+        eot: &[u32],
+        max_new: usize,
+    ) -> Result<Vec<u32>> {
+        use crate::inference::speculative::{
+            accepted_draft_prefix, NGramDrafter, DEFAULT_NGRAM_DRAFT_TOKENS,
+        };
+        let max_draft = std::env::var("CAMELID_GEMMA4_SPEC_DRAFT_TOKENS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_NGRAM_DRAFT_TOKENS)
+            .max(1);
+        let drafter = NGramDrafter::default();
+        let argmax = |l: &[f32]| -> u32 {
+            l.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap()
+        };
+        let (mut accepted_rounds, mut accepted_drafts) = (0u64, 0u64);
+        let spec_timing = std::env::var("CAMELID_GEMMA4_SPEC_TIMING").is_ok();
+        let mut history = prompt_tokens.to_vec();
+        let mut generated: Vec<u32> = Vec::new();
+        let mut pos = prompt_tokens.len();
+        while generated.len() < max_new {
+            // t0 is the target's own next-token argmax — always greedy-correct.
+            let t0 = argmax(&logits);
+            if eot.contains(&t0) {
+                break;
+            }
+            generated.push(t0);
+            history.push(t0);
+            if generated.len() >= max_new {
+                break;
+            }
+            let budget = max_new - generated.len();
+            let drafts = drafter.draft(&history, max_draft.min(budget));
+            // Verify [t0, d1..dm] at positions pos..pos+m in one weight pass: rows[i]
+            // predicts position pos+i+1.
+            let mut chunk = Vec::with_capacity(1 + drafts.len());
+            chunk.push(t0);
+            chunk.extend_from_slice(&drafts);
+            let rows = self.step_chunk(&chunk, pos, kc, vc)?;
+            let preds: Vec<u32> = (0..drafts.len()).map(|i| argmax(&rows[i])).collect();
+            let j = accepted_draft_prefix(&drafts, &preds);
+            accepted_rounds += 1;
+            accepted_drafts += j as u64;
+            let mut stopped = false;
+            for &d in &drafts[..j] {
+                if generated.len() >= max_new {
+                    break;
+                }
+                if eot.contains(&d) {
+                    stopped = true;
+                    break;
+                }
+                generated.push(d);
+                history.push(d);
+            }
+            if stopped {
+                break;
+            }
+            // Keep KV through the last accepted position (pos+j); discard the rejected
+            // draft tail. rows[j] predicts pos+j+1 → it's next round's t0 source.
+            let keep = pos + j + 1;
+            for li in 0..kc.len() {
+                kc[li].truncate(keep);
+                vc[li].truncate(keep);
+            }
+            pos = keep;
+            logits = rows.into_iter().nth(j).expect("rows[j] exists");
+        }
+        if spec_timing {
+            let toks = generated.len().max(1) as f64;
+            eprintln!(
+                "[spec] {} tokens in {accepted_rounds} verify passes ({:.2} tokens/pass; {accepted_drafts} drafts accepted)",
+                generated.len(),
+                toks / accepted_rounds.max(1) as f64,
+            );
+        }
+        Ok(generated)
     }
 
     /// Greedy decode that emits the incremental decoded-text delta after each new
