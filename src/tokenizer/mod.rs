@@ -321,9 +321,20 @@ impl Tokenizer {
                 eog,
             },
             config: TokenizerConfig {
-                add_bos: file
-                    .metadata_bool("tokenizer.ggml.add_bos_token")
-                    .unwrap_or(true),
+                // Gemma 4 workaround (matches llama.cpp PR #21500): some gemma4
+                // exports — notably the 26B A4B QAT GGUF — ship an incorrect
+                // `add_bos_token = false`, but the model is always run with a
+                // leading BOS. llama.cpp force-overrides it to true for gemma4;
+                // do the same so the prompt token stream matches the reference
+                // (without this, the BOS is dropped and the whole forward
+                // diverges). E-series/12B already ship true, so this is a no-op
+                // for them.
+                add_bos: if model_name == "gemma4" {
+                    true
+                } else {
+                    file.metadata_bool("tokenizer.ggml.add_bos_token")
+                        .unwrap_or(true)
+                },
                 add_eos: file
                     .metadata_bool("tokenizer.ggml.add_eos_token")
                     .unwrap_or(false),

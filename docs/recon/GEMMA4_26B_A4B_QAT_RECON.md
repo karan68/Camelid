@@ -194,12 +194,24 @@ Confirmed NOT the bug (each checked against the reference source / runtime):
 - prompt tokenization: `add_bos=False` respected → `[818,5279,529,7001,563]`,
   identical to the reference.
 
-Symptom: `The capital of France is` → reference ` Paris.` (tokens
-`[9079, 236761, ...]`); camelid WIP → token `506` ("the"), then degenerate
-repetition. First-token probe recorded at
-`qa/gemma4/oracle/gemma-4-26B_q4_0-it.first-token-probe.json`.
+### ROOT-CAUSED AND FIXED (the MoE math was correct all along)
 
-Next step (the only thing static inspection cannot resolve): build llama.cpp
-from source with the eval-callback and dump per-layer activations for this
-prompt, then diff camelid's per-layer hidden state (`CAMELID_GEMMA4_DUMP_LAYERS`)
-to find the first diverging layer/op — the same technique used to land 12B.
+The divergence was NOT in the MoE forward — it was the prompt tokenization.
+The eval-callback trace showed the reference feeds **6** tokens
+(`[2, 818, 5279, 529, 7001, 563]`, BOS-led) while camelid fed **5** (no BOS).
+This 26B QAT export ships an incorrect `tokenizer.ggml.add_bos_token = false`;
+llama.cpp force-overrides it to true for all gemma4 (PR #21500 workaround,
+`LLAMA_VOCAB_PRE_TYPE_GEMMA4`). Camelid now applies the same override in
+`Tokenizer::from_gguf` (force `add_bos=true` when `tokenizer.ggml.model ==
+"gemma4"`; E-series/12B already ship true so it is a no-op for them).
+
+With the BOS restored, the 26B A4B MoE forward is **token-identical to the
+reference**: `The capital of France is` → ` Paris.`
+(`[9079, 236761, 107, 100, 236800, 236786]`, exact match). The entire derived
+MoE contract above is therefore validated end-to-end on the real row.
+
+Tooling note: the eval-callback example builds standalone against the existing
+reference dylibs — `clang++ -std=c++17 -I common -I include -I ggml/include
+examples/eval-callback/eval-callback.cpp -Lbuild/bin -lllama -lllama-common
+-lggml -lggml-base -lggml-cpu` — and prints every named tensor per op, which is
+how the 6-vs-5 token mismatch was caught in one run.
