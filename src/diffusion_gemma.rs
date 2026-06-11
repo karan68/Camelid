@@ -26,8 +26,7 @@ mod refmath;
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
 use crate::inference::{
-    q4_k_wire_row_dot, q5_0_wire_row_dot, q6_k_wire_block_dequant, q6_k_wire_row_dot,
-    q8_0_wire_row_dot, quantize_q8_k_blocks, Q8KBlock, Q4_K_WIRE_BYTES_PER_BLOCK,
+    q6_k_wire_block_dequant, quantize_q8_k_blocks, Q8KBlock, Q4_K_WIRE_BYTES_PER_BLOCK,
     Q5_0_WIRE_BYTES_PER_BLOCK, Q6_K_VALUES_PER_BLOCK, Q6_K_WIRE_BYTES_PER_BLOCK,
 };
 use crate::model::Gemma4Metadata;
@@ -58,7 +57,9 @@ fn dg_gelu(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_560_802_865_4;
     const GELU_COEF_A: f32 = 0.044_715;
     let v = crate::tensor::f16_round(x);
-    let g = 0.5 * v * (1.0 + (SQRT_2_OVER_PI * v * (1.0 + GELU_COEF_A * v * v)).tanh());
+    // literal port of ggml_gelu_f32 (a contraction probe of the inner
+    // polynomial produced identical results on real activations)
+    let g = 0.5 * v * (1.0 + refmath::libm_tanhf(SQRT_2_OVER_PI * v * (1.0 + GELU_COEF_A * v * v)));
     crate::tensor::f16_round(g)
 }
 
@@ -201,12 +202,12 @@ impl DgWire {
         match self.format {
             DgFormat::Q8_0 => {
                 for (r, y) in out.iter_mut().enumerate() {
-                    *y = q8_0_wire_row_dot(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
+                    *y = refmath::q8_0_dot_arm(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
                 }
             }
             DgFormat::Q5_0 => {
                 for (r, y) in out.iter_mut().enumerate() {
-                    *y = q5_0_wire_row_dot(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
+                    *y = refmath::q5_0_dot_arm(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
                 }
             }
             DgFormat::Q4K => {
@@ -215,7 +216,7 @@ impl DgWire {
                     .as_ref()
                     .expect("K-quant rows imply 256-aligned input");
                 for (r, y) in out.iter_mut().enumerate() {
-                    *y = q4_k_wire_row_dot(&bytes[r * rb..(r + 1) * rb], xk);
+                    *y = refmath::q4_k_dot_arm(&bytes[r * rb..(r + 1) * rb], xk);
                 }
             }
             DgFormat::Q6K => {
@@ -224,7 +225,7 @@ impl DgWire {
                     .as_ref()
                     .expect("K-quant rows imply 256-aligned input");
                 for (r, y) in out.iter_mut().enumerate() {
-                    *y = q6_k_wire_row_dot(&bytes[r * rb..(r + 1) * rb], xk);
+                    *y = refmath::q6_k_dot_arm(&bytes[r * rb..(r + 1) * rb], xk);
                 }
             }
         }
@@ -236,15 +237,8 @@ impl DgWire {
     /// at the pin); every other format uses the vec_dot path. The MoE expert
     /// path (`mul_mat_id`) never uses tinyBLAS — experts call `matvec_rows`.
     fn matvec_dense(&self, x: &DgActivation) -> Result<Vec<f32>> {
-        if self.format == DgFormat::Q8_0 {
-            let rb = self.row_bytes();
-            let bytes = self.mmap.bytes(self.offset, self.rows * rb)?;
-            let mut out = vec![0f32; self.rows];
-            for (r, y) in out.iter_mut().enumerate() {
-                *y = refmath::tinyblas_q8_0_dot(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
-            }
-            return Ok(out);
-        }
+        // empirically dense Q8_0 matmuls also match the vec_dot path
+        // (llamafile does not engage for this graph's shapes)
         self.matvec_rows(0, self.rows, x)
     }
 }
@@ -652,11 +646,10 @@ impl DgEncoderRuntime {
                 for (rv, sv) in r.iter_mut().zip(&lw.gate_inp_scale) {
                     *rv = *rv * inv * sv;
                 }
-                // tinyBLAS f32 engages for this GEMM (m=128 %4==0, n=17>=4, k 4-aligned)
+                // empirically the router GEMM matches the vec_dot_f32 tree, not
+                // the tinyBLAS per-element order (llamafile did not engage)
                 let logits: Vec<f32> = (0..self.n_expert)
-                    .map(|e| {
-                        refmath::tinyblas_f32_dot(&lw.gate_inp[e * hidden..(e + 1) * hidden], &r)
-                    })
+                    .map(|e| refmath::vec_dot_f32(&lw.gate_inp[e * hidden..(e + 1) * hidden], &r))
                     .collect();
                 moe_logits_all.extend_from_slice(&logits);
 

@@ -13366,7 +13366,9 @@ pub(crate) const Q5_0_WIRE_BYTES_PER_BLOCK: usize = 22;
 /// inline; the reference precomputes them as Q8_K `bsums` — identical
 /// integers). DiffusionGemma lane: correctness-first scalar, no SIMD.
 // index-based loops intentionally mirror the reference C kernel's structure
-#[allow(clippy::needless_range_loop)]
+// unit-tested ports of the reference GENERIC kernels (the DG runtime now
+// uses the ARM-order variants in diffusion_gemma::refmath)
+#[allow(dead_code, clippy::needless_range_loop)]
 pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
     const WIRE: usize = Q4_K_WIRE_BYTES_PER_BLOCK;
     let mut sums = [0f32; 8];
@@ -13458,7 +13460,9 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
 /// its qh bit, accumulate the two half-block integer dots, then scale by
 /// `d_w·d_act`. DiffusionGemma lane: correctness-first scalar, no SIMD.
 // index-based loops intentionally mirror the reference C kernel's structure
-#[allow(clippy::needless_range_loop)]
+// unit-tested ports of the reference GENERIC kernels (the DG runtime now
+// uses the ARM-order variants in diffusion_gemma::refmath)
+#[allow(dead_code, clippy::needless_range_loop)]
 pub(crate) fn q5_0_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
     const WIRE: usize = Q5_0_WIRE_BYTES_PER_BLOCK;
     let mut sumf = 0f32;

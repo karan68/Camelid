@@ -189,6 +189,28 @@ fn dg_encoder_prefill_matches_pinned_llamacpp() {
     };
     eprintln!("encoder prefill done in {:.1}s", t0.elapsed().as_secs_f32());
 
+    // optional: dump camelid's checkpoints for offline ulp forensics
+    if let Ok(dump_dir) = std::env::var("CAMELID_DG_ENC_DUMP_DIR") {
+        let dir = PathBuf::from(&dump_dir);
+        std::fs::create_dir_all(&dir).expect("create camelid dump dir");
+        let write_f32 = |name: &str, data: &[f32]| {
+            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("{name}.bin")), bytes).expect("write dump");
+        };
+        write_f32("inp_region", &trace.inp_scaled);
+        write_f32("result_norm", &trace.result_norm_last);
+        for (l, lt) in trace.layers.iter().enumerate() {
+            write_f32(&format!("Kcur_pos-{l}"), &lt.k);
+            write_f32(&format!("Vcur_normed-{l}"), &lt.v);
+            write_f32(&format!("attn_out-{l}"), &lt.attn_out);
+            write_f32(&format!("ffn_moe_logits-{l}"), &lt.moe_logits);
+            write_f32(&format!("l_out-{l}"), &lt.out_scaled);
+            let tk: Vec<u8> = lt.moe_topk.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(dir.join(format!("ffn_moe_topk-{l}.bin")), tk).expect("write topk");
+        }
+        eprintln!("camelid checkpoints dumped to {dump_dir}");
+    }
+
     let mut rows: Vec<String> = Vec::new();
     let mut first_divergent_layer: Option<usize> = None;
     let mut failures: Vec<String> = Vec::new();

@@ -18,6 +18,44 @@
 
 use crate::tensor::f16_round;
 
+// The reference calls the system libm f32 functions directly; Rust's
+// f32::sin/cos/exp/tanh may lower differently (1-ulp scatter observed on
+// rope angles). Bind the exact symbols.
+#[repr(C)]
+struct SinCosF32 {
+    sinval: f32,
+    cosval: f32,
+}
+
+unsafe extern "C" {
+    fn expf(x: f32) -> f32;
+    fn tanhf(x: f32) -> f32;
+    // Apple's combined sin/cos — the symbol clang emits when a function
+    // computes both sinf(x) and cosf(x) (observed in the pinned dylib's rope
+    // disassembly); NOT bitwise-identical to separate sinf/cosf calls.
+    #[cfg(target_os = "macos")]
+    #[link_name = "__sincosf_stret"]
+    fn sincosf_stret(x: f32) -> SinCosF32;
+}
+
+/// (sin, cos) with the exact semantics of the reference's `__sincosf_stret`.
+#[cfg(target_os = "macos")]
+pub(crate) fn libm_sincosf(x: f32) -> (f32, f32) {
+    let r = unsafe { sincosf_stret(x) };
+    (r.sinval, r.cosval)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn libm_sincosf(x: f32) -> (f32, f32) {
+    (x.sin(), x.cos())
+}
+pub(crate) fn libm_expf(x: f32) -> f32 {
+    unsafe { expf(x) }
+}
+pub(crate) fn libm_tanhf(x: f32) -> f32 {
+    unsafe { tanhf(x) }
+}
+
 /// `ggml_compute_forward_rms_norm_f32` (ops.cpp): the sum of squares
 /// accumulates SEQUENTIALLY IN DOUBLE, `mean = sum/ne` collapses to f32, and
 /// the output is `x[i] * scale * w[i]` (the fused-mul order; the unfused
@@ -61,7 +99,9 @@ pub(crate) fn vec_dot_f32(x: &[f32], y: &[f32]) -> f32 {
     }
     let mut sumf = (acc[0][0] + acc[0][1]) + (acc[0][2] + acc[0][3]);
     for k in np..n {
-        sumf += x[k] * y[k];
+        // the reference's scalar leftover `sumf += x[i]*y[i]` contracts to a
+        // fused fmadd under clang's default -ffp-contract=on
+        sumf = x[k].mul_add(y[k], sumf);
     }
     sumf
 }
@@ -140,7 +180,7 @@ pub(crate) fn softmax_row(row: &mut [f32]) {
         i += 4;
     }
     while i < n {
-        let val = (row[i] - max).exp();
+        let val = libm_expf(row[i] - max);
         sum += val as f64;
         row[i] = val;
         i += 1;
@@ -157,6 +197,9 @@ pub(crate) fn softmax_row(row: &mut [f32]) {
 /// mnpack/tile machinery only groups elements; it never changes a single
 /// element's accumulation order. Engages for f32 matmuls with m%4==0 and
 /// n>=4 (the MoE router here); k must be 4-aligned.
+// retained as the documented tinyBLAS per-element reference order; the
+// graph's shapes empirically take the vec_dot path instead
+#[allow(dead_code)]
 pub(crate) fn tinyblas_f32_dot(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     debug_assert!(a.len().is_multiple_of(4));
@@ -177,6 +220,9 @@ pub(crate) fn tinyblas_f32_dot(a: &[f32], b: &[f32]) -> f32 {
 /// converts to f32 and FMA-accumulates scaled by `d_a*d_b`, and the final
 /// reduction is vaddvq's pairwise tree. Engages for DENSE Q8_0 matmuls
 /// (mul_mat; the MoE expert path uses vec_dot instead).
+// retained as the documented tinyBLAS per-element reference order; the
+// graph's shapes empirically take the vec_dot path instead
+#[allow(dead_code)]
 pub(crate) fn tinyblas_q8_0_dot(weight_wire: &[u8], input: &[crate::tensor::Q8_0Block]) -> f32 {
     const WIRE: usize = 34;
     let mut acc = [0f32; 4];
@@ -243,8 +289,9 @@ pub(crate) fn rope_neox(
     for i in 0..half {
         let ff = factors.map_or(1.0, |f| f[i]);
         let angle = theta / ff;
-        cache[2 * i] = angle.cos();
-        cache[2 * i + 1] = angle.sin();
+        let (sin_v, cos_v) = libm_sincosf(angle);
+        cache[2 * i] = cos_v;
+        cache[2 * i + 1] = sin_v;
         theta *= theta_scale;
     }
     for h in 0..heads {
@@ -253,8 +300,11 @@ pub(crate) fn rope_neox(
             let (c, s) = (cache[2 * i], cache[2 * i + 1]);
             let x0 = vec[base + i];
             let x1 = vec[base + half + i];
-            vec[base + i] = x0 * c - x1 * s;
-            vec[base + half + i] = x0 * s + x1 * c;
+            // decoded from the pinned dylib's vectorized NEOX loop
+            // (ld2 cos/sin, fneg x1, fmul, fmla):
+            //   dst0 = fma(x0, cos, sin*(-x1));  dst1 = fma(x0, sin, cos*x1)
+            vec[base + i] = x0.mul_add(c, -(x1 * s));
+            vec[base + half + i] = x0.mul_add(s, c * x1);
         }
     }
 }
@@ -267,6 +317,199 @@ pub(crate) fn vec_sum_f32(x: &[f32]) -> f32 {
         sum += v as f64;
     }
     sum as f32
+}
+
+/// Per-16 activation sums (the reference precomputes these as Q8_K `bsums`;
+/// camelid's block lacks them — identical integers either way).
+fn bsums16(y: &crate::inference::Q8KBlock) -> [i32; 16] {
+    let mut out = [0i32; 16];
+    for (t, o) in out.iter_mut().enumerate() {
+        *o = y.qs[t * 16..(t + 1) * 16].iter().map(|&q| q as i32).sum();
+    }
+    out
+}
+
+/// `ggml_vec_dot_q4_K_q8_K`, the M4's nrc=1 path (arch/arm/quants.c, the
+/// __ARM_NEON section): per superblock ONE sequential f32 accumulator —
+/// `sumf -= dmin·minsprod` then `sumf += d·(sumi1+sumi2)`, both fused by
+/// clang's default contraction; everything inside is exact integer math
+/// (per-32 bsum pairs × mins; per-64 nibble-group dots × 6-bit scales).
+pub(crate) fn q4_k_dot_arm(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    const WIRE: usize = 144;
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d = y.d * crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = y.d * crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let sc = &block[4..16];
+        let qs = &block[16..144];
+
+        // 6-bit scale/min unpack (kmask scheme; same values as the generic)
+        let mut utmp = [0u32; 3];
+        utmp[0] = u32::from_le_bytes([sc[0], sc[1], sc[2], sc[3]]);
+        utmp[1] = u32::from_le_bytes([sc[4], sc[5], sc[6], sc[7]]);
+        utmp[2] = u32::from_le_bytes([sc[8], sc[9], sc[10], sc[11]]);
+        const KMASK1: u32 = 0x3f3f3f3f;
+        const KMASK2: u32 = 0x0f0f0f0f;
+        const KMASK3: u32 = 0x03030303;
+        let mins8 = [
+            utmp[1] & KMASK1,
+            ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4),
+        ];
+        let scales_w = [
+            utmp[0] & KMASK1,
+            (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4),
+        ];
+        let scale_at = |g: usize| -> i32 { ((scales_w[g / 4] >> (8 * (g % 4))) & 0xff) as i32 };
+        let min_at = |g: usize| -> i32 { ((mins8[g / 4] >> (8 * (g % 4))) & 0xff) as i32 };
+
+        // mins side: per-32 activation sums × mins (exact integers)
+        let bs = bsums16(y);
+        let mut prod = 0i64;
+        for g in 0..8 {
+            prod += ((bs[2 * g] + bs[2 * g + 1]) as i64) * min_at(g) as i64;
+        }
+        sumf = (-dmin).mul_add(prod as f32, sumf);
+
+        // main side: FOUR 32-byte q4 chunks per superblock (the reference's
+        // QK_K/64 loop): chunk j's low nibbles dot q8[64j..64j+32] with
+        // scales[2j], its high nibbles dot q8[64j+32..64j+64] with
+        // scales[2j+1] — 8 scale groups total
+        let mut sumi1 = 0i64;
+        let mut sumi2 = 0i64;
+        for j in 0..4 {
+            let q4 = &qs[j * 32..(j + 1) * 32];
+            let q8 = &y.qs[j * 64..(j + 1) * 64];
+            let mut lo = 0i64;
+            let mut hi = 0i64;
+            for t in 0..32 {
+                lo += ((q4[t] & 0xf) as i64) * q8[t] as i64;
+                hi += ((q4[t] >> 4) as i64) * q8[32 + t] as i64;
+            }
+            sumi1 += lo * scale_at(2 * j) as i64;
+            sumi2 += hi * scale_at(2 * j + 1) as i64;
+        }
+        sumf = d.mul_add((sumi1 + sumi2) as f32, sumf);
+    }
+    sumf
+}
+
+/// `ggml_vec_dot_q6_K_q8_K`, the M4's nrc=1 path (__ARM_NEON section): the
+/// 6-bit values dot UNSIGNED against q8 with the -32 offset folded out via
+/// `isum - 32·isum_mins` (bsums × int scales); the only float op per
+/// superblock is the fused `sum += d_all·y.d·(…)`.
+pub(crate) fn q6_k_dot_arm(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    const WIRE: usize = 210;
+    let mut sum = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d_all = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+
+        let bs = bsums16(y);
+        let mut isum_mins = 0i64;
+        for t in 0..16 {
+            isum_mins += bs[t] as i64 * (scales[t] as i8) as i64;
+        }
+
+        // unsigned 6-bit rebuild, per 128-value halves, 16-value groups × scale
+        let mut isum = 0i64;
+        for half in 0..2 {
+            let qlh = &ql[half * 64..(half + 1) * 64];
+            let qhh = &qh[half * 32..(half + 1) * 32];
+            let q8 = &y.qs[half * 128..(half + 1) * 128];
+            let sc = &scales[half * 8..(half + 1) * 8];
+            // value layout mirrors the reference rebuild: for l in 0..32 the
+            // four interleaved streams (ql lo/hi × qh 2-bit fields)
+            let mut group_sums = [0i64; 8];
+            for l in 0..32 {
+                let v0 = ((qlh[l] & 0xf) | ((qhh[l] & 3) << 4)) as i64;
+                let v1 = ((qlh[32 + l] & 0xf) | (((qhh[l] >> 2) & 3) << 4)) as i64;
+                let v2 = ((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) as i64;
+                let v3 = ((qlh[32 + l] >> 4) | (((qhh[l] >> 6) & 3) << 4)) as i64;
+                group_sums[l / 16] += v0 * q8[l] as i64;
+                group_sums[2 + l / 16] += v1 * q8[32 + l] as i64;
+                group_sums[4 + l / 16] += v2 * q8[64 + l] as i64;
+                group_sums[6 + l / 16] += v3 * q8[96 + l] as i64;
+            }
+            for g in 0..8 {
+                isum += group_sums[g] * (sc[g] as i8) as i64;
+            }
+        }
+        sum = (d_all * y.d).mul_add((isum - 32 * isum_mins) as f32, sum);
+    }
+    sum
+}
+
+/// The shared float pattern of `ggml_vec_dot_q5_0_q8_0` and
+/// `ggml_vec_dot_q8_0_q8_0` NEON bodies: blocks processed in PAIRS with two
+/// 4-lane accumulators (even/odd), per block lane L covering value indices
+/// {4L..4L+3} ∪ {16+4L..16+4L+3} (chained lo/hi vdotq), lane-FMA scaled by
+/// `d_w·d_a`, reduced as `vaddvq(even) + vaddvq(odd)`. Block counts here are
+/// always even (66 dense / 22 expert), so the scalar tail never runs.
+fn q0_pair_dot(
+    weights: impl Fn(usize, usize) -> i32,
+    n_blocks: usize,
+    d_w: impl Fn(usize) -> f32,
+    input: &[crate::tensor::Q8_0Block],
+) -> f32 {
+    debug_assert!(n_blocks.is_multiple_of(2), "reference tail not ported");
+    let mut acc = [[0f32; 4]; 2];
+    for (i, y) in input.iter().enumerate() {
+        let s = d_w(i) * y.scale;
+        let par = i % 2;
+        for l in 0..4 {
+            let mut lane = 0i32;
+            for t in 0..4 {
+                lane += weights(i, 4 * l + t) * y.quants[4 * l + t] as i32;
+                lane += weights(i, 16 + 4 * l + t) * y.quants[16 + 4 * l + t] as i32;
+            }
+            acc[par][l] = (lane as f32).mul_add(s, acc[par][l]);
+        }
+    }
+    ((acc[0][0] + acc[0][1]) + (acc[0][2] + acc[0][3]))
+        + ((acc[1][0] + acc[1][1]) + (acc[1][2] + acc[1][3]))
+}
+
+/// `ggml_vec_dot_q5_0_q8_0` (NEON pair structure; expert/down rows).
+pub(crate) fn q5_0_dot_arm(weight_wire: &[u8], input: &[crate::tensor::Q8_0Block]) -> f32 {
+    const WIRE: usize = 22;
+    let n_blocks = weight_wire.len() / WIRE;
+    let d_w = |i: usize| {
+        crate::tensor::f16_bits_to_f32(u16::from_le_bytes([
+            weight_wire[i * WIRE],
+            weight_wire[i * WIRE + 1],
+        ]))
+    };
+    let weights = |i: usize, idx: usize| -> i32 {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+        let qs = &block[6..22];
+        let (nib, bit) = if idx < 16 {
+            ((qs[idx] & 0x0f) as i32, (qh >> idx) & 1)
+        } else {
+            ((qs[idx - 16] >> 4) as i32, (qh >> idx) & 1)
+        };
+        (nib | ((bit as i32) << 4)) - 16
+    };
+    q0_pair_dot(weights, n_blocks, d_w, input)
+}
+
+/// `ggml_vec_dot_q8_0_q8_0` (NEON pair structure; expert/mul_mat_id rows —
+/// the DENSE Q8_0 path is tinyBLAS, see `tinyblas_q8_0_dot`).
+pub(crate) fn q8_0_dot_arm(weight_wire: &[u8], input: &[crate::tensor::Q8_0Block]) -> f32 {
+    const WIRE: usize = 34;
+    let n_blocks = weight_wire.len() / WIRE;
+    let d_w = |i: usize| {
+        crate::tensor::f16_bits_to_f32(u16::from_le_bytes([
+            weight_wire[i * WIRE],
+            weight_wire[i * WIRE + 1],
+        ]))
+    };
+    let weights = |i: usize, idx: usize| -> i32 { (weight_wire[i * WIRE + 2 + idx] as i8) as i32 };
+    q0_pair_dot(weights, n_blocks, d_w, input)
 }
 
 #[cfg(test)]
