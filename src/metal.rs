@@ -7197,6 +7197,7 @@ fn encode_gemma4_q8_matmul(
 /// only the bound pipeline differs (it reads 18-byte Q4_0 wire blocks and
 /// unpacks nibbles inline). `scalar` holds blocks_per_row at offset 0 and rows
 /// at offset 4, exactly as the Q8 path.
+#[cfg(target_os = "macos")]
 fn encode_gemma4_q4_0_matmul(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
