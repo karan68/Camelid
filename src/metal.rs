@@ -5337,6 +5337,7 @@ pub fn try_gemma4_q4_0_matmul_f32y(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub fn try_gemma4_ffn(
+    fmt: GemmaWireFmt,
     h_in: &[f32],
     ffn_norm: &[f32],
     post_ffw_norm: &[f32],
@@ -5346,7 +5347,7 @@ pub fn try_gemma4_ffn(
     down_wire: &[u8],
     ffn_dim: usize,
 ) -> Option<Vec<f32>> {
-    const WIRE: usize = 34;
+    let wire: usize = fmt.wire_bytes();
     let hidden = h_in.len();
     if hidden == 0
         || ffn_dim == 0
@@ -5359,9 +5360,9 @@ pub fn try_gemma4_ffn(
     }
     let bpr_hidden = hidden / 32;
     let bpr_ffn = ffn_dim / 32;
-    if gate_wire.len() != ffn_dim * bpr_hidden * WIRE
-        || up_wire.len() != ffn_dim * bpr_hidden * WIRE
-        || down_wire.len() != hidden * bpr_ffn * WIRE
+    if gate_wire.len() != ffn_dim * bpr_hidden * wire
+        || up_wire.len() != ffn_dim * bpr_hidden * wire
+        || down_wire.len() != hidden * bpr_ffn * wire
     {
         return None;
     }
@@ -5383,6 +5384,7 @@ pub fn try_gemma4_ffn(
     let cb = k.queue.new_command_buffer();
     let e = cb.new_compute_command_encoder();
     encode_gemma4_ffn(
+        fmt,
         e,
         k,
         &mut keep,
@@ -7155,6 +7157,48 @@ fn encode_q8_matmul_f32y(
     );
 }
 
+/// Wire quant format of a gemma4 weight tensor for the GPU GEMV dispatch.
+/// `Q8_0` = 34-byte blocks (f16 scale + 32 i8); `Q4_0` = 18-byte blocks (f16
+/// scale + 16 nibble bytes). Un-gated so it can appear in the public
+/// `try_gemma4_ffn` signature on every target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GemmaWireFmt {
+    Q8_0,
+    Q4_0,
+}
+
+impl GemmaWireFmt {
+    /// Bytes per 32-weight wire block.
+    pub fn wire_bytes(self) -> usize {
+        match self {
+            GemmaWireFmt::Q8_0 => 34,
+            GemmaWireFmt::Q4_0 => 18,
+        }
+    }
+}
+
+/// Dispatch the gemma4 GPU GEMV for the weight's wire format. Q8_0 and Q4_0
+/// share the same `(y, weight, out, scalar, rows)` contract — only the kernel
+/// (and the per-block byte stride it reads) differs — so callers in the resident
+/// graph stay format-agnostic.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_gemma4_matmul(
+    fmt: GemmaWireFmt,
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    match fmt {
+        GemmaWireFmt::Q8_0 => encode_gemma4_q8_matmul(e, k, y, weight, out, scalar, rows),
+        GemmaWireFmt::Q4_0 => encode_gemma4_q4_0_matmul(e, k, y, weight, out, scalar, rows),
+    }
+}
+
 /// Encode one f32-activation × wire-Q8 GEMV into the shared encoder:
 /// `out[r] = Σ_b w_scale[b] · Σ_j (w_i8[b][j] · y[b*32+j])`. The weight is the raw
 /// 34-byte GGUF wire layout (f16 scale + 32 i8). Gemma's resident decode always
@@ -7243,6 +7287,7 @@ fn encode_gemma4_q4_0_matmul(
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn encode_gemma4_ffn(
+    fmt: GemmaWireFmt,
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
     keep: &mut Vec<Buffer>,
@@ -7291,8 +7336,17 @@ fn encode_gemma4_ffn(
     }
 
     encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
-    encode_gemma4_q8_matmul(e, k, &normf, gate_w, &gate_buf, &gateup_scalar, ffn_dim);
-    encode_gemma4_q8_matmul(e, k, &normf, up_w, &up_buf, &gateup_scalar, ffn_dim);
+    encode_gemma4_matmul(
+        fmt,
+        e,
+        k,
+        &normf,
+        gate_w,
+        &gate_buf,
+        &gateup_scalar,
+        ffn_dim,
+    );
+    encode_gemma4_matmul(fmt, e, k, &normf, up_w, &up_buf, &gateup_scalar, ffn_dim);
     encode_binary(
         e,
         &k.gelu_mul_pipeline,
@@ -7302,7 +7356,7 @@ fn encode_gemma4_ffn(
         &geglu_n,
         ffn_dim,
     );
-    encode_gemma4_q8_matmul(e, k, &act_buf, down_w, &down_buf, &down_scalar, hidden);
+    encode_gemma4_matmul(fmt, e, k, &act_buf, down_w, &down_buf, &down_scalar, hidden);
     encode_rms_norm_f32(e, k, &down_buf, &postnorm_w, &dn_buf, &rms_scalar);
     encode_binary(
         e,
@@ -7814,6 +7868,7 @@ fn encode_gemma4_layer(
         owns_kv,
     );
     encode_gemma4_ffn(
+        GemmaWireFmt::Q8_0,
         e,
         k,
         keep,
@@ -11953,6 +12008,7 @@ pub fn try_gemma4_q4_0_matmul_f32y(
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 pub fn try_gemma4_ffn(
+    _fmt: GemmaWireFmt,
     _h_in: &[f32],
     _ffn_norm: &[f32],
     _post_ffw_norm: &[f32],
@@ -13291,9 +13347,104 @@ mod tests {
         let want: Vec<f32> = h_in.iter().zip(&dn).map(|(a, b)| a + b).collect();
 
         let got = try_gemma4_ffn(
-            &h_in, &ffn_norm, &post_norm, eps, &gate_wire, &up_wire, &down_wire, ffn_dim,
+            GemmaWireFmt::Q8_0,
+            &h_in,
+            &ffn_norm,
+            &post_norm,
+            eps,
+            &gate_wire,
+            &up_wire,
+            &down_wire,
+            ffn_dim,
         )
         .expect("gemma4 ffn");
+        for (a, b) in got.iter().zip(&want) {
+            assert!((a - b).abs() < 1.0e-2, "{a} != {b}");
+        }
+    }
+
+    // GPU QAT integration parity gate: the WHOLE gemma4 FFN sub-block (rms_norm ->
+    // gate/up GEMV -> GeGLU -> down GEMV -> post_ffw_norm -> residual) run on the
+    // GPU with Q4_0 weights must match the same chain on CPU. This proves the Q4_0
+    // wire GEMV composes correctly inside the real gemma4 graph — the rung above
+    // the standalone kernel test, and the integration gate for moving the QAT
+    // rows' dominant cost (the FFN) onto the GPU.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_gemma4_ffn_q4_matches_cpu() {
+        if !detect_metal_device().available {
+            return;
+        }
+        use crate::inference::{gemma4::gelu_tanh, q4_0_wire_block_dequant};
+        let hidden = 128usize; // bpr_hidden = 4
+        let ffn_dim = 256usize; // bpr_ffn = 8
+        let eps = 1.0e-6f32;
+        // Build each weight as (Q4_0 wire bytes, dequantized f32 rows) so the CPU
+        // reference dots the SAME values the GPU's f32×dequant Q4_0 GEMV reads.
+        let make_weight = |rows: usize, in_dim: usize, seed: usize| -> (Vec<u8>, Vec<Vec<f32>>) {
+            let mut wire = Vec::new();
+            let mut deq = Vec::new();
+            for r in 0..rows {
+                let mut drow = vec![0.0f32; in_dim];
+                for b in 0..(in_dim / 32) {
+                    let scale = (((r + b + seed) % 7) as f32 + 1.0) * 0.015;
+                    let mut blk = [0u8; 18];
+                    blk[0..2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                    for (j, slot) in blk[2..].iter_mut().enumerate() {
+                        *slot = ((r * 13 + b * 7 + j * 5 + seed) % 256) as u8;
+                    }
+                    let d = q4_0_wire_block_dequant(&blk);
+                    for (i, &v) in d.iter().enumerate() {
+                        drow[b * 32 + i] = v;
+                    }
+                    wire.extend_from_slice(&blk);
+                }
+                deq.push(drow);
+            }
+            (wire, deq)
+        };
+        let (gate_wire, gate_deq) = make_weight(ffn_dim, hidden, 1);
+        let (up_wire, up_deq) = make_weight(ffn_dim, hidden, 7);
+        let (down_wire, down_deq) = make_weight(hidden, ffn_dim, 3);
+        let h_in: Vec<f32> = (0..hidden)
+            .map(|i| ((i as f32 % 13.0) - 6.0) * 0.1)
+            .collect();
+        let ffn_norm: Vec<f32> = (0..hidden).map(|i| 0.8 + (i as f32 % 5.0) * 0.05).collect();
+        let post_norm: Vec<f32> = (0..hidden).map(|i| 0.9 + (i as f32 % 3.0) * 0.03).collect();
+        let rms = |x: &[f32], w: &[f32]| -> Vec<f32> {
+            let mss = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+            let inv = (mss + eps).powf(-0.5);
+            x.iter().zip(w).map(|(v, wv)| v * inv * wv).collect()
+        };
+        let matmul = |deq: &[Vec<f32>], x: &[f32]| -> Vec<f32> {
+            deq.iter()
+                .map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum())
+                .collect()
+        };
+        let normf = rms(&h_in, &ffn_norm);
+        let gate = matmul(&gate_deq, &normf);
+        let up = matmul(&up_deq, &normf);
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| gelu_tanh(*g) * u)
+            .collect();
+        let down = matmul(&down_deq, &act);
+        let dn = rms(&down, &post_norm);
+        let want: Vec<f32> = h_in.iter().zip(&dn).map(|(a, b)| a + b).collect();
+
+        let got = try_gemma4_ffn(
+            GemmaWireFmt::Q4_0,
+            &h_in,
+            &ffn_norm,
+            &post_norm,
+            eps,
+            &gate_wire,
+            &up_wire,
+            &down_wire,
+            ffn_dim,
+        )
+        .expect("gemma4 q4 ffn");
         for (a, b) in got.iter().zip(&want) {
             assert!((a - b).abs() < 1.0e-2, "{a} != {b}");
         }
