@@ -66,6 +66,7 @@ export default function ChatWorkspace({
 }) {
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
   const [showControls, setShowControls] = useState(false)
+  const [showAllMessages, setShowAllMessages] = useState(false)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
@@ -426,7 +427,7 @@ export default function ChatWorkspace({
         </div>
       </div>
 
-      <div className={`cxcomposer__status is-${statusTone}`} title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
+      <div className={`cxcomposer__status is-${statusTone}`} role="status" aria-live="polite" title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
         <StatusDot tone={statusTone} pulse={selectedModelRunnable} />
         <strong className="cxcomposer__status-label">{runtimeStatusLabel}</strong>
         <span className="cxcomposer__status-sep" aria-hidden="true">·</span>
@@ -481,7 +482,16 @@ export default function ChatWorkspace({
                   ))}
                 </div>
               )}
-              {visibleMessages.map((message, index) => {
+              {/* Long-thread windowing (Phase 7): render the latest 60 turns;
+                  earlier turns mount on demand. Keeps streaming smooth without
+                  a virtualization dependency. */}
+              {!showAllMessages && visibleMessages.length > 60 && (
+                <button type="button" className="cxchat__show-earlier" onClick={() => setShowAllMessages(true)}>
+                  Show {visibleMessages.length - 60} earlier messages
+                </button>
+              )}
+              {(showAllMessages ? visibleMessages : visibleMessages.slice(-60)).map((message) => {
+                const index = visibleMessages.indexOf(message)
                 const priorUserMessage = message.role === 'assistant'
                   ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')
                   : null

@@ -224,6 +224,16 @@ assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be
 assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
 assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
 
+/* ---- Command palette + shortcuts (Phase 7) ---- */
+const paletteSource = read('../src/components/CommandPalette.jsx')
+const frontendReadmeSource = read('../README.md')
+assert.match(appSource, /<CommandPalette/, 'the app must mount the command palette')
+assert.match(appSource, /<ShortcutsOverlay/, 'the app must mount the shortcuts overlay')
+assert.match(appSource, /lazy\(\(\) => import\('\.\/views\//, 'non-chat views must stay route-split')
+assert.match(paletteSource, /readiness still gates send/, 'palette model switching must stay gate-honest')
+assert.match(paletteSource, /camelid:open-ledger/, 'palette ledger jumps must use the shared deep-link event')
+assert.match(frontendReadmeSource, /readiness-gate semantics are \*\*unchanged\*\*/, 'frontend README must state gate semantics are unchanged after the overhaul')
+
 /* ---- Session telemetry (Phase 6) ---- */
 assert.match(telemetryViewSource, /operational telemetry — not compatibility evidence/, 'every telemetry surface must carry the not-evidence affordance')
 assert.match(telemetryViewSource, /useState\(false\)/, 'prompt reveal must default to redacted')

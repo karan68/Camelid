@@ -78,12 +78,12 @@ function LedgerRow({ row, focused, registerRef }) {
 
       <div className="ledger-row__columns">
         <div className="ledger-row__col">
-          <h4 className="ledger-row__col-title">Proven</h4>
+          <h3 className="ledger-row__col-title">Proven</h3>
           <p className="ledger-row__copy">{displayCapabilityCopy(row.evidence) || 'No evidence copy advertised for this row.'}</p>
           {row.tested_context && <p className="ledger-row__meta">tested context: <code>{row.tested_context}</code></p>}
         </div>
         <div className="ledger-row__col ledger-row__col--not-claimed">
-          <h4 className="ledger-row__col-title">Not claimed</h4>
+          <h3 className="ledger-row__col-title">Not claimed</h3>
           <p className="ledger-row__copy">{displayCapabilityCopy(row.full_support_blockers) || 'This row advertises no explicit boundary copy; nothing beyond the proven column is claimed.'}</p>
           {row.support_scope && <p className="ledger-row__meta">scope: <code>{row.support_scope}</code></p>}
         </div>
@@ -91,7 +91,7 @@ function LedgerRow({ row, focused, registerRef }) {
 
       {open && (
         <div className="ledger-row__drill">
-          <h4 className="ledger-row__col-title">Evidence checklist</h4>
+          <h3 className="ledger-row__col-title">Evidence checklist</h3>
           <ul className="ledger-row__tracks">
             {tracks.map((track) => (
               <li key={track.field} className="ledger-row__track">
@@ -122,7 +122,7 @@ function LedgerRow({ row, focused, registerRef }) {
 
           {!supported && row.next_step && (
             <div className="ledger-row__promotion">
-              <h4 className="ledger-row__col-title">Promotion path</h4>
+              <h3 className="ledger-row__col-title">Promotion path</h3>
               <p className="ledger-row__copy">{displayCapabilityCopy(row.next_step)}</p>
               <p className="ledger-row__meta">An honest checklist, not a promise — this row moves only when the evidence above does.</p>
             </div>

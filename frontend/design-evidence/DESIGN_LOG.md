@@ -440,3 +440,68 @@ Branch: `feat/frontend-phase-6-observability`.
   stretching the cadence), red strip cells.
 - Screenshots: telemetry × dark/light × 1440/390 + populated/empty/unreachable shots
   in design-evidence/phase-6/.
+
+---
+
+## Phase 7 — Polish, command palette, accessibility, performance (2026-06-12)
+
+Branch: `feat/frontend-phase-7-polish`. The closing phase.
+
+### What shipped
+
+- **Command palette** (Cmd/Ctrl+K): navigate all 12 views, new conversation, theme
+  cycle, switch model (hint stays gate-honest: "readiness still gates send"), and jump
+  to any compatibility row — reusing the same `camelid:open-ledger` event the chips
+  use, live-verified to land focused on the row. Combobox/listbox semantics, arrow/
+  enter/esc keyboard model.
+- **"?" shortcut overlay** documenting the full keyboard map (outside text fields).
+- **Accessibility**: Lighthouse a11y **100 on chat, 98 on compatibility** (gate ≥95).
+  The one real fix it surfaced: interactive Evidence Chips now carry an explicit
+  aria-label (the topbar gate chip loses its visible label at mobile widths and was
+  name-less). Composer status strip became a polite live region; heading order
+  normalized in the ledger; icon-per-state chips (Phase 1) already satisfied
+  color-independence.
+- **Performance**: route-level code splitting — chat stays eager, the other 11 views
+  load on first visit. Initial JS chunk **104.10 kB gz** (was 163.32 monolithic);
+  total across all chunks **176.39 kB gz** vs the 229.9 budget (1.6× the 143.76
+  baseline — met with 23% headroom). Long-conversation windowing (latest 60 turns +
+  "show earlier" expander; the telemetry log was already windowed) instead of a
+  virtualization dependency. Fixed an ineffective dynamic import in the poll loop.
+- **Responsive**: the baseline-recorded observatory run-details overflow at 390px is
+  fixed (panel stacks under the canvas ≤700px; live-measured 0px horizontal overflow).
+  Full audit captured at 390/768/1024/1440.
+- **Identity**: SVG favicon (instrument sparkle, steel→brass→copper on the dark base)
+  + theme-color meta; wordmark already carried by Space Grotesk since Phase 1.
+- **frontend/README.md**: new views/features/shortcuts section with the explicit
+  statement that readiness-gate semantics are unchanged (smoke-asserted).
+
+### Tried and rejected
+
+- A virtualization library for message lists: rejected — windowing achieves the
+  perf goal with zero dependencies and no scroll-anchoring edge cases during
+  streaming.
+- Chasing compatibility from 98 to 100: the residual flag is a heading-order
+  nit inside contract-rendered sections; restructuring real content hierarchy for a
+  scanner point wasn't worth bending the ledger's semantics. 98 ≥ 95 gate.
+
+### Gate results
+
+- 10/10 smokes green (smoke:ui extended with palette/overlay/code-split/README
+  assertions); readiness-gate libs: empty diff — byte-identical through all 8 phases.
+- Lighthouse a11y: chat 100, compatibility 98 (both ≥95).
+- Bundle budget met: 176.39 kB gz total / 104.10 initial vs 229.9 ceiling.
+- Final screenshot set: 12 views × dark/light × 1440/390 (48 shots, self-check
+  distinct) + 24-shot responsive audit at 768/1024 + palette/shortcuts/observatory-
+  fix evidence. design-evidence/phase-7/.
+
+### Before / after (the whole overhaul)
+
+Phase 0 baseline → Phase 7: a Gemini-styled chat shell with ad-hoc status badges and
+a Google-Fonts CDN dependency became an instrument-panel operator console with one
+claim component (the Evidence Chip, cited everywhere, deep-linked to a live-contract
+evidence ledger), a chat surface with telemetry-honest footers and contract-gated
+controls, a model inspector + tokenizer playground, a gated API workbench whose curl
+examples run verbatim, a real-traffic-only session telemetry dashboard, a command
+palette, AA-contrast-smoked dual themes on self-hosted fonts, and a 10-smoke gate
+suite (from 8, one of which was dead) — at 104 kB gz initial JS against a 143.76 kB
+baseline monolith, with the fail-closed chat gate byte-identical throughout.

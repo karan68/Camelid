@@ -142,6 +142,7 @@ export function EvidenceChip({
         type="button"
         className={classes}
         data-state={resolvedState}
+        aria-label={`${EVIDENCE_STATE_LABELS[resolvedState]} claim: ${typeof text === 'string' ? text : status || 'details'} — view source`}
         aria-expanded={open}
         aria-controls={open ? popId : undefined}
         onClick={() => setOpen((v) => !v)}

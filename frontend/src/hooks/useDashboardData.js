@@ -7,7 +7,7 @@ import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversatio
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
-import { recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
+import { getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -630,7 +630,6 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const tick = async () => {
       if (cancelled) return
       await loadDashboard({ silent: true })
-      const { getTelemetrySnapshot } = await import('../lib/telemetryLog')
       const last = getTelemetrySnapshot().health.at(-1)
       delay = last?.ok === false ? Math.min(delay * 2, 20000) : 2500
       if (!cancelled) timer = setTimeout(tick, delay)
