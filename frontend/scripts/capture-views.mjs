@@ -34,7 +34,7 @@ if (!executablePath) throw new Error('No local Chrome found for capture')
 
 await mkdir(outDir, { recursive: true })
 const captured = []
-const browser = await puppeteer.launch({ executablePath, headless: 'new' })
+const browser = await puppeteer.launch({ executablePath, headless: 'new', args: ['--enable-gpu', '--use-angle=metal', '--ignore-gpu-blocklist'] })
 
 try {
   for (const theme of themes) {

@@ -4,8 +4,8 @@
 
    1. The telemetry store reduces a realistic real-event sequence correctly
       (lifecycle, prefill, decode, KV, sampler, receipt, workers, errors).
-   2. The view renders the honest empty states ("Waiting for live Camelid
-      telemetry." / "Start a local inference to watch Camelid work.").
+   2. The view renders the honest empty states (Phase 6.1 Flow Bench: the
+      no-traffic copy + the never-fake-motion promise; stillness is honest).
    3. No renderer module spawns activity outside onEvent — visual activity
       may only originate from real backend events. */
 
@@ -114,15 +114,17 @@ try {
   })
 
   // --- 2. honest empty states render --------------------------------------
-  check('view: waiting state copy renders before telemetry connects', () => {
+  check('view: honest no-traffic state renders with no requests', () => {
     const html = renderToStaticMarkup(React.createElement(InferenceObservatoryView, { apiBase: 'http://127.0.0.1:1' }))
-    assert.ok(html.includes('Waiting for live Camelid telemetry.'), 'waiting copy missing')
-    assert.ok(html.includes('Inference Observatory'), 'title missing')
-    assert.ok(html.includes('observatory-canvas'), 'canvas missing')
+    assert.ok(html.includes('No session traffic yet'), 'honest empty copy missing')
+    assert.ok(html.includes('The Flow Bench'), 'title missing')
+    assert.ok(html.includes('flowbench'), 'bench stage missing')
+    assert.ok(html.includes('operational telemetry'), 'not-evidence affordance missing')
   })
-  check('view: idle invitation copy exists in source', () => {
+  check('view: never-fake-motion promise exists in source', () => {
     const source = readFileSync(resolve(frontendRoot, 'src/views/InferenceObservatoryView.jsx'), 'utf8')
-    assert.ok(source.includes('Start a local inference to watch Camelid work.'))
+    assert.ok(source.includes('never fake motion'))
+    assert.ok(source.includes('the bench stays still until a real request runs'))
   })
 
   // --- 3. renderers only animate from real events --------------------------

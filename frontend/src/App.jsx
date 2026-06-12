@@ -363,7 +363,7 @@ function App() {
 
           {tab === 'cluster' && <ClusterView showNotice={showNotice} />}
 
-          {tab === 'observatory' && <InferenceObservatoryView apiBase={apiBase} />}
+          {tab === 'observatory' && <InferenceObservatoryView apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
           </Suspense>
         </div>
       </main>

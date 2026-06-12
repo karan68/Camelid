@@ -231,6 +231,20 @@ assert.doesNotMatch(inferenceTelemetryHookSource, /useMemo\(\(\) => createInfere
 assert.doesNotMatch(inferenceTelemetryHookSource, /store\.disconnect\(\)/, 'unmount must not tear down the shared stream — navigation would wipe run state (DEFECT 2)')
 assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must connect the observatory stream at startup, not first view mount (DEFECT 1)')
 
+/* ---- Flow Bench (Phase 6.1) ---- */
+const flowBenchSource = read('../src/components/observatory/FlowBench.jsx')
+const flowBenchEngineSource = read('../src/lib/observatory/flowBench.js')
+const observatoryViewSource = read('../src/views/InferenceObservatoryView.jsx')
+assert.match(observatoryViewSource, /operational telemetry — not compatibility evidence/, 'the Flow Bench view must carry the telemetry-not-evidence affordance')
+assert.match(observatoryViewSource, /flowbench-rail__tiles/, 'the instrument rail tiles must be present')
+assert.match(flowBenchSource, /aria-hidden="true"/, 'the sim canvases must be aria-hidden; the rail and log carry the information')
+assert.match(flowBenchSource, /reducedMotion/, 'reduced motion must render a static field instead of animation')
+assert.match(flowBenchSource, /visibilitychange/, 'the sim must pause on document.hidden')
+assert.match(flowBenchSource, /subscribeLifecycle/, 'the sim must consume the shared lifecycle bus — no separate measurement path')
+assert.doesNotMatch(flowBenchEngineSource, /--color-verified|--color-evidence/, 'copper and amber are claim colors and are forbidden in the fluid')
+assert.doesNotMatch(flowBenchSource, /promptText|messageContent|\.content\b/, 'the sim consumes counts and timings only, never content')
+assert.match(telemetryLogSource, /export function beginRequest/, 'request ids must be minted at send time so sim and metrics logs match one-to-one')
+
 /* ---- Command palette + shortcuts (Phase 7) ---- */
 const paletteSource = read('../src/components/CommandPalette.jsx')
 const frontendReadmeSource = read('../README.md')
