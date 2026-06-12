@@ -815,7 +815,7 @@
 .models-view.cxv .cxv-panel > .models-compatibility-strip,
 .models-view.cxv .cxv-panel > .models-summary-strip { margin: 0; }
 
-/* Models grid/form helpers ported from legacy components.css/layout.css so the
+/* Models grid/form helpers ported from the retired pre-redesign sheets so the
    view's setup forms, readiness grids, and catalog grid keep their layout once
    the legacy sheets are dropped. */
 .camelid-view--page .models-setup-grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(2, minmax(0, 1fr)); }

@@ -239,3 +239,18 @@ Note: the observatory pair was captured in a second pass the same day (same head
 backend state — tiny fixture loaded, chat gate blocked, observatory in its honest
 "waiting for live telemetry" empty state). Baseline finding for the Phase 7 responsive
 audit: at 390px the observatory Run Details panel overflows the viewport horizontally.
+
+---
+
+## Errata (appended in Phase 2 pre-work — trust BASELINE.md only together with this section)
+
+1. **§7 fonts claim was false.** At baseline, `tokens.css:11` imported Plus Jakarta
+   Sans/Outfit from fonts.googleapis.com at runtime — the baseline did NOT render
+   fully offline. Phase 1 replaced the CDN import with self-hosted Fontsource files;
+   offline rendering became true (and testable) only from Phase 1 onward.
+2. **§9 understated how broken `smoke:ui` was.** It recorded a single stale README
+   assertion, but every assertion after that first failure was dead code: the script
+   read the already-deleted `src/styles/components.css` (readFileSync would throw)
+   and asserted pre-redesign TopBar internals (`exactHintDetail`) that no longer
+   exist in `components/TopBar.jsx`. The smoke was re-baselined in Phase 2 pre-work
+   and only then re-joined the standing gate set.

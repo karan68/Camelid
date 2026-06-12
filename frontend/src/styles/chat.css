@@ -356,7 +356,7 @@
   .cxturn__user-chip { max-width: 90%; }
 }
 
-/* ---- Ported from legacy components.css: streaming-loader + diagnostics-trigger
+/* ---- Ported from the retired pre-redesign sheet: streaming-loader + diagnostics-trigger
    cosmetics, so chat.css fully owns the chat surface once legacy is dropped. ---- */
 .streaming-loader-compact { padding: 0 0 8px; }
 .streaming-loader-dot-1 { animation-delay: 0ms; }

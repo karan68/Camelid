@@ -5,7 +5,8 @@
    Requires Google Chrome installed (driven via puppeteer-core; no bundled
    browser download). */
 
-import { mkdir } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import puppeteer from 'puppeteer-core'
 
@@ -32,6 +33,7 @@ const executablePath = CHROME_PATHS.find((p) => existsSync(p))
 if (!executablePath) throw new Error('No local Chrome found for capture')
 
 await mkdir(outDir, { recursive: true })
+const captured = []
 const browser = await puppeteer.launch({ executablePath, headless: 'new' })
 
 try {
@@ -52,6 +54,7 @@ try {
         const file = join(outDir, `${view}-${theme}-${width}.png`)
         await page.screenshot({ path: file })
         console.log(`captured ${file}`)
+        captured.push(file)
       }
     }
     await page.close()
@@ -59,3 +62,17 @@ try {
 } finally {
   await browser.close()
 }
+
+/* Self-check: two different views captured pixel-identical means the app never
+   actually switched views (the hash-routing-doesn't-remount failure mode that
+   once produced 40 identical chat screenshots). Fail loudly. */
+const hashes = new Map()
+for (const file of captured) {
+  const digest = createHash('sha256').update(await readFile(file)).digest('hex')
+  if (hashes.has(digest)) {
+    console.error(`capture self-check FAILED: ${file} is pixel-identical to ${hashes.get(digest)}`)
+    process.exit(1)
+  }
+  hashes.set(digest, file)
+}
+console.log(`capture self-check passed: ${captured.length} screenshots, all distinct`)
