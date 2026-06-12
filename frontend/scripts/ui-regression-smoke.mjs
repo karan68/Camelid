@@ -16,6 +16,7 @@ import {
   shouldCreateConversationForSend,
 } from '../src/lib/chatState.js'
 import { normalizeStoredConversations } from '../src/lib/conversationStorage.js'
+import { conversationToJson, conversationToMarkdown } from '../src/lib/conversationExport.js'
 
 /* ---- Behavioral asserts: conversation selection + stored-stream recovery ---- */
 const oldChat = { id: 'old-chat', title: 'Old chat', messages: [{ role: 'user', content: 'old prompt' }] }
@@ -37,6 +38,27 @@ assert.equal(revivedInterruptedChat.messages[0].finish_reason, 'interrupted', 'r
 assert.equal(revivedInterruptedChat.messages[0].content, '(generation interrupted)', 'blank reloaded interrupted streams should render safely')
 const liveStreamingChat = normalizeStoredConversations([{ id: 'live-chat', messages: [{ id: 'live-assistant', role: 'assistant', content: 'partial', streaming: true, streaming_phase: 'streaming' }] }])[0]
 assert.equal(liveStreamingChat.messages[0].streaming, true, 'live in-memory stream normalization should preserve active generation state')
+
+/* ---- Conversation export must be path-free by construction (I7) ---- */
+const sneakyConversation = {
+  id: 'conv-1',
+  title: 'Export test',
+  model_id: 'llama32_3b_instruct_q8_0',
+  model_path: '/Volumes/Untitled/models/secret.gguf',
+  messages: [{
+    id: 'm1', role: 'assistant', content: 'hello', model_id: 'llama32_3b_instruct_q8_0',
+    model_path: '/Volumes/Untitled/models/secret.gguf',
+    camelid: { backend_path: '/private/tmp/x.gguf' },
+    support_row: { id: 'llama32_3b_instruct_q8_0', status: 'supported_exact_row_smoke', supported: true, manifest_path: '/Users/x/qa/manifest.json' },
+    usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
+    usage_source: 'backend',
+  }],
+}
+for (const exported of [conversationToJson(sneakyConversation), conversationToMarkdown(sneakyConversation)]) {
+  assert.doesNotMatch(exported, /model_path|backend_path|manifest_path|\/Volumes\/|\/private\/tmp|\/Users\//, 'exports must never include filesystem paths — whitelisted fields only')
+}
+assert.match(conversationToJson(sneakyConversation), /telemetry, not support evidence|telemetry_note/, 'exports must carry the telemetry-not-evidence note')
+assert.match(conversationToMarkdown(sneakyConversation), /telemetry, not support evidence/, 'markdown exports must label telemetry as not support evidence')
 
 /* ---- Sources ---- */
 const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8')

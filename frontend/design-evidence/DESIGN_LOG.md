@@ -121,3 +121,78 @@ asserts WCAG AA for all 124 text/status-on-surface pairs in both themes — pass
   initially re-shot the chat view 40× because hash navigation doesn't remount
   (fixed in the harness). Known carry-over: observatory run-details panel still
   overflows at 390px (recorded at baseline; Phase 7 responsive audit scope).
+
+---
+
+## Phase 2 — Chat experience (2026-06-12)
+
+Branch: `feat/frontend-phase-2-chat-experience` (pre-work commits 547a233 + 755a7b1,
+feature commit follows this entry).
+
+### Pre-work (committed separately)
+
+- BASELINE.md errata appended (offline-fonts claim, smoke:ui health overstatement).
+- Deleted three zero-importer pre-redesign orphans (AppSidebar, ConversationDeleteDialog,
+  GlobalNotice); scrubbed stale components.css comment references.
+- capture-views.mjs gained a sha256 self-check that fails the run when two captured
+  views are pixel-identical (the 40-identical-screenshots failure mode); negative-tested.
+- smoke:ui re-baselined: full port/retire ledger in commit 755a7b1; negative-tested
+  (injected copper-token violation fails the run). It is now in the standing gate set.
+
+### What shipped
+
+- **Markdown**: tables (header detection + instrument-grid styling), ordered lists with
+  preserved start numbers, links (http/https/mailto only — any other scheme degrades to
+  visible plain text), italics/strikethrough, and per-language syntax highlighting
+  (python/rust/bash/json families joined js/html/css) — all still rendered as React
+  elements, so there is no innerHTML path at all. New `smoke:markdown` (SSR via vite
+  ssrLoadModule) covers tables/lists/links/highlighting/injection-escaping.
+- **Metadata footer** on completed assistant messages: model id, the Evidence Chip for
+  the row that was active at send time (row id + status snapshot, never paths), token
+  counts labeled `usage` (backend) vs `usage est.` (client estimate), TTFT, tok/s,
+  duration, and a persistent CLIENT-MEASURED tag (I4).
+- **Message actions**: copy (existing), regenerate (truncates the thread at the prior
+  user turn and resends through the same gate-checked sendMessage path — no second send
+  path exists), edit-and-resend on user rows (inline textarea, Enter resends, Esc cancels).
+- **Conversation export** (Markdown/JSON) from Chat history: field-whitelist serializer
+  (`lib/conversationExport.js`) so filesystem paths are excluded by construction; smoke:ui
+  now feeds it a conversation salted with path fields and asserts none survive (I7), plus
+  the telemetry-not-evidence note in both formats.
+- **Generation controls drawer**: system-prompt editor with local presets (leads the
+  request; the code-first policy prompt appends behind it), and the sampling lane —
+  every parameter renders as a guarded "no contract row" Evidence Chip because
+  /api/capabilities advertises no sampling rows (BACKEND_ASKS.md #1). The unlock path is
+  fully wired (`lib/samplingContract.js`: exact-id row match, per-model persistence,
+  contract-gated request overrides) but inert until the contract grows.
+- **Keyboard**: Enter/Shift+Enter (existing), Esc cancels stream (existing), Cmd/Ctrl+K
+  stub jumps to the composer and says the palette ships in Phase 7 (no fake palette).
+
+### Tried and rejected
+
+- marked/DOMPurify/highlight.js: rejected — the renderer is already React-element-based
+  (sanitized by construction); extending it keeps runtime deps at zero and the offline
+  property trivial.
+- Editable sampling controls with a "values are experimental" disclaimer: rejected —
+  I3 says guarded surfaces, not caveated live ones. Controls unlock per-parameter only
+  when the contract advertises the exact row.
+- A second "regenerate" request path in the hook: rejected — regenerate/edit-resend
+  reuse sendMessage with truncate+override options so the chat gate, code-first policy,
+  streaming, and abort handling stay single-sourced.
+
+### Gate results
+
+- Build clean; JS **150.66 kB gz** (Phase 1: 145.85; ceiling 229.9), CSS 20.03 kB gz.
+- All 10 smokes green: streaming, model-state, capability-readiness, 3b-closure,
+  integration (one regex made markup-tolerant for the new keyword highlighting — the
+  escaped-content assertion is intact), observatory, **markdown (new)**, **ui
+  (re-baselined, now standing)**, contrast, tiny (chat verifiably blocked for the
+  unsupported fixture).
+- Readiness-gate libs: empty git diff.
+- Live manual pass against the loaded supported 3B row, driven through the real UI
+  (p2-manual-*.png): chat unlocked; mid-stream abort renders the interrupted warning
+  and keeps partial content; metadata footer renders with TTFT 336ms / tok/s / supported
+  chip; regenerate replaced the reply without duplicating turns. Structured SSE
+  `event: error` mid-stream stays covered by smoke:streaming + smoke:integration
+  (the backend offers no way to trigger one on demand — noted, not hand-waved).
+- Screenshots: chat + history × dark/light × 1440/390 via the harness (self-check
+  passed, 8 distinct) + live-stream evidence set + controls-drawer shot.

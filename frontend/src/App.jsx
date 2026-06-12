@@ -55,7 +55,7 @@ function App() {
     loadingModelId, registerForm, setRegisterForm, externalForm, setExternalForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, latestAssistantMessage, pendingConversation,
-    createConversation, showNewChatLanding, sendMessage, stopGeneration, saveToMemory,
+    createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation,
     installModel, installCatalogModel, cancelModelDownload, activateModel, unloadCurrentModel,
     registerModel, connectExternalModel, loadDashboard, stoppingGeneration,
@@ -79,6 +79,21 @@ function App() {
   }, [])
 
   const closeMobileNav = () => setMobileNavOpen(false)
+
+  /* Cmd/Ctrl+K command-palette stub (full palette ships in Phase 7): jumps to
+     chat and focuses the composer instead of pretending a palette exists. */
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setTab('chat')
+        window.requestAnimationFrame(() => document.querySelector('.cxcomposer__input')?.focus())
+        showNotice('Command palette arrives in Phase 7 — jumped to the chat composer for now.', 'info')
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [showNotice])
 
   const navigateTab = (next) => {
     setTab(next)
@@ -216,6 +231,7 @@ function App() {
               setComposer={setComposer}
               saveToMemory={saveToMemory}
               sendMessage={sendMessage}
+              resendFromMessage={resendFromMessage}
               stopGeneration={stopGeneration}
               sending={sending}
               receiptMode={receiptMode}

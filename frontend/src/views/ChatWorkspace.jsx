@@ -6,6 +6,7 @@ import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
 import { MessageTurn } from '../components/chat/MessageTurn'
+import { ChatControls } from '../components/chat/ChatControls'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 
 const isBootstrapMessage = (message) =>
@@ -52,6 +53,7 @@ export default function ChatWorkspace({
   setComposer,
   saveToMemory,
   sendMessage,
+  resendFromMessage = null,
   stopGeneration,
   sending,
   receiptMode = false,
@@ -63,6 +65,7 @@ export default function ChatWorkspace({
   demoMode = false,
 }) {
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
+  const [showControls, setShowControls] = useState(false)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
@@ -326,6 +329,13 @@ export default function ChatWorkspace({
 
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
+      {showControls && (
+        <ChatControls
+          capabilities={capabilities}
+          modelId={selectedModelId}
+          onClose={() => setShowControls(false)}
+        />
+      )}
       <div className="cxcomposer__box">
         <textarea
           ref={composerRef}
@@ -381,6 +391,17 @@ export default function ChatWorkspace({
             {!demoMode && (
               <button type="button" className="cxcomposer__tool" onClick={secondaryAction} disabled={secondaryActionDisabled}>
                 <IconMemory size={16} /> {secondaryActionLabel}
+              </button>
+            )}
+            {!demoMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool ${showControls ? 'is-on' : ''}`}
+                aria-expanded={showControls}
+                onClick={() => setShowControls((value) => !value)}
+                title="System prompt and contract-gated sampling controls"
+              >
+                <IconBolt size={16} /> Controls
               </button>
             )}
           </div>
@@ -461,9 +482,11 @@ export default function ChatWorkspace({
                 </div>
               )}
               {visibleMessages.map((message, index) => {
-                const priorUserPrompt = message.role === 'assistant'
-                  ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')?.content
+                const priorUserMessage = message.role === 'assistant'
+                  ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')
                   : null
+                const priorUserPrompt = priorUserMessage?.content || null
+                const canResend = Boolean(resendFromMessage) && !generationActive && selectedModelRunnable
                 return (
                   <MessageTurn
                     key={message.id}
@@ -471,6 +494,8 @@ export default function ChatWorkspace({
                     generationElapsedSeconds={generationElapsedSeconds}
                     priorUserPrompt={priorUserPrompt}
                     onReusePrompt={setComposer}
+                    onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
+                    onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
                   />
                 )
               })}

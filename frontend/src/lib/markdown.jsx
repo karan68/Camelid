@@ -22,8 +22,14 @@ export const copyText = async (text) => {
   }
 }
 
+/* Only http(s)/mailto links render as anchors; any other scheme (javascript:,
+   data:, file:) stays plain text — model output never picks the protocol. */
+const SAFE_LINK_SCHEME = /^(https?:|mailto:)/i
+
 const renderInlineMarkdown = (text, keyPrefix) => {
-  const parts = String(text || '').split(/(`[^`]+`|\*\*[^*]+\*\*)/g).filter(Boolean)
+  const parts = String(text || '')
+    .split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*\s][^*]*\*|~~[^~]+~~|\[[^\]]+\]\([^()\s]+\))/g)
+    .filter(Boolean)
   return parts.map((part, index) => {
     const key = `${keyPrefix}-${index}`
     if (part.startsWith('`') && part.endsWith('`')) {
@@ -32,8 +38,61 @@ const renderInlineMarkdown = (text, keyPrefix) => {
     if (part.startsWith('**') && part.endsWith('**')) {
       return <strong key={key}>{part.slice(2, -2)}</strong>
     }
+    if (part.startsWith('~~') && part.endsWith('~~')) {
+      return <del key={key}>{part.slice(2, -2)}</del>
+    }
+    if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+      return <em key={key}>{part.slice(1, -1)}</em>
+    }
+    const link = part.match(/^\[([^\]]+)\]\(([^()\s]+)\)$/)
+    if (link) {
+      const [, label, href] = link
+      if (SAFE_LINK_SCHEME.test(href)) {
+        return <a key={key} href={href} target="_blank" rel="noopener noreferrer">{label}</a>
+      }
+      return <span key={key}>{label} ({href})</span>
+    }
     return <span key={key}>{part}</span>
   })
+}
+
+/* ---- Tables: header + |---| separator + body rows, cells get inline markdown ---- */
+const isTableLine = (line) => /^\|.*\|$/.test(line.trim())
+const isTableSeparator = (line) => /^\|(\s*:?-{2,}:?\s*\|)+$/.test(line.trim().replace(/\s/g, ''))
+
+const splitTableCells = (line) => {
+  const trimmed = line.trim().replace(/^\||\|$/g, '')
+  return trimmed.split('|').map((cell) => cell.trim())
+}
+
+const renderTable = (tableLines, keyPrefix) => {
+  const hasHeader = tableLines.length >= 2 && isTableSeparator(tableLines[1])
+  const headerCells = hasHeader ? splitTableCells(tableLines[0]) : []
+  const bodyLines = hasHeader ? tableLines.slice(2) : tableLines
+  return (
+    <div key={`${keyPrefix}-table`} className="message-table-wrap">
+      <table className="message-table">
+        {hasHeader && (
+          <thead>
+            <tr>
+              {headerCells.map((cell, index) => (
+                <th key={`${keyPrefix}-th-${index}`}>{renderInlineMarkdown(cell, `${keyPrefix}-th-${index}`)}</th>
+              ))}
+            </tr>
+          </thead>
+        )}
+        <tbody>
+          {bodyLines.filter((line) => !isTableSeparator(line)).map((line, rowIndex) => (
+            <tr key={`${keyPrefix}-tr-${rowIndex}`}>
+              {splitTableCells(line).map((cell, cellIndex) => (
+                <td key={`${keyPrefix}-td-${rowIndex}-${cellIndex}`}>{renderInlineMarkdown(cell, `${keyPrefix}-td-${rowIndex}-${cellIndex}`)}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  )
 }
 
 const normalizeProseForReading = (text) => String(text || '')
@@ -74,6 +133,8 @@ const renderMarkdownText = (text, keyPrefix) => {
   const blocks = []
   let paragraph = []
   let list = []
+  let orderedList = []
+  let tableLines = []
 
   const flushParagraph = () => {
     if (paragraph.length) {
@@ -95,6 +156,20 @@ const renderMarkdownText = (text, keyPrefix) => {
       )
       list = []
     }
+    if (orderedList.length) {
+      blocks.push(
+        <ol key={`${keyPrefix}-ol-${blocks.length}`} start={orderedList[0].start}>
+          {orderedList.map((item, index) => (
+            <li key={`${keyPrefix}-oli-${blocks.length}-${index}`}>{renderInlineMarkdown(item.text, `${keyPrefix}-oli-${index}`)}</li>
+          ))}
+        </ol>,
+      )
+      orderedList = []
+    }
+    if (tableLines.length) {
+      blocks.push(renderTable(tableLines, `${keyPrefix}-tbl-${blocks.length}`))
+      tableLines = []
+    }
   }
 
   lines.forEach((rawLine) => {
@@ -104,6 +179,13 @@ const renderMarkdownText = (text, keyPrefix) => {
       flushList()
       return
     }
+    if (isTableLine(line)) {
+      flushParagraph()
+      if (!tableLines.length) flushList()
+      tableLines.push(line)
+      return
+    }
+    if (tableLines.length) flushList()
     const heading = line.match(/^(#{1,3})\s+(.+)$/)
     if (heading) {
       flushParagraph()
@@ -135,7 +217,15 @@ const renderMarkdownText = (text, keyPrefix) => {
     const listItem = line.match(/^[-*]\s+(.+)$/)
     if (listItem) {
       flushParagraph()
+      if (!list.length) flushList()
       list.push(listItem[1])
+      return
+    }
+    const orderedItem = line.match(/^(\d+)[.)]\s+(.+)$/)
+    if (orderedItem) {
+      flushParagraph()
+      if (!orderedList.length) flushList()
+      orderedList.push({ start: orderedList.length ? orderedList[0].start : Number(orderedItem[1]), text: orderedItem[2] })
       return
     }
     flushList()
@@ -146,26 +236,57 @@ const renderMarkdownText = (text, keyPrefix) => {
   return blocks
 }
 
+const LANG_KEYWORDS = {
+  python: 'def|class|import|from|return|if|elif|else|for|while|try|except|finally|with|as|lambda|None|True|False|self|in|not|and|or|is|pass|raise|yield|global|nonlocal|del|assert|async|await|print',
+  rust: 'fn|let|mut|impl|pub|struct|enum|match|use|mod|trait|where|for|while|loop|if|else|return|self|Self|crate|super|const|static|ref|move|async|await|dyn|unsafe|type|Some|None|Ok|Err|Box|Vec|String',
+  bash: 'if|then|elif|else|fi|for|do|done|while|until|case|esac|function|echo|export|local|return|source|set|exit|read|shift|trap|true|false',
+  json: 'true|false|null',
+  js: 'const|let|var|function|return|if|else|for|while|class|new|true|false|null|undefined|import|export|from|async|await|document|window|of|in|typeof|instanceof|switch|case|break|continue|throw|try|catch|finally|yield|extends|super|this|static|get|set',
+}
+
+const languageFamily = (language) => {
+  const value = String(language || '').toLowerCase()
+  if (value.includes('html') || value.includes('xml')) return 'html'
+  if (value.includes('css')) return 'css'
+  if (value.includes('python') || value === 'py') return 'python'
+  if (value.includes('rust') || value === 'rs') return 'rust'
+  if (/^(bash|sh|shell|zsh|console)/.test(value)) return 'bash'
+  if (value.includes('json')) return 'json'
+  return 'js'
+}
+
 const syntaxClassForToken = (token, language) => {
-  const lowerLanguage = String(language || '').toLowerCase()
+  const family = languageFamily(language)
   if (/^\s+$/.test(token)) return ''
   if (/^\/\//.test(token) || /^\/\*/.test(token) || /^<!--/.test(token)) return 'comment'
+  if ((family === 'python' || family === 'bash') && /^#/.test(token)) return 'comment'
+  if (family === 'json' && /^"(?:\\.|[^"])*"$/.test(token) && token.endsWith('"')) {
+    return 'string'
+  }
   if (/^['"`]/.test(token)) return 'string'
   if (/^\d/.test(token)) return 'number'
-  if (lowerLanguage.includes('html') && /^<\/?[\w-]+/.test(token)) return 'tag'
-  if (lowerLanguage.includes('html') && /^[\w:-]+(?==)/.test(token)) return 'attr'
-  if (/^(const|let|var|function|return|if|else|for|while|class|new|true|false|null|undefined|import|export|from|async|await|document|window)$/.test(token)) return 'keyword'
-  if (lowerLanguage.includes('css') && /^[\w-]+(?=\s*:)/.test(token)) return 'attr'
+  if (family === 'html' && /^<\/?[\w-]+/.test(token)) return 'tag'
+  if (family === 'html' && /^[\w:-]+(?==)/.test(token)) return 'attr'
+  const keywords = LANG_KEYWORDS[family] || LANG_KEYWORDS.js
+  if (new RegExp(`^(?:${keywords})$`).test(token)) return 'keyword'
+  if (family === 'css' && /^[\w-]+(?=\s*:)/.test(token)) return 'attr'
   return ''
 }
 
 const renderHighlightedCode = (code, language, keyPrefix) => {
   const lowerLanguage = String(language || '').toLowerCase()
-  const pattern = lowerLanguage.includes('html')
+  const family = languageFamily(lowerLanguage)
+  const pattern = family === 'html'
     ? /(<!--[\s\S]*?-->|<\/?[\w-]+|\/?>|[\w:-]+(?==)|"(?:\\.|[^"])*"|'(?:\\.|[^'])*')/g
-    : lowerLanguage.includes('css')
+    : family === 'css'
       ? /(\/\*[\s\S]*?\*\/|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|#[\da-fA-F]{3,8}|\b\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)?\b|[\w-]+(?=\s*:))/g
-      : /(\/\/.*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`|\b(?:const|let|var|function|return|if|else|for|while|class|new|true|false|null|undefined|import|export|from|async|await|document|window)\b|\b\d+(?:\.\d+)?\b)/g
+      : family === 'python' || family === 'bash'
+        ? new RegExp(`(#.*|"""[\\s\\S]*?"""|'''[\\s\\S]*?'''|"(?:\\\\.|[^"])*"|'(?:\\\\.|[^'])*'|\\b(?:${LANG_KEYWORDS[family]})\\b|\\b\\d+(?:\\.\\d+)?\\b)`, 'g')
+        : family === 'rust'
+          ? new RegExp(`(\\/\\/.*|\\/\\*[\\s\\S]*?\\*\\/|"(?:\\\\.|[^"])*"|\\b(?:${LANG_KEYWORDS.rust})\\b|\\b\\d+(?:\\.\\d+)?\\b)`, 'g')
+          : family === 'json'
+            ? /("(?:\\.|[^"])*")|\b(?:true|false|null)\b|-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b/g
+            : new RegExp(`(\\/\\/.*|\\/\\*[\\s\\S]*?\\*\\/|"(?:\\\\.|[^"])*"|'(?:\\\\.|[^'])*'|\`(?:\\\\.|[^\`])*\`|\\b(?:${LANG_KEYWORDS.js})\\b|\\b\\d+(?:\\.\\d+)?\\b)`, 'g')
   const nodes = []
   let cursor = 0
   let match = pattern.exec(code)

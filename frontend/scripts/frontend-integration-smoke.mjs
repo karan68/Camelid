@@ -290,7 +290,9 @@ try {
   }))
 
   assert.match(completedUnclosedFenceMarkup, /message-code-card/, 'completed replies with an unclosed fenced block should still render as a safe code card')
-  assert.match(completedUnclosedFenceMarkup, /print\([\s\S]*&quot;safe&quot;[\s\S]*\)/, 'completed unclosed code content should remain visible and escaped in the code card')
+  // The syntax highlighter may wrap tokens (e.g. print) in spans; assert the escaped
+  // content stays visible rather than exact text adjacency.
+  assert.match(completedUnclosedFenceMarkup, /print[\s\S]{0,80}?\([\s\S]*&quot;safe&quot;/, 'completed unclosed code content should remain visible and escaped in the code card')
   assert.doesNotMatch(completedUnclosedFenceMarkup, /Still generating — code block incomplete/, 'completed unclosed code should not claim the backend is still generating')
   assert.doesNotMatch(completedUnclosedFenceMarkup, /data-code-streaming-state="open"/, 'completed unclosed code should not expose an active streaming code state')
 

@@ -6,6 +6,7 @@ import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
+import { contractSamplingOverrides } from '../lib/samplingContract'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -118,13 +119,23 @@ function looksLikeCodePrompt(value) {
     && /\b(html|html5|css|javascript|js|python|py|pygame|game|pacman|pacmac|tetris|app|component|page|website)\b/.test(text)
 }
 
+const SYSTEM_PROMPT_STORAGE_KEY = 'camelid.systemPrompt'
+
+function getConfiguredSystemPrompt() {
+  if (typeof window === 'undefined') return ''
+  return String(window.localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || '').trim()
+}
+
 function applyLocalChatPolicy(messages) {
   const lastUser = [...(messages || [])].reverse().find((message) => message.role === 'user')
-  if (!looksLikeCodePrompt(lastUser?.content)) return messages
-  return [
-    { role: 'system', content: CODE_FIRST_SYSTEM_PROMPT },
-    ...messages,
-  ]
+  const systemMessages = []
+  // User-configured system prompt (Generation controls drawer) leads; the
+  // code-first policy prompt appends behind it when the prompt looks code-y.
+  const configuredPrompt = getConfiguredSystemPrompt()
+  if (configuredPrompt) systemMessages.push({ role: 'system', content: configuredPrompt })
+  if (looksLikeCodePrompt(lastUser?.content)) systemMessages.push({ role: 'system', content: CODE_FIRST_SYSTEM_PROMPT })
+  if (!systemMessages.length) return messages
+  return [...systemMessages, ...messages]
 }
 
 function localChatMaxTokens() {
@@ -699,6 +710,19 @@ export function useDashboardData({ showNotice, clearNotice }) {
       : selectedConversation
   )
 
+  /* Regenerate / edit-and-resend: truncate the thread at the given user
+     message and resend through the normal gate-checked sendMessage path. */
+  const resendFromMessage = async (messageId, editedContent = null) => {
+    const conversation = selectedConversation
+    const index = (conversation?.messages || []).findIndex((message) => message.id === messageId)
+    if (index === -1) return
+    const target = conversation.messages[index]
+    if (target.role !== 'user') return
+    const content = String(editedContent ?? target.content ?? '').trim()
+    if (!content) return
+    await sendMessage({ overrideContent: content, truncateFromMessageId: messageId })
+  }
+
   const stopGeneration = () => {
     if (!activeChatRequestRef.current || stoppingGeneration) return false
     setStoppingGeneration(true)
@@ -706,8 +730,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
-  const sendMessage = async () => {
-    if (!composer.trim()) return
+  /* options.overrideContent: send this text instead of the composer draft
+     (regenerate / edit-and-resend). options.truncateFromMessageId: drop that
+     message and everything after it first, so the resent turn replaces the
+     old tail instead of duplicating it. The gate checks below are identical
+     for every path — resends cannot bypass the fail-closed chat gate. */
+  const sendMessage = async (options = {}) => {
+    const { overrideContent = null, truncateFromMessageId = null } = options
+    const draftContent = overrideContent ?? composer
+    if (!draftContent.trim()) return
     if (!selectedModelRunnable) {
       if (selectedModelRuntimeReady && !selectedModelCapabilitySupported) {
         const hint = findCompatibilityHint(dashboard?.capabilities, selectedModel)
@@ -718,7 +749,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       return
     }
 
-    const messageContent = composer.trim()
+    const messageContent = draftContent.trim()
     setSending(true)
     let activeConversationId = null
     let assistantId = null
@@ -733,9 +764,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setSelectedConversationId(conversation.id)
       const userMessage = { id: makeId('message'), role: 'user', content: messageContent, model_id: selectedModelId, created_at: nowIso() }
       setPendingChat({ conversationId: conversation.id, content: messageContent, modelId: selectedModelId })
-      setComposer('')
+      if (overrideContent === null) setComposer('')
 
-      const history = [...(conversation.messages || []), userMessage]
+      const truncateIndex = truncateFromMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === truncateFromMessageId)
+        : -1
+      const baseMessages = truncateIndex >= 0
+        ? (conversation.messages || []).slice(0, truncateIndex)
+        : (conversation.messages || [])
+      const history = [...baseMessages, userMessage]
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .filter((message) => !message.content.startsWith('Conversation created.'))
         .map(({ role, content }) => ({ role, content }))
@@ -744,18 +781,31 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
-          ? { ...item, model_id: selectedModelId, messages: [...(item.messages || []), userMessage], updated_at: nowIso() }
+          ? {
+              ...item,
+              model_id: selectedModelId,
+              messages: truncateIndex >= 0 ? [...baseMessages, userMessage] : [...(item.messages || []), userMessage],
+              updated_at: nowIso(),
+            }
           : item
       )))
 
       const requestStartedAt = performance.now()
       assistantId = makeId('message')
+      /* Snapshot of the support claim that was active when this send left the
+         composer: row id + status only (never paths) so the message footer can
+         cite the exact contract row that gated this generation. */
+      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+      const supportRowAtSend = sendGate.hint?.target
+        ? { id: sendGate.hint.target.id, status: sendGate.hint.target.status, supported: sendGate.contractSupported }
+        : null
       const assistantMessageBase = {
         id: assistantId,
         role: 'assistant',
         content: '',
         model_id: selectedModelId,
         model_name: selectedModel?.name || selectedModelId,
+        support_row: supportRowAtSend,
         created_at: nowIso(),
         tokens_in_per_sec: null,
         tokens_out_per_sec: null,
@@ -787,6 +837,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
           messages: requestMessages,
           temperature: 0,
           max_tokens: localChatMaxTokens(history),
+          /* Empty today: a sampling override is sent only when /api/capabilities
+             advertises a supported row for that exact parameter. */
+          ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
           // Receipts only attach to non-streaming responses; the JSON
           // fallback in readStreamingChatCompletion handles that shape.
           stream: !receiptMode,
@@ -866,6 +919,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
           completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
           total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
         },
+        /* Footer labeling: backend-reported usage vs client estimate (I4). */
+        usage_source: streamed.usage ? 'backend' : 'client_estimate',
         camelid: streamed.camelid || null,
         camelid_receipt: streamed.camelidReceipt || null,
         streaming: false,
@@ -1322,6 +1377,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     createConversation,
     showNewChatLanding,
     sendMessage,
+    resendFromMessage,
     stopGeneration,
     saveToMemory,
     createMemory,
