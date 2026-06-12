@@ -324,3 +324,64 @@ Branch: `feat/frontend-phase-4-compatibility-explorer`. The signature view.
   correctly offers no ledger link.
 - Screenshots: compatibility × dark/light × 1440/390 (self-check passed) + drill-down
   + deep-link focus shots in design-evidence/phase-4/.
+
+---
+
+## Phase 5 — API workbench (2026-06-12)
+
+Branch: `feat/frontend-phase-5-api-workbench`.
+
+### What shipped
+
+- **components/api/ApiWorkbench.jsx + lib/apiExamples.js** — nine routes of the live
+  surface as workbench cards: /v1/health, /v1/models, /v1/chat/completions,
+  /v1/completions, /api/capabilities, /api/models/tokenizer/encode, and the three
+  fail-closed routes (/v1/embeddings, /v1/responses, /v1/messages) rendered as typed
+  guarded rows citing the fail_closed_native_compatibility_routes feature row.
+- **Examples** in curl / Python / JS-fetch, pre-filled with the live API base and
+  loaded model id, copy button per card. Generation examples mirror the chat request
+  shape (greedy temperature=0, streaming). Gate evidence: the chat-completions curl
+  example was extracted from the rendered page DOM and executed verbatim — it streamed
+  SSE chunks from the live 3B.
+- **Try-it gating (I1/I3)**: generation endpoints run only when the shared exact-row
+  chat gate is green — including /v1/completions, where a found sharp edge made this
+  matter: the raw backend route answers for ANY loaded model (it generated <unk> tokens
+  from the unsupported tiny fixture), so the workbench card states explicitly that the
+  route answers but the UI keeps generation examples gated like chat. Read-only routes
+  run whenever the backend answers; fail-closed routes never run. Verified live in both
+  directions: tiny fixture → both generation try-its guarded with typed copy while
+  health stayed runnable; 3B loaded → chat try-it unlocked.
+- **Request inspector (I4)**: rendered request, status, headers/total timings, pretty
+  JSON bodies, and a timestamped SSE chunk log (capped at 80 lines with an honest
+  truncation note) under a pinned "operational telemetry — not compatibility evidence"
+  chip. Live run: 9 chunk lines, headers 162ms, total 1100ms.
+- ApiView's four static endpoint cards were absorbed into the workbench; the
+  readiness-gated curl block and every smoke-asserted gate string stayed live (one
+  asserted phrase was restored into the section copy when the cards went away — the
+  smoke caught it).
+
+### Tried and rejected / deviations
+
+- "Python · openai sdk" as the visible tab label: rejected by the pre-existing
+  integration-smoke brand assertion on rendered markup. Deliberate resolution: the tab
+  label is just "Python"; the SDK example itself (which must name the class it
+  instantiates — that is technical compatibility content, not product copy) renders
+  only when the tab is selected, so the default markup stays brand-clean.
+  lib/apiExamples.js is consciously excluded from the brand sweep with an inline
+  comment; the workbench component itself remains swept.
+- Gating /v1/completions as 'tokenizer-level' (it technically runs for any loaded
+  model): rejected — I1 says generation examples gate exactly like chat; a route that
+  emits unsupported-model tokens is precisely what the gate exists to keep out of the
+  paved path.
+
+### Gate results
+
+- Build clean; JS **159.41 kB gz** (Phase 4: 156.08; ceiling 229.9).
+- 10/10 smokes green; integration smoke extended with both gating directions
+  (blocked fixture → data-tryit-ready=false for both generation routes + typed copy +
+  health true; green 3B fixture → chat try-it true); smoke:ui extended with workbench
+  assertions. Readiness-gate libs: empty diff.
+- Copy-paste gate: page-extracted curl ran verbatim against the live backend (SSE).
+- Screenshots: api × dark/light × 1440/390 (self-check passed) + gated-state +
+  SSE-inspector shots in design-evidence/phase-5/. Backend left re-gated on the tiny
+  fixture (smoke:tiny re-run green at close).

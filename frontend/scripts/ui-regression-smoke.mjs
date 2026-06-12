@@ -78,6 +78,7 @@ const streamParserSource = read('../src/lib/chatCompletionStream.js')
 const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
 const modelInspectorSource = read('../src/components/models/ModelInspector.jsx')
 const compatibilityViewSource = read('../src/views/CompatibilityView.jsx')
+const apiWorkbenchSource = read('../src/components/api/ApiWorkbench.jsx')
 const appSource = read('../src/App.jsx')
 const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlayground.jsx')
 const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
@@ -221,6 +222,18 @@ assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be
 assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
 assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
 
+/* ---- API workbench (Phase 5) ---- */
+assert.match(apiViewSource, /<ApiWorkbench/, 'the API view must mount the workbench')
+assert.match(apiViewSource, /chatUnlocked=\{selectedExactRowReady\}/, 'workbench generation gating must come from the shared exact-row chat gate')
+assert.match(apiWorkbenchSource, /Requires a loaded supported model/, 'gated generation try-its must say they require a loaded supported model')
+assert.match(apiWorkbenchSource, /gated exactly like chat/, 'the guarded copy must tie the workbench gate to the chat gate')
+assert.match(apiWorkbenchSource, /operational telemetry — not compatibility evidence/, 'the request inspector must carry the telemetry-not-evidence banner')
+assert.match(apiWorkbenchSource, /fail_closed/, 'fail-closed routes must render their typed guarded state')
+assert.doesNotMatch(apiWorkbenchSource, /dangerouslySetInnerHTML/, 'inspector output must render as text')
+/* lib/apiExamples.js is deliberately NOT in the brand sweep: code samples may
+   name the SDK class they instantiate (technical compatibility content); UI
+   copy may not. The sweep still covers the workbench component itself. */
+
 /* ---- Compatibility ledger (Phase 4) ---- */
 assert.match(compatibilityViewSource, /capabilities\?\.model_compatibility/, 'the ledger must render rows from the live contract only')
 assert.match(compatibilityViewSource, /Not claimed/, 'the ledger must render the not-claimed column')
@@ -274,6 +287,7 @@ const visibleUiSources = [
   '../src/components/models/ModelInspector.jsx',
   '../src/components/models/TokenizerPlayground.jsx',
   '../src/views/CompatibilityView.jsx',
+  '../src/components/api/ApiWorkbench.jsx',
 ].map((path) => [path, read(path)])
 for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)

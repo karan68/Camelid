@@ -879,6 +879,23 @@ try {
   assert.match(genericExactMarkup, /Custom exact row evidence from \/api\/capabilities\./, 'API view should render generic exact-row evidence text')
   assert.doesNotMatch(genericExactMarkup, /No selected model exact row matched/, 'generic exact row-id matches should not fall through to broad or missing support copy')
 
+  /* ---- API workbench try-it gating (Phase 5) ---- */
+  const blockedApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: { status: 'online', api_base: 'http://127.0.0.1:8181', loaded_now: true, generation_ready: true, active_model_id: 'tiny-generation' },
+    selectedModel: { id: 'tiny-generation', name: 'tiny-generation', provider_kind: 'local', status: 'ready', model_path: '/tmp/x.gguf', loaded_now: true, generation_ready: true },
+    capabilities,
+  }))
+  assert.match(blockedApiMarkup, /data-tryit-ready="false" data-endpoint="v1_chat_completions"/, 'chat-completions try-it must stay guarded when no exact supported row matches')
+  assert.match(blockedApiMarkup, /data-tryit-ready="false" data-endpoint="v1_completions"/, 'raw completions try-it must stay guarded exactly like chat')
+  assert.match(blockedApiMarkup, /Requires a loaded supported model/, 'guarded try-its must render the typed gate copy')
+  assert.match(blockedApiMarkup, /data-tryit-ready="true" data-endpoint="v1_health"/, 'read-only health try-it may run while the backend is online')
+  const greenApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: readyRuntime,
+    selectedModel: aliasSelectedModel,
+    capabilities: green3BCapabilities,
+  }))
+  assert.match(greenApiMarkup, /data-tryit-ready="true" data-endpoint="v1_chat_completions"/, 'chat-completions try-it must unlock when the exact supported row is loaded and ready')
+
   /* ---- Compatibility ledger renders ONLY the live contract (Phase 4) ---- */
   const ledgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities }))
   assert.match(ledgerMarkup, /tinyllama_1_1b_chat_q8_0/, 'ledger rows must come from the capabilities payload')

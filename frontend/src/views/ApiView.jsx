@@ -3,6 +3,7 @@ import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId, modelRuntimeIdMatches } from '../lib/modelState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
+import { ApiWorkbench } from '../components/api/ApiWorkbench'
 import { EmptyState } from '../components/ui/EmptyState'
 import { IconApi } from '../components/ui/icons'
 
@@ -98,34 +99,23 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           <h2>Standard /v1-compatible surface</h2>
           <StatusDot tone={selectedExactRowReady ? 'ready' : 'warn'} label={readinessPillCopy} />
         </div>
-        <p className="cxv-sub">Generation endpoints stay useful only when runtime readiness is green and the selected local GGUF has an exact supported compatibility row. Capability rows explain supported and guarded lanes, but they never override loaded_now/generation_ready or active_model_id matching.</p>
-        <div className="sys-endpoints">
-          <div className="sys-endpoint">
-            <div className="sys-endpoint__head"><strong>Chat completions</strong><span className="cxv-tag">POST</span></div>
-            <code>{apiBase ? `${apiBase}/v1/chat/completions` : 'Unavailable until the local API is running'}</code>
-            <p>{chatCompletionsCopy}</p>
-          </div>
-          <div className="sys-endpoint">
-            <div className="sys-endpoint__head"><strong>Model listing</strong><span className="cxv-tag">GET</span></div>
-            <code>{apiBase ? `${apiBase}/v1/models` : 'Unavailable until the local API is running'}</code>
-            <p>Lists the active runtime model. It is not a broad compatibility catalog.</p>
-          </div>
-          <div className="sys-endpoint">
-            <div className="sys-endpoint__head"><strong>Health</strong><span className="cxv-tag">GET</span></div>
-            <code>{apiBase ? `${apiBase}/v1/health` : 'Unavailable until the local API is running'}</code>
-            <p>Source of truth for active_model_id, loaded_now, and generation_ready.</p>
-          </div>
-          <div className="sys-endpoint">
-            <div className="sys-endpoint__head"><strong>Capabilities</strong><span className="cxv-tag">GET</span></div>
-            <code>{apiBase ? `${apiBase}/api/capabilities` : 'Unavailable until the local API is running'}</code>
-            <p>Support contract for exact compatibility rows, row-scoped family/quant evidence, API feature support, and typed guardrails.</p>
-          </div>
-        </div>
+        <p className="cxv-sub">Generation endpoints stay useful only when runtime readiness is green and the selected local GGUF has an exact supported compatibility row. /api/capabilities carries the support contract — exact compatibility rows, row-scoped family/quant evidence, feature support, and typed guardrails — but it never overrides loaded_now/generation_ready or active_model_id matching.</p>
+        {/* The chat-completions gate sentence stays the single source for the
+            generation-endpoint posture shown in the workbench cards below. */}
+        <p className="cxv-sub">{chatCompletionsCopy}</p>
         <div className="sys-curl">
           <div className="sys-curl__head"><strong>Readiness-gated curl</strong><span className="cxv-tag">curl</span></div>
           <pre>{apiBase ? curlExample : 'Start the local runtime to see an exact-row readiness check.'}</pre>
         </div>
       </section>
+
+      <ApiWorkbench
+        apiBase={apiBase}
+        modelId={modelId}
+        backendOnline={runtime?.status !== 'offline' && Boolean(apiBase)}
+        chatUnlocked={selectedExactRowReady}
+        tokenizerAvailable={Boolean(runtime?.loaded_now)}
+      />
 
       <section className="cxv-card cxv-panel">
         <div className="cxv-section__head"><h2>/api/capabilities summary</h2><span className="cxv-section__count">evidence boundaries</span></div>
