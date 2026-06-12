@@ -9,7 +9,7 @@ const repoRoot = new URL('..', import.meta.url)
 const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8')
 const expectedAsset = 'docs/assets/camelid-readme-chat-surface-dark.png'
 const retiredLightAsset = 'docs/assets/ui-screenshot-v2.png'
-const expectedSha256 = '7cd116017ab4f330ec5c0be6595c3514bbcc916aa67116db2dd1fbe363d943dc'
+const expectedSha256 = '7f6fe43ac10741cb58817e0b43959798729c433d88bc1105b8f97baebb1a0b41'
 
 assert.match(
   readme,

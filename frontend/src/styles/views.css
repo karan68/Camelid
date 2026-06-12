@@ -1248,3 +1248,7 @@
 .tele-health__cell.is-fail { background: color-mix(in srgb, var(--color-error) 65%, transparent); }
 .tele-log-actions { display: flex; align-items: center; gap: var(--space-4); }
 .tele-reveal { display: inline-flex; align-items: center; gap: var(--space-1); font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-text-muted); }
+
+/* Settings: local-data danger actions (Phase 7 follow-up) */
+.settings-danger { background: var(--color-error); color: var(--color-bg); border-color: transparent; }
+.settings-danger-ghost { color: var(--color-error); border-color: color-mix(in srgb, var(--color-error) 40%, transparent); }

@@ -1045,6 +1045,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
+  /* Settings → "Delete all conversations". Local-only data; memories and
+     models are untouched. */
+  const deleteAllConversations = async () => {
+    persistConversations(() => [])
+    setSelectedConversationId(NEW_CHAT_SENTINEL)
+    showNotice('All conversations deleted from this browser.', 'success')
+    return true
+  }
+
   const showNewChatLanding = () => {
     setTab('chat')
     setSelectedConversationId(NEW_CHAT_SENTINEL)
@@ -1424,6 +1433,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     deleteMemory,
     renameConversation,
     deleteConversation,
+    deleteAllConversations,
     installModel,
     installCatalogModel,
     cancelModelDownload,

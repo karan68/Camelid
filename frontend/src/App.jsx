@@ -66,7 +66,7 @@ function App() {
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, latestAssistantMessage, pendingConversation,
     createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
-    createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation,
+    createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
     installModel, installCatalogModel, cancelModelDownload, activateModel, unloadCurrentModel,
     registerModel, connectExternalModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
@@ -349,6 +349,8 @@ function App() {
               themePreference={preference}
               setThemePreference={setPreference}
               onOpenCluster={() => navigateTab('cluster')}
+              conversationCount={conversations.length}
+              deleteAllConversations={deleteAllConversations}
             />
           )}
 

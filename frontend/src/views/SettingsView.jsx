@@ -23,7 +23,10 @@ export default function SettingsView({
   themePreference = 'system',
   setThemePreference = () => {},
   onOpenCluster = () => {},
+  conversationCount = 0,
+  deleteAllConversations = null,
 }) {
+  const [confirmWipe, setConfirmWipe] = useState(false)
   const online = runtime?.status === 'online'
   const { status, command, setCommand, resolvedCommand, starting, start, stop } = backend
   const [copied, setCopied] = useState(false)
@@ -167,6 +170,36 @@ export default function SettingsView({
               <option value="8192">8,192 tokens — default</option>
               <option value="16384">16,384 tokens — very long</option>
             </select>
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader eyebrow="Chat" title="Local data" />
+        <CardBody>
+          <p className="settings-help">Conversations live only in this browser&apos;s storage. Deleting them does not touch models, memories, or anything on disk.</p>
+          <div className="settings-select-row">
+            {deleteAllConversations && (confirmWipe ? (
+              <>
+                <button
+                  type="button"
+                  className="primary-button settings-danger"
+                  onClick={async () => { await deleteAllConversations(); setConfirmWipe(false) }}
+                >
+                  Confirm — delete {conversationCount} conversation{conversationCount === 1 ? '' : 's'}
+                </button>
+                <button type="button" className="ghost-button" onClick={() => setConfirmWipe(false)}>Cancel</button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="ghost-button settings-danger-ghost"
+                disabled={conversationCount === 0}
+                onClick={() => setConfirmWipe(true)}
+              >
+                {conversationCount === 0 ? 'No conversations stored' : `Delete all ${conversationCount} conversations…`}
+              </button>
+            ))}
           </div>
         </CardBody>
       </Card>
