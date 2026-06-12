@@ -24,6 +24,7 @@
 
 use std::path::Path;
 
+mod reff16;
 mod refmath;
 pub mod refrng;
 
@@ -352,6 +353,15 @@ pub struct DgEncoderRuntime {
     /// `final_logit_softcapping` (30.0 on the tracked GGUF); `None` skips the
     /// capping exactly as the reference's falsy check does.
     final_logit_softcapping: Option<f32>,
+    // self-conditioning gated MLP (Phase 4)
+    sc_pre_norm: Vec<f32>,
+    sc_gate: DgWire,
+    sc_up: DgWire,
+    sc_down: DgWire,
+    /// The SC soft-embedding weight: `token_embd` dequantized and transposed
+    /// to f16 `[n_embd rows][n_vocab]` exactly as the reference's
+    /// `dg_ensure_sc_embT` (built lazily once; ~1.5 GB).
+    sc_emb_t: std::sync::OnceLock<Vec<u16>>,
 }
 
 impl DgEncoderRuntime {
@@ -496,6 +506,19 @@ impl DgEncoderRuntime {
             n_expert_used,
             n_ff_exp,
             eps,
+            sc_pre_norm: f32t("self_cond_pre_norm.weight")?,
+            sc_gate: DgWire::bind(&mmap, desc("self_cond_gate.weight")?, n_embd)?,
+            sc_up: DgWire::bind(&mmap, desc("self_cond_up.weight")?, n_embd)?,
+            sc_down: {
+                let ffn_dim = gguf
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == "self_cond_down.weight")
+                    .and_then(|t| t.dimensions.first().copied())
+                    .unwrap_or(0) as usize;
+                DgWire::bind(&mmap, desc("self_cond_down.weight")?, ffn_dim)?
+            },
+            sc_emb_t: std::sync::OnceLock::new(),
             layers,
             token_embd,
             output_norm: f32t("output_norm.weight")?,
@@ -863,7 +886,169 @@ pub struct DgEbStep {
     pub entropy_sum: f32,
 }
 
+/// Raw-pointer Send wrapper for the disjoint-index embT scatter (each
+/// worker writes a disjoint set of `[e][v]` slots).
+struct ScSendPtr(*mut u16);
+unsafe impl Sync for ScSendPtr {}
+
+/// Self-conditioning input for one unified forward: the previous step's RAW
+/// canvas logits, the PREVIOUS step's `1/t`, and the {0,1} gate (0 on the EB
+/// loop's first step — the SC chain still runs, exactly like the reference
+/// graph, so the gated `±0.0` add semantics are preserved).
+pub struct DgScInput<'a> {
+    pub logits: &'a [f32],
+    pub temp_inv: f32,
+    pub use_sc: f32,
+}
+
+/// Reference EB sampler parameters (`diffusion_eb_params` defaults at pin).
+pub struct DgEbParams {
+    pub seed: u32,
+    pub max_steps: i32,
+    pub t_min: f32,
+    pub t_max: f32,
+    pub entropy_bound: f32,
+    pub stability_threshold: i32,
+    pub confidence_threshold: f32,
+}
+
+impl Default for DgEbParams {
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            max_steps: 48,
+            t_min: 0.4,
+            t_max: 0.8,
+            entropy_bound: 0.1,
+            stability_threshold: 1,
+            confidence_threshold: 0.005,
+        }
+    }
+}
+
+/// One executed EB denoise step's full record (the Phase 4 gate surface).
+pub struct DgEbStepRecord {
+    pub step_idx: i32,
+    pub canvas_in: Vec<i32>,
+    pub step: DgEbStep,
+    pub finished: bool,
+}
+
 impl DgEncoderRuntime {
+    /// The SC soft-embedding weight, built once: every `token_embd` row
+    /// dequantized (Q6_K, bit-exact) and rounded to f16, stored TRANSPOSED
+    /// as `[n_embd rows][n_vocab]` — `dg_ensure_sc_embT` semantics.
+    fn sc_emb_t(&self) -> Result<&[u16]> {
+        if let Some(t) = self.sc_emb_t.get() {
+            return Ok(t);
+        }
+        let n_vocab = self.token_embd.rows;
+        let hidden = self.n_embd;
+        let mut t = vec![0u16; n_vocab * hidden];
+        let nth = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        let chunk = n_vocab.div_ceil(nth);
+        let t_ptr = ScSendPtr(t.as_mut_ptr());
+        std::thread::scope(|s| -> Result<()> {
+            let mut handles = Vec::new();
+            for ci in 0..nth {
+                let v0 = ci * chunk;
+                let v1 = (v0 + chunk).min(n_vocab);
+                if v0 >= v1 {
+                    continue;
+                }
+                let t_ptr = &t_ptr;
+                handles.push(s.spawn(move || -> Result<()> {
+                    for v in v0..v1 {
+                        let row = self.embed_row(v as u32)?;
+                        for (e, &val) in row.iter().enumerate() {
+                            // transposed scatter: embT[e][v]
+                            unsafe {
+                                *t_ptr.0.add(e * n_vocab + v) = crate::tensor::f32_to_f16_bits(val);
+                            }
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                h.join().expect("embT worker panicked")?;
+            }
+            Ok(())
+        })?;
+        Ok(self.sc_emb_t.get_or_init(|| t))
+    }
+
+    /// The self-conditioning signal for every canvas position (PRE
+    /// `sc_use`-gate): `softmax(prev_logits * temp_inv)` per position, the
+    /// f16 soft-embedding matmul scaled by `sqrt(n_embd)`, then the gated
+    /// MLP `sc_down(gelu(sc_gate(normed)) * sc_up(normed))` — mirroring
+    /// `dg_canvas_embed`'s SC subgraph op for op.
+    fn sc_signal(&self, sc: &DgScInput, c: usize) -> Result<Vec<Vec<f32>>> {
+        let n_vocab = self.token_embd.rows;
+        if sc.logits.len() != c * n_vocab {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "sc logits length {} != C*n_vocab {}",
+                sc.logits.len(),
+                c * n_vocab
+            )));
+        }
+        let hidden = self.n_embd;
+        let eps = self.eps;
+        let emb_t = self.sc_emb_t()?;
+        let embed_scale = (hidden as f32).sqrt();
+
+        let mut sigs = Vec::with_capacity(c);
+        for pos in 0..c {
+            // probs = soft_max(scale(sc_logits, temp_inv)) — f32, same
+            // kernel as every other softmax; then the F16 src1 conversion
+            // (ggml quantizes src1 rows to the f16 vec_dot_type)
+            let mut probs: Vec<f32> = sc.logits[pos * n_vocab..(pos + 1) * n_vocab]
+                .iter()
+                .map(|&x| x * sc.temp_inv)
+                .collect();
+            refmath::softmax_row(&mut probs);
+            let probs_f16: Vec<u16> = probs
+                .iter()
+                .map(|&x| crate::tensor::f32_to_f16_bits(x))
+                .collect();
+
+            // soft = (embT @ probs) * sqrt(n_embd) — one f16 dot per row
+            let mut soft = vec![0f32; hidden];
+            let nth = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(8);
+            let chunk = hidden.div_ceil(nth);
+            std::thread::scope(|s| {
+                for (ci, ys) in soft.chunks_mut(chunk).enumerate() {
+                    let probs_f16 = &probs_f16;
+                    s.spawn(move || {
+                        for (i, y) in ys.iter_mut().enumerate() {
+                            let e = ci * chunk + i;
+                            *y = reff16::vec_dot_f16(
+                                &emb_t[e * n_vocab..(e + 1) * n_vocab],
+                                probs_f16,
+                            ) * embed_scale;
+                        }
+                    });
+                }
+            });
+
+            // SC gated MLP: pre_norm -> down( gelu(gate) * up )
+            let normed = refmath::rms_norm(&soft, Some(&self.sc_pre_norm), eps);
+            let nq = DgActivation::new(&normed);
+            let g = self.sc_gate.matvec_dense(&nq)?;
+            let u = self.sc_up.matvec_dense(&nq)?;
+            let h: Vec<f32> = g.iter().zip(&u).map(|(gv, uv)| dg_gelu(*gv) * uv).collect();
+            let hq = DgActivation::new(&h);
+            sigs.push(self.sc_down.matvec_dense(&hq)?);
+        }
+        Ok(sigs)
+    }
+
     /// UNIFIED decode-surface forward (Phase 3): one no-cache bidirectional
     /// pass over `[prompt | canvas]` with zero self-conditioning, mirroring
     /// the reference graph (src/models/diffusion-gemma.cpp at the pin):
@@ -878,6 +1063,20 @@ impl DgEncoderRuntime {
         &self,
         prompt: &[u32],
         canvas: &[u32],
+        want_trace: bool,
+    ) -> Result<DgUnifiedOut> {
+        self.unified_forward_sc(prompt, canvas, None, want_trace)
+    }
+
+    /// Unified forward with optional self-conditioning (the EB loop's
+    /// per-step decode). With `sc`, the SC subgraph runs exactly as the
+    /// reference graph does — including on the gated-off first step, where
+    /// `sig * 0.0` adds a signed zero per element.
+    pub fn unified_forward_sc(
+        &self,
+        prompt: &[u32],
+        canvas: &[u32],
+        sc: Option<&DgScInput>,
         want_trace: bool,
     ) -> Result<DgUnifiedOut> {
         let p = prompt.len();
@@ -901,8 +1100,16 @@ impl DgEncoderRuntime {
         let win = self.g.sliding_window as usize;
         let embed_scale = (hidden as f32).sqrt();
 
-        // embeddings: every row scaled by sqrt(n_embd); canvas rows then take
-        // the weightless rms_norm (the zero-SC canvas embedding)
+        // self-conditioning signal per canvas position (graph order: the SC
+        // subgraph feeds the canvas embedding)
+        let sigs = match sc {
+            Some(sc_in) => Some(self.sc_signal(sc_in, c)?),
+            None => None,
+        };
+
+        // embeddings: every row scaled by sqrt(n_embd); canvas rows add the
+        // gated SC signal (when enabled) and then take the weightless
+        // rms_norm
         let mut h: Vec<Vec<f32>> = Vec::with_capacity(n);
         let mut inp_scaled = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
         for (pos, &tok) in prompt.iter().chain(canvas.iter()).enumerate() {
@@ -911,6 +1118,14 @@ impl DgEncoderRuntime {
                 *v *= embed_scale;
             }
             if pos >= p {
+                if let (Some(sigs), Some(sc_in)) = (&sigs, sc) {
+                    // canvas = add(canvas, scale(sc_sig, sc_use)) — the
+                    // scale-by-{0,1} multiply runs per element (±0.0 at
+                    // step 0), then the add
+                    for (ev, sv) in e.iter_mut().zip(&sigs[pos - p]) {
+                        *ev += sv * sc_in.use_sc;
+                    }
+                }
                 e = refmath::rms_norm(&e, None, eps);
             }
             if want_trace {
@@ -1293,6 +1508,82 @@ impl DgEncoderRuntime {
             next_canvas,
             entropy_sum,
         }
+    }
+
+    /// The full Entropy-Bound denoise loop
+    /// (`diffusion_generate_entropy_bound` at the pin, default unified
+    /// no-KV-cache path): canvas random-init from the seed, per step one
+    /// unified forward with self-conditioning (gated off on step 0, then
+    /// `softmax(prev raw logits * prev 1/t)`), the per-position worker, the
+    /// MI-bound acceptance + renoise, and the adaptive stop (argmax stable
+    /// for `stability_threshold` steps AND mean entropy below
+    /// `confidence_threshold`). `on_step` observes each executed step's
+    /// record and the step's raw canvas logits.
+    pub fn eb_generate(
+        &self,
+        prompt: &[u32],
+        params: &DgEbParams,
+        mut on_step: impl FnMut(&DgEbStepRecord, &[f32]),
+    ) -> Result<Vec<DgEbStepRecord>> {
+        let n_vocab = self.token_embd.rows;
+        let c = self.canvas_length;
+        let s = params.max_steps.max(1);
+        let draws = refrng::eb_draws(params.seed, n_vocab as i32, c, s as usize);
+
+        let mut current_canvas: Vec<i32> = draws.canvas_init.clone();
+        let mut sc_buffer = vec![0f32; c * n_vocab];
+        let mut prev_temp_inv = 1.0f32;
+        let mut prev_argmax: Vec<i32> = vec![-1; c];
+        let mut held = 0i32;
+        let mut records = Vec::new();
+
+        for cur_step in (1..=s).rev() {
+            let step_idx = s - cur_step;
+            let canvas_u32: Vec<u32> = current_canvas.iter().map(|&v| v as u32).collect();
+            let sc_in = DgScInput {
+                logits: &sc_buffer,
+                temp_inv: prev_temp_inv,
+                use_sc: if step_idx == 0 { 0.0 } else { 1.0 },
+            };
+            let out = self.unified_forward_sc(prompt, &canvas_u32, Some(&sc_in), false)?;
+            sc_buffer.copy_from_slice(&out.logits);
+
+            let step = Self::eb_step(
+                &out.logits,
+                n_vocab,
+                step_idx,
+                s,
+                params.t_min,
+                params.t_max,
+                params.entropy_bound,
+                &draws.u[step_idx as usize],
+                &draws.renoise[step_idx as usize],
+            );
+
+            current_canvas = step.next_canvas.clone();
+            held = if prev_argmax == step.argmax {
+                held + 1
+            } else {
+                0
+            };
+            let confident = step.entropy_sum / (c as f32) < params.confidence_threshold;
+            let finished = held >= params.stability_threshold && confident;
+            prev_argmax = step.argmax.clone();
+            prev_temp_inv = step.temp_inv;
+
+            let record = DgEbStepRecord {
+                step_idx,
+                canvas_in: canvas_u32.iter().map(|&v| v as i32).collect(),
+                step,
+                finished,
+            };
+            on_step(&record, &out.logits);
+            records.push(record);
+            if finished {
+                break;
+            }
+        }
+        Ok(records)
     }
 }
 
