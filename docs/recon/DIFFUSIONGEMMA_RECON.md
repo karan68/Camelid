@@ -292,6 +292,40 @@ Two reference-identity facts this phase established:
    `(float)draw / 2^32` — which CAN return exactly 1.0f, a quirk the
    sampler inherits.
 
+## 8c. Phase 4 status — full EB denoise loop parity: PASSED, BIT-EXACT
+
+`eb_generate` runs the complete Entropy-Bound denoise loop (the reference's
+default unified no-KV-cache path) with live self-conditioning:
+`softmax(prev raw logits × prev 1/t)` through the f16-transposed soft
+embedding (`dg_ensure_sc_embT` semantics) and the gated MLP into the canvas
+embedding, per-step pre-drawn randomness, MI-bound acceptance, renoise, and
+the adaptive stop. **Bit-exact at the FULL default parameters** (S=48,
+seed 0): sealed bundle `target/dg-eb-loop-parity-20260612T063936Z/` — the
+reference's adaptive stop fired at step 7 (executed=8, finished=true) and
+camelid matched the trajectory step for step: every discrete output equal,
+entropies bit-exact on all steps, 268,435,456 dumped canvas-logits values
+bit-identical.
+
+Phase 4 kernel facts:
+
+1. **fp16 is a first-class kernel precision in the SC path.** The
+   soft-embedding matmul is `ggml_vec_dot_f16` (NEON: 4 float16x8
+   accumulators, `vfmaq_f16` fused single-rounding lanes, an f16 reduce
+   tree, f32 lane conversion, double total). Camelid ports it as an exact
+   f64 emulation (one round-to-nearest-even to f16 per op; double rounding
+   is innocuous since 53 ≥ 2·11+2) plus an aarch64 inline-asm `fmla v.8h`
+   fast path — both pinned bit-for-bit against hardware ground truth
+   (`scripts/dg-f16-dump.cpp`).
+2. **The even-ne11 nrc=2 mmla path is bit-identical to nrc=1 for Q4_K.**
+   The SC gate/up matmuls (ne11=256) are the first surface where ggml's
+   i8mm 2×2 tile kernel engages; its integer sums and its two fused float
+   ops per superblock are the same values in the same order as the nrc=1
+   body, so no separate port is needed (confirmed by the passing gates).
+3. **Step 0 self-conditioning is not a no-op at the bit level.** The EB
+   loop keeps the SC subgraph in the graph with `use_sc = 0.0`; `sig × 0.0`
+   adds a signed zero per element to the canvas embedding. Camelid runs the
+   full chain on step 0 to reproduce the ±0.0 pattern.
+
 ## 9. Phase 0 gate status
 
 - `tensor-inventory.json` + `metadata.json` exist; **zero** unclassified
