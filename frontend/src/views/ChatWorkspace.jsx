@@ -3,6 +3,7 @@ import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } 
 import { getChatGateState } from '../lib/chatGate'
 import { Sparkle } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
+import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
@@ -412,7 +413,14 @@ export default function ChatWorkspace({
         {selectedModel && (
           <>
             <span className="cxcomposer__status-sep" aria-hidden="true">·</span>
-            <span className="cxcomposer__status-row">{supportStatusLabel}</span>
+            <EvidenceChip
+              status={selectedChatGate.hint?.target?.status || ''}
+              state={selectedChatGate.contractSupported ? 'supported' : selectedChatGate.hint?.target?.status ? null : 'unsupported'}
+              label={supportStatusLabel}
+              source={{ rowId: selectedChatGate.hint?.target?.id, note: selectedChatGate.copy }}
+              size="sm"
+              className="cxcomposer__status-row"
+            />
           </>
         )}
       </div>

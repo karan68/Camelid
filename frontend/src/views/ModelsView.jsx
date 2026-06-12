@@ -6,6 +6,7 @@ import { formatBytes, formatCompactNumber } from '../lib/formatters'
 import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, modelRuntimeIdMatches } from '../lib/modelState'
 import { SupportedModels } from '../components/models/SupportedModels'
 import { StatusDot } from '../components/ui/StatusDot'
+import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconModels } from '../components/ui/icons'
 
 const FILTERS = [
@@ -695,7 +696,11 @@ export default function ModelsView({
                   <strong>{LLAMA32_3B_ACCEPTANCE_TARGET.name}</strong>
                   <span>{formatModelMeta(LLAMA32_3B_ACCEPTANCE_TARGET)}</span>
                 </div>
-                <div className="status-pill ready">Supported exact-row smoke · runtime required</div>
+                <EvidenceChip
+                  status="supported_exact_row_smoke"
+                  label="Exact-row smoke · runtime required"
+                  source={{ rowId: 'llama32_3b_instruct_q8_0', detail: 'Supported for the exact 3B Instruct Q8_0 artifact only; chat still requires the loaded runtime to match.' }}
+                />
               </div>
 
               <div className="models-card-tags">
@@ -756,7 +761,10 @@ export default function ModelsView({
                       <span className="models-card-display-name">{capabilityRowTitle(target)}</span>
                       <span>{target.family} · {target.quantization}</span>
                     </div>
-                    <div className={`status-pill ${tone}`}>{formatCapabilityStatus(target.status)}</div>
+                    <EvidenceChip
+                      status={target.status}
+                      source={{ rowId: target.id, detail: `${target.family} · ${target.quantization}${target.tested_context ? ` · ${target.tested_context}` : ''}` }}
+                    />
                   </div>
 
                   <div className="models-card-tags">
@@ -1122,7 +1130,11 @@ export default function ModelsView({
                       <strong>{model.name}</strong>
                       <span>{formatModelMeta(model)}</span>
                     </div>
-                    <div className={`status-pill ${routingReady ? 'ready' : 'warm'}`}>{routingReady ? 'API routing advertised' : 'API routing planned'}</div>
+                    <EvidenceChip
+                      state={routingReady ? 'evidence' : 'planned'}
+                      label={routingReady ? 'API routing advertised' : 'API routing planned'}
+                      asText
+                    />
                   </div>
                   <p className="model-summary">Hosted API links stay disabled until Camelid exposes and wires provider routing for chat.</p>
                   <div className="models-card-actions">

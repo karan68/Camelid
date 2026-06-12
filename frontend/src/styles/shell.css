@@ -31,11 +31,20 @@
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  height: 60px;
+  height: 56px;
   padding: 0 var(--space-5);
   flex: none;
-  border-bottom: 1px solid transparent;
+  border-bottom: 1px solid var(--color-border-soft);
+  background: var(--color-glass);
+  backdrop-filter: blur(10px);
 }
+.topbar__gate {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.topbar__gate-chip .ev-chip__label { max-width: 240px; }
 .topbar__menu {
   display: none;
   place-items: center;
@@ -45,9 +54,10 @@
 }
 .topbar__menu:hover { background: var(--color-surface-hover); color: var(--color-text); }
 .topbar__title {
+  font-family: var(--font-display);
   font-size: var(--text-lg);
   font-weight: 600;
-  letter-spacing: -0.01em;
+  letter-spacing: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -58,10 +68,11 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  height: 38px;
-  padding: 0 var(--space-4);
-  border-radius: var(--radius-pill);
+  height: 34px;
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
   background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
   color: var(--color-text-muted);
   font-size: var(--text-sm);
   font-weight: 600;
@@ -286,6 +297,9 @@
 }
 
 @media (max-width: 860px) {
+  /* Icon-only gate chip on small screens; the popover still carries the label. */
+  .topbar__gate-chip .ev-chip__label { display: none; }
+  .topbar__model-name { max-width: 110px; }
   .camelid-app,
   .camelid-app.is-collapsed { grid-template-columns: minmax(0, 1fr); }
   .topbar__menu { display: grid; }

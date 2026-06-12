@@ -1,7 +1,9 @@
-import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
+import { displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { getRuntimeRequestModelId, modelRuntimeIdMatches } from '../lib/modelState'
 import { StatusDot } from '../components/ui/StatusDot'
+import { EvidenceChip } from '../components/ui/EvidenceChip'
+import { EmptyState } from '../components/ui/EmptyState'
 import { IconApi } from '../components/ui/icons'
 
 function guardedApiFeatures(features = []) {
@@ -74,6 +76,15 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
           <StatusDot tone={runtimeTone} pulse={generationReady} label={headerStatus} />
         </div>
       </header>
+
+      {runtime?.status === 'offline' && (
+        <EmptyState
+          className="cx-empty--inline"
+          icon={<IconApi size={22} />}
+          title="Backend unreachable"
+          description={`Nothing answered at ${apiBase || 'the configured API base'}. Start the local runtime (cargo run -- serve) or fix the API base in Settings; the contract sections below stay empty until /api/capabilities responds.`}
+        />
+      )}
 
       <div className="cxv-stat-grid">
         <div className="cxv-stat"><span>Runtime</span><strong>{runtimeStat}</strong><small>{generationReady ? 'generation_ready=true' : loadedNow ? 'loaded_now=true' : 'no model loaded'}</small></div>
@@ -187,7 +198,14 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                 <code className="a-code">{selectedModel.id}</code>
                 {selectedCompatibilityTarget ? (
                   <>
-                    <p><b>{selectedCompatibilityTarget.id}: {formatCapabilityStatus(selectedCompatibilityTarget.status)}</b></p>
+                    <p>
+                      <EvidenceChip
+                        status={selectedCompatibilityTarget.status}
+                        source={{ rowId: selectedCompatibilityTarget.id, detail: selectedCompatibilityTarget.support_scope ? displayCapabilityCopy(selectedCompatibilityTarget.support_scope) : undefined }}
+                        size="sm"
+                      />{' '}
+                      <b>{selectedCompatibilityTarget.id}</b>
+                    </p>
                     <p>{selectedCompatibilitySupported ? 'This selected model has an exact supported compatibility row; runtime readiness must still match before chat unlocks.' : 'An exact row matched, but it is not supported for chat at this gate.'}</p>
                   </>
                 ) : (
@@ -208,7 +226,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                 <div key={feature.id} className="sys-row">
                   <div className="sys-row__head">
                     <span>{displayCapabilityId(feature.id)}</span>
-                    <span className={statusTagClass(feature.status)}>{formatCapabilityStatus(feature.status)}</span>
+                    <EvidenceChip status={feature.status} source={{ rowId: feature.id }} size="sm" />
                   </div>
                   <small>{displayCapabilityCopy(feature.notes || 'Advertised by /api/capabilities. These feature rows do not widen model support; chat still follows the selected exact-row and runtime readiness gate above.')}</small>
                 </div>
@@ -231,7 +249,14 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                   <div key={target.id} className="sys-row">
                     <div className="sys-row__head">
                       <span>{target.id}</span>
-                      <span className={statusTagClass(target.status)}>{formatCapabilityStatus(target.status)} · {target.family} · {target.quantization}</span>
+                      <span className="sys-row__claims">
+                        <EvidenceChip
+                          status={target.status}
+                          source={{ rowId: target.id, detail: `${target.family} · ${target.quantization}` }}
+                          size="sm"
+                        />
+                        <span className="sys-row__meta">{target.family} · {target.quantization}</span>
+                      </span>
                     </div>
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)} · frontend load: {formatCapabilityStatus(target.frontend_load_path_verified)}</small>
                     <small>Template: {formatCapabilityStatus(target.chat_template_shape_pack || 'not_started')} · 512-context: {formatCapabilityStatus(target.bounded_context_512_pack || 'not_started')} · 1024-context: {formatCapabilityStatus(target.bounded_context_1024_pack || 'not_started')} · 2048-context: {formatCapabilityStatus(target.bounded_context_2048_pack || 'not_started')} · 4096-context: {formatCapabilityStatus(target.bounded_context_4096_pack || 'not_started')} · 8192-context: {formatCapabilityStatus(target.bounded_context_8192_pack || 'not_started')} · perf: {formatCapabilityStatus(target.performance_measured || 'not_started')}</small>
@@ -253,7 +278,7 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
                   <div key={feature.id} className="sys-row">
                     <div className="sys-row__head">
                       <span>{displayCapabilityId(feature.id)}</span>
-                      <span className={statusTagClass(feature.status)}>{formatCapabilityStatus(feature.status)}</span>
+                      <EvidenceChip status={feature.status} source={{ rowId: feature.id }} size="sm" />
                     </div>
                     <small>{displayCapabilityCopy(guardedCapabilityCopy(feature, 'API affordances and frontend controls'))}</small>
                   </div>
@@ -269,9 +294,3 @@ export default function ApiView({ runtime, selectedModel, capabilities }) {
   )
 }
 
-function statusTagClass(status) {
-  const tone = capabilityStatusTone(status)
-  if (tone === 'ready') return 'cxv-tag cxv-tag--ready'
-  if (tone === 'warm') return 'cxv-tag cxv-tag--warn'
-  return 'cxv-tag'
-}
