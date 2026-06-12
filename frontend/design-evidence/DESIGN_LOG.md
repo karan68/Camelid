@@ -505,3 +505,31 @@ examples run verbatim, a real-traffic-only session telemetry dashboard, a comman
 palette, AA-contrast-smoked dual themes on self-hosted fonts, and a 10-smoke gate
 suite (from 8, one of which was dead) — at 104 kB gz initial JS against a 143.76 kB
 baseline monolith, with the fail-closed chat gate byte-identical throughout.
+
+---
+
+## Final acceptance (2026-06-12, after Phase 7)
+
+1. `npm run build` clean — initial JS 104.10 kB gz, total 176.39 kB gz. ✓
+2. `smoke:streaming`, `smoke:contrast`, re-baselined `smoke:ui` green (with the full
+   10-smoke suite). ✓
+3. Backend up → `smoke:tiny` green: the unsupported fixture loads, reports
+   generation_ready=true, and chat verifiably stays blocked. ✓
+4. Supported-row manual pass (Llama 3.2 3B Instruct Q8_0 — the supported
+   `supported_exact_row_smoke` row; the spec names TinyLlama, any supported exact row
+   satisfies the gate-green condition): load ✓, inspector ✓, streaming chat ✓, Esc
+   abort mid-stream renders interrupted state ✓, regenerate completes with telemetry
+   footer ✓, conversation export (path-free, smoke-enforced) ✓, workbench try-it
+   unlocked + request inspector ✓, telemetry dashboard populating from the session ✓,
+   Compatibility ledger matching /api/capabilities exactly (14/14 row ids, 11/11
+   feature rows) ✓.
+5. frontend/README.md source-of-truth section re-read against the shipped app: every
+   listed behavior holds — health/models/capabilities consumption, meta-as-descriptive,
+   no native-route unlocks, load via /api/models/load, gate visible in the top bar on
+   every tab with a direct jump to the contract (via the ledger), API tab first-class,
+   readiness-gated examples, file_type quant normalization, exact-row wins shown
+   row-scoped, streaming + typed SSE error handling, and the fail-closed chat gate.
+   No drift found. ✓
+
+The overhaul is complete: Phases 0–7 shipped, all invariants I1–I7 held at every
+gate, and the readiness-gate libraries are byte-identical to the Phase 0 record.
