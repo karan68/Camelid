@@ -842,3 +842,139 @@
   .camelid-view--page .composer-actions,
   .camelid-view--page .import-callout-row { grid-template-columns: 1fr; }
 }
+
+/* ==========================================================================
+   Phase 3 — model inspector drawer, tokenizer playground, card evidence row
+   ========================================================================== */
+.models-card-evidence-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  flex-wrap: wrap;
+}
+.models-card-evidence-link {
+  font-size: var(--text-xs);
+  color: var(--color-accent-text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+}
+
+.model-inspector-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  background: var(--color-overlay);
+  display: flex;
+  justify-content: flex-end;
+}
+.model-inspector {
+  width: min(640px, 94vw);
+  height: 100%;
+  overflow-y: auto;
+  background: var(--color-bg-elevated);
+  border-left: 1px solid var(--color-border-strong);
+  box-shadow: var(--shadow-3);
+  padding: var(--space-5) var(--space-6);
+  animation: camelidFadeIn var(--dur-base) var(--ease-standard);
+}
+.model-inspector__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.model-inspector__head h2 { margin: 0; font-family: var(--font-display); font-size: var(--text-xl); }
+.model-inspector__id { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted); }
+.model-inspector__banner { margin-bottom: var(--space-4); }
+.model-inspector__note { color: var(--color-text-muted); font-size: var(--text-sm); }
+.model-inspector__hint { font-size: 0.6875rem; color: var(--color-text-faint); font-weight: 400; }
+.model-inspector__section { margin-bottom: var(--space-5); }
+.model-inspector__section h3 {
+  margin: 0 0 var(--space-2);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+.model-inspector__grid { margin: 0; display: flex; flex-direction: column; }
+.model-inspector__grid > div {
+  display: grid;
+  grid-template-columns: 180px 1fr;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--color-border-soft);
+  align-items: baseline;
+}
+.model-inspector__grid > div:last-child { border-bottom: none; }
+.model-inspector__grid dt {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--color-text-faint);
+  word-break: break-all;
+}
+.model-inspector__grid dd { margin: 0; font-size: var(--text-sm); color: var(--color-text); min-width: 0; }
+.model-inspector__grid dd code { font-family: var(--font-mono); font-size: 0.75rem; word-break: break-all; }
+.model-inspector__grid--kv dd { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text-muted); word-break: break-word; }
+
+.tokenizer-playground__controls { display: flex; flex-direction: column; gap: var(--space-2); margin: var(--space-3) 0; }
+.tokenizer-playground__input {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+}
+.tokenizer-playground__input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.tokenizer-playground__options { display: flex; align-items: center; gap: var(--space-4); flex-wrap: wrap; }
+.tokenizer-playground__options label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+}
+.tokenizer-playground__error { color: var(--color-error); font-size: var(--text-sm); }
+.tokenizer-playground__stat-row { display: flex; align-items: baseline; gap: var(--space-4); flex-wrap: wrap; margin-bottom: var(--space-3); }
+.tokenizer-playground__stat { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--color-text); }
+.tokenizer-playground__verdict {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+.tokenizer-playground__verdict.is-exact { color: var(--color-ready); }
+.tokenizer-playground__hint { font-size: var(--text-xs); color: var(--color-text-faint); }
+.tokenizer-playground__tokens {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.tokenizer-playground__token {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 2px 6px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-subtle);
+}
+.tokenizer-playground__piece { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text); white-space: pre; max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
+.tokenizer-playground__id { font-family: var(--font-mono); font-size: 0.625rem; color: var(--color-text-faint); }
+.tokenizer-playground__roundtrip { font-size: var(--text-sm); color: var(--color-text-muted); word-break: break-word; }

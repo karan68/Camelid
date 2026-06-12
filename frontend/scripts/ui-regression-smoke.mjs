@@ -76,6 +76,8 @@ const analyticsViewSource = read('../src/views/AnalyticsView.jsx')
 const capabilitiesSource = read('../src/lib/capabilities.js')
 const streamParserSource = read('../src/lib/chatCompletionStream.js')
 const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
+const modelInspectorSource = read('../src/components/models/ModelInspector.jsx')
+const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlayground.jsx')
 const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
 const useThemeSource = read('../src/hooks/useTheme.js')
 const mainSource = read('../src/main.jsx')
@@ -207,6 +209,16 @@ assert.match(modelsViewSource, /Catalog quant:/, 'Catalog cards may show catalog
 assert.doesNotMatch(modelsViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|getQuantCapability|quantCapabilityLabel|quantCapabilityCopy/, 'Models view should not render broad quant/family capability lists as support evidence')
 assert.match(modelsViewSource, /<EvidenceChip/, 'Models tracked-row status claims should render through the Evidence Chip')
 
+/* ---- Model management (Phase 3) ---- */
+assert.match(modelsViewSource, /ModelCardEvidence/, 'local model cards must resolve their claim through the card evidence chip')
+assert.match(modelsViewSource, /no exact supported row/, 'unmatched local models must show the calm no-exact-row state, not an error')
+assert.match(modelsViewSource, /view the compatibility ledger/, 'unmatched local models must link to the compatibility view')
+assert.match(modelInspectorSource, /not support evidence/, 'the model inspector must label its contents as descriptive, not support evidence')
+assert.doesNotMatch(modelInspectorSource, /getChatGateState|isCompatibilitySupportedForModel|findCompatibilityHint/, 'the inspector renders metadata; it must never compute or imply gate state')
+assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be summarized, not dumped')
+assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
+assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
+
 /* ---- Analytics ---- */
 assert.match(analyticsViewSource, /displayCapabilityId\(feature\.id\)/, 'Analytics view should not render raw provider-scoped API feature ids')
 
@@ -247,6 +259,8 @@ const visibleUiSources = [
   '../src/components/ui/EvidenceChip.jsx',
   '../src/lib/evidenceStatus.js',
   '../src/lib/markdown.jsx',
+  '../src/components/models/ModelInspector.jsx',
+  '../src/components/models/TokenizerPlayground.jsx',
 ].map((path) => [path, read(path)])
 for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)

@@ -196,3 +196,70 @@ feature commit follows this entry).
   (the backend offers no way to trigger one on demand — noted, not hand-waved).
 - Screenshots: chat + history × dark/light × 1440/390 via the harness (self-check
   passed, 8 distinct) + live-stream evidence set + controls-drawer shot.
+
+---
+
+## Phase 3 — Model management (2026-06-12)
+
+Branch: `feat/frontend-phase-3-model-management`.
+
+### What shipped
+
+- **Card-level Evidence Chips on local GGUFs** (`ModelCardEvidence` in ModelsView):
+  every local model card — both "Local runtime" and "Still needs setup" — resolves its
+  exact model/quant against the live contract. Matched rows show their real status
+  chip; unmatched models get the calm muted "no exact supported row" chip plus a
+  "view the compatibility ledger" jump (currently #api; re-targets to the Phase 4 view
+  when it exists). Not an error state (I2).
+- **Model inspector drawer** (`components/models/ModelInspector.jsx`): fetches
+  `/api/models/current` + `/api/models/tokenizer` on open. File section (path with a
+  "local-only display; never exported" note, GGUF version, quant from file_type,
+  tensor count/offsets, model-native context length explicitly caveated against the
+  bounded-pack contract), tokenizer section (model, vocab size, special ids, config
+  flags), and the full 35-key KV grid with long values summarized client-side (the raw
+  payload is 5.6 MB of vocab/merges arrays — rendered as "[…, N items]"). A banner
+  chip pins the framing: descriptive metadata — not support evidence (I2/I4).
+- **Tokenizer playground** (`components/models/TokenizerPlayground.jsx`): live
+  encode/decode against `/api/models/tokenizer/{encode,decode}` (feature row
+  `tokenizer_encode_decode`, cited by the panel chip). Text → token count, per-token
+  id+piece chips (per-id decode — faithful for BPE since decode is a fixed id→bytes
+  map; capped at 200 with an honest truncation note), add_special/parse_special
+  toggles, and a byte-exact round-trip verdict computed over the full sequence.
+  Works whenever a tokenizer is loaded — chat support not required, and the chip copy
+  says token output does not widen generation support.
+- **Load/switch flow**: already had typed-guardrail error surfacing
+  (getGuardrailErrorMessage → load_error + notice) and busy states; unchanged. The
+  active model's "unmistakable everywhere" treatment comes from the Phase 1 topbar
+  gate + composer chips + the active-model-card highlight.
+
+### Tried and rejected
+
+- Storing `/api/models/current` in dashboard state for the inspector: rejected — the
+  payload is 5.6 MB; the drawer fetches on open and summarizes immediately instead of
+  keeping vocab arrays resident in React state.
+- Per-token pieces via incremental prefix decodes: rejected — O(n) requests with no
+  correctness gain over per-id decode for BPE; per-id chunks of 16 keep it simple and
+  the full-sequence round-trip still catches any normalization drift.
+- Evidence chips on catalog-preview cards: deferred — catalog entries are not local
+  GGUFs; their "Catalog quant:" labels already stay non-promotional, and Phase 4's
+  ledger view is the right home for browsing claims.
+
+### Gate results
+
+- Build clean; JS **153.38 kB gz** (Phase 2: 150.66; ceiling 229.9).
+- All 9 offline smokes green + `smoke:tiny` PASS; smoke:ui extended with Phase 3
+  assertions (card chip presence + calm no-row copy + ledger link; inspector labeled
+  not-support-evidence and barred from gate computation; playground cites
+  tokenizer_encode_decode and disclaims generation support; both new components in
+  the brand-hygiene sweep).
+- Readiness-gate libs: empty git diff.
+- Wrong-row demonstration through the real UI: tiny fixture loaded
+  (generation_ready=true) → composer reads "Runtime ready, support gated ·
+  tiny-generation · No matching COMPATIBILITY.md row", send stays locked with a
+  draft present, and the library card shows the calm unsupported chip + ledger link
+  (chat-blocked-tiny / library-blocked-tiny screenshots).
+- Live checks against the loaded 3B: inspector renders 35 KV rows with arrays
+  summarized and context length present; playground round-trips
+  "Hello Camelid, parity is the product." at 10 tokens, byte-exact ✓.
+- Screenshots: library × dark/light × 1440/390 (harness self-check passed) +
+  inspector + playground + blocked-state evidence.

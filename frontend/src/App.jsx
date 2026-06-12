@@ -292,6 +292,8 @@ function App() {
               installModel={installModel}
               installCatalogModel={installCatalogModel}
               cancelModelDownload={cancelModelDownload}
+              apiBase={apiBase}
+              setTab={navigateTab}
             />
           )}
 

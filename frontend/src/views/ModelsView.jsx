@@ -5,6 +5,8 @@ import { getChatGateState } from '../lib/chatGate'
 import { formatBytes, formatCompactNumber } from '../lib/formatters'
 import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, modelRuntimeIdMatches } from '../lib/modelState'
 import { SupportedModels } from '../components/models/SupportedModels'
+import { ModelInspector } from '../components/models/ModelInspector'
+import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconModels } from '../components/ui/icons'
@@ -180,6 +182,30 @@ function CapabilityEvidenceBlock({ capabilities, model, catalogItem }) {
   )
 }
 
+/* Card-level claim chip (Phase 3): resolves this exact model/quant against the
+   live contract. Unmatched models get a calm muted state with a jump to the
+   compatibility ledger — not an error (I2). */
+function ModelCardEvidence({ capabilities, model, catalogItem, onOpenCompatibility }) {
+  const hint = findCompatibilityHint(capabilities, model, catalogItem)
+  const exactTarget = isExactCompatibilityHint(hint) ? hint.target : null
+  return (
+    <div className="models-card-evidence-row">
+      <EvidenceChip
+        status={exactTarget?.status || ''}
+        state={exactTarget ? null : 'unsupported'}
+        label={exactTarget ? undefined : 'no exact supported row'}
+        source={{ rowId: exactTarget?.id, note: compatibilityHintCopy(hint) }}
+        size="sm"
+      />
+      {!exactTarget && onOpenCompatibility && (
+        <button type="button" className="models-card-evidence-link" onClick={onOpenCompatibility}>
+          view the compatibility ledger
+        </button>
+      )}
+    </div>
+  )
+}
+
 function getNextStepCopy(model, { active, selected, runnable, generationReady } = {}) {
   if (!model) return 'Pick a model for the next chat or load one now.'
   if (active && generationReady) return 'Already loaded and ready to answer immediately.'
@@ -295,8 +321,11 @@ export default function ModelsView({
   installModel,
   installCatalogModel,
   cancelModelDownload,
+  apiBase = '',
+  setTab = null,
 }) {
   const [query, setQuery] = useState('')
+  const [inspectorOpen, setInspectorOpen] = useState(false)
   const [statusFilter, setStatusFilter] = useState('all')
   const [showImportAdvanced, setShowImportAdvanced] = useState(false)
   const [catalogItems, setCatalogItems] = useState([])
@@ -916,6 +945,14 @@ export default function ModelsView({
                     <div className={`status-pill ${statusTone(model)}`}>{getModelStatusLabel(model)}</div>
                   </div>
 
+                  {!external && (
+                    <ModelCardEvidence
+                      capabilities={capabilities}
+                      model={model}
+                      onOpenCompatibility={setTab ? () => setTab('api') : null}
+                    />
+                  )}
+
                   <div className="models-card-tags">
                     {loadedNow && <div className={`pin-badge ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Loaded + generation-ready' : 'Loaded, not ready'}</div>}
                     {selected && <div className={`pin-badge ${chatUnlocked ? 'ready' : contractBlocked ? 'warm' : ''}`}>{chatUnlocked ? 'Next chat ready' : contractBlocked ? 'Next chat contract-blocked' : 'Next chat'}</div>}
@@ -938,6 +975,11 @@ export default function ModelsView({
                   <div className="models-card-actions">
                     <button className="ghost-button" onClick={() => setSelectedModelId(model.id)} disabled={busy}>{selected ? 'Chosen for next chat' : chatUnlocked ? 'Use for next chat' : contractBlocked ? 'Select; chat stays blocked' : generationReady ? 'Select and inspect contract' : 'Select after load'}</button>
                     {canLoad && !external && <button className="primary-button" onClick={() => activateModel(model.id)} disabled={busy || (loadedNow && generationReady)}>{busy ? 'Loading…' : loadedNow ? generationReady ? 'Loaded now' : 'Retry readiness check' : 'Load now'}</button>}
+                    {loadedNow && !external && (
+                      <button className="ghost-button" onClick={() => setInspectorOpen(true)} title="GGUF metadata, tokenizer, tensors — descriptive only, not support evidence">
+                        Inspect metadata
+                      </button>
+                    )}
                   </div>
                 </article>
               )
@@ -945,6 +987,8 @@ export default function ModelsView({
           </div>
         )}
       </section>
+
+      <TokenizerPlayground apiBase={apiBase} />
 
       {catalogAvailable && (
         <section className="cxv-card cxv-panel models-catalog-panel-clean">
@@ -1182,6 +1226,14 @@ export default function ModelsView({
                     <div className={`status-pill ${statusTone(model)}`}>{getModelStatusLabel(model)}</div>
                   </div>
 
+                  {!external && (
+                    <ModelCardEvidence
+                      capabilities={capabilities}
+                      model={model}
+                      onOpenCompatibility={setTab ? () => setTab('api') : null}
+                    />
+                  )}
+
                   <div className="models-card-tags">
                     {loadedNow && <div className={`pin-badge ${generationReady ? 'ready' : 'warm'}`}>{generationReady ? 'Loaded + generation-ready' : 'Loaded, not ready'}</div>}
                     {selected && <div className={`pin-badge ${chatUnlocked ? 'ready' : contractBlocked ? 'warm' : ''}`}>{chatUnlocked ? 'Next chat ready' : contractBlocked ? 'Next chat contract-blocked' : 'Next chat'}</div>}
@@ -1221,6 +1273,8 @@ export default function ModelsView({
           </div>
         </section>
       )}
+
+      {inspectorOpen && <ModelInspector apiBase={apiBase} onClose={() => setInspectorOpen(false)} />}
     </section>
   )
 }
