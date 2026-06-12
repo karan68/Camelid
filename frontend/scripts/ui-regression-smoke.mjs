@@ -49,7 +49,7 @@ const sneakyConversation = {
     id: 'm1', role: 'assistant', content: 'hello', model_id: 'llama32_3b_instruct_q8_0',
     model_path: '/Volumes/Untitled/models/secret.gguf',
     camelid: { backend_path: '/private/tmp/x.gguf' },
-    support_row: { id: 'llama32_3b_instruct_q8_0', status: 'supported_exact_row_smoke', supported: true, manifest_path: '/Users/x/qa/manifest.json' },
+    support_row: { id: 'llama32_3b_instruct_q8_0', status: 'supported_exact_row_smoke', supported: true, manifest_path: '/Volumes/ExampleHome/qa/manifest.json' },
     usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
     usage_source: 'backend',
   }],
