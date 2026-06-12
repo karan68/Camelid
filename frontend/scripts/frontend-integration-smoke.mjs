@@ -19,6 +19,7 @@ const server = await createServer({
 
 try {
   const { default: ChatWorkspace } = await server.ssrLoadModule('/src/views/ChatWorkspace.jsx')
+  const { default: CompatibilityView } = await server.ssrLoadModule('/src/views/CompatibilityView.jsx')
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
   const { default: SystemView } = await server.ssrLoadModule('/src/views/SystemView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
@@ -290,7 +291,9 @@ try {
   }))
 
   assert.match(completedUnclosedFenceMarkup, /message-code-card/, 'completed replies with an unclosed fenced block should still render as a safe code card')
-  assert.match(completedUnclosedFenceMarkup, /print\([\s\S]*&quot;safe&quot;[\s\S]*\)/, 'completed unclosed code content should remain visible and escaped in the code card')
+  // The syntax highlighter may wrap tokens (e.g. print) in spans; assert the escaped
+  // content stays visible rather than exact text adjacency.
+  assert.match(completedUnclosedFenceMarkup, /print[\s\S]{0,80}?\([\s\S]*&quot;safe&quot;/, 'completed unclosed code content should remain visible and escaped in the code card')
   assert.doesNotMatch(completedUnclosedFenceMarkup, /Still generating — code block incomplete/, 'completed unclosed code should not claim the backend is still generating')
   assert.doesNotMatch(completedUnclosedFenceMarkup, /data-code-streaming-state="open"/, 'completed unclosed code should not expose an active streaming code state')
 
@@ -875,6 +878,34 @@ try {
   assert.match(genericExactMarkup, /custom_exact_row_q8_0/, 'API view should render generic selected exact-row ids from capabilities')
   assert.match(genericExactMarkup, /Custom exact row evidence from \/api\/capabilities\./, 'API view should render generic exact-row evidence text')
   assert.doesNotMatch(genericExactMarkup, /No selected model exact row matched/, 'generic exact row-id matches should not fall through to broad or missing support copy')
+
+  /* ---- API workbench try-it gating (Phase 5) ---- */
+  const blockedApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: { status: 'online', api_base: 'http://127.0.0.1:8181', loaded_now: true, generation_ready: true, active_model_id: 'tiny-generation' },
+    selectedModel: { id: 'tiny-generation', name: 'tiny-generation', provider_kind: 'local', status: 'ready', model_path: '/tmp/x.gguf', loaded_now: true, generation_ready: true },
+    capabilities,
+  }))
+  assert.match(blockedApiMarkup, /data-tryit-ready="false" data-endpoint="v1_chat_completions"/, 'chat-completions try-it must stay guarded when no exact supported row matches')
+  assert.match(blockedApiMarkup, /data-tryit-ready="false" data-endpoint="v1_completions"/, 'raw completions try-it must stay guarded exactly like chat')
+  assert.match(blockedApiMarkup, /Requires a loaded supported model/, 'guarded try-its must render the typed gate copy')
+  assert.match(blockedApiMarkup, /data-tryit-ready="true" data-endpoint="v1_health"/, 'read-only health try-it may run while the backend is online')
+  const greenApiMarkup = renderToStaticMarkup(React.createElement(ApiView, {
+    runtime: readyRuntime,
+    selectedModel: aliasSelectedModel,
+    capabilities: green3BCapabilities,
+  }))
+  assert.match(greenApiMarkup, /data-tryit-ready="true" data-endpoint="v1_chat_completions"/, 'chat-completions try-it must unlock when the exact supported row is loaded and ready')
+
+  /* ---- Compatibility ledger renders ONLY the live contract (Phase 4) ---- */
+  const ledgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities }))
+  assert.match(ledgerMarkup, /tinyllama_1_1b_chat_q8_0/, 'ledger rows must come from the capabilities payload')
+  assert.match(ledgerMarkup, /Not claimed/, 'every ledger row must carry the not-claimed column')
+  assert.match(ledgerMarkup, /arbitrary\/Jinja templates, production throughput, portability/, 'the not-claimed column must render the contract blocker copy verbatim')
+  assert.match(ledgerMarkup, /How to read this ledger/, 'the ledger must keep its explainer')
+  assert.doesNotMatch(ledgerMarkup, /broad_family_trap|broad_quant_trap/, 'the ledger must not render non-row capability lists as support evidence')
+  const emptyLedgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities: null }))
+  assert.match(emptyLedgerMarkup, /Ledger unavailable/, 'an unreadable contract must render the fail-closed empty state')
+  assert.doesNotMatch(emptyLedgerMarkup, /ledger-row__id/, 'no contract means zero ledger rows — nothing renders from memory')
 
   console.log('Frontend integration smoke passed')
 } finally {

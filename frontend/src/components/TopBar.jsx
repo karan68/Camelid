@@ -4,12 +4,15 @@ import { getChatGateState } from '../lib/chatGate'
 import { modelRuntimeIdMatches } from '../lib/modelState'
 import { IconMenu } from './ui/icons'
 import { StatusDot } from './ui/StatusDot'
+import { EvidenceChip } from './ui/EvidenceChip'
 
 const TITLES = {
   chat: 'Chat',
   library: 'Models',
   api: 'API',
+  compatibility: 'Compatibility ledger',
   analytics: 'Analytics',
+  telemetry: 'Session telemetry',
   history: 'Chat history',
   memory: 'Memory',
   system: 'System',
@@ -54,16 +57,28 @@ function TopBar({
       )}
       <h1 className="topbar__title" title={tab === 'chat' && hasCustomTitle ? rawTitle : heading}>{heading}</h1>
       <div className="topbar__spacer" />
-      {tab === 'chat' && !demoMode && (
-        <button
-          type="button"
-          className="topbar__model"
-          onClick={() => setTab('library')}
-          title={gate.chatUnlocked ? `${modelName} is ready` : 'Open Models to load or switch models'}
-        >
-          <StatusDot tone={tone} pulse={gate.chatUnlocked} />
-          <span className="topbar__model-name">{clampText(modelName, 32)}</span>
-        </button>
+      {!demoMode && (
+        <div className="topbar__gate">
+          {/* Support-gate claim: rendered by the EvidenceChip, sourced from the
+              shared chat gate. Runtime + contract stay visible on every tab. */}
+          <EvidenceChip
+            status={gate.hint?.target?.status || ''}
+            state={gate.contractSupported ? 'supported' : gate.hint?.target?.status ? null : 'unsupported'}
+            label={gate.label}
+            source={{ rowId: gate.hint?.target?.id, note: gate.copy }}
+            size="sm"
+            className="topbar__gate-chip"
+          />
+          <button
+            type="button"
+            className="topbar__model"
+            onClick={() => setTab('library')}
+            title={gate.chatUnlocked ? `${modelName} is ready` : 'Open Models to load or switch models'}
+          >
+            <StatusDot tone={tone} pulse={gate.chatUnlocked} />
+            <span className="topbar__model-name">{clampText(modelName, 32)}</span>
+          </button>
+        </div>
       )}
     </header>
   )

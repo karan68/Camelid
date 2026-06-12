@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from 'react'
 import { Avatar } from '../ui/Avatar'
-import { IconCopy, IconCheck, IconRefresh } from '../ui/icons'
+import { EvidenceChip } from '../ui/EvidenceChip'
+import { IconCopy, IconCheck, IconRefresh, IconEdit } from '../ui/icons'
 import { AssistantMarkdown, copyText, hasOpenCodeFence } from '../../lib/markdown'
 import { cleanLegacyDemoCapCopy } from '../../lib/conversationStorage'
 import {
@@ -11,7 +12,111 @@ import {
 import { ParityReceiptCard } from './render/ParityReceipt'
 import { DeveloperDiagnosticsBlock } from './render/Diagnostics'
 
-export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt }) {
+const formatMs = (value) => {
+  const ms = Number(value)
+  if (!Number.isFinite(ms) || ms <= 0) return null
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`
+}
+
+const formatRate = (value) => {
+  const rate = Number(value)
+  if (!Number.isFinite(rate) || rate <= 0) return null
+  return `${rate >= 10 ? Math.round(rate) : rate.toFixed(1)} tok/s`
+}
+
+/* Per-message metadata footer. Token counts are labeled by source (backend
+   usage vs client estimate); TTFT and tok/s are always client-measured and say
+   so — operational telemetry, never support evidence (I4). The Evidence Chip
+   cites the contract row that was active when this reply was generated. */
+function MessageMetaFooter({ message }) {
+  const usage = message.usage
+  const ttft = formatMs(message.first_content_ms)
+  const rate = formatRate(message.tokens_out_per_sec)
+  const duration = formatMs(message.elapsed_ms)
+  const usageLabel = message.usage_source === 'backend' ? 'usage' : 'usage est.'
+  if (!usage && !ttft && !rate && !message.model_id) return null
+  return (
+    <footer className="cxturn__meta" aria-label="Generation details (client-measured telemetry)">
+      {message.model_id && <span className="cxturn__meta-item cxturn__meta-model">{message.model_id}</span>}
+      {message.support_row && (
+        <EvidenceChip
+          status={message.support_row.status}
+          state={message.support_row.supported ? 'supported' : null}
+          source={{ rowId: message.support_row.id, detail: 'Row active when this reply was generated.' }}
+          size="sm"
+        />
+      )}
+      {usage && Number.isFinite(Number(usage.prompt_tokens)) && (
+        <span className="cxturn__meta-item" title={message.usage_source === 'backend' ? 'Token counts reported by the backend' : 'Token counts estimated client-side (backend sent no usage)'}>
+          {usageLabel} {usage.prompt_tokens}→{usage.completion_tokens}
+        </span>
+      )}
+      {ttft && <span className="cxturn__meta-item" title="Time to first content, measured in this browser">TTFT {ttft}</span>}
+      {rate && <span className="cxturn__meta-item" title="Decode rate, measured in this browser">{rate}</span>}
+      {duration && <span className="cxturn__meta-item" title="Total request duration, measured in this browser">{duration}</span>}
+      <span className="cxturn__meta-item cxturn__meta-note">client-measured</span>
+    </footer>
+  )
+}
+
+/* User rows: copy + inline edit-and-resend. Editing truncates the thread at
+   this message and resends through the normal gate-checked send path. */
+function UserTurn({ message, messageContent, onEditResend }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(messageContent)
+  const submitEdit = () => {
+    const next = draft.trim()
+    setEditing(false)
+    if (next && next !== messageContent) onEditResend?.(message.id, next)
+  }
+  return (
+    <article className="cxturn cxturn--user">
+      <div className="cxturn__user-chip">
+        {editing ? (
+          <div className="cxturn__edit">
+            <textarea
+              className="cxturn__edit-input"
+              value={draft}
+              rows={Math.min(8, Math.max(2, draft.split('\n').length))}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault()
+                  submitEdit()
+                }
+                if (event.key === 'Escape') {
+                  event.stopPropagation()
+                  setEditing(false)
+                  setDraft(messageContent)
+                }
+              }}
+              aria-label="Edit message and resend"
+              autoFocus
+            />
+            <div className="cxturn__edit-actions">
+              <button type="button" className="cxturn__action" onClick={submitEdit}>Resend</button>
+              <button type="button" className="cxturn__action" onClick={() => { setEditing(false); setDraft(messageContent) }}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <p>{messageContent}</p>
+        )}
+      </div>
+      {!editing && onEditResend && (
+        <div className="cxturn__actions cxturn__actions--user" aria-label="Message actions">
+          <button type="button" className="cxturn__action" onClick={() => copyText(messageContent)} title="Copy message">
+            <IconCopy size={14} /> <span>Copy</span>
+          </button>
+          <button type="button" className="cxturn__action" onClick={() => { setDraft(messageContent); setEditing(true) }} title="Edit this message and resend — replaces the replies after it">
+            <IconEdit size={14} /> <span>Edit &amp; resend</span>
+          </button>
+        </div>
+      )}
+    </article>
+  )
+}
+
+export const MessageTurn = memo(function MessageTurn({ message, generationElapsedSeconds, priorUserPrompt, onReusePrompt, onRegenerate, onEditResend }) {
   const [copied, setCopied] = useState(false)
   const copiedResetRef = useRef(null)
   const messageContent = cleanLegacyDemoCapCopy(message.content)
@@ -41,9 +146,11 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
 
   if (isUser) {
     return (
-      <article className="cxturn cxturn--user">
-        <div className="cxturn__user-chip"><p>{messageContent}</p></div>
-      </article>
+      <UserTurn
+        message={message}
+        messageContent={messageContent}
+        onEditResend={onEditResend}
+      />
     )
   }
 
@@ -78,6 +185,11 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
                 <span>{copied ? 'Copied' : 'Copy'}</span>
               </button>
             )}
+            {showMessageActions && onRegenerate && (
+              <button type="button" className="cxturn__action" onClick={() => onRegenerate()} title="Resend the prompt that produced this reply, with the same parameters">
+                <IconRefresh size={16} /> <span>Regenerate</span>
+              </button>
+            )}
             {showReusePromptAction && (
               <button type="button" className="cxturn__action" onClick={() => onReusePrompt?.(priorUserPrompt)}>
                 <IconRefresh size={16} /> <span>Use prompt again</span>
@@ -85,6 +197,8 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
             )}
           </div>
         )}
+
+        {message.role === 'assistant' && !assistantStreaming && <MessageMetaFooter message={message} />}
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />

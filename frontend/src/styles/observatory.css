@@ -408,3 +408,18 @@
     width: 256px;
   }
 }
+
+
+/* Phase 7 responsive fix: the run-details panel overflowed the viewport at
+   390px (recorded at the Phase 0 baseline). Stack it under the canvas on
+   small screens instead of overlaying off-screen. */
+@media (max-width: 700px) {
+  .observatory-details,
+  .observatory-details-panel,
+  [class*='observatory'] aside {
+    position: static !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin-top: var(--space-3);
+  }
+}

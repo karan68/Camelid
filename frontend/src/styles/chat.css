@@ -356,7 +356,7 @@
   .cxturn__user-chip { max-width: 90%; }
 }
 
-/* ---- Ported from legacy components.css: streaming-loader + diagnostics-trigger
+/* ---- Ported from the retired pre-redesign sheet: streaming-loader + diagnostics-trigger
    cosmetics, so chat.css fully owns the chat surface once legacy is dropped. ---- */
 .streaming-loader-compact { padding: 0 0 8px; }
 .streaming-loader-dot-1 { animation-delay: 0ms; }
@@ -365,4 +365,132 @@
   background: color-mix(in srgb, var(--color-chip) 80%, transparent);
   border-color: var(--color-border-strong);
   color: var(--color-text);
+}
+
+/* ---- Markdown tables (Phase 2) — instrument grid, mono header ---- */
+.message-table-wrap { overflow-x: auto; margin: var(--space-3) 0; border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); }
+.message-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.message-table th {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  background: var(--color-surface-subtle);
+  border-bottom: 1px solid var(--color-border-strong);
+}
+.message-table td { padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--color-border-soft); vertical-align: top; }
+.message-table tr:last-child td { border-bottom: none; }
+.message-markdown ol { padding-left: 1.4em; margin: var(--space-2) 0; }
+.message-markdown ol li { margin: 2px 0; }
+.message-markdown a { color: var(--color-accent-text); text-decoration: underline; text-underline-offset: 2px; }
+
+/* ---- Per-message metadata footer (Phase 2) — client-measured telemetry ---- */
+.cxturn__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-border-soft);
+}
+.cxturn__meta-item {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--color-text-faint);
+  white-space: nowrap;
+}
+.cxturn__meta-model { color: var(--color-text-muted); }
+.cxturn__meta-note { margin-left: auto; opacity: 0.75; font-style: normal; letter-spacing: var(--tracking-wide); text-transform: uppercase; font-size: 0.625rem; }
+
+/* ---- User-row edit & resend (Phase 2) ---- */
+.cxturn--user { position: relative; }
+.cxturn__actions--user { justify-content: flex-end; opacity: 0; transition: opacity var(--dur-fast) var(--ease-standard); }
+.cxturn--user:hover .cxturn__actions--user,
+.cxturn--user:focus-within .cxturn__actions--user { opacity: 1; }
+.cxturn__edit { display: flex; flex-direction: column; gap: var(--space-2); min-width: min(480px, 70vw); }
+.cxturn__edit-input {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font: inherit;
+  padding: var(--space-2) var(--space-3);
+}
+.cxturn__edit-input:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.cxturn__edit-actions { display: flex; gap: var(--space-2); justify-content: flex-end; }
+@media (prefers-reduced-motion: reduce) {
+  .cxturn__actions--user { transition: none; }
+}
+
+/* ---- Generation controls drawer (Phase 2) ---- */
+.chat-controls {
+  margin-bottom: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-subtle);
+}
+.chat-controls__head { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-3); }
+.chat-controls__head h3 { margin: 0; font-family: var(--font-display); font-size: var(--text-md); font-weight: 600; }
+.chat-controls__group { margin-bottom: var(--space-4); }
+.chat-controls__group:last-child { margin-bottom: 0; }
+.chat-controls__group-head { display: flex; align-items: baseline; gap: var(--space-3); margin-bottom: var(--space-2); flex-wrap: wrap; }
+.chat-controls__label {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+.chat-controls__note { font-size: var(--text-xs); color: var(--color-text-faint); }
+.chat-controls__prompt {
+  width: 100%;
+  resize: vertical;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font: inherit;
+  font-size: var(--text-sm);
+  padding: var(--space-2) var(--space-3);
+}
+.chat-controls__prompt:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+.chat-controls__presets { display: flex; gap: var(--space-2); margin-top: var(--space-2); align-items: center; flex-wrap: wrap; }
+.chat-controls__preset-select, .chat-controls__preset-name {
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font-size: var(--text-xs);
+  padding: 4px var(--space-2);
+}
+.chat-controls__params { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+.chat-controls__param {
+  display: grid;
+  grid-template-columns: 120px 1fr auto;
+  gap: var(--space-3);
+  align-items: center;
+  padding: var(--space-1) 0;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+.chat-controls__param:last-child { border-bottom: none; }
+.chat-controls__param-name { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text); }
+.chat-controls__param-current { font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-text-faint); }
+.chat-controls__param-input {
+  width: 120px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  padding: 3px var(--space-2);
 }

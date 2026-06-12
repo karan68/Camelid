@@ -20,11 +20,11 @@ export function Sparkle({ className = '', size = 24, title }) {
         fill="url(#camelid-sparkle-grad)"
       />
       <defs>
+        {/* Instrument gradient: steel → brass → copper (matches --camelid-aurora). */}
         <linearGradient id="camelid-sparkle-grad" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stopColor="#4285f4" />
-          <stop offset="35%" stopColor="#9b51e0" />
-          <stop offset="70%" stopColor="#e289f2" />
-          <stop offset="100%" stopColor="#fa9085" />
+          <stop offset="0%" stopColor="#8fb6dc" />
+          <stop offset="52%" stopColor="#b9ad8e" />
+          <stop offset="100%" stopColor="#dfa371" />
         </linearGradient>
       </defs>
     </svg>

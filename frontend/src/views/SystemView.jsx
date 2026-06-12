@@ -1,7 +1,9 @@
-import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportNextStepCopy } from '../lib/capabilities'
+import { displayCapabilityCopy, displayCapabilityId, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, guardedCapabilityCopy, isExactCompatibilityHint, isGuardedCapabilityStatus, isSupportedCapabilityStatus, rowSupportNextStepCopy } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { describeModelState, getRuntimeRequestModelId } from '../lib/modelState'
 import { StatusDot } from '../components/ui/StatusDot'
+import { EvidenceChip } from '../components/ui/EvidenceChip'
+import { EmptyState } from '../components/ui/EmptyState'
 import { IconSystem } from '../components/ui/icons'
 
 function runtimeReadinessLabel(runtime) {
@@ -14,13 +16,6 @@ function supportLaneTitle(lane) {
   if (lane.key === 'template') return 'Template/Jinja readiness'
   if (lane.key === 'context') return 'Checked context readiness'
   return 'Throughput readiness'
-}
-
-function statusTagClass(status) {
-  const tone = capabilityStatusTone(status)
-  if (tone === 'ready') return 'cxv-tag cxv-tag--ready'
-  if (tone === 'warm') return 'cxv-tag cxv-tag--warn'
-  return 'cxv-tag'
 }
 
 export default function SystemView({ runtime, selectedModel, capabilities }) {
@@ -99,6 +94,15 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
           <StatusDot tone={runtimeTone} pulse={runtime?.generation_ready} label={runtimePill} />
         </div>
       </header>
+
+      {runtime?.status === 'offline' && (
+        <EmptyState
+          className="cx-empty--inline"
+          icon={<IconSystem size={22} />}
+          title="Backend unreachable"
+          description={`Nothing answered at ${runtime?.api_base || 'the configured API base'}. Start the local runtime (cargo run -- serve) or fix the API base in Settings; runtime health and the support gate below stay unknown until /v1/health responds.`}
+        />
+      )}
 
       <div className="cxv-stat-grid">
         <div className="cxv-stat"><span>Runtime</span><strong>{runtimeState}</strong><small>{runtime?.engine || 'engine unknown'}</small></div>
@@ -244,7 +248,10 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
                   <div key={target.id} className="sys-row">
                     <div className="sys-row__head">
                       <span>{target.family} · {target.quantization}</span>
-                      <span className={statusTagClass(target.status)}>{target.id}: {formatCapabilityStatus(target.status)}</span>
+                      <span className="sys-row__claims">
+                        <span className="sys-row__meta">{target.id}</span>
+                        <EvidenceChip status={target.status} source={{ rowId: target.id, detail: `${target.family} · ${target.quantization}` }} size="sm" />
+                      </span>
                     </div>
                     <small>Metadata: {formatCapabilityStatus(target.metadata_parses)} · tokenizer: {formatCapabilityStatus(target.tokenizer_works)} · tensors: {formatCapabilityStatus(target.tensors_load)} · generation: {formatCapabilityStatus(target.generation_runs)}</small>
                     <small>{exactRowSupportLanes(target, apiFeatures).map((lane) => `${supportLaneTitle(lane).replace(' readiness', '')}: ${lane.label}`).join(' · ')}</small>
@@ -265,7 +272,7 @@ export default function SystemView({ runtime, selectedModel, capabilities }) {
                   <div key={feature.id} className="sys-row">
                     <div className="sys-row__head">
                       <span>{displayCapabilityId(feature.id)}</span>
-                      <span className={statusTagClass(feature.status)}>{formatCapabilityStatus(feature.status)}</span>
+                      <EvidenceChip status={feature.status} source={{ rowId: feature.id }} size="sm" />
                     </div>
                     <small>{displayCapabilityCopy(guardedCapabilityCopy(feature, 'System/API controls'))}</small>
                   </div>

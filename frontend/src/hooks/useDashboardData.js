@@ -6,6 +6,8 @@ import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
 import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversationForSend } from '../lib/chatState'
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
+import { contractSamplingOverrides } from '../lib/samplingContract'
+import { getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -14,7 +16,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster'])
+const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
 const DEFAULT_API_BASE = import.meta.env?.VITE_CAMELID_API_BASE || 'http://127.0.0.1:8181'
 
 function getInitialTab() {
@@ -118,13 +120,23 @@ function looksLikeCodePrompt(value) {
     && /\b(html|html5|css|javascript|js|python|py|pygame|game|pacman|pacmac|tetris|app|component|page|website)\b/.test(text)
 }
 
+const SYSTEM_PROMPT_STORAGE_KEY = 'camelid.systemPrompt'
+
+function getConfiguredSystemPrompt() {
+  if (typeof window === 'undefined') return ''
+  return String(window.localStorage.getItem(SYSTEM_PROMPT_STORAGE_KEY) || '').trim()
+}
+
 function applyLocalChatPolicy(messages) {
   const lastUser = [...(messages || [])].reverse().find((message) => message.role === 'user')
-  if (!looksLikeCodePrompt(lastUser?.content)) return messages
-  return [
-    { role: 'system', content: CODE_FIRST_SYSTEM_PROMPT },
-    ...messages,
-  ]
+  const systemMessages = []
+  // User-configured system prompt (Generation controls drawer) leads; the
+  // code-first policy prompt appends behind it when the prompt looks code-y.
+  const configuredPrompt = getConfiguredSystemPrompt()
+  if (configuredPrompt) systemMessages.push({ role: 'system', content: configuredPrompt })
+  if (looksLikeCodePrompt(lastUser?.content)) systemMessages.push({ role: 'system', content: CODE_FIRST_SYSTEM_PROMPT })
+  if (!systemMessages.length) return messages
+  return [...systemMessages, ...messages]
 }
 
 function localChatMaxTokens() {
@@ -481,8 +493,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const currentLocalModels = localModelsOverride || localModelsRef.current
       const currentLocalConversations = localConversationsRef.current
       const currentLocalMemories = localMemoriesRef.current
+      const healthStartedAt = performance.now()
       const [health, modelList, capabilities, downloads] = await Promise.all([
-        fetchJson(`${normalizedApiBase}/v1/health`),
+        fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
+          recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
+          return result
+        }, (error) => {
+          recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
+          throw error
+        }),
         fetchJson(`${normalizedApiBase}/v1/models`),
         fetchJson(`${normalizedApiBase}/api/capabilities`).catch(() => null),
         fetchJson(`${normalizedApiBase}/api/models/catalog/downloads`).catch(() => []),
@@ -602,8 +621,21 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   useEffect(() => {
     loadDashboard()
-    const interval = setInterval(() => loadDashboard({ silent: true }), 2500)
-    return () => clearInterval(interval)
+    /* Self-scheduling refresh with backoff: 2.5s while the backend answers,
+       doubling to a 20s ceiling on consecutive failures, reset on success.
+       Reachability history comes from these real polls (telemetryLog). */
+    let cancelled = false
+    let timer = null
+    let delay = 2500
+    const tick = async () => {
+      if (cancelled) return
+      await loadDashboard({ silent: true })
+      const last = getTelemetrySnapshot().health.at(-1)
+      delay = last?.ok === false ? Math.min(delay * 2, 20000) : 2500
+      if (!cancelled) timer = setTimeout(tick, delay)
+    }
+    timer = setTimeout(tick, delay)
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [normalizedApiBase])
 
@@ -699,6 +731,19 @@ export function useDashboardData({ showNotice, clearNotice }) {
       : selectedConversation
   )
 
+  /* Regenerate / edit-and-resend: truncate the thread at the given user
+     message and resend through the normal gate-checked sendMessage path. */
+  const resendFromMessage = async (messageId, editedContent = null) => {
+    const conversation = selectedConversation
+    const index = (conversation?.messages || []).findIndex((message) => message.id === messageId)
+    if (index === -1) return
+    const target = conversation.messages[index]
+    if (target.role !== 'user') return
+    const content = String(editedContent ?? target.content ?? '').trim()
+    if (!content) return
+    await sendMessage({ overrideContent: content, truncateFromMessageId: messageId })
+  }
+
   const stopGeneration = () => {
     if (!activeChatRequestRef.current || stoppingGeneration) return false
     setStoppingGeneration(true)
@@ -706,8 +751,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
     return true
   }
 
-  const sendMessage = async () => {
-    if (!composer.trim()) return
+  /* options.overrideContent: send this text instead of the composer draft
+     (regenerate / edit-and-resend). options.truncateFromMessageId: drop that
+     message and everything after it first, so the resent turn replaces the
+     old tail instead of duplicating it. The gate checks below are identical
+     for every path — resends cannot bypass the fail-closed chat gate. */
+  const sendMessage = async (options = {}) => {
+    const { overrideContent = null, truncateFromMessageId = null } = options
+    const draftContent = overrideContent ?? composer
+    if (!draftContent.trim()) return
     if (!selectedModelRunnable) {
       if (selectedModelRuntimeReady && !selectedModelCapabilitySupported) {
         const hint = findCompatibilityHint(dashboard?.capabilities, selectedModel)
@@ -718,7 +770,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       return
     }
 
-    const messageContent = composer.trim()
+    const messageContent = draftContent.trim()
     setSending(true)
     let activeConversationId = null
     let assistantId = null
@@ -733,9 +785,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       setSelectedConversationId(conversation.id)
       const userMessage = { id: makeId('message'), role: 'user', content: messageContent, model_id: selectedModelId, created_at: nowIso() }
       setPendingChat({ conversationId: conversation.id, content: messageContent, modelId: selectedModelId })
-      setComposer('')
+      if (overrideContent === null) setComposer('')
 
-      const history = [...(conversation.messages || []), userMessage]
+      const truncateIndex = truncateFromMessageId
+        ? (conversation.messages || []).findIndex((message) => message.id === truncateFromMessageId)
+        : -1
+      const baseMessages = truncateIndex >= 0
+        ? (conversation.messages || []).slice(0, truncateIndex)
+        : (conversation.messages || [])
+      const history = [...baseMessages, userMessage]
         .filter((message) => message.role === 'user' || message.role === 'assistant')
         .filter((message) => !message.content.startsWith('Conversation created.'))
         .map(({ role, content }) => ({ role, content }))
@@ -744,18 +802,31 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
       persistConversations((current) => current.map((item) => (
         item.id === conversation.id
-          ? { ...item, model_id: selectedModelId, messages: [...(item.messages || []), userMessage], updated_at: nowIso() }
+          ? {
+              ...item,
+              model_id: selectedModelId,
+              messages: truncateIndex >= 0 ? [...baseMessages, userMessage] : [...(item.messages || []), userMessage],
+              updated_at: nowIso(),
+            }
           : item
       )))
 
       const requestStartedAt = performance.now()
       assistantId = makeId('message')
+      /* Snapshot of the support claim that was active when this send left the
+         composer: row id + status only (never paths) so the message footer can
+         cite the exact contract row that gated this generation. */
+      const sendGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
+      const supportRowAtSend = sendGate.hint?.target
+        ? { id: sendGate.hint.target.id, status: sendGate.hint.target.status, supported: sendGate.contractSupported }
+        : null
       const assistantMessageBase = {
         id: assistantId,
         role: 'assistant',
         content: '',
         model_id: selectedModelId,
         model_name: selectedModel?.name || selectedModelId,
+        support_row: supportRowAtSend,
         created_at: nowIso(),
         tokens_in_per_sec: null,
         tokens_out_per_sec: null,
@@ -787,6 +858,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
           messages: requestMessages,
           temperature: 0,
           max_tokens: localChatMaxTokens(history),
+          /* Empty today: a sampling override is sent only when /api/capabilities
+             advertises a supported row for that exact parameter. */
+          ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
           // Receipts only attach to non-streaming responses; the JSON
           // fallback in readStreamingChatCompletion handles that shape.
           stream: !receiptMode,
@@ -866,6 +940,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
           completion_tokens: streamed.completionTokens || estimateTokenCount(streamed.content),
           total_tokens: promptTokenEstimate + (streamed.completionTokens || estimateTokenCount(streamed.content)),
         },
+        /* Footer labeling: backend-reported usage vs client estimate (I4). */
+        usage_source: streamed.usage ? 'backend' : 'client_estimate',
         camelid: streamed.camelid || null,
         camelid_receipt: streamed.camelidReceipt || null,
         streaming: false,
@@ -886,8 +962,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
           : item
       )))
       setSelectedConversationId(conversation.id)
+      recordChatGeneration({
+        modelId: requestModelId,
+        durationMs: elapsedMs,
+        ttftMs: streamed.firstContentMs ?? null,
+        promptTokens: assistantMessage.usage?.prompt_tokens,
+        completionTokens: assistantMessage.usage?.completion_tokens,
+        tokensPerSec: assistantMessage.tokens_out_per_sec,
+        usageSource: assistantMessage.usage_source,
+        outcome: streamed.finishReason === 'error' ? 'error' : 'ok',
+        promptText: messageContent,
+      })
     } catch (error) {
       const requestWasAborted = error?.name === 'AbortError'
+      recordChatGeneration({
+        modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId),
+        durationMs: null,
+        ttftMs: null,
+        outcome: requestWasAborted ? 'interrupted' : 'error',
+        promptText: messageContent,
+      })
       const pendingPatchAtFailure = pendingAssistantPatch
       if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(pendingAssistantFrame)
@@ -1322,6 +1416,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     createConversation,
     showNewChatLanding,
     sendMessage,
+    resendFromMessage,
     stopGeneration,
     saveToMemory,
     createMemory,

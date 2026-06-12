@@ -1,4 +1,12 @@
 #!/usr/bin/env node
+/* UI regression smoke — re-baselined in Phase 2 pre-work against the shipped
+   Phase 1 reality (Evidence Chip, dark-first tokens, post-redesign chat stack).
+
+   Heritage: every assertion from the pre-rebaseline script was either ported
+   (verbatim where the source still matches, re-pointed where the code moved
+   to MessageTurn.jsx / lib/markdown.jsx / chat.css) or explicitly retired —
+   the retirement list with reasons lives in the re-baseline commit message.
+   From that commit onward this smoke is part of the standing I6 gate set. */
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 
@@ -8,7 +16,9 @@ import {
   shouldCreateConversationForSend,
 } from '../src/lib/chatState.js'
 import { normalizeStoredConversations } from '../src/lib/conversationStorage.js'
+import { conversationToJson, conversationToMarkdown } from '../src/lib/conversationExport.js'
 
+/* ---- Behavioral asserts: conversation selection + stored-stream recovery ---- */
 const oldChat = { id: 'old-chat', title: 'Old chat', messages: [{ role: 'user', content: 'old prompt' }] }
 const newerChat = { id: 'newer-chat', title: 'Newer chat', messages: [{ role: 'user', content: 'newer prompt' }] }
 const conversations = [newerChat, oldChat]
@@ -29,73 +39,94 @@ assert.equal(revivedInterruptedChat.messages[0].content, '(generation interrupte
 const liveStreamingChat = normalizeStoredConversations([{ id: 'live-chat', messages: [{ id: 'live-assistant', role: 'assistant', content: 'partial', streaming: true, streaming_phase: 'streaming' }] }])[0]
 assert.equal(liveStreamingChat.messages[0].streaming, true, 'live in-memory stream normalization should preserve active generation state')
 
-const readmeSource = readFileSync(new URL('../../README.md', import.meta.url), 'utf8')
+/* ---- Conversation export must be path-free by construction (I7) ---- */
+const sneakyConversation = {
+  id: 'conv-1',
+  title: 'Export test',
+  model_id: 'llama32_3b_instruct_q8_0',
+  model_path: '/Volumes/Untitled/models/secret.gguf',
+  messages: [{
+    id: 'm1', role: 'assistant', content: 'hello', model_id: 'llama32_3b_instruct_q8_0',
+    model_path: '/Volumes/Untitled/models/secret.gguf',
+    camelid: { backend_path: '/private/tmp/x.gguf' },
+    support_row: { id: 'llama32_3b_instruct_q8_0', status: 'supported_exact_row_smoke', supported: true, manifest_path: '/Users/x/qa/manifest.json' },
+    usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
+    usage_source: 'backend',
+  }],
+}
+for (const exported of [conversationToJson(sneakyConversation), conversationToMarkdown(sneakyConversation)]) {
+  assert.doesNotMatch(exported, /model_path|backend_path|manifest_path|\/Volumes\/|\/private\/tmp|\/Users\//, 'exports must never include filesystem paths — whitelisted fields only')
+}
+assert.match(conversationToJson(sneakyConversation), /telemetry, not support evidence|telemetry_note/, 'exports must carry the telemetry-not-evidence note')
+assert.match(conversationToMarkdown(sneakyConversation), /telemetry, not support evidence/, 'markdown exports must label telemetry as not support evidence')
+
+/* ---- Sources ---- */
+const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8')
+const readmeSource = read('../../README.md')
+const chatWorkspaceSource = read('../src/views/ChatWorkspace.jsx')
+const messageTurnSource = read('../src/components/chat/MessageTurn.jsx')
+const markdownSource = read('../src/lib/markdown.jsx')
+const dashboardHookSource = read('../src/hooks/useDashboardData.js')
+const loadedModelDisplaySource = read('../src/lib/loadedModelDisplay.js')
+const apiViewSource = read('../src/views/ApiView.jsx')
+const systemViewSource = read('../src/views/SystemView.jsx')
+const modelsViewSource = read('../src/views/ModelsView.jsx')
+const topBarSource = read('../src/components/TopBar.jsx')
+const analyticsViewSource = read('../src/views/AnalyticsView.jsx')
+const capabilitiesSource = read('../src/lib/capabilities.js')
+const streamParserSource = read('../src/lib/chatCompletionStream.js')
+const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
+const modelInspectorSource = read('../src/components/models/ModelInspector.jsx')
+const compatibilityViewSource = read('../src/views/CompatibilityView.jsx')
+const apiWorkbenchSource = read('../src/components/api/ApiWorkbench.jsx')
+const telemetryViewSource = read('../src/views/TelemetryView.jsx')
+const telemetryLogSource = read('../src/lib/telemetryLog.js')
+const appSource = read('../src/App.jsx')
+const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlayground.jsx')
+const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
+const useThemeSource = read('../src/hooks/useTheme.js')
+const mainSource = read('../src/main.jsx')
+const tokensCss = read('../src/styles/tokens.css')
+const evidenceCss = read('../src/styles/evidence.css')
+const chatCss = read('../src/styles/chat.css')
+const uiCss = read('../src/styles/ui.css')
+const statusSheets = ['../src/styles/ui.css', '../src/styles/shell.css', '../src/styles/chat.css', '../src/styles/views.css', '../src/styles/cluster.css', '../src/styles/observatory.css']
+  .map((path) => [path, read(path)])
+
+/* ---- README product surface ---- */
 assert.match(readmeSource, /docs\/assets\/camelid-readme-chat-surface-dark\.png/, 'README should use the approved dark collapsed-rail chat screenshot')
 assert.doesNotMatch(readmeSource, /assets\/camelid-banner\.png/, 'README should not lead with the disliked first banner image')
 assert.doesNotMatch(readmeSource, /docs\/assets\/ui-screenshot-v2\.png/, 'README must not regress to the retired light screenshot')
-assert.match(readmeSource, /product-forward while still reflecting the local-first runtime contract/i, 'README screenshot caption should preserve the local-first runtime contract')
 
-const chatWorkspaceSource = readFileSync(new URL('../src/views/ChatWorkspace.jsx', import.meta.url), 'utf8')
-const dashboardHookSource = readFileSync(new URL('../src/hooks/useDashboardData.js', import.meta.url), 'utf8')
-const loadedModelDisplaySource = readFileSync(new URL('../src/lib/loadedModelDisplay.js', import.meta.url), 'utf8')
-const apiViewSource = readFileSync(new URL('../src/views/ApiView.jsx', import.meta.url), 'utf8')
-const systemViewSource = readFileSync(new URL('../src/views/SystemView.jsx', import.meta.url), 'utf8')
-const modelsViewSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
-const topBarSource = readFileSync(new URL('../src/components/TopBar.jsx', import.meta.url), 'utf8')
-const analyticsViewSource = readFileSync(new URL('../src/views/AnalyticsView.jsx', import.meta.url), 'utf8')
-const capabilitiesSource = readFileSync(new URL('../src/lib/capabilities.js', import.meta.url), 'utf8')
-const streamParserSource = readFileSync(new URL('../src/lib/chatCompletionStream.js', import.meta.url), 'utf8')
-const visibleUiSources = [
-  '../src/views/ChatWorkspace.jsx',
-  '../src/views/ApiView.jsx',
-  '../src/views/SystemView.jsx',
-  '../src/views/ModelsView.jsx',
-  '../src/hooks/useDashboardData.js',
-].map((path) => [path, readFileSync(new URL(path, import.meta.url), 'utf8')])
-assert.match(chatWorkspaceSource, /pending is-streaming/, 'pending assistant row should use the same streaming Pac-Man state as live token rows')
-assert.match(chatWorkspaceSource, /splitFenceInfo/, 'streaming/incomplete fenced code blocks should be parsed as code instead of prose')
-assert.match(chatWorkspaceSource, /pushCodeBlock/, 'code block rendering should stay centralized for complete and incomplete fences')
-assert.match(chatWorkspaceSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
-assert.match(chatWorkspaceSource, /\$\{assistantStreaming \? 'is-streaming' : ''\}/, 'only assistant rows that are actively streaming should receive the animated streaming class')
-assert.doesNotMatch(chatWorkspaceSource, /\$\{message\.streaming \? 'is-streaming' : ''\}/, 'raw message.streaming should not keep completed/non-assistant rows visually active')
-assert.match(chatWorkspaceSource, /incomplete:\s*incompleteFence,\s*streaming/, 'unclosed streaming fences should reach the code-card renderer as active incomplete code')
-assert.match(chatWorkspaceSource, /aria-busy=\{stillGenerating \? 'true' : undefined\}/, 'incomplete streaming code cards should expose busy state')
-assert.match(chatWorkspaceSource, /hasOpenCodeFence/, 'streaming rows should detect open fenced code so the active state can call that out')
-assert.match(chatWorkspaceSource, /isOpenStreamingCode\s*=\s*assistantStreaming\s*&&\s*hasOpenCodeFence\(messageContent\)/, 'open-code status should only be active on rows that are still streaming')
-assert.match(chatWorkspaceSource, /data-streaming-code-state=\{isOpenStreamingCode \? 'open' : undefined\}/, 'only open streaming code rows should expose the active code-state marker')
-assert.match(chatWorkspaceSource, /function StreamingLoader/, 'pre-token live status should render through the dedicated streaming loader component')
-assert.match(chatWorkspaceSource, /role="status" aria-live="polite"/, 'streaming loader should expose an accessible live status while the backend is active')
-assert.match(chatWorkspaceSource, /aria-label=\{`\$\{label\}\. \$\{elapsedSeconds\} seconds elapsed\.`\}/, 'streaming loader should keep the status label and elapsed time available to assistive tech')
-assert.match(chatWorkspaceSource, /streaming-loader-dot streaming-loader-dot-3/, 'streaming loader should render the animated dot trio explicitly')
-assert.match(chatWorkspaceSource, /ACTIVE_STREAMING_LABEL\s*=\s*'Streaming response'/, 'live assistant rows should keep concise accessible streaming status copy')
-assert.match(chatWorkspaceSource, /OPEN_CODE_STREAMING_LABEL\s*=\s*'Streaming code response'/, 'streaming open code fences should keep concise accessible status copy')
-assert.match(chatWorkspaceSource, /showStreamingStatus\s*=\s*assistantStreaming\s*&&\s*!messageContent/, 'token-streaming assistant rows should keep the live badge minimal after first content for render stability')
-assert.match(chatWorkspaceSource, /showStreamingStatus && <StreamingLoader/, 'pre-token assistant rows should render the active streaming loader before streamed content')
-assert.match(chatWorkspaceSource, /function LiveGenerationBadge/, 'post-token streaming rows should keep a visible live generation badge while the backend is still generating')
-assert.match(chatWorkspaceSource, /showLiveGenerationBadge\s*=\s*assistantStreaming\s*&&\s*Boolean\(messageContent\)/, 'streaming assistant rows with visible content should still expose an active generation indicator')
-assert.match(chatWorkspaceSource, /showLiveGenerationBadge && <LiveGenerationBadge/, 'streaming content should render the active generation badge until the backend finishes')
-assert.match(chatWorkspaceSource, /useLayoutEffect/, 'streaming chat should auto-scroll after token renders so growing code stays in view')
-assert.match(chatWorkspaceSource, /autoFollowGenerationRef/, 'streaming auto-scroll should be gated so manual upward scrolling is respected')
-assert.match(chatWorkspaceSource, /distanceFromBottom\s*<\s*260/, 'streaming auto-scroll should only keep following while the user is near the live tail')
-assert.match(chatWorkspaceSource, /scrollIntoView\(\{ block: 'end', behavior: 'auto' \}\)/, 'streaming auto-scroll should pin to the live tail without queuing slow smooth-scroll animations')
-assert.match(chatWorkspaceSource, /chat-thread-stream-anchor/, 'chat thread should expose a bottom anchor for live streaming auto-scroll')
-assert.match(chatWorkspaceSource, /function CodeBlockCard/, 'code cards should own scroll behavior while streaming')
-assert.match(chatWorkspaceSource, /preRef\.current/, 'streaming code cards should keep a ref to the scrollable pre element')
-assert.match(chatWorkspaceSource, /pre\.scrollTop\s*=\s*pre\.scrollHeight/, 'streaming code cards should follow the bottom of growing code')
-assert.match(chatWorkspaceSource, /distanceFromBottom\s*<\s*80/, 'code-card auto-scroll should stop if the user scrolls away from the code tail')
-assert.match(chatWorkspaceSource, /PREPARING_STREAMING_LABEL\s*=\s*'Preparing local response'/, 'pre-token pending rows should keep concise local-stream status copy')
-assert.match(chatWorkspaceSource, /FIRST_TOKEN_STREAMING_LABEL\s*=\s*'Backend is generating'/, 'pre-token pending rows should keep concise backend-generation status copy')
-assert.match(chatWorkspaceSource, /LONG_FIRST_TOKEN_STREAMING_LABEL\s*=\s*'Local response is taking a while'/, 'long pre-token waits should keep a concise accessible explanation')
-assert.match(chatWorkspaceSource, /aria-busy=\{assistantStreaming \? 'true' : undefined\}/, 'streaming assistant rows should expose row-level busy state while text is incomplete')
-assert.match(chatWorkspaceSource, /data-streaming-state=\{assistantStreaming \? 'active' : undefined\}/, 'streaming assistant rows should expose an active state marker for regression coverage')
-assert.match(chatWorkspaceSource, /pending is-streaming" aria-busy="true" data-streaming-state="active"/, 'pre-token pending rows should be active while the backend is thinking')
+/* ---- Chat workspace ---- */
 assert.match(chatWorkspaceSource, /lastVisibleMessageIsUser[\s\S]*awaitingAssistant[\s\S]*generationActive && !hasStreamingAssistantContent/, 'a sent user row should keep showing an awaiting assistant indicator until streamed assistant content is visible')
 assert.match(chatWorkspaceSource, /hasStreamingAssistant[\s\S]*generationActive/, 'a persisted streaming row should keep the UI active even if the send call state changes')
-assert.doesNotMatch(chatWorkspaceSource, /<StreamingStatus/, 'the old text badge component should not reappear beside the dedicated loader')
-assert.doesNotMatch(chatWorkspaceSource, /The first token has not arrived yet\./, 'pre-token assistant rows should not duplicate the loader with placeholder copy')
-assert.match(chatWorkspaceSource, /CODE_CARD_STREAMING_LABEL\s*=\s*'Still generating — code block incomplete'/, 'incomplete streaming code blocks should visibly say the code is still incomplete')
-assert.match(chatWorkspaceSource, /data-code-streaming-state=\{stillGenerating \? 'open' : undefined\}/, 'open streaming code fences should expose an active code state marker')
-assert.match(chatWorkspaceSource, /message-code-card-status[^>]*aria-live="polite"[^>]*data-live-status="active"[^>]*>\{CODE_CARD_STREAMING_LABEL\}</, 'incomplete streaming code blocks should show a live active still-generating badge')
+assert.match(chatWorkspaceSource, /cxcomposer__status/, 'the composer should keep the consolidated runtime/support status line')
+assert.match(chatWorkspaceSource, /<EvidenceChip/, 'the composer support claim should render through the Evidence Chip, not an ad-hoc badge')
+assert.match(chatWorkspaceSource, /selectedChatGate\.contractSupported \? 'supported'/, 'the composer Evidence Chip must take its supported state only from the shared chat gate')
+assert.doesNotMatch(chatWorkspaceSource, /max[-_\s]?tokens?|token\s+limit/i, 'Chat UI should not expose a visible max-token picker or cap')
+
+/* ---- Message rendering (moved from pre-redesign ChatWorkspace to MessageTurn/markdown) ---- */
+assert.match(messageTurnSource, /aria-busy=\{assistantStreaming \? 'true' : undefined\}/, 'streaming assistant rows should expose row-level busy state while text is incomplete')
+assert.match(messageTurnSource, /data-streaming-state=\{assistantStreaming \? 'active' : undefined\}/, 'streaming assistant rows should expose an active state marker for regression coverage')
+assert.match(messageTurnSource, /\$\{assistantStreaming \? 'is-streaming' : ''\}/, 'only assistant rows that are actively streaming should receive the animated streaming class')
+assert.doesNotMatch(messageTurnSource, /\$\{message\.streaming \? 'is-streaming' : ''\}/, 'raw message.streaming should not keep completed/non-assistant rows visually active')
+assert.match(messageTurnSource, /streaming=\{assistantStreaming\}/, 'assistant markdown should know when an assistant row is still streaming')
+assert.match(markdownSource, /splitFenceInfo/, 'streaming/incomplete fenced code blocks should be parsed as code instead of prose')
+assert.match(markdownSource, /pushCodeBlock/, 'code block rendering should stay centralized for complete and incomplete fences')
+assert.match(markdownSource, /CODE_CARD_STREAMING_LABEL\s*=\s*'Still generating — code block incomplete'/, 'incomplete streaming code blocks should visibly say the code is still incomplete')
+assert.match(markdownSource, /data-code-streaming-state=\{stillGenerating \? 'open' : undefined\}/, 'open streaming code fences should expose an active code state marker')
+assert.match(markdownSource, /message-code-card-status[^>]*aria-live="polite"[^>]*data-live-status="active"[^>]*>\{CODE_CARD_STREAMING_LABEL\}</, 'incomplete streaming code blocks should show a live active still-generating badge')
+assert.doesNotMatch(markdownSource, /dangerouslySetInnerHTML/, 'model output must never reach the DOM through dangerouslySetInnerHTML')
+assert.doesNotMatch(messageTurnSource, /dangerouslySetInnerHTML/, 'message rows must never use dangerouslySetInnerHTML')
+
+/* ---- Dashboard data hook ---- */
+assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
+assert.match(dashboardHookSource, /max_tokens:\s*localChatMaxTokens\(history\)/, 'local chat sends should choose the token budget from the prompt policy')
+assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
+assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
+assert.match(dashboardHookSource, /readStreamingChatCompletion\(response/, 'dashboard chat send should use the centralized stream parser')
+assert.match(dashboardHookSource, /finish_reason:\s*requestWasAborted\s*\?\s*'interrupted'\s*:\s*'error',[\s\S]*streaming:\s*false/, 'failed or interrupted generations should clear streaming state instead of leaving active pellets/status forever')
 assert.match(dashboardHookSource, /const conversations = localConversations\.length \? localConversations : dashboard\?\.conversations \|\| \[\]/, 'main chat should resolve selectedConversation from live local conversation state before stale dashboard snapshots')
 assert.match(dashboardHookSource, /currentLocalConversations\.some\(\(conversation\) => conversation\.id === current\)/, 'dashboard refresh should validate selected conversation against the same current local conversation snapshot it renders')
 assert.match(dashboardHookSource, /const selectedConversationIdRef = useRef\(selectedConversationId\)/, 'conversation selection should keep an immediate ref so background refreshes do not lose the active thread between state commits')
@@ -117,23 +148,18 @@ assert.match(dashboardHookSource, /prefer tkinter from the standard library over
 assert.match(dashboardHookSource, /complete runnable event loop/, 'Python game prompts should ask for runnable game logic, not a sketch')
 assert.match(dashboardHookSource, /python\|py\|pygame\|game\|pacman\|pacmac/, 'code-first detection should catch Python game demos and the pacmac typo')
 assert.match(dashboardHookSource, /Never use external files or script src/, 'HTML code prompts should prevent unusable external script references in demos')
-assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
-assert.match(dashboardHookSource, /LOCAL_CHAT_DEMO_MAX_TOKENS\s*=\s*800/, 'ordinary local chat should keep a bounded default response budget')
-assert.match(dashboardHookSource, /LOCAL_CHAT_CODE_MAX_TOKENS\s*=\s*2048/, 'code/html prompts should get a larger budget instead of clipping complete files')
-assert.match(dashboardHookSource, /max_tokens:\s*localChatMaxTokens\(history\)/, 'local chat sends should choose the token budget from the prompt policy')
-assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
-assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
-assert.match(dashboardHookSource, /readStreamingChatCompletion\(response/, 'dashboard chat send should use the centralized stream parser')
+
+/* ---- Stream parser ---- */
 assert.match(streamParserSource, /function defaultEstimateTokenCount/, 'central stream parser should keep a JSON fallback token estimator')
 assert.match(streamParserSource, /function readSseDataLines/, 'central stream parser should isolate SSE data-line handling')
 assert.match(streamParserSource, /export function extractSseEvents/, 'stream parser should keep SSE boundary handling centralized')
 assert.match(streamParserSource, /replace\(/, 'stream parser should normalize line endings before splitting SSE events')
 assert.match(streamParserSource, /split\('\\n\\n'\)/, 'stream parser should split normalized SSE events on blank lines for partial rendering')
-assert.match(dashboardHookSource, /finish_reason:\s*requestWasAborted\s*\?\s*'interrupted'\s*:\s*'error',[\s\S]*streaming:\s*false/, 'failed or interrupted generations should clear streaming state instead of leaving active pellets/status forever')
+
+/* ---- API view ---- */
 assert.match(apiViewSource, /Selected exact-row evidence/, 'API support view should show selected exact-row evidence instead of a broad validated-target claim')
 assert.match(apiViewSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API endpoint readiness should use the shared exact-row chat gate')
 assert.match(apiViewSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API endpoint readiness should stay aligned with Chat/System exact-row chat unlocks')
-assert.match(apiViewSource, /selectedExactRowReady/, 'API endpoint readiness should only turn green when runtime readiness and the selected exact compatibility row both match')
 assert.match(apiViewSource, /selectedRuntimeMatches/, 'API endpoint readiness should require active_model_id to match the selected model')
 assert.match(apiViewSource, /readinessPillCopy/, 'API endpoint status copy should come from the exact-row readiness gate, not generation_ready alone')
 assert.match(apiViewSource, /chatCompletionsCopy/, 'API chat-completions copy should stay gated unless selected exact-row evidence and runtime readiness both match')
@@ -159,24 +185,26 @@ assert.match(apiViewSource, /displayCapabilityCopy\(selectedCompatibilityTarget\
 assert.match(capabilitiesSource, /function displayCapabilityId/, 'capability ids should be display-normalized before support/API UI rendering')
 assert.match(capabilitiesSource, /function displayCapabilityCopy/, 'backend capability copy should be display-normalized before support/API UI rendering')
 assert.match(apiViewSource, /displayCapabilityId\(feature\.id\)/, 'API view should not render raw provider-scoped API feature ids')
+assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'API curl examples should use the loaded backend model id for alias-selected exact rows')
+assert.match(apiViewSource, /<EvidenceChip/, 'API contract rows should render their status claims through the Evidence Chip')
+
+/* ---- System view ---- */
 assert.match(systemViewSource, /Selected exact-row evidence/, 'System support view should show selected exact-row evidence instead of broad quant or family capability lists')
 assert.match(systemViewSource, /Exact-row quant evidence/, 'System support view should scope quant evidence to compatibility rows')
 assert.match(systemViewSource, /Exact-row family evidence/, 'System support view should scope family evidence to compatibility rows')
 assert.doesNotMatch(systemViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|summarizeCapabilityItems/, 'System support view should not render non-row capability lists as support evidence')
 assert.match(systemViewSource, /displayCapabilityId\(feature\.id\)/, 'System view should not render raw provider-scoped API feature ids')
+assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
+assert.match(systemViewSource, /<EvidenceChip/, 'System contract rows should render their status claims through the Evidence Chip')
+
+/* ---- Models view ---- */
 assert.match(modelsViewSource, /Exact-row quant evidence/, 'Models support cards should display row-scoped quant evidence')
 assert.match(modelsViewSource, /Exact-row support/, 'Models support cards should display exact-row support boundaries')
 assert.match(modelsViewSource, /modelRuntimeIdMatches\(model, runtime\)/, 'Models runtime/readiness surfaces should accept backend runtime_model_name aliases for exact-row local imports')
-assert.match(apiViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'API curl examples should use the loaded backend model id for alias-selected exact rows')
-assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
 assert.match(modelsViewSource, /modelRuntimeIdMatches\(selectedLocalModel, runtime\)/, 'Models next-chat copy should not fall back to blocked when the selected exact row uses a browser id plus backend runtime_model_name')
-assert.match(chatWorkspaceSource, /chat-readiness-strip-live[\s\S]*runtimeStatusLabel[\s\S]*supportStatusLabel[\s\S]*capabilityLaneStatus\.label/, 'Non-empty live chat should keep exact-row runtime/support/capability readiness visible after the first message')
-assert.match(chatWorkspaceSource, /getChatCapabilityLaneCopy\(selectedChatGate, capabilities\)/, 'Live chat capability copy should come from the selected exact-row support gate')
 assert.match(modelsViewSource, /compatibilityHintMatchesExactTarget\(capabilities, model, target\)/, 'Models tracked-row matching must require an exact compatibility hint, not a quant-mismatch target id')
 assert.match(modelsViewSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'Models tracked exact-row cards should use the shared chat gate instead of stale browser readiness')
 assert.match(modelsViewSource, /chatUnlocked\s*=\s*Boolean\(matchedChatGate\?\.chatUnlocked\)/, 'Models tracked exact-row cards should require loaded_now, generation_ready, active_model_id, and exact support before claiming chat unlock')
-assert.match(topBarSource, /exactHintDetail\(activeChatGate\.hint\) \|\| exactHintDetail\(selectedChatGate\.hint\)/, 'TopBar support contract detail should prefer active or selected exact-row hint labels before the first current-gate fallback')
-assert.match(topBarSource, /exactTargetFromHint\(activeChatGate\.hint\)[\s\S]*exactTargetFromHint\(selectedChatGate\.hint\)[\s\S]*getCurrentCompatibilityTarget/, 'TopBar support contract detail should prefer active or selected exact-row evidence before the first current-gate fallback')
 assert.match(modelsViewSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'The 3B acceptance target should only hide when an exact 3B Q8_0 row is present')
 assert.match(modelsViewSource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*hasExactLlama32ThreeBArtifact[\s\S]*compatibilityHintMatchesExactTarget/, 'The 3B acceptance target fallback must require exact GGUF artifact identity instead of a broad 3B Instruct Q8 label')
 assert.doesNotMatch(modelsViewSource, /findCompatibilityHint\(capabilities, model\)\?\.target\?\.id === target\.id/, 'Models tracked-row matching must not treat quant-mismatch hints as exact-row matches')
@@ -184,32 +212,127 @@ assert.match(modelsViewSource, /rowSupportNextStepCopy\(target, apiFeatures\)/, 
 assert.match(modelsViewSource, /template\/Jinja, checked context, and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats/, 'Models support section should state that template/Jinja, checked-context, and production-throughput are row-scoped lanes, not generic caveats')
 assert.match(modelsViewSource, /Catalog quant:/, 'Catalog cards may show catalog quant labels without promoting them to support')
 assert.doesNotMatch(modelsViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|getQuantCapability|quantCapabilityLabel|quantCapabilityCopy/, 'Models view should not render broad quant/family capability lists as support evidence')
+assert.match(modelsViewSource, /<EvidenceChip/, 'Models tracked-row status claims should render through the Evidence Chip')
+
+/* ---- Model management (Phase 3) ---- */
+assert.match(modelsViewSource, /ModelCardEvidence/, 'local model cards must resolve their claim through the card evidence chip')
+assert.match(modelsViewSource, /no exact supported row/, 'unmatched local models must show the calm no-exact-row state, not an error')
+assert.match(modelsViewSource, /view the compatibility ledger/, 'unmatched local models must link to the compatibility view')
+assert.match(modelInspectorSource, /not support evidence/, 'the model inspector must label its contents as descriptive, not support evidence')
+assert.doesNotMatch(modelInspectorSource, /getChatGateState|isCompatibilitySupportedForModel|findCompatibilityHint/, 'the inspector renders metadata; it must never compute or imply gate state')
+assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be summarized, not dumped')
+assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
+assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
+
+/* ---- Command palette + shortcuts (Phase 7) ---- */
+const paletteSource = read('../src/components/CommandPalette.jsx')
+const frontendReadmeSource = read('../README.md')
+assert.match(appSource, /<CommandPalette/, 'the app must mount the command palette')
+assert.match(appSource, /<ShortcutsOverlay/, 'the app must mount the shortcuts overlay')
+assert.match(appSource, /lazy\(\(\) => import\('\.\/views\//, 'non-chat views must stay route-split')
+assert.match(paletteSource, /readiness still gates send/, 'palette model switching must stay gate-honest')
+assert.match(paletteSource, /camelid:open-ledger/, 'palette ledger jumps must use the shared deep-link event')
+assert.match(frontendReadmeSource, /readiness-gate semantics are \*\*unchanged\*\*/, 'frontend README must state gate semantics are unchanged after the overhaul')
+
+/* ---- Session telemetry (Phase 6) ---- */
+assert.match(telemetryViewSource, /operational telemetry — not compatibility evidence/, 'every telemetry surface must carry the not-evidence affordance')
+assert.match(telemetryViewSource, /useState\(false\)/, 'prompt reveal must default to redacted')
+assert.match(telemetryViewSource, /•••• redacted/, 'redacted prompts must render visibly redacted')
+assert.match(telemetryViewSource, /It never seeds or invents data/, 'the empty state must promise no synthetic data')
+assert.doesNotMatch(telemetryViewSource, /EvidenceChip[\s\S]{0,300}(ttftMs|tokensPerSec|durationMs|medianT)/, 'perf numbers must never render inside Evidence Chips')
+assert.doesNotMatch(telemetryLogSource, /Math\.random|seedData|sampleData|fakeData|demoData/, 'the telemetry store must have no synthetic data path')
+assert.match(dashboardHookSource, /recordChatGeneration\(/, 'chat sends must feed the session telemetry store')
+assert.match(dashboardHookSource, /recordHealthPoll\(/, 'health polls must feed the reachability history')
+assert.match(apiWorkbenchSource, /recordWorkbenchRun\(/, 'workbench try-its must feed the session telemetry store')
+
+/* Behavioral: export is path/content-free by whitelist even for salted records. */
+const { recordChatGeneration: telRecord, exportTelemetryJson: telExport } = await import('../src/lib/telemetryLog.js')
+telRecord({ modelId: 'salt-model', durationMs: 12, ttftMs: 5, outcome: 'ok', promptText: 'SECRET PROMPT /Volumes/Untitled/models/secret.gguf' })
+const telExported = telExport()
+assert.doesNotMatch(telExported, /SECRET PROMPT|\/Volumes\/|promptText/, 'telemetry exports must exclude prompt content and paths by whitelist')
+assert.match(telExported, /salt-model/, 'telemetry exports keep whitelisted fields')
+assert.match(telExported, /Not compatibility or support evidence/, 'telemetry exports must carry the not-evidence note')
+
+/* ---- API workbench (Phase 5) ---- */
+assert.match(apiViewSource, /<ApiWorkbench/, 'the API view must mount the workbench')
+assert.match(apiViewSource, /chatUnlocked=\{selectedExactRowReady\}/, 'workbench generation gating must come from the shared exact-row chat gate')
+assert.match(apiWorkbenchSource, /Requires a loaded supported model/, 'gated generation try-its must say they require a loaded supported model')
+assert.match(apiWorkbenchSource, /gated exactly like chat/, 'the guarded copy must tie the workbench gate to the chat gate')
+assert.match(apiWorkbenchSource, /operational telemetry — not compatibility evidence/, 'the request inspector must carry the telemetry-not-evidence banner')
+assert.match(apiWorkbenchSource, /fail_closed/, 'fail-closed routes must render their typed guarded state')
+assert.doesNotMatch(apiWorkbenchSource, /dangerouslySetInnerHTML/, 'inspector output must render as text')
+/* lib/apiExamples.js is deliberately NOT in the brand sweep: code samples may
+   name the SDK class they instantiate (technical compatibility content); UI
+   copy may not. The sweep still covers the workbench component itself. */
+
+/* ---- Compatibility ledger (Phase 4) ---- */
+assert.match(compatibilityViewSource, /capabilities\?\.model_compatibility/, 'the ledger must render rows from the live contract only')
+assert.match(compatibilityViewSource, /Not claimed/, 'the ledger must render the not-claimed column')
+assert.match(compatibilityViewSource, /Resemblance is not evidence/, 'the ledger explainer must state that resemblance is not evidence')
+assert.match(compatibilityViewSource, /Promotion path/, 'non-supported rows must show their promotion path from contract next_step copy')
+assert.doesNotMatch(compatibilityViewSource, /supported_exact_row_smoke|supported_current_gate|tinyllama_|llama32_|llama3_|mistral|mixtral/i, 'the ledger source must contain zero hardcoded row ids or support statuses — the contract is the only voice')
+assert.match(evidenceChipSource, /camelid:open-ledger/, 'Evidence Chips must deep-link to the ledger via the open-ledger event')
+assert.match(appSource, /camelid:open-ledger/, 'the app shell must listen for ledger deep-links')
+assert.match(modelsViewSource, /setTab\('compatibility'\)/, 'unmatched model cards must link to the compatibility ledger view')
+
+/* ---- Analytics ---- */
 assert.match(analyticsViewSource, /displayCapabilityId\(feature\.id\)/, 'Analytics view should not render raw provider-scoped API feature ids')
+
+/* ---- TopBar (re-baselined to the Evidence Chip gate) ---- */
+assert.match(topBarSource, /getChatGateState\(capabilities, selectedModel, runtime\)/, 'TopBar must derive its support claim from the shared chat gate')
+assert.match(topBarSource, /<EvidenceChip/, 'TopBar support gate must render through the Evidence Chip')
+assert.match(topBarSource, /className="topbar__gate"/, 'TopBar gate block must render on every tab, not only chat')
+assert.doesNotMatch(topBarSource, /tab === 'chat' && !demoMode &&[\s\S]*topbar__gate/, 'TopBar gate visibility must not be restricted to the chat tab')
+assert.match(topBarSource, /state=\{gate\.contractSupported \? 'supported'/, 'TopBar Evidence Chip supported state must come only from the shared gate contract flag')
+
+/* ---- Evidence Chip system (Phase 1 contract) ---- */
+assert.doesNotMatch(evidenceChipSource, /fetch\(|getChatGateState|isCompatibilitySupportedForModel|findCompatibilityHint/, 'EvidenceChip must stay purely presentational — it renders gate state, never computes or fetches it')
+assert.match(evidenceStatusSource, /if \(value === 'supported' \|\| value\.startsWith\('supported_'\)\) return 'supported'/, 'only contract supported/supported_* statuses may classify into the copper supported state')
+assert.match(evidenceCss, /\.ev-chip--supported\s*\{[^}]*var\(--color-verified\)/s, 'the supported chip state must use the reserved copper tokens')
+for (const [path, css] of statusSheets) {
+  assert.doesNotMatch(css, /var\(--color-verified\)/, `${path} must not spend the copper supported color on non-claim surfaces`)
+}
+
+/* ---- Tokens, fonts, themes (Phase 1 contract) ---- */
+assert.doesNotMatch(tokensCss, /@import url\(['"]?https?:/, 'tokens.css must not import from a CDN — the app renders fully offline')
+assert.match(tokensCss, /:root \{\s*\n\s*color-scheme: dark;/, 'dark is the canonical :root palette (dark-first)')
+assert.match(tokensCss, /--color-verified:/, 'tokens must define the reserved copper supported color')
+assert.match(tokensCss, /--color-evidence:/, 'tokens must define the bounded-evidence amber distinct from copper')
+assert.match(mainSource, /@fontsource-variable\/inter/, 'body font must be self-hosted via Fontsource')
+assert.match(mainSource, /@fontsource\/ibm-plex-mono/, 'mono font must be self-hosted via Fontsource')
+assert.doesNotMatch(mainSource, /fonts\.googleapis|fonts\.gstatic/, 'no third-party font CDN calls')
+assert.match(useThemeSource, /return saved && VALID\.has\(saved\) \? saved : 'dark'/, 'theme preference must default to dark')
+
+/* ---- Brand hygiene across visible UI sources ---- */
+const visibleUiSources = [
+  '../src/views/ChatWorkspace.jsx',
+  '../src/views/ApiView.jsx',
+  '../src/views/SystemView.jsx',
+  '../src/views/ModelsView.jsx',
+  '../src/hooks/useDashboardData.js',
+  '../src/components/TopBar.jsx',
+  '../src/components/chat/MessageTurn.jsx',
+  '../src/components/ui/EvidenceChip.jsx',
+  '../src/lib/evidenceStatus.js',
+  '../src/lib/markdown.jsx',
+  '../src/components/models/ModelInspector.jsx',
+  '../src/components/models/TokenizerPlayground.jsx',
+  '../src/views/CompatibilityView.jsx',
+  '../src/components/api/ApiWorkbench.jsx',
+  '../src/views/TelemetryView.jsx',
+].map((path) => [path, read(path)])
 for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)
 }
-assert.doesNotMatch(chatWorkspaceSource, /max[-_\s]?tokens?|token\s+limit/i, 'Chat UI should not expose a visible max-token picker or cap')
 
-const componentCss = readFileSync(new URL('../src/styles/components.css', import.meta.url), 'utf8')
-assert.match(componentCss, /\.streaming-loader\s*{[^}]*display:\s*flex[^}]*justify-content:\s*center/s, 'streaming assistant rows should show a centered dedicated loader')
-assert.match(componentCss, /\.streaming-loader-compact\s*{[^}]*padding:\s*0 0 8px/s, 'compact streaming loader should sit above pre-token assistant content without extra copy')
-assert.match(componentCss, /\.streaming-loader-track\s*{[^}]*display:\s*inline-flex[^}]*gap:\s*10px/s, 'streaming loader should keep a compact centered track')
-assert.match(componentCss, /\.streaming-loader-dot\s*{[^}]*border-radius:\s*999px[^}]*animation:\s*camelid-streaming-dot-bounce/s, 'streaming loader dots should animate while the loader is rendered')
-assert.match(componentCss, /\.message-row-assistant\.assistant::before,[\s\S]*?\.message-row-assistant\.assistant::after\s*{[^}]*content:\s*none !important[^}]*animation:\s*none !important/s, 'assistant row pseudo Pac-Man should stay disabled after moving the loader into the bubble')
-assert.match(componentCss, /\.message-code-card\.is-generating\s*{/, 'incomplete streaming code cards should have an active visual treatment')
-assert.match(componentCss, /\.message-code-card\.is-generating figcaption\s*{[^}]*position:\s*sticky[^}]*top:\s*0/s, 'incomplete streaming code cards should keep their generating label anchored while code grows')
-assert.match(componentCss, /\.message-code-card-status\s*{[^}]*display:\s*inline-flex[^}]*gap:\s*6px/s, 'incomplete code badges should be compact and visibly active')
-assert.match(componentCss, /\.message-code-card-status::before\s*{[^}]*animation:\s*camelid-live-dot-pulse/s, 'incomplete code badges should pulse only when the badge is rendered')
-assert.match(componentCss, /\.message-live-generation-badge\s*{[^}]*display:\s*inline-flex[^}]*border:\s*1px/s, 'streaming assistant content should keep a visible active badge while the backend is generating')
-assert.match(componentCss, /\.message-live-dot\s*{[^}]*animation:\s*camelid-live-dot-pulse/s, 'live generation badges should visibly pulse only while the badge is rendered')
-assert.match(componentCss, /@keyframes camelid-live-dot-pulse/, 'live generation dots should have an explicit pulse animation')
-const streamingDotRule = componentCss.match(/\.streaming-loader-dot\s*{[\s\S]*?\n}/)?.[0] || ''
-assert.match(streamingDotRule, /width:\s*10px/, 'streaming dots should stay compact and visible')
-assert.match(streamingDotRule, /height:\s*10px/, 'streaming dots should stay compact and visible')
-assert.match(streamingDotRule, /border-radius:\s*999px/, 'streaming dots should stay round')
-const streamingDotKeyframes = componentCss.match(/@keyframes camelid-streaming-dot-bounce\s*{[\s\S]*?\n}/)?.[0] || ''
-assert.match(streamingDotKeyframes, /translateY\(-3px\)/, 'streaming dots should bounce subtly while active')
-assert.match(streamingDotKeyframes, /opacity:\s*1/, 'streaming dots should brighten at peak animation')
-assert.doesNotMatch(componentCss, /\.message-row-assistant\.assistant\.is-streaming::after\s*{/, 'streaming assistant rows must not keep legacy pseudo animations')
+/* ---- Streaming visuals (current chat.css/ui.css truth) ---- */
+assert.match(chatCss, /\.streaming-loader\s*\{[^}]*display:\s*inline-flex/s, 'streaming assistant rows should keep a dedicated loader')
+assert.match(chatCss, /\.streaming-loader-dot\s*\{[^}]*border-radius:\s*50%[^}]*animation:\s*camelidDotBounce/s, 'streaming loader dots should animate only while the loader is rendered')
+assert.match(chatCss, /\.streaming-loader-compact\s*\{[^}]*padding:\s*0 0 8px/s, 'compact streaming loader should sit above pre-token assistant content without extra copy')
+assert.match(chatCss, /\.message-code-card\.is-generating\s*\{/, 'incomplete streaming code cards should have an active visual treatment')
+assert.match(chatCss, /\.message-live-generation-badge\s*\{/, 'streaming assistant content should keep a visible active badge while the backend is generating')
+assert.match(chatCss, /\.message-live-dot\s*\{[^}]*animation:\s*cxPulse/s, 'live generation badges should visibly pulse only while the badge is rendered')
+assert.match(uiCss, /@keyframes cxPulse/, 'the live pulse keyframes must exist')
+assert.match(tokensCss, /@keyframes camelidDotBounce/, 'the streaming dot bounce keyframes must exist')
 
-console.log('UI regression smoke passed')
+console.log('UI regression smoke passed (re-baselined Phase 2 pre-work)')

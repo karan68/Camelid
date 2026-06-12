@@ -141,3 +141,45 @@ npm run smoke -- --model '$CAMELID_MODEL_DIR/Meta-Llama-3-8B-Instruct-Q8_0.gguf'
 ```
 
 These commands must still fail closed if the loaded model is the wrong row, lacks Q8_0 metadata, is not `loaded_now=true` + `generation_ready=true`, or is outside the exact supported `/api/capabilities` row. That is intentional: the UI supports only the exact 1B/3B/8B smoke rows without making a broad Llama-family claim. The older public reopened-lane API + frontend smoke summary for all four exact rows remains `../qa/evidence-bundles/four-row-api-webui-20260505T003100Z-head-b403884/manifest.json`; for the exact 3B row, use `../qa/evidence-bundles/llama32-3b-api-webui-current-head-20260513T2005Z-head-e9f926e/manifest.json` as the canonical Ubuntu API/WebUI support-gate refresh. The exact 1B third bounded 2048-context pack now passed after the RoPE frequency-factor fix at `../qa/evidence-bundles/llama32-1b-context-2048-rope-factors-20260506T0105Z-head-62f8cbc/manifest.json`; the older 1B blocker notes remain historical. The exact 3B third bounded 2048-context pack passed at `../qa/evidence-bundles/llama32-3b-context-2048-20260505T105742Z-head-36ec8e492d65/manifest.json`; the exact 8B broader three-prompt 50-token pack passed at `../qa/evidence-bundles/llama3-8b-broader-50tok-20260505T005031Z-head-d13541ad8d7e/manifest.json`; the first 8B bounded 512-context pack passed at `../qa/evidence-bundles/llama3-8b-context-512-20260504T234625Z-head-58acf592345c/manifest.json`; and the published source/runtime-head 8B 1024/2048 bounded-pack pass at `../qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` matched prompt tokens, generated token IDs, and generated text for `CMLD-102`/`CMLD-204`, closing those exact bounded buckets. Older 8B 1024/2048 bounded-pack artifacts remain historical for their source heads only. The compact chat-template-shapes pack passed at `../qa/evidence-bundles/llama3-8b-chat-template-shapes-20260505T003821Z-head-d13541ad8d7e/manifest.json`, and the lazy-Q8 hot-path measurement is summarized at `../qa/evidence-bundles/llama3-8b-lazy-q8-hotpath-20260505T021411Z-head-723a665/manifest.json`; the frontend surfaces those as bounded exact-row evidence only. They do not establish arbitrary/Jinja-template readiness, production-throughput support, model-native/larger context, portability, neighboring rows, or broad Llama-family support.
+
+## Views & features (after the 2026-06 frontend overhaul)
+
+All readiness-gate semantics are **unchanged** by the overhaul: chat (and every
+generation try-it) unlocks only when `/v1/health` reports the selected
+`active_model_id` with `loaded_now=true` and `generation_ready=true` AND
+`/api/capabilities` has an exact supported compatibility row for the loaded
+model/quant. The gate libraries (`chatGate.js`, `capabilities.js`,
+`modelState.js`, `capabilityReadiness.js`) were verified byte-identical at every
+phase gate.
+
+- **Chat** — markdown with tables/lists/safe links and per-language syntax
+  highlighting; streaming with stop/abort; regenerate and edit-and-resend
+  (single gate-checked send path); per-message telemetry footer (client-measured,
+  labeled); conversation export (Markdown/JSON, path-free by whitelist);
+  Generation-controls drawer (system prompt + presets; sampling parameters stay
+  guarded until `/api/capabilities` advertises the exact row).
+- **Models** — Evidence Chips on every local GGUF card (unmatched models show a
+  calm "no exact supported row" state), model inspector drawer (GGUF KV
+  metadata, tokenizer, tensors — descriptive only, never support evidence), and
+  a tokenizer playground (live encode/decode, byte-exact round-trip check).
+- **Compatibility ledger** (`#compatibility`) — the live `/api/capabilities`
+  contract: per-row Proven / Not-claimed columns at equal weight, evidence
+  checklists with pack-id citations, promotion paths for non-supported rows.
+  Every Evidence Chip in the app deep-links to its row here.
+- **API** — workbench with copyable curl/Python/JS examples pre-filled from the
+  live API base and loaded model id; try-it runners gated exactly like chat;
+  request inspector (timings + SSE chunk log, operational telemetry only).
+- **Telemetry** (`#telemetry`) — session dashboard computed only from real
+  requests: tiles/sparklines, per-model breakdown, reachability history
+  (health poll with backoff), request log with prompts redacted by default and
+  path/content-free export.
+- **Design system** — dark-first instrument theme; copper is reserved for
+  supported/verified states; self-hosted fonts (fully offline rendering);
+  WCAG AA contrast smoke (`npm run smoke:contrast`).
+
+### Keyboard shortcuts
+
+- `Cmd/Ctrl + K` — command palette (navigate, switch model, jump to a ledger row)
+- `Enter` / `Shift+Enter` — send / newline in the composer
+- `Esc` — stop a running generation, close overlays
+- `?` — shortcut map (outside text fields)
