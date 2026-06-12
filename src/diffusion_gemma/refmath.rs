@@ -30,6 +30,7 @@ struct SinCosF32 {
 unsafe extern "C" {
     fn expf(x: f32) -> f32;
     fn tanhf(x: f32) -> f32;
+    fn logf(x: f32) -> f32;
     // Apple's combined sin/cos — the symbol clang emits when a function
     // computes both sinf(x) and cosf(x) (observed in the pinned dylib's rope
     // disassembly); NOT bitwise-identical to separate sinf/cosf calls.
@@ -54,6 +55,9 @@ pub(crate) fn libm_expf(x: f32) -> f32 {
 }
 pub(crate) fn libm_tanhf(x: f32) -> f32 {
     unsafe { tanhf(x) }
+}
+pub(crate) fn libm_logf(x: f32) -> f32 {
+    unsafe { logf(x) }
 }
 
 /// `ggml_compute_forward_rms_norm_f32` (ops.cpp): the sum of squares

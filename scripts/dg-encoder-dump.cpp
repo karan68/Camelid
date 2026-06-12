@@ -1,13 +1,15 @@
-// dg-encoder-dump — per-layer encoder (PREFILL) checkpoint dumper for the
-// DiffusionGemma lane's Phase 2 parity gate.
+// dg-encoder-dump — per-layer checkpoint dumper for the DiffusionGemma
+// lane's Phase 2 (PREFILL) and Phase 3 (UNIFIED) parity gates.
 //
-// Runs ONE prompt-only PREFILL forward of the diffusion model (the encoder
-// path: causal prompt attention, encoder per-layer scalars, prompt K/V store)
-// on the CPU backend and captures the graph's named checkpoint tensors via
-// the eval callback: input embeddings, per-layer K/V (post-norm post-rope),
-// post-attention residual, MoE router logits, selected expert indices, and
-// the scaled layer output. Each tensor is written raw (f32/i32 little-endian)
-// with a JSON manifest line on stdout.
+// Without a canvas file: ONE prompt-only PREFILL forward (the encoder path:
+// causal prompt attention, encoder per-layer scalars, prompt K/V store).
+// With a canvas file: ONE unified no-cache [prompt | canvas] forward (the
+// Phase 3 decode surface: region mask, canvas rms_norm embedding, decoder
+// scalars on canvas rows, zero self-conditioning) — plus the final logits
+// ("result_output").
+// Both run on the CPU backend and capture the graph's named checkpoint
+// tensors via the eval callback. Each tensor is written raw (f32/i32
+// little-endian) with a JSON manifest line on stdout.
 //
 // All model-graph semantics here are the work of the llama.cpp / ggml authors
 // (https://github.com/ggml-org/llama.cpp, MIT). Compile against the PINNED
@@ -18,7 +20,7 @@
 //       scripts/dg-encoder-dump.cpp -L <pin>/build/bin -lllama \
 //       -Wl,-rpath,<pin>/build/bin -o <out>/dg-encoder-dump
 // Run:
-//   dg-encoder-dump <model.gguf> <prompt_ids.i32> <out_dir>
+//   dg-encoder-dump <model.gguf> <prompt_ids.i32> <out_dir> [canvas_ids.i32]
 
 #include "llama.h"
 #include "ggml.h"
@@ -43,12 +45,17 @@ struct capture_ctx {
 // "inp_scaled") and the scaled layer output as "l_out-N" (not
 // "out_scaled-N"); the values are identical (cvec is a pass-through here).
 static bool want_name(const char * name, int n_layer) {
-    if (strcmp(name, "inp_region") == 0 || strcmp(name, "result_norm") == 0) {
+    if (strcmp(name, "inp_region") == 0 || strcmp(name, "result_norm") == 0 ||
+        strcmp(name, "result_output") == 0) {
         return true;
     }
     static const char * per_layer[] = {
         "Kcur_pos",      "Vcur_normed", "attn_out", "ffn_moe_logits",
         "ffn_moe_topk",  "l_out",
+        // pre-attention chain bisection (Phase 3: batch-size-dependent
+        // reference kernels suspected between inp_region and Kcur_pos)
+        "attn_norm",     "Qcur",        "Kcur",     "Vcur",
+        "Qcur_normed",   "Kcur_normed",
         // FFN-branch bisection points (labels survive cb renames)
         "ffn_mlp",       "ffn_moe",     "ffn_moe_weights",
         // expert-chain bisection points (merged gate_up path)
@@ -130,21 +137,38 @@ static std::vector<int32_t> read_i32(const char * path) {
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <model.gguf> <prompt_ids.i32> <out_dir>\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr, "usage: %s <model.gguf> <prompt_ids.i32> <out_dir> [canvas_ids.i32]\n",
+                argv[0]);
         return 1;
     }
-    const char * model_path = argv[1];
-    const char * ids_path   = argv[2];
-    const char * out_dir    = argv[3];
+    const char * model_path  = argv[1];
+    const char * ids_path    = argv[2];
+    const char * out_dir     = argv[3];
+    const char * canvas_path = (argc == 5) ? argv[4] : nullptr;
 
     const std::vector<int32_t> prompt = read_i32(ids_path);
     const int P = (int) prompt.size();
     if (P <= 0) { fprintf(stderr, "empty prompt\n"); return 1; }
+    std::vector<int32_t> canvas;
+    if (canvas_path) {
+        canvas = read_i32(canvas_path);
+        if (canvas.empty()) { fprintf(stderr, "empty canvas\n"); return 1; }
+    }
+    const int C = (int) canvas.size();
+    const int N = P + C;
 
     llama_backend_init();
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0; // CPU only: the parity contract names the backend
+    // An EMPTY device list keeps GPU backends out of the scheduler entirely.
+    // n_gpu_layers=0 alone is NOT enough: with a Metal device registered, the
+    // sched's op-offload policy still runs large-batch ops (n_tokens >= 32)
+    // on the GPU — fine at the Phase 2 prompt (17 rows), but the Phase 3
+    // unified forward (273 rows) would silently leave the CPU kernels the
+    // parity contract names.
+    static ggml_backend_dev_t no_devices[1] = { nullptr };
+    mparams.devices = no_devices;
     // No weight repacking: repacked Q4_K (q4_K_8x8) materializes ~13 GB into
     // RAM (OOM on a 16 GB host) and runs different kernels than the generic
     // vec_dot path this lane's parity contract mirrors.
@@ -168,9 +192,9 @@ int main(int argc, char ** argv) {
     cc.captured = 0;
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx             = P;
-    cparams.n_batch           = P;
-    cparams.n_ubatch          = P; // non-causal arch: whole prompt in one ubatch
+    cparams.n_ctx             = N;
+    cparams.n_batch           = N;
+    cparams.n_ubatch          = N; // non-causal arch: whole sequence in one ubatch
     cparams.no_perf           = true;
     cparams.flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.cb_eval           = eval_cb;
@@ -188,29 +212,47 @@ int main(int argc, char ** argv) {
 
     llama_set_causal_attn(ctx, false); // the arch fills its own region mask
 
-    // ENCODER phase: PREFILL the prompt, writing the prompt K/V store
-    // (mirrors examples/diffusion-gemma-eval/diffusion-gemma-eval.cpp DG_CACHED)
-    llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, P);
-    llama_diffusion_set_sc(model, nullptr, /*use_sc=*/0.0f, /*temp_inv=*/1.0f, /*enabled=*/false);
-
-    llama_batch batch = llama_batch_init(P, 0, 1);
-    batch.n_tokens = P;
-    for (int i = 0; i < P; ++i) {
-        batch.token[i]     = prompt[i];
-        batch.pos[i]       = i;
-        batch.n_seq_id[i]  = 1;
-        batch.seq_id[i][0] = 0;
-        batch.logits[i]    = (i == P - 1) ? 1 : 0;
+    llama_batch batch = llama_batch_init(N, 0, 1);
+    if (!canvas_path) {
+        // ENCODER phase: PREFILL the prompt, writing the prompt K/V store
+        // (mirrors examples/diffusion-gemma-eval/diffusion-gemma-eval.cpp DG_CACHED)
+        llama_diffusion_set_phase(model, /*PKV_PREFILL=*/1, P);
+        llama_diffusion_set_sc(model, nullptr, /*use_sc=*/0.0f, /*temp_inv=*/1.0f, /*enabled=*/false);
+        batch.n_tokens = P;
+        for (int i = 0; i < P; ++i) {
+            batch.token[i]     = prompt[i];
+            batch.pos[i]       = i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = (i == P - 1) ? 1 : 0;
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "PREFILL decode failed\n");
+            return 1;
+        }
+        llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0);
+    } else {
+        // UNIFIED phase (Phase 3 surface): one no-cache [prompt | canvas]
+        // forward, zero self-conditioning, logits for every row (mirrors
+        // examples/diffusion-gemma-eval/diffusion-gemma-eval.cpp uncached)
+        batch.n_tokens = N;
+        for (int i = 0; i < N; ++i) {
+            batch.token[i]     = (i < P) ? prompt[i] : canvas[i - P];
+            batch.pos[i]       = i;
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = 0;
+            batch.logits[i]    = 1;
+        }
+        if (llama_decode(ctx, batch) != 0) {
+            fprintf(stderr, "UNIFIED decode failed\n");
+            return 1;
+        }
     }
-    if (llama_decode(ctx, batch) != 0) {
-        fprintf(stderr, "PREFILL decode failed\n");
-        return 1;
-    }
-    llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0);
     llama_batch_free(batch);
     fclose(manifest);
 
-    fprintf(stderr, "captured %d checkpoint tensors for P=%d into %s\n", cc.captured, P, out_dir);
+    fprintf(stderr, "captured %d checkpoint tensors for P=%d C=%d into %s\n",
+            cc.captured, P, C, out_dir);
 
     llama_free(ctx);
     llama_model_free(model);

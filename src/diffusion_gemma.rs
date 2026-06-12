@@ -1,9 +1,12 @@
-//! Experimental DiffusionGemma encoder runtime (recon/evidence lane only).
+//! Experimental DiffusionGemma runtime (recon/evidence lane only).
 //!
-//! Implements the ENCODER side of the block-diffusion model: a causal
+//! Implements the ENCODER side of the block-diffusion model (a causal
 //! prompt-prefill forward over the shared Gemma-4 backbone with the
-//! encoder-mode per-layer output scalars, producing the per-layer K/V the
-//! decoder will later cross-attend into. See
+//! encoder-mode per-layer output scalars — Phase 2) and the Phase 3 decode
+//! surface (`unified_forward`: one zero-self-conditioning bidirectional
+//! forward over `[prompt | canvas]` through the tied lm_head, plus
+//! `eb_step`/`refrng`: one Entropy-Bound sampler step with the reference's
+//! exact host RNG). See
 //! `docs/recon/DIFFUSIONGEMMA_RECON.md` for the verified architecture facts
 //! and the lane charter rules. Nothing here is a support claim; the public
 //! posture stays "Active development — recon/evidence-only. Not supported."
@@ -22,6 +25,7 @@
 use std::path::Path;
 
 mod refmath;
+pub mod refrng;
 
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
@@ -199,36 +203,50 @@ impl DgWire {
         let bytes = self
             .mmap
             .bytes(self.offset + (first_row * rb) as u64, n_rows * rb)?;
+        let dot = |r: usize| -> f32 {
+            let row = &bytes[r * rb..(r + 1) * rb];
+            match self.format {
+                DgFormat::Q8_0 => refmath::q8_0_dot_arm(row, &x.q8_0),
+                DgFormat::Q5_0 => refmath::q5_0_dot_arm(row, &x.q8_0),
+                DgFormat::Q4K => refmath::q4_k_dot_arm(
+                    row,
+                    x.q8_k
+                        .as_ref()
+                        .expect("K-quant rows imply 256-aligned input"),
+                ),
+                DgFormat::Q6K => refmath::q6_k_dot_arm(
+                    row,
+                    x.q8_k
+                        .as_ref()
+                        .expect("K-quant rows imply 256-aligned input"),
+                ),
+            }
+        };
         let mut out = vec![0f32; n_rows];
-        match self.format {
-            DgFormat::Q8_0 => {
-                for (r, y) in out.iter_mut().enumerate() {
-                    *y = refmath::q8_0_dot_arm(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
-                }
+        // Row-chunk threading: every output element is one self-contained row
+        // dot, so splitting ROWS across threads cannot change any value (the
+        // reference's own mul_mat threads partition the same way). Small
+        // matvecs stay sequential — thread spawn would dominate.
+        let nth = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8);
+        if nth <= 1 || n_rows * self.in_dim < (1 << 21) {
+            for (r, y) in out.iter_mut().enumerate() {
+                *y = dot(r);
             }
-            DgFormat::Q5_0 => {
-                for (r, y) in out.iter_mut().enumerate() {
-                    *y = refmath::q5_0_dot_arm(&bytes[r * rb..(r + 1) * rb], &x.q8_0);
+        } else {
+            let chunk = n_rows.div_ceil(nth);
+            std::thread::scope(|s| {
+                for (ci, ys) in out.chunks_mut(chunk).enumerate() {
+                    let dot = &dot;
+                    s.spawn(move || {
+                        for (i, y) in ys.iter_mut().enumerate() {
+                            *y = dot(ci * chunk + i);
+                        }
+                    });
                 }
-            }
-            DgFormat::Q4K => {
-                let xk = x
-                    .q8_k
-                    .as_ref()
-                    .expect("K-quant rows imply 256-aligned input");
-                for (r, y) in out.iter_mut().enumerate() {
-                    *y = refmath::q4_k_dot_arm(&bytes[r * rb..(r + 1) * rb], xk);
-                }
-            }
-            DgFormat::Q6K => {
-                let xk = x
-                    .q8_k
-                    .as_ref()
-                    .expect("K-quant rows imply 256-aligned input");
-                for (r, y) in out.iter_mut().enumerate() {
-                    *y = refmath::q6_k_dot_arm(&bytes[r * rb..(r + 1) * rb], xk);
-                }
-            }
+            });
         }
         Ok(out)
     }
@@ -329,6 +347,11 @@ pub struct DgEncoderRuntime {
     token_embd: DgWire,
     output_norm: Vec<f32>,
     rope_factors: Option<Vec<f32>>,
+    /// `diffusion.canvas_length` — the unified forward's region split.
+    canvas_length: usize,
+    /// `final_logit_softcapping` (30.0 on the tracked GGUF); `None` skips the
+    /// capping exactly as the reference's falsy check does.
+    final_logit_softcapping: Option<f32>,
 }
 
 impl DgEncoderRuntime {
@@ -358,18 +381,25 @@ impl DgEncoderRuntime {
         let eps = gguf
             .metadata_f32(&format!("{arch}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-6);
-        if gguf
+        let canvas_length = gguf
             .metadata_u32("diffusion.canvas_length")
             .or_else(|| {
                 gguf.metadata_string("diffusion.canvas_length")
                     .and_then(|s| s.parse().ok())
             })
-            .is_none()
-        {
+            .ok_or_else(|| {
+                BackendError::InvalidModelMetadata(
+                    "missing diffusion.canvas_length (not a DiffusionGemma file?)".into(),
+                )
+            })? as usize;
+        if canvas_length == 0 {
             return Err(BackendError::InvalidModelMetadata(
-                "missing diffusion.canvas_length (not a DiffusionGemma file?)".into(),
+                "diffusion.canvas_length must be positive".into(),
             ));
         }
+        let final_logit_softcapping = gguf
+            .metadata_f32(&format!("{arch}.final_logit_softcapping"))
+            .filter(|&c| c != 0.0);
 
         let store = TensorStore::open(path, &gguf);
         let mmap = GgufWireMmap::map(path)?;
@@ -470,6 +500,8 @@ impl DgEncoderRuntime {
             token_embd,
             output_norm: f32t("output_norm.weight")?,
             rope_factors,
+            canvas_length,
+            final_logit_softcapping,
         })
     }
 
@@ -803,6 +835,467 @@ impl DgEncoderRuntime {
     }
 }
 
+/// Output of one unified (zero-SC) `[prompt | canvas]` forward.
+pub struct DgUnifiedOut {
+    pub n_prompt: usize,
+    pub n_canvas: usize,
+    pub n_vocab: usize,
+    /// Canvas-row logits, `[C * n_vocab]` row-major — the Phase 3 gate
+    /// surface (`llama-diffusion-gemma-eval` writes exactly these rows).
+    pub logits: Vec<f32>,
+    /// Per-layer checkpoint trace over ALL `P + C` positions (ladder
+    /// debugging only; ~1 GB at full canvas — request it explicitly).
+    pub trace: Option<DgEncoderTrace>,
+}
+
+/// One Entropy-Bound denoiser step's host-math outputs (reference:
+/// `diffusion_generate_entropy_bound`, examples/diffusion/diffusion.cpp at
+/// the pin — per-position worker, MI-bound acceptance, renoise).
+pub struct DgEbStep {
+    pub t: f32,
+    pub temp_inv: f32,
+    pub argmax: Vec<i32>,
+    pub entropy: Vec<f32>,
+    pub denoiser: Vec<i32>,
+    pub accepted: Vec<bool>,
+    pub next_canvas: Vec<i32>,
+    /// Sequential f32 sum of entropies (the reference's adaptive-stop input).
+    pub entropy_sum: f32,
+}
+
+impl DgEncoderRuntime {
+    /// UNIFIED decode-surface forward (Phase 3): one no-cache bidirectional
+    /// pass over `[prompt | canvas]` with zero self-conditioning, mirroring
+    /// the reference graph (src/models/diffusion-gemma.cpp at the pin):
+    /// canvas embeddings take a weightless rms_norm after the embed scale,
+    /// the region mask keeps prompt queries causal (SWA-clipped) over the
+    /// prompt only while canvas queries are bidirectional (sliding layers
+    /// reach the last `n_swa-1` prompt positions), prompt rows scale by the
+    /// encoder per-layer scalar and canvas rows by the decoder scalar, and
+    /// the canvas rows finish through the tied lm_head with final-logit
+    /// softcapping.
+    pub fn unified_forward(
+        &self,
+        prompt: &[u32],
+        canvas: &[u32],
+        want_trace: bool,
+    ) -> Result<DgUnifiedOut> {
+        let p = prompt.len();
+        let c = canvas.len();
+        let n = p + c;
+        if p == 0 {
+            return Err(BackendError::RuntimeShapeMismatch("empty prompt".into()));
+        }
+        if c != self.canvas_length {
+            // the reference graph splits on the GGUF's canvas_length, so any
+            // other canvas size would silently exercise a different region
+            // split — fail closed instead
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "canvas length {c} != diffusion.canvas_length {}",
+                self.canvas_length
+            )));
+        }
+        let eps = self.eps;
+        let hidden = self.n_embd;
+        let heads = self.n_head;
+        let win = self.g.sliding_window as usize;
+        let embed_scale = (hidden as f32).sqrt();
+
+        // embeddings: every row scaled by sqrt(n_embd); canvas rows then take
+        // the weightless rms_norm (the zero-SC canvas embedding)
+        let mut h: Vec<Vec<f32>> = Vec::with_capacity(n);
+        let mut inp_scaled = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
+        for (pos, &tok) in prompt.iter().chain(canvas.iter()).enumerate() {
+            let mut e = self.embed_row(tok)?;
+            for v in e.iter_mut() {
+                *v *= embed_scale;
+            }
+            if pos >= p {
+                e = refmath::rms_norm(&e, None, eps);
+            }
+            if want_trace {
+                inp_scaled.extend_from_slice(&e);
+            }
+            h.push(e);
+        }
+
+        // canvas->prompt sliding bound: last (n_swa - 1) prompt positions
+        let canvas_prompt_lo = p as i64 - win as i64 + 1;
+
+        let mut traces = Vec::with_capacity(if want_trace { self.n_layer } else { 0 });
+        for (l, lw) in self.layers.iter().enumerate() {
+            let sliding = self.g.is_sliding_layer(l);
+            let head_dim = self.g.head_dim_at(l) as usize;
+            let kv_heads = self.g.kv_heads_at(l) as usize;
+            let theta = self.g.rope_freq_base_at(l);
+            let q_dim = heads * head_dim;
+            let kv_dim = kv_heads * head_dim;
+            let group = heads / kv_heads;
+            let rope_factors = if sliding {
+                None
+            } else {
+                self.rope_factors.as_deref()
+            };
+
+            // ---- projections for every position (identical to the encoder
+            // path; absolute positions feed RoPE) ----
+            let mut qs: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let mut ks: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let mut vs: Vec<Vec<f32>> = Vec::with_capacity(n);
+            for (pos, hp) in h.iter().enumerate() {
+                let xn = refmath::rms_norm(hp, Some(&lw.attn_norm), eps);
+                let xq = DgActivation::new(&xn);
+                let mut q = lw.attn_q.matvec_dense(&xq)?;
+                for hh in 0..heads {
+                    let s = &mut q[hh * head_dim..(hh + 1) * head_dim];
+                    s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.q_norm), eps));
+                }
+                refmath::rope_neox(&mut q, heads, head_dim, pos, theta, rope_factors);
+
+                let mut k = lw.attn_k.matvec_dense(&xq)?;
+                let mut v = match lw.attn_v.as_ref() {
+                    Some(wv) => wv.matvec_dense(&xq)?,
+                    None => k.clone(),
+                };
+                for hh in 0..kv_heads {
+                    let s = &mut k[hh * head_dim..(hh + 1) * head_dim];
+                    s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.k_norm), eps));
+                    let sv = &mut v[hh * head_dim..(hh + 1) * head_dim];
+                    sv.copy_from_slice(&refmath::rms_norm(sv, None, eps));
+                }
+                refmath::rope_neox(&mut k, kv_heads, head_dim, pos, theta, rope_factors);
+                qs.push(q);
+                ks.push(k);
+                vs.push(v);
+            }
+
+            // region-aware mask (llm_graph_input_attn_diffusion::set_input):
+            // prompt queries causal over the prompt only (SWA-clipped on
+            // sliding layers); canvas queries bidirectional — global layers
+            // see everything, sliding layers see all canvas plus the last
+            // (n_swa - 1) prompt positions
+            let allow = |q_pos: usize, k_pos: usize| -> bool {
+                if q_pos >= p {
+                    if sliding {
+                        k_pos >= p || k_pos as i64 >= canvas_prompt_lo
+                    } else {
+                        true
+                    }
+                } else {
+                    k_pos <= q_pos && (!sliding || k_pos + win > q_pos)
+                }
+            };
+
+            let mut v_cols: Vec<Vec<f32>> = vec![vec![0f32; n]; kv_heads * head_dim];
+            for (pp, vp) in vs.iter().enumerate() {
+                for (di, &val) in vp.iter().enumerate() {
+                    v_cols[di][pp] = val;
+                }
+            }
+
+            let mut attn_out = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
+            for pos in 0..n {
+                let mut attn = vec![0f32; q_dim];
+                for hh in 0..heads {
+                    let kvh = hh / group;
+                    let qh = &qs[pos][hh * head_dim..(hh + 1) * head_dim];
+                    let mut row: Vec<f32> = (0..n)
+                        .map(|kp| {
+                            if allow(pos, kp) {
+                                let kk = &ks[kp][kvh * head_dim..(kvh + 1) * head_dim];
+                                refmath::vec_dot_f32(qh, kk)
+                            } else {
+                                f32::NEG_INFINITY
+                            }
+                        })
+                        .collect();
+                    refmath::softmax_row(&mut row);
+                    let out = &mut attn[hh * head_dim..(hh + 1) * head_dim];
+                    for (d, o) in out.iter_mut().enumerate() {
+                        *o = refmath::vec_dot_f32(&v_cols[kvh * head_dim + d], &row);
+                    }
+                }
+                let aq = DgActivation::new(&attn);
+                let o = lw.attn_output.matvec_dense(&aq)?;
+                let on = refmath::rms_norm(&o, Some(&lw.post_attn_norm), eps);
+                for (a, b) in h[pos].iter_mut().zip(&on) {
+                    *a += b;
+                }
+                if want_trace {
+                    attn_out.extend_from_slice(&h[pos]);
+                }
+            }
+
+            // ---- dense shared-expert MLP + 128-expert MoE (identical math
+            // to the encoder path; only the per-layer output scalar is
+            // region-aware) ----
+            let mut moe_logits_all = Vec::new();
+            let mut moe_topk_all = Vec::new();
+            let mut out_scaled = Vec::new();
+            for (pos, hp) in h.iter_mut().enumerate() {
+                let attn_resid = hp.clone();
+                let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
+                let xq = DgActivation::new(&xn);
+                let gate = lw.ffn_gate.matvec_dense(&xq)?;
+                let up = lw.ffn_up.matvec_dense(&xq)?;
+                let act: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| dg_gelu(*g) * u).collect();
+                let actq = DgActivation::new(&act);
+                let mlp = lw.ffn_down.matvec_dense(&actq)?;
+                let mlp = refmath::rms_norm(&mlp, Some(&lw.post_norm_1), eps);
+
+                let mut r = refmath::rms_norm(&attn_resid, None, eps);
+                let inv = 1.0f32 / (hidden as f32).sqrt();
+                for (rv, sv) in r.iter_mut().zip(&lw.gate_inp_scale) {
+                    *rv = *rv * inv * sv;
+                }
+                let logits: Vec<f32> = (0..self.n_expert)
+                    .map(|e| refmath::vec_dot_f32(&lw.gate_inp[e * hidden..(e + 1) * hidden], &r))
+                    .collect();
+
+                let mut probs: Vec<f32> = logits.clone();
+                refmath::softmax_row(&mut probs);
+                let mut idx: Vec<usize> = (0..self.n_expert).collect();
+                idx.sort_unstable_by(|&a, &b| {
+                    probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b))
+                });
+                idx.truncate(self.n_expert_used);
+                if want_trace {
+                    moe_logits_all.extend_from_slice(&logits);
+                    for &e in &idx {
+                        moe_topk_all.push(e as i32);
+                    }
+                }
+                let selected: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+                let mut wsum = refmath::vec_sum_f32(&selected);
+                wsum = wsum.max(f32::from_bits(0x3880_0000));
+
+                let cur_moe = refmath::rms_norm(&attn_resid, Some(&lw.pre_norm_2), eps);
+                let cur_moe_q = DgActivation::new(&cur_moe);
+                let two_nff = 2 * self.n_ff_exp;
+                let mut moe_acc = vec![0f32; hidden];
+                for &e in &idx {
+                    let w = refmath::vdsp_div(probs[e], wsum);
+                    let gate_up = lw
+                        .gate_up_exps
+                        .matvec_rows(e * two_nff, two_nff, &cur_moe_q)?;
+                    let hexp: Vec<f32> = (0..self.n_ff_exp)
+                        .map(|o| dg_gelu(gate_up[o]) * gate_up[o + self.n_ff_exp])
+                        .collect();
+                    let hexp_q = DgActivation::new(&hexp);
+                    let y = lw.down_exps.matvec_rows(e * hidden, hidden, &hexp_q)?;
+                    let s_e = lw.down_exps_scale[e];
+                    for (a, yv) in moe_acc.iter_mut().zip(&y) {
+                        *a += yv * s_e * w;
+                    }
+                }
+                let moe_out = refmath::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
+
+                let mut combined = mlp;
+                for (cv, m) in combined.iter_mut().zip(&moe_out) {
+                    *cv += m;
+                }
+                let ffn_out = refmath::rms_norm(&combined, Some(&lw.post_ffw_norm), eps);
+                for (a, b) in hp.iter_mut().zip(&ffn_out) {
+                    *a += b;
+                }
+                // region-aware per-layer scalar: prompt rows take the encoder
+                // scalar, canvas rows the decoder scalar
+                let scale = if pos < p {
+                    lw.enc_out_scale
+                } else {
+                    lw.out_scale
+                };
+                for v in hp.iter_mut() {
+                    *v *= scale;
+                }
+                if want_trace {
+                    out_scaled.extend_from_slice(hp);
+                }
+            }
+
+            if want_trace {
+                let mut k_flat = Vec::with_capacity(n * kv_dim);
+                let mut v_flat = Vec::with_capacity(n * kv_dim);
+                for pos in 0..n {
+                    k_flat.extend_from_slice(&ks[pos]);
+                    v_flat.extend_from_slice(&vs[pos]);
+                }
+                traces.push(DgLayerTrace {
+                    k: k_flat,
+                    v: v_flat,
+                    attn_out,
+                    moe_logits: moe_logits_all,
+                    moe_topk: moe_topk_all,
+                    out_scaled,
+                    ffn_mlp: Vec::new(),
+                    ffn_moe: Vec::new(),
+                    moe_weights: Vec::new(),
+                    moe_gate_up: Vec::new(),
+                    moe_geglu: Vec::new(),
+                    moe_down: Vec::new(),
+                    moe_down_scaled: Vec::new(),
+                    moe_weights_norm: Vec::new(),
+                    moe_pre_norm: Vec::new(),
+                });
+            }
+        }
+
+        // final norm on every row; lm_head (tied Q6_K token embedding) +
+        // final-logit softcapping on the CANVAS rows only (the gate surface)
+        let n_vocab = self.token_embd.rows;
+        let mut result_norm_all = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
+        let mut logits = Vec::with_capacity(c * n_vocab);
+        for (pos, hp) in h.iter().enumerate() {
+            let rn = refmath::rms_norm(hp, Some(&self.output_norm), eps);
+            if pos >= p {
+                let rq = DgActivation::new(&rn);
+                let mut row = self.token_embd.matvec_dense(&rq)?;
+                if let Some(cap) = self.final_logit_softcapping {
+                    // reference: scale(1/cap) -> tanh -> scale(cap); the
+                    // reciprocal is computed in f32 at graph build
+                    let inv_cap = 1.0f32 / cap;
+                    for v in row.iter_mut() {
+                        *v = refmath::libm_tanhf(*v * inv_cap) * cap;
+                    }
+                }
+                logits.extend_from_slice(&row);
+            }
+            if want_trace {
+                result_norm_all.extend_from_slice(&rn);
+            }
+        }
+
+        let trace = want_trace.then(|| DgEncoderTrace {
+            n_pos: n,
+            inp_scaled,
+            layers: traces,
+            result_norm_last: result_norm_all[(n - 1) * hidden..].to_vec(),
+            result_norm_all,
+        });
+
+        Ok(DgUnifiedOut {
+            n_prompt: p,
+            n_canvas: c,
+            n_vocab,
+            logits,
+            trace,
+        })
+    }
+
+    /// One Entropy-Bound denoiser step's host math, transcribed from the
+    /// reference sampler (diffusion.cpp at the pin): per position the argmax
+    /// of `logits/t`, the entropy of `softmax(logits/t)`, and a multinomial
+    /// draw via the pre-drawn `u`; then the MI-bound acceptance (lowest
+    /// entropies whose STRICTLY-EARLIER cumulative sum stays within the
+    /// bound, double accumulator) and the renoise rule (accepted -> sampled
+    /// token, rest -> the pre-drawn fresh random token). `step_idx`/`s` set
+    /// the linear temperature schedule (`cur_step = s - step_idx`).
+    ///
+    /// Tie caveat: the reference orders positions with `std::sort` on
+    /// entropy; equal entropies across positions land in unspecified order,
+    /// and an acceptance boundary INSIDE such a tie group is the one case
+    /// where this port (sort_unstable_by) could legally differ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn eb_step(
+        logits: &[f32],
+        n_vocab: usize,
+        step_idx: i32,
+        s: i32,
+        t_min: f32,
+        t_max: f32,
+        entropy_bound: f32,
+        u: &[f32],
+        renoise: &[i32],
+    ) -> DgEbStep {
+        let c = u.len();
+        debug_assert_eq!(logits.len(), c * n_vocab);
+        debug_assert_eq!(renoise.len(), c);
+        let cur_step = s - step_idx;
+        // the reference's `t_min + (t_max - t_min) * ratio` is one expression
+        // and contracts to fma under clang's default -ffp-contract=on
+        let t = (t_max - t_min).mul_add(cur_step as f32 / s as f32, t_min);
+        let temp_inv = 1.0f32 / t;
+
+        let mut argmax = vec![0i32; c];
+        let mut entropy = vec![0f32; c];
+        let mut denoiser = vec![0i32; c];
+        for pos in 0..c {
+            let row = &logits[pos * n_vocab..(pos + 1) * n_vocab];
+            let mut m = f32::NEG_INFINITY;
+            let mut amax = 0i32;
+            for (v, &x) in row.iter().enumerate() {
+                let z = x * temp_inv;
+                if z > m {
+                    m = z;
+                    amax = v as i32;
+                }
+            }
+            // the reference's `expf(row[v] * temp_inv - m)` argument and its
+            // `H -= p * logf(p)` update both CONTRACT under clang's default
+            // -ffp-contract=on (fmadd / fmsub in the oracle's disassembly) —
+            // mirror the single-rounding forms
+            let neg_m = -m;
+            let mut zsum = 0.0f32;
+            for &x in row {
+                zsum += refmath::libm_expf(x.mul_add(temp_inv, neg_m));
+            }
+            let target = u[pos] * zsum;
+            let mut cum = 0.0f32;
+            let mut hent = 0.0f32;
+            let mut sampled = (n_vocab - 1) as i32;
+            let mut picked = false;
+            for (v, &x) in row.iter().enumerate() {
+                let e = refmath::libm_expf(x.mul_add(temp_inv, neg_m));
+                let pr = e / zsum;
+                if pr > 0.0 {
+                    hent = (-pr).mul_add(refmath::libm_logf(pr), hent);
+                }
+                cum += e;
+                if !picked && cum >= target {
+                    sampled = v as i32;
+                    picked = true;
+                }
+            }
+            argmax[pos] = amax;
+            entropy[pos] = hent;
+            denoiser[pos] = sampled;
+        }
+
+        let mut order: Vec<usize> = (0..c).collect();
+        order.sort_unstable_by(|&a, &b| entropy[a].partial_cmp(&entropy[b]).unwrap());
+        let mut accepted = vec![false; c];
+        let mut cum_e = 0f64;
+        for &pos in &order {
+            cum_e += entropy[pos] as f64;
+            if cum_e - entropy[pos] as f64 <= entropy_bound as f64 {
+                accepted[pos] = true;
+            }
+        }
+
+        let mut next_canvas = vec![0i32; c];
+        let mut entropy_sum = 0.0f32;
+        for pos in 0..c {
+            next_canvas[pos] = if accepted[pos] {
+                denoiser[pos]
+            } else {
+                renoise[pos]
+            };
+            entropy_sum += entropy[pos];
+        }
+
+        DgEbStep {
+            t,
+            temp_inv,
+            argmax,
+            entropy,
+            denoiser,
+            accepted,
+            next_canvas,
+            entropy_sum,
+        }
+    }
+}
+
 /// Re-export the metadata so the parity test can sanity-check shapes.
 impl DgEncoderRuntime {
     pub fn n_layer(&self) -> usize {
@@ -816,6 +1309,9 @@ impl DgEncoderRuntime {
     }
     pub fn n_expert(&self) -> usize {
         self.n_expert
+    }
+    pub fn n_vocab(&self) -> usize {
+        self.token_embd.rows
     }
     pub fn n_expert_used(&self) -> usize {
         self.n_expert_used

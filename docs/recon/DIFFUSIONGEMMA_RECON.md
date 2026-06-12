@@ -247,6 +247,51 @@ preserved in `target/dg-encoder-parity-20260611T194014Z/FAILURE_REPORT.md`
 and the loop log. The pinned reference itself is bit-deterministic across
 thread counts (control in that bundle).
 
+## 8b. Phase 3 status — single denoise step parity: PASSED, BIT-EXACT
+
+`src/diffusion_gemma.rs::unified_forward` implements the Phase 3 decode
+surface — one zero-self-conditioning bidirectional forward over
+`[prompt | canvas]` (canvas embeddings rms_norm'd after the embed scale,
+region mask: prompt causal/SWA over prompt only, canvas bidirectional with
+sliding layers reaching the last `n_swa−1` prompt positions, decoder
+per-layer scalars on canvas rows, tied Q6_K lm_head + tanh softcapping at
+30.0) — and `eb_step` + `refrng` implement one Entropy-Bound sampler step
+with the reference's exact host RNG. **Bit-exact at ZERO tolerance**:
+sealed bundle `target/dg-decode-parity-20260612T034000Z/` — all
+**67,108,864 canvas logits** (256 × 262144), every per-layer trace
+checkpoint, the full mt19937/libc++ RNG streams (canvas init + u +
+renoise), and every EB step-0 output (argmax canvas, entropies, multinomial
+draws, MI-bound accepted set of 24, renoised next canvas) identical to the
+pinned reference.
+
+Two reference-identity facts this phase established:
+
+1. **The default macOS build's big-batch matmuls are NOT the CPU kernels.**
+   ggml registers a BLAS (Accelerate) backend whose device claims every
+   contiguous `mul_mat` with `ne0/ne1/ne10 >= 32` (`ggml-blas.cpp`,
+   `min_batch = 32`) and computes it as dequantize-src0-to-f32 +
+   `cblas_sgemm` — no activation quantization, closed-source blocking,
+   ~1e-2-relative different from the vec_dot path on Q4_K rows. The Phase 2
+   prompt (17 rows) sat under the threshold; the unified forward (273 rows)
+   crosses it for all dense projections, KQV, the router, and the lm_head.
+   GPU op-offload behaves the same way (Metal takes `n_tokens >= 32` graphs
+   even at `ngl=0`). The lane's parity contract therefore NAMES the
+   kernel configuration: **CPU-pure build of the same pinned commit**
+   (`build-cpu`: `GGML_BLAS=OFF`, `GGML_METAL=OFF`, `GGML_ACCELERATE=ON` so
+   the CPU backend's vDSP diversions stay), with an empty `mparams.devices`
+   list in the dumper. Phase 2's sealed result is unaffected (verified:
+   camelid's unified prompt rows are byte-identical to the Phase 2 ref).
+2. **Sampler host math contracts.** The reference EB worker's
+   `expf(row[v]*temp_inv − m)` argument and `H -= p*logf(p)` update both
+   contract to single-rounding fma forms under clang's default
+   `-ffp-contract=on` (fmadd/fmsub in the oracle disassembly); the linear
+   temperature schedule `t_min + (t_max−t_min)*ratio` contracts too. The
+   distributions are libc++-specific ports (`refrng.rs`): for the
+   full-range mt19937, `uniform_int_distribution` collapses to one masked
+   draw with rejection, and `uniform_real_distribution<float>(0,1)` is
+   `(float)draw / 2^32` — which CAN return exactly 1.0f, a quirk the
+   sampler inherits.
+
 ## 9. Phase 0 gate status
 
 - `tensor-inventory.json` + `metadata.json` exist; **zero** unclassified
