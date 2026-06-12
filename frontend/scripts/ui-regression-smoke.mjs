@@ -224,6 +224,13 @@ assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be
 assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
 assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
 
+/* ---- Observatory lifecycle (Phase 6.1 defect guards) ---- */
+const inferenceTelemetryHookSource = read('../src/hooks/useInferenceTelemetry.js')
+assert.match(inferenceTelemetryHookSource, /const sharedStore = createInferenceTelemetryStore\(\)/, 'the inference telemetry store must be a shared app-lifetime singleton, not per-mount (DEFECT 1)')
+assert.doesNotMatch(inferenceTelemetryHookSource, /useMemo\(\(\) => createInferenceTelemetryStore/, 'per-mount store creation loses every event emitted while the view is unmounted')
+assert.doesNotMatch(inferenceTelemetryHookSource, /store\.disconnect\(\)/, 'unmount must not tear down the shared stream — navigation would wipe run state (DEFECT 2)')
+assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must connect the observatory stream at startup, not first view mount (DEFECT 1)')
+
 /* ---- Command palette + shortcuts (Phase 7) ---- */
 const paletteSource = read('../src/components/CommandPalette.jsx')
 const frontendReadmeSource = read('../README.md')

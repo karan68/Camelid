@@ -9,6 +9,7 @@ import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
 import { useTheme } from './hooks/useTheme'
+import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry'
 import ChatWorkspace from './views/ChatWorkspace'
 import { CommandPalette } from './components/CommandPalette'
 import { ShortcutsOverlay } from './components/ShortcutsOverlay'
@@ -89,6 +90,12 @@ function App() {
   }, [])
 
   const closeMobileNav = () => setMobileNavOpen(false)
+
+  /* Observatory stream listens from app start (Phase 6.1 DEFECT 1): runs made
+     before the view's first mount must not be invisible. */
+  useEffect(() => {
+    if (apiBase) ensureInferenceTelemetryConnected(apiBase)
+  }, [apiBase])
 
   /* Evidence Chips anywhere in the app deep-link to their ledger row through
      this event — no prop drilling through every chip call site. */
