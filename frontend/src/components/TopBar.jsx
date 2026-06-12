@@ -12,6 +12,7 @@ const TITLES = {
   api: 'API',
   compatibility: 'Compatibility ledger',
   analytics: 'Analytics',
+  telemetry: 'Session telemetry',
   history: 'Chat history',
   memory: 'Memory',
   system: 'System',

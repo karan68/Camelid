@@ -7,6 +7,7 @@ import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversatio
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
+import { recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -15,7 +16,7 @@ const LOCAL_MODELS_STORAGE_KEY = 'camelid.localModels'
 const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
-const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility'])
+const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
 const DEFAULT_API_BASE = import.meta.env?.VITE_CAMELID_API_BASE || 'http://127.0.0.1:8181'
 
 function getInitialTab() {
@@ -492,8 +493,15 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const currentLocalModels = localModelsOverride || localModelsRef.current
       const currentLocalConversations = localConversationsRef.current
       const currentLocalMemories = localMemoriesRef.current
+      const healthStartedAt = performance.now()
       const [health, modelList, capabilities, downloads] = await Promise.all([
-        fetchJson(`${normalizedApiBase}/v1/health`),
+        fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
+          recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
+          return result
+        }, (error) => {
+          recordHealthPoll({ ok: false, latencyMs: performance.now() - healthStartedAt })
+          throw error
+        }),
         fetchJson(`${normalizedApiBase}/v1/models`),
         fetchJson(`${normalizedApiBase}/api/capabilities`).catch(() => null),
         fetchJson(`${normalizedApiBase}/api/models/catalog/downloads`).catch(() => []),
@@ -613,8 +621,22 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   useEffect(() => {
     loadDashboard()
-    const interval = setInterval(() => loadDashboard({ silent: true }), 2500)
-    return () => clearInterval(interval)
+    /* Self-scheduling refresh with backoff: 2.5s while the backend answers,
+       doubling to a 20s ceiling on consecutive failures, reset on success.
+       Reachability history comes from these real polls (telemetryLog). */
+    let cancelled = false
+    let timer = null
+    let delay = 2500
+    const tick = async () => {
+      if (cancelled) return
+      await loadDashboard({ silent: true })
+      const { getTelemetrySnapshot } = await import('../lib/telemetryLog')
+      const last = getTelemetrySnapshot().health.at(-1)
+      delay = last?.ok === false ? Math.min(delay * 2, 20000) : 2500
+      if (!cancelled) timer = setTimeout(tick, delay)
+    }
+    timer = setTimeout(tick, delay)
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [normalizedApiBase])
 
@@ -941,8 +963,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
           : item
       )))
       setSelectedConversationId(conversation.id)
+      recordChatGeneration({
+        modelId: requestModelId,
+        durationMs: elapsedMs,
+        ttftMs: streamed.firstContentMs ?? null,
+        promptTokens: assistantMessage.usage?.prompt_tokens,
+        completionTokens: assistantMessage.usage?.completion_tokens,
+        tokensPerSec: assistantMessage.tokens_out_per_sec,
+        usageSource: assistantMessage.usage_source,
+        outcome: streamed.finishReason === 'error' ? 'error' : 'ok',
+        promptText: messageContent,
+      })
     } catch (error) {
       const requestWasAborted = error?.name === 'AbortError'
+      recordChatGeneration({
+        modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId),
+        durationMs: null,
+        ttftMs: null,
+        outcome: requestWasAborted ? 'interrupted' : 'error',
+        promptText: messageContent,
+      })
       const pendingPatchAtFailure = pendingAssistantPatch
       if (pendingAssistantFrame !== null && typeof window !== 'undefined') {
         window.cancelAnimationFrame(pendingAssistantFrame)

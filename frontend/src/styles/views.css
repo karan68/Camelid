@@ -1217,3 +1217,34 @@
   .wb-grid { grid-template-columns: 1fr; }
   .wb-inspector__cols { grid-template-columns: 1fr; }
 }
+
+/* ==========================================================================
+   Phase 6 — session telemetry dashboard
+   ========================================================================== */
+.tele-spark-row { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-1) 0; }
+.tele-spark-label { font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-text-faint); width: 70px; text-transform: uppercase; letter-spacing: 0.04em; }
+.tele-spark { color: var(--color-accent); display: block; }
+.tele-spark--empty { font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-text-faint); }
+.tele-note { margin: var(--space-2) 0 0; font-family: var(--font-mono); font-size: 0.625rem; letter-spacing: var(--tracking-wide); text-transform: uppercase; color: var(--color-text-faint); }
+.tele-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.tele-table th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--color-text-faint);
+  padding: var(--space-1) var(--space-2);
+  border-bottom: 1px solid var(--color-border-strong);
+}
+.tele-table td { padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--color-border-soft); color: var(--color-text-muted); }
+.tele-table td code { font-family: var(--font-mono); font-size: 0.75rem; color: var(--color-text); word-break: break-all; }
+.tele-table tr.is-error td { color: var(--color-error); }
+.tele-table--log { font-size: var(--text-xs); }
+.tele-prompt { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 0.6875rem; }
+.tele-health { display: flex; flex-wrap: wrap; gap: 3px; }
+.tele-health__cell { width: 10px; height: 18px; border-radius: 2px; background: var(--color-surface-strong); }
+.tele-health__cell.is-ok { background: color-mix(in srgb, var(--color-ready) 55%, transparent); }
+.tele-health__cell.is-fail { background: color-mix(in srgb, var(--color-error) 65%, transparent); }
+.tele-log-actions { display: flex; align-items: center; gap: var(--space-4); }
+.tele-reveal { display: inline-flex; align-items: center; gap: var(--space-1); font-family: var(--font-mono); font-size: 0.6875rem; color: var(--color-text-muted); }

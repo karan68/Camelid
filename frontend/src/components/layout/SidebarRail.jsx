@@ -5,7 +5,7 @@ import { ThemeToggle } from '../ui/ThemeToggle'
 import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import {
-  IconAnalytics, IconApi, IconChat, IconHistory, IconMemory, IconModels,
+  IconAnalytics, IconApi, IconChart, IconChat, IconHistory, IconMemory, IconModels,
   IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
 } from '../ui/icons'
 
@@ -13,6 +13,7 @@ const NAV = [
   { tab: 'library', label: 'Models', Icon: IconModels },
   { tab: 'history', label: 'Chat history', Icon: IconHistory },
   { tab: 'analytics', label: 'Analytics', Icon: IconAnalytics },
+  { tab: 'telemetry', label: 'Telemetry', Icon: IconChart },
   { tab: 'memory', label: 'Memory', Icon: IconMemory },
   { tab: 'system', label: 'System', Icon: IconSystem },
   { tab: 'api', label: 'API', Icon: IconApi },

@@ -19,10 +19,11 @@ import SystemView from './views/SystemView'
 import SettingsView from './views/SettingsView'
 import ClusterView from './views/ClusterView'
 import CompatibilityView from './views/CompatibilityView'
+import TelemetryView from './views/TelemetryView'
 import InferenceObservatoryView from './views/InferenceObservatoryView'
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility'])
+const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -312,6 +313,8 @@ function App() {
           )}
 
           {tab === 'api' && <ApiView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
+
+          {tab === 'telemetry' && <TelemetryView />}
 
           {tab === 'compatibility' && (
             <CompatibilityView

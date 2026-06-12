@@ -385,3 +385,58 @@ Branch: `feat/frontend-phase-5-api-workbench`.
 - Screenshots: api × dark/light × 1440/390 (self-check passed) + gated-state +
   SSE-inspector shots in design-evidence/phase-5/. Backend left re-gated on the tiny
   fixture (smoke:tiny re-run green at close).
+
+---
+
+## Phase 6 — Observability dashboard (2026-06-12)
+
+Branch: `feat/frontend-phase-6-observability`.
+
+### What shipped
+
+- **lib/telemetryLog.js** — the session store. Records arrive ONLY from real traffic:
+  the chat send path (success, interruption, and error all record), workbench try-it
+  runs, and the live health polls. In-memory ring buffers (500 requests / 240 polls),
+  nothing persists across reloads, no seeding path exists (smoke bars the obvious
+  fabrication routes and the empty state promises "never seeds or invents data").
+- **views/TelemetryView.jsx** (`#telemetry`, first-class tab): summary tiles
+  (requests, error rate, median TTFT / tok/s / duration — all client-measured and
+  labeled), SVG sparkline trends, per-model breakdown by model id (captioned: grouping
+  implies nothing about support), backend reachability strip, and the request log.
+- **Request log**: time, endpoint, model, outcome, duration, token counts; prompt
+  content REDACTED by default with a per-session reveal toggle; Export JSON goes
+  through a field whitelist that cannot include prompt content or paths — smoke-
+  enforced behaviorally with a salted record (secret prompt + /Volumes path → absent
+  from export, whitelisted fields + not-evidence note present).
+- **Health with backoff**: the dashboard refresh loop became self-scheduling — 2.5s
+  while the backend answers, doubling to a 20s ceiling on consecutive failures, reset
+  on success. Every poll outcome (latency or failure) lands in the reachability strip.
+- **I4 pinned everywhere**: page-level chip + per-panel captions; a smoke assertion
+  bars perf numbers from rendering inside Evidence Chips in this view. Bounded
+  perf/RSS contract evidence stays in the Compatibility ledger, explicitly pointed to.
+
+### Tried and rejected
+
+- Persisting telemetry to localStorage: rejected — "session metrics" should die with
+  the session; persistence would also turn yesterday's numbers into ambient pseudo-
+  evidence.
+- Folding into AnalyticsView: rejected — Analytics is conversation usage over stored
+  history; this is live operational traffic. Mixing them blurs the I4 boundary the
+  spec draws.
+- A separate health poller for the panel: rejected — the dashboard already polls; a
+  second poller would double traffic and make the history lie about cadence. The
+  existing loop gained backoff instead.
+
+### Gate results
+
+- Build clean; JS **163.18 kB gz** (Phase 5: 159.41; ceiling 229.9).
+- 10/10 smokes green incl. the behavioral export-whitelist check; gate libs empty diff.
+- "Demonstrably real requests" shown live end-to-end in one browser session: fresh
+  session renders the empty state with only real health polls in the strip; one real
+  chat send (3B, "telemetry check") + one workbench health try-it populate exactly 2
+  log rows, the tiles (TTFT median 284ms · 3.9 tok/s · 387ms), and a 3B per-model row;
+  prompt redacted by default, reveal toggle shows it. Failure history demonstrated in
+  an isolated profile against a dead API base: 4 failed polls in 16s (backoff visibly
+  stretching the cadence), red strip cells.
+- Screenshots: telemetry × dark/light × 1440/390 + populated/empty/unreachable shots
+  in design-evidence/phase-6/.

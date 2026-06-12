@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { copyText } from '../../lib/markdown'
 import { workbenchEndpoints } from '../../lib/apiExamples'
+import { recordWorkbenchRun } from '../../lib/telemetryLog'
 
 /* API workbench (Phase 5).
 
@@ -186,6 +187,14 @@ export function ApiWorkbench({ apiBase, modelId, backendOnline, chatUnlocked, to
     setRunningId(endpoint.id)
     setInspection({ endpointId: endpoint.id, pending: true })
     const record = await runEndpoint(endpoint, apiBase)
+    recordWorkbenchRun({
+      endpoint: endpoint.path,
+      modelId: endpoint.gate === 'chat' ? modelId : null,
+      durationMs: record.totalMs,
+      headersMs: record.headersMs,
+      httpStatus: record.status,
+      outcome: record.error || !/^2\d\d/.test(record.status || '') ? 'error' : 'ok',
+    })
     setInspection({ endpointId: endpoint.id, pending: false, ...record })
     setRunningId(null)
   }

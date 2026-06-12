@@ -79,6 +79,8 @@ const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
 const modelInspectorSource = read('../src/components/models/ModelInspector.jsx')
 const compatibilityViewSource = read('../src/views/CompatibilityView.jsx')
 const apiWorkbenchSource = read('../src/components/api/ApiWorkbench.jsx')
+const telemetryViewSource = read('../src/views/TelemetryView.jsx')
+const telemetryLogSource = read('../src/lib/telemetryLog.js')
 const appSource = read('../src/App.jsx')
 const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlayground.jsx')
 const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
@@ -222,6 +224,25 @@ assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be
 assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
 assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
 
+/* ---- Session telemetry (Phase 6) ---- */
+assert.match(telemetryViewSource, /operational telemetry — not compatibility evidence/, 'every telemetry surface must carry the not-evidence affordance')
+assert.match(telemetryViewSource, /useState\(false\)/, 'prompt reveal must default to redacted')
+assert.match(telemetryViewSource, /•••• redacted/, 'redacted prompts must render visibly redacted')
+assert.match(telemetryViewSource, /It never seeds or invents data/, 'the empty state must promise no synthetic data')
+assert.doesNotMatch(telemetryViewSource, /EvidenceChip[\s\S]{0,300}(ttftMs|tokensPerSec|durationMs|medianT)/, 'perf numbers must never render inside Evidence Chips')
+assert.doesNotMatch(telemetryLogSource, /Math\.random|seedData|sampleData|fakeData|demoData/, 'the telemetry store must have no synthetic data path')
+assert.match(dashboardHookSource, /recordChatGeneration\(/, 'chat sends must feed the session telemetry store')
+assert.match(dashboardHookSource, /recordHealthPoll\(/, 'health polls must feed the reachability history')
+assert.match(apiWorkbenchSource, /recordWorkbenchRun\(/, 'workbench try-its must feed the session telemetry store')
+
+/* Behavioral: export is path/content-free by whitelist even for salted records. */
+const { recordChatGeneration: telRecord, exportTelemetryJson: telExport } = await import('../src/lib/telemetryLog.js')
+telRecord({ modelId: 'salt-model', durationMs: 12, ttftMs: 5, outcome: 'ok', promptText: 'SECRET PROMPT /Volumes/Untitled/models/secret.gguf' })
+const telExported = telExport()
+assert.doesNotMatch(telExported, /SECRET PROMPT|\/Volumes\/|promptText/, 'telemetry exports must exclude prompt content and paths by whitelist')
+assert.match(telExported, /salt-model/, 'telemetry exports keep whitelisted fields')
+assert.match(telExported, /Not compatibility or support evidence/, 'telemetry exports must carry the not-evidence note')
+
 /* ---- API workbench (Phase 5) ---- */
 assert.match(apiViewSource, /<ApiWorkbench/, 'the API view must mount the workbench')
 assert.match(apiViewSource, /chatUnlocked=\{selectedExactRowReady\}/, 'workbench generation gating must come from the shared exact-row chat gate')
@@ -288,6 +309,7 @@ const visibleUiSources = [
   '../src/components/models/TokenizerPlayground.jsx',
   '../src/views/CompatibilityView.jsx',
   '../src/components/api/ApiWorkbench.jsx',
+  '../src/views/TelemetryView.jsx',
 ].map((path) => [path, read(path)])
 for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)
