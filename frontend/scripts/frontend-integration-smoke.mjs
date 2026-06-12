@@ -19,6 +19,7 @@ const server = await createServer({
 
 try {
   const { default: ChatWorkspace } = await server.ssrLoadModule('/src/views/ChatWorkspace.jsx')
+  const { default: CompatibilityView } = await server.ssrLoadModule('/src/views/CompatibilityView.jsx')
   const { default: ApiView } = await server.ssrLoadModule('/src/views/ApiView.jsx')
   const { default: SystemView } = await server.ssrLoadModule('/src/views/SystemView.jsx')
   const { default: ModelsView } = await server.ssrLoadModule('/src/views/ModelsView.jsx')
@@ -877,6 +878,17 @@ try {
   assert.match(genericExactMarkup, /custom_exact_row_q8_0/, 'API view should render generic selected exact-row ids from capabilities')
   assert.match(genericExactMarkup, /Custom exact row evidence from \/api\/capabilities\./, 'API view should render generic exact-row evidence text')
   assert.doesNotMatch(genericExactMarkup, /No selected model exact row matched/, 'generic exact row-id matches should not fall through to broad or missing support copy')
+
+  /* ---- Compatibility ledger renders ONLY the live contract (Phase 4) ---- */
+  const ledgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities }))
+  assert.match(ledgerMarkup, /tinyllama_1_1b_chat_q8_0/, 'ledger rows must come from the capabilities payload')
+  assert.match(ledgerMarkup, /Not claimed/, 'every ledger row must carry the not-claimed column')
+  assert.match(ledgerMarkup, /arbitrary\/Jinja templates, production throughput, portability/, 'the not-claimed column must render the contract blocker copy verbatim')
+  assert.match(ledgerMarkup, /How to read this ledger/, 'the ledger must keep its explainer')
+  assert.doesNotMatch(ledgerMarkup, /broad_family_trap|broad_quant_trap/, 'the ledger must not render non-row capability lists as support evidence')
+  const emptyLedgerMarkup = renderToStaticMarkup(React.createElement(CompatibilityView, { capabilities: null }))
+  assert.match(emptyLedgerMarkup, /Ledger unavailable/, 'an unreadable contract must render the fail-closed empty state')
+  assert.doesNotMatch(emptyLedgerMarkup, /ledger-row__id/, 'no contract means zero ledger rows — nothing renders from memory')
 
   console.log('Frontend integration smoke passed')
 } finally {

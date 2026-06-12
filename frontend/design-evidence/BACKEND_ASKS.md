@@ -31,3 +31,25 @@ change needed when the rows appear.
 **Not asked:** any claim that sampled output has parity evidence. If sampled
 lanes need their own evidence categories, that belongs in the compatibility
 rows, not the feature row notes.
+
+## 2. Evidence-bundle manifest references on compatibility rows (Phase 4, 2026-06-12)
+
+**Surface waiting on it:** the Compatibility ledger's per-row evidence checklist cites
+what the contract exposes today — the `*_pack_id` identifiers (e.g.
+`tinyllama-context-512-smoke-v1`). The repo's qa/evidence-bundles manifests
+(README/COMPATIBILITY.md reference them by path) are not addressable from
+`/api/capabilities`, so chip popovers can name a pack id but cannot cite its manifest.
+
+**Ask:** add an optional manifest reference per evidence lane, e.g.
+
+```json
+{
+  "bounded_context_512_pack": "validated_bounded_pack",
+  "bounded_context_512_pack_id": "tinyllama-context-512-smoke-v1",
+  "bounded_context_512_pack_manifest": "qa/evidence-bundles/tinyllama-context-512-.../manifest.json"
+}
+```
+
+Repo-relative paths only (no absolute filesystem paths — the frontend will render them
+as citations, and I7 keeps absolute paths out of shareable surfaces). The ledger picks
+up `*_pack_manifest` fields automatically once they appear.

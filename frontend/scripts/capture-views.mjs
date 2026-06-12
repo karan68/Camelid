@@ -21,7 +21,7 @@ const themes = (args.get('themes') || 'dark,light').split(',')
 const widths = (args.get('widths') || '1440,390').split(',').map(Number)
 const onlyViews = args.get('views')?.split(',') || null
 
-const VIEWS = ['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory']
+const VIEWS = ['chat', 'library', 'api', 'compatibility', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory']
 const HEIGHTS = { 1440: 900, 1024: 768, 768: 1024, 390: 844 }
 
 const CHROME_PATHS = [

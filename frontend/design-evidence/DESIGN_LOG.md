@@ -263,3 +263,64 @@ Branch: `feat/frontend-phase-3-model-management`.
   "Hello Camelid, parity is the product." at 10 tokens, byte-exact ✓.
 - Screenshots: library × dark/light × 1440/390 (harness self-check passed) +
   inspector + playground + blocked-state evidence.
+
+---
+
+## Phase 4 — Compatibility & evidence explorer (2026-06-12)
+
+Branch: `feat/frontend-phase-4-compatibility-explorer`. The signature view.
+
+### What shipped
+
+- **views/CompatibilityView.jsx** — the live ledger, new first-class tab
+  (`#compatibility`, registered in HASH_TABS/VALID_TABS/TopBar/sidebar). Everything on
+  the screen is the `/api/capabilities` payload at render time: the support-contract
+  block (current gate / support policy / unsupported policy verbatim), a stat strip
+  (14 rows · 9 supported · 5 "tracked, honestly not claimed"), and one ledger row per
+  exact lane. Smoke-enforced: the view source contains zero hardcoded row ids or
+  support statuses, and the integration smoke renders it against a mock contract
+  (rows come from the mock; trap fields like broad_family lists must NOT render) and
+  against a null contract (fail-closed "Ledger unavailable", zero rows).
+- **Proven / Not claimed at equal visual weight** — two same-width columns per row;
+  the not-claimed column renders the row's `full_support_blockers` copy verbatim with
+  `support_scope` underneath. Supported rows get a copper left edge (rule lives in
+  evidence.css — the copper-reservation smoke caught it in views.css, which is exactly
+  what that assertion is for).
+- **Per-row drill-down** — a 13-track evidence checklist (metadata/tokenizer/tensors/
+  generation/prompt-token parity/frontend load/template-shape pack/bounded 512–8192
+  context packs/perf-RSS), each an Evidence Chip citing the row id plus the
+  `*_pack_id` evidence-bundle identifier where the contract advertises one; latest
+  checked bucket → result, and the row's readiness-gate sentence.
+- **Promotion path** — for non-supported rows only, the contract's `next_step` copy in
+  a dashed planned-tinted panel, captioned "an honest checklist, not a promise."
+- **Cross-linking** — every Evidence Chip in the app now carries "View in the evidence
+  ledger →" in its popover whenever it cites a row id, dispatching a
+  `camelid:open-ledger` event the app shell listens for (no prop drilling through
+  dozens of chip sites). The ledger scrolls to, highlights, and auto-expands the row;
+  api-feature ids resolve to the ledger's feature section. ModelCardEvidence's
+  "view the compatibility ledger" link re-targeted from #api to the new view.
+- **"How to read this ledger" explainer** in product voice: exact-row support, bounded
+  packs ≠ native context, perf ≠ throughput promises, unsupported is a normal state.
+
+### Tried and rejected
+
+- Hash-fragment row addressing (#compatibility/<row>): rejected — hash routing is
+  mount-time-only here; the event + focus-state approach deep-links from live chips
+  without rearchitecting navigation.
+- Rendering manifest paths from README/COMPATIBILITY.md copy: rejected — that would be
+  doc-derived support claims the contract doesn't make. The contract exposes pack ids
+  (cited); manifest references are BACKEND_ASKS.md #2 and render automatically when
+  `*_pack_manifest` fields appear.
+
+### Gate results
+
+- Build clean; JS **156.08 kB gz** (Phase 3: 153.38; ceiling 229.9).
+- 10/10 smokes green (integration + ui extended with the ledger assertions above);
+  readiness-gate libs empty diff; `smoke:tiny` still proves fail-closed chat.
+- Live UI checks: 14 rows render from the live contract with not-claimed on every
+  row; drill-down shows 13 tracks with real pack ids; deep-link from a library
+  tracked-row chip lands focused + auto-expanded on llama32_3b_instruct_q8_0. One
+  honest negative: the composer chip with the tiny fixture loaded cites no row, so it
+  correctly offers no ledger link.
+- Screenshots: compatibility × dark/light × 1440/390 (self-check passed) + drill-down
+  + deep-link focus shots in design-evidence/phase-4/.

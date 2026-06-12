@@ -949,7 +949,7 @@ export default function ModelsView({
                     <ModelCardEvidence
                       capabilities={capabilities}
                       model={model}
-                      onOpenCompatibility={setTab ? () => setTab('api') : null}
+                      onOpenCompatibility={setTab ? () => setTab('compatibility') : null}
                     />
                   )}
 
@@ -1230,7 +1230,7 @@ export default function ModelsView({
                     <ModelCardEvidence
                       capabilities={capabilities}
                       model={model}
-                      onOpenCompatibility={setTab ? () => setTab('api') : null}
+                      onOpenCompatibility={setTab ? () => setTab('compatibility') : null}
                     />
                   )}
 

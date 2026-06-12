@@ -77,6 +77,8 @@ const capabilitiesSource = read('../src/lib/capabilities.js')
 const streamParserSource = read('../src/lib/chatCompletionStream.js')
 const evidenceChipSource = read('../src/components/ui/EvidenceChip.jsx')
 const modelInspectorSource = read('../src/components/models/ModelInspector.jsx')
+const compatibilityViewSource = read('../src/views/CompatibilityView.jsx')
+const appSource = read('../src/App.jsx')
 const tokenizerPlaygroundSource = read('../src/components/models/TokenizerPlayground.jsx')
 const evidenceStatusSource = read('../src/lib/evidenceStatus.js')
 const useThemeSource = read('../src/hooks/useTheme.js')
@@ -219,6 +221,16 @@ assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be
 assert.match(tokenizerPlaygroundSource, /does not widen generation support/, 'the tokenizer playground must say its output is not generation-support evidence')
 assert.match(tokenizerPlaygroundSource, /tokenizer_encode_decode/, 'the playground chip must cite the exact contract feature row')
 
+/* ---- Compatibility ledger (Phase 4) ---- */
+assert.match(compatibilityViewSource, /capabilities\?\.model_compatibility/, 'the ledger must render rows from the live contract only')
+assert.match(compatibilityViewSource, /Not claimed/, 'the ledger must render the not-claimed column')
+assert.match(compatibilityViewSource, /Resemblance is not evidence/, 'the ledger explainer must state that resemblance is not evidence')
+assert.match(compatibilityViewSource, /Promotion path/, 'non-supported rows must show their promotion path from contract next_step copy')
+assert.doesNotMatch(compatibilityViewSource, /supported_exact_row_smoke|supported_current_gate|tinyllama_|llama32_|llama3_|mistral|mixtral/i, 'the ledger source must contain zero hardcoded row ids or support statuses — the contract is the only voice')
+assert.match(evidenceChipSource, /camelid:open-ledger/, 'Evidence Chips must deep-link to the ledger via the open-ledger event')
+assert.match(appSource, /camelid:open-ledger/, 'the app shell must listen for ledger deep-links')
+assert.match(modelsViewSource, /setTab\('compatibility'\)/, 'unmatched model cards must link to the compatibility ledger view')
+
 /* ---- Analytics ---- */
 assert.match(analyticsViewSource, /displayCapabilityId\(feature\.id\)/, 'Analytics view should not render raw provider-scoped API feature ids')
 
@@ -261,6 +273,7 @@ const visibleUiSources = [
   '../src/lib/markdown.jsx',
   '../src/components/models/ModelInspector.jsx',
   '../src/components/models/TokenizerPlayground.jsx',
+  '../src/views/CompatibilityView.jsx',
 ].map((path) => [path, read(path)])
 for (const [path, source] of visibleUiSources) {
   assert.doesNotMatch(source, /\b(OpenAI|ChatGPT|Claude|Gemini)\b/, `${path} visible copy should not mention competitor brands`)

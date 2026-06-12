@@ -185,6 +185,18 @@ export function EvidenceChip({
           {!hasCitation && (
             <p className="ev-pop__note">No citation attached — treat this as descriptive copy, not evidence.</p>
           )}
+          {source?.rowId && (
+            <button
+              type="button"
+              className="ev-pop__ledger-link"
+              onClick={() => {
+                setOpen(false)
+                window.dispatchEvent(new CustomEvent('camelid:open-ledger', { detail: { rowId: source.rowId } }))
+              }}
+            >
+              View in the evidence ledger →
+            </button>
+          )}
         </div>
       )}
     </span>

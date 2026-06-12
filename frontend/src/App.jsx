@@ -18,10 +18,11 @@ import ApiView from './views/ApiView'
 import SystemView from './views/SystemView'
 import SettingsView from './views/SettingsView'
 import ClusterView from './views/ClusterView'
+import CompatibilityView from './views/CompatibilityView'
 import InferenceObservatoryView from './views/InferenceObservatoryView'
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory'])
+const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -37,6 +38,7 @@ function App() {
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches,
   )
   const [pendingDeleteConversationId, setPendingDeleteConversationId] = useState(null)
+  const [ledgerFocusRow, setLedgerFocusRow] = useState(null)
   const [deleteBusy, setDeleteBusy] = useState(false)
 
   useEffect(() => {
@@ -79,6 +81,18 @@ function App() {
   }, [])
 
   const closeMobileNav = () => setMobileNavOpen(false)
+
+  /* Evidence Chips anywhere in the app deep-link to their ledger row through
+     this event — no prop drilling through every chip call site. */
+  useEffect(() => {
+    const onOpenLedger = (event) => {
+      setLedgerFocusRow(event.detail?.rowId || null)
+      setTab('compatibility')
+      if (typeof window !== 'undefined') window.history.replaceState(null, '', '#compatibility')
+    }
+    window.addEventListener('camelid:open-ledger', onOpenLedger)
+    return () => window.removeEventListener('camelid:open-ledger', onOpenLedger)
+  }, [setTab])
 
   /* Cmd/Ctrl+K command-palette stub (full palette ships in Phase 7): jumps to
      chat and focuses the composer instead of pretending a palette exists. */
@@ -298,6 +312,14 @@ function App() {
           )}
 
           {tab === 'api' && <ApiView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
+
+          {tab === 'compatibility' && (
+            <CompatibilityView
+              capabilities={dashboard?.capabilities}
+              focusRowId={ledgerFocusRow}
+              onFocusConsumed={() => setLedgerFocusRow(null)}
+            />
+          )}
 
           {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
 

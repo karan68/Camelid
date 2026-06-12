@@ -209,3 +209,7 @@
   .ev-pop { animation: none; }
   .ev-pop__state--supported svg { animation: none; }
 }
+
+/* Ledger supported-row accent (Phase 4) — lives here because the copper edge
+   IS a supported claim; views.css is barred from the copper tokens by smoke. */
+.ledger-row--supported { border-left: 3px solid var(--color-verified); }

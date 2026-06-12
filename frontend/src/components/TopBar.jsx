@@ -10,6 +10,7 @@ const TITLES = {
   chat: 'Chat',
   library: 'Models',
   api: 'API',
+  compatibility: 'Compatibility ledger',
   analytics: 'Analytics',
   history: 'Chat history',
   memory: 'Memory',
