@@ -590,3 +590,19 @@ thread on a 2D overlay — the art↔data link.
   GPU-enabled capture), 40-frame sequence + flowbench-stream-recording.mp4 of a real
   streamed request (late-join thread → token flow → completion mix) in
   design-evidence/phase-6.1/. Every motion in it maps to a logged request.
+
+---
+
+## Phase 6.2 — Flow Bench visual remediation (2026-06-12)
+
+### Before-critique (design-evidence/phase-6.2/before/, one real streamed request)
+t=0: clean idle (0% lit — honest). TTFT: a single soft grey puff, 2.45% of pixels,
+already the visual peak. Mid-stream: the puff has FADED to 1.58% while tokens are
+still flowing — injection loses to dissipation. Completion: 0.8%, a ghost. Why weak:
+(1) magnitude — dye dissipation 0.988/frame (~50%/s) outruns the 0.07–0.11-tinted
+injections, and ambient drift ~0.07 canvas/s means ink dies where it spawns;
+(2) contrast — mean ink RGB(99,102,104) on #0e1216 ≈ 2.9:1, under the 3:1 floor;
+(3) NOT the wiring — instrumentation counted start=1, first_content=1, progress=100,
+end=1 reaching the sim for one request; canvas is true-size (816×520@dpr1 headless)
+and tokens resolve to real values at init. It reads as "is something supposed to be
+happening?" — exactly the failure the phase names.
