@@ -19,9 +19,42 @@ const state = {
   counter: 0,
 }
 const listeners = new Set()
+const lifecycleListeners = new Set()
 
 function emit() {
   for (const listener of listeners) listener()
+}
+
+/* ---- Request lifecycle bus (Phase 6.1) ----
+   One emitter for everything that observes live traffic: the Telemetry view's
+   metrics AND the Flow Bench simulation consume these same events, so the two
+   can never disagree. Events carry COUNTS and TIMINGS only — never content. */
+function emitLifecycle(event) {
+  for (const listener of lifecycleListeners) {
+    try { listener(event) } catch { /* a bad subscriber must not break the bus */ }
+  }
+}
+
+export function subscribeLifecycle(listener) {
+  lifecycleListeners.add(listener)
+  return () => lifecycleListeners.delete(listener)
+}
+
+/* Start of a real request; returns the id the END record will carry, so the
+   sim's event log and the request log match one-to-one. */
+export function beginRequest({ kind, endpoint, modelId }) {
+  state.counter += 1
+  const id = `req-${state.counter}`
+  emitLifecycle({ type: 'start', id, at: Date.now(), kind, endpoint, modelId: modelId || null })
+  return id
+}
+
+export function emitFirstContent(id, ttftMs) {
+  emitLifecycle({ type: 'first_content', id, at: Date.now(), ttftMs: Number.isFinite(ttftMs) ? ttftMs : null })
+}
+
+export function emitProgress(id, { tokens, tokensPerSec }) {
+  emitLifecycle({ type: 'progress', id, at: Date.now(), tokens: Number.isFinite(tokens) ? tokens : null, tokensPerSec: Number.isFinite(tokensPerSec) ? tokensPerSec : null })
 }
 
 export function subscribeTelemetry(listener) {
@@ -30,16 +63,24 @@ export function subscribeTelemetry(listener) {
 }
 
 function pushRequest(record) {
-  state.counter += 1
-  state.requests.push({ id: `req-${state.counter}`, at: Date.now(), ...record })
+  let id = record.lifecycleId
+  if (!id) {
+    state.counter += 1
+    id = `req-${state.counter}`
+  }
+  const { lifecycleId, ...rest } = record
+  const finalRecord = { id, at: Date.now(), ...rest }
+  state.requests.push(finalRecord)
   if (state.requests.length > MAX_REQUEST_RECORDS) state.requests.splice(0, state.requests.length - MAX_REQUEST_RECORDS)
+  emitLifecycle({ type: 'end', id, at: finalRecord.at, kind: finalRecord.kind, outcome: finalRecord.outcome, durationMs: finalRecord.durationMs ?? null, tokensPerSec: finalRecord.tokensPerSec ?? null })
   emit()
 }
 
 /* Chat generation: called from the real sendMessage path on completion,
    interruption, or error. */
-export function recordChatGeneration({ modelId, durationMs, ttftMs, promptTokens, completionTokens, tokensPerSec, usageSource, outcome, promptText }) {
+export function recordChatGeneration({ lifecycleId, modelId, durationMs, ttftMs, promptTokens, completionTokens, tokensPerSec, usageSource, outcome, promptText }) {
   pushRequest({
+    lifecycleId,
     kind: 'chat',
     endpoint: '/v1/chat/completions',
     modelId: modelId || null,
@@ -55,8 +96,9 @@ export function recordChatGeneration({ modelId, durationMs, ttftMs, promptTokens
 }
 
 /* Workbench try-it: called from the real ApiWorkbench runner. */
-export function recordWorkbenchRun({ endpoint, modelId, durationMs, headersMs, httpStatus, outcome }) {
+export function recordWorkbenchRun({ lifecycleId, endpoint, modelId, durationMs, headersMs, httpStatus, outcome }) {
   pushRequest({
+    lifecycleId,
     kind: 'workbench',
     endpoint: endpoint || null,
     modelId: modelId || null,

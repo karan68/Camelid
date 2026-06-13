@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { copyText } from '../../lib/markdown'
 import { workbenchEndpoints } from '../../lib/apiExamples'
-import { recordWorkbenchRun } from '../../lib/telemetryLog'
+import { beginRequest, emitFirstContent, emitProgress, recordWorkbenchRun } from '../../lib/telemetryLog'
 
 /* API workbench (Phase 5).
 
@@ -28,7 +28,7 @@ function nowMs() {
   return performance.now()
 }
 
-async function runEndpoint(endpoint, apiBase) {
+async function runEndpoint(endpoint, apiBase, lifecycleId) {
   const base = (apiBase || '').replace(/\/$/, '')
   const url = `${base}${endpoint.path}`
   const init = endpoint.body
@@ -49,6 +49,7 @@ async function runEndpoint(endpoint, apiBase) {
     const response = await fetch(url, init)
     record.status = `${response.status} ${response.statusText}`
     record.headersMs = nowMs() - startedAt
+    if (lifecycleId) emitFirstContent(lifecycleId, record.headersMs)
     const contentType = response.headers.get('content-type') || ''
     if (endpoint.sse && contentType.includes('text/event-stream') && response.body) {
       const reader = response.body.getReader()
@@ -57,6 +58,7 @@ async function runEndpoint(endpoint, apiBase) {
         const { done, value } = await reader.read()
         if (done) break
         const at = nowMs() - startedAt
+        if (lifecycleId) emitProgress(lifecycleId, { tokens: record.chunks.length, tokensPerSec: record.chunks.length / Math.max(at / 1000, 0.001) })
         for (const line of decoder.decode(value, { stream: true }).split('\n')) {
           if (!line.trim()) continue
           if (record.chunks.length >= CHUNK_LOG_LIMIT) {
@@ -186,8 +188,10 @@ export function ApiWorkbench({ apiBase, modelId, backendOnline, chatUnlocked, to
     if (runningId) return
     setRunningId(endpoint.id)
     setInspection({ endpointId: endpoint.id, pending: true })
-    const record = await runEndpoint(endpoint, apiBase)
+    const lifecycleId = beginRequest({ kind: 'workbench', endpoint: endpoint.path, modelId: endpoint.gate === 'chat' ? modelId : null })
+    const record = await runEndpoint(endpoint, apiBase, lifecycleId)
     recordWorkbenchRun({
+      lifecycleId,
       endpoint: endpoint.path,
       modelId: endpoint.gate === 'chat' ? modelId : null,
       durationMs: record.totalMs,

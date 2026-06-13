@@ -533,3 +533,105 @@ baseline monolith, with the fail-closed chat gate byte-identical throughout.
 
 The overhaul is complete: Phases 0–7 shipped, all invariants I1–I7 held at every
 gate, and the readiness-gate libraries are byte-identical to the Phase 0 record.
+
+---
+
+## Phase 6.1 — Observatory rework: The Flow Bench (2026-06-12)
+
+Branch: `feat/frontend-phase-6.1-flow-bench`.
+
+### Defects found and fixed first (own commits; full detail in phase-6.1/DEFECTS.md)
+1. Per-mount SSE store + unmount disconnect made every run invisible unless the view
+   was open when it happened (and wiped state on navigation). Fixed: shared
+   app-lifetime store bootstrapped from the app shell; smoke-guarded.
+2. Connection churn (41 EventSource cycles / 21 mounts) — same root cause, same fix.
+   Teardown itself was verified clean (0 rAF unmounted, opened==closed).
+3. During the rework, my own destroy() called WEBGL_lose_context — strict-mode
+   double-mount then reused the same dead context on the same canvas. Removed; guard
+   added (`isContextLost()` → Canvas2D fallback).
+
+### Event → fluid mapping as shipped
+| Real event | Behavior |
+| --- | --- |
+| start | steel-blue prompt droplet at one of 5 inlets, drifting with the bench current |
+| first_content | the droplet bursts where it stands — TTFT is the drift distance |
+| progress | grey-white generation ink advected by a jet whose power tracks real tok/s |
+| end ok | inks mix; field diffuses toward ambient |
+| end interrupted | thread cuts with a counter-jet (curls back, visibly truncated) |
+| end error | low-saturation red bloom, re-splatted ~2.6s so it refuses to mix |
+| idle | zero injections; 0.988/frame dissipation settles to near-still drift |
+| late join | a request started on another tab renders from the inlet onward — a real product need (send a chat, switch here to watch); deviation from the strict table, logged here |
+
+One shared emitter: the lifecycle bus in lib/telemetryLog (ids minted at send time;
+chat + workbench unified in their own commit). The sim has no other input; counts and
+timings only. Copper/amber barred from the engine by smoke assertion.
+
+### Implementation
+Self-written WebGL curl-noise dye advection (~250 lines incl. GLSL; divergence-free by
+construction, no pressure solve needed) + Canvas2D particle fallback sharing the
+choreography. No dependency added. Route chunk 8.24 → **6.88 kB gz (net −1.36)**;
+other routes unchanged; global budget untouched. DPR capped at 2; pauses on
+document.hidden; reduced-motion (system or manual toggle) renders one static field
+frame — measured 0 rAF requests. Hover on a log row draws that request's traced ink
+thread on a 2D overlay — the art↔data link.
+
+### Gate evidence
+- 10/10 smokes green (observatory smoke's two idle-copy checks re-pointed to the new
+  honest-idle copy, intent preserved; new Flow Bench assertions added to smoke:ui);
+  gate libs empty diff; smoke:tiny green, 3B reloaded after.
+- Truth check (executable no-synthetic-data): N real requests driven, sim ledger 'end'
+  ids matched the rail's request log one-to-one (2/2, zero phantom events).
+- Performance: 75fps measured at default settings (idle-settling field, M4, dpr 2);
+  0 rAF in 1s after 20 navigate-away/return cycles (no loop/listener leaks).
+- Tuning iterations recorded: additive splats first blew out to white (fixed:
+  intensity-tinted injections + soft tonemap), then over-damped to murky smoke
+  (fixed: luminance-driven alpha). Final: luminous ink on the dark bench.
+- Evidence: idle/hover/reduced-motion stills, harness shots (both themes/widths,
+  GPU-enabled capture), 40-frame sequence + flowbench-stream-recording.mp4 of a real
+  streamed request (late-join thread → token flow → completion mix) in
+  design-evidence/phase-6.1/. Every motion in it maps to a logged request.
+
+---
+
+## Phase 6.2 — Flow Bench visual remediation (2026-06-12)
+
+### Before-critique (design-evidence/phase-6.2/before/, one real streamed request)
+t=0: clean idle (0% lit — honest). TTFT: a single soft grey puff, 2.45% of pixels,
+already the visual peak. Mid-stream: the puff has FADED to 1.58% while tokens are
+still flowing — injection loses to dissipation. Completion: 0.8%, a ghost. Why weak:
+(1) magnitude — dye dissipation 0.988/frame (~50%/s) outruns the 0.07–0.11-tinted
+injections, and ambient drift ~0.07 canvas/s means ink dies where it spawns;
+(2) contrast — mean ink RGB(99,102,104) on #0e1216 ≈ 2.9:1, under the 3:1 floor;
+(3) NOT the wiring — instrumentation counted start=1, first_content=1, progress=100,
+end=1 reaching the sim for one request; canvas is true-size (816×520@dpr1 headless)
+and tokens resolve to real values at init. It reads as "is something supposed to be
+happening?" — exactly the failure the phase names.
+
+### Phase 6.2 outcome (after 6 documented iterations + one root-cause hunt)
+
+**The real bug, found by elimination:** advection had been silently DEAD since 6.1.
+`render()` enables blending for screen compositing; blending into a (half-)float sim
+target without EXT_float_blend is INVALID_OPERATION and the driver silently drops the
+draw — so every advect/splat after the first rendered frame no-opped. The "flow" was
+JS-advanced splat positions; the ping-pong then flickered two stale dye generations
+(48.8% of pixels flipping between consecutive frames at constant coverage — the
+tell). Isolation tests passed because they never called render() between steps. Fix:
+`gl.disable(BLEND)` at the head of every sim pass + canonical front/back swap +
+FBO-completeness check with byte fallback + time-based (frame-rate-independent) decay
++ concentration-tracked alpha so dark pigment is visible on the light theme.
+
+**Iterations** (frames + verdicts in iterations/iter1–5): 1 stronger params — ribbon
+appears but cotton-soft; 2 sharper — ink exits right edge; 3 weaker bench current —
+reference-quality swirl (vs a dead sim); 4 first tune against LIVE advection —
+billowing fronts + filaments, core blown white; 5 displayGain 1.55 + 70% steel-blue
+lean (operator request: visible color) + alphaGain 4.6 + dissipation 0.9992.
+
+**Final parameter table** = FLOW_CONFIG in lib/observatory/flowBench.js (dev tuning
+panel ships in dev builds only — verified absent from dist).
+
+**smoke:flow (permanent gate)**: dark ttft-departure 3.9% (floor 1%), completion
+24.0% (floor 15%), top-decile contrast 7.87:1 (floor 3:1), idle settle
+35.3%→0.0%→0.000% frame delta after 60s; light 23.0% / 7.26:1. fps 79 at final
+settings; 0 rAF leaks after 20 nav cycles; reduced-motion renders the frozen tuned
+swirl. Thumbnail-test recordings (both themes) + hover-link proof shot in
+design-evidence/phase-6.2/.

@@ -7,7 +7,7 @@ import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversatio
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
-import { getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
+import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
 const SELECTED_CONVERSATION_STORAGE_KEY = 'camelid.selectedConversationId'
@@ -774,6 +774,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     setSending(true)
     let activeConversationId = null
     let assistantId = null
+    let chatLifecycleId = null
     let pendingAssistantPatch = null
     let pendingAssistantFrame = null
 
@@ -812,6 +813,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
 
       const requestStartedAt = performance.now()
+      const lifecycleId = beginRequest({ kind: 'chat', endpoint: '/v1/chat/completions', modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId) })
+      chatLifecycleId = lifecycleId
+      let firstContentEmitted = false
+      let lastProgressAt = 0
       assistantId = makeId('message')
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
@@ -908,6 +913,14 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const streamed = await readStreamingChatCompletion(response, (_delta, fullContent) => {
         const liveElapsedMs = performance.now() - requestStartedAt
         const liveCompletionTokens = estimateTokenCount(fullContent)
+        if (!firstContentEmitted && fullContent) {
+          firstContentEmitted = true
+          emitFirstContent(lifecycleId, liveElapsedMs)
+        }
+        if (performance.now() - lastProgressAt > 100) {
+          lastProgressAt = performance.now()
+          emitProgress(lifecycleId, { tokens: liveCompletionTokens, tokensPerSec: tokensPerSecond(liveCompletionTokens, liveElapsedMs) })
+        }
         markAssistantStreamState({
           content: fullContent || '…',
           streaming_phase: 'streaming',
@@ -963,6 +976,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
       setSelectedConversationId(conversation.id)
       recordChatGeneration({
+        lifecycleId,
         modelId: requestModelId,
         durationMs: elapsedMs,
         ttftMs: streamed.firstContentMs ?? null,
@@ -976,6 +990,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     } catch (error) {
       const requestWasAborted = error?.name === 'AbortError'
       recordChatGeneration({
+        lifecycleId: chatLifecycleId,
         modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId),
         durationMs: null,
         ttftMs: null,
