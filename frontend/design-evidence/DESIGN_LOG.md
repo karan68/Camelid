@@ -606,3 +606,32 @@ injections, and ambient drift ~0.07 canvas/s means ink dies where it spawns;
 end=1 reaching the sim for one request; canvas is true-size (816×520@dpr1 headless)
 and tokens resolve to real values at init. It reads as "is something supposed to be
 happening?" — exactly the failure the phase names.
+
+### Phase 6.2 outcome (after 6 documented iterations + one root-cause hunt)
+
+**The real bug, found by elimination:** advection had been silently DEAD since 6.1.
+`render()` enables blending for screen compositing; blending into a (half-)float sim
+target without EXT_float_blend is INVALID_OPERATION and the driver silently drops the
+draw — so every advect/splat after the first rendered frame no-opped. The "flow" was
+JS-advanced splat positions; the ping-pong then flickered two stale dye generations
+(48.8% of pixels flipping between consecutive frames at constant coverage — the
+tell). Isolation tests passed because they never called render() between steps. Fix:
+`gl.disable(BLEND)` at the head of every sim pass + canonical front/back swap +
+FBO-completeness check with byte fallback + time-based (frame-rate-independent) decay
++ concentration-tracked alpha so dark pigment is visible on the light theme.
+
+**Iterations** (frames + verdicts in iterations/iter1–5): 1 stronger params — ribbon
+appears but cotton-soft; 2 sharper — ink exits right edge; 3 weaker bench current —
+reference-quality swirl (vs a dead sim); 4 first tune against LIVE advection —
+billowing fronts + filaments, core blown white; 5 displayGain 1.55 + 70% steel-blue
+lean (operator request: visible color) + alphaGain 4.6 + dissipation 0.9992.
+
+**Final parameter table** = FLOW_CONFIG in lib/observatory/flowBench.js (dev tuning
+panel ships in dev builds only — verified absent from dist).
+
+**smoke:flow (permanent gate)**: dark ttft-departure 3.9% (floor 1%), completion
+24.0% (floor 15%), top-decile contrast 7.87:1 (floor 3:1), idle settle
+35.3%→0.0%→0.000% frame delta after 60s; light 23.0% / 7.26:1. fps 79 at final
+settings; 0 rAF leaks after 20 nav cycles; reduced-motion renders the frozen tuned
+swirl. Thumbnail-test recordings (both themes) + hover-link proof shot in
+design-evidence/phase-6.2/.

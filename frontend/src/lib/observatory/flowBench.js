@@ -16,6 +16,30 @@
 
 const MAX_TRACE_POINTS = 240
 
+/* All visual-impact parameters in one place (Phase 6.2). Mutable on purpose:
+   the engine reads it every frame, so the dev tuning panel iterates live.
+   These are the shipped values from documented tuning iterations. */
+export const FLOW_CONFIG = {
+  simScale: 0.5,
+  dyeDissipation: 0.9992,   // was 0.988 — ink lived <2s and lost to injection
+  ambient: 0.26,            // baseline curl strength (idle stays near-still via decay)
+  activeBoost: 2.2,         // field multiplier while any request is live
+  driftTint: 0.4,
+  driftRadius: 0.0014,
+  flowTint: 0.85,
+  flowRadius: 0.003,
+  burstTint: 1.3,
+  burstRadius: 0.006,
+  bloomTint: 0.12,
+  bloomRadius: 0.006,
+  cutTint: 0.35,
+  mixTint: 0.5,
+  jetBase: 0.5,
+  jetPerSpeed: 1.6,
+  displayGain: 1.55,
+  alphaGain: 4.6,
+}
+
 function cssColor(name, fallback) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
   return value || fallback
@@ -33,6 +57,12 @@ function parseColor(value) {
   return m ? [m[1] / 255, m[2] / 255, m[3] / 255] : [0.5, 0.6, 0.7]
 }
 
+function blueLean([r, g, b], [ar, ag, ab]) {
+  /* generation ink: warm grey-white pulled toward the steel-blue family so the
+     flow visibly carries color — still inside the Phase 6.1 palette contract */
+  return [r * 0.3 + ar * 0.7, g * 0.3 + ag * 0.7, b * 0.3 + ab * 0.7]
+}
+
 function desaturate([r, g, b], amount) {
   const grey = 0.3 * r + 0.6 * g + 0.1 * b
   return [r + (grey - r) * amount, g + (grey - g) * amount, b + (grey - b) * amount]
@@ -41,7 +71,7 @@ function desaturate([r, g, b], amount) {
 export function readPalette() {
   return {
     prompt: parseColor(cssColor('--color-accent', '#8fb6dc')),
-    generation: desaturate(parseColor(cssColor('--color-text', '#dde5ed')), 0.15),
+    generation: blueLean(parseColor(cssColor('--color-text', '#dde5ed')), parseColor(cssColor('--color-accent', '#8fb6dc'))),
     error: desaturate(parseColor(cssColor('--color-error', '#e9928a')), 0.45),
   }
 }
@@ -119,30 +149,33 @@ float n3=noise(p+vec2(e,0.)+t*0.06),n4=noise(p-vec2(e,0.)+t*0.06);
 return vec2((n1-n2)/(2.*e),-(n3-n4)/(2.*e));}`
 
 const ADVECT = `precision highp float;varying vec2 uv;uniform sampler2D dye;
-uniform float t;uniform float dt;uniform float ambient;uniform vec4 jets[8];uniform int jetCount;
+uniform float t;uniform float dt;uniform float ambient;uniform float diss;uniform vec4 jets[8];uniform int jetCount;
 ${NOISE}
 void main(){
 vec2 vel=curl(uv*3.0,t)*ambient;
-vel.x+=ambient*0.6; /* gentle left-to-right bench current */
+vel.x+=ambient*0.22; /* gentle left-to-right bench current */
 for(int i=0;i<8;i++){if(i>=jetCount)break;
 vec2 jp=jets[i].xy;float power=jets[i].z;
 vec2 d=uv-jp;float fall=exp(-dot(d,d)*220.0);
 vel+=vec2(power,0.18*sin(t*2.0+jp.y*40.0))*fall;}
 vec2 src=uv-vel*dt;
-vec4 c=texture2D(dye,src);
-gl_FragColor=c*0.988; /* slow diffusion toward ambient */
+float k=pow(diss,dt*75.0); /* time-based decay: frame-rate independent */
+vec4 c=texture2D(dye,src)*k;
+if(c.a<0.025)c*=pow(0.90,dt*75.0); /* settle-snap so idle truly stills */
+gl_FragColor=c;
 }`
 
 const SPLAT = `precision highp float;varying vec2 uv;uniform sampler2D dye;
 uniform vec2 point;uniform vec3 color;uniform float radius;
 void main(){vec2 d=uv-point;d.x*=1.6;float a=exp(-dot(d,d)/radius);
-vec4 base=texture2D(dye,uv);gl_FragColor=vec4(base.rgb+color*a,1.0);}`
+vec4 base=texture2D(dye,uv);gl_FragColor=vec4(min(base.rgb+color*a,vec3(4.0)),min(base.a+a*0.8,3.0));}`
 
-const DISPLAY = `precision highp float;varying vec2 uv;uniform sampler2D dye;
-void main(){vec3 c=texture2D(dye,uv).rgb;
-c=c*1.9/(1.0+c); /* soft tonemap: luminous ink, never blown white */
-float lum=dot(c,vec3(0.55));
-gl_FragColor=vec4(c,clamp(lum*2.6,0.0,0.92));}`
+const DISPLAY = `precision highp float;varying vec2 uv;uniform sampler2D dye;uniform float gain;uniform float alphaGain;
+void main(){vec4 c=texture2D(dye,uv);
+vec3 col=c.rgb*gain/(1.0+c.rgb); /* soft tonemap: ink never blows to white */
+/* alpha = dye CONCENTRATION (alpha channel), not luminance — dark pigment on
+   a light theme must be as visible as bright ink on the dark theme */
+gl_FragColor=vec4(col,clamp(c.a*alphaGain*0.55,0.0,0.94));}`
 
 function compile(gl, type, src) {
   const sh = gl.createShader(type)
@@ -161,7 +194,7 @@ function program(gl, frag) {
   return pr
 }
 
-export function createWebGLBench(canvas, simScale = 0.5) {
+export function createWebGLBench(canvas, simScale = FLOW_CONFIG.simScale) {
   const gl = canvas.getContext('webgl', { alpha: true, antialias: false, preserveDrawingBuffer: true })
   if (!gl || gl.isContextLost()) return null
   const half = gl.getExtension('OES_texture_half_float')
@@ -179,6 +212,7 @@ export function createWebGLBench(canvas, simScale = 0.5) {
   let simW = 0
   let simH = 0
   let fbos = null
+  let activeTexType = texType
 
   function makeTarget(w, h) {
     const tex = gl.createTexture()
@@ -187,7 +221,7 @@ export function createWebGLBench(canvas, simScale = 0.5) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, texType, null)
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, activeTexType, null)
     const fbo = gl.createFramebuffer()
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo)
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
@@ -200,6 +234,14 @@ export function createWebGLBench(canvas, simScale = 0.5) {
     simW = Math.max(64, Math.round(width * simScale))
     simH = Math.max(64, Math.round(height * simScale))
     fbos = [makeTarget(simW, simH), makeTarget(simW, simH)]
+    /* Half-float color attachments are not renderable everywhere; an
+       incomplete FBO silently no-ops every draw (the original Phase 6.1 sim
+       shipped with advection dead because of exactly this). Verify once and
+       fall back to byte textures. */
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE && activeTexType !== gl.UNSIGNED_BYTE) {
+      activeTexType = gl.UNSIGNED_BYTE
+      fbos = [makeTarget(simW, simH), makeTarget(simW, simH)]
+    }
   }
 
   function draw(pr) {
@@ -211,43 +253,54 @@ export function createWebGLBench(canvas, simScale = 0.5) {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
   }
 
+  /* Canonical read→write→swap. `front` always names the texture holding the
+     latest dye; every pass reads front, writes back, then swaps — render()
+     only ever samples front. This forecloses the parity flicker where the
+     screen alternated two stale generations. */
+  let front = 0
+  const back = () => 1 - front
+
+  function pass(pr, setup) {
+    gl.disable(gl.BLEND) /* render() enables blend for compositing; blending
+      into the (half-)float sim target is INVALID_OPERATION without
+      EXT_float_blend and silently drops the draw — the advection-was-dead bug */
+    gl.viewport(0, 0, simW, simH)
+    gl.useProgram(pr)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[back()].fbo)
+    gl.activeTexture(gl.TEXTURE0)
+    gl.bindTexture(gl.TEXTURE_2D, fbos[front].tex)
+    gl.uniform1i(gl.getUniformLocation(pr, 'dye'), 0)
+    setup(pr)
+    draw(pr)
+    front = back()
+  }
+
   return {
     kind: 'webgl',
     resize,
     splat(x, y, color, radius) {
-      gl.viewport(0, 0, simW, simH)
-      gl.useProgram(splatPr)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[1].fbo)
-      gl.activeTexture(gl.TEXTURE0)
-      gl.bindTexture(gl.TEXTURE_2D, fbos[0].tex)
-      gl.uniform1i(gl.getUniformLocation(splatPr, 'dye'), 0)
-      gl.uniform2f(gl.getUniformLocation(splatPr, 'point'), x, 1 - y)
-      gl.uniform3f(gl.getUniformLocation(splatPr, 'color'), ...color)
-      gl.uniform1f(gl.getUniformLocation(splatPr, 'radius'), radius)
-      draw(splatPr)
-      fbos.reverse()
+      pass(splatPr, (pr) => {
+        gl.uniform2f(gl.getUniformLocation(pr, 'point'), x, 1 - y)
+        gl.uniform3f(gl.getUniformLocation(pr, 'color'), ...color)
+        gl.uniform1f(gl.getUniformLocation(pr, 'radius'), radius)
+      })
     },
     step(t, dt, ambient, jets) {
-      gl.viewport(0, 0, simW, simH)
-      gl.useProgram(advectPr)
-      gl.bindFramebuffer(gl.FRAMEBUFFER, fbos[1].fbo)
-      gl.activeTexture(gl.TEXTURE0)
-      gl.bindTexture(gl.TEXTURE_2D, fbos[0].tex)
-      gl.uniform1i(gl.getUniformLocation(advectPr, 'dye'), 0)
-      gl.uniform1f(gl.getUniformLocation(advectPr, 't'), t)
-      gl.uniform1f(gl.getUniformLocation(advectPr, 'dt'), dt)
-      gl.uniform1f(gl.getUniformLocation(advectPr, 'ambient'), ambient)
-      const flat = new Float32Array(32)
-      jets.slice(0, 8).forEach((jet, i) => {
-        flat[i * 4] = jet.x
-        flat[i * 4 + 1] = 1 - jet.y
-        flat[i * 4 + 2] = jet.power
-        flat[i * 4 + 3] = 0
+      pass(advectPr, (pr) => {
+        gl.uniform1f(gl.getUniformLocation(pr, 't'), t)
+        gl.uniform1f(gl.getUniformLocation(pr, 'dt'), dt)
+        gl.uniform1f(gl.getUniformLocation(pr, 'ambient'), ambient)
+        gl.uniform1f(gl.getUniformLocation(pr, 'diss'), FLOW_CONFIG.dyeDissipation)
+        const flat = new Float32Array(32)
+        jets.slice(0, 8).forEach((jet, i) => {
+          flat[i * 4] = jet.x
+          flat[i * 4 + 1] = 1 - jet.y
+          flat[i * 4 + 2] = jet.power
+          flat[i * 4 + 3] = 0
+        })
+        gl.uniform4fv(gl.getUniformLocation(pr, 'jets[0]') || gl.getUniformLocation(pr, 'jets'), flat)
+        gl.uniform1i(gl.getUniformLocation(pr, 'jetCount'), Math.min(jets.length, 8))
       })
-      gl.uniform4fv(gl.getUniformLocation(advectPr, 'jets'), flat)
-      gl.uniform1i(gl.getUniformLocation(advectPr, 'jetCount'), Math.min(jets.length, 8))
-      draw(advectPr)
-      fbos.reverse()
     },
     render() {
       gl.viewport(0, 0, canvas.width, canvas.height)
@@ -258,8 +311,10 @@ export function createWebGLBench(canvas, simScale = 0.5) {
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA)
       gl.useProgram(displayPr)
       gl.activeTexture(gl.TEXTURE0)
-      gl.bindTexture(gl.TEXTURE_2D, fbos[0].tex)
+      gl.bindTexture(gl.TEXTURE_2D, fbos[front].tex)
       gl.uniform1i(gl.getUniformLocation(displayPr, 'dye'), 0)
+      gl.uniform1f(gl.getUniformLocation(displayPr, 'gain'), FLOW_CONFIG.displayGain)
+      gl.uniform1f(gl.getUniformLocation(displayPr, 'alphaGain'), FLOW_CONFIG.alphaGain)
       draw(displayPr)
     },
     destroy() {

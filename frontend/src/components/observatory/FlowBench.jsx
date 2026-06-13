@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { subscribeLifecycle } from '../../lib/telemetryLog'
-import { createBench, createChoreography, readPalette } from '../../lib/observatory/flowBench'
+import { createBench, createChoreography, FLOW_CONFIG, readPalette } from '../../lib/observatory/flowBench'
 
 /* The Flow Bench (Phase 6.1): inference as liquid, every motion a real event.
 
@@ -67,14 +67,14 @@ export function FlowBench({ reducedMotion = false, highlightId = null, onSimEven
     const ensureRequest = (event) => {
       if (!choreography.active.has(event.id)) {
         const req = choreography.start({ id: event.id, kind: event.kind || 'late' })
-        bench.splat(req.x, req.y, tint(palette.prompt, 0.5), 0.0009)
+        bench.splat(req.x, req.y, tint(palette.prompt, FLOW_CONFIG.burstTint * 0.6), FLOW_CONFIG.driftRadius * 2)
       }
     }
     const unsubscribe = subscribeLifecycle((event) => {
       onSimEvent?.(event)
       if (event.type === 'start') {
         const req = choreography.start(event)
-        bench.splat(req.x, req.y, tint(palette.prompt, 0.5), 0.0009)
+        bench.splat(req.x, req.y, tint(palette.prompt, FLOW_CONFIG.burstTint * 0.6), FLOW_CONFIG.driftRadius * 2)
       } else if (event.type === 'first_content') {
         ensureRequest(event)
         choreography.firstContent(event)
@@ -103,35 +103,35 @@ export function FlowBench({ reducedMotion = false, highlightId = null, onSimEven
       for (const req of choreography.active.values()) {
         if (req.phase === 'drift') {
           req.x = Math.min(req.x + dt * 0.05, 0.92)
-          bench.splat(req.x, req.y, tint(palette.prompt, 0.09), 0.0006)
+          bench.splat(req.x, req.y, tint(palette.prompt, FLOW_CONFIG.driftTint), FLOW_CONFIG.driftRadius)
           choreography.trace(req.id, req.x, req.y)
         } else if (req.phase === 'burst') {
-          bench.splat(req.x, req.y, tint(palette.prompt, 0.55), 0.004)
+          bench.splat(req.x, req.y, tint(palette.prompt, FLOW_CONFIG.burstTint), FLOW_CONFIG.burstRadius)
           req.phase = 'flow'
         } else if (req.phase === 'flow') {
           const speed = Math.min(req.tokensPerSec / 24, 1.5)
-          jets.push({ x: req.x, y: req.y, power: 0.18 + speed * 0.7 })
-          const tx = Math.min(req.x + dt * (0.05 + speed * 0.12), 0.95)
+          jets.push({ x: req.x, y: req.y, power: FLOW_CONFIG.jetBase + speed * FLOW_CONFIG.jetPerSpeed })
+          const tx = Math.min(req.x + dt * (0.03 + speed * 0.07), 0.82)
           req.x = tx
-          bench.splat(tx, req.y, tint(palette.generation, 0.11), 0.0012)
+          bench.splat(tx, req.y, tint(palette.generation, FLOW_CONFIG.flowTint), FLOW_CONFIG.flowRadius)
           choreography.trace(req.id, tx, req.y)
         } else if (req.phase === 'cut') {
-          bench.splat(req.x, req.y, tint(palette.generation, 0.25), 0.002)
+          bench.splat(req.x, req.y, tint(palette.generation, FLOW_CONFIG.cutTint), FLOW_CONFIG.flowRadius)
           jets.push({ x: req.x, y: req.y, power: -0.35 }) // curls back
           req.phase = 'settled'
         } else if (req.phase === 'bloom') {
           // immiscible: re-splat the same spot so it holds shape before fading
           if (!req.bloomUntil) req.bloomUntil = performance.now() + 2600
-          if (performance.now() < req.bloomUntil) bench.splat(req.x, req.y, tint(palette.error, 0.05), 0.005)
+          if (performance.now() < req.bloomUntil) bench.splat(req.x, req.y, tint(palette.error, FLOW_CONFIG.bloomTint), FLOW_CONFIG.bloomRadius)
           else req.phase = 'settled'
         } else if (req.phase === 'mixing') {
-          bench.splat(req.x, req.y, tint(palette.generation, 0.3), 0.0015)
+          bench.splat(req.x, req.y, tint(palette.generation, FLOW_CONFIG.mixTint), FLOW_CONFIG.flowRadius)
           req.phase = 'settled'
         }
       }
       choreography.prune()
 
-      bench.step(t, dt, 0.12, jets)
+      bench.step(t, dt, FLOW_CONFIG.ambient * (jets.length ? FLOW_CONFIG.activeBoost : 1), jets)
       bench.render()
 
       // hover-highlight overlay: draw the hovered request's ink thread
@@ -195,10 +195,41 @@ export function FlowBench({ reducedMotion = false, highlightId = null, onSimEven
   const highlightRef = useRef(highlightId)
   useEffect(() => { highlightRef.current = highlightId }, [highlightId])
 
+  if (import.meta.env.DEV && typeof window !== 'undefined') window.__flowConfig = FLOW_CONFIG
+
   return (
     <div className="flowbench" data-renderer={rendererKind}>
       <canvas ref={canvasRef} className="flowbench__canvas" aria-hidden="true" />
       <canvas ref={overlayRef} className="flowbench__overlay" aria-hidden="true" />
+      {import.meta.env.DEV && <DevTuner />}
+    </div>
+  )
+}
+
+/* Dev-only live tuning panel — Vite strips this from production builds. */
+function DevTuner() {
+  const [open, setOpen] = useState(false)
+  const [, bump] = useState(0)
+  if (!open) {
+    return <button type="button" className="flowbench__tuner-toggle" onClick={() => setOpen(true)}>tune</button>
+  }
+  const keys = Object.keys(FLOW_CONFIG).filter((k) => k !== 'simScale')
+  return (
+    <div className="flowbench__tuner">
+      <button type="button" onClick={() => setOpen(false)}>close</button>
+      {keys.map((key) => (
+        <label key={key}>
+          <span>{key} {FLOW_CONFIG[key]}</span>
+          <input
+            type="range"
+            min={0}
+            max={key.includes('Dissipation') ? 1 : key.includes('Radius') ? 0.02 : 4}
+            step={key.includes('Dissipation') ? 0.0005 : key.includes('Radius') ? 0.0002 : 0.05}
+            value={FLOW_CONFIG[key]}
+            onChange={(e) => { FLOW_CONFIG[key] = Number(e.target.value); bump((n) => n + 1) }}
+          />
+        </label>
+      ))}
     </div>
   )
 }

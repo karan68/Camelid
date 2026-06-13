@@ -492,3 +492,8 @@
   .flowbench-stage { grid-template-columns: 1fr; }
   .flowbench { min-height: 360px; }
 }
+
+/* Dev tuning panel (dev builds only) */
+.flowbench__tuner-toggle { position: absolute; bottom: 8px; right: 8px; z-index: 5; font-family: var(--font-mono); font-size: 0.625rem; color: var(--color-text-faint); background: var(--color-glass); border: 1px solid var(--color-border-soft); border-radius: var(--radius-sm); padding: 2px 8px; }
+.flowbench__tuner { position: absolute; top: 8px; right: 8px; z-index: 5; width: 230px; max-height: 90%; overflow-y: auto; background: var(--color-glass-strong); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); padding: var(--space-2); display: flex; flex-direction: column; gap: 4px; }
+.flowbench__tuner label { display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 0.625rem; color: var(--color-text-muted); }
