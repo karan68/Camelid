@@ -4,7 +4,7 @@ import { Button } from '../components/ui/Button'
 import { Chip } from '../components/ui/Chip'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Field } from '../components/ui/Field'
-import { Sparkle } from '../components/ui/Avatar'
+import { CamelidMark } from '../components/ui/CamelidMark'
 import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconMonitor, IconSun, IconMoon, IconNetwork, IconChevronRight } from '../components/ui/icons'
 import { copyText } from '../lib/markdown'
 
@@ -225,7 +225,7 @@ export default function SettingsView({
 
       <Card tone="muted">
         <div className="settings-about">
-          <Sparkle size={28} />
+          <CamelidMark size={28} />
           <div>
             <strong>Camelid</strong>
             <p>Local, proof-carrying LLM inference. The UI talks to the backend over the OpenAI-compatible HTTP API.</p>

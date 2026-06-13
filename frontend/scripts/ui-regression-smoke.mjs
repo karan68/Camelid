@@ -231,6 +231,46 @@ assert.doesNotMatch(inferenceTelemetryHookSource, /useMemo\(\(\) => createInfere
 assert.doesNotMatch(inferenceTelemetryHookSource, /store\.disconnect\(\)/, 'unmount must not tear down the shared stream — navigation would wipe run state (DEFECT 2)')
 assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must connect the observatory stream at startup, not first view mount (DEFECT 1)')
 
+/* ---- Display pacing honesty bounds (Phase 8B) ---- */
+const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')
+{
+  const state = createPacerState()
+  let received = ''
+  let now = 0
+  // bursty arrival: 40 chars instantly, then nothing, then a 200-char burst
+  received = 'x'.repeat(40)
+  for (let i = 0; i < 30; i += 1) { now += 16; paceStep(state, received, now) }
+  let shown = paceStep(state, received, now += 16)
+  assert.equal(shown.length, 40, 'paced display must fully catch up during quiet periods')
+  received = 'x'.repeat(240)
+  const arrivalAt = now
+  let lagViolated = false
+  while (shown.length < 240) {
+    now += 16
+    shown = paceStep(state, received, now)
+    if (now - arrivalAt > MAX_LAG_MS && shown.length < 240) lagViolated = true
+  }
+  assert.equal(lagViolated, false, `paced display must never lag real arrival by more than ${MAX_LAG_MS}ms`)
+  const drained = paceDrain(state, received)
+  assert.equal(drained, received, 'drain must be instant and byte-identical to the received stream')
+}
+assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
+assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
+
+/* ---- Camelid mark (Phase 8): original glyph, derivative sparkle retired ---- */
+const camelidMarkSource = read('../src/components/ui/CamelidMark.jsx')
+const avatarSource = read('../src/components/ui/Avatar.jsx')
+const faviconSource = read('../public/favicon.svg')
+assert.match(topBarSource, /<CamelidMark/, 'the TopBar must render the Camelid mark')
+assert.match(chatWorkspaceSource, /CamelidMark|Avatar/, 'chat must render the Camelid mark (directly or via Avatar)')
+assert.match(avatarSource, /CamelidMark/, 'the assistant avatar must frame the Camelid mark')
+assert.match(camelidMarkSource, /camelid-mark__ear/, 'the mark keeps its animatable ear sub-elements')
+assert.match(camelidMarkSource, /reduced-motion/, 'mark states must document the reduced-motion contract')
+for (const [path, source] of [['Avatar.jsx', avatarSource], ['TopBar.jsx', topBarSource], ['favicon.svg', faviconSource], ['ChatWorkspace.jsx', chatWorkspaceSource]]) {
+  assert.doesNotMatch(source, /[Ss]parkle|camelid-sparkle-grad/, `${path} must not ship the retired sparkle mark`)
+}
+assert.doesNotMatch(faviconSource, /9b51e0|4285f4|fa9085/, 'favicon must not carry the old gradient stops')
+
 /* ---- Flow Bench (Phase 6.1) ---- */
 const flowBenchSource = read('../src/components/observatory/FlowBench.jsx')
 const flowBenchEngineSource = read('../src/lib/observatory/flowBench.js')

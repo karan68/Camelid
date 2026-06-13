@@ -1,5 +1,5 @@
 import { useMemo } from 'react'
-import { Sparkle } from '../ui/Avatar'
+import { CamelidMark } from '../ui/CamelidMark'
 import { StatusDot } from '../ui/StatusDot'
 import { ThemeToggle } from '../ui/ThemeToggle'
 import { Tooltip } from '../ui/Tooltip'
@@ -105,7 +105,7 @@ export function SidebarRail({
     <aside className="rail" id="camelid-sidebar" aria-label="Navigation sidebar">
       <div className="rail__header">
         <button type="button" className="rail__brand" onClick={showNewChatLanding} aria-label="Camelid home">
-          <Sparkle size={24} />
+          <CamelidMark size={24} />
           <span className="rail__brand-name">Camelid</span>
         </button>
         <button type="button" className="rail__icon-btn" aria-label="Collapse sidebar" onClick={onToggleCollapsed}>

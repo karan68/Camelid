@@ -161,7 +161,13 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       data-streaming-state={assistantStreaming ? 'active' : undefined}
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
-      <div className="cxturn__avatar"><Avatar size={30} /></div>
+      <div className="cxturn__avatar">
+        <Avatar
+          size={30}
+          state={assistantStreaming ? (messageContent ? 'streaming' : 'awaiting') : 'idle'}
+          pulse={assistantStreaming ? String(messageContent || '').length : 0}
+        />
+      </div>
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
@@ -199,6 +205,8 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         )}
 
         {message.role === 'assistant' && !assistantStreaming && <MessageMetaFooter message={message} />}
+        {/* reserve the footer's space during streaming so it never shifts layout */}
+        {message.role === 'assistant' && assistantStreaming && <div className="cxturn__meta cxturn__meta--reserve" aria-hidden="true" />}
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />

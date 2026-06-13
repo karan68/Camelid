@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
-import { Sparkle } from '../components/ui/Avatar'
+import { CamelidMark } from '../components/ui/CamelidMark'
+import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
@@ -67,6 +68,7 @@ export default function ChatWorkspace({
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
   const [showControls, setShowControls] = useState(false)
   const [showAllMessages, setShowAllMessages] = useState(false)
+  const [userScrolledAway, setUserScrolledAway] = useState(false)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
@@ -260,11 +262,14 @@ export default function ChatWorkspace({
   useEffect(() => {
     if (!generationActive) return undefined
     autoFollowGenerationRef.current = true
+    setUserScrolledAway(false)
     const updateAutoFollow = () => {
       const el = document.querySelector('.cxchat__scroll')
       if (!el) return
       const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
-      autoFollowGenerationRef.current = distanceFromBottom < 260
+      const follow = distanceFromBottom < 260
+      if (follow !== autoFollowGenerationRef.current) setUserScrolledAway(!follow)
+      autoFollowGenerationRef.current = follow
     }
     const el = document.querySelector('.cxchat__scroll')
     el?.addEventListener('scroll', updateAutoFollow, { passive: true })
@@ -452,13 +457,13 @@ export default function ChatWorkspace({
   )
 
   return (
-    <section className={`cxchat is-${readinessState} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
+    <section className={`cxchat is-${readinessState} ${userScrolledAway ? 'is-user-scrolled' : ''} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
       <div className="cxchat__scroll">
         <div className="cxchat__column">
           {isFreshThread ? (
             <div className="cxchat__empty">
               <div className="cxchat-hero">
-                <Sparkle size={52} className="cxchat-hero__sparkle" />
+                <CamelidMark size={52} className="cxchat-hero__mark" />
                 <h2 className="cxchat-hero__title">{productHeroTitle}</h2>
                 <p className="cxchat-hero__summary">{productHeroSummary}</p>
               </div>
@@ -509,13 +514,23 @@ export default function ChatWorkspace({
                   />
                 )
               })}
+              {generationActive && (
+                <button
+                  type="button"
+                  className="cxchat__jump-latest"
+                  data-autofollow-affordance
+                  onClick={() => { autoFollowGenerationRef.current = true; setUserScrolledAway(false); chatBottomRef.current?.scrollIntoView({ block: 'end' }) }}
+                >
+                  ↓ jump to latest
+                </button>
+              )}
               {awaitingAssistant && (
                 <>
                   {pendingUserPrompt && (
                     <article className="cxturn cxturn--user"><div className="cxturn__user-chip"><p>{pendingUserPrompt}</p></div></article>
                   )}
                   <article className="cxturn cxturn--assistant is-streaming" aria-busy="true" data-streaming-state="active">
-                    <div className="cxturn__avatar"><Sparkle size={30} /></div>
+                    <div className="cxturn__avatar"><Avatar size={30} state="awaiting" /></div>
                     <div className="cxturn__body"><StreamingLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} /></div>
                   </article>
                 </>

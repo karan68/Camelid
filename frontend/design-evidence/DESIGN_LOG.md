@@ -635,3 +635,57 @@ panel ships in dev builds only — verified absent from dist).
 settings; 0 rAF leaks after 20 nav cycles; reduced-motion renders the frozen tuned
 swirl. Thumbnail-test recordings (both themes) + hover-link proof shot in
 design-evidence/phase-6.2/.
+
+---
+
+## Phase 8A — Original Camelid mark (2026-06-12)
+
+**Inventory of the retired four-point sparkle** (all replaced, grep count now 0):
+Avatar.jsx (assistant avatar), ChatWorkspace hero (52px) + pending row (30px),
+MessageTurn avatar via Avatar, SidebarRail brand lockup (24px), SettingsView (28px),
+TopologyCanvas empty state (22px), public/favicon.svg, plus CSS: pulseSparkle
+keyframes (deleted), .camelid-sparkle-icon, hero class (renamed).
+
+**Direction: the animal.** components/ui/CamelidMark.jsx — an upright-neck llama
+glyph with the signature splayed ear pair, three strokes on a strict 24px grid,
+stroke-only, currentColor (neutral ink default; copper never decorates). Legible at
+16px (favicon ships it on the dark base in steel ink); wordmark lockup = mark +
+Space Grotesk "Camelid" (sidebar/TopBar).
+
+**Similarity check (one sentence each, per the brief):**
+- Gemini: theirs is a four-point star; ours is an animal head with ears.
+- ~Open~AI provider mark: theirs is an interlocking-loop knot; ours has no loops.
+- Copilot: theirs is rounded twin chat-shapes; ours is a stroke-drawn quadruped head.
+- Meta AI: theirs is a blue-gradient ring; ours is no ring and no gradient.
+- Mistral: theirs is a pixel-block flag; ours has no blocks or flag geometry.
+- Perplexity: theirs is a wireframe polyhedron; ours is organic-figurative, not
+  geometric-abstract.
+(No comparison needed more than a sentence; no redesign triggered.)
+
+**Animation states** (CSS transform/opacity on SVG sub-elements only; reduced motion
+renders all states static — state is also carried by existing text affordances):
+| state | motion |
+| --- | --- |
+| idle | static |
+| awaiting (post-send, pre-TTFT) | 2.2s breathing scale/opacity |
+| streaming | ears flick alternately, advanced by each rAF-coalesced token batch (data-step parity) — rhythm = real cadence |
+| error/abort | one 320ms settle back to rest |
+
+Gate: zero old-mark instances (grep + smoke:ui assertions incl. favicon gradient
+stops); 4-state screenshots both themes + streaming recording in
+design-evidence/phase-8/.
+
+## Phase 8B — chat fluidity (2026-06-12)
+
+Baseline (PERF_BASELINE.md) showed the original architecture already healthy on the
+test machine (rAF-coalesced flushes since Phase 0; 0 long tasks at 695 tokens) — so
+this pass removed the structural risks rather than chasing numbers: block-memoized
+markdown (stable prefix parses once via React.memo keyed on its string; boundary =
+last block break outside an open fence), open-fence highlighting deferred to fence
+close (decision: highlighting was the only per-flush O(block) cost left), footer
+space reservation (zero layout shift), jump-to-latest affordance, contain:layout
+style on turns, and the honest pacing buffer (lib/streamPacing.js — ≤150ms lag bound
++ instant byte-identical drain, enforced by a behavioral smoke; metrics keep real
+arrival times per I4; first easing curve failed its own lag-bound smoke and was
+steepened to 60%/step). Full table in PERF_AFTER.md; before/after recordings of the
+identical greedy prompt.
