@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
+import { getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
@@ -331,6 +332,22 @@ export default function ChatWorkspace({
     return `${model.name} · Not loaded`
   }
 
+  /* Send-time budget check (Phase 9): mirrors the backend's real rule —
+     prompt_tokens + max_tokens must fit the context or the request gets a
+     typed context_length_exceeded error (verified: the backend rejects, it
+     does not clamp). Prompt size is a client estimate, labeled as such. */
+  const estimatedPromptTokens = useMemo(() => {
+    const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
+    const text = `${history} ${composer}`
+    const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
+    return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
+  }, [visibleMessages, composer])
+  const sendBudget = validateSendBudget({
+    promptTokens: estimatedPromptTokens,
+    maxTokens: getConfiguredMaxTokens(selectedModelId),
+    contextLength: modelContextLength(selectedModel),
+  })
+
   const detailCopy = selectedModelRunnable ? selectionSummaryCopy : (supportBlocked || selectedModelIssue ? selectedCompatibilityCopy : readinessFinePrint)
 
   const renderComposer = () => (
@@ -424,7 +441,7 @@ export default function ChatWorkspace({
               data-send-ready={canSubmit ? 'true' : 'false'}
               title={!canSubmit ? sendDisabledReason : 'Send message to Camelid'}
               onClick={sendMessage}
-              disabled={!canSubmit}
+              disabled={!canSubmit || sendBudget.level === 'error'}
             >
               <IconSend size={20} />
             </button>
@@ -432,6 +449,11 @@ export default function ChatWorkspace({
         </div>
       </div>
 
+      {sendBudget.level === 'error' && (
+        <p className="cxcomposer__budget-error" role="alert">
+          <span aria-hidden="true">✕</span> {sendBudget.message}
+        </p>
+      )}
       <div className={`cxcomposer__status is-${statusTone}`} role="status" aria-live="polite" title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
         <StatusDot tone={statusTone} pulse={selectedModelRunnable} />
         <strong className="cxcomposer__status-label">{runtimeStatusLabel}</strong>

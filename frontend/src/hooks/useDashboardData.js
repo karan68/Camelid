@@ -8,6 +8,7 @@ import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
 import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
+import { getConfiguredMaxTokens as getModelMaxTokens } from '../lib/responseLimits'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
@@ -140,10 +141,11 @@ function applyLocalChatPolicy(messages) {
   return [...systemMessages, ...messages]
 }
 
-function localChatMaxTokens() {
-  // Configurable in Settings → Chat. Defaults generously so long answers and full
+function localChatMaxTokens(history, modelId = '') {
+  // Configurable in Settings → Chat (per-model since Phase 9, with the legacy
+  // global key as fallback). Defaults generously so long answers and full
   // programs aren't truncated (the old 800/2048 caps cut off larger code).
-  return getConfiguredMaxTokens()
+  return getModelMaxTokens(modelId)
 }
 
 function tokensPerSecond(tokens, elapsedMs) {
@@ -275,6 +277,9 @@ function modelFromBackend(item, health, currentModel, localRecord, apiBase) {
   return {
     id,
     name: resolveLoadedModelDisplayName({ fallbackName, modelPath, quantLabel }),
+    /* descriptive model-shape metadata from /v1/models (n_ctx_train etc.) —
+       display/limits only, never a support signal (I2) */
+    meta: item.meta || localRecord?.meta || null,
     provider_kind: 'local',
     status: generationReady ? 'ready' : localRecord?.status || 'registered',
     model_path: modelPath,
@@ -864,7 +869,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           model: requestModelId,
           messages: requestMessages,
           temperature: 0,
-          max_tokens: localChatMaxTokens(history),
+          max_tokens: localChatMaxTokens(history, requestModelId),
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */
           ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),

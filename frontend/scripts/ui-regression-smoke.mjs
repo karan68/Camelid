@@ -104,7 +104,11 @@ assert.match(chatWorkspaceSource, /hasStreamingAssistant[\s\S]*generationActive/
 assert.match(chatWorkspaceSource, /cxcomposer__status/, 'the composer should keep the consolidated runtime/support status line')
 assert.match(chatWorkspaceSource, /<EvidenceChip/, 'the composer support claim should render through the Evidence Chip, not an ad-hoc badge')
 assert.match(chatWorkspaceSource, /selectedChatGate\.contractSupported \? 'supported'/, 'the composer Evidence Chip must take its supported state only from the shared chat gate')
-assert.doesNotMatch(chatWorkspaceSource, /max[-_\s]?tokens?|token\s+limit/i, 'Chat UI should not expose a visible max-token picker or cap')
+/* Ported (Phase 9): the original blunt regex predates the composer's send-time
+   budget VALIDATION (which legitimately references the configured cap). The
+   intent stands: chat must not render a max-token PICKER — the control lives
+   in Settings. */
+assert.doesNotMatch(chatWorkspaceSource, /<ResponseLengthControl|Response length<|setConfiguredMaxTokens/, 'Chat UI must not expose the response-length picker — it lives in Settings')
 
 /* ---- Message rendering (moved from pre-redesign ChatWorkspace to MessageTurn/markdown) ---- */
 assert.match(messageTurnSource, /aria-busy=\{assistantStreaming \? 'true' : undefined\}/, 'streaming assistant rows should expose row-level busy state while text is incomplete')
@@ -122,7 +126,7 @@ assert.doesNotMatch(messageTurnSource, /dangerouslySetInnerHTML/, 'message rows 
 
 /* ---- Dashboard data hook ---- */
 assert.match(dashboardHookSource, /Include inline <style> and inline <script>/, 'HTML code prompts should ask for inline CSS and JS, not an unfinished fragment')
-assert.match(dashboardHookSource, /max_tokens:\s*localChatMaxTokens\(history\)/, 'local chat sends should choose the token budget from the prompt policy')
+assert.match(dashboardHookSource, /max_tokens:\s*localChatMaxTokens\(history, requestModelId\)/, 'local chat sends should choose the per-model token budget (Phase 9)')
 assert.match(dashboardHookSource, /getRuntimeRequestModelId\(selectedModel, runtime, selectedModelId\)/, 'chat sends should use the backend active runtime model id when a browser alias is selected')
 assert.doesNotMatch(dashboardHookSource, /Camelid streamed the local reply\./, 'successful streams should not show a noisy demo-breaking toast')
 assert.match(dashboardHookSource, /readStreamingChatCompletion\(response/, 'dashboard chat send should use the centralized stream parser')
@@ -230,6 +234,30 @@ assert.match(inferenceTelemetryHookSource, /const sharedStore = createInferenceT
 assert.doesNotMatch(inferenceTelemetryHookSource, /useMemo\(\(\) => createInferenceTelemetryStore/, 'per-mount store creation loses every event emitted while the view is unmounted')
 assert.doesNotMatch(inferenceTelemetryHookSource, /store\.disconnect\(\)/, 'unmount must not tear down the shared stream — navigation would wipe run state (DEFECT 2)')
 assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must connect the observatory stream at startup, not first view mount (DEFECT 1)')
+
+/* ---- Response-length control (Phase 9) ---- */
+const responseLimitsSource = read('../src/lib/responseLimits.js')
+const rlcSource = read('../src/components/settings/ResponseLengthControl.jsx')
+const { validateResponseLength, validateSendBudget, verifiedContextBound, sliderToTokens, tokensToSlider } = await import('../src/lib/responseLimits.js')
+{
+  const red = validateResponseLength({ value: 8192, contextLength: 64, verifiedBound: null, modelName: 'fixture' })
+  assert.equal(red.level, 'error', 'value above model context must be the red error state')
+  assert.match(red.message, /context_length_exceeded|Exceeds/, 'red copy must say what is wrong')
+  const amber = validateResponseLength({ value: 4096, contextLength: 131072, verifiedBound: 2048 })
+  assert.equal(amber.level, 'caution', 'value above verified bound but under model max is amber')
+  assert.match(amber.message, /allowed, untested/, 'amber copy must state allowed-but-untested')
+  assert.equal(validateResponseLength({ value: 1024, contextLength: 131072, verifiedBound: 2048 }).level, 'ok')
+  const send = validateSendBudget({ promptTokens: 60, maxTokens: 50, contextLength: 64 })
+  assert.equal(send.level, 'error', 'send budget must mirror the backend rule: prompt + max_tokens > context fails')
+  const bound = verifiedContextBound({ model_compatibility: [{ id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_512_pack: 'validated_bounded_pack', bounded_context_512_window: 512, bounded_context_2048_pack: 'validated_third_pack', bounded_context_2048_window: 2048, bounded_context_4096_pack: 'not_promoted', bounded_context_4096_window: 4096 }] }, { id: 'llama32_3b_instruct_q8_0', name: 'x', quant: 'Q8_0', model_path: '/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf' })
+  assert.equal(bound, 2048, 'verified bound is the max VALIDATED pack window, never an unvalidated one')
+  assert.ok(Math.abs(tokensToSlider(sliderToTokens(0.5)) - 0.5) < 0.03, 'log slider mapping round-trips')
+}
+assert.match(rlcSource, /from model metadata, not a support claim/, 'the context marker must disclaim support (I2)')
+assert.match(rlcSource, /memory estimate unavailable — backend does not yet report/, 'missing memory data renders an honest absent line, never a fake gauge')
+assert.match(rlcSource, /estimated/, 'the future readout contract keeps the estimated label in source')
+assert.doesNotMatch(rlcSource, /navigator\.deviceMemory|performance\.memory/, 'no client-side memory guessing')
+assert.match(chatWorkspaceSource, /validateSendBudget/, 'the composer must validate prompt+max_tokens against the real context rule at send time')
 
 /* ---- Display pacing honesty bounds (Phase 8B) ---- */
 const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')
