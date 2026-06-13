@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import {
   DETENTS,
@@ -21,6 +21,11 @@ import {
 const fmt = (n) => n.toLocaleString()
 
 export function ResponseLengthControl({ value, onChange, model = null, capabilities = null }) {
+  /* While dragging, the thumb renders from RAW local position — a controlled
+     rewrite that snaps the thumb under the pointer breaks the drag in some
+     engines (the thumb stuck at the 256k detent and 1M was unreachable).
+     Tokens still update live; the snap applies to the committed value only. */
+  const [dragPos, setDragPos] = useState(null)
   const contextLength = modelContextLength(model)
   const verifiedBound = useMemo(() => verifiedContextBound(capabilities, model), [capabilities, model])
   const verdict = validateResponseLength({ value, contextLength, verifiedBound, modelName: model?.name || 'the loaded model' })
@@ -39,8 +44,16 @@ export function ResponseLengthControl({ value, onChange, model = null, capabilit
             className="rlc__slider"
             min="0"
             max="1000"
-            value={Math.round(tokensToSlider(value) * 1000)}
-            onChange={(event) => setValue(sliderToTokens(Number(event.target.value) / 1000))}
+            value={dragPos ?? Math.round(tokensToSlider(value) * 1000)}
+            onChange={(event) => {
+              const raw = Number(event.target.value)
+              setDragPos(raw)
+              setValue(sliderToTokens(raw / 1000))
+            }}
+            onPointerUp={() => setDragPos(null)}
+            onTouchEnd={() => setDragPos(null)}
+            onKeyUp={() => setDragPos(null)}
+            onBlur={() => setDragPos(null)}
             aria-label="Response length in tokens (logarithmic scale)"
             aria-invalid={verdict.level === 'error'}
           />
