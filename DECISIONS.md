@@ -88,6 +88,26 @@ the single-node 50-token gate is unchanged). Open follow-up: a separate gate may
 the GPU-resident lane across a split, but the distributed pipeline's parity reference stays the
 CPU lane.
 
+## D6 — Phase 3 driver: a same-binary `parity_node` example (2026-06-13, PASS)
+
+Phase 3 (two Macs over LAN) runs through `examples/parity_node.rs`, a single binary with
+`worker` and `coordinator` modes. Rationale: the existing `distribute-master`/`-worker`
+CLI does not pin the CPU lane or emit a `DistributedParityReceipt`, both of which the gate
+requires. The example reuses the library's public session API, `src/cluster.rs` wire, and
+`src/receipt`. **The same binary must run on every node** — a different build would defeat
+the parity claim — so it is built once and copied to each node.
+
+Transport hardening (not parity relaxation): the worker resets its KV cache per connection
+(a persistent worker serves many runs); the coordinator resets its KV per run, uses bounded
+connect-retry + whole-run retry, and the worker survives a single bad run. mini2's worker
+runs under `caffeinate` (App Nap / Wi-Fi power-save otherwise stalled `accept()`).
+
+**Result PASS 2026-06-13:** two consecutive runs token-identical, mac-m4 `[0,11)` → mini2
+`[11,22)`, TinyLlama 1.1B Q8_0 (byte-identical GGUF, sha `a4c9bb1d…`); deterministic
+`receipt_id 33b79d8d…`; artifacts `qa/distributed/{two-mac-tinyllama-q8.json,
+cluster-topology.json}` + `CLUSTER_BENCH.md` (honest latency, ~5.5 tok/s, capability not
+speed).
+
 ## D5 — Branch / naming for the lane (2026-06-13)
 
 Work proceeds on `feat/distributed-parity-lane` off `origin/main`. Single-node TinyLlama
