@@ -2,6 +2,7 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     embed_build_provenance();
+    ensure_web_ui_placeholder();
     println!("cargo:rerun-if-changed=src/x86_amx_q8.c");
     println!("cargo:rerun-if-env-changed=CAMELID_BUILD_X86_AMX_SHIM");
     println!("cargo:rustc-check-cfg=cfg(camelid_x86_amx_shim)");
@@ -86,6 +87,37 @@ fn embed_build_provenance() {
     }
     if let Some(describe) = git_stdout(&["describe", "--tags", "--dirty"]) {
         println!("cargo:rustc-env=CAMELID_GIT_DESCRIBE={describe}");
+    }
+}
+
+// The web UI (frontend/dist) is embedded into the binary via rust-embed, which
+// fails to compile if the folder has no index.html. A fresh checkout has not
+// run `npm run build` yet, so write a placeholder index.html when one is
+// missing — a real `npm run build` overwrites it. This keeps `cargo build`
+// working with no Node toolchain while still embedding the real UI in release
+// builds that run the frontend build first.
+fn ensure_web_ui_placeholder() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let dist = manifest_dir.join("frontend").join("dist");
+    let index = dist.join("index.html");
+    // Re-embed whenever the built UI changes (or the placeholder is replaced).
+    println!("cargo:rerun-if-changed={}", dist.display());
+    if index.exists() {
+        return;
+    }
+    if let Err(err) = std::fs::create_dir_all(&dist) {
+        println!(
+            "cargo:warning=could not create {}: {err}; web UI will be unavailable",
+            dist.display()
+        );
+        return;
+    }
+    let placeholder = "<!doctype html><!-- placeholder: run `cd frontend && npm run build` to embed the real UI -->\n";
+    if let Err(err) = std::fs::write(&index, placeholder) {
+        println!(
+            "cargo:warning=could not write {}: {err}; web UI will be unavailable",
+            index.display()
+        );
     }
 }
 

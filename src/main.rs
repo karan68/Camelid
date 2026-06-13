@@ -84,6 +84,10 @@ enum Command {
         /// ngram, 5 for draft).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_TOKENS")]
         spec_draft_tokens: Option<usize>,
+        /// Do not open the web UI in a browser on startup. By default, when run
+        /// interactively, `serve` opens the chat surface automatically.
+        #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
+        no_open: bool,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -417,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
             spec_decode,
             spec_draft_model,
             spec_draft_tokens,
+            no_open,
         } => {
             configure_rayon_threads(threads)?;
             apply_runtime_tuning_env(
@@ -434,7 +439,9 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
             }
-            api::serve(addr, threads, model).await?
+            // Open the browser only when run interactively and not opted out.
+            let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            api::serve(addr, threads, model, open_ui).await?
         }
         Command::ServeDistributed {
             role,
@@ -476,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                api::serve(addr, threads, Some(model)).await?
+                api::serve(addr, threads, Some(model), false).await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;

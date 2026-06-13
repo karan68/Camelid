@@ -1281,6 +1281,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/messages", post(unsupported_messages))
         .route("/v1/rerank", post(unsupported_reranking))
         .route("/v1/reranking", post(unsupported_reranking))
+        // Anything not matched above is served from the embedded web UI (the
+        // chat surface and its static assets), with a client-side-route
+        // fallback to the app shell. API routes are matched first.
+        .fallback(crate::web_ui::handler)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1290,6 +1294,7 @@ pub async fn serve(
     addr: SocketAddr,
     configured_threads: Option<usize>,
     initial_model: Option<PathBuf>,
+    open_ui: bool,
 ) -> std::io::Result<()> {
     let state = AppState::with_configured_threads(configured_threads);
     if let Some(model_path) = initial_model {
@@ -1300,7 +1305,21 @@ pub async fn serve(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "camelid server listening");
+    let url = format!("http://{addr}");
+    print_ready_banner(&url);
+    if open_ui {
+        crate::web_ui::open_in_browser(&url);
+    }
     axum::serve(listener, router_with_state(state)).await
+}
+
+/// Print a clear, human-facing pointer to the web UI once the server is up.
+/// `tracing` output is for operators; this banner is for the person who just
+/// ran `camelid serve` and wants to know where to click.
+fn print_ready_banner(url: &str) {
+    eprintln!("\n  🐪 Camelid is ready");
+    eprintln!("  Open the chat UI:  {url}");
+    eprintln!("  OpenAI-style API:  {url}/v1/chat/completions\n");
 }
 
 /// Live inference telemetry stream (SSE). Subscribers receive only events

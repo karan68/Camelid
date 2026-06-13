@@ -66,7 +66,7 @@ Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md
 | OpenAI-style API | ✅ Working | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus capability/health routes. |
 | Streaming chat | ✅ Working | SSE streaming on the chat endpoint. |
 | Apple Silicon Metal path | ✅ Working | GPU-resident prefill and decode, auto-selected when a Metal device is present; CPU fallback otherwise. |
-| Web frontend | ✅ Working | Local React/Vite chat surface; unlocks chat only for recognized model rows. |
+| Web frontend | ✅ Working | Local React/Vite chat surface, embedded in the binary and served at the same address; unlocks chat only for recognized model rows. |
 | Parity receipts | ✅ Working | Opt-in sealed record of one request; `camelid verify-receipt` re-checks it against llama.cpp (incl. 7B on a 16 GB host). |
 | Two-Mac distributed serve | ✅ Working | Layer sharding over TCP for rows too large for one 16 GB host (Gemma 4 12B, 26B-A4B). |
 | Other quantizations | ⛔ Not supported | Fail closed in v0.1. |
@@ -97,10 +97,11 @@ Both rows serve over HTTP through the same lane — set `CAMELID_GEMMA4_SERVE=1`
 
 ## Quickstart
 
-Build:
+Build the binary. The web UI is compiled into it, so build the frontend first and it gets embedded — one binary, no separate Node process at runtime:
 
 ```bash
-cargo build --release
+(cd frontend && npm ci && npm run build)   # bundles the web UI
+cargo build --release                       # embeds it into the binary
 ```
 
 Serve a local GGUF model (Q8_0):
@@ -111,7 +112,7 @@ Serve a local GGUF model (Q8_0):
   --threads 4
 ```
 
-The server listens on `127.0.0.1:8181` by default. List the loaded model (its `id` comes from the GGUF metadata):
+The server listens on `127.0.0.1:8181` and **opens the chat UI in your browser automatically** (pass `--no-open` to disable). The same address serves the OpenAI-style API. List the loaded model (its `id` comes from the GGUF metadata):
 
 ```bash
 curl -s http://127.0.0.1:8181/v1/models
@@ -130,7 +131,7 @@ curl -s http://127.0.0.1:8181/v1/chat/completions \
   }'
 ```
 
-Run the local web frontend:
+The web frontend is served by the binary itself at the same address — no extra step. For hot-reloading frontend development, run the Vite dev server separately (it proxies to a running `camelid serve`):
 
 ```bash
 cd frontend && npm ci && npm run dev

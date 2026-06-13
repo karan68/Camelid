@@ -19,7 +19,20 @@ const CONVERSATIONS_STORAGE_KEY = 'camelid.conversations'
 const MEMORIES_STORAGE_KEY = 'camelid.memories'
 const API_BASE_STORAGE_KEY = 'camelid.apiBase'
 const VALID_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'compatibility', 'telemetry'])
-const DEFAULT_API_BASE = import.meta.env?.VITE_CAMELID_API_BASE || 'http://127.0.0.1:8181'
+// Where the UI looks for the camelid API by default:
+//   1. an explicit VITE_CAMELID_API_BASE override always wins;
+//   2. in a production build (served by the camelid binary itself), use the
+//      same origin the page was loaded from, so a custom `serve --addr` just
+//      works with no configuration;
+//   3. in the Vite dev server, the backend is a separate process on :8181.
+function defaultApiBase() {
+  if (import.meta.env?.VITE_CAMELID_API_BASE) return import.meta.env.VITE_CAMELID_API_BASE
+  if (!import.meta.env?.DEV && typeof window !== 'undefined' && window.location?.origin) {
+    return window.location.origin
+  }
+  return 'http://127.0.0.1:8181'
+}
+const DEFAULT_API_BASE = defaultApiBase()
 
 function getInitialTab() {
   if (typeof window === 'undefined') return 'chat'
