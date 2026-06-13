@@ -58,7 +58,11 @@ export function ResponseLengthControl({ value, onChange, model = null, capabilit
               </span>
             )}
             {contextLength !== null && (
-              <span className={`rlc__marker rlc__marker--context ${value > contextLength ? 'is-violated' : ''}`} style={{ left: `${tokensToSlider(contextLength) * 100}%` }}>
+              <span
+                className={`rlc__marker rlc__marker--context ${value > contextLength ? 'is-violated' : ''}`}
+                data-edge={tokensToSlider(contextLength) > 0.6 ? 'right' : undefined}
+                style={{ left: `${tokensToSlider(contextLength) * 100}%` }}
+              >
                 <span className="rlc__marker-label">model max {fmt(contextLength)} · from model metadata, not a support claim</span>
               </span>
             )}

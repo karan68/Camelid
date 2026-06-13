@@ -1258,11 +1258,11 @@
    ========================================================================== */
 .rlc { display: flex; flex-direction: column; gap: var(--space-2); }
 .rlc__row { display: flex; align-items: flex-start; gap: var(--space-4); }
-.rlc__track-wrap { position: relative; flex: 1; padding: 26px 0 30px; min-width: 0; }
+.rlc__track-wrap { position: relative; flex: 1; padding: 46px 0 30px; min-width: 0; }
 .rlc__slider { width: 100%; accent-color: var(--color-accent); }
 .rlc--error .rlc__slider { accent-color: var(--color-error); }
 .rlc--caution .rlc__slider { accent-color: var(--color-evidence); }
-.rlc__detents { position: absolute; left: 0; right: 0; bottom: 6px; height: 16px; }
+.rlc__detents { position: absolute; left: 0; right: 0; bottom: 6px; height: 16px; pointer-events: none; }
 .rlc__detent {
   position: absolute;
   transform: translateX(-50%);
@@ -1272,8 +1272,13 @@
   text-align: center;
 }
 .rlc__detent i { display: block; width: 1px; height: 5px; background: var(--color-border-strong); margin: 0 auto 2px; }
-.rlc__markers { position: absolute; left: 0; right: 0; top: 0; height: 24px; }
+.rlc__markers { position: absolute; left: 0; right: 0; top: 0; height: 44px; pointer-events: none; }
 .rlc__marker { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+/* two rows so the verified chip and the context label never collide */
+.rlc__marker--verified { top: 22px; }
+.rlc__marker--context { top: 0; }
+/* near the right edge, anchor the long context label leftward instead of centering */
+.rlc__marker--context[data-edge='right'] { transform: translateX(-92%); }
 .rlc__marker--context .rlc__marker-label {
   font-family: var(--font-mono);
   font-size: 0.625rem;
@@ -1284,7 +1289,7 @@
 .rlc__marker--context.is-violated .rlc__marker-label { color: var(--color-error); border-left-color: var(--color-error); }
 .rlc__number {
   width: 110px;
-  margin-top: 18px;
+  margin-top: 38px;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
   background: var(--color-bg-elevated);

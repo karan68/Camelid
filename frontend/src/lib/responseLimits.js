@@ -46,7 +46,7 @@ export function sliderToTokens(position) {
   const value = Math.round(Math.exp(LOG_MIN + (LOG_MAX - LOG_MIN) * Math.min(Math.max(position, 0), 1)))
   // light detent snap: within 2% of track distance
   for (const detent of DETENTS) {
-    if (Math.abs(tokensToSlider(detent) - position) < 0.02) return detent
+    if (Math.abs(tokensToSlider(detent) - position) < 0.012) return detent
   }
   return value
 }
