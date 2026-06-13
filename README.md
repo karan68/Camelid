@@ -95,9 +95,24 @@ Both rows serve over HTTP through the same lane — set `CAMELID_GEMMA4_SERVE=1`
 
 ---
 
+## Install
+
+Download a prebuilt binary from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) — the web UI is baked in, so there's nothing else to install:
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/timtoole02/Camelid/releases/latest/download/camelid-macos-arm64.tar.gz | tar -xz
+cd camelid-macos-arm64
+xattr -d com.apple.quarantine ./camelid 2>/dev/null || true   # allow the unsigned binary to run
+
+# Linux (x86_64): camelid-linux-x86_64.tar.gz
+```
+
+Then jump to [Quickstart](#quickstart) — `./camelid pull` to get a model, `./camelid serve --model …` to chat.
+
 ## Quickstart
 
-Build the binary. The web UI is compiled into it, so build the frontend first and it gets embedded — one binary, no separate Node process at runtime:
+Already have a binary from [Install](#install)? Skip to "Get a model" below. To build from source instead — the web UI is compiled into the binary, so build the frontend first and it gets embedded (one binary, no separate Node process at runtime):
 
 ```bash
 (cd frontend && npm ci && npm run build)   # bundles the web UI
