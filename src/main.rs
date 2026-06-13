@@ -34,8 +34,20 @@ use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 
+// Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
+// "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without
+// a git checkout.
+const VERSION: &str = match option_env!("CAMELID_GIT_DESCRIBE") {
+    Some(describe) => describe,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Parser)]
-#[command(name = "camelid", about = "Rust-native local GGUF inference backend")]
+#[command(
+    name = "camelid",
+    version = VERSION,
+    about = "Rust-native local GGUF inference backend"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
