@@ -205,6 +205,8 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
         )}
 
         {message.role === 'assistant' && !assistantStreaming && <MessageMetaFooter message={message} />}
+        {/* reserve the footer's space during streaming so it never shifts layout */}
+        {message.role === 'assistant' && assistantStreaming && <div className="cxturn__meta cxturn__meta--reserve" aria-hidden="true" />}
 
         {message.role === 'assistant' && !assistantStreaming && message.camelid_receipt && (
           <ParityReceiptCard receipt={message.camelid_receipt} />

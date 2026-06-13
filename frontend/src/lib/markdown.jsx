@@ -350,7 +350,10 @@ export function CodeBlockCard({ language, code, keyPrefix, stillGenerating }) {
         {stillGenerating && <span className="message-code-card-status" aria-live="polite" data-live-status="active">{CODE_CARD_STREAMING_LABEL}</span>}
         <button type="button" onClick={() => copyText(code)} aria-label={`Copy ${language} code`}>Copy</button>
       </figcaption>
-      <pre ref={preRef}><code>{renderHighlightedCode(code, language, keyPrefix)}</code></pre>
+      {/* Highlighting deferred while the fence is open (Phase 8B): plain text
+          per flush; full per-language highlighting applies once the fence
+          closes and the block becomes a memoized stable segment. */}
+      <pre ref={preRef}><code>{stillGenerating ? code : renderHighlightedCode(code, language, keyPrefix)}</code></pre>
     </figure>
   )
 }
@@ -374,16 +377,32 @@ export const hasOpenCodeFence = (content) => {
   return Boolean(matches && matches.length % 2 === 1)
 }
 
-function AssistantMarkdownInner({ content, streaming = false }) {
-  const normalized = String(content || '').replace(/\r\n/g, '\n')
+/* Streaming-path block memoization (Phase 8B): the stable prefix (everything
+   up to the last block boundary outside an open fence) renders through a
+   React.memo component keyed on its string, so completed blocks parse exactly
+   once; only the open tail re-parses per rAF flush. Non-streaming renders are
+   a single stable segment. */
+const StableMarkdownSegment = memo(function StableMarkdownSegment({ content }) {
+  return renderFencedContent(content, false)
+})
+
+function splitStableBoundary(content) {
+  const fences = [...content.matchAll(/```/g)]
+  if (fences.length % 2 === 1) {
+    // open fence: everything before it is stable
+    return fences[fences.length - 1].index
+  }
+  const lastBreak = content.lastIndexOf('\n\n')
+  return lastBreak === -1 ? 0 : lastBreak + 2
+}
+
+function renderFencedContent(normalized, streaming) {
   const blocks = []
   let cursor = 0
   let fenceStart = normalized.indexOf('```', cursor)
-
   while (fenceStart !== -1) {
     const before = normalized.slice(cursor, fenceStart)
     blocks.push(...renderMarkdownText(before, `md-${blocks.length}`))
-
     const infoStart = fenceStart + 3
     const nextLine = normalized.indexOf('\n', infoStart)
     const infoEnd = nextLine === -1 ? normalized.length : nextLine
@@ -394,14 +413,29 @@ function AssistantMarkdownInner({ content, streaming = false }) {
     const codeEnd = fenceEnd === -1 ? normalized.length : fenceEnd
     const codeBody = normalized.slice(codeStart, codeEnd)
     const code = firstCodeLine ? `${firstCodeLine}${codeBody ? `\n${codeBody}` : ''}` : codeBody
-
     pushCodeBlock(blocks, language, code, `code-${blocks.length}`, { incomplete: incompleteFence, streaming })
     cursor = fenceEnd === -1 ? normalized.length : fenceEnd + 3
     fenceStart = normalized.indexOf('```', cursor)
   }
   blocks.push(...renderMarkdownText(normalized.slice(cursor), `md-${blocks.length}`))
+  return blocks
+}
 
-  return <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
+function AssistantMarkdownInner({ content, streaming = false }) {
+  const normalized = String(content || '').replace(/\r\n/g, '\n')
+  if (!streaming) {
+    const blocks = renderFencedContent(normalized, false)
+    return <div className="message-markdown">{blocks.length ? blocks : <p>{content}</p>}</div>
+  }
+  const boundary = splitStableBoundary(normalized)
+  const stable = normalized.slice(0, boundary)
+  const tail = normalized.slice(boundary)
+  return (
+    <div className="message-markdown">
+      {stable && <StableMarkdownSegment content={stable} />}
+      {tail && renderFencedContent(tail, true)}
+    </div>
+  )
 }
 
 export const AssistantMarkdown = memo(AssistantMarkdownInner)

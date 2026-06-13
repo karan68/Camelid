@@ -231,6 +231,32 @@ assert.doesNotMatch(inferenceTelemetryHookSource, /useMemo\(\(\) => createInfere
 assert.doesNotMatch(inferenceTelemetryHookSource, /store\.disconnect\(\)/, 'unmount must not tear down the shared stream — navigation would wipe run state (DEFECT 2)')
 assert.match(appSource, /ensureInferenceTelemetryConnected/, 'the app shell must connect the observatory stream at startup, not first view mount (DEFECT 1)')
 
+/* ---- Display pacing honesty bounds (Phase 8B) ---- */
+const { createPacerState, paceStep, paceDrain, MAX_LAG_MS } = await import('../src/lib/streamPacing.js')
+{
+  const state = createPacerState()
+  let received = ''
+  let now = 0
+  // bursty arrival: 40 chars instantly, then nothing, then a 200-char burst
+  received = 'x'.repeat(40)
+  for (let i = 0; i < 30; i += 1) { now += 16; paceStep(state, received, now) }
+  let shown = paceStep(state, received, now += 16)
+  assert.equal(shown.length, 40, 'paced display must fully catch up during quiet periods')
+  received = 'x'.repeat(240)
+  const arrivalAt = now
+  let lagViolated = false
+  while (shown.length < 240) {
+    now += 16
+    shown = paceStep(state, received, now)
+    if (now - arrivalAt > MAX_LAG_MS && shown.length < 240) lagViolated = true
+  }
+  assert.equal(lagViolated, false, `paced display must never lag real arrival by more than ${MAX_LAG_MS}ms`)
+  const drained = paceDrain(state, received)
+  assert.equal(drained, received, 'drain must be instant and byte-identical to the received stream')
+}
+assert.match(dashboardHookSource, /paceStep\(pacer, fullContent/, 'streaming display must go through the bounded pacer')
+assert.match(dashboardHookSource, /paceDrain\(pacer, streamed\.content/, 'final content must drain byte-identical from the real stream')
+
 /* ---- Camelid mark (Phase 8): original glyph, derivative sparkle retired ---- */
 const camelidMarkSource = read('../src/components/ui/CamelidMark.jsx')
 const avatarSource = read('../src/components/ui/Avatar.jsx')

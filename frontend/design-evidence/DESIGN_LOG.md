@@ -674,3 +674,18 @@ renders all states static — state is also carried by existing text affordances
 Gate: zero old-mark instances (grep + smoke:ui assertions incl. favicon gradient
 stops); 4-state screenshots both themes + streaming recording in
 design-evidence/phase-8/.
+
+## Phase 8B — chat fluidity (2026-06-12)
+
+Baseline (PERF_BASELINE.md) showed the original architecture already healthy on the
+test machine (rAF-coalesced flushes since Phase 0; 0 long tasks at 695 tokens) — so
+this pass removed the structural risks rather than chasing numbers: block-memoized
+markdown (stable prefix parses once via React.memo keyed on its string; boundary =
+last block break outside an open fence), open-fence highlighting deferred to fence
+close (decision: highlighting was the only per-flush O(block) cost left), footer
+space reservation (zero layout shift), jump-to-latest affordance, contain:layout
+style on turns, and the honest pacing buffer (lib/streamPacing.js — ≤150ms lag bound
++ instant byte-identical drain, enforced by a behavioral smoke; metrics keep real
+arrival times per I4; first easing curve failed its own lag-bound smoke and was
+steepened to 60%/step). Full table in PERF_AFTER.md; before/after recordings of the
+identical greedy prompt.

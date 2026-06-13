@@ -7,6 +7,7 @@ import { NEW_CHAT_SENTINEL, resolveSelectedConversation, shouldCreateConversatio
 import { normalizeStoredConversations } from '../lib/conversationStorage.js'
 import { getRuntimeRequestModelId, isExternalModel, modelRuntimeIdMatches } from '../lib/modelState'
 import { contractSamplingOverrides } from '../lib/samplingContract'
+import { createPacerState, paceDrain, paceStep } from '../lib/streamPacing'
 import { beginRequest, emitFirstContent, emitProgress, getTelemetrySnapshot, recordChatGeneration, recordHealthPoll } from '../lib/telemetryLog'
 
 const TAB_STORAGE_KEY = 'camelid.activeTab'
@@ -817,6 +818,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       chatLifecycleId = lifecycleId
       let firstContentEmitted = false
       let lastProgressAt = 0
+      const pacer = createPacerState()
       assistantId = makeId('message')
       /* Snapshot of the support claim that was active when this send left the
          composer: row id + status only (never paths) so the message footer can
@@ -922,7 +924,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
           emitProgress(lifecycleId, { tokens: liveCompletionTokens, tokensPerSec: tokensPerSecond(liveCompletionTokens, liveElapsedMs) })
         }
         markAssistantStreamState({
-          content: fullContent || '…',
+          /* paced display (lag-bounded ≤150ms, drains on end; metrics use the
+             real stream — see lib/streamPacing.js) */
+          content: paceStep(pacer, fullContent, performance.now()) || '…',
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
           tokens_out_per_sec: tokensPerSecond(liveCompletionTokens, liveElapsedMs),
@@ -943,7 +947,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const elapsedMs = performance.now() - requestStartedAt
       const assistantMessage = {
         ...assistantMessageBase,
-        content: streamed.content || '(empty response)',
+        content: paceDrain(pacer, streamed.content || '(empty response)'),
         tokens_in_per_sec: tokensPerSecond(promptTokenEstimate, streamed.firstContentMs),
         tokens_out_per_sec: tokensPerSecond(streamed.completionTokens || estimateTokenCount(streamed.content), elapsedMs),
         finish_reason: streamed.finishReason,
