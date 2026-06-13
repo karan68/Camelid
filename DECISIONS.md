@@ -108,25 +108,38 @@ runs under `caffeinate` (App Nap / Wi-Fi power-save otherwise stalled `accept()`
 cluster-topology.json}` + `CLUSTER_BENCH.md` (honest latency, ~5.5 tok/s, capability not
 speed).
 
-## D7 — Phase 4 prep + Pi blocker (2026-06-13, BLOCKED on hardware)
+## D7 — Phase 4 (heterogeneous Mac+Pi): PORTABILITY SOLVED, Pi inference BLOCKED (2026-06-13)
 
-Phase 4 (a model too big for any single node, across Mac+Mac+Pi, parity vs a llama.cpp
-oracle) is blocked at the hardware boundary, reported not faked (operating rule #5):
-- Pi at `192.168.86.27` unreachable (off / off-network); other Pis don't resolve; the Pis
-  run NanoCamelid, not camelid.
-- No rust cross target here (Homebrew toolchain, no `rustup`), so cross-compiling camelid
-  for aarch64-Linux isn't available locally. **Plan: build `parity_node` natively on the Pi**
-  (its own aarch64-Linux rustc) — `build.rs` is confirmed portable (x86 AMX shim gated to
-  `linux+x86_64`; Accelerate to macOS; Metal to `cfg(macos)`).
-- Both Macs are 16 GB (32 GB aggregate). The only local model too big for any node is
-  Mixtral-8x7B Q8_0 (46 GB, MoE — camelid support uncertain), which needs ≥3 nodes → needs
-  the Pi.
+Reported, not faked (operating rule #5). Two distinct results:
 
-Prep landed so the Pi run is turnkey once a Pi is online: `parity_node` now enforces a
-per-node materialization cap (`--max-weight-bytes` / `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`)
-and **refuses to start with a typed error** when a shard's slice exceeds it (verified: the
-[11,22) TinyLlama shard reports ~2.2 GB and refuses at cap=1000). User chose to bring the
-Pis online first; awaiting reachable Pi address(es).
+**RESOLVED — camelid is portable to aarch64-Linux (the spec's assumed hard blocker).**
+- All 3 Pis found: `camelid1` 192.168.86.20, `camelid2` .48, `camelid3` .39 — Pi 5, 16 GB,
+  aarch64 Linux (kernel 6.12 rpi-2712), running NanoCamelid. Key `~/Documents/cert/pi5_tooleman_ed25519`,
+  user `tooleman`. (The old ssh-config `192.168.86.27` is now a different device.)
+- `build.rs` portable (x86 AMX gated to linux+x86_64; Accelerate macOS; Metal cfg(macos)).
+  No rust cross-target locally (Homebrew, no rustup), so built **natively on camelid1**:
+  installed rustup (1.96), rsynced source, `cargo build --release --example parity_node`
+  succeeded in **2m10s** with zero errors. The Linux binary runs (prints usage; clean `ldd`,
+  no Metal/Accelerate).
+
+**BLOCKED — the Pi worker crashes at model load on aarch64-Linux.** Copied llama-2-13b
+(sha-size verified, byte-identical via scp) and TinyLlama to camelid1. Every attempt to run
+`parity_node worker --gguf ...` dies the instant it executes — the SSH session drops (255),
+no log file is even created, no stderr/panic/backtrace, no listening socket, process gone,
+memory flat. Reproduces with **both** the 13 GB model and the 1.2 GB TinyLlama → **not OOM**;
+it is a hard signal death (SIGSEGV/SIGBUS/SIGILL) during model open/load, before our first
+print, specific to the aarch64-Linux runtime (the identical source/binary loads fine on the
+Macs, including mini2 in Phase 3). Ruled out: hardcoded page size (`page_size()` uses
+`sysconf(_SC_PAGESIZE)`, correct for Linux 4 KB vs macOS 16 KB pages). Could not capture the
+exact signal remotely — the crash tears down the ssh session before any output/exit code is
+recorded (~12 launch variants tried: detached/nohup/setsid/managed/pty/exit-to-file).
+
+**Conclusion:** the cross-ARM (Apple vs Cortex) parity question stays OPEN — the Pi cannot
+yet run camelid inference. This is a real aarch64-Linux runtime finding, not smoothed over.
+Next step needs Pi-console (non-ssh) capture of the crash, or a core dump, to localize the
+load-path bug. Phase 4 prep landed: `parity_node` enforces a per-node materialization cap
+(`--max-weight-bytes` / `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`) with a typed
+refuse-to-start (verified: TinyLlama [11,22) ~2.2 GB refuses at cap=1000).
 
 ## D5 — Branch / naming for the lane (2026-06-13)
 

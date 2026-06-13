@@ -54,8 +54,16 @@ with a receipt, never a throughput win.
   whole-run retry so a transport flake retries the run and never relaxes the parity gate
   (operating rule: fix the transport, never the threshold).
 
-## Phase 4 — heterogeneous (Mac + Mac + Pi), too-big model
+## Phase 4 — heterogeneous (Mac + Pi): partial (2026-06-13)
 
-Pending. Will record the same table plus the cross-ARM numeric-parity verdict (Apple cores
-vs Pi Cortex cores) against a llama.cpp reference, per DECISIONS / the build spec. If the
-Pis introduce divergence, that divergence will be documented here, not smoothed over.
+Setup: 3× Pi 5 (16 GB, aarch64 Linux) found and used; camelid built **natively on camelid1**
+(`cargo build --release --example parity_node`, 2m10s, zero errors) — proving aarch64-Linux
+portability. llama-2-13b + TinyLlama copied to the Pi (byte-identical).
+
+**Result: cross-ARM parity NOT yet measured — the Pi worker crashes at model load.** Every
+`parity_node worker --gguf …` on the Pi dies instantly (hard signal during load, before any
+output; reproduces with the 1.2 GB TinyLlama, so it is not OOM). The same binary/source runs
+on the Macs. See DECISIONS D7. The cross-ARM (Apple vs Cortex) numeric-parity verdict is
+therefore **open**, not faked. Next: capture the crash on the Pi console / via a core dump to
+localize the aarch64-Linux load-path bug, then re-run; if the Pis then introduce numeric
+divergence, it will be documented here, not smoothed over.
