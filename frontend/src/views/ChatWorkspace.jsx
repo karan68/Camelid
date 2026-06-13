@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
-import { Sparkle } from '../components/ui/Avatar'
+import { CamelidMark } from '../components/ui/CamelidMark'
+import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
@@ -458,7 +459,7 @@ export default function ChatWorkspace({
           {isFreshThread ? (
             <div className="cxchat__empty">
               <div className="cxchat-hero">
-                <Sparkle size={52} className="cxchat-hero__sparkle" />
+                <CamelidMark size={52} className="cxchat-hero__mark" />
                 <h2 className="cxchat-hero__title">{productHeroTitle}</h2>
                 <p className="cxchat-hero__summary">{productHeroSummary}</p>
               </div>
@@ -515,7 +516,7 @@ export default function ChatWorkspace({
                     <article className="cxturn cxturn--user"><div className="cxturn__user-chip"><p>{pendingUserPrompt}</p></div></article>
                   )}
                   <article className="cxturn cxturn--assistant is-streaming" aria-busy="true" data-streaming-state="active">
-                    <div className="cxturn__avatar"><Sparkle size={30} /></div>
+                    <div className="cxturn__avatar"><Avatar size={30} state="awaiting" /></div>
                     <div className="cxturn__body"><StreamingLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} /></div>
                   </article>
                 </>

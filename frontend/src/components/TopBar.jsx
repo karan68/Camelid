@@ -5,6 +5,7 @@ import { modelRuntimeIdMatches } from '../lib/modelState'
 import { IconMenu } from './ui/icons'
 import { StatusDot } from './ui/StatusDot'
 import { EvidenceChip } from './ui/EvidenceChip'
+import { CamelidMark } from './ui/CamelidMark'
 
 const TITLES = {
   chat: 'Chat',
@@ -55,6 +56,7 @@ function TopBar({
           <IconMenu size={22} />
         </button>
       )}
+      <CamelidMark size={18} className="topbar__mark" />
       <h1 className="topbar__title" title={tab === 'chat' && hasCustomTitle ? rawTitle : heading}>{heading}</h1>
       <div className="topbar__spacer" />
       {!demoMode && (

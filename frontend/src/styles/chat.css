@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Chat workspace — centered thread, assistant turns with sparkle avatar,
+   Chat workspace — centered thread, assistant turns with the Camelid-mark avatar,
    right-aligned user chips, docked pill composer, consolidated status line.
    ========================================================================== */
 
@@ -20,7 +20,7 @@
   text-align: center;
 }
 .cxchat-hero { display: flex; flex-direction: column; align-items: center; }
-.cxchat-hero__sparkle { margin-bottom: var(--space-4); animation: pulseSparkle 6s var(--ease-standard) infinite; }
+.cxchat-hero__mark { margin-bottom: var(--space-4); color: var(--color-text-muted); }
 .cxchat-hero__title {
   font-size: var(--text-display);
   font-weight: 700;

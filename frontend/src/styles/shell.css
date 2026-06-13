@@ -53,6 +53,7 @@
   color: var(--color-text-muted);
 }
 .topbar__menu:hover { background: var(--color-surface-hover); color: var(--color-text); }
+.topbar__mark { flex: none; color: var(--color-text-muted); }
 .topbar__title {
   font-family: var(--font-display);
   font-size: var(--text-lg);

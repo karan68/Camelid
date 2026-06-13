@@ -161,7 +161,13 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       data-streaming-state={assistantStreaming ? 'active' : undefined}
       data-streaming-code-state={isOpenStreamingCode ? 'open' : undefined}
     >
-      <div className="cxturn__avatar"><Avatar size={30} /></div>
+      <div className="cxturn__avatar">
+        <Avatar
+          size={30}
+          state={assistantStreaming ? (messageContent ? 'streaming' : 'awaiting') : 'idle'}
+          pulse={assistantStreaming ? String(messageContent || '').length : 0}
+        />
+      </div>
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
