@@ -61,4 +61,4 @@ These documents are working notes, not support ledgers. When a note and a public
 ## Historical archives
 
 - [`ROADMAP_ARCHIVE.md`](docs/archive/ROADMAP_ARCHIVE.md) — completed-phase history
-- [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md) — detailed historical status log
+- [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md) — detailed historical status log

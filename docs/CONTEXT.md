@@ -6,7 +6,7 @@ A shared language for Camelid agents and contributors. Keep this file as a gloss
 
 **Camelid**
 The product: a local-first LLM runtime and chat surface. Use this name in public-facing product language.
-_Avoid_: backendinference except when referring to historical crate/repo names.
+_Avoid_: the pre-Camelid engine/crate name, except when referring to historical crate/repo names.
 
 **Support contract**
 The public truth about which exact model rows and workflows are supported. A row is supported only when parity evidence, API behavior, frontend behavior, and docs agree.

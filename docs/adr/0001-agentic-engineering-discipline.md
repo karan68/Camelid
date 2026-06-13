@@ -12,7 +12,7 @@ Camelid is being advanced by multiple AI worker lanes across performance, parity
 
 Camelid uses a small-skills operating model inspired by Matt Pocock's engineering-skills pattern:
 
-1. Maintain a project glossary in `CONTEXT.md` and use those terms in code, tests, docs, issues, and agent updates.
+1. Maintain a project glossary in `docs/CONTEXT.md` and use those terms in code, tests, docs, issues, and agent updates.
 2. Record hard-to-reverse, surprising engineering trade-offs as ADRs in `docs/adr/`.
 3. Require a feedback loop before major hypotheses: test, API script, same-host guard, benchmark, or profiler loop.
 4. Prefer tracer-bullet vertical slices over broad horizontal rewrites.
@@ -23,7 +23,7 @@ Camelid uses a small-skills operating model inspired by Matt Pocock's engineerin
 
 ## Consequences
 
-- Agents must update or reference `CONTEXT.md` when terminology becomes ambiguous.
+- Agents must update or reference `docs/CONTEXT.md` when terminology becomes ambiguous.
 - Performance work without a reproducible loop is not ready for implementation.
 - Failed experiments should leave a rejected-slice note instead of vanishing.
 - Documentation may lag code only when explicitly marked as not promotion-ready.

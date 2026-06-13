@@ -84,6 +84,10 @@ enum Command {
         /// ngram, 5 for draft).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_TOKENS")]
         spec_draft_tokens: Option<usize>,
+        /// Do not open the web UI in a browser on startup. By default, when run
+        /// interactively, `serve` opens the chat surface automatically.
+        #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
+        no_open: bool,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -107,6 +111,7 @@ enum Command {
         threads: Option<usize>,
     },
     /// Benchmark raw TCP latency and bandwidth between Coordinator and Worker.
+    #[command(hide = true)]
     BenchNetwork {
         /// Mode to run: coordinator or worker
         #[arg(long, default_value = "coordinator")]
@@ -126,6 +131,17 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Download a supported model (a known-good Q8_0 GGUF) into ./models.
+    ///
+    /// Run with no argument to list the catalog. Accepts a catalog id or a
+    /// fragment of the name, e.g. `camelid pull llama32_3b`.
+    Pull {
+        /// Catalog id or name fragment to download. Omit to list all models.
+        model: Option<String>,
+        /// Directory to download into (default: ./models).
+        #[arg(long, env = "CAMELID_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+    },
     /// Generate text with a Gemma 4 model (correctness-first runtime).
     Gemma4Generate {
         path: PathBuf,
@@ -168,6 +184,7 @@ enum Command {
         max_tokens: usize,
     },
     /// Dump focused tensor descriptor, raw block, and f32 dequantization diagnostics.
+    #[command(hide = true)]
     TensorDump {
         path: PathBuf,
         /// Tensor name to dump. Repeat to override the TinyLlama parity default set.
@@ -187,6 +204,7 @@ enum Command {
         layers: Vec<usize>,
     },
     /// Run a deterministic release-mode microbenchmark for dense matmul/FFN hot loops.
+    #[command(hide = true)]
     BenchDenseHotloops {
         /// LLaMA hidden width for the synthetic single-row input.
         #[arg(long, default_value_t = 2048)]
@@ -205,6 +223,7 @@ enum Command {
         threads: Option<usize>,
     },
     /// Load one GGUF Q8_0 tensor as retained blocks and benchmark bounded row dequantization/dot rows.
+    #[command(hide = true)]
     BenchQ8Blocks {
         /// GGUF model path.
         path: PathBuf,
@@ -293,6 +312,7 @@ enum Command {
     /// from a prompt, and emits one JSON metrics object per measured iteration
     /// (load/prefill/TTFT/decode timings, decode tok/s, peak RSS). For runtime
     /// comparison harnesses.
+    #[command(hide = true)]
     BenchGenerate {
         /// GGUF model path.
         model: PathBuf,
@@ -386,6 +406,7 @@ enum Command {
     /// Recompute and stamp `receipt_id` on a receipt body. Emitters (e.g. the
     /// chat-parity harness) delegate sealing here so canonical serialization
     /// and digesting live in exactly one implementation.
+    #[command(hide = true)]
     SealReceipt {
         /// Receipt JSON to seal (the existing receipt_id value is ignored).
         #[arg(long, value_name = "PATH")]
@@ -417,6 +438,7 @@ async fn main() -> anyhow::Result<()> {
             spec_decode,
             spec_draft_model,
             spec_draft_tokens,
+            no_open,
         } => {
             configure_rayon_threads(threads)?;
             apply_runtime_tuning_env(
@@ -434,7 +456,9 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
             }
-            api::serve(addr, threads, model).await?
+            // Open the browser only when run interactively and not opted out.
+            let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            api::serve(addr, threads, model, open_ui).await?
         }
         Command::ServeDistributed {
             role,
@@ -476,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                api::serve(addr, threads, Some(model)).await?
+                api::serve(addr, threads, Some(model), false).await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
@@ -533,6 +557,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::Pull { model, models_dir } => {
+            let dir = models_dir.unwrap_or_else(|| PathBuf::from("models"));
+            camelid::catalog::run_pull(model.as_deref(), &dir)?;
         }
         Command::Gemma4Generate {
             path,

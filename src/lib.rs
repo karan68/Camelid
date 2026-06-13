@@ -1,4 +1,5 @@
 pub mod api;
+pub mod catalog;
 pub mod cluster;
 pub mod distributed;
 pub mod error;
@@ -15,6 +16,7 @@ pub mod receipt;
 pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;
+pub mod web_ui;
 pub mod wire_mmap;
 
 pub use error::{BackendError, Result};

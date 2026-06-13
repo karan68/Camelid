@@ -66,7 +66,7 @@ Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md
 | OpenAI-style API | ✅ Working | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus capability/health routes. |
 | Streaming chat | ✅ Working | SSE streaming on the chat endpoint. |
 | Apple Silicon Metal path | ✅ Working | GPU-resident prefill and decode, auto-selected when a Metal device is present; CPU fallback otherwise. |
-| Web frontend | ✅ Working | Local React/Vite chat surface; unlocks chat only for recognized model rows. |
+| Web frontend | ✅ Working | Local React/Vite chat surface, embedded in the binary and served at the same address; unlocks chat only for recognized model rows. |
 | Parity receipts | ✅ Working | Opt-in sealed record of one request; `camelid verify-receipt` re-checks it against llama.cpp (incl. 7B on a 16 GB host). |
 | Two-Mac distributed serve | ✅ Working | Layer sharding over TCP for rows too large for one 16 GB host (Gemma 4 12B, 26B-A4B). |
 | Other quantizations | ⛔ Not supported | Fail closed in v0.1. |
@@ -95,23 +95,46 @@ Both rows serve over HTTP through the same lane — set `CAMELID_GEMMA4_SERVE=1`
 
 ---
 
-## Quickstart
+## Install
 
-Build:
+Download a prebuilt binary from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) — the web UI is baked in, so there's nothing else to install:
 
 ```bash
-cargo build --release
+# macOS (Apple Silicon)
+curl -L https://github.com/timtoole02/Camelid/releases/latest/download/camelid-macos-arm64.tar.gz | tar -xz
+cd camelid-macos-arm64
+xattr -d com.apple.quarantine ./camelid 2>/dev/null || true   # allow the unsigned binary to run
+
+# Linux (x86_64): camelid-linux-x86_64.tar.gz
 ```
 
-Serve a local GGUF model (Q8_0):
+Then jump to [Quickstart](#quickstart) — `./camelid pull` to get a model, `./camelid serve --model …` to chat.
+
+## Quickstart
+
+Already have a binary from [Install](#install)? Skip to "Get a model" below. To build from source instead — the web UI is compiled into the binary, so build the frontend first and it gets embedded (one binary, no separate Node process at runtime):
+
+```bash
+(cd frontend && npm ci && npm run build)   # bundles the web UI
+cargo build --release                       # embeds it into the binary
+```
+
+Get a model. Camelid validates specific **Q8_0** rows (most GGUFs on the web are other quantizations and fail closed), so `pull` fetches a known-good one into `./models`:
+
+```bash
+./target/release/camelid pull              # list the supported models
+./target/release/camelid pull llama32_3b   # download Llama 3.2 3B Instruct Q8_0
+```
+
+Serve it (`pull` prints the exact command to run; the model is in `./models`):
 
 ```bash
 ./target/release/camelid serve \
-  --model /path/to/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --model models/Llama-3.2-3B-Instruct-Q8_0.gguf \
   --threads 4
 ```
 
-The server listens on `127.0.0.1:8181` by default. List the loaded model (its `id` comes from the GGUF metadata):
+The server listens on `127.0.0.1:8181` and **opens the chat UI in your browser automatically** (pass `--no-open` to disable). The same address serves the OpenAI-style API. List the loaded model (its `id` comes from the GGUF metadata):
 
 ```bash
 curl -s http://127.0.0.1:8181/v1/models
@@ -130,7 +153,7 @@ curl -s http://127.0.0.1:8181/v1/chat/completions \
   }'
 ```
 
-Run the local web frontend:
+The web frontend is served by the binary itself at the same address — no extra step. For hot-reloading frontend development, run the Vite dev server separately (it proxies to a running `camelid serve`):
 
 ```bash
 cd frontend && npm ci && npm run dev
