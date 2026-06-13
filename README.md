@@ -19,6 +19,19 @@ Camelid loads GGUF models directly, serves them over a local OpenAI-style API, a
 
 ---
 
+## Get started in two commands
+
+Grab the binary for your platform from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) (the chat UI is built in), then:
+
+```bash
+./camelid pull llama32_3b      # download a supported model into ./models
+./camelid serve --model models/Llama-3.2-3B-Instruct-Q8_0.gguf
+```
+
+`serve` opens the chat UI in your browser automatically. **No Python, no Node, no Docker, no separate server** — one static binary that serves the OpenAI-style API and the web UI on the same port. Full details in [Install](#install) and [Quickstart](#quickstart).
+
+---
+
 ## Why Camelid
 
 | | |
