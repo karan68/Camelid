@@ -12,10 +12,23 @@
   0%, 100% { transform: scale(1); opacity: 0.7; }
   50% { transform: scale(1.07); opacity: 1; }
 }
-/* streaming: ears flick alternately, advanced by real token batches (data-step
-   flips per rAF-coalesced flush) — generation speed is visible as rhythm */
-.camelid-mark[data-state='streaming'][data-step='0'] .camelid-mark__ear--l { transform: rotate(-10deg); }
-.camelid-mark[data-state='streaming'][data-step='1'] .camelid-mark__ear--r { transform: rotate(10deg); }
+/* streaming: a happy head-bob groove (continuous) layered with ear flicks
+   advanced by real token batches (data-step flips per rAF-coalesced flush) —
+   the groove says "having a good time", the ear rhythm IS the real cadence */
+.camelid-mark[data-state='streaming'] {
+  animation: camelidMarkGroove 0.9s var(--ease-standard) infinite;
+  transform-origin: 45% 85%;
+}
+@keyframes camelidMarkGroove {
+  0%, 100% { transform: rotate(-6deg) translateY(0.4px); }
+  25% { transform: rotate(0deg) translateY(-0.9px); }
+  50% { transform: rotate(6deg) translateY(0.3px); }
+  75% { transform: rotate(0deg) translateY(-0.9px); }
+}
+.camelid-mark[data-state='streaming'][data-step='0'] .camelid-mark__ear--l { transform: rotate(-14deg); }
+.camelid-mark[data-state='streaming'][data-step='0'] .camelid-mark__ear--r { transform: rotate(4deg); }
+.camelid-mark[data-state='streaming'][data-step='1'] .camelid-mark__ear--r { transform: rotate(14deg); }
+.camelid-mark[data-state='streaming'][data-step='1'] .camelid-mark__ear--l { transform: rotate(-4deg); }
 .camelid-mark[data-state='settle'] .camelid-mark__ear { transform: none; transition-duration: 320ms; }
 @media (prefers-reduced-motion: reduce) {
   .camelid-mark, .camelid-mark__ear { animation: none !important; transition: none !important; transform: none !important; }
