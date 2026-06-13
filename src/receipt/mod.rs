@@ -18,6 +18,7 @@
 //! body (sorted keys, no insignificant whitespace, `receipt_id` excluded), so
 //! a receipt can be cited by fingerprint and trivially checked for tampering.
 
+pub mod distributed;
 pub mod verify;
 
 use std::collections::BTreeMap;
