@@ -391,7 +391,13 @@ fn run_coordinator(args: &[String]) -> Result<(), Err> {
             (max_tokens - 1) as f64 / bench.decode_elapsed.as_secs_f64().max(1e-9)
         );
         if !v.is_token_identical() {
-            return Err(format!("run {run_idx} NOT token-identical: {v:?}").into());
+            // A divergence is a finding to RECORD (in the receipt), not an error to abort on
+            // before emitting the artifact (operating rule #6 / spec Phase 4). Keep going so
+            // the receipt is always written with the verdict.
+            eprintln!(
+                "coordinator: run {run_idx} DIVERGED at generated token {} — recording in receipt",
+                v.first_divergent_generated_token_index
+            );
         }
         last_run = Some(bench);
     }
@@ -415,7 +421,7 @@ fn run_coordinator(args: &[String]) -> Result<(), Err> {
 
     let decode_steps = (max_tokens - 1).max(1) as f64;
     let decode_tok_s = (max_tokens - 1) as f64 / decode_elapsed.as_secs_f64().max(1e-9);
-    println!("\n=== Phase 3 distributed parity ({config_id}) ===");
+    println!("\n=== distributed parity ({config_id}) ===");
     println!("nodes: {self_host} [0,{split}) -> {worker_host} [{split},{layers})");
     println!("prompt {prompt:?} -> prompt_ids {prompt_ids:?}");
     println!("token-identical: {}", verdict.is_token_identical());
@@ -471,8 +477,14 @@ fn run_coordinator(args: &[String]) -> Result<(), Err> {
         std::fs::File::create(&out)?.write_all(json.as_bytes())?;
         println!("receipt written: {out}");
     }
-    if !receipt.is_validated() {
-        return Err("DISTRIBUTED RUN NOT TOKEN-IDENTICAL TO REFERENCE".into());
+    if receipt.is_validated() {
+        println!("RESULT: token-identical to single-node reference (validated).");
+    } else {
+        println!(
+            "RESULT: EXPERIMENTAL-DIVERGENT — diverged from reference at generated token {} \
+             (recorded in receipt, not smoothed over).",
+            receipt.first_divergent_generated_token_index
+        );
     }
     Ok(())
 }

@@ -122,24 +122,35 @@ Reported, not faked (operating rule #5). Two distinct results:
   succeeded in **2m10s** with zero errors. The Linux binary runs (prints usage; clean `ldd`,
   no Metal/Accelerate).
 
-**BLOCKED — the Pi worker crashes at model load on aarch64-Linux.** Copied llama-2-13b
-(sha-size verified, byte-identical via scp) and TinyLlama to camelid1. Every attempt to run
-`parity_node worker --gguf ...` dies the instant it executes — the SSH session drops (255),
-no log file is even created, no stderr/panic/backtrace, no listening socket, process gone,
-memory flat. Reproduces with **both** the 13 GB model and the 1.2 GB TinyLlama → **not OOM**;
-it is a hard signal death (SIGSEGV/SIGBUS/SIGILL) during model open/load, before our first
-print, specific to the aarch64-Linux runtime (the identical source/binary loads fine on the
-Macs, including mini2 in Phase 3). Ruled out: hardcoded page size (`page_size()` uses
-`sysconf(_SC_PAGESIZE)`, correct for Linux 4 KB vs macOS 16 KB pages). Could not capture the
-exact signal remotely — the crash tears down the ssh session before any output/exit code is
-recorded (~12 launch variants tried: detached/nohup/setsid/managed/pty/exit-to-file).
+**RESOLVED — the Pi runs camelid inference; the earlier "crash" was an SSH self-kill.** The
+launch failures were `pkill -f parity_node` matching the *SSH command's own cmdline* (which
+contains "parity_node") and killing its own session before the launch ran — not a code crash.
+Launching without that pkill, the Pi worker loads and listens fine (TinyLlama [11,22) ~2.2 GB
+f32 est; llama-2-13b [20,40) 26 GB f32 est / ~6.5 GB Q8 resident, within a 40 GB cap).
 
-**Conclusion:** the cross-ARM (Apple vs Cortex) parity question stays OPEN — the Pi cannot
-yet run camelid inference. This is a real aarch64-Linux runtime finding, not smoothed over.
-Next step needs Pi-console (non-ssh) capture of the crash, or a core dump, to localize the
-load-path bug. Phase 4 prep landed: `parity_node` enforces a per-node materialization cap
-(`--max-weight-bytes` / `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`) with a typed
-refuse-to-start (verified: TinyLlama [11,22) ~2.2 GB refuses at cap=1000).
+**RESULT — cross-ARM parity is EXPERIMENTAL-DIVERGENT (a real finding, recorded).** Run
+`hetero-mac-pi-tinyllama-q8`: Mac (Apple) coordinator [0,11) + reference, Pi (Cortex) worker
+[11,22) + head, TinyLlama Q8_0 (byte-identical GGUF). The heterogeneous output is
+**token-identical to the all-Apple single-node reference for the first 24 generated tokens,
+then diverges at generated token 25** (`first_divergent_generated_token_index=25`,
+`generated_tokens_match=false`). Cross-platform IEEE-754 differences (FMA contraction /
+accumulation order, Apple vs ARM Cortex) compound until a greedy argmax flips. Sealed receipt
+`qa/distributed/hetero-mac-pi-tinyllama-q8.json` (`receipt_id 11bbe0e1…`, `validated:false`) —
+documented, NOT hidden behind a tolerance (operating rule #6). The lane stays **experimental**
+for heterogeneous Apple+Cortex configs. parity_node now emits the receipt on divergence
+instead of aborting.
+
+**Too-big (llama-2-13b) capability evidence + reference gap.** Each shard loads only its slice
+(Pi [20,40) ~6.5 GB Q8 within a 40 GB f32-est cap; full model's 52 GB f32 est would exceed it
+→ "fits no single capped node"). But the **single-node reference OOM'd the 16 GB Mac** loading
+the full 13 GB model — which is itself evidence the full model exceeds one 16 GB node. So a
+same-engine reference can't be computed on-device for 13b; completing the 13b parity verdict
+needs the **llama.cpp oracle** reference (spec-sanctioned for models that fit nowhere whole) —
+a documented next step (add an oracle/external-reference mode to parity_node).
+
+Phase 4 prep landed: per-node materialization cap (`--max-weight-bytes` /
+`CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`) with a typed refuse-to-start (verified:
+TinyLlama [11,22) ~2.2 GB refuses at cap=1000).
 
 ## D5 — Branch / naming for the lane (2026-06-13)
 

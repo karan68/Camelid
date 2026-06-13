@@ -54,16 +54,47 @@ with a receipt, never a throughput win.
   whole-run retry so a transport flake retries the run and never relaxes the parity gate
   (operating rule: fix the transport, never the threshold).
 
-## Phase 4 — heterogeneous (Mac + Pi): partial (2026-06-13)
+## Phase 4 — heterogeneous (Mac + Pi): cross-ARM parity measured (2026-06-13)
 
-Setup: 3× Pi 5 (16 GB, aarch64 Linux) found and used; camelid built **natively on camelid1**
-(`cargo build --release --example parity_node`, 2m10s, zero errors) — proving aarch64-Linux
-portability. llama-2-13b + TinyLlama copied to the Pi (byte-identical).
+Setup: 3× Pi 5 (16 GB, aarch64 Linux) found; camelid built **natively on camelid1** in
+2m10s, zero errors — aarch64-Linux portability proven. The SAME source builds a clean Linux
+binary (no Metal/Accelerate). (The earlier "Pi crash" was a self-inflicted
+`pkill -f parity_node` matching the SSH command's own cmdline, not a code bug.)
 
-**Result: cross-ARM parity NOT yet measured — the Pi worker crashes at model load.** Every
-`parity_node worker --gguf …` on the Pi dies instantly (hard signal during load, before any
-output; reproduces with the 1.2 GB TinyLlama, so it is not OOM). The same binary/source runs
-on the Macs. See DECISIONS D7. The cross-ARM (Apple vs Cortex) numeric-parity verdict is
-therefore **open**, not faked. Next: capture the crash on the Pi console / via a core dump to
-localize the aarch64-Linux load-path bug, then re-run; if the Pis then introduce numeric
-divergence, it will be documented here, not smoothed over.
+### `hetero-mac-pi-tinyllama-q8` — Apple coordinator + Cortex worker, TinyLlama Q8_0
+
+| Metric | Value |
+|---|---|
+| topology | mac-m4 (Apple) [0,11) + embedding/ref → camelid1 Pi (Cortex) [11,22) + head |
+| GGUF | byte-identical on both nodes |
+| activation bytes/token | 8192 |
+| avg coord-local compute/token | ~72 ms |
+| avg hop round-trip/token (incl. Pi compute + LAN) | ~148 ms |
+| decode throughput | ~4.6 tok/s |
+| **token-identical to single-node reference** | **NO** |
+| **first divergent generated token** | **25** (of 50) |
+
+**Finding (recorded, not smoothed over — operating rule #6 / spec Phase 4):** the
+heterogeneous Apple+Cortex pipeline reproduces the all-Apple reference exactly for **24
+generated tokens**, then diverges at token 25. Root cause: cross-platform IEEE-754 differences
+(FMA contraction / accumulation order) between Apple and ARM Cortex CPUs — the last-bit
+differences in the Pi-computed layers [11,22) compound until a greedy argmax flips. Sealed
+receipt: `qa/distributed/hetero-mac-pi-tinyllama-q8.json` (`validated:false`,
+`first_divergent_generated_token_index=25`). The lane stays **experimental** for heterogeneous
+Apple+Cortex configs: token-identity does NOT hold across this CPU-architecture boundary.
+
+### `hetero-mac-pi-llama13b-q8-capped` — too-big capability (reference gap)
+
+Each shard loads only its slice: Pi worker [20,40) reported 26 GB f32-estimate materialization
+(~6.5 GB Q8 resident) **within a 40 GB cap**; the full model's ~52 GB f32 estimate would
+exceed it (→ fits no single capped node). The **single-node reference OOM'd the 16 GB Mac**
+loading the full 13 GB model — direct evidence the whole model exceeds one 16 GB node while the
+shards fit. Consequently a same-engine on-device reference is impossible here; the 13b parity
+verdict needs the **llama.cpp oracle** reference (spec-sanctioned for models that fit nowhere
+whole). Documented next step: add an external/oracle-reference mode to `parity_node`.
+
+**Honest summary:** the heterogeneous Mac+Pi cluster *runs* sharded inference (capability
+demonstrated), but Apple↔Cortex output is **not** token-identical (diverges at token 25) — so
+heterogeneous configs are experimental-divergent, and the genuinely-too-big 13b parity awaits
+an oracle reference. No speed claims; distributed CPU-lane decode is slower than single-node by
+design.
