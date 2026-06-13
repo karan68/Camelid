@@ -7,6 +7,8 @@ import { Field } from '../components/ui/Field'
 import { CamelidMark } from '../components/ui/CamelidMark'
 import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconMonitor, IconSun, IconMoon, IconNetwork, IconChevronRight } from '../components/ui/icons'
 import { copyText } from '../lib/markdown'
+import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseLimits'
+import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
 
 const THEME_OPTS = [
   { value: 'system', label: 'System', Icon: IconMonitor },
@@ -25,6 +27,8 @@ export default function SettingsView({
   onOpenCluster = () => {},
   conversationCount = 0,
   deleteAllConversations = null,
+  selectedModel = null,
+  capabilities = null,
 }) {
   const [confirmWipe, setConfirmWipe] = useState(false)
   const online = runtime?.status === 'online'
@@ -33,7 +37,7 @@ export default function SettingsView({
   const [apiBaseDraft, setApiBaseDraft] = useState(apiBase || 'http://127.0.0.1:8181')
   const [showAdvanced, setShowAdvanced] = useState(Boolean(command))
   const [showLogs, setShowLogs] = useState(false)
-  const [maxTokens, setMaxTokens] = useState(() => (typeof window !== 'undefined' && window.localStorage.getItem('camelid.maxTokens')) || '8192')
+  const [maxTokens, setMaxTokens] = useState(() => getConfiguredMaxTokens(selectedModel?.id))
   const copyResetRef = useRef(null)
 
   useEffect(() => () => { if (copyResetRef.current) window.clearTimeout(copyResetRef.current) }, [])
@@ -54,8 +58,9 @@ export default function SettingsView({
 
   const handleMaxTokens = (value) => {
     setMaxTokens(value)
-    if (typeof window !== 'undefined') window.localStorage.setItem('camelid.maxTokens', value)
-    showNotice?.(`Max response length set to ${Number(value).toLocaleString()} tokens.`, 'success')
+    setConfiguredMaxTokens(selectedModel?.id || '', value)
+    // keep the legacy global key as the fallback for other models
+    if (typeof window !== 'undefined') window.localStorage.setItem('camelid.maxTokens', String(value))
   }
 
   const statusTone = online ? 'ready' : status.running ? 'warn' : 'offline'
@@ -162,15 +167,12 @@ export default function SettingsView({
         <CardHeader eyebrow="Chat" title="Response length" />
         <CardBody>
           <p className="settings-help">How many tokens Camelid can generate per reply. Larger means more complete answers and full programs (less truncation), but slower. Supported rows are validated to ~2K context; larger values still run model-native.</p>
-          <div className="settings-select-row">
-            <select value={maxTokens} onChange={(e) => handleMaxTokens(e.target.value)} aria-label="Max response length">
-              <option value="1024">1,024 tokens — short</option>
-              <option value="2048">2,048 tokens</option>
-              <option value="4096">4,096 tokens</option>
-              <option value="8192">8,192 tokens — default</option>
-              <option value="16384">16,384 tokens — very long</option>
-            </select>
-          </div>
+          <ResponseLengthControl
+            value={Number(maxTokens)}
+            onChange={(next) => handleMaxTokens(next)}
+            model={selectedModel}
+            capabilities={capabilities}
+          />
         </CardBody>
       </Card>
 

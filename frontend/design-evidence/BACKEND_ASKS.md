@@ -53,3 +53,25 @@ what the contract exposes today — the `*_pack_id` identifiers (e.g.
 Repo-relative paths only (no absolute filesystem paths — the frontend will render them
 as citations, and I7 keeps absolute paths out of shareable surfaces). The ledger picks
 up `*_pack_manifest` fields automatically once they appear.
+
+## 3. System memory + KV-cache cost for the response-length control (Phase 9, 2026-06-12)
+
+**Surface waiting on it:** Settings → Response length renders its memory ceiling
+marker and projected-memory gauge ABSENT (with an explanatory line) because neither
+input exists on the API. The frontend will not estimate RAM client-side or invent KV
+math from assumed dtypes.
+
+**Ask (exact fields, units = bytes):**
+1. `GET /api/system/memory` → `{ "total_bytes": u64, "available_bytes": u64,
+   "process_rss_bytes": u64 }` (or fold the same fields into `/v1/health`).
+2. On `/api/models/current` (and ideally `/v1/models` meta):
+   `"kv_bytes_per_token": u64` for the loaded runtime configuration — or, if
+   preferred, `"kv_cache_dtype": "f16" | "f32" | ...` so the frontend can combine it
+   with the GGUF block_count / head_count_kv / key_length / value_length already
+   exposed. Also useful: `"kv_cached_tokens": u32` (current cache occupancy) so the
+   projection can subtract already-resident tokens.
+
+Once present, the control renders: projected = process_rss_bytes +
+(value − kv_cached_tokens) × kv_bytes_per_token vs available_bytes, labeled
+"estimated", with red above available RAM and amber above 85% — formula shown in the
+readout's popover.

@@ -689,3 +689,45 @@ style on turns, and the honest pacing buffer (lib/streamPacing.js — ≤150ms l
 arrival times per I4; first easing curve failed its own lag-bound smoke and was
 steepened to 60%/step). Full table in PERF_AFTER.md; before/after recordings of the
 identical greedy prompt.
+
+---
+
+## Phase 9 — Response-length control (2026-06-12)
+
+**Step 0 data contract (probed before any UI):** model context = `/v1/models`
+`meta.n_ctx_train` (now merged onto model records — descriptive, I2-disclaimed in the
+marker label); verified bound = max VALIDATED `bounded_context_*_pack` window on the
+exact matched row (3B: 2,048; unvalidated windows never count; the exact-artifact gate
+applies — a fixture without the GGUF basename gets no bound, which the smoke proves);
+KV-cost and system memory DO NOT EXIST on the API → BACKEND_ASKS.md #3 filed with
+exact field names/units, and the memory indicators render ABSENT with an explanatory
+line — no client-side estimation, no fake gauge.
+
+**Boundary behavior (probed live):** the backend does NOT clamp — any request where
+`prompt_tokens + max_tokens > context_length` returns typed
+`context_length_exceeded` (verified with the 64-token fixture at max_tokens 1M and at
+50). The UI mirrors that truthfully: red states block send with the typed error's
+language.
+
+**The control:** log-scale slider (position↔tokens round-trips, smoke-checked) with
+detents at 256/1k/4k/16k/64k/256k/1M and light snap; paired numeric field (1→1M,
+arrows step, Shift = ×10); markers from real data only (verified bound gets the one
+allowed Evidence-Chip treatment; model max labeled "from model metadata, not a
+support claim"). Per-model persistence (`camelid.maxTokens.<id>`, legacy global key
+as fallback); stored values are clamped visually, never rewritten.
+
+**Validation:** red = will-not-fail-silently errors (over model context), amber =
+allowed-but-untested (over verified bound), each with icon + product-voice message;
+composer-level send-time check uses the backend's real rule with the client prompt
+estimate (labeled estimated) and disables send with the inline red strip.
+
+**Conscious smoke port:** the Phase-2-era "no max-token strings in ChatWorkspace"
+regex predates send-time validation; narrowed to its intent (no PICKER in chat — the
+control lives in Settings).
+
+**Matrix (design-evidence/phase-9/, both themes):** normal 1,024 ok · 8,192 amber
+(beyond verified 2,048) · 200,000 red (over 131,072) · missing-data fallback (absent
+lines, captured offline — while a model is loaded the gate's selection snap-back
+makes metadata-less selection unreachable, which is itself correct behavior) ·
+composer red strip with real numbers (131,072 limit + estimated prompt) and send
+disabled. Gate: 11/11 smokes green, gate libs empty diff, main chunk 104.68 kB gz.

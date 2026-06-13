@@ -358,6 +358,8 @@ function App() {
               onOpenCluster={() => navigateTab('cluster')}
               conversationCount={conversations.length}
               deleteAllConversations={deleteAllConversations}
+              selectedModel={selectedModel}
+              capabilities={dashboard?.capabilities}
             />
           )}
 
