@@ -1300,6 +1300,10 @@ pub async fn serve(
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
+            eprintln!("\n  Could not load that model: {err}");
+            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
+            eprintln!("      camelid pull            # list supported models");
+            eprintln!("      camelid pull <id>       # download one into ./models\n");
             return Err(std::io::Error::other(err.to_string()));
         }
     }
@@ -10854,7 +10858,7 @@ pub struct CatalogItem {
     pub license: &'static str,
 }
 
-fn curated_catalog() -> Vec<CatalogItem> {
+pub fn curated_catalog() -> Vec<CatalogItem> {
     vec![
         CatalogItem {
             catalog_id: "llama32_1b_instruct_q8_0",

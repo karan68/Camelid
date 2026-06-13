@@ -1,4 +1,5 @@
 pub mod api;
+pub mod catalog;
 pub mod cluster;
 pub mod distributed;
 pub mod error;

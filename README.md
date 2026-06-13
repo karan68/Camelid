@@ -104,11 +104,18 @@ Build the binary. The web UI is compiled into it, so build the frontend first an
 cargo build --release                       # embeds it into the binary
 ```
 
-Serve a local GGUF model (Q8_0):
+Get a model. Camelid validates specific **Q8_0** rows (most GGUFs on the web are other quantizations and fail closed), so `pull` fetches a known-good one into `./models`:
+
+```bash
+./target/release/camelid pull              # list the supported models
+./target/release/camelid pull llama32_3b   # download Llama 3.2 3B Instruct Q8_0
+```
+
+Serve it (`pull` prints the exact command to run; the model is in `./models`):
 
 ```bash
 ./target/release/camelid serve \
-  --model /path/to/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --model models/Llama-3.2-3B-Instruct-Q8_0.gguf \
   --threads 4
 ```
 
