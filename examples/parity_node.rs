@@ -81,6 +81,79 @@ fn session(
     Ok(s)
 }
 
+/// f32 footprint of one tensor when materialized: product(dims) * 4. Unowned pipeline
+/// tensors are zero-element placeholders (dims `[0]`) and contribute 0.
+fn tensor_f32_bytes(t: &CpuTensor) -> u64 {
+    if t.shape.dims.is_empty() {
+        return 0;
+    }
+    t.shape.dims.iter().product::<usize>() as u64 * 4
+}
+
+/// Total f32-materialization bytes of the tensors this node actually owns. Summing every
+/// tensor yields just this shard's slice because unowned tensors are placeholders.
+fn shard_materialization_bytes(w: &LlamaLoadedWeights) -> u64 {
+    let mut total = tensor_f32_bytes(&w.token_embedding) + tensor_f32_bytes(&w.output_norm);
+    if let Some(o) = &w.output {
+        total += tensor_f32_bytes(o);
+    }
+    if let Some(r) = &w.rope_freqs {
+        total += tensor_f32_bytes(r);
+    }
+    for l in &w.layers {
+        for t in [
+            &l.attention_norm,
+            &l.attention_q,
+            &l.attention_k,
+            &l.attention_v,
+            &l.attention_output,
+            &l.ffn_norm,
+            &l.ffn_gate,
+            &l.ffn_up,
+            &l.ffn_down,
+        ] {
+            total += tensor_f32_bytes(t);
+        }
+        if let Some(m) = &l.moe_router {
+            total += tensor_f32_bytes(m);
+        }
+    }
+    total
+}
+
+/// The per-node materialization cap (bytes): `--max-weight-bytes` flag, else
+/// `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES` (the engine's existing discipline).
+fn cap_from(args: &[String]) -> Option<u64> {
+    arg(args, "--max-weight-bytes")
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+}
+
+/// Enforce the per-node memory cap: a shard whose slice would exceed its cap refuses to
+/// start with a typed error rather than starting and OOM-ing mid-run (Phase 4 discipline).
+fn enforce_cap(label: &str, weights: &LlamaLoadedWeights, args: &[String]) -> Result<(), Err> {
+    let bytes = shard_materialization_bytes(weights);
+    match cap_from(args) {
+        Some(cap) if bytes > cap => Err(format!(
+            "{label}: slice would materialize {bytes} bytes > cap {cap}; refusing to start \
+             (shard smaller or raise --max-weight-bytes)"
+        )
+        .into()),
+        Some(cap) => {
+            eprintln!("{label}: slice materialization {bytes} bytes within cap {cap}");
+            Ok(())
+        }
+        None => {
+            eprintln!("{label}: slice materialization {bytes} bytes (no cap set)");
+            Ok(())
+        }
+    }
+}
+
 /// Connect to the worker with bounded retries + a per-attempt timeout. Link-local / Wi-Fi
 /// fabrics flap; a transient connect failure is a transport concern, never a reason to
 /// relax the parity gate.
@@ -143,6 +216,11 @@ fn run_worker(args: &[String]) -> Result<(), Err> {
     let listen = arg(args, "--listen").unwrap_or_else(|| "0.0.0.0:9311".to_string());
     let (gguf, binding) = open(&gguf_path)?;
     let mut shard = session(&gguf_path, &gguf, &binding, Some(start..end))?;
+    enforce_cap(
+        &format!("worker shard [{start},{end})"),
+        &shard.weights,
+        args,
+    )?;
     let listener = TcpListener::bind(&listen)?;
     eprintln!("worker: layers [{start},{end}) listening on {listen}");
     loop {
@@ -276,6 +354,11 @@ fn run_coordinator(args: &[String]) -> Result<(), Err> {
     let hidden_dim = config.embedding_length as usize;
     let activation_bytes_per_token = hidden_dim * 4;
     let mut coord = session(&gguf_path, &gguf, &binding, Some(0..split))?;
+    enforce_cap(
+        &format!("coordinator shard [0,{split})"),
+        &coord.weights,
+        args,
+    )?;
 
     let mut last_run: Option<Bench> = None;
     for run_idx in 1..=runs {

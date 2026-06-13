@@ -108,6 +108,26 @@ runs under `caffeinate` (App Nap / Wi-Fi power-save otherwise stalled `accept()`
 cluster-topology.json}` + `CLUSTER_BENCH.md` (honest latency, ~5.5 tok/s, capability not
 speed).
 
+## D7 — Phase 4 prep + Pi blocker (2026-06-13, BLOCKED on hardware)
+
+Phase 4 (a model too big for any single node, across Mac+Mac+Pi, parity vs a llama.cpp
+oracle) is blocked at the hardware boundary, reported not faked (operating rule #5):
+- Pi at `192.168.86.27` unreachable (off / off-network); other Pis don't resolve; the Pis
+  run NanoCamelid, not camelid.
+- No rust cross target here (Homebrew toolchain, no `rustup`), so cross-compiling camelid
+  for aarch64-Linux isn't available locally. **Plan: build `parity_node` natively on the Pi**
+  (its own aarch64-Linux rustc) — `build.rs` is confirmed portable (x86 AMX shim gated to
+  `linux+x86_64`; Accelerate to macOS; Metal to `cfg(macos)`).
+- Both Macs are 16 GB (32 GB aggregate). The only local model too big for any node is
+  Mixtral-8x7B Q8_0 (46 GB, MoE — camelid support uncertain), which needs ≥3 nodes → needs
+  the Pi.
+
+Prep landed so the Pi run is turnkey once a Pi is online: `parity_node` now enforces a
+per-node materialization cap (`--max-weight-bytes` / `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`)
+and **refuses to start with a typed error** when a shard's slice exceeds it (verified: the
+[11,22) TinyLlama shard reports ~2.2 GB and refuses at cap=1000). User chose to bring the
+Pis online first; awaiting reachable Pi address(es).
+
 ## D5 — Branch / naming for the lane (2026-06-13)
 
 Work proceeds on `feat/distributed-parity-lane` off `origin/main`. Single-node TinyLlama
