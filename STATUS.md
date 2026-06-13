@@ -2,7 +2,7 @@
 
 Last updated: 2026-06-01
 
-`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
+`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md).
 
 Use this file to answer three practical questions: what is supported now, what changed recently, and what still blocks the next support move?
 
@@ -444,5 +444,5 @@ Qwen and Gemma remain planned exact-row candidates.
 This file is intentionally a snapshot, not a diary. When a change materially affects support or its blockers:
 
 - add the current evidence summary here
-- keep the detailed run log and older slices in `STATUS_ARCHIVE_2026-04.md` or later archives
+- keep the detailed run log and older slices in `docs/archive/STATUS_ARCHIVE_2026-04.md` or later archives
 - update `COMPATIBILITY.md`, `ROADMAP.md`, and user-visible readiness copy in the same change window when support language changes
