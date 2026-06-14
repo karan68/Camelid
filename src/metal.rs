@@ -16612,6 +16612,8 @@ mod tests {
                 gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
                 up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
                 down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                q_norm: None,
+                k_norm: None,
             })
             .collect();
 
