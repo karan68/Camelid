@@ -305,20 +305,33 @@ impl LiveDriver {
 
 impl ModelDriver for LiveDriver {
     fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
-        let messages = history_to_messages(history);
         let tool_defs = tools_to_json(tools);
-        let request = json!({
-            "model": self.model_id,
-            "messages": messages,
-            "tools": tool_defs,
-            "stream": false,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-        });
-        let (text, _, _) = self
+        // First try with a standalone system role (Llama 3.x etc. — unchanged).
+        let text = match self
             .client
-            .chat_blocking(&request)
-            .map_err(|e| e.to_string())?;
+            .chat_blocking(&self.request(history, &tool_defs, false))
+        {
+            Ok((text, _, _)) => text,
+            Err(err) => {
+                let msg = err.to_string();
+                // Some chat templates (Mistral v0.3, Gemma) reject a standalone
+                // system role — retry with the system prompt folded into the
+                // first user turn. This only fires when the template complains,
+                // so models that accept a system role are unaffected.
+                if msg.contains("roles must alternate")
+                    || msg.contains("System role")
+                    || msg.contains("system role")
+                    || msg.contains("chat template")
+                {
+                    self.client
+                        .chat_blocking(&self.request(history, &tool_defs, true))
+                        .map_err(|e| e.to_string())?
+                        .0
+                } else {
+                    return Err(msg);
+                }
+            }
+        };
         let calls = super::tool_parse::parse(&text, &self.family);
         if calls.is_empty() {
             Ok(ModelStep::Text(text))
@@ -328,14 +341,49 @@ impl ModelDriver for LiveDriver {
     }
 }
 
+impl LiveDriver {
+    fn request(&self, history: &[AgentMsg], tool_defs: &[Value], fold_system: bool) -> Value {
+        json!({
+            "model": self.model_id,
+            "messages": history_to_messages(history, fold_system),
+            "tools": tool_defs,
+            "stream": false,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        })
+    }
+}
+
 /// Convert agent history to OpenAI-style chat messages (tool results carried as
 /// `role:"tool"`; the model's prior tool calls re-stated as assistant text).
-fn history_to_messages(history: &[AgentMsg]) -> Vec<Value> {
+/// When `fold_system` is set, the system prompt is merged into the first user
+/// message instead of a standalone `system` role (for templates that reject it).
+fn history_to_messages(history: &[AgentMsg], fold_system: bool) -> Vec<Value> {
+    let system: String = history
+        .iter()
+        .filter_map(|m| match m {
+            AgentMsg::System(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let mut fold_pending = fold_system && !system.is_empty();
     let mut out = Vec::new();
     for msg in history {
         match msg {
-            AgentMsg::System(t) => out.push(json!({"role":"system","content":t})),
-            AgentMsg::User(t) => out.push(json!({"role":"user","content":t})),
+            AgentMsg::System(t) => {
+                if !fold_system {
+                    out.push(json!({"role":"system","content":t}));
+                }
+            }
+            AgentMsg::User(t) => {
+                if fold_pending {
+                    fold_pending = false;
+                    out.push(json!({"role":"user","content":format!("{system}\n\n{t}")}));
+                } else {
+                    out.push(json!({"role":"user","content":t}));
+                }
+            }
             AgentMsg::Assistant(t) => out.push(json!({"role":"assistant","content":t})),
             AgentMsg::ToolCalls(calls) => {
                 let rendered = calls
