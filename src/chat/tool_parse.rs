@@ -208,5 +208,79 @@ mod tests {
         // Looks like a call but is broken JSON → no calls, no panic.
         assert!(parse("{\"name\": \"read_file\", \"parameters\": {bad", "llama").is_empty());
         assert!(parse("<tool_call>{not json}</tool_call>", "qwen").is_empty());
+        // Truncated mid-string and empty input.
+        assert!(parse(
+            "{\"name\":\"read_file\",\"parameters\":{\"path\":\"no",
+            "llama"
+        )
+        .is_empty());
+        assert!(parse("", "llama").is_empty());
+    }
+
+    #[test]
+    fn double_encoded_args_string_is_normalized_to_object() {
+        // Some models emit `parameters`/`arguments` as a JSON-encoded *string*.
+        let out = parse(
+            "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}",
+            "llama",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].args["path"], "a.txt"); // normalized to a real object
+    }
+
+    #[test]
+    fn function_envelope_is_unwrapped() {
+        // OpenAI-shaped output the model sometimes mirrors back.
+        let out = parse(
+            "{\"type\":\"function\",\"function\":{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}}",
+            "llama",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "list_dir");
+        assert_eq!(out[0].args["path"], ".");
+    }
+
+    #[test]
+    fn multiple_calls_in_one_turn() {
+        // Hermes: two tagged calls.
+        let hermes = parse(
+            "<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}</tool_call>\
+             <tool_call>{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}</tool_call>",
+            "qwen3",
+        );
+        assert_eq!(hermes.len(), 2);
+        assert_eq!(hermes[0].name, "read_file");
+        assert_eq!(hermes[1].name, "list_dir");
+        // Llama: a JSON array of calls.
+        let arr = parse(
+            "[{\"name\":\"read_file\",\"parameters\":{\"path\":\"a\"}},{\"name\":\"search\",\"parameters\":{\"pattern\":\"x\"}}]",
+            "llama",
+        );
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[1].name, "search");
+    }
+
+    #[test]
+    fn trailing_and_leading_prose_around_call() {
+        let out = parse(
+            "Sure, I'll read it now:\n<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}}</tool_call>\nDone.",
+            "qwen",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+    }
+
+    #[test]
+    fn schema_echo_parses_to_name_with_wrong_args_for_the_gate_to_reject() {
+        // The exact 1B failure mode: name is right, args are the schema. The
+        // parser must surface it (name parsed) so validate() rejects it with a
+        // typed error rather than the parser silently "succeeding".
+        let out = parse(
+            "{\"name\":\"read_file\",\"parameters\":{\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"],\"type\":\"object\"}}",
+            "llama",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+        assert!(out[0].args.get("path").is_none()); // no real value → gate rejects
     }
 }

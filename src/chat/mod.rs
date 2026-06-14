@@ -15,6 +15,7 @@
 //! See `DECISIONS.md` D6 and `RECON_CHAT.md`.
 
 mod agent;
+mod agent_eval;
 mod banner;
 mod client;
 mod clipboard;
@@ -143,6 +144,29 @@ fn catalog_label_for(model: &std::path::Path) -> Option<String> {
         .into_iter()
         .find(|item| item.filename == name)
         .map(|item| item.catalog_id.to_string())
+}
+
+/// Parsed `camelid agent-eval` flags.
+pub struct AgentEvalOptions {
+    pub model: PathBuf,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
+    pub max_steps: usize,
+    pub max_tokens: u32,
+    pub receipt_dir: PathBuf,
+}
+
+/// Entry for the `agent-eval` subcommand: the tool-capability promotion harness.
+/// Returns PASS(0) / FAIL(1) / INCONCLUSIVE(3).
+pub fn run_agent_eval(opts: AgentEvalOptions) -> anyhow::Result<i32> {
+    agent_eval::run(agent_eval::EvalConfig {
+        addr: opts.addr,
+        model: opts.model,
+        load_timeout: opts.load_timeout,
+        max_steps: opts.max_steps,
+        max_tokens: opts.max_tokens,
+        receipt_dir: opts.receipt_dir,
+    })
 }
 
 extern "C" fn on_sigint(_signal: libc::c_int) {

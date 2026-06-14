@@ -421,3 +421,40 @@ box. The server-side `tool_capable` ledger column is added the moment a row earn
 field to `ModelCompatibilityTarget` + set the promoted row true); until then the client's
 `CompatRow.tool_capable` defaults false, so the gate is correct without it. No capability is
 published that no model has demonstrated.
+
+### D10 (cont.) — agent-mode hardening + promotion harness (2026-06-14)
+
+**Phase 0 — render bug, fixed (`TOOLCALL_DIAG.md`).** The malformed args were a render bug, not
+just model size: tools were threaded as **OpenAI-nested** `{type, function:{…}}`, so the model
+saw the envelope leak into the prompt and its `parameters` field was the JSON *schema*
+(`properties`/`required`/`type`) — which a weak model echoes. Fix: the server now **normalizes**
+each tool to its flat `function` object before rendering (matching llama.cpp/vLLM), localized to
+the tools-present path; `tools=None` stays byte-identical (438 lib tests pass). Proven offline by
+`tool_render_nested_vs_flat_diagnostic`. Conclusion: render is now canonical-correct, so a future
+big-model failure cannot be a leftover template bug. The parser maps `parameters`/`arguments`
+correctly (it never keyed off the schema's `properties`).
+
+**Phase 1 — parser robustness.** `tool_parse` tests now cover plain/`python_tag` JSON, Hermes
+`<tool_call>` tags, the `function` envelope, **double-encoded args** (a JSON-string normalized to
+an object), multiple calls per turn, leading/trailing prose, the schema-echo failure mode (name
+parsed, no real args → the gate rejects), and malformed/truncated/empty (clean, no panic).
+
+**Phase 2 — `agent-eval` promotion harness.** A subcommand that loads a model with a **bounded
+timeout** and runs a fixed tool-use battery, reporting **PASS / FAIL / INCONCLUSIVE** + a hashed
+receipt (`camelid.agent_eval/v1`: model id, GGUF+quant+size, raw output, parsed calls, per-case
+pass, host loadavg, timestamp, `promotion_eligible`). **INCONCLUSIVE** (load timed out) never
+changes a flag and never counts as FAIL — this is the noisy-box fix. Promotion = flip
+`tool_capable` true only after a PASS receipt. Verified live: 1B → **FAIL** (loaded 48s, malformed
+args, exit 1) even with the corrected render; 1s timeout → **INCONCLUSIVE** (exit 3, flag
+untouched). No row promoted (no PASS earned).
+
+**Phase 3 — polish.** Loop: **repeat-call detection** (3 identical calls → break with an
+explanation, not the whole budget) + a step-cap summary of what ran. Approval grants are
+**session-scoped** (the `a` choice persists across goals; `/tools` shows which are auto-allowed).
+Tool output truncates with an explicit "(N more lines)". Injection resistance proven
+source-agnostically: a fooled model that *follows* injected content into a destructive call is
+still **denied by the gate** (the gate, not the model, is the backstop) — covers file and
+http_fetch result content alike.
+
+**Honesty.** No `tool_capable` flag is set; nothing in the docs claims tool-calling works on a row
+without a PASS receipt. The capability only ever moves on harness evidence.

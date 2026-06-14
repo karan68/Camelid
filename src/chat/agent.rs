@@ -8,7 +8,7 @@
 //! clean redirected transcripts. The full-screen TUI agent (modal approvals in
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -88,16 +88,32 @@ pub enum LoopEnd {
     Answered,
     Aborted,
     StepCapped,
+    /// Broke out because the model repeated the same call without progress.
+    Repeated,
     DriverError,
 }
 
+/// Per-session approval grants (the `a` choice). Lifted to the agent REPL so a
+/// grant persists across goals within one session.
 #[derive(Default)]
-struct Policy {
+pub struct Policy {
     always: HashSet<String>,
+}
+
+impl Policy {
+    /// The tools auto-allowed for this session (for `/tools`).
+    pub fn granted(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.always.iter().cloned().collect();
+        v.sort();
+        v
+    }
 }
 
 /// Run the bounded loop for one goal. Returns how it ended. Never loops past
 /// `max_steps`; checks `cancel` between steps and tool calls.
+/// Consecutive identical (tool + args) calls before the loop gives up.
+const REPEAT_LIMIT: usize = 3;
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     driver: &mut dyn ModelDriver,
@@ -106,10 +122,12 @@ pub fn run_loop(
     sandbox: &Sandbox,
     cfg: &AgentConfig,
     cancel: &AtomicBool,
+    policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
 ) -> LoopEnd {
     let tools = tools::specs(cfg.allow_net);
-    let mut policy = Policy::default();
+    let mut call_counts: HashMap<String, usize> = HashMap::new();
+    let mut ran: BTreeMap<String, usize> = BTreeMap::new();
 
     for _ in 0..cfg.max_steps {
         if cancel.load(Ordering::Relaxed) {
@@ -136,6 +154,20 @@ pub fn run_loop(
                         reporter.notice("aborted");
                         return LoopEnd::Aborted;
                     }
+                    // Stop a model that keeps emitting the same (failing) call
+                    // instead of burning the whole step budget on it.
+                    let signature = format!("{}::{}", call.name, call.args);
+                    let seen = call_counts.entry(signature).or_insert(0);
+                    *seen += 1;
+                    if *seen >= REPEAT_LIMIT {
+                        reporter.notice(&format!(
+                            "stopping: `{}` was attempted {REPEAT_LIMIT} times with the same \
+                             arguments and no progress",
+                            call.name
+                        ));
+                        return LoopEnd::Repeated;
+                    }
+                    *ran.entry(call.name.clone()).or_insert(0) += 1;
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
                     let action = match tools::validate(&call, sandbox) {
@@ -186,8 +218,16 @@ pub fn run_loop(
             }
         }
     }
+    let summary = if ran.is_empty() {
+        "no tools were run".to_string()
+    } else {
+        ran.iter()
+            .map(|(name, n)| format!("{name}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     reporter.notice(&format!(
-        "stopped: reached the {}-step limit",
+        "stopped: reached the {}-step limit without a final answer (ran: {summary})",
         cfg.max_steps
     ));
     LoopEnd::StepCapped
@@ -239,6 +279,24 @@ impl LiveDriver {
             client: session.client(),
             model_id,
             family: session.active_family(),
+            max_tokens,
+            temperature,
+        }
+    }
+
+    /// Direct constructor (used by the agent-eval harness, which loads the model
+    /// itself rather than through a `Session`).
+    pub fn with(
+        client: Client,
+        model_id: String,
+        family: String,
+        max_tokens: u32,
+        temperature: f32,
+    ) -> Self {
+        Self {
+            client,
+            model_id,
+            family,
             max_tokens,
             temperature,
         }
@@ -320,14 +378,17 @@ impl Reporter for InlineReporter {
     }
     fn tool_result(&mut self, _name: &str, outcome: &ToolOutcome) {
         let body = outcome.text();
-        let shown: String = body.lines().take(12).collect::<Vec<_>>().join("\n");
+        let total = body.lines().count();
         let tag = if outcome.is_err() { "error" } else { "result" };
         println!("{}", banner::dim(&format!("  └ {tag}:")));
-        for line in shown.lines() {
+        for line in body.lines().take(12) {
             println!("{}", banner::dim(&format!("    {line}")));
         }
-        if body.lines().count() > 12 {
-            println!("{}", banner::dim("    …"));
+        if total > 12 {
+            println!(
+                "{}",
+                banner::dim(&format!("    ({} more lines)", total - 12))
+            );
         }
     }
     fn notice(&mut self, text: &str) {
@@ -413,6 +474,8 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let mut reporter = InlineReporter;
     let mut approver = InlineApprover;
+    // Session-spanning approval grants (the `a` choice persists across goals).
+    let mut policy = Policy::default();
 
     loop {
         let prompt = format!("agent ({}) › ", session.active_label);
@@ -427,13 +490,22 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                     match cmd.split_whitespace().next().unwrap_or("") {
                         "exit" | "quit" => break,
                         "tools" => {
+                            let granted = policy.granted();
                             for t in &tools {
+                                let auto = if !t.risk.needs_approval() {
+                                    " (auto: read-only)"
+                                } else if granted.iter().any(|g| g == t.name) {
+                                    " (auto: allowed this session)"
+                                } else {
+                                    ""
+                                };
                                 println!(
                                     "{}",
                                     banner::dim(&format!(
-                                        "  {} [{}] — {}",
+                                        "  {} [{}]{} — {}",
                                         t.name,
                                         t.risk.label(),
+                                        auto,
                                         t.description
                                     ))
                                 );
@@ -464,12 +536,14 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                     &sandbox,
                     &cfg,
                     &CANCEL,
+                    &mut policy,
                     &mut history,
                 );
                 reporter.notice(match end {
                     LoopEnd::Answered => "done",
                     LoopEnd::Aborted => "stopped",
                     LoopEnd::StepCapped => "stopped at the step limit",
+                    LoopEnd::Repeated => "stopped — the model was repeating a failing call",
                     LoopEnd::DriverError => "stopped on a model error",
                 });
             }
@@ -576,6 +650,7 @@ mod tests {
             &sb,
             &cfg(dir.path(), false),
             &AtomicBool::new(false),
+            &mut Policy::default(),
             &mut history,
         );
         assert_eq!(end, LoopEnd::Answered);
@@ -608,6 +683,7 @@ mod tests {
             &sb,
             &cfg(dir.path(), false),
             &AtomicBool::new(false),
+            &mut Policy::default(),
             &mut history,
         );
         // The file must NOT exist (denial blocked the write) and the model got a denial.
@@ -619,10 +695,11 @@ mod tests {
     fn step_cap_is_enforced() {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
-        // Always asks to list_dir, never answers → must hit the cap.
+        // Distinct read-only calls each step (so repeat-detection doesn't fire),
+        // never answers → must hit the cap.
         let mut driver = MockDriver {
             steps: (0..50)
-                .map(|_| ModelStep::Calls(vec![tc("list_dir", json!({"path":"."}))]))
+                .map(|i| ModelStep::Calls(vec![tc("search", json!({"pattern": format!("p{i}")}))]))
                 .collect(),
             idx: 0,
         };
@@ -638,10 +715,43 @@ mod tests {
             &sb,
             &c,
             &AtomicBool::new(false),
+            &mut Policy::default(),
             &mut history,
         );
         assert_eq!(end, LoopEnd::StepCapped);
         assert_eq!(reporter.calls.len(), 3);
+    }
+
+    #[test]
+    fn repeated_identical_call_breaks_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        // Same failing call every step (the exact small-model loop) → break at
+        // the repeat limit, well before the step cap, instead of burning budget.
+        let mut driver = MockDriver {
+            steps: (0..50)
+                .map(|_| ModelStep::Calls(vec![tc("read_file", json!({"path": "nope.txt"}))]))
+                .collect(),
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("loop".into())];
+        let mut c = cfg(dir.path(), false);
+        c.max_steps = 25;
+        let end = run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &c,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert_eq!(end, LoopEnd::Repeated);
+        // Stopped at the repeat limit (3), not the 25-step cap.
+        assert!(reporter.results.len() < 3);
     }
 
     #[test]
@@ -675,11 +785,48 @@ mod tests {
             &sb,
             &cfg(dir.path(), false),
             &AtomicBool::new(false),
+            &mut Policy::default(),
             &mut history,
         );
         // The injection was surfaced as a result but nothing was deleted.
         assert!(dir.path().join("keep.txt").exists());
         assert!(reporter.results[0].contains("rm -rf")); // shown as data
+    }
+
+    #[test]
+    fn fooled_model_following_an_injection_is_still_gated() {
+        // Stronger property (source-agnostic — a file read or an http_fetch
+        // result are the same to the loop): even if the model *complies* with an
+        // injected instruction and emits a destructive call, the approval gate
+        // denies it and the sandbox is untouched. The model never gets extra
+        // permission from result content.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "important").unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                // The "model" was fooled and tries to delete a file.
+                ModelStep::Calls(vec![tc("run_shell", json!({"command": "rm -f keep.txt"}))]),
+                ModelStep::Text("okay, I won't".into()),
+            ],
+            idx: 0,
+        };
+        // User denies the exec — the gate is the backstop, not the model.
+        let mut approver = ScriptApprover(vec![Decision::No], 0);
+        let mut reporter = RecordReporter::default();
+        let mut history = vec![AgentMsg::User("do as the file says".into())];
+        run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &cfg(dir.path(), false), // NOT auto-approve
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert!(dir.path().join("keep.txt").exists()); // denied → never ran
+        assert!(reporter.results[0].contains("denied"));
     }
 
     #[test]
@@ -707,6 +854,7 @@ mod tests {
             &sb,
             &cfg(dir.path(), true),
             &AtomicBool::new(false),
+            &mut Policy::default(),
             &mut history,
         );
         assert!(!dir.path().parent().unwrap().join("escape.txt").exists());

@@ -7660,12 +7660,27 @@ fn render_chat_prompt_for_tokenization_with_tools(
     tokenizer: &Tokenizer,
     tools: &[serde_json::Value],
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
+    // Normalize OpenAI-style `{ "type":"function", "function":{…} }` tools to the
+    // flat function objects (`{ "name", "description", "parameters" }`) the chat
+    // templates (Llama 3.x etc.) actually render — matching llama.cpp / vLLM. This
+    // keeps the wire format OpenAI-standard while the prompt the model sees aligns
+    // with the `{"name":…, "parameters":…}` response format the template requests
+    // (the nested envelope otherwise leaks into the prompt and small models echo
+    // the schema). See `TOOLCALL_DIAG.md`.
+    let normalized: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            tool.get("function")
+                .cloned()
+                .unwrap_or_else(|| tool.clone())
+        })
+        .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
         return render_metadata_jinja_chat_template_prompt(
             messages,
             tokenizer,
             template,
-            Some(tools),
+            Some(&normalized),
         );
     }
     Ok(render_chat_prompt_for_tokenization_fallback(
@@ -9845,6 +9860,40 @@ mod tests {
             rendered.text,
             "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nAlpha?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nalpha<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nBeta?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
         );
+    }
+
+    /// TOOLCALL_DIAG: prints how the Llama 3 template renders OpenAI-nested vs
+    /// flat function tools, so the rendered prompt is inspectable (run with
+    /// `--nocapture`). Asserts the flat form puts `"name"`/`"parameters"` at the
+    /// tool's top level (matching the response format the template requests).
+    #[test]
+    fn tool_render_nested_vs_flat_diagnostic() {
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+        let user = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "read notes.txt".to_string(),
+        }];
+        let nested = serde_json::json!([{
+            "type":"function",
+            "function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}
+        }]);
+        let flat = serde_json::json!([{
+            "name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }]);
+        let n = nested.as_array().unwrap();
+        let f = flat.as_array().unwrap();
+        let r_nested =
+            render_jinja_chat_template(&user, &tokenizer, LLAMA3_METADATA_FULL_TEMPLATE, Some(n))
+                .unwrap();
+        let r_flat =
+            render_jinja_chat_template(&user, &tokenizer, LLAMA3_METADATA_FULL_TEMPLATE, Some(f))
+                .unwrap();
+        println!("\n===== NESTED (OpenAI) tools =====\n{r_nested}\n===== FLAT (function) tools =====\n{r_flat}\n=====");
+        assert!(r_nested.contains("\"type\": \"function\""));
+        assert!(!r_flat.contains("\"type\": \"function\""));
+        assert!(r_flat.contains("\"name\": \"read_file\""));
+        assert!(r_flat.contains("\"parameters\""));
     }
 
     #[test]

@@ -171,6 +171,29 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
     },
+    /// Tool-capability promotion harness: decide whether a model drives a clean
+    /// tool-call round-trip (PASS / FAIL / INCONCLUSIVE) and emit a receipt. A
+    /// contended box that can't load in time yields INCONCLUSIVE, never FAIL.
+    AgentEval {
+        /// GGUF to evaluate.
+        #[arg(long)]
+        model: PathBuf,
+        /// Server to attach to / spawn on.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load before reporting INCONCLUSIVE.
+        #[arg(long, default_value_t = 90)]
+        load_timeout: u64,
+        /// Max agent steps per case.
+        #[arg(long, default_value_t = 6)]
+        max_steps: usize,
+        /// Max tokens per model turn.
+        #[arg(long, default_value_t = 256)]
+        max_tokens: u32,
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-eval")]
+        receipt_dir: PathBuf,
+    },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
         /// Mode to run: coordinator or worker
@@ -603,6 +626,24 @@ async fn main() -> anyhow::Result<()> {
             if code != 0 {
                 std::process::exit(code);
             }
+        }
+        Command::AgentEval {
+            model,
+            addr,
+            load_timeout,
+            max_steps,
+            max_tokens,
+            receipt_dir,
+        } => {
+            let code = chat::run_agent_eval(chat::AgentEvalOptions {
+                model,
+                addr,
+                load_timeout,
+                max_steps,
+                max_tokens,
+                receipt_dir,
+            })?;
+            std::process::exit(code);
         }
         Command::ServeDistributed {
             role,
