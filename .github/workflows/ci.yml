@@ -46,7 +46,23 @@ jobs:
         # macos-latest is Apple Silicon, so it compiles and lints the
         # cfg(target_os = "macos") Metal path that ubuntu never sees. The Metal
         # tests self-skip when no GPU device is reported by the runner.
-        os: [ubuntu-latest, macos-latest]
+        # windows-latest (MSVC) is a first-class CPU target: it builds the
+        # Windows file-I/O / mmap path (src/platform_fs.rs, the memmap2 wire
+        # mapping) and runs the same exact-row gates as the other hosts.
+        #
+        # `features` is per-OS: the optional `cuda` backend depends on `cudarc`,
+        # which is gated to non-macOS (macOS's GPU lane is Metal). So macOS uses
+        # the default feature set, while ubuntu/windows use --all-features, which
+        # additionally compiles and lints the CUDA backend. The CUDA correctness
+        # tests self-skip without a CUDA device (CI runners have no GPU), exactly
+        # like the Metal tests; GPU parity is validated on a CUDA host locally.
+        include:
+          - os: ubuntu-latest
+            features: --all-features
+          - os: macos-latest
+            features: ''
+          - os: windows-latest
+            features: --all-features
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -64,13 +80,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
 
       - name: Tests
-        run: cargo test --all-targets --all-features
+        run: cargo test --all-targets ${{ matrix.features }}
 
       - name: Docs
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps ${{ matrix.features }}
 
   validation-scripts:
     runs-on: ubuntu-latest

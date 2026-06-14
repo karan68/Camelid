@@ -1,8 +1,9 @@
 use std::{
     fs::File,
     io::{Error as IoError, ErrorKind, Result as IoResult},
-    os::unix::fs::FileExt,
 };
+
+use crate::platform_fs::read_exact_at;
 
 use super::f16_bits_to_f32;
 use crate::tensor::record_q8_0_file_read;
@@ -49,7 +50,7 @@ impl Q8BlockReader {
             .checked_add((block_idx * Self::BLOCK_SIZE_BYTES) as u64)
             .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "block offset overflow"))?;
         let mut block_data = [0u8; Self::BLOCK_SIZE_BYTES];
-        file.read_exact_at(&mut block_data, block_offset)?;
+        read_exact_at(file, &mut block_data, block_offset)?;
         record_q8_0_file_read(block_data.len());
 
         let scale_bits = u16::from_le_bytes(block_data[0..2].try_into().expect("2-byte scale"));

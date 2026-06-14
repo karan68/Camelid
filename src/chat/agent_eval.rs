@@ -265,6 +265,27 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
     )
 }
 
+/// Host 1-minute load average for the eval receipt. POSIX-only (`getloadavg`);
+/// Windows has no equivalent, so the receipt records `null` (unavailable)
+/// rather than a misleading number.
+#[cfg(unix)]
+fn host_loadavg_1m() -> Option<f64> {
+    let mut load = [0f64; 3];
+    // SAFETY: getloadavg writes up to 3 doubles into the provided buffer and
+    // returns the number of samples written.
+    let n = unsafe { libc::getloadavg(load.as_mut_ptr(), 3) };
+    if n >= 1 {
+        Some(load[0])
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn host_loadavg_1m() -> Option<f64> {
+    None
+}
+
 /// Emit the receipt + the human verdict, return the exit code.
 fn finish(
     cfg: &EvalConfig,
@@ -274,10 +295,7 @@ fn finish(
     note: &str,
     cases: &[Value],
 ) -> anyhow::Result<i32> {
-    let mut load = [0f64; 3];
-    unsafe {
-        libc::getloadavg(load.as_mut_ptr(), 3);
-    }
+    let loadavg_1m = host_loadavg_1m();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -291,7 +309,7 @@ fn finish(
         "quantization": infer_quant(gguf),
         "note": note,
         "cases": cases,
-        "host_loadavg_1m": load[0],
+        "host_loadavg_1m": loadavg_1m,
         "timestamp_unix": ts,
         "promotion_eligible": outcome == EvalOutcome::Pass,
     });

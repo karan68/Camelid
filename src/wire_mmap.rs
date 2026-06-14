@@ -14,14 +14,37 @@
 
 use std::{
     fs::File,
-    os::unix::io::AsRawFd,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use crate::{BackendError, Result};
+use crate::{platform_fs::read_exact_at, BackendError, Result};
+
+/// System page size, used for window/buffer alignment.
+#[cfg(unix)]
+pub fn page_size() -> usize {
+    // SAFETY: sysconf(_SC_PAGESIZE) has no preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+}
+
+/// System page size, used for window/buffer alignment.
+#[cfg(windows)]
+pub fn page_size() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    // SAFETY: GetSystemInfo only writes into the provided SYSTEM_INFO.
+    let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    unsafe { GetSystemInfo(&mut info) };
+    info.dwPageSize as usize
+}
 
 /// A read-only, shared, page-cache-backed mapping of an entire GGUF file.
+///
+/// Unix maps the file with `mmap(PROT_READ, MAP_SHARED)`; Windows maps it with
+/// `memmap2` (`CreateFileMapping`/`MapViewOfFile`). Both expose the same
+/// immutable, byte-addressable, shareable view, so the file's own page cache
+/// backs reads directly with no load-time copy. The public API is identical on
+/// both platforms.
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct GgufWireMmap {
     ptr: *const u8,
@@ -34,9 +57,12 @@ pub struct GgufWireMmap {
 
 // SAFETY: the mapping is immutable (PROT_READ) for its entire lifetime and the
 // underlying pages are managed by the kernel; concurrent reads are safe.
+#[cfg(unix)]
 unsafe impl Send for GgufWireMmap {}
+#[cfg(unix)]
 unsafe impl Sync for GgufWireMmap {}
 
+#[cfg(unix)]
 impl Drop for GgufWireMmap {
     fn drop(&mut self) {
         // SAFETY: ptr/mapped_len came from a successful mmap and are unmapped once.
@@ -46,14 +72,11 @@ impl Drop for GgufWireMmap {
     }
 }
 
-pub fn page_size() -> usize {
-    // SAFETY: sysconf(_SC_PAGESIZE) has no preconditions.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-}
-
+#[cfg(unix)]
 impl GgufWireMmap {
     /// Map `path` read-only. The mapping covers the whole file.
     pub fn map(path: &Path) -> Result<Arc<Self>> {
+        use std::os::unix::io::AsRawFd;
         let file = File::open(path).map_err(|err| {
             BackendError::InvalidTensorData(format!(
                 "wire mmap open failed for {}: {err}",
@@ -168,6 +191,101 @@ impl GgufWireMmap {
     }
 }
 
+/// A read-only mapping of an entire GGUF file, backed by `memmap2`
+/// (`CreateFileMapping`/`MapViewOfFile`). `memmap2::Mmap` is already `Send +
+/// Sync`, so this type is too without an explicit `unsafe impl`.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct GgufWireMmap {
+    mmap: memmap2::Mmap,
+    file_len: u64,
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl GgufWireMmap {
+    /// Map `path` read-only. The mapping covers the whole file.
+    pub fn map(path: &Path) -> Result<Arc<Self>> {
+        let file = File::open(path).map_err(|err| {
+            BackendError::InvalidTensorData(format!(
+                "wire mmap open failed for {}: {err}",
+                path.display()
+            ))
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|err| {
+                BackendError::InvalidTensorData(format!(
+                    "wire mmap metadata failed for {}: {err}",
+                    path.display()
+                ))
+            })?
+            .len();
+        if file_len == 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "wire mmap refused for empty file {}",
+                path.display()
+            )));
+        }
+        // SAFETY: the file is opened read-only and the mapping is treated as
+        // immutable for its whole lifetime; no other handle here writes to it.
+        let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|err| {
+            BackendError::InvalidTensorData(format!(
+                "wire mmap failed for {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(Arc::new(Self {
+            mmap,
+            file_len,
+            path: path.to_path_buf(),
+        }))
+    }
+
+    /// Sequential-access hint. `memmap2` exposes no portable advise on Windows;
+    /// the OS prefetcher handles read-ahead, so this is a no-op.
+    pub fn advise_sequential(&self) {}
+
+    /// Population hint; a no-op on Windows (see `advise_sequential`).
+    pub fn advise_willneed(&self) {}
+
+    pub fn file_len(&self) -> u64 {
+        self.file_len
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Base address of the mapping.
+    pub fn base_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
+    /// Mapped length. `memmap2` maps exactly the file length.
+    pub fn mapped_len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    /// Borrow file bytes at `offset..offset+len`.
+    pub fn bytes(&self, offset: u64, len: usize) -> Result<&[u8]> {
+        let end = offset.checked_add(len as u64).ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "wire mmap range overflow at offset {offset} len {len} in {}",
+                self.path.display()
+            ))
+        })?;
+        if end > self.file_len {
+            return Err(BackendError::InvalidTensorData(format!(
+                "wire mmap range {offset}..{end} exceeds file length {} in {}",
+                self.file_len,
+                self.path.display()
+            )));
+        }
+        Ok(&self.mmap[offset as usize..offset as usize + len])
+    }
+}
+
 /// A page-aligned, heap-owned copy of one tensor's wire-format bytes, suitable
 /// for an offset-0 `newBufferWithBytesNoCopy` Metal buffer: the GPU reads this
 /// allocation in place, so it is the ONLY resident copy of the weight (no
@@ -205,7 +323,6 @@ impl WirePages {
     /// Allocate page-aligned storage and fill it with `byte_len` bytes read from
     /// `file` at `offset` (one sequential read, page cache enabled).
     pub fn read_from_file(file: &File, offset: u64, byte_len: usize) -> Result<Arc<Self>> {
-        use std::os::unix::fs::FileExt;
         if byte_len == 0 {
             return Err(BackendError::InvalidTensorData(
                 "wire pages refused for an empty tensor range".to_string(),
@@ -230,7 +347,7 @@ impl WirePages {
         };
         // SAFETY: the allocation is alloc_len >= byte_len bytes and exclusively owned here.
         let fill = unsafe { std::slice::from_raw_parts_mut(ptr, byte_len) };
-        file.read_exact_at(fill, offset).map_err(|err| {
+        read_exact_at(file, fill, offset).map_err(|err| {
             BackendError::InvalidTensorData(format!(
                 "wire pages read of {byte_len} bytes at offset {offset} failed: {err}"
             ))
