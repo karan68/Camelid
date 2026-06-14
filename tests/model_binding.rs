@@ -691,3 +691,151 @@ fn push_u64(b: &mut Vec<u8>, value: u64) {
 fn push_i64(b: &mut Vec<u8>, value: i64) {
     b.extend_from_slice(&value.to_le_bytes());
 }
+
+// ---------------------------------------------------------------------------
+// Qwen3 QK-norm binder coverage (feat/qwen3-support, Gate 1).
+//
+// Qwen3 applies a per-head RMSNorm to Q and K after the projections and before
+// RoPE (`attn_q_norm`/`attn_k_norm`, shape `[head_dim]`). The dense binder must
+// carry them for qwen3 and fail closed both directions: qwen3 missing them, and
+// a plain Llama-family row unexpectedly carrying them.
+// ---------------------------------------------------------------------------
+
+/// Build a tiny qwen3 GGUF (1 block, embedding 16, 2 heads, 1 KV head,
+/// head_dim 8, tied embeddings). `include_qk_norm` toggles the
+/// `attn_q_norm`/`attn_k_norm` tensors. head_dim is 8 so the F32 norm tensors
+/// (32 bytes) honor the GGUF 32-byte data alignment.
+fn write_qwen3_gguf(path: &Path, include_qk_norm: bool) {
+    write_qk_norm_gguf(path, "qwen3", include_qk_norm);
+}
+
+fn write_qk_norm_gguf(path: &Path, architecture: &str, include_qk_norm: bool) {
+    let mut tensors: Vec<(&str, Vec<i64>)> = vec![
+        ("token_embd.weight", vec![4, 16]),
+        ("output_norm.weight", vec![16]),
+        ("blk.0.attn_norm.weight", vec![16]),
+        ("blk.0.attn_q.weight", vec![16, 16]),
+        ("blk.0.attn_k.weight", vec![16, 8]),
+        ("blk.0.attn_v.weight", vec![16, 8]),
+        ("blk.0.attn_output.weight", vec![16, 16]),
+        ("blk.0.ffn_norm.weight", vec![16]),
+        ("blk.0.ffn_gate.weight", vec![16, 32]),
+        ("blk.0.ffn_up.weight", vec![16, 32]),
+        ("blk.0.ffn_down.weight", vec![32, 16]),
+    ];
+    if include_qk_norm {
+        // head_dim = embedding_length / head_count = 16 / 2 = 8.
+        tensors.push(("blk.0.attn_q_norm.weight", vec![8]));
+        tensors.push(("blk.0.attn_k_norm.weight", vec![8]));
+    }
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_i64(&mut b, tensors.len() as i64);
+    push_i64(&mut b, 14);
+
+    push_kv_string(&mut b, "general.architecture", architecture);
+    push_kv_string(&mut b, "general.name", "QK Norm Fixture");
+    push_kv_u32(&mut b, "general.file_type", 0);
+    push_kv_u32(&mut b, &format!("{architecture}.context_length"), 128);
+    push_kv_u32(&mut b, &format!("{architecture}.embedding_length"), 16);
+    push_kv_u32(&mut b, &format!("{architecture}.block_count"), 1);
+    push_kv_u32(&mut b, &format!("{architecture}.feed_forward_length"), 32);
+    push_kv_u32(&mut b, &format!("{architecture}.attention.head_count"), 2);
+    push_kv_u32(
+        &mut b,
+        &format!("{architecture}.attention.head_count_kv"),
+        1,
+    );
+    push_kv_u32(&mut b, &format!("{architecture}.attention.key_length"), 8);
+    push_kv_u32(&mut b, &format!("{architecture}.attention.value_length"), 8);
+    push_kv_f32(
+        &mut b,
+        &format!("{architecture}.rope.freq_base"),
+        1_000_000.0,
+    );
+    push_kv_f32(
+        &mut b,
+        &format!("{architecture}.attention.layer_norm_rms_epsilon"),
+        1e-6,
+    );
+    push_kv_u32(&mut b, &format!("{architecture}.vocab_size"), 4);
+
+    let mut relative_offset = 0u64;
+    for (name, dims) in &tensors {
+        push_string(&mut b, name);
+        push_u32(&mut b, dims.len() as u32);
+        for dim in dims {
+            push_i64(&mut b, *dim);
+        }
+        push_i32(&mut b, 0);
+        push_u64(&mut b, relative_offset);
+        relative_offset += dims.iter().product::<i64>() as u64 * 4;
+    }
+
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+    b.extend(vec![0u8; relative_offset as usize]);
+    fs::write(path, b).unwrap();
+}
+
+#[test]
+fn qwen3_binds_per_head_qk_norm_tensors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen3.gguf");
+    write_qwen3_gguf(&path, true);
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+
+    let layer = &binding.layers[0];
+    let q_norm = layer
+        .attention_q_norm
+        .as_ref()
+        .expect("qwen3 must bind attn_q_norm");
+    let k_norm = layer
+        .attention_k_norm
+        .as_ref()
+        .expect("qwen3 must bind attn_k_norm");
+    // Shape is [head_dim] = [8].
+    assert_eq!(q_norm.dimensions, vec![8]);
+    assert_eq!(k_norm.dimensions, vec![8]);
+}
+
+#[test]
+fn qwen3_without_qk_norm_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen3-no-qknorm.gguf");
+    write_qwen3_gguf(&path, false);
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let err = LlamaTensorBinding::bind(&gguf, &config)
+        .expect_err("qwen3 missing attn_q_norm/attn_k_norm must fail closed");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("QK-norm") && msg.to_lowercase().contains("qwen3"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn llama_family_with_unexpected_qk_norm_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("llama-with-qknorm.gguf");
+    // A plain llama row that unexpectedly carries QK-norm tensors must not be
+    // silently accepted (the Llama forward path would drop them).
+    write_qk_norm_gguf(&path, "llama", true);
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    let err = LlamaTensorBinding::bind(&gguf, &config)
+        .expect_err("llama row carrying QK-norm tensors must fail closed");
+    assert!(
+        format!("{err}").contains("QK-norm"),
+        "unexpected error: {err}"
+    );
+}

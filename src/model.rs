@@ -562,6 +562,16 @@ pub struct LlamaLayerTensors {
     pub attention_k: GgufTensorDescriptor,
     pub attention_v: GgufTensorDescriptor,
     pub attention_output: GgufTensorDescriptor,
+    /// Per-head RMSNorm applied to the Q projection *after* reshape-to-heads and
+    /// *before* RoPE. `Some` only for architectures that use QK-norm (Qwen3);
+    /// `None` for plain Llama-family rows (llama/mistral/qwen2/…). When `Some`
+    /// the descriptor shape is `[head_dim]`. See [`LlamaTensorBinding::bind`] for
+    /// the per-architecture presence invariant.
+    pub attention_q_norm: Option<GgufTensorDescriptor>,
+    /// Per-head RMSNorm applied to the K projection, mirroring
+    /// [`Self::attention_q_norm`]. Bound in lockstep with it (both `Some` or both
+    /// `None`).
+    pub attention_k_norm: Option<GgufTensorDescriptor>,
     pub ffn_norm: GgufTensorDescriptor,
     pub ffn: LlamaFfnTensors,
 }
@@ -616,9 +626,82 @@ impl LlamaTensorBinding {
         };
         let rope_freqs = find_tensor(gguf, "rope_freqs.weight").cloned();
 
+        // Per-architecture QK-norm classification. Qwen3 applies a per-head
+        // RMSNorm to Q and K after the projections and before RoPE
+        // (`attn_q_norm`/`attn_k_norm`, shape `[head_dim]`); the plain
+        // Llama-family rows do not. We classify every architecture that reaches
+        // this dense binder so a model can never be silently mis-bound in either
+        // direction (carrying QK-norm weights that the forward path would drop,
+        // or fabricating them where none exist).
+        let architecture = gguf.architecture().unwrap_or_default();
+        let expects_qk_norm = architecture == "qwen3";
+        let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
+
+        // Qwen3 sets the per-head dim explicitly via `attention.key_length` /
+        // `attention.value_length`; it is NOT guaranteed to equal
+        // `embedding_length / head_count`. The in-scope row (1.7B) has
+        // key_length == embedding/heads, so the standard dense geometry holds.
+        // Sizes where they differ (e.g. 0.6B: 1024/16=64 ≠ key_length 128) are
+        // out of scope and unproven — fail closed with a clear typed error here
+        // rather than letting a confusing tensor-shape mismatch surface later.
+        if expects_qk_norm {
+            let derived_head_dim = (config.attention_head_count != 0)
+                .then(|| config.embedding_length / config.attention_head_count);
+            for suffix in ["attention.key_length", "attention.value_length"] {
+                if let Some(explicit) = gguf.metadata_u32(&architecture_key(architecture, suffix)) {
+                    if Some(explicit) != derived_head_dim {
+                        return Err(BackendError::UnsupportedModelArchitecture(format!(
+                            "qwen3 {suffix}={explicit} differs from embedding_length/head_count={}; \
+                             only the proven Qwen3 row where the per-head dim equals \
+                             embedding_length/head_count is supported (Qwen3-1.7B Q8_0). \
+                             Other Qwen3 sizes are unproven and fail closed",
+                            derived_head_dim
+                                .map(|d| d.to_string())
+                                .unwrap_or_else(|| "<undefined>".into())
+                        )));
+                    }
+                }
+            }
+        }
+
         let mut layers = Vec::with_capacity(config.block_count as usize);
         for layer_idx in 0..config.block_count {
+            let q_norm_name = format!("blk.{layer_idx}.attn_q_norm.weight");
+            let k_norm_name = format!("blk.{layer_idx}.attn_k_norm.weight");
+            let (attention_q_norm, attention_k_norm) = if expects_qk_norm {
+                // Required for Qwen3: both must be present, or fail closed.
+                let q = find_tensor(gguf, &q_norm_name).cloned();
+                let k = find_tensor(gguf, &k_norm_name).cloned();
+                if q.is_none() || k.is_none() {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "qwen3 layer {layer_idx} is missing QK-norm tensors \
+                         (attn_q_norm present: {}, attn_k_norm present: {}); Qwen3 applies \
+                         per-head RMSNorm to Q and K and cannot be run correctly without them",
+                        q.is_some(),
+                        k.is_some()
+                    )));
+                }
+                (q, k)
+            } else {
+                // Forbidden for the plain Llama-family rows: if a GGUF unexpectedly
+                // carries QK-norm tensors under one of these architectures, the
+                // forward path would silently drop them — fail closed instead.
+                if forbids_qk_norm
+                    && (find_tensor(gguf, &q_norm_name).is_some()
+                        || find_tensor(gguf, &k_norm_name).is_some())
+                {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "architecture {architecture:?} unexpectedly carries QK-norm tensors at \
+                         layer {layer_idx} (attn_q_norm/attn_k_norm); the Llama-family forward \
+                         path does not apply them, so Camelid fails closed rather than running \
+                         a model whose weights it would silently ignore"
+                    )));
+                }
+                (None, None)
+            };
             layers.push(LlamaLayerTensors {
+                attention_q_norm,
+                attention_k_norm,
                 attention_norm: required_tensor(
                     gguf,
                     &format!("blk.{layer_idx}.attn_norm.weight"),
@@ -766,6 +849,30 @@ impl LlamaTensorBinding {
                 dims.embedding_length,
                 &format!("layer {idx} attention output"),
             )?;
+            // QK-norm (Qwen3) — per-head RMSNorm weights over the head dim. Only
+            // populated for architectures that use them; validate shape `[head_dim]`
+            // and require they appear together.
+            match (&layer.attention_q_norm, &layer.attention_k_norm) {
+                (Some(q_norm), Some(k_norm)) => {
+                    require_descriptor_shape(
+                        q_norm,
+                        &[head_dim],
+                        &format!("layer {idx} attention q_norm"),
+                    )?;
+                    require_descriptor_shape(
+                        k_norm,
+                        &[head_dim],
+                        &format!("layer {idx} attention k_norm"),
+                    )?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "layer {idx} has exactly one of attn_q_norm/attn_k_norm bound; QK-norm \
+                         weights must be present as a pair"
+                    )));
+                }
+            }
             require_descriptor_shape(
                 &layer.ffn_norm,
                 &[dims.embedding_length],

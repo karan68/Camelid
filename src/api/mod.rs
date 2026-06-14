@@ -8115,8 +8115,8 @@ mod tests {
         model::LlamaModelConfig,
         tensor::CpuTensor,
         tokenizer::{
-            BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig,
-            TokenizerModel,
+            BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer,
+            TokenizerConfig, TokenizerModel,
         },
     };
 
@@ -9270,6 +9270,7 @@ mod tests {
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![
                 Token {
                     id: 0,
@@ -9328,6 +9329,7 @@ mod tests {
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = Tokenizer {
             model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: Vec::new(),
             token_to_id: HashMap::new(),
             byte_token_to_id: HashMap::new(),
@@ -10301,6 +10303,7 @@ mod tests {
     fn mistral_test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![
                 Token {
                     id: 0,
@@ -10451,6 +10454,7 @@ mod tests {
     fn llama3_tokenizer_with_template(template: &str) -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![Token {
                 id: 0,
                 text: "<|begin_of_text|>".to_string(),
@@ -10494,6 +10498,8 @@ mod tests {
                 attention_k: desc("blk.0.attn_k.weight"),
                 attention_v: desc("blk.0.attn_v.weight"),
                 attention_output: desc("blk.0.attn_output.weight"),
+                attention_q_norm: None,
+                attention_k_norm: None,
                 ffn_norm: desc("blk.0.ffn_norm.weight"),
                 ffn: LlamaFfnTensors::Dense {
                     gate: desc("blk.0.ffn_gate.weight"),
@@ -10606,6 +10612,7 @@ mod tests {
     fn test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: Vec::new(),
             token_to_id: HashMap::new(),
             byte_token_to_id: HashMap::new(),
