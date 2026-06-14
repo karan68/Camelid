@@ -63,17 +63,78 @@ fn resolve(entries: &[CatalogItem], query: &str) -> anyhow::Result<CatalogItem> 
     }
 }
 
+/// Ask the Hugging Face Hub for the current byte size of `item`'s GGUF.
+///
+/// The catalog ships a `size_bytes` constant, but uploaders occasionally
+/// re-publish a row (a re-quant, a metadata fix) and the byte count shifts.
+/// Gating "is this download complete?" on a baked-in constant then breaks: a
+/// fully-downloaded file stops matching, so `pull` tries to resume a file that
+/// is already whole. Querying the Hub's file tree keeps the check honest.
+///
+/// Returns `None` when offline or the response can't be parsed; callers then
+/// fall back to the catalog constant.
+fn remote_size(item: &CatalogItem) -> Option<u64> {
+    let url = format!(
+        "https://huggingface.co/api/models/{}/tree/main?recursive=1",
+        item.repo_id
+    );
+    let output = std::process::Command::new("curl")
+        .args(["-fsSL", &url])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let tree: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    for entry in tree.as_array()? {
+        if entry.get("path").and_then(|p| p.as_str()) == Some(item.filename) {
+            // LFS/xet-backed files report the real content size under `lfs.size`;
+            // the top-level `size` for those is just the pointer's byte count.
+            return entry
+                .get("lfs")
+                .and_then(|lfs| lfs.get("size"))
+                .and_then(|s| s.as_u64())
+                .or_else(|| entry.get("size").and_then(|s| s.as_u64()));
+        }
+    }
+    None
+}
+
 /// Download `item` into `models_dir` via `curl` (resumable, streaming progress
-/// to the terminal). Skips the download if a complete copy already exists.
+/// to the terminal). Skips a complete copy, resumes a partial one, and re-fetches
+/// a stale/oversized one — judged against the Hub's *current* file size, not a
+/// baked-in constant, so a re-published row can't trick `pull` into resuming a
+/// file that is already whole.
 fn download(item: &CatalogItem, models_dir: &Path) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(models_dir)?;
     let dest = models_dir.join(item.filename);
 
+    // Authoritative size from the Hub; fall back to the catalog constant offline.
+    let expected = remote_size(item);
+    let target = expected.unwrap_or(item.size_bytes);
+
     if let Ok(meta) = std::fs::metadata(&dest) {
-        if meta.len() == item.size_bytes {
-            eprintln!("{} already downloaded at {}", item.name, dest.display());
+        let have = meta.len();
+        if have == target {
+            eprintln!(
+                "{} already downloaded at {} ({:.1} GB, size-verified)",
+                item.name,
+                dest.display(),
+                target as f64 / 1e9
+            );
             return Ok(dest);
         }
+        if expected.is_some() && have > target {
+            // Larger than the Hub's current file: a stale or corrupt copy. A
+            // byte-range resume can't repair that, so start clean.
+            eprintln!(
+                "Local {} is {have} bytes but the Hub file is {target} — re-downloading fresh",
+                item.filename
+            );
+            let _ = std::fs::remove_file(&dest);
+        }
+        // Otherwise the file is shorter than expected: a partial download that
+        // `curl -C -` resumes below.
     }
 
     let url = format!(
@@ -83,7 +144,7 @@ fn download(item: &CatalogItem, models_dir: &Path) -> anyhow::Result<PathBuf> {
     eprintln!(
         "Downloading {} ({:.1} GB) from {}",
         item.name,
-        item.size_bytes as f64 / 1e9,
+        target as f64 / 1e9,
         item.repo_id
     );
 
@@ -96,9 +157,26 @@ fn download(item: &CatalogItem, models_dir: &Path) -> anyhow::Result<PathBuf> {
         .status()
         .map_err(|err| anyhow::anyhow!("could not run curl (is it installed?): {err}"))?;
 
+    let have_after = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+
     if !status.success() {
-        anyhow::bail!("download failed (curl exited with {status}); re-run to resume");
+        // curl returns non-zero (HTTP 416) when asked to resume a file that is
+        // already complete. If every byte is here, that's success, not failure;
+        // otherwise the download genuinely broke.
+        if have_after == 0 || have_after != target {
+            anyhow::bail!("download failed (curl exited with {status}); re-run to resume");
+        }
     }
+
+    // Final integrity gate: never hand back a short or oversized file when the
+    // Hub told us the size to expect.
+    if expected.is_some() && have_after != target {
+        anyhow::bail!(
+            "download incomplete: {} is {have_after} bytes, expected {target} — re-run to resume",
+            item.filename
+        );
+    }
+
     Ok(dest)
 }
 
