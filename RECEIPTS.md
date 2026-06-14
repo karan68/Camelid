@@ -37,6 +37,18 @@ A receipt does **not** prove: anything about other prompts, other context length
 quantizations, other models, performance, or general correctness. It does not change any row
 of the support ledger.
 
+### Optional: the execution-trace rollup
+
+A receipt produced on the deterministic CPU lane (the server running with `--deterministic`)
+also carries an **execution-trace rollup** — a single SHA-256 over the whole forward pass
+(every layer's hidden state and the final logits, folded across every generated token). It
+proves not just that the *output tokens* match, but that the *internal computation* re-runs
+bit-for-bit: `verify-receipt` re-derives the digest from an independent run and checks it.
+This is only meaningful because the deterministic lane is reduction-order-stable. The digest
+is ISA-specific (the receipt records `host_isa`), so a verifier on a different CPU re-runs the
+tokens but reports `SKIP execution-trace` rather than a false mismatch. Receipts emitted on the
+default (non-deterministic, GPU) path carry no rollup and are unchanged.
+
 ## Verifying a receipt
 
 ```bash

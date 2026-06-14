@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
@@ -1425,6 +1426,12 @@ pub struct LlamaInferenceSession {
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
     resident_paths_disabled: bool,
+    /// When set, the deterministic forward pass folds each layer's output hidden state and the
+    /// final logits into a streaming SHA-256 rollup (an execution-trace digest). Transient
+    /// proof-carrying state, not part of the session's logical identity — skipped by
+    /// Clone/PartialEq/Debug like `resident_decode`. Only enabled in deterministic mode
+    /// (`enable_execution_trace`); the default path never allocates it.
+    execution_trace: Option<ExecutionTraceHasher>,
 }
 
 impl LlamaInferenceSession {
@@ -1450,6 +1457,7 @@ impl LlamaInferenceSession {
             ),
             resident_decode: self.resident_decode.take(),
             resident_paths_disabled: self.resident_paths_disabled,
+            execution_trace: self.execution_trace.take(),
         }
     }
 
@@ -1472,6 +1480,7 @@ impl Clone for LlamaInferenceSession {
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
             resident_paths_disabled: self.resident_paths_disabled,
+            execution_trace: None,
         }
     }
 }
@@ -1508,6 +1517,7 @@ impl LlamaInferenceSession {
             kv_cache: LlamaKvCache::new(plan)?,
             resident_decode: None,
             resident_paths_disabled: false,
+            execution_trace: None,
         })
     }
 
@@ -1529,6 +1539,39 @@ impl LlamaInferenceSession {
     /// pins sessions to CPU because KV rollback only exists for CPU state.
     pub fn set_resident_paths_disabled(&mut self, disabled: bool) {
         self.resident_paths_disabled = disabled;
+    }
+
+    /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
+    /// hidden state and the final logits into a streaming SHA-256 (see [`ExecutionTraceHasher`]).
+    /// Fails closed unless deterministic mode is active — the rollup is only meaningful on the
+    /// order-stable CPU lane (RECEIPTS.md rule 2), and arming it would otherwise advertise a
+    /// digest over a non-reproducible run. Returns whether the trace was armed.
+    pub fn enable_execution_trace(&mut self) -> bool {
+        if deterministic_mode_enabled() {
+            self.execution_trace
+                .get_or_insert_with(ExecutionTraceHasher::new);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the execution-trace rollup is currently armed.
+    pub fn execution_trace_armed(&self) -> bool {
+        self.execution_trace.is_some()
+    }
+
+    /// Checkpoints folded so far by the armed rollup (layers + logits across all tokens), if any.
+    pub fn execution_trace_fold_count(&self) -> Option<u64> {
+        self.execution_trace.as_ref().map(|h| h.fold_count())
+    }
+
+    /// Finalize and take the execution-trace rollup digest (lowercase-hex SHA-256), if armed.
+    /// Consumes the accumulated hasher; a subsequent generation must re-arm.
+    pub fn take_execution_trace_digest(&mut self) -> Option<String> {
+        self.execution_trace
+            .take()
+            .map(ExecutionTraceHasher::finalize_hex)
     }
 
     /// Roll the sequence back to `position`, discarding newer KV entries.
@@ -2658,6 +2701,13 @@ impl LlamaInferenceSession {
             )));
         }
 
+        // Take the execution-trace rollup out for the duration of this forward so the per-layer
+        // fold is a plain local (no borrow conflict with the `self.weights.layers` loop). It is
+        // restored on the success path; an error path drops it (the generation failed anyway).
+        // Only ever Some in deterministic mode (see `enable_execution_trace`); on the default
+        // path this is None and adds nothing.
+        let mut execution_trace = self.execution_trace.take();
+
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let total_started = Instant::now();
         if !collect_diagnostics {
@@ -2754,6 +2804,9 @@ impl LlamaInferenceSession {
                     &mut self.kv_cache,
                 )?;
                 hidden = timed.output;
+                if let Some(trace) = execution_trace.as_mut() {
+                    trace.fold_layer_hidden(layer_idx, &hidden.data);
+                }
                 telemetry::emit(telemetry::Event::LayerCompleted {
                     layer: layer_idx,
                     layers_total: self.weights.layers.len(),
@@ -2841,6 +2894,13 @@ impl LlamaInferenceSession {
                     None,
                 )
             };
+        // Fold the final logits and restore the rollup onto the session for the next token.
+        if compute_logits {
+            if let Some(trace) = execution_trace.as_mut() {
+                trace.fold_logits(&logits.data);
+            }
+        }
+        self.execution_trace = execution_trace;
         self.kv_cache.position += 1;
         if !collect_diagnostics {
             metal::end_inference_session();
@@ -3181,6 +3241,89 @@ fn env_flag_enabled(key: &str) -> bool {
 /// llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated against.
 pub fn deterministic_mode_enabled() -> bool {
     env_flag_enabled("CAMELID_DETERMINISTIC")
+}
+
+/// Schema tag for the execution-trace rollup digest carried in a parity receipt.
+pub const EXECUTION_TRACE_SCHEMA_V1: &str = "camelid.execution-trace/v1";
+/// Algorithm tag: a single streaming SHA-256 over the whole deterministic forward pass.
+pub const EXECUTION_TRACE_ALGORITHM_ROLLUP_V1: &str = "sha256-rollup-v1";
+
+/// Streaming SHA-256 rollup over a deterministic forward pass. It folds, in forward order
+/// across every generated token, each transformer layer's output hidden state and the final
+/// logits vector into one digest. The fold is domain-separated (a kind byte + index + length
+/// prefix per checkpoint) so the byte stream is unambiguous, and uses little-endian f32 bytes
+/// so it is reproducible on a given host.
+///
+/// This is a single *rollup*: a mismatch proves the run differs but does not localize which
+/// token or layer. It is only meaningful on the order-stable CPU lane (deterministic mode):
+/// the underlying values are reduction-order-stable there (see [`deterministic_mode_enabled`]
+/// and DECISIONS.md §D9), and byte-for-byte reproducibility requires greedy decoding
+/// (RECEIPTS.md rule 2). The digest is ISA-specific (i8mm vs scalar round differently), so it
+/// is re-derivable on the same deterministic lane/host, not portable across ISAs.
+#[derive(Clone)]
+pub struct ExecutionTraceHasher {
+    hasher: Sha256,
+    fold_count: u64,
+}
+
+impl ExecutionTraceHasher {
+    /// Kind byte for a per-layer output hidden-state checkpoint.
+    const KIND_LAYER_HIDDEN: u8 = 0;
+    /// Kind byte for a final logits checkpoint.
+    const KIND_LOGITS: u8 = 1;
+
+    pub fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            fold_count: 0,
+        }
+    }
+
+    /// Fold one f32 checkpoint, domain-separated by `kind` + `index` + length so adjacent
+    /// checkpoints can never alias. Bytes are little-endian (host-reproducible).
+    fn fold(&mut self, kind: u8, index: u64, data: &[f32]) {
+        self.hasher.update([kind]);
+        self.hasher.update(index.to_le_bytes());
+        self.hasher.update((data.len() as u64).to_le_bytes());
+        let mut buf = Vec::with_capacity(data.len() * 4);
+        for &value in data {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        self.hasher.update(&buf);
+        self.fold_count += 1;
+    }
+
+    /// Fold a transformer layer's output hidden state.
+    pub fn fold_layer_hidden(&mut self, layer_index: usize, hidden: &[f32]) {
+        self.fold(Self::KIND_LAYER_HIDDEN, layer_index as u64, hidden);
+    }
+
+    /// Fold a final logits vector.
+    pub fn fold_logits(&mut self, logits: &[f32]) {
+        self.fold(Self::KIND_LOGITS, 0, logits);
+    }
+
+    /// Number of checkpoints folded so far (layers + logits across all tokens).
+    pub fn fold_count(&self) -> u64 {
+        self.fold_count
+    }
+
+    /// Finalize to a lowercase-hex SHA-256 digest.
+    pub fn finalize_hex(self) -> String {
+        let digest = self.hasher.finalize();
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+        }
+        out
+    }
+}
+
+impl Default for ExecutionTraceHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn prefill_chunk_token_count(prefill_count: usize) -> usize {
