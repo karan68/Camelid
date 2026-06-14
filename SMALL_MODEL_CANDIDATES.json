@@ -164,6 +164,32 @@
           "SHA256SUMS"
         ]
       }
+    },
+    {
+      "model_id": "qwen3-0.6b-instruct-q8",
+      "path": "$CAMELID_MODEL_DIR/Qwen3-0.6B-Q8_0.gguf",
+      "source": "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf",
+      "family": "qwen3",
+      "tokenizer": "qwen2 (GPT-2/BPE)",
+      "chat_template": "ChatML, thinking disabled",
+      "quant": "Q8_0",
+      "estimated_ram_materialization_risk": "very low; ~307 MiB server RSS after generation",
+      "expected_support_row": "supported exact-row smoke for Qwen3-0.6B Q8_0 short local ChatML chat/parity with thinking DISABLED; exercises the explicit head_dim path (head_dim 128 != embedding/head_count 64). do NOT infer other Qwen3 sizes/variants/quants, MoE (A3B), longer context, or thinking-mode",
+      "load_harness": "inspect, /api/models/load, /v1/health generation_ready=true, /v1/completions, /v1/chat/completions, API smoke",
+      "parity_harness": "node scripts/chat-parity-qwen3.mjs vs pinned llama.cpp -ctk f32 -ctv f32 -fa off --no-repack; prompt-token, generated-token, generated-text match at 1/5/50",
+      "latest_evidence": {
+        "load_result": "PASS generation_ready=true (cpu_reference)",
+        "engine_fixes": "explicit head_dim from attention.key_length (DenseLlamaDims.head_dim/q_width); unlocks Qwen3 0.6B/4B/32B where head_dim != embedding/head_count",
+        "short_generation_parity": "PASS: token+text identical to llama.cpp at 1/5/50 tokens for three fixed ChatML thinking-disabled prompts (all_pass=true)",
+        "model_sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+        "artifact_dir": "qa/evidence-bundles/qwen3-0.6b-q8-chatml-parity-20260614T032905Z-head-63bf015",
+        "artifacts": [
+          "qwen3-0.6b-chatml-chat-parity.json",
+          "manifest.json",
+          "README.md",
+          "SHA256SUMS"
+        ]
+      }
     }
   ],
   "latest_local_audit": {

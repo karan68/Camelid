@@ -23,6 +23,13 @@ pub struct LlamaModelConfig {
     pub rms_norm_epsilon: f32,
     pub vocab_size: Option<u32>,
     pub file_type: Option<u32>,
+    /// Explicit per-head dimension from `<arch>.attention.key_length`, when the
+    /// GGUF sets it. Qwen3 sizes where `head_dim != embedding_length/head_count`
+    /// (0.6B/4B/32B) rely on this; `None` falls back to `embedding/head_count`
+    /// (llama/mistral, and the Qwen3 sizes where they happen to be equal). The
+    /// Llama dense path reads this in [`DenseLlamaDims`]; gemma4 keeps its own
+    /// per-layer head-dim handling in [`Gemma4Metadata`].
+    pub attention_key_length: Option<u32>,
     /// RoPE uses NEOX "split-half" pairing (dim `d` rotated with `d + rope_dim/2`)
     /// rather than the default "adjacent even/odd" pairing. llama.cpp permutes the
     /// Q/K projection weights for LLaMA-family conversions so that the adjacent
@@ -162,6 +169,13 @@ impl LlamaModelConfig {
                     )
                 }),
             file_type: gguf.metadata_u32("general.file_type"),
+            // Explicit head_dim for the dense path (gemma4 has its own per-layer
+            // head-dim handling, so don't surface it here for that arch).
+            attention_key_length: if gemma4.is_some() {
+                None
+            } else {
+                gguf.metadata_u32(&architecture_key(architecture, "attention.key_length"))
+            },
             // Qwen3 GGUFs are not weight-permuted (unlike LLaMA conversions), so
             // their RoPE must use NEOX split-half pairing to match llama.cpp.
             // Verified token-identical against the pinned reference for
@@ -653,28 +667,22 @@ impl LlamaTensorBinding {
         let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
 
         // Qwen3 sets the per-head dim explicitly via `attention.key_length` /
-        // `attention.value_length`; it is NOT guaranteed to equal
-        // `embedding_length / head_count`. The in-scope row (1.7B) has
-        // key_length == embedding/heads, so the standard dense geometry holds.
-        // Sizes where they differ (e.g. 0.6B: 1024/16=64 ≠ key_length 128) are
-        // out of scope and unproven — fail closed with a clear typed error here
-        // rather than letting a confusing tensor-shape mismatch surface later.
+        // `attention.value_length` and it is NOT guaranteed to equal
+        // `embedding_length / head_count` (0.6B/4B/32B differ). The dense path
+        // carries the explicit head_dim through `LlamaModelConfig.attention_key_length`
+        // / `DenseLlamaDims`. The engine assumes a single head_dim for K and V, so
+        // require key_length == value_length and fail closed otherwise.
         if expects_qk_norm {
-            let derived_head_dim = (config.attention_head_count != 0)
-                .then(|| config.embedding_length / config.attention_head_count);
-            for suffix in ["attention.key_length", "attention.value_length"] {
-                if let Some(explicit) = gguf.metadata_u32(&architecture_key(architecture, suffix)) {
-                    if Some(explicit) != derived_head_dim {
-                        return Err(BackendError::UnsupportedModelArchitecture(format!(
-                            "qwen3 {suffix}={explicit} differs from embedding_length/head_count={}; \
-                             only the proven Qwen3 row where the per-head dim equals \
-                             embedding_length/head_count is supported (Qwen3-1.7B Q8_0). \
-                             Other Qwen3 sizes are unproven and fail closed",
-                            derived_head_dim
-                                .map(|d| d.to_string())
-                                .unwrap_or_else(|| "<undefined>".into())
-                        )));
-                    }
+            let key_length =
+                gguf.metadata_u32(&architecture_key(architecture, "attention.key_length"));
+            let value_length =
+                gguf.metadata_u32(&architecture_key(architecture, "attention.value_length"));
+            if let (Some(k), Some(v)) = (key_length, value_length) {
+                if k != v {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "qwen3 attention.key_length={k} != value_length={v}; the engine assumes a \
+                         single per-head dimension for K and V, so this row fails closed"
+                    )));
                 }
             }
         }
@@ -1266,6 +1274,10 @@ pub(crate) struct DenseLlamaDims {
     pub feed_forward_length: usize,
     pub attention_head_count_kv: usize,
     pub head_dim: usize,
+    /// Query projection width = `attention_head_count * head_dim`. Equals
+    /// `embedding_length` only when `head_dim == embedding_length/head_count`;
+    /// Qwen3 0.6B/4B/32B set an explicit larger head_dim so `q_width > embedding`.
+    pub q_width: usize,
     pub kv_width: usize,
     pub vocab_size: usize,
 }
@@ -1304,13 +1316,20 @@ impl DenseLlamaDims {
             ));
         }
 
-        let head_dim = embedding_length / attention_head_count;
+        // Prefer the GGUF's explicit per-head dim (`attention.key_length`) when
+        // present — Qwen3 0.6B/4B/32B set head_dim != embedding/head_count. Fall
+        // back to embedding/head_count for rows that don't carry it.
+        let head_dim = match config.attention_key_length {
+            Some(key_length) if key_length > 0 => key_length as usize,
+            _ => embedding_length / attention_head_count,
+        };
         Ok(Self {
             embedding_length,
             block_count: config.block_count as usize,
             feed_forward_length: config.feed_forward_length as usize,
             attention_head_count_kv,
             head_dim,
+            q_width: attention_head_count * head_dim,
             kv_width: attention_head_count_kv * head_dim,
             vocab_size,
         })

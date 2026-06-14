@@ -642,7 +642,7 @@ impl LlamaLoadedWeights {
             require_matrix_shape(
                 &layer.attention_q,
                 dims.embedding_length,
-                dims.embedding_length,
+                dims.q_width,
                 &format!("layer {idx} attention q"),
             )?;
             require_matrix_shape(
@@ -659,7 +659,7 @@ impl LlamaLoadedWeights {
             )?;
             require_matrix_shape(
                 &layer.attention_output,
-                dims.embedding_length,
+                dims.q_width,
                 dims.embedding_length,
                 &format!("layer {idx} attention output"),
             )?;

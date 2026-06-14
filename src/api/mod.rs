@@ -10869,6 +10869,7 @@ mod tests {
             vocab_size: Some(3),
             file_type: Some(0),
             rope_neox_pairing: false,
+            attention_key_length: None,
             moe: None,
             gemma4: None,
         }

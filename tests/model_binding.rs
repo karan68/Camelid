@@ -839,3 +839,87 @@ fn llama_family_with_unexpected_qk_norm_fails_closed() {
         "unexpected error: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Qwen3 explicit head_dim (feat/qwen3-family-headdim): sizes where
+// head_dim != embedding_length/head_count (0.6B/4B/32B). q_width = heads*head_dim
+// is then WIDER than embedding_length, so the binder/dims must source head_dim
+// from attention.key_length, not embedding/heads.
+// ---------------------------------------------------------------------------
+
+/// embed 16, 2 q heads, 1 kv head, key_length 16 → head_dim 16 (NOT 16/2=8),
+/// q_width = 2*16 = 32 (> embedding), kv_width = 1*16 = 16. Tied embeddings.
+fn write_qwen3_explicit_head_dim_gguf(path: &Path) {
+    let tensors: Vec<(&str, Vec<i64>)> = vec![
+        ("token_embd.weight", vec![4, 16]),
+        ("output_norm.weight", vec![16]),
+        ("blk.0.attn_norm.weight", vec![16]),
+        ("blk.0.attn_q.weight", vec![16, 32]),
+        ("blk.0.attn_q_norm.weight", vec![16]),
+        ("blk.0.attn_k.weight", vec![16, 16]),
+        ("blk.0.attn_k_norm.weight", vec![16]),
+        ("blk.0.attn_v.weight", vec![16, 16]),
+        ("blk.0.attn_output.weight", vec![32, 16]),
+        ("blk.0.ffn_norm.weight", vec![16]),
+        ("blk.0.ffn_gate.weight", vec![16, 32]),
+        ("blk.0.ffn_up.weight", vec![16, 32]),
+        ("blk.0.ffn_down.weight", vec![32, 16]),
+    ];
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    push_u32(&mut b, 3);
+    push_i64(&mut b, tensors.len() as i64);
+    push_i64(&mut b, 14);
+    push_kv_string(&mut b, "general.architecture", "qwen3");
+    push_kv_string(&mut b, "general.name", "Qwen3 Explicit HeadDim Fixture");
+    push_kv_u32(&mut b, "general.file_type", 0);
+    push_kv_u32(&mut b, "qwen3.context_length", 128);
+    push_kv_u32(&mut b, "qwen3.embedding_length", 16);
+    push_kv_u32(&mut b, "qwen3.block_count", 1);
+    push_kv_u32(&mut b, "qwen3.feed_forward_length", 32);
+    push_kv_u32(&mut b, "qwen3.attention.head_count", 2);
+    push_kv_u32(&mut b, "qwen3.attention.head_count_kv", 1);
+    push_kv_u32(&mut b, "qwen3.attention.key_length", 16);
+    push_kv_u32(&mut b, "qwen3.attention.value_length", 16);
+    push_kv_f32(&mut b, "qwen3.rope.freq_base", 1_000_000.0);
+    push_kv_f32(&mut b, "qwen3.attention.layer_norm_rms_epsilon", 1e-6);
+    push_kv_u32(&mut b, "qwen3.vocab_size", 4);
+    let mut relative_offset = 0u64;
+    for (name, dims) in &tensors {
+        push_string(&mut b, name);
+        push_u32(&mut b, dims.len() as u32);
+        for dim in dims {
+            push_i64(&mut b, *dim);
+        }
+        push_i32(&mut b, 0);
+        push_u64(&mut b, relative_offset);
+        relative_offset += dims.iter().product::<i64>() as u64 * 4;
+    }
+    while !b.len().is_multiple_of(32) {
+        b.push(0);
+    }
+    b.extend(vec![0u8; relative_offset as usize]);
+    fs::write(path, b).unwrap();
+}
+
+#[test]
+fn qwen3_explicit_head_dim_binds_wide_q_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("qwen3-explicit-headdim.gguf");
+    write_qwen3_explicit_head_dim_gguf(&path);
+
+    let gguf = read_metadata(&path).unwrap();
+    let config = LlamaModelConfig::from_gguf(&gguf).unwrap();
+    // head_dim comes from key_length (16), NOT embedding/heads (16/2=8).
+    assert_eq!(config.attention_key_length, Some(16));
+    // KV cache plan reflects the explicit head_dim.
+    let cache_plan = LlamaKvCachePlan::from_config(&config).unwrap();
+    assert_eq!(cache_plan.head_dim, 16);
+
+    // Binder accepts the wide q projection [16, 32] (q_width 32 > embedding 16)
+    // and the matching output [32, 16] — fails closed without explicit-head_dim plumbing.
+    let binding = LlamaTensorBinding::bind(&gguf, &config).unwrap();
+    assert_eq!(binding.layers[0].attention_q.dimensions, vec![16, 32]);
+    assert_eq!(binding.layers[0].attention_output.dimensions, vec![32, 16]);
+    assert!(binding.layers[0].attention_q_norm.is_some());
+}

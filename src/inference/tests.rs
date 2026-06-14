@@ -1088,6 +1088,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         vocab_size: Some(2),
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7421,6 +7422,7 @@ fn applies_rope_to_each_attention_head() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7459,6 +7461,7 @@ fn apply_rope_uses_configured_frequency_base() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7507,6 +7510,7 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7559,6 +7563,7 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7618,6 +7623,7 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7682,6 +7688,7 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7758,6 +7765,7 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7833,6 +7841,7 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9356,6 +9365,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         vocab_size: Some(3),
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9620,6 +9630,7 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9815,6 +9826,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9913,6 +9925,7 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -10054,6 +10067,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         vocab_size: Some(4),
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -10812,6 +10826,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         vocab_size: None,
         file_type: None,
         rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
