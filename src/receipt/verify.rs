@@ -189,6 +189,18 @@ pub async fn run(options: VerifyOptions) -> VerifyOutcome {
     // and weights are owned within `replay_receipt_request` and dropped on
     // return.
     if options.mode != VerifyMode::ReferenceOnly {
+        // An execution-trace block pins the deterministic CPU lane and a host ISA. We can only
+        // re-derive its rollup on the same ISA (the Q8_0 dot rounds differently across ISAs),
+        // so check the trace only when this host matches; otherwise re-run on the normal lane
+        // and skip the digest comparison with an honest note.
+        let trace_check = receipt
+            .execution_trace
+            .as_ref()
+            .map(|trace| trace.host_isa == crate::receipt::host_isa_marker())
+            .unwrap_or(false);
+        if trace_check {
+            force_deterministic_lane();
+        }
         match crate::api::replay_receipt_request(&options.gguf, options.threads, &receipt.request)
             .await
         {
@@ -203,6 +215,41 @@ pub async fn run(options: VerifyOptions) -> VerifyOutcome {
                     replay.result.prompt_token_ids.len(),
                     replay.result.generated_token_ids.len()
                 );
+                if let Some(trace) = &receipt.execution_trace {
+                    if !trace_check {
+                        println!(
+                            "SKIP execution-trace: receipt rollup is for ISA {} but this host is {}; \
+                             the digest is ISA-specific and cannot be re-derived here",
+                            trace.host_isa,
+                            crate::receipt::host_isa_marker()
+                        );
+                    } else {
+                        match &replay.execution_trace_digest {
+                            Some(rederived) if *rederived == trace.digest => {
+                                println!(
+                                    "PASS execution-trace: re-derived the {} rollup digest \
+                                     identically (lane {}, ISA {}, {} checkpoints)",
+                                    trace.algorithm, trace.lane, trace.host_isa, trace.fold_count
+                                );
+                            }
+                            Some(rederived) => {
+                                println!(
+                                    "FAIL execution-trace: re-derived rollup {rederived} != receipt \
+                                     {}",
+                                    trace.digest
+                                );
+                                return not_verified("execution-trace");
+                            }
+                            None => {
+                                println!(
+                                    "FAIL execution-trace: the re-run produced no rollup (the \
+                                     deterministic lane did not arm)"
+                                );
+                                return not_verified("execution-trace");
+                            }
+                        }
+                    }
+                }
             }
             Err(err) => {
                 println!("FAIL camelid-rerun: {err}");
@@ -256,6 +303,31 @@ pub async fn run(options: VerifyOptions) -> VerifyOutcome {
 fn not_verified(step: &str) -> VerifyOutcome {
     println!("RECEIPT NOT VERIFIED (failed step: {step})");
     VerifyOutcome::NotVerified
+}
+
+/// Pin this verifier process to the deterministic CPU lane so a receipt's execution-trace
+/// rollup re-derives identically: enable deterministic mode and force the whole Metal/GPU
+/// stack off. Mirrors the CLI `--deterministic` arm; verify-receipt is a one-shot command, so
+/// mutating process env here is safe.
+fn force_deterministic_lane() {
+    std::env::set_var("CAMELID_DETERMINISTIC", "1");
+    for key in [
+        "CAMELID_METAL_RESIDENT_DECODE",
+        "CAMELID_METAL_F32Y",
+        "CAMELID_METAL_WIRE",
+        "CAMELID_METAL_WIRE_NSG8",
+        "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_MM",
+        "CAMELID_METAL_LINEAR",
+        "CAMELID_METAL_Q8",
+        "CAMELID_METAL_Q8_RETAINED",
+        "CAMELID_HYBRID_Q8_RETAINED",
+        "CAMELID_METAL_NOCOPY",
+    ] {
+        std::env::set_var(key, "0");
+    }
+    std::env::set_var("CAMELID_NO_GPU_SAMPLE", "1");
 }
 
 /// Full verification as two isolated passes. Each pass invokes this same binary

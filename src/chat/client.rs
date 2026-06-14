@@ -29,9 +29,15 @@ pub struct Health {
 pub struct CompatRow {
     pub id: String,
     #[serde(default)]
+    pub family: String,
+    #[serde(default)]
     pub quantization: String,
     #[serde(default)]
     pub status: String,
+    /// Whether this exact row is verified to drive tool-calling (agent mode).
+    /// Default false; promoted only with a real tool-call round-trip as evidence.
+    #[serde(default)]
+    pub tool_capable: bool,
 }
 
 impl CompatRow {
@@ -737,13 +743,17 @@ mod tests {
     fn supported_predicate_reads_the_ledger_status() {
         let supported = CompatRow {
             id: "tinyllama_1_1b_chat_q8_0".into(),
+            family: "llama_bpe_decoder".into(),
             quantization: "Q8_0".into(),
             status: "supported_exact_row_smoke".into(),
+            tool_capable: false,
         };
         let planned = CompatRow {
             id: "qwen2_5_7b_instruct_q8_0".into(),
+            family: "qwen2".into(),
             quantization: "Q8_0".into(),
             status: "planned".into(),
+            tool_capable: false,
         };
         assert!(supported.is_supported());
         assert!(!planned.is_supported());

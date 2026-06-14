@@ -14,6 +14,8 @@
 //! `--model` at an unsupported GGUF is refused with the engine's typed error.
 //! See `DECISIONS.md` D6 and `RECON_CHAT.md`.
 
+mod agent;
+mod agent_eval;
 mod banner;
 mod client;
 mod clipboard;
@@ -24,6 +26,8 @@ mod palette;
 mod server;
 mod session;
 mod theme;
+mod tool_parse;
+mod tools;
 mod tui;
 
 use std::io::IsTerminal;
@@ -54,6 +58,14 @@ pub struct ChatOptions {
     pub models_dir: PathBuf,
     /// Force the inline line REPL instead of the full-screen TUI.
     pub plain: bool,
+    /// Enter agent mode (tool-calling loop) instead of plain chat.
+    pub agent: bool,
+    /// Sandbox root for agent tools (default: cwd).
+    pub workdir: Option<PathBuf>,
+    pub max_steps: usize,
+    pub auto_approve: bool,
+    pub allow_net: bool,
+    pub shell_timeout: u64,
 }
 
 /// Entry point for the `Chat` subcommand. Returns a process exit code (0 = ok,
@@ -78,16 +90,38 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
 
     // --model backstop: load + classify before any UI, so an unsupported GGUF
     // exits with the typed error and no screen takeover. Loading a cold GGUF can
-    // take several seconds, so give feedback before the UI takes the screen.
+    // take several seconds, so give feedback before the UI takes the screen. A
+    // known supported GGUF is labeled with its ledger id (so posture + the agent
+    // tool-capable gate match), exactly like the picker.
     if let Some(model) = &opts.model {
         eprintln!("Loading {} …", model.display());
-        match session.load_model_file(model, None, None)? {
+        let label = catalog_label_for(model);
+        let posture = label.as_ref().map(|_| "supported");
+        match session.load_model_file(model, label.as_deref(), posture)? {
             LoadResult::Loaded => {}
             LoadResult::Unsupported(message) => {
                 eprintln!("{message}");
                 return Ok(1);
             }
         }
+    }
+
+    // Agent mode: a tool-calling loop (line renderer), gated to tool-capable rows.
+    if opts.agent {
+        if !session.has_model() {
+            eprintln!("agent mode needs a model — pass --model <gguf>");
+            return Ok(2);
+        }
+        let cfg = agent::AgentConfig {
+            workdir: opts.workdir.unwrap_or_else(|| PathBuf::from(".")),
+            max_steps: opts.max_steps,
+            auto_approve: opts.auto_approve,
+            allow_net: opts.allow_net,
+            shell_timeout: std::time::Duration::from_secs(opts.shell_timeout),
+            max_tokens: opts.max_tokens,
+            temperature: opts.temperature,
+        };
+        return agent::run_agent(&mut session, opts.addr, cfg);
     }
 
     // Full-screen TUI when we have a real terminal on both ends and the user did
@@ -99,6 +133,40 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
         inline::run(&mut session, opts.addr, spawned)?;
     }
     Ok(0)
+}
+
+/// If `model`'s filename matches a curated-catalog row, return that catalog id
+/// (= the ledger row id) so a `--model`-loaded supported GGUF carries its ledger
+/// identity (posture + agent tool-capable gate).
+fn catalog_label_for(model: &std::path::Path) -> Option<String> {
+    let name = model.file_name()?.to_str()?;
+    camelid::api::curated_catalog()
+        .into_iter()
+        .find(|item| item.filename == name)
+        .map(|item| item.catalog_id.to_string())
+}
+
+/// Parsed `camelid agent-eval` flags.
+pub struct AgentEvalOptions {
+    pub model: PathBuf,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
+    pub max_steps: usize,
+    pub max_tokens: u32,
+    pub receipt_dir: PathBuf,
+}
+
+/// Entry for the `agent-eval` subcommand: the tool-capability promotion harness.
+/// Returns PASS(0) / FAIL(1) / INCONCLUSIVE(3).
+pub fn run_agent_eval(opts: AgentEvalOptions) -> anyhow::Result<i32> {
+    agent_eval::run(agent_eval::EvalConfig {
+        addr: opts.addr,
+        model: opts.model,
+        load_timeout: opts.load_timeout,
+        max_steps: opts.max_steps,
+        max_tokens: opts.max_tokens,
+        receipt_dir: opts.receipt_dir,
+    })
 }
 
 extern "C" fn on_sigint(_signal: libc::c_int) {

@@ -169,6 +169,29 @@ impl Session {
             .unwrap_or(false)
     }
 
+    /// The ledger `family` of the active model (drives tool-call parsing), or "".
+    pub fn active_family(&self) -> String {
+        self.ledger
+            .iter()
+            .find(|row| {
+                row.id == self.active_label || Some(row.id.as_str()) == self.active_id.as_deref()
+            })
+            .map(|row| row.family.clone())
+            .unwrap_or_default()
+    }
+
+    /// True when the active model matches a ledger row verified for tool-calling
+    /// (agent mode). Matched by the display label (the picker sets it to the
+    /// ledger id) or the server-assigned id. Honest gate: an arbitrary `--model`
+    /// that doesn't match a tool-capable row is not tool-capable.
+    pub fn active_tool_capable(&self) -> bool {
+        self.ledger.iter().any(|row| {
+            row.tool_capable
+                && (row.id == self.active_label
+                    || Some(row.id.as_str()) == self.active_id.as_deref())
+        })
+    }
+
     /// Support posture for a model id, read from the ledger ("supported" or the
     /// raw status; "loaded" when the id is not a ledger row).
     pub fn posture_for(&self, id: &str) -> String {

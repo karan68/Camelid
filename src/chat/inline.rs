@@ -104,6 +104,13 @@ fn dispatch(session: &mut Session, rl: &mut DefaultEditor, command: &str) -> any
             banner::dim("themes are a full-screen TUI feature (run without --plain)")
         ),
         "stop" => println!("{}", banner::dim("nothing to stop in line mode")),
+        "agent" => println!(
+            "{}",
+            banner::dim(
+                "agent mode runs as its own sandboxed loop — relaunch with: \
+                 camelid chat --agent --model <gguf>  (requires a tool-capable supported row)"
+            )
+        ),
         "model" => {
             if arg.is_empty() {
                 println!("usage: /model <id>   (see /models)");

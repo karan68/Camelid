@@ -306,6 +306,9 @@ pub struct ModelCompatibilityTarget {
     pub family: &'static str,
     pub quantization: &'static str,
     pub status: &'static str,
+    /// Verified (via the agent-eval harness) to drive a clean tool-call
+    /// round-trip. Promoted only with a PASS receipt; default false.
+    pub tool_capable: bool,
     pub support_scope: &'static str,
     pub full_support_status: &'static str,
     pub full_support_blockers: &'static str,
@@ -403,6 +406,11 @@ pub struct ChatCompletionRequest {
     /// channels are stripped from chat output either way. Default: false (the
     /// reference's `enable_thinking:false` rendering).
     pub camelid_enable_thinking: Option<bool>,
+    /// OpenAI-style tool/function definitions. When present, they are rendered
+    /// into the prompt through the loaded model's own chat template (Hybrid agent
+    /// mode); the model's tool-call output is parsed by the client. Models whose
+    /// template does not render tools simply ignore them.
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -833,6 +841,10 @@ pub struct GenerationSessionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Tool/function definitions, rendered into the prompt via the model's chat
+    /// template (agent mode). `None` renders identically to before.
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
@@ -1170,6 +1182,8 @@ struct GeneratedText {
     completion_tokens: usize,
     finish_reason: &'static str,
     timings: GenerationTimings,
+    /// Execution-trace rollup `(digest, fold_count)` from a deterministic run, else `None`.
+    execution_trace: Option<(String, u64)>,
 }
 
 struct GeneratedTokens {
@@ -1183,6 +1197,9 @@ struct GeneratedTokens {
     dense_diagnostic_generated_index: Option<usize>,
     finish_reason: &'static str,
     timings: GenerationTimings,
+    /// Execution-trace rollup `(digest, fold_count)` captured during a deterministic run, or
+    /// `None` when the trace was not armed (any non-deterministic generation).
+    execution_trace: Option<(String, u64)>,
 }
 
 fn collect_dense_diagnostics_for_generated_index(
@@ -1763,6 +1780,7 @@ async fn llama_server_completion(
         camelid_prompt_token_ids,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -2033,6 +2051,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         model_compatibility: vec![
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q8_0",
                 status: "supported_current_gate",
@@ -2074,6 +2093,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama32_1b_instruct_q8_0",
+                tool_capable: false,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2115,6 +2135,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama32_3b_instruct_q8_0",
+                tool_capable: true,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2156,6 +2177,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama3_8b_instruct_q8_0",
+                tool_capable: false,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2197,6 +2219,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_e4b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_ple_matformer_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2238,6 +2261,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_e2b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_ple_matformer_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2279,6 +2303,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_12b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_dense_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2320,6 +2345,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_26b_a4b_it_q4_0",
+                tool_capable: false,
                 family: "gemma4_a4b_moe_decoder",
                 quantization: "Q4_0",
                 status: "supported_exact_row_smoke",
@@ -2361,6 +2387,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q4_0/Q5_0",
                 status: "planned_phase_10",
@@ -2402,6 +2429,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_k_q5_k",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q4_K_M/Q5_K_M",
                 status: "planned_phase_10",
@@ -2443,6 +2471,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "mistral_7b_instruct_v0_3_q8_0",
+                tool_capable: false,
                 family: "mistral",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2484,6 +2513,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
+                tool_capable: false,
                 family: "mixtral_moe",
                 quantization: "Q8_0",
                 status: "active_validation_partial_runtime",
@@ -2525,6 +2555,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
+                tool_capable: false,
                 family: "qwen_decoder",
                 quantization: "Q8_0",
                 status: "planned_exact_row_candidate",
@@ -2566,6 +2597,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma2_9b_it_q8_0",
+                tool_capable: false,
                 family: "gemma2_decoder",
                 quantization: "Q8_0",
                 status: "planned_exact_row_candidate",
@@ -4444,6 +4476,7 @@ async fn completions(
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
     };
@@ -4481,6 +4514,7 @@ async fn completions(
                 completion_tokens,
                 finish_reason,
                 timings,
+                execution_trace: _,
             } = generated;
             (
                 StatusCode::OK,
@@ -4590,6 +4624,7 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -4770,6 +4805,20 @@ async fn build_server_receipt(
         let models = state.loaded_models.read().await;
         models.get(model_id)?.lane.clone()
     };
+    // Attach the execution-trace rollup only for reproducible (deterministic, greedy) runs that
+    // actually captured one. Non-reproducible or non-deterministic runs leave it absent, so the
+    // receipt serializes and digests exactly as before.
+    let execution_trace = generated
+        .execution_trace
+        .as_ref()
+        .filter(|_| stamp.reproducible)
+        .map(|(digest, fold_count)| {
+            receipt::ExecutionTraceBlock::rollup_v1(
+                digest.clone(),
+                *fold_count,
+                generated.generated_token_ids.len(),
+            )
+        });
     let mut receipt = ParityReceipt {
         schema: RECEIPT_SCHEMA_V1.to_string(),
         receipt_id: String::new(),
@@ -4800,6 +4849,7 @@ async fn build_server_receipt(
             finish_reason: generated.finish_reason.to_string(),
         },
         parity: ParityBlock::not_compared(),
+        execution_trace,
         signature: None,
     };
     if let Err(err) = receipt.seal() {
@@ -4818,6 +4868,9 @@ async fn build_server_receipt(
 pub struct ReceiptReplay {
     pub lane: LaneIdentity,
     pub result: ReceiptResult,
+    /// Execution-trace rollup digest re-derived by this replay, when the replay ran on the
+    /// deterministic lane (else `None`). Verification compares it against the receipt's block.
+    pub execution_trace_digest: Option<String>,
 }
 
 /// Replay a receipt's request through the exact non-streaming generation path
@@ -4874,6 +4927,7 @@ pub async fn replay_receipt_request(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
     };
@@ -4887,6 +4941,7 @@ pub async fn replay_receipt_request(
     };
     Ok(ReceiptReplay {
         lane: loaded.lane,
+        execution_trace_digest: generated.execution_trace.map(|(digest, _)| digest),
         result: ReceiptResult {
             prompt_token_ids: generated.prompt_token_ids,
             generated_token_ids: generated.generated_token_ids,
@@ -5176,6 +5231,7 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
+    let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
     let sampling = sampling_config_from_request(&req).map_err(|response| *response)?;
@@ -5265,11 +5321,16 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
-            let rendered_prompt = render_chat_prompt_for_tokenization_for_model_result(
-                &messages,
-                &tokenizer,
-                Some(&model.id),
-            )
+            let rendered_prompt = match request_tools.as_deref() {
+                Some(tools) if !tools.is_empty() => {
+                    render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
+                }
+                _ => render_chat_prompt_for_tokenization_for_model_result(
+                    &messages,
+                    &tokenizer,
+                    Some(&model.id),
+                ),
+            }
             .map_err(|err| {
                 api_error(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -6337,6 +6398,7 @@ fn generate_decoded_tokens(
         dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
         finish_reason: generated.finish_reason,
         timings: generated.timings,
+        execution_trace: generated.execution_trace,
     })
 }
 
@@ -6510,7 +6572,13 @@ fn generate_token_ids(
     let mut sample = 0;
     let mut reused_prompt_prefix = false;
 
-    if !prepared.collect_dense_diagnostics {
+    // The execution-trace rollup is captured only on the deterministic CPU lane (the only lane
+    // where it is reduction-order-stable). When it will be armed, bypass the prompt-prefix cache
+    // so the served run and any later verify re-run fold an identical forward (a cache hit skips
+    // the prompt forwards on one side only, which would desync the digest).
+    let want_execution_trace = crate::inference::deterministic_mode_enabled();
+
+    if !prepared.collect_dense_diagnostics && !want_execution_trace {
         if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
             prepared.session = cached.session.clone();
             // The cached session's resident-path pin reflects the request
@@ -6541,6 +6609,10 @@ fn generate_token_ids(
             }
         }
     }
+
+    // Arm the rollup now that the session is settled (past any prompt-cache swap). Fails closed
+    // unless deterministic mode is active, so non-deterministic generations never trace.
+    let tracing_armed = want_execution_trace && prepared.session.enable_execution_trace();
 
     for _ in generated.len() as u32..prepared.max_tokens {
         if finish_reason != "length" {
@@ -6816,6 +6888,16 @@ fn generate_token_ids(
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
 
+    // Finalize the rollup before any field is moved out of `prepared`.
+    let execution_trace = if tracing_armed {
+        let fold_count = prepared.session.execution_trace_fold_count();
+        prepared
+            .session
+            .take_execution_trace_digest()
+            .zip(fold_count)
+    } else {
+        None
+    };
     Ok(GeneratedTokens {
         prompt_token_ids: prepared.token_ids,
         token_ids: generated,
@@ -6827,6 +6909,7 @@ fn generate_token_ids(
         dense_diagnostic_generated_index,
         finish_reason,
         timings: prepared.timings,
+        execution_trace,
     })
 }
 
@@ -7608,11 +7691,13 @@ fn render_chat_prompt_for_tokenization_for_model_result(
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
         if metadata_chat_template_enabled() {
-            return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
+            return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
         if let Some(row_label) = exact_llama32_metadata_jinja_row {
             if is_llama3_instruct_template(template) {
-                return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
+                return render_metadata_jinja_chat_template_prompt(
+                    messages, tokenizer, template, None,
+                );
             }
             return Err(exact_llama32_metadata_jinja_chat_template_error(
                 &format!(
@@ -7626,6 +7711,42 @@ fn render_chat_prompt_for_tokenization_for_model_result(
         )));
     }
 
+    Ok(render_chat_prompt_for_tokenization_fallback(
+        messages, tokenizer,
+    ))
+}
+
+/// Agent mode: render the chat prompt with tool definitions threaded into the
+/// model's own chat template. Used only when a request carries `tools`; when the
+/// model has no chat template, tools cannot be rendered and we fall back.
+fn render_chat_prompt_for_tokenization_with_tools(
+    messages: &[ChatMessage],
+    tokenizer: &Tokenizer,
+    tools: &[serde_json::Value],
+) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
+    // Normalize OpenAI-style `{ "type":"function", "function":{…} }` tools to the
+    // flat function objects (`{ "name", "description", "parameters" }`) the chat
+    // templates (Llama 3.x etc.) actually render — matching llama.cpp / vLLM. This
+    // keeps the wire format OpenAI-standard while the prompt the model sees aligns
+    // with the `{"name":…, "parameters":…}` response format the template requests
+    // (the nested envelope otherwise leaks into the prompt and small models echo
+    // the schema). See `TOOLCALL_DIAG.md`.
+    let normalized: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            tool.get("function")
+                .cloned()
+                .unwrap_or_else(|| tool.clone())
+        })
+        .collect();
+    if let Some(template) = tokenizer.chat_template.as_deref() {
+        return render_metadata_jinja_chat_template_prompt(
+            messages,
+            tokenizer,
+            template,
+            Some(&normalized),
+        );
+    }
     Ok(render_chat_prompt_for_tokenization_fallback(
         messages, tokenizer,
     ))
@@ -7813,8 +7934,9 @@ fn render_metadata_jinja_chat_template_prompt(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     template: &str,
+    tools: Option<&[serde_json::Value]>,
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
-    let rendered = render_jinja_chat_template(messages, tokenizer, template)?;
+    let rendered = render_jinja_chat_template(messages, tokenizer, template, tools)?;
     Ok(RenderedPrompt {
         add_special: !rendered_prompt_starts_with_token_text(
             &rendered,
@@ -7830,6 +7952,7 @@ fn render_jinja_chat_template(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     template: &str,
+    tools: Option<&[serde_json::Value]>,
 ) -> std::result::Result<String, MiniJinjaError> {
     let template_messages = messages
         .iter()
@@ -7854,6 +7977,11 @@ fn render_jinja_chat_template(
         eom_token => eom_token,
         unk_token => unk_token,
         add_generation_prompt => true,
+        // Agent mode: the model's own template renders these. When `tools` is
+        // None both resolve to none, so the template takes its no-tools path and
+        // the render is byte-identical to before.
+        tools => tools,
+        custom_tools => tools,
     })
 }
 
@@ -9798,6 +9926,40 @@ mod tests {
         );
     }
 
+    /// TOOLCALL_DIAG: prints how the Llama 3 template renders OpenAI-nested vs
+    /// flat function tools, so the rendered prompt is inspectable (run with
+    /// `--nocapture`). Asserts the flat form puts `"name"`/`"parameters"` at the
+    /// tool's top level (matching the response format the template requests).
+    #[test]
+    fn tool_render_nested_vs_flat_diagnostic() {
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+        let user = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "read notes.txt".to_string(),
+        }];
+        let nested = serde_json::json!([{
+            "type":"function",
+            "function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}
+        }]);
+        let flat = serde_json::json!([{
+            "name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }]);
+        let n = nested.as_array().unwrap();
+        let f = flat.as_array().unwrap();
+        let r_nested =
+            render_jinja_chat_template(&user, &tokenizer, LLAMA3_METADATA_FULL_TEMPLATE, Some(n))
+                .unwrap();
+        let r_flat =
+            render_jinja_chat_template(&user, &tokenizer, LLAMA3_METADATA_FULL_TEMPLATE, Some(f))
+                .unwrap();
+        println!("\n===== NESTED (OpenAI) tools =====\n{r_nested}\n===== FLAT (function) tools =====\n{r_flat}\n=====");
+        assert!(r_nested.contains("\"type\": \"function\""));
+        assert!(!r_flat.contains("\"type\": \"function\""));
+        assert!(r_flat.contains("\"name\": \"read_file\""));
+        assert!(r_flat.contains("\"parameters\""));
+    }
+
     #[test]
     fn exact_llama32_1b_row_uses_metadata_jinja_renderer_without_env_opt_in_system_user() {
         let _guard = crate::test_support::env_lock();
@@ -10156,8 +10318,8 @@ mod tests {
         let template = "{{ raise_exception('unsupported chat-template branch') }}";
         let tokenizer = llama3_tokenizer_with_template(template);
 
-        let err =
-            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+        let err = render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template, None)
+            .unwrap_err();
         assert!(err.to_string().contains("unsupported chat-template branch"));
 
         let rendered = render_chat_prompt_for_tokenization(
@@ -10332,8 +10494,8 @@ mod tests {
         let template = "{{ unsupported_template_variable }}";
         let tokenizer = llama3_tokenizer_with_template(template);
 
-        let err =
-            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+        let err = render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template, None)
+            .unwrap_err();
 
         assert_eq!(err.kind(), MiniJinjaErrorKind::UndefinedError);
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
