@@ -2756,6 +2756,49 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn qwen3_chatml_prompt_renders_thinking_disabled_generation_prompt() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "What is the capital of France?".to_string(),
+        }];
+        let prompt = render_qwen3_chatml_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn qwen3_chatml_template_detected_and_no_generation_prompt_after_assistant_turn() {
+        assert!(is_qwen3_chatml_template(
+            "{%- if ... %}<|im_start|>...<|im_end|>..."
+        ));
+        assert!(!is_qwen3_chatml_template(
+            "<|start_header_id|>...<|eot_id|>"
+        ));
+        // A trailing assistant turn must NOT get an extra generation prompt.
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let prompt = render_qwen3_chatml_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
+        );
+    }
+
+    #[test]
     fn strip_channels_removes_thinking_spans() {
         assert_eq!(
             gemma4_strip_channels("<|channel>secret plan<channel|>Paris"),
@@ -7636,6 +7679,16 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: true,
             };
         }
+        if is_qwen3_chatml_template(template) {
+            return RenderedPrompt {
+                text: render_qwen3_chatml_prompt(messages),
+                // Qwen3 has add_bos_token=false; the ChatML template fully
+                // specifies the prompt. Parse specials so <|im_start|>/<|im_end|>
+                // become control token ids (151644/151645), not literal text.
+                add_special: false,
+                parse_special: true,
+            };
+        }
     }
 
     RenderedPrompt {
@@ -7643,6 +7696,34 @@ fn render_chat_prompt_for_tokenization_fallback(
         add_special: true,
         parse_special: tokenizer.chat_prompt_parse_special(),
     }
+}
+
+/// Render a Qwen3 ChatML prompt with thinking **disabled** (the deterministic,
+/// parity-locked mode). Mirrors the GGUF jinja template for the standard cases
+/// (optional leading system turn, then user/assistant turns), then appends the
+/// thinking-disabled generation prompt `<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+/// Verified token-identical to the reference for single-turn user prompts.
+fn render_qwen3_chatml_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        // If the caller already supplied a trailing assistant turn, don't append
+        // another generation prompt.
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        // Thinking disabled: the empty <think></think> block matches the GGUF
+        // template's `enable_thinking is false` branch, giving a direct,
+        // deterministic answer for parity.
+        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+    prompt
 }
 
 #[cfg(test)]
@@ -7666,6 +7747,14 @@ fn is_mistral_instruct_template(template: &str) -> bool {
     template.contains("[INST]")
         && template.contains("[/INST]")
         && (template.contains("bos_token") || template.contains("</s>"))
+}
+
+/// Qwen3 (and Qwen2) ChatML template detector: `<|im_start|>` / `<|im_end|>`
+/// turn markers. camelid's minijinja cannot render the full Qwen3 jinja template
+/// (it uses constructs that evaluate to undefined), so the dense ChatML path is
+/// rendered by [`render_qwen3_chatml_prompt`] instead.
+fn is_qwen3_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>") && template.contains("<|im_end|>")
 }
 
 fn exact_llama32_metadata_jinja_chat_template_error(message: &str) -> MiniJinjaError {
@@ -8115,8 +8204,8 @@ mod tests {
         model::LlamaModelConfig,
         tensor::CpuTensor,
         tokenizer::{
-            BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig,
-            TokenizerModel,
+            BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer,
+            TokenizerConfig, TokenizerModel,
         },
     };
 
@@ -9270,6 +9359,7 @@ mod tests {
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![
                 Token {
                     id: 0,
@@ -9328,6 +9418,7 @@ mod tests {
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = Tokenizer {
             model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: Vec::new(),
             token_to_id: HashMap::new(),
             byte_token_to_id: HashMap::new(),
@@ -10301,6 +10392,7 @@ mod tests {
     fn mistral_test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![
                 Token {
                     id: 0,
@@ -10451,6 +10543,7 @@ mod tests {
     fn llama3_tokenizer_with_template(template: &str) -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![Token {
                 id: 0,
                 text: "<|begin_of_text|>".to_string(),
@@ -10494,6 +10587,8 @@ mod tests {
                 attention_k: desc("blk.0.attn_k.weight"),
                 attention_v: desc("blk.0.attn_v.weight"),
                 attention_output: desc("blk.0.attn_output.weight"),
+                attention_q_norm: None,
+                attention_k_norm: None,
                 ffn_norm: desc("blk.0.ffn_norm.weight"),
                 ffn: LlamaFfnTensors::Dense {
                     gate: desc("blk.0.ffn_gate.weight"),
@@ -10606,6 +10701,7 @@ mod tests {
     fn test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: Vec::new(),
             token_to_id: HashMap::new(),
             byte_token_to_id: HashMap::new(),
@@ -10772,6 +10868,7 @@ mod tests {
             rms_norm_epsilon: 1e-6,
             vocab_size: Some(3),
             file_type: Some(0),
+            rope_neox_pairing: false,
             moe: None,
             gemma4: None,
         }
@@ -10808,6 +10905,8 @@ mod tests {
                 ffn_gate: select_rows("blk.0.ffn_gate.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_up: select_rows("blk.0.ffn_up.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_down: select_rows("blk.0.ffn_down.weight", hidden, ffn, &[0, 1, 2, 3]),
+                attention_q_norm: None,
+                attention_k_norm: None,
                 moe_router: None,
             }],
             layer_range: None,
