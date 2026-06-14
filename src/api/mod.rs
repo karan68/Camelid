@@ -1182,6 +1182,8 @@ struct GeneratedText {
     completion_tokens: usize,
     finish_reason: &'static str,
     timings: GenerationTimings,
+    /// Execution-trace rollup `(digest, fold_count)` from a deterministic run, else `None`.
+    execution_trace: Option<(String, u64)>,
 }
 
 struct GeneratedTokens {
@@ -1195,6 +1197,9 @@ struct GeneratedTokens {
     dense_diagnostic_generated_index: Option<usize>,
     finish_reason: &'static str,
     timings: GenerationTimings,
+    /// Execution-trace rollup `(digest, fold_count)` captured during a deterministic run, or
+    /// `None` when the trace was not armed (any non-deterministic generation).
+    execution_trace: Option<(String, u64)>,
 }
 
 fn collect_dense_diagnostics_for_generated_index(
@@ -4509,6 +4514,7 @@ async fn completions(
                 completion_tokens,
                 finish_reason,
                 timings,
+                execution_trace: _,
             } = generated;
             (
                 StatusCode::OK,
@@ -4799,6 +4805,20 @@ async fn build_server_receipt(
         let models = state.loaded_models.read().await;
         models.get(model_id)?.lane.clone()
     };
+    // Attach the execution-trace rollup only for reproducible (deterministic, greedy) runs that
+    // actually captured one. Non-reproducible or non-deterministic runs leave it absent, so the
+    // receipt serializes and digests exactly as before.
+    let execution_trace = generated
+        .execution_trace
+        .as_ref()
+        .filter(|_| stamp.reproducible)
+        .map(|(digest, fold_count)| {
+            receipt::ExecutionTraceBlock::rollup_v1(
+                digest.clone(),
+                *fold_count,
+                generated.generated_token_ids.len(),
+            )
+        });
     let mut receipt = ParityReceipt {
         schema: RECEIPT_SCHEMA_V1.to_string(),
         receipt_id: String::new(),
@@ -4829,6 +4849,7 @@ async fn build_server_receipt(
             finish_reason: generated.finish_reason.to_string(),
         },
         parity: ParityBlock::not_compared(),
+        execution_trace,
         signature: None,
     };
     if let Err(err) = receipt.seal() {
@@ -4847,6 +4868,9 @@ async fn build_server_receipt(
 pub struct ReceiptReplay {
     pub lane: LaneIdentity,
     pub result: ReceiptResult,
+    /// Execution-trace rollup digest re-derived by this replay, when the replay ran on the
+    /// deterministic lane (else `None`). Verification compares it against the receipt's block.
+    pub execution_trace_digest: Option<String>,
 }
 
 /// Replay a receipt's request through the exact non-streaming generation path
@@ -4917,6 +4941,7 @@ pub async fn replay_receipt_request(
     };
     Ok(ReceiptReplay {
         lane: loaded.lane,
+        execution_trace_digest: generated.execution_trace.map(|(digest, _)| digest),
         result: ReceiptResult {
             prompt_token_ids: generated.prompt_token_ids,
             generated_token_ids: generated.generated_token_ids,
@@ -6373,6 +6398,7 @@ fn generate_decoded_tokens(
         dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
         finish_reason: generated.finish_reason,
         timings: generated.timings,
+        execution_trace: generated.execution_trace,
     })
 }
 
@@ -6546,7 +6572,13 @@ fn generate_token_ids(
     let mut sample = 0;
     let mut reused_prompt_prefix = false;
 
-    if !prepared.collect_dense_diagnostics {
+    // The execution-trace rollup is captured only on the deterministic CPU lane (the only lane
+    // where it is reduction-order-stable). When it will be armed, bypass the prompt-prefix cache
+    // so the served run and any later verify re-run fold an identical forward (a cache hit skips
+    // the prompt forwards on one side only, which would desync the digest).
+    let want_execution_trace = crate::inference::deterministic_mode_enabled();
+
+    if !prepared.collect_dense_diagnostics && !want_execution_trace {
         if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
             prepared.session = cached.session.clone();
             // The cached session's resident-path pin reflects the request
@@ -6577,6 +6609,10 @@ fn generate_token_ids(
             }
         }
     }
+
+    // Arm the rollup now that the session is settled (past any prompt-cache swap). Fails closed
+    // unless deterministic mode is active, so non-deterministic generations never trace.
+    let tracing_armed = want_execution_trace && prepared.session.enable_execution_trace();
 
     for _ in generated.len() as u32..prepared.max_tokens {
         if finish_reason != "length" {
@@ -6852,6 +6888,16 @@ fn generate_token_ids(
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
 
+    // Finalize the rollup before any field is moved out of `prepared`.
+    let execution_trace = if tracing_armed {
+        let fold_count = prepared.session.execution_trace_fold_count();
+        prepared
+            .session
+            .take_execution_trace_digest()
+            .zip(fold_count)
+    } else {
+        None
+    };
     Ok(GeneratedTokens {
         prompt_token_ids: prepared.token_ids,
         token_ids: generated,
@@ -6863,6 +6909,7 @@ fn generate_token_ids(
         dense_diagnostic_generated_index,
         finish_reason,
         timings: prepared.timings,
+        execution_trace,
     })
 }
 

@@ -473,3 +473,42 @@ capable; the OpenAI-nested render had been breaking it (it `FAIL`ed before the f
 label to the ledger id, so `active_tool_capable()` matches). The 1B remains `FAIL`/gated (too weak);
 Qwen3-4B `FAIL`ed by reasoning in `<think>` instead of emitting the call (and isn't a ledger row);
 both are honest non-promotions. The gate, harness, and ledger all read the one `tool_capable` flag.
+## D11 — Execution-trace rollup, Pillar Two (2026-06-14)
+
+Built on D9: now that the deterministic CPU forward pass is bit-exact, a receipt can carry a
+cryptographic **execution-trace rollup** — proof of *how* the computation ran, not just which
+tokens came out. This is the "later portable execution-trace feature" D9 was the foundation for.
+
+**Shape — single rollup (chosen over per-layer-localized or final-logits-only).** One streaming
+SHA-256 (`ExecutionTraceHasher`, `camelid.execution-trace/v1`, `sha256-rollup-v1`) folds, in
+forward order across every generated token, each transformer layer's output hidden state and the
+final logits (domain-separated by a kind byte + index + length prefix; little-endian f32 bytes).
+A mismatch on re-derivation proves the run differs but does not localize the token/layer — that
+is the single-rollup tradeoff, chosen for the simplest end-to-end slice. Runtime cost is
+negligible (the bytes are already materialized; SHA-256 is multi-GB/s — sub-1% of decode), so
+scope, not speed, drove the choice.
+
+**Only meaningful on the deterministic lane; fail-closed.** `LlamaInferenceSession::
+enable_execution_trace()` refuses to arm unless `deterministic_mode_enabled()` (RECEIPTS.md
+rule 2 — a digest over a non-reproducible run is meaningless). The default (non-deterministic)
+path never allocates the hasher and is byte-for-byte unchanged; the receipt field is
+`Option<ExecutionTraceBlock>` with `skip_serializing_if = None`, so non-traced receipts serialize
+and digest exactly as before (proven by `execution_trace_absent_keeps_receipt_byte_identical`).
+
+**Emission and verification cannot desync — they share one path.** Both the served generation and
+`verify-receipt`'s re-run funnel through `replay_receipt_request → generate_decoded_tokens`, where
+the rollup is armed (when deterministic) and captured once. When tracing, the prompt-prefix cache
+is bypassed (a cache hit would skip the prompt forwards on one side only). Verification re-derives
+the digest from an independent re-run and checks it matches; the rollup is included in the
+`receipt_id` digest, so it is itself tamper-evident.
+
+**ISA-pinned, not cross-ISA-portable.** The digest is reduction-order-stable on the deterministic
+CPU lane but ISA-specific (the Q8_0 dot rounds differently across ISAs), so the block records
+`lane` (`deterministic-cpu`) and `host_isa` (e.g. `aarch64-i8mm`). `verify-receipt` re-derives only
+when the verifier's ISA matches; otherwise it prints `SKIP execution-trace` rather than a false
+`FAIL`. The committed test digest is the M4/i8mm reference (i8mm-guarded), matching the D9 pattern.
+
+**Proof:** `tests/execution_trace.rs` (engine rollup: run-to-run + thread-count invariant +
+prompt-sensitive + pinned + fail-closed) and `tests/execution_trace_receipt.rs` (the full
+emit→re-derive round trip through the real API replay path). Not built here: per-layer/per-token
+localization, distributed (per-shard) trace chains, signing.
