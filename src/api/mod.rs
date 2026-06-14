@@ -2756,6 +2756,49 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn qwen3_chatml_prompt_renders_thinking_disabled_generation_prompt() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "What is the capital of France?".to_string(),
+        }];
+        let prompt = render_qwen3_chatml_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn qwen3_chatml_template_detected_and_no_generation_prompt_after_assistant_turn() {
+        assert!(is_qwen3_chatml_template(
+            "{%- if ... %}<|im_start|>...<|im_end|>..."
+        ));
+        assert!(!is_qwen3_chatml_template(
+            "<|start_header_id|>...<|eot_id|>"
+        ));
+        // A trailing assistant turn must NOT get an extra generation prompt.
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let prompt = render_qwen3_chatml_prompt(&messages);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
+        );
+    }
+
+    #[test]
     fn strip_channels_removes_thinking_spans() {
         assert_eq!(
             gemma4_strip_channels("<|channel>secret plan<channel|>Paris"),
@@ -7636,6 +7679,16 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: true,
             };
         }
+        if is_qwen3_chatml_template(template) {
+            return RenderedPrompt {
+                text: render_qwen3_chatml_prompt(messages),
+                // Qwen3 has add_bos_token=false; the ChatML template fully
+                // specifies the prompt. Parse specials so <|im_start|>/<|im_end|>
+                // become control token ids (151644/151645), not literal text.
+                add_special: false,
+                parse_special: true,
+            };
+        }
     }
 
     RenderedPrompt {
@@ -7643,6 +7696,34 @@ fn render_chat_prompt_for_tokenization_fallback(
         add_special: true,
         parse_special: tokenizer.chat_prompt_parse_special(),
     }
+}
+
+/// Render a Qwen3 ChatML prompt with thinking **disabled** (the deterministic,
+/// parity-locked mode). Mirrors the GGUF jinja template for the standard cases
+/// (optional leading system turn, then user/assistant turns), then appends the
+/// thinking-disabled generation prompt `<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+/// Verified token-identical to the reference for single-turn user prompts.
+fn render_qwen3_chatml_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        // If the caller already supplied a trailing assistant turn, don't append
+        // another generation prompt.
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        // Thinking disabled: the empty <think></think> block matches the GGUF
+        // template's `enable_thinking is false` branch, giving a direct,
+        // deterministic answer for parity.
+        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    }
+    prompt
 }
 
 #[cfg(test)]
@@ -7666,6 +7747,14 @@ fn is_mistral_instruct_template(template: &str) -> bool {
     template.contains("[INST]")
         && template.contains("[/INST]")
         && (template.contains("bos_token") || template.contains("</s>"))
+}
+
+/// Qwen3 (and Qwen2) ChatML template detector: `<|im_start|>` / `<|im_end|>`
+/// turn markers. camelid's minijinja cannot render the full Qwen3 jinja template
+/// (it uses constructs that evaluate to undefined), so the dense ChatML path is
+/// rendered by [`render_qwen3_chatml_prompt`] instead.
+fn is_qwen3_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>") && template.contains("<|im_end|>")
 }
 
 fn exact_llama32_metadata_jinja_chat_template_error(message: &str) -> MiniJinjaError {

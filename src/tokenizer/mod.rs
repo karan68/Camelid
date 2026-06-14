@@ -663,9 +663,16 @@ impl Tokenizer {
             return None;
         }
 
+        // Match both CONTROL and USER_DEFINED ("added") tokens, mirroring
+        // llama.cpp's special-token partition. Qwen3 marks <think>/</think>
+        // (and many <|...|> markers) as USER_DEFINED (type 4) rather than CONTROL
+        // (type 3); without matching USER_DEFINED, a rendered ChatML template's
+        // literal "</think>" tokenizes as text instead of the single special
+        // token, and chat generation diverges from the reference.
         self.tokens
             .iter()
-            .filter(|token| token.kind == TokenKind::Control)
+            .filter(|token| matches!(token.kind, TokenKind::Control | TokenKind::UserDefined))
+            .filter(|token| !token.text.is_empty())
             .filter(|token| text[byte_start..].starts_with(&token.text))
             .max_by_key(|token| token.text.len())
             .map(|token| (token.text.as_str(), token.text.len()))
