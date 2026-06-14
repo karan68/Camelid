@@ -16,10 +16,14 @@
 
 mod banner;
 mod client;
+mod clipboard;
 mod inline;
+mod markdown;
 mod models;
+mod palette;
 mod server;
 mod session;
+mod theme;
 mod tui;
 
 use std::io::IsTerminal;

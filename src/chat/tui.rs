@@ -4,6 +4,10 @@
 //! background thread that forwards deltas over a channel, so the UI stays
 //! responsive and Ctrl-C cancels mid-stream. Everything rides the same audited
 //! HTTP/SSE client and the shared [`Session`] core.
+//!
+//! Features: a `/` command palette, instant switching between models already
+//! loaded in the server, Markdown-rendered replies, a live streaming spinner +
+//! tok/s, a context gauge, themes, and clipboard copy.
 
 use std::io::Stdout;
 use std::net::SocketAddr;
@@ -21,23 +25,21 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph};
 use ratatui::{Frame, Terminal};
 
-use super::banner;
-use super::client::StreamEnd;
+use super::client::{LoadedInfo, StreamEnd};
+use super::markdown;
 use super::models::{Availability, PickerRow};
+use super::palette;
 use super::session::{self, Role, Session};
+use super::theme::Theme;
+use super::{banner, clipboard};
 
-const TAN: Color = Color::Indexed(179);
-const SAND: Color = Color::Indexed(223);
-const DIMC: Color = Color::Indexed(245);
-const USERC: Color = Color::Indexed(110);
-const CODEC: Color = Color::Indexed(151);
+const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// A message from the streaming worker thread to the UI loop.
 enum StreamMsg {
     Delta(String),
     Done(u32),
@@ -51,15 +53,20 @@ enum Mode {
     Help,
 }
 
-/// Work that must run with the terminal temporarily restored (so `curl`'s
-/// download progress is visible): leave the alt-screen, run it, re-enter.
 enum Suspend {
     Pull(String),
     DownloadAndLoad(usize),
 }
 
+/// One row of the model browser: a model already loaded (instant switch) or a
+/// supported catalog row (load/download).
+enum PickEntry {
+    Loaded(LoadedInfo, bool),
+    Catalog(PickerRow),
+}
+
 struct PickerUi {
-    rows: Vec<PickerRow>,
+    entries: Vec<PickEntry>,
     state: ListState,
 }
 
@@ -86,18 +93,24 @@ struct App<'a> {
     session: &'a mut Session,
     addr: SocketAddr,
     spawned: bool,
+    theme: Theme,
     input: String,
-    cursor: usize, // byte offset into input
+    cursor: usize,
     scroll: usize,
     last_max_scroll: usize,
     follow: bool,
     sidebar: bool,
     mode: Mode,
     picker: PickerUi,
+    palette_open: bool,
+    palette_sel: usize,
+    palette_dismissed: bool,
     status: String,
+    frame: u64,
     stream_rx: Option<Receiver<StreamMsg>>,
     streaming: bool,
     live: String,
+    live_tokens: u32,
     started: Option<Instant>,
     stats: Option<String>,
     history: Vec<String>,
@@ -109,13 +122,14 @@ struct App<'a> {
 impl<'a> App<'a> {
     fn new(session: &'a mut Session, addr: SocketAddr, spawned: bool) -> Self {
         let status = format!(
-            "server {} at {addr} · F1 help · Tab sidebar · /models to switch",
+            "server {} at {addr} · type / for commands · F1 help",
             if spawned { "spawned" } else { "attached" }
         );
         App {
             session,
             addr,
             spawned,
+            theme: Theme::Sandstorm,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -124,13 +138,18 @@ impl<'a> App<'a> {
             sidebar: true,
             mode: Mode::Normal,
             picker: PickerUi {
-                rows: Vec::new(),
+                entries: Vec::new(),
                 state: ListState::default(),
             },
+            palette_open: false,
+            palette_sel: 0,
+            palette_dismissed: false,
             status,
+            frame: 0,
             stream_rx: None,
             streaming: false,
             live: String::new(),
+            live_tokens: 0,
             started: None,
             stats: None,
             history: Vec::new(),
@@ -145,9 +164,12 @@ impl<'a> App<'a> {
             self.open_picker();
         }
         while !self.quit {
+            self.frame = self.frame.wrapping_add(1);
             terminal.draw(|f| self.draw(f))?;
             self.poll_stream();
-            if event::poll(Duration::from_millis(50))? {
+            // Poll faster while streaming so the spinner animates smoothly.
+            let timeout = if self.streaming { 80 } else { 120 };
+            if event::poll(Duration::from_millis(timeout))? {
                 match event::read()? {
                     Event::Key(key) if key.kind != KeyEventKind::Release => self.on_key(key),
                     Event::Mouse(m) => match m.kind {
@@ -186,9 +208,11 @@ impl<'a> App<'a> {
         self.stream_rx = Some(rx);
         self.streaming = true;
         self.live.clear();
+        self.live_tokens = 0;
         self.started = Some(Instant::now());
         self.stats = None;
         self.follow = true;
+        self.scroll = usize::MAX;
     }
 
     fn poll_stream(&mut self) {
@@ -207,6 +231,7 @@ impl<'a> App<'a> {
             match msg {
                 StreamMsg::Delta(d) => {
                     self.live.push_str(&d);
+                    self.live_tokens += 1;
                     if self.follow {
                         self.scroll = usize::MAX;
                     }
@@ -217,22 +242,25 @@ impl<'a> App<'a> {
                 }
                 StreamMsg::Cancelled => {
                     self.session.pop_last();
-                    self.streaming = false;
-                    self.stream_rx = None;
-                    self.live.clear();
+                    self.end_stream();
                     self.status = "interrupted — turn discarded".into();
                     return;
                 }
                 StreamMsg::Error(e) => {
                     self.session.pop_last();
-                    self.streaming = false;
-                    self.stream_rx = None;
-                    self.live.clear();
+                    self.end_stream();
                     self.status = format!("generation failed: {e}");
                     return;
                 }
             }
         }
+    }
+
+    fn end_stream(&mut self) {
+        self.streaming = false;
+        self.stream_rx = None;
+        self.live.clear();
+        self.live_tokens = 0;
     }
 
     fn finish(&mut self, completion: Option<u32>) {
@@ -249,21 +277,22 @@ impl<'a> App<'a> {
             Some(n) => format!("{n} tok · {secs:.1}s"),
             None => format!("{secs:.1}s"),
         });
-        self.streaming = false;
-        self.stream_rx = None;
+        self.end_stream();
     }
 
     // ---- input / commands ------------------------------------------------
 
     fn submit(&mut self) {
         let text = self.input.trim().to_string();
+        self.input.clear();
+        self.cursor = 0;
+        self.palette_open = false;
+        self.palette_dismissed = false;
         if text.is_empty() {
             return;
         }
         self.history.push(text.clone());
         self.hist_idx = None;
-        self.input.clear();
-        self.cursor = 0;
         if let Some(command) = text.strip_prefix('/') {
             self.command(command);
         } else if self.session.has_model() {
@@ -276,10 +305,12 @@ impl<'a> App<'a> {
 
     fn command(&mut self, command: &str) {
         let mut parts = command.splitn(2, char::is_whitespace);
-        let name = parts.next().unwrap_or("");
+        let raw = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
+        let name = palette::resolve(raw).map(|c| c.name).unwrap_or(raw);
         match name {
             "models" => self.open_picker(),
+            "switch" => self.open_picker(),
             "model" => self.select_by_id(arg),
             "set" => {
                 let mut kv = arg.splitn(2, char::is_whitespace);
@@ -309,11 +340,29 @@ impl<'a> App<'a> {
                     self.status = "system prompt set (next turn)".into();
                 }
             }
-            "reset" | "clear" => {
+            "reset" => {
                 self.session.reset_history();
                 self.status = "history cleared".into();
             }
-            "retry" | "regenerate" => self.retry(),
+            "retry" => self.retry(),
+            "stop" => {
+                if self.streaming {
+                    session::CANCEL.store(true, Ordering::SeqCst);
+                    self.status = "stopping…".into();
+                } else {
+                    self.status = "nothing is generating".into();
+                }
+            }
+            "copy" => self.copy_last(),
+            "theme" => {
+                self.theme = if arg.is_empty() {
+                    self.theme.next()
+                } else {
+                    Theme::from_name(arg).unwrap_or_else(|| self.theme.next())
+                };
+                self.status = format!("theme: {}", self.theme.name());
+            }
+            "sidebar" => self.sidebar = !self.sidebar,
             "tokens" => {
                 let f = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_else(|| "n/a".into());
                 self.status = format!(
@@ -324,7 +373,7 @@ impl<'a> App<'a> {
             }
             "info" => {
                 self.sidebar = true;
-                self.status = "model info in the sidebar".into();
+                self.status = "model + settings in the sidebar".into();
             }
             "save" => {
                 let path = std::path::PathBuf::from(if arg.is_empty() {
@@ -355,8 +404,25 @@ impl<'a> App<'a> {
                 }
             }
             "help" => self.mode = Mode::Help,
-            "exit" | "quit" => self.quit = true,
-            other => self.status = format!("unknown command /{other} — /help"),
+            "exit" => self.quit = true,
+            other => self.status = format!("unknown command /{other} — type / to browse"),
+        }
+    }
+
+    fn copy_last(&mut self) {
+        let last = self
+            .session
+            .history
+            .iter()
+            .rev()
+            .find(|t| t.role == Role::Assistant)
+            .map(|t| t.content.clone());
+        match last {
+            Some(text) if clipboard::copy(&text) => {
+                self.status = format!("copied {} chars to clipboard", text.len())
+            }
+            Some(_) => self.status = "clipboard copy not supported by this terminal".into(),
+            None => self.status = "no reply to copy yet".into(),
         }
     }
 
@@ -374,19 +440,27 @@ impl<'a> App<'a> {
         self.start_generation();
     }
 
-    // ---- model picker ----------------------------------------------------
+    // ---- model browser (loaded switch + catalog) -------------------------
 
     fn open_picker(&mut self) {
-        let rows = self.session.supported_rows();
+        let mut entries = Vec::new();
+        let active = self.session.active_id.clone();
+        for info in self.session.loaded_models() {
+            let is_active = active.as_deref() == Some(info.id.as_str());
+            entries.push(PickEntry::Loaded(info, is_active));
+        }
+        for row in self.session.supported_rows() {
+            entries.push(PickEntry::Catalog(row));
+        }
         self.picker
             .state
-            .select(if rows.is_empty() { None } else { Some(0) });
-        self.picker.rows = rows;
+            .select(if entries.is_empty() { None } else { Some(0) });
+        self.picker.entries = entries;
         self.mode = Mode::Picker;
     }
 
     fn picker_move(&mut self, delta: isize) {
-        let len = self.picker.rows.len();
+        let len = self.picker.entries.len();
         if len == 0 {
             return;
         }
@@ -399,32 +473,49 @@ impl<'a> App<'a> {
         let Some(index) = self.picker.state.selected() else {
             return;
         };
-        let Some(row) = self.picker.rows.get(index) else {
-            return;
-        };
-        match row.availability {
-            Availability::Ready => {
-                let id = row.id.clone();
-                let path = row.local_path(self.session.models_dir());
+        match self.picker.entries.get(index) {
+            Some(PickEntry::Loaded(info, _)) => {
+                let info = info.clone();
+                self.session.switch_to_loaded(&info);
+                self.status = format!("switched to {} (history reset)", info.id);
                 self.mode = Mode::Normal;
-                if let Some(path) = path {
-                    self.load_path(&path, &id);
+            }
+            Some(PickEntry::Catalog(row)) => match row.availability {
+                Availability::Ready => {
+                    let id = row.id.clone();
+                    let path = row.local_path(self.session.models_dir());
+                    self.mode = Mode::Normal;
+                    if let Some(path) = path {
+                        self.load_path(&path, &id);
+                    }
                 }
-            }
-            Availability::NotDownloaded => {
-                self.mode = Mode::Normal;
-                self.pending = Some(Suspend::DownloadAndLoad(index));
-            }
-            Availability::NoPullAlias => {
-                self.status = format!("'{}' has no pull alias — use --model", row.id);
-            }
+                Availability::NotDownloaded => {
+                    self.mode = Mode::Normal;
+                    self.pending = Some(Suspend::DownloadAndLoad(index));
+                }
+                Availability::NoPullAlias => {
+                    self.status = format!("'{}' has no pull alias — use --model", row.id);
+                }
+            },
+            None => {}
         }
     }
 
     fn select_by_id(&mut self, id: &str) {
+        // Prefer an already-loaded model (instant switch), else a catalog row.
+        if let Some(info) = self
+            .session
+            .loaded_models()
+            .into_iter()
+            .find(|m| m.id == id)
+        {
+            self.session.switch_to_loaded(&info);
+            self.status = format!("switched to {id} (history reset)");
+            return;
+        }
         let rows = self.session.supported_rows();
         let Some(row) = rows.iter().find(|r| r.id == id) else {
-            self.status = format!("'{id}' is not a supported id — /models");
+            self.status = format!("'{id}' is not loaded or a supported id — type /models");
             return;
         };
         match row.availability {
@@ -454,8 +545,6 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Restore the terminal, run a blocking download/load with visible progress,
-    /// then re-enter the alt-screen.
     fn run_suspended(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -479,17 +568,16 @@ impl<'a> App<'a> {
                 }
             }
             Suspend::DownloadAndLoad(index) => {
-                let rows = self.session.supported_rows();
-                if let Some(row) = rows.get(index) {
+                if let Some(PickEntry::Catalog(row)) = self.picker.entries.get(index) {
                     if let Some(item) = row.catalog.as_ref() {
+                        let id = row.id.clone();
                         match camelid::catalog::run_pull(
                             Some(item.catalog_id),
                             self.session.models_dir(),
                         ) {
                             Ok(()) => {
                                 if let Some(path) = row.local_path(self.session.models_dir()) {
-                                    let id = row.id.clone();
-                                    self.load_path(&path, &id);
+                                    self.load_path(&path.clone(), &id);
                                 }
                             }
                             Err(err) => self.status = format!("pull failed: {err}"),
@@ -512,7 +600,6 @@ impl<'a> App<'a> {
     // ---- scrolling -------------------------------------------------------
 
     fn scroll_up(&mut self, n: usize) {
-        // Resolve a pending "stick to bottom" to a concrete value first.
         if self.scroll == usize::MAX {
             self.scroll = self.last_max_scroll;
         }
@@ -536,7 +623,6 @@ impl<'a> App<'a> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-        // Ctrl-D quits from any mode (overlay or not).
         if ctrl && key.code == KeyCode::Char('d') {
             self.quit = true;
             return;
@@ -560,14 +646,43 @@ impl<'a> App<'a> {
             Mode::Normal => {}
         }
 
+        // Command palette intercepts navigation while open.
+        if self.palette_open {
+            match key.code {
+                KeyCode::Up => {
+                    self.palette_sel = self.palette_sel.saturating_sub(1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.palette_sel += 1;
+                    self.clamp_palette();
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_palette();
+                    return;
+                }
+                KeyCode::Esc => {
+                    self.palette_open = false;
+                    self.palette_dismissed = true;
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.palette_enter();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
-            KeyCode::Char('d') if ctrl => self.quit = true,
             KeyCode::Char('c') if ctrl => {
                 if self.streaming {
                     session::CANCEL.store(true, Ordering::SeqCst);
                 } else if !self.input.is_empty() {
                     self.input.clear();
                     self.cursor = 0;
+                    self.refresh_palette();
                 } else {
                     self.status = "Ctrl-D or /exit to quit".into();
                 }
@@ -580,7 +695,9 @@ impl<'a> App<'a> {
             KeyCode::F(1) => self.mode = Mode::Help,
             KeyCode::PageUp => self.scroll_up(10),
             KeyCode::PageDown => self.scroll_down(10),
-            KeyCode::Enter if alt => self.insert_char('\n'),
+            KeyCode::Enter if alt => {
+                self.insert_char('\n');
+            }
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Left => self.move_cursor(-1),
@@ -594,9 +711,75 @@ impl<'a> App<'a> {
         }
     }
 
+    fn refresh_palette(&mut self) {
+        self.palette_open = self.input.starts_with('/') && !self.palette_dismissed;
+        self.clamp_palette();
+    }
+
+    fn clamp_palette(&mut self) {
+        let n = self.palette_matches().len();
+        if n == 0 {
+            self.palette_sel = 0;
+        } else if self.palette_sel >= n {
+            self.palette_sel = n - 1;
+        }
+    }
+
+    fn palette_query(&self) -> String {
+        self.input
+            .strip_prefix('/')
+            .unwrap_or("")
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    }
+
+    fn palette_matches(&self) -> Vec<&'static palette::Cmd> {
+        palette::matches(&self.palette_query())
+    }
+
+    fn complete_palette(&mut self) {
+        if let Some(cmd) = self.palette_matches().get(self.palette_sel) {
+            self.input = format!("/{} ", cmd.name);
+            self.cursor = self.input.len();
+            self.palette_dismissed = false;
+            self.refresh_palette();
+        }
+    }
+
+    fn palette_enter(&mut self) {
+        // Did the user already type an argument after the command word?
+        let typed = self.input.strip_prefix('/').unwrap_or("");
+        let arg_typed = typed
+            .split_once(char::is_whitespace)
+            .map(|(_, rest)| !rest.trim().is_empty())
+            .unwrap_or(false);
+        if arg_typed {
+            self.submit();
+            return;
+        }
+        match self.palette_matches().get(self.palette_sel) {
+            // A command with a required (`<…>`) argument completes and waits;
+            // no-arg and optional-arg (`[…]`) commands run immediately.
+            Some(cmd) if cmd.args.starts_with('<') => {
+                self.input = format!("/{} ", cmd.name);
+                self.cursor = self.input.len();
+                self.palette_dismissed = false;
+            }
+            Some(cmd) => {
+                self.input = format!("/{}", cmd.name);
+                self.submit();
+            }
+            None => self.submit(),
+        }
+    }
+
     fn insert_char(&mut self, c: char) {
         self.input.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.palette_dismissed = false;
+        self.refresh_palette();
     }
 
     fn backspace(&mut self) {
@@ -610,6 +793,7 @@ impl<'a> App<'a> {
             .unwrap_or(1);
         self.cursor -= prev;
         self.input.remove(self.cursor);
+        self.refresh_palette();
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -634,6 +818,7 @@ impl<'a> App<'a> {
         self.hist_idx = Some(idx);
         self.input = self.history[idx].clone();
         self.cursor = self.input.len();
+        self.refresh_palette();
     }
 
     fn history_next(&mut self) {
@@ -650,13 +835,14 @@ impl<'a> App<'a> {
             }
             None => {}
         }
+        self.refresh_palette();
     }
 
     // ---- rendering -------------------------------------------------------
 
     fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
-        let body = if self.sidebar {
+        let body = if self.sidebar && area.width > 70 {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Min(20), Constraint::Length(34)])
@@ -670,19 +856,22 @@ impl<'a> App<'a> {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3), // chat
+                Constraint::Min(3),
                 Constraint::Length(self.input_height()),
-                Constraint::Length(1), // status
+                Constraint::Length(1),
             ])
             .split(body);
 
         self.draw_chat(f, rows[0]);
         self.draw_input(f, rows[1]);
         self.draw_status(f, rows[2]);
+        if self.palette_open {
+            self.draw_palette(f, rows[1]);
+        }
 
         match self.mode {
             Mode::Picker => self.draw_picker(f, area),
-            Mode::Help => draw_help(f, area),
+            Mode::Help => self.draw_help(f, area),
             Mode::Normal => {}
         }
     }
@@ -693,7 +882,8 @@ impl<'a> App<'a> {
     }
 
     fn draw_chat(&mut self, f: &mut Frame, area: Rect) {
-        let title = if self.session.has_model() {
+        let th = self.theme;
+        let label = if self.session.has_model() {
             format!(
                 " 🐪 Camelid — {} · {} ",
                 self.session.active_label, self.session.active_posture
@@ -701,16 +891,15 @@ impl<'a> App<'a> {
         } else {
             " 🐪 Camelid — no model ".to_string()
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(TAN))
+            .border_style(Style::default().fg(th.primary()))
             .title(Span::styled(
-                title,
-                Style::default().fg(SAND).add_modifier(Modifier::BOLD),
+                label,
+                Style::default().fg(th.title()).add_modifier(Modifier::BOLD),
             ))
             .title_alignment(Alignment::Left);
         let inner = block.inner(area);
-        f.render_widget(block, area);
 
         let width = inner.width.max(1) as usize;
         let lines = self.chat_lines(width);
@@ -722,46 +911,65 @@ impl<'a> App<'a> {
         } else {
             self.scroll.min(max_scroll)
         };
+        if start < max_scroll {
+            block = block.title(Span::styled(
+                format!("  ↓ {} more  ", max_scroll - start),
+                Style::default().fg(th.dim()),
+            ));
+        }
+        f.render_widget(block, area);
         let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
         f.render_widget(Paragraph::new(visible), inner);
     }
 
-    /// Build the wrapped, styled transcript (history + any in-flight reply).
     fn chat_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let th = self.theme;
         let mut out: Vec<Line<'static>> = Vec::new();
         if self.session.history.is_empty() && !self.streaming {
             for line in banner::CAMEL_LINES.lines() {
                 out.push(Line::from(Span::styled(
                     line.to_string(),
-                    Style::default().fg(TAN),
+                    Style::default().fg(th.primary()),
                 )));
             }
             out.push(Line::from(""));
             out.push(Line::from(Span::styled(
-                "Type a message and press Enter. /help for commands.".to_string(),
-                Style::default().fg(DIMC),
+                "Type a message and press Enter — or / for commands.".to_string(),
+                Style::default().fg(th.dim()),
             )));
             return out;
         }
         for turn in &self.session.history {
-            push_turn(&mut out, turn.role, &turn.content, width);
+            push_header(&mut out, turn.role, th);
+            match turn.role {
+                Role::User => push_plain(&mut out, &turn.content, width, th.user()),
+                Role::Assistant => out.extend(markdown::render(&turn.content, width, th)),
+            }
+            out.push(Line::from(""));
         }
         if self.streaming {
-            push_turn(&mut out, Role::Assistant, &self.live, width);
+            push_header(&mut out, Role::Assistant, th);
+            out.extend(markdown::render(&self.live, width, th));
+            let spin = SPINNER[(self.frame as usize) % SPINNER.len()];
             out.push(Line::from(Span::styled(
-                "▌".to_string(),
-                Style::default().fg(TAN),
+                spin.to_string(),
+                Style::default().fg(th.primary()),
             )));
         }
         out
     }
 
     fn draw_input(&self, f: &mut Frame, area: Rect) {
-        let border = if self.streaming { DIMC } else { TAN };
+        let th = self.theme;
+        let border = if self.streaming {
+            th.dim()
+        } else {
+            th.primary()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border))
-            .title(Span::styled(" › ", Style::default().fg(SAND)));
+            .title(Span::styled(" › ", Style::default().fg(th.title())));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -770,9 +978,9 @@ impl<'a> App<'a> {
             .split('\n')
             .map(|l| Line::from(l.to_string()))
             .collect();
-        let (row, col) = self.cursor_rowcol();
         f.render_widget(Paragraph::new(text), inner);
         if !self.streaming {
+            let (row, col) = self.cursor_rowcol();
             f.set_cursor_position((inner.x + col as u16, inner.y + row as u16));
         }
     }
@@ -789,39 +997,63 @@ impl<'a> App<'a> {
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
+        let th = self.theme;
         let mut spans = Vec::new();
         if self.streaming {
-            spans.push(Span::styled("● streaming ", Style::default().fg(TAN)));
-            spans.push(Span::styled("^C cancel  ", Style::default().fg(DIMC)));
+            let spin = SPINNER[(self.frame as usize) % SPINNER.len()];
+            let secs = self
+                .started
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0);
+            let tps = if secs > 0.0 {
+                self.live_tokens as f64 / secs
+            } else {
+                0.0
+            };
+            spans.push(Span::styled(
+                format!("{spin} {} tok · {tps:.0} tok/s  ", self.live_tokens),
+                Style::default().fg(th.primary()),
+            ));
+            spans.push(Span::styled("^C stop  ", Style::default().fg(th.dim())));
         } else if let Some(stats) = &self.stats {
             spans.push(Span::styled(
                 format!("└ {stats}  "),
-                Style::default().fg(DIMC),
+                Style::default().fg(th.dim()),
             ));
         }
-        spans.push(Span::styled(self.status.clone(), Style::default().fg(DIMC)));
+        spans.push(Span::styled(
+            self.status.clone(),
+            Style::default().fg(th.dim()),
+        ));
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     fn draw_sidebar(&self, f: &mut Frame, area: Rect) {
+        let th = self.theme;
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIMC))
-            .title(Span::styled(" settings ", Style::default().fg(SAND)));
+            .border_style(Style::default().fg(th.dim()))
+            .title(Span::styled(" settings ", Style::default().fg(th.title())));
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        let inner = inner.inner(Margin::new(1, 0));
         let s = &self.session.settings;
-        let mut lines = vec![
-            kv("model", &self.session.active_label),
-            kv("posture", &self.session.active_posture),
+        let lines = vec![
+            kv("model", &self.session.active_label, th),
+            kv("posture", &self.session.active_posture, th),
+            kv(
+                "loaded",
+                &self.session.loaded_models().len().to_string(),
+                th,
+            ),
             Line::from(""),
-            kv("temperature", &format!("{:.2}", s.temperature)),
-            kv("top_p", &opt(s.top_p.map(|v| format!("{v:.2}")))),
-            kv("top_k", &opt(s.top_k.map(|v| v.to_string()))),
-            kv("max_tokens", &s.max_tokens.to_string()),
-            kv("seed", &opt(s.seed.map(|v| v.to_string()))),
-            kv("stream", if s.stream { "on" } else { "off" }),
+            kv("temperature", &format!("{:.2}", s.temperature), th),
+            kv("top_p", &opt(s.top_p.map(|v| format!("{v:.2}"))), th),
+            kv("top_k", &opt(s.top_k.map(|v| v.to_string())), th),
+            kv("max_tokens", &s.max_tokens.to_string(), th),
+            kv("seed", &opt(s.seed.map(|v| v.to_string())), th),
+            kv("stream", if s.stream { "on" } else { "off" }, th),
             Line::from(""),
             kv(
                 "system",
@@ -830,140 +1062,224 @@ impl<'a> App<'a> {
                 } else {
                     "—"
                 },
+                th,
             ),
-            kv("turns", &self.session.history.len().to_string()),
-            kv("server", &self.addr.to_string()),
-            kv("via", if self.spawned { "spawned" } else { "attached" }),
+            kv("turns", &self.session.history.len().to_string(), th),
+            kv("theme", self.theme.name(), th),
+            kv("server", &self.addr.to_string(), th),
+            kv("via", if self.spawned { "spawned" } else { "attached" }, th),
         ];
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Tab hide · /set k v".to_string(),
-            Style::default().fg(DIMC),
-        )));
-        f.render_widget(Paragraph::new(lines), inner.inner(Margin::new(1, 0)));
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(inner);
+        f.render_widget(Paragraph::new(lines), rows[0]);
+        self.draw_context_gauge(f, rows[1]);
+    }
+
+    fn draw_context_gauge(&self, f: &mut Frame, area: Rect) {
+        let th = self.theme;
+        let used = self.session.last_prompt_tokens.unwrap_or(0)
+            + self.session.last_completion_tokens.unwrap_or(0);
+        let label = match self.session.active_ctx {
+            Some(ctx) if ctx > 0 => {
+                let ratio = (used as f64 / ctx as f64).clamp(0.0, 1.0);
+                let gauge = Gauge::default()
+                    .block(
+                        Block::default()
+                            .title(Span::styled(" context ", Style::default().fg(th.dim()))),
+                    )
+                    .gauge_style(Style::default().fg(th.primary()))
+                    .ratio(ratio)
+                    .label(format!("{used}/{ctx}"));
+                f.render_widget(gauge, area);
+                return;
+            }
+            _ => format!("context {used}/?"),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(th.dim()),
+            ))),
+            area,
+        );
+    }
+
+    fn draw_palette(&self, f: &mut Frame, input_area: Rect) {
+        let th = self.theme;
+        let matches = self.palette_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let rows = (matches.len() as u16 + 2).min(10);
+        let y = input_area.y.saturating_sub(rows);
+        let rect = Rect {
+            x: input_area.x,
+            y,
+            width: input_area.width,
+            height: rows,
+        };
+        f.render_widget(Clear, rect);
+        let items: Vec<ListItem> = matches
+            .iter()
+            .map(|c| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" /{:<10}", c.name), Style::default().fg(th.title())),
+                    Span::styled(format!("{:<16}", c.args), Style::default().fg(th.dim())),
+                    Span::styled(c.desc.to_string(), Style::default().fg(th.dim())),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(self.palette_sel.min(matches.len() - 1)));
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(th.primary()))
+                    .title(Span::styled(
+                        " commands · ↑↓ Tab Enter ",
+                        Style::default().fg(th.title()),
+                    )),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(th.highlight_bg())
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ");
+        f.render_stateful_widget(list, rect, &mut state);
     }
 
     fn draw_picker(&mut self, f: &mut Frame, area: Rect) {
-        let rect = centered(area, 64, 60);
+        let th = self.theme;
+        let rect = centered(area, 70, 70);
         f.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(TAN))
+            .border_style(Style::default().fg(th.primary()))
             .title(Span::styled(
-                " supported models — ↑↓ Enter · Esc ",
-                Style::default().fg(SAND).add_modifier(Modifier::BOLD),
+                " models — ● loaded (instant) · ↑↓ Enter · Esc ",
+                Style::default().fg(th.title()).add_modifier(Modifier::BOLD),
             ));
-        if self.picker.rows.is_empty() {
-            let p = Paragraph::new("the server advertises no supported models")
-                .block(block)
-                .style(Style::default().fg(DIMC));
-            f.render_widget(p, rect);
+        if self.picker.entries.is_empty() {
+            f.render_widget(
+                Paragraph::new("the server advertises no supported models")
+                    .block(block)
+                    .style(Style::default().fg(th.dim())),
+                rect,
+            );
             return;
         }
         let items: Vec<ListItem> = self
             .picker
-            .rows
+            .entries
             .iter()
-            .map(|row| {
-                let tag = match row.availability {
-                    Availability::Ready => Span::styled(" [ready]", Style::default().fg(CODEC)),
-                    Availability::NotDownloaded => {
-                        Span::styled(" [not downloaded]", Style::default().fg(DIMC))
-                    }
-                    Availability::NoPullAlias => {
-                        Span::styled(" [no pull alias]", Style::default().fg(DIMC))
-                    }
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<32} ", row.id), Style::default().fg(SAND)),
-                    Span::styled(format!("{:<6}", row.quant), Style::default().fg(DIMC)),
-                    tag,
-                ]))
+            .map(|entry| match entry {
+                PickEntry::Loaded(info, active) => {
+                    let dot = if *active { "● " } else { "○ " };
+                    Line::from(vec![
+                        Span::styled(dot.to_string(), Style::default().fg(th.primary())),
+                        Span::styled(format!("{:<30} ", info.id), Style::default().fg(th.title())),
+                        Span::styled(info.descriptor(), Style::default().fg(th.dim())),
+                    ])
+                }
+                PickEntry::Catalog(row) => {
+                    let tag = match row.availability {
+                        Availability::Ready => "[ready]",
+                        Availability::NotDownloaded => "[download]",
+                        Availability::NoPullAlias => "[no alias]",
+                    };
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("{:<30} ", row.id), Style::default().fg(th.accent())),
+                        Span::styled(format!("{:<6} ", row.quant), Style::default().fg(th.dim())),
+                        Span::styled(tag.to_string(), Style::default().fg(th.dim())),
+                    ])
+                }
             })
+            .map(ListItem::new)
             .collect();
         let list = List::new(items)
             .block(block)
             .highlight_style(
                 Style::default()
-                    .bg(Color::Indexed(238))
+                    .bg(th.highlight_bg())
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("› ");
         f.render_stateful_widget(list, rect, &mut self.picker.state);
     }
+
+    fn draw_help(&self, f: &mut Frame, area: Rect) {
+        let th = self.theme;
+        let rect = centered(area, 64, 76);
+        f.render_widget(Clear, rect);
+        let mut lines: Vec<Line> = vec![
+            help_row("Enter", "send · Alt+Enter newline", th),
+            help_row("/", "open the command palette", th),
+            help_row("Ctrl-C", "stop a stream / clear input", th),
+            help_row("Ctrl-D", "quit · Ctrl-L clear history", th),
+            help_row("PgUp/PgDn", "scroll · wheel scrolls too", th),
+            help_row("Tab", "toggle the sidebar", th),
+            help_row("Up/Down", "input history", th),
+            help_row("F1", "this help", th),
+            Line::from(""),
+        ];
+        for cmd in palette::COMMANDS {
+            lines.push(help_row(
+                &format!("/{} {}", cmd.name, cmd.args),
+                cmd.desc,
+                th,
+            ));
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(th.primary()))
+            .title(Span::styled(
+                " keys & commands — any key closes ",
+                Style::default().fg(th.title()).add_modifier(Modifier::BOLD),
+            ));
+        f.render_widget(Paragraph::new(lines).block(block), rect);
+    }
 }
 
-fn push_turn(out: &mut Vec<Line<'static>>, role: Role, content: &str, width: usize) {
+fn push_header(out: &mut Vec<Line<'static>>, role: Role, th: Theme) {
     let color = match role {
-        Role::User => USERC,
-        Role::Assistant => TAN,
+        Role::User => th.user(),
+        Role::Assistant => th.primary(),
     };
     out.push(Line::from(Span::styled(
         format!("▸ {}", role.display()),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )));
-    let mut in_code = false;
-    for raw in content.split('\n') {
-        if raw.trim_start().starts_with("```") {
-            in_code = !in_code;
-            out.push(Line::from(Span::styled(
-                raw.to_string(),
-                Style::default().fg(DIMC),
-            )));
-            continue;
-        }
-        let style = if in_code {
-            Style::default().fg(CODEC).bg(Color::Indexed(236))
-        } else {
-            Style::default()
-        };
+}
+
+fn push_plain(
+    out: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    color: ratatui::style::Color,
+) {
+    for raw in text.split('\n') {
         for piece in wrap(raw, width.max(1)) {
-            out.push(Line::from(Span::styled(piece, style)));
+            out.push(Line::from(Span::styled(piece, Style::default().fg(color))));
         }
     }
-    out.push(Line::from(""));
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 62, 70);
-    f.render_widget(Clear, rect);
-    let lines: Vec<Line> = [
-        ("Enter", "send · Alt+Enter newline"),
-        ("Ctrl-C", "cancel a stream / clear input"),
-        ("Ctrl-D", "quit · Ctrl-L clear history"),
-        ("PgUp/PgDn", "scroll · wheel scrolls too"),
-        ("Tab", "toggle the settings sidebar"),
-        ("Up/Down", "input history"),
-        ("", ""),
-        ("/models", "pick a supported model"),
-        ("/model <id>", "switch model by id"),
-        ("/set k v", "temperature top_p top_k max_tokens seed stream"),
-        ("/system <t>", "system prompt · /reset clear · /retry"),
-        ("/save /load", "session JSON · /pull <alias> download"),
-        ("/tokens /info", "stats · /help · /exit"),
-    ]
-    .iter()
-    .map(|(k, v)| {
-        Line::from(vec![
-            Span::styled(format!("  {k:<12}"), Style::default().fg(SAND)),
-            Span::styled((*v).to_string(), Style::default().fg(DIMC)),
-        ])
-    })
-    .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(TAN))
-        .title(Span::styled(
-            " keys & commands — any key to close ",
-            Style::default().fg(SAND).add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-fn kv(key: &str, value: &str) -> Line<'static> {
+fn help_row(key: &str, desc: &str, th: Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{key:<12}"), Style::default().fg(DIMC)),
-        Span::styled(value.to_string(), Style::default().fg(SAND)),
+        Span::styled(format!("  {key:<16}"), Style::default().fg(th.title())),
+        Span::styled(desc.to_string(), Style::default().fg(th.dim())),
+    ])
+}
+
+fn kv(key: &str, value: &str, th: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{key:<12}"), Style::default().fg(th.dim())),
+        Span::styled(value.to_string(), Style::default().fg(th.title())),
     ])
 }
 
@@ -990,36 +1306,15 @@ fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
         .split(v[1])[1]
 }
 
-/// Char-safe word wrap (no panics on multibyte; hard-splits over-long words).
+/// Char-safe word wrap for plain (non-markdown) lines.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_len = 0usize;
-    let flush_word = |out: &mut Vec<String>, cur: &mut String, cur_len: &mut usize, word: &str| {
-        let wlen = word.chars().count();
-        if wlen > width {
-            // Hard-split a word longer than the line.
-            let mut chunk = String::new();
-            let mut clen = 0;
-            for ch in word.chars() {
-                if clen == width {
-                    out.push(std::mem::take(&mut chunk));
-                    clen = 0;
-                }
-                chunk.push(ch);
-                clen += 1;
-            }
-            *cur = chunk;
-            *cur_len = clen;
-        } else {
-            *cur = word.to_string();
-            *cur_len = wlen;
-        }
-    };
     for word in text.split(' ') {
         let wlen = word.chars().count();
         if cur_len == 0 {
-            flush_word(&mut out, &mut cur, &mut cur_len, word);
+            place(&mut out, &mut cur, &mut cur_len, word, wlen, width);
         } else if cur_len + 1 + wlen <= width {
             cur.push(' ');
             cur.push_str(word);
@@ -1027,9 +1322,36 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         } else {
             out.push(std::mem::take(&mut cur));
             cur_len = 0;
-            flush_word(&mut out, &mut cur, &mut cur_len, word);
+            place(&mut out, &mut cur, &mut cur_len, word, wlen, width);
         }
     }
     out.push(cur);
     out
+}
+
+fn place(
+    out: &mut Vec<String>,
+    cur: &mut String,
+    cur_len: &mut usize,
+    word: &str,
+    wlen: usize,
+    width: usize,
+) {
+    if wlen > width {
+        let mut chunk = String::new();
+        let mut n = 0;
+        for ch in word.chars() {
+            if n == width {
+                out.push(std::mem::take(&mut chunk));
+                n = 0;
+            }
+            chunk.push(ch);
+            n += 1;
+        }
+        *cur = chunk;
+        *cur_len = n;
+    } else {
+        *cur = word.to_string();
+        *cur_len = wlen;
+    }
 }

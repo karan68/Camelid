@@ -49,6 +49,53 @@ struct Capabilities {
     model_compatibility: Vec<CompatRow>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelList {
+    #[serde(default)]
+    data: Vec<LoadedInfo>,
+}
+
+/// One currently-loaded model from `GET /v1/models`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadedInfo {
+    pub id: String,
+    #[serde(default)]
+    pub meta: Option<LoadedMeta>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoadedMeta {
+    #[serde(default)]
+    pub n_ctx_train: Option<u32>,
+    #[serde(default)]
+    pub n_params: Option<u64>,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+impl LoadedInfo {
+    pub fn context_length(&self) -> Option<u32> {
+        self.meta.as_ref().and_then(|m| m.n_ctx_train)
+    }
+    /// A short human descriptor, e.g. "8.0B · ctx 8192 · 8.5 GB".
+    pub fn descriptor(&self) -> String {
+        let Some(meta) = &self.meta else {
+            return String::new();
+        };
+        let mut parts = Vec::new();
+        if let Some(p) = meta.n_params {
+            parts.push(format!("{:.1}B", p as f64 / 1e9));
+        }
+        if let Some(c) = meta.n_ctx_train {
+            parts.push(format!("ctx {c}"));
+        }
+        if let Some(s) = meta.size {
+            parts.push(format!("{:.1} GB", s as f64 / 1e9));
+        }
+        parts.join(" · ")
+    }
+}
+
 /// Outcome of a `/api/models/load` call.
 pub enum LoadOutcome {
     /// The model loaded and exposes a Camelid-supported runtime config.
@@ -128,6 +175,21 @@ impl Client {
         anyhow::ensure!(status == 200, "/api/capabilities returned HTTP {status}");
         let caps: Capabilities = serde_json::from_value(body)?;
         Ok(caps.model_compatibility)
+    }
+
+    /// `GET /v1/models` → every model currently loaded in the server (for the
+    /// instant loaded-model switcher). Empty on error.
+    pub fn list_loaded(&self) -> Vec<LoadedInfo> {
+        let Ok((status, body)) = self.request("GET", "/v1/models", None, Duration::from_secs(5))
+        else {
+            return Vec::new();
+        };
+        if status != 200 {
+            return Vec::new();
+        }
+        serde_json::from_value::<ModelList>(body)
+            .map(|list| list.data)
+            .unwrap_or_default()
     }
 
     /// `GET /api/models/current` → the active `LoadedModel` JSON (for `/info`),

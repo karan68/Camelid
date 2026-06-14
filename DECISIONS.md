@@ -239,3 +239,30 @@ scripts drive) and `tui.rs` is the ratatui app.
 - **New options:** `/set` (temperature, top_p, top_k, max_tokens, seed, stream), `/system`,
   `/reset`, `/retry`, `/save`/`/load` (session JSON), `/info`, `/tokens`, `/pull`, plus CLI
   `--top-p/--top-k/--seed/--plain`. Mascot redesigned to the dromedary line-art.
+
+## D8 — `camelid chat` production feature pass (2026-06-14)
+
+Added on top of the TUI (D7), all sharing the `session::Session` core and the same audited
+HTTP/SSE lane:
+
+- **Slash command palette** (`palette.rs`): typing `/` opens a filtering popup over the input
+  (prefix-ranked, ↑↓ select, Tab complete, Enter run). One static `COMMANDS` registry is the
+  single source of truth for the palette, `/help`, and dispatch (alias-aware) in both front ends.
+- **Instant loaded-model switching** — **zero backend change**: `get_or_load_model` already
+  activates an already-loaded model by the request's `model` id with no reload, and `GET
+  /v1/models` lists every loaded model (id + ctx/params/size). `/switch` and the model browser's
+  "● loaded (instant)" section just send the chosen id; `/model <id>` prefers a loaded model.
+- **Markdown rendering** (`markdown.rs`, dependency-free): fenced code blocks, headings, bullets,
+  block quotes, inline `code`/**bold**/*italic*, with style-aware width wrapping. Assistant turns
+  render as Markdown; user turns stay plain.
+- **Themes** (`theme.rs`): sandstorm/mono/ocean/nord, `/theme [name]` cycles/picks; every widget
+  + the markdown renderer pull styles from the active theme.
+- **Live streaming** spinner + tok/s in the status bar (frame-driven), a **context gauge** in the
+  sidebar (last-turn tokens vs the model's `n_ctx_train`), and **`/copy`** to the clipboard via an
+  OSC 52 escape with a hand-rolled base64 (`clipboard.rs`) — works inside the alt-screen and over
+  SSH, no dep.
+- New deps this pass: **none** beyond `ratatui` (added in D7). New unit tests: palette
+  resolve/rank, markdown render/inline-code, base64 vectors (bin chat tests 18 → 27).
+
+Note: ratatui's diff renderer interleaves cursor escapes between characters, so PTY screen-scrape
+string matching is unreliable; verify features by reconstructing the screen, not substring search.

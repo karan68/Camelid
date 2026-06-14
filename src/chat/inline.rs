@@ -92,10 +92,18 @@ fn prompt_line(session: &Session) -> String {
 /// Returns true when the session should exit.
 fn dispatch(session: &mut Session, rl: &mut DefaultEditor, command: &str) -> anyhow::Result<bool> {
     let mut parts = command.splitn(2, char::is_whitespace);
-    let name = parts.next().unwrap_or("");
+    let raw = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
+    let name = super::palette::resolve(raw).map(|c| c.name).unwrap_or(raw);
     match name {
         "models" => run_picker(session, rl)?,
+        "switch" => switch_loaded(session, rl)?,
+        "copy" => copy_last(session),
+        "theme" => println!(
+            "{}",
+            banner::dim("themes are a full-screen TUI feature (run without --plain)")
+        ),
+        "stop" => println!("{}", banner::dim("nothing to stop in line mode")),
         "model" => {
             if arg.is_empty() {
                 println!("usage: /model <id>   (see /models)");
@@ -335,10 +343,83 @@ fn run_picker(session: &mut Session, rl: &mut DefaultEditor) -> anyhow::Result<(
     select_row(session, rl, row)
 }
 
+fn switch_loaded(session: &mut Session, rl: &mut DefaultEditor) -> anyhow::Result<()> {
+    let loaded = session.loaded_models();
+    if loaded.is_empty() {
+        println!("{}", banner::dim("no models are loaded yet — use /models"));
+        return Ok(());
+    }
+    println!("Loaded models (instant switch):");
+    let active = session.active_id.clone();
+    for (i, info) in loaded.iter().enumerate() {
+        let dot = if active.as_deref() == Some(info.id.as_str()) {
+            "●"
+        } else {
+            "○"
+        };
+        println!(
+            "  {:>2}. {dot} {:<30} {}",
+            i + 1,
+            info.id,
+            info.descriptor()
+        );
+    }
+    let choice = rl.readline("switch to # (blank to cancel): ")?;
+    let choice = choice.trim();
+    if choice.is_empty() {
+        return Ok(());
+    }
+    if let Some(info) = choice
+        .parse::<usize>()
+        .ok()
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|i| loaded.get(i))
+    {
+        session.switch_to_loaded(info);
+        println!(
+            "{}",
+            banner::dim(&format!("switched to {} (history reset)", info.id))
+        );
+    } else {
+        println!("not a valid selection: {choice:?}");
+    }
+    Ok(())
+}
+
+fn copy_last(session: &Session) {
+    match session
+        .history
+        .iter()
+        .rev()
+        .find(|t| t.role == super::session::Role::Assistant)
+    {
+        Some(turn) if super::clipboard::copy(&turn.content) => {
+            println!(
+                "{}",
+                banner::dim(&format!("copied {} chars", turn.content.len()))
+            )
+        }
+        Some(_) => println!(
+            "{}",
+            banner::dim("clipboard copy not supported by this terminal")
+        ),
+        None => println!("{}", banner::dim("no reply to copy yet")),
+    }
+}
+
 fn select_by_id(session: &mut Session, id: &str) {
+    // Prefer an already-loaded model (instant switch).
+    if let Some(info) = session.loaded_models().into_iter().find(|m| m.id == id) {
+        session.switch_to_loaded(&info);
+        println!(
+            "{}",
+            banner::dim(&format!("switched to {id} (history reset)"))
+        );
+        return;
+    }
     let rows = session.supported_rows();
     let Some(row) = rows.iter().find(|row| row.id == id) else {
-        println!("'{id}' is not a supported model id — see /models");
+        println!("'{id}' is not loaded or a supported model id — see /models");
         return;
     };
     match row.availability {
@@ -414,8 +495,13 @@ fn availability_tag(availability: Availability) -> &'static str {
 fn print_help() {
     println!("commands:");
     for (cmd, help) in [
-        ("/models", "pick a supported model (downloads if needed)"),
-        ("/model <id>", "switch to a supported model by id"),
+        ("/models", "browse loaded + downloadable models"),
+        ("/switch", "instantly switch between already-loaded models"),
+        (
+            "/model <id>",
+            "switch to a model by id (loaded or supported)",
+        ),
+        ("/copy", "copy the last reply to the clipboard"),
         (
             "/set <k> <v>",
             "sampling: temperature, top_p, top_k, max_tokens, seed, stream",

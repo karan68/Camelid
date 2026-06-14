@@ -34,15 +34,15 @@ Want a single command that proves the whole path end to end? `scripts/smoke.sh` 
 
 ### Run in the terminal
 
-Prefer the keyboard? `camelid chat` is an interactive REPL that streams replies live in your terminal. It attaches to a running `camelid serve` or spawns one for you.
+Prefer the keyboard? `camelid chat` is a full-screen terminal app — Markdown-rendered replies that stream in live, a scrollable chat pane, a settings sidebar with a context gauge, a `/` command palette, and instant switching between models already loaded in the server. It attaches to a running `camelid serve` or spawns one for you. (Over a pipe, SSH without a TTY, or with `--plain`, it falls back to a scrollback-friendly line REPL.)
 
 ```bash
 ./camelid pull tinyllama        # the baseline supported row (or any pull alias)
-./camelid chat                  # opens a picker of supported models, or:
+./camelid chat                  # full-screen TUI; opens the model browser, or:
 ./camelid chat --model models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
 ```
 
-With no `--model`, `chat` opens a picker built from the live support ledger (`/api/capabilities`) — it lists only **supported** rows and shows which are already downloaded. Switch models any time in-session with `/models` (history resets on a switch); `/help` lists the rest (`/system`, `/tokens`, `/reset`, `/pull`, `/exit`). Pointing `--model` at a GGUF whose architecture Camelid doesn't support is refused with the same typed error the rest of the engine uses — the terminal is not a backdoor around the support contract. Gemma 4 12B/26B remain **two-Mac distributed only** and are not single-node chat rows.
+Type **`/`** to open the command palette and browse everything (filter as you type, **↑↓** to pick, **Tab**/**Enter** to run). Highlights: **`/models`** browses loaded + downloadable models, **`/switch`** flips instantly between models already loaded in the server (no reload), **`/set <temperature|top_p|top_k|max_tokens|seed|stream> <value>`** tunes sampling live, **`/system`** sets a prompt, **`/save`/`/load`** persist a session, **`/copy`** yanks the last reply to the clipboard, **`/theme`** restyles, **`/retry`** regenerates. **Tab** toggles the sidebar, **PgUp/PgDn** and the wheel scroll, **Ctrl-C** stops a stream, **Ctrl-D** quits (**F1** for the full key/command list). The model browser is built from the live support ledger (`/api/capabilities`) — it lists only **supported** rows and shows which are already downloaded. Pointing `--model` at a GGUF whose architecture Camelid doesn't support is refused with the same typed error the rest of the engine uses — the terminal is not a backdoor around the support contract. Gemma 4 12B/26B remain **two-Mac distributed only** and are not single-node chat rows.
 
 ---
 

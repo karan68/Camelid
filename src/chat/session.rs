@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::client::{Client, CompatRow, LoadOutcome};
+use super::client::{Client, CompatRow, LoadOutcome, LoadedInfo};
 use super::models::{self, PickerRow};
 
 /// Set by the SIGINT handler while a stream is in flight so the read loop can
@@ -101,6 +101,8 @@ pub struct Session {
     pub active_id: Option<String>,
     pub active_label: String,
     pub active_posture: String,
+    /// Training context length of the active model (for the context gauge).
+    pub active_ctx: Option<u32>,
     pub last_prompt_tokens: Option<u32>,
     pub last_completion_tokens: Option<u32>,
 }
@@ -123,9 +125,24 @@ impl Session {
             active_id: None,
             active_label: String::new(),
             active_posture: String::new(),
+            active_ctx: None,
             last_prompt_tokens: None,
             last_completion_tokens: None,
         }
+    }
+
+    /// Models currently loaded in the server (for the instant switcher).
+    pub fn loaded_models(&self) -> Vec<LoadedInfo> {
+        self.client.list_loaded()
+    }
+
+    /// Switch the active model to one already loaded in the server. This is
+    /// instant — the next request's `model` field re-activates it server-side
+    /// with no reload. History resets (different context window).
+    pub fn switch_to_loaded(&mut self, info: &LoadedInfo) {
+        self.active_ctx = info.context_length();
+        let posture = self.posture_for(&info.id);
+        self.set_active(info.id.clone(), info.id.clone(), posture);
     }
 
     pub fn client(&self) -> Client {
@@ -192,6 +209,11 @@ impl Session {
                     .map(str::to_string)
                     .unwrap_or_else(|| self.posture_for(&id));
                 let label = label.map(str::to_string).unwrap_or_else(|| id.clone());
+                self.active_ctx = self
+                    .loaded_models()
+                    .iter()
+                    .find(|m| m.id == id)
+                    .and_then(|m| m.context_length());
                 self.set_active(id, label, posture);
                 Ok(LoadResult::Loaded)
             }
@@ -414,6 +436,7 @@ mod tests {
             active_id: Some("m".into()),
             active_label: "m".into(),
             active_posture: "loaded".into(),
+            active_ctx: None,
             last_prompt_tokens: None,
             last_completion_tokens: None,
         }
