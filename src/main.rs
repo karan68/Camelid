@@ -34,6 +34,8 @@ use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 
+mod chat;
+
 // Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
 // "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without
 // a git checkout.
@@ -100,6 +102,47 @@ enum Command {
         /// interactively, `serve` opens the chat surface automatically.
         #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
         no_open: bool,
+    },
+    /// Interactive terminal chat REPL over the local Camelid API.
+    ///
+    /// Attaches to (or spawns) a `camelid serve`, opens a supported-model picker,
+    /// and streams `/v1/chat/completions` live. Switch models in-session with
+    /// `/models`.
+    Chat {
+        /// Load this GGUF at startup (same semantics as `serve --model`). Omit to
+        /// open the supported-model picker.
+        #[arg(long, env = "CAMELID_MODEL")]
+        model: Option<PathBuf>,
+        /// Server to attach to, or spawn on if nothing is listening there.
+        #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
+        addr: SocketAddr,
+        /// Initial system prompt.
+        #[arg(long)]
+        system: Option<String>,
+        /// Maximum tokens to generate per turn.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: u32,
+        /// Sampling temperature (0 = greedy/deterministic).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Nucleus sampling top-p (omit to leave unset).
+        #[arg(long)]
+        top_p: Option<f32>,
+        /// Top-k sampling (omit to leave unset).
+        #[arg(long)]
+        top_k: Option<u32>,
+        /// Sampling seed (omit for the engine default).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Print the full response after completion instead of streaming.
+        #[arg(long, default_value_t = false)]
+        no_stream: bool,
+        /// Force the inline line REPL instead of the full-screen TUI.
+        #[arg(long, default_value_t = false)]
+        plain: bool,
+        /// Directory holding downloaded GGUFs (picker availability + pull target).
+        #[arg(long, env = "CAMELID_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -471,6 +514,36 @@ async fn main() -> anyhow::Result<()> {
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
             api::serve(addr, threads, model, open_ui).await?
+        }
+        Command::Chat {
+            model,
+            addr,
+            system,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            no_stream,
+            plain,
+            models_dir,
+        } => {
+            let code = chat::run_chat(chat::ChatOptions {
+                model,
+                addr,
+                system,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                no_stream,
+                plain,
+                models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+            })?;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Command::ServeDistributed {
             role,

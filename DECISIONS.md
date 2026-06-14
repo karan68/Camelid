@@ -157,3 +157,85 @@ TinyLlama [11,22) ~2.2 GB refuses at cap=1000).
 Work proceeds on `feat/distributed-parity-lane` off `origin/main`. Single-node TinyLlama
 1.1B Chat Q8_0 gate and the full validation suite (`fmt`/`clippy -D warnings`/`test`/`doc`)
 must stay green before every commit (operating rule #3).
+
+## D6 — `camelid chat` terminal mode (2026-06-13)
+
+Work proceeds on `feat/terminal-chat` off `origin/main`. Full validation suite
+(`fmt`/`clippy -D warnings`/`test`/`doc`) stays green before every commit (operating rule #3).
+Recon detail backing these decisions: `RECON_CHAT.md`.
+
+**Decision A — compatibility source: PROGRAMMATIC.** The supported set is structured data at
+`GET /api/capabilities` → `CapabilitiesResponse.model_compatibility: Vec<ModelCompatibilityTarget>`
+(and the Rust `capabilities_response_with_plan`). The picker filters rows by
+`status.starts_with("supported")` at runtime — no hardcoded list, no second prose parser of
+`COMPATIBILITY.md`. The "prose-only → stop for confirmation" boundary did not trigger. The
+capabilities ledger (supported rows) and `curated_catalog()` (8 pullable rows) are two lists
+joined on `model_compatibility.id == CatalogItem.catalog_id`; supported rows with no catalog
+entry render `[supported · no pull alias]`.
+
+**Decision B — architecture: Option B (HTTP client over a child-process `serve`).** Justification:
+the engine already ships an audited OpenAI-compatible SSE lane at `/v1/chat/completions`; driving
+it over HTTP makes terminal output provably identical to the validated lane (constraints 2/4/5)
+and avoids Option A's re-plumbed streaming + token-for-token parity-test burden. The usual cost
+of Option B (an HTTP client) is **zero here**: the repo has no HTTP-client dep but already
+hand-rolls a blocking HTTP/1.1 client over `std::net::TcpStream` in `src/receipt/verify.rs`
+(`http_json`/`parse_http_response`); `chat` reuses that pattern and extends it with a
+line-buffered `data:` SSE reader. Control-plane actions reuse pub Rust in-process —
+`catalog::run_pull`/`curated_catalog()` for pull, a `models/<filename>` fs check for availability;
+only load/capabilities/health/generation go over HTTP. The `chat` command body is fully
+synchronous (blocking client + blocking line editor + `std::process::Child`); no tokio in the
+chat path.
+
+- **Spawn-vs-attach:** probe `GET /v1/health` on `--addr` (default `127.0.0.1:8181`); attach if
+  it answers, else spawn `camelid serve --addr <addr> --no-open` as a child and poll health until
+  ready. Tear the child down on exit **only if we spawned it** (an attached server is left alone).
+
+**History reset on model switch.** Switching the active model mid-session clears conversation
+history (a different model = a different context window; carrying history is a footgun) and prints
+a one-line notice. The `--system`/`/system` system prompt is **re-applied** across a switch
+(it is a session-level instruction, not model-specific context).
+
+**Constraint #4 gate (repo wins).** The backend's only generation gate is the typed
+architecture error (`unsupported_runtime`/`generation_ready=false`). A recognized-arch
+non-ledger GGUF would generate, same as the engine + React frontend today. `chat` reuses that
+typed gate verbatim and does not invent new per-file matching (which would violate "reuse, don't
+reimplement"); the picker's supported-only selection keeps the normal path from reaching a
+non-supported row. Full rationale in `RECON_CHAT.md` §8.
+
+**Line editor dependency: `rustyline`.** Chosen over `reedline` for a smaller, mature, sync API
+(line editing + in-session history) that fits the synchronous chat loop with no async glue. It is
+the single new dependency this feature adds.
+
+**Ctrl-C semantics.** A SIGINT handler flips a cancel flag. During `rustyline` readline the
+terminal is raw, so Ctrl-C arrives as a byte → `Interrupted` → an idle hint, not a quit. During
+a stream the terminal is cooked, so Ctrl-C raises SIGINT → the read loop aborts cleanly and the
+**entire in-flight turn (the user message and the partial reply) is discarded**, so history stays
+coherent. Ctrl-D / `/exit` quit cleanly; a spawned server is torn down by `ServerHandle`'s Drop.
+
+**Phase 8 evidence.** SSE/de-chunk parser and ledger-derived picker are covered by bin unit
+tests (`cargo test --bin camelid chat::`). The supported-path and unsupported-gate end-to-end
+checks live in `scripts/chat-terminal-smoke.sh`, gated on `CAMELID_CHAT_SUPPORTED_GGUF` /
+`CAMELID_CHAT_UNSUPPORTED_GGUF` (no-op when unset, like the parity scripts) so they never block
+`cargo test`.
+
+## D7 — `camelid chat` full-screen TUI (2026-06-13)
+
+`chat` grew a full-screen ratatui front end (the default on an interactive terminal). Both UIs
+share one UI-agnostic `session::Session` core (state, sampling settings, request shape, save/load
+— no I/O); `inline.rs` is the line REPL (now also the `--plain`/non-TTY fallback that the smoke
+scripts drive) and `tui.rs` is the ratatui app.
+
+- **Concurrency:** the redraw loop runs on the main thread; each generation streams on a
+  background thread that forwards deltas over an `mpsc` channel, polled non-blocking each frame.
+  Ctrl-C (a key event in raw mode) flips the shared `session::CANCEL` flag → the worker aborts.
+- **Reuse intact:** the worker calls the same `Client::chat_stream` SSE lane; `Client` is now
+  `Clone` (just a `SocketAddr`). No second generation path.
+- **Deps:** `ratatui = "0.29"` (+ its `crossterm`). Only network/HTTP stays hand-rolled.
+- **Downloads in the TUI:** selecting a not-downloaded picker row (or `/pull`) suspends the
+  alt-screen, runs the existing `catalog::run_pull` with visible `curl` progress, then re-enters
+  — so the audited pull path is reused and progress isn't swallowed by the alt-screen.
+- **Front-end choice:** TUI when stdin+stdout are both TTYs and `--plain` is unset; else inline.
+  The `--model` unsupported gate runs before either UI (typed error + exit 1, no screen takeover).
+- **New options:** `/set` (temperature, top_p, top_k, max_tokens, seed, stream), `/system`,
+  `/reset`, `/retry`, `/save`/`/load` (session JSON), `/info`, `/tokens`, `/pull`, plus CLI
+  `--top-p/--top-k/--seed/--plain`. Mascot redesigned to the dromedary line-art.

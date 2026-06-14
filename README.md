@@ -32,6 +32,18 @@ Grab the binary for your platform from the [latest release](https://github.com/t
 
 Want a single command that proves the whole path end to end? `scripts/smoke.sh` pulls TinyLlama, serves it, does one real chat round-trip, and asserts on the reply — no mocks. See [Quickstart](#quickstart).
 
+### Run in the terminal
+
+Prefer the keyboard? `camelid chat` is an interactive REPL that streams replies live in your terminal. It attaches to a running `camelid serve` or spawns one for you.
+
+```bash
+./camelid pull tinyllama        # the baseline supported row (or any pull alias)
+./camelid chat                  # opens a picker of supported models, or:
+./camelid chat --model models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+```
+
+With no `--model`, `chat` opens a picker built from the live support ledger (`/api/capabilities`) — it lists only **supported** rows and shows which are already downloaded. Switch models any time in-session with `/models` (history resets on a switch); `/help` lists the rest (`/system`, `/tokens`, `/reset`, `/pull`, `/exit`). Pointing `--model` at a GGUF whose architecture Camelid doesn't support is refused with the same typed error the rest of the engine uses — the terminal is not a backdoor around the support contract. Gemma 4 12B/26B remain **two-Mac distributed only** and are not single-node chat rows.
+
 ---
 
 ## Which model should I try first?
