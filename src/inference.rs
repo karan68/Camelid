@@ -3173,6 +3173,20 @@ fn env_flag_enabled(key: &str) -> bool {
     )
 }
 
+/// Opt-in deterministic inference mode (`CAMELID_DETERMINISTIC=1`, set by the CLI
+/// `--deterministic` flag). When on, the engine is pinned to the order-stable CPU
+/// forward pass: every Metal/GPU dispatch gate fails closed to its CPU equivalent,
+/// regardless of any `CAMELID_METAL_*` override. This makes the supported TinyLlama
+/// 1.1B Q8_0 forward pass bit-exact and reduction-order-stable across runs, thread
+/// counts, and processes (the CPU reduction order is already fixed — each output owns
+/// its full serial K-dimension reduction; see `qa/determinism/determinism-baseline-*.md` and
+/// DECISIONS.md §D9). The library default is OFF, so the default (GPU fast) path and
+/// every embedder are byte-for-byte unchanged. The pinned reduction order mirrors the
+/// llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated against.
+pub fn deterministic_mode_enabled() -> bool {
+    env_flag_enabled("CAMELID_DETERMINISTIC")
+}
+
 fn prefill_chunk_token_count(prefill_count: usize) -> usize {
     const DEFAULT_PREFILL_CHUNK_TOKENS: usize = 256;
     prefill_chunk_token_count_from_env(
@@ -8480,23 +8494,26 @@ fn q8_0_file_reader_block_dot_enabled() -> bool {
 
 #[allow(dead_code)]
 fn q8_0_metal_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8")
+    // Deterministic mode fails closed to the CPU Q8_0 kernels (see `deterministic_mode_enabled`).
+    !deterministic_mode_enabled() && q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8")
 }
 
 /// Gate for the GPU-resident decode forward (whole token on the Metal GPU, KV cache resident
-/// across tokens). Default off; opt in with `CAMELID_METAL_RESIDENT_DECODE`.
+/// across tokens). Default off; opt in with `CAMELID_METAL_RESIDENT_DECODE`. Deterministic
+/// mode forces this off so the forward stays on the order-stable CPU path.
 fn resident_decode_metal_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+    !deterministic_mode_enabled()
+        && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
 }
 
 #[allow(dead_code)]
 fn q8_0_metal_retained_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED")
+    !deterministic_mode_enabled() && q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED")
 }
 
 #[allow(dead_code)]
 fn q8_0_hybrid_retained_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_HYBRID_Q8_RETAINED")
+    !deterministic_mode_enabled() && q8_0_env_flag_enabled_default_off("CAMELID_HYBRID_Q8_RETAINED")
 }
 
 fn q8_0_metal_trace_enabled() -> bool {
@@ -14936,7 +14953,11 @@ fn try_accumulate_descriptor_linear_row_metal(
 ) -> bool {
     #[cfg(target_os = "macos")]
     {
-        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1") {
+        // Cheap existing check first so the default path (Metal linear off) short-circuits
+        // before the deterministic-mode env read — zero added work when the flag is unused.
+        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1")
+            || deterministic_mode_enabled()
+        {
             return false;
         }
         if weight.q8_0_blocks.is_some() || weight.q8_0_file_backing.is_some() {
@@ -16987,7 +17008,11 @@ fn try_accumulate_transposed_linear_row_metal(
 ) -> bool {
     #[cfg(target_os = "macos")]
     {
-        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1") {
+        // Cheap existing check first so the default path (Metal linear off) short-circuits
+        // before the deterministic-mode env read — zero added work when the flag is unused.
+        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1")
+            || deterministic_mode_enabled()
+        {
             return false;
         }
         if weight.q8_0_blocks.is_some() || weight.q8_0_file_backing.is_some() {
