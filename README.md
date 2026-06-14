@@ -52,7 +52,7 @@ Type **`/`** to open the command palette and browse everything (filter as you ty
 
 Promotion is decided by the **`camelid agent-eval --model <gguf>`** harness, which runs a fixed tool-use battery against a fixture and reports one of three outcomes with a receipt artifact: **`PASS`** (clean round-trip — eligible for promotion), **`FAIL`** (loaded but the model can't produce usable tool calls), or **`INCONCLUSIVE`** (didn't load in budget — a contended box, *not* a capability failure; re-run on a quiet host). A row's `tool_capable` flag is flipped true **only** after a `PASS` receipt — never a lucky run.
 
-**Today no supported row is marked tool-capable.** With the corrected render, the small Llama 3.2 models still `FAIL` the harness (malformed arguments — too weak); the more-capable rows (3B/8B/Qwen3) are the candidates, pending a `PASS` on a quiet box. So `--agent` is built and tested (loop, full tool set, sandbox, approval gate — all unit-tested) but **refuses every model** with a typed error until one earns a `PASS`. This is an *interface*, not a capability claim about any model.
+**`Llama 3.2 3B Instruct Q8_0` is the first promoted row** — it earned a `PASS` receipt ([`qa/agent-eval/`](qa/agent-eval/)): with the corrected render it emits well-formed tool calls, reads the fixture, and answers correctly. So `camelid chat --agent --model models/Llama-3.2-3B-Instruct-Q8_0.gguf` runs the live loop. (The 1B is too weak — it `FAIL`s the harness with malformed args even with the correct render — so it stays gated, as does any row without a PASS receipt.) The capability moves only on harness evidence, never a claim.
 
 ---
 

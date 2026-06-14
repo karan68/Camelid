@@ -306,6 +306,9 @@ pub struct ModelCompatibilityTarget {
     pub family: &'static str,
     pub quantization: &'static str,
     pub status: &'static str,
+    /// Verified (via the agent-eval harness) to drive a clean tool-call
+    /// round-trip. Promoted only with a PASS receipt; default false.
+    pub tool_capable: bool,
     pub support_scope: &'static str,
     pub full_support_status: &'static str,
     pub full_support_blockers: &'static str,
@@ -2043,6 +2046,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         model_compatibility: vec![
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q8_0",
                 status: "supported_current_gate",
@@ -2084,6 +2088,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama32_1b_instruct_q8_0",
+                tool_capable: false,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2125,6 +2130,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama32_3b_instruct_q8_0",
+                tool_capable: true,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2166,6 +2172,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama3_8b_instruct_q8_0",
+                tool_capable: false,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2207,6 +2214,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_e4b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_ple_matformer_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2248,6 +2256,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_e2b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_ple_matformer_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2289,6 +2298,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_12b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_dense_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2330,6 +2340,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_26b_a4b_it_q4_0",
+                tool_capable: false,
                 family: "gemma4_a4b_moe_decoder",
                 quantization: "Q4_0",
                 status: "supported_exact_row_smoke",
@@ -2371,6 +2382,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q4_0/Q5_0",
                 status: "planned_phase_10",
@@ -2412,6 +2424,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_k_q5_k",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q4_K_M/Q5_K_M",
                 status: "planned_phase_10",
@@ -2453,6 +2466,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "mistral_7b_instruct_v0_3_q8_0",
+                tool_capable: false,
                 family: "mistral",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2494,6 +2508,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
+                tool_capable: false,
                 family: "mixtral_moe",
                 quantization: "Q8_0",
                 status: "active_validation_partial_runtime",
@@ -2535,6 +2550,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
+                tool_capable: false,
                 family: "qwen_decoder",
                 quantization: "Q8_0",
                 status: "planned_exact_row_candidate",
@@ -2576,6 +2592,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma2_9b_it_q8_0",
+                tool_capable: false,
                 family: "gemma2_decoder",
                 quantization: "Q8_0",
                 status: "planned_exact_row_candidate",

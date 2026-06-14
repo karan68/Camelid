@@ -458,3 +458,18 @@ http_fetch result content alike.
 
 **Honesty.** No `tool_capable` flag is set; nothing in the docs claims tool-calling works on a row
 without a PASS receipt. The capability only ever moves on harness evidence.
+
+### D10 (cont.) — first promotion: Llama 3.2 3B Instruct Q8_0 is tool_capable (2026-06-14)
+
+`llama32_3b_instruct_q8_0` earned a **PASS** from `agent-eval` and is promoted: `tool_capable: true`
+on that `ModelCompatibilityTarget` row (the field is added to the struct, all other rows `false`).
+Receipt committed at `qa/agent-eval/Llama-3.2-3B-Instruct-Q8_0-…-PASS.json`: with the corrected
+flat-tools render the 3B emitted a well-formed `read_file(notes.txt)` call (args `{"path":…}`, not
+the schema echo), read the fixture (`alpha\nbeta\ngamma\n`), and answered `3` — `promotion_eligible:
+true`, host loadavg 2.5. This confirms the Phase 0 render fix was the actual blocker: the 3B was
+capable; the OpenAI-nested render had been breaking it (it `FAIL`ed before the fix, `PASS`es after).
+
+`--agent --model <the 3B GGUF>` now runs the live loop (the catalog-label match sets the active
+label to the ledger id, so `active_tool_capable()` matches). The 1B remains `FAIL`/gated (too weak);
+Qwen3-4B `FAIL`ed by reasoning in `<think>` instead of emitting the call (and isn't a ledger row);
+both are honest non-promotions. The gate, harness, and ledger all read the one `tool_capable` flag.
