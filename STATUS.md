@@ -109,6 +109,24 @@ Boundaries that remain in force:
 
 Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8.md`](docs/performance/ubuntu-x86-q8.md).
 
+## Windows x86 platform bring-up
+
+Windows `x86_64-pc-windows-msvc` (MSVC toolchain) is now a tracked CPU platform alongside macOS and Ubuntu. This is a narrow, exact-row bring-up; it does not promote any model lane (support is exact-row and does not spread by platform any more than by size or quantization).
+
+What is proven on Windows now:
+
+- The repo-health gate is green on MSVC: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, and `cargo doc --no-deps --all-features`. CI runs them on a `windows-latest` job.
+- The **TinyLlama 1.1B Chat Q8_0** baseline gate reproduces the cross-platform evidence exactly: output-projection layout `output_projection_layout_ok=true` with `gguf_dimensions=[2048,32000]` and `storage_row_stride_bytes=2176` (byte-for-byte identical), the `hello` smoke first token `29907`/"C" plus the same 50-token stream, and the supported-lane parity audit vs llama.cpp (prompt tokens, generated text, and generated token IDs match; `first_divergent_token_index=-1`).
+- The port is implementation-only behind `#[cfg(...)]` guards (Windows positioned `seek_read` for the Q8_0 file-backed reads; `memmap2` for the GGUF wire mapping); macOS/Ubuntu paths are unchanged, and the token-major `output.weight` interpretation is identical.
+
+Boundaries that remain in force:
+
+- TinyLlama is the only exact row with a full Windows parity gate today; Llama 3.2 1B/3B run and agree with the GPU lane on Windows CPU, but their direct Windows-vs-llama.cpp parity bundles are follow-up.
+- No Windows performance, throughput, or packaging claim.
+- **Windows CUDA is experimental and not a supported lane.** An opt-in NVRTC backend (`--features cuda`, `CAMELID_CUDA_Q8=1`, RTX 3060) is token-identical to the CPU/llama.cpp reference for TinyLlama (direct parity) and Llama 3.2 1B/3B (GPU-vs-CPU), with both GPU kernels unit-tested bit-identical to the CPU dot — but it is decode-only, uploads weights per call, and does not yet carry the artifact-backed parity-bundle discipline the CPU rows require. The CPU path stays the default and the correctness reference; do not claim the CUDA lane as supported until it carries the same committed evidence.
+
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support for the release-contract wording.
+
 ## Durable evidence anchors
 
 - `qa/evidence-bundles/four-row-public-20260503T024327Z/manifest.json` plus `qa/evidence-bundles/four-row-public-20260503T024327Z/SHA256SUMS` are the committed carry-forward row bundles/checksums for the public smoke boundary.

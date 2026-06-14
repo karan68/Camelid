@@ -1647,7 +1647,9 @@ fn phys_footprint_bytes() -> u64 {
     peak_rss_bytes()
 }
 
-/// Peak resident set size of this process. macOS reports bytes; Linux kilobytes.
+/// Peak resident set size of this process in bytes. macOS `getrusage` reports
+/// bytes; other Unix reports kilobytes (scaled here).
+#[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -1663,6 +1665,25 @@ fn peak_rss_bytes() -> u64 {
     {
         max * 1024
     }
+}
+
+/// Peak resident set size of this process in bytes. Windows exposes the peak
+/// working set directly via `GetProcessMemoryInfo`.
+#[cfg(windows)]
+fn peak_rss_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle; `counters` is
+    // sized via its `cb` field per the API contract.
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if ok == 0 {
+        return 0;
+    }
+    counters.PeakWorkingSetSize as u64
 }
 
 fn connect_with_retry(addr: SocketAddr) -> TcpStream {

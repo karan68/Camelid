@@ -36,6 +36,7 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) ffn_down_vnni_decode: bool,
     pub(super) ffn_down_vnni_decode_rawptr: bool,
     pub(super) metal: bool,
+    pub(super) cuda: bool,
     pub(super) metal_retained: bool,
     pub(super) hybrid_retained: bool,
     pub(super) hybrid_gpu_rows: Option<usize>,
@@ -155,6 +156,10 @@ impl Q8RuntimeFlags {
                 "CAMELID_X86_Q8_FFN_DOWN_VNNI_DECODE_RAWPTR",
             ),
             metal: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8"),
+            // Opt-in CUDA Q8_0 hybrid linear (decode). Default off; the CPU path
+            // stays the reference. Harmless without the `cuda` feature because
+            // `cuda::try_*` is a stub that returns false (CPU fallback).
+            cuda: q8_0_env_flag_enabled_default_off("CAMELID_CUDA_Q8"),
             metal_retained: q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED"),
             hybrid_retained: q8_0_env_flag_enabled_default_off("CAMELID_HYBRID_Q8_RETAINED"),
             hybrid_gpu_rows: env::var("CAMELID_HYBRID_Q8_GPU_ROWS")

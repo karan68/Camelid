@@ -171,6 +171,21 @@ Already have a binary from [Install](#install)? Skip to "Get a model" below. To 
 cargo build --release                       # embeds it into the binary
 ```
 
+### Build from source on Windows (x86_64, MSVC)
+
+Windows `x86_64-pc-windows-msvc` is a tracked CPU platform (see [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support). There is no prebuilt Windows binary yet, so build from source. Prerequisites: the **MSVC** toolchain (Visual Studio Build Tools with the C++ workload — *not* MinGW), Rust via `rustup` with the `x86_64-pc-windows-msvc` host, and Node.js for the embedded web UI. Then, in PowerShell:
+
+```powershell
+cd frontend; npm ci; npm run build; cd ..   # bundles the web UI
+cargo build --release                       # embeds it into the binary
+.\target\release\camelid.exe pull tinyllama # the baseline supported row
+.\target\release\camelid.exe serve --model models\tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+```
+
+The server behaves exactly as on the other platforms (listens on `127.0.0.1:8181`, same OpenAI-style API + web UI). The TinyLlama 1.1B Chat Q8_0 baseline gate is verified on Windows with the same parity evidence as macOS/Ubuntu.
+
+> **Experimental GPU (NVIDIA/CUDA).** `cargo build --release --features cuda` adds an opt-in CUDA backend (enable at runtime with `CAMELID_CUDA_Q8=1`) that runs the Q8_0 decode matmul on the GPU. It is token-identical to the CPU reference on the tested rows but is **decode-only and not a supported lane** — the CPU path is the default and the correctness reference. Building the feature needs the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) (12.x; CUDA libraries are loaded at runtime); running it needs an NVIDIA GPU + driver.
+
 Get a model. Camelid validates specific **Q8_0** rows (most GGUFs on the web are other quantizations and fail closed), so `pull` fetches a known-good one into `./models`:
 
 ```bash

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod catalog;
 pub mod cluster;
+pub mod cuda;
 pub mod distributed;
 pub mod error;
 pub mod execution_plan;
@@ -12,6 +13,7 @@ pub mod inference;
 pub mod metal;
 pub mod model;
 pub mod model_source;
+pub mod platform_fs;
 pub mod receipt;
 pub mod telemetry;
 pub mod tensor;
