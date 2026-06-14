@@ -47,7 +47,7 @@ with a receipt, never a throughput win.
 ### Operational notes (environment, not the engine)
 
 - The Thunderbolt bridge (`169.254.0.0/16`) offers ~0.6 ms RTT but its link-local address
-  reassigned mid-session; the gated runs used the stable LAN IP `192.168.86.50`.
+  reassigned mid-session; the gated runs used the stable LAN IP (redacted).
 - mini2's worker, launched over SSH, was initially throttled by macOS App Nap / Wi-Fi
   power-save between runs (TCP `accept()` stalled → connect timeouts). Running the worker
   under `caffeinate -dimsu` resolved it. The coordinator also uses bounded connect-retry +
