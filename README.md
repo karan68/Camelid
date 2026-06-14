@@ -30,6 +30,41 @@ Grab the binary for your platform from the [latest release](https://github.com/t
 
 `serve` opens the chat UI in your browser automatically. **No Python, no Node, no Docker, no separate server** — one static binary that serves the OpenAI-style API and the web UI on the same port. Full details in [Install](#install) and [Quickstart](#quickstart).
 
+Want a single command that proves the whole path end to end? `scripts/smoke.sh` pulls TinyLlama, serves it, does one real chat round-trip, and asserts on the reply — no mocks. See [Quickstart](#quickstart).
+
+### Run in the terminal
+
+Prefer the keyboard? `camelid chat` is an interactive REPL that streams replies live in your terminal. It attaches to a running `camelid serve` or spawns one for you.
+
+```bash
+./camelid pull tinyllama        # the baseline supported row (or any pull alias)
+./camelid chat                  # opens a picker of supported models, or:
+./camelid chat --model models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+```
+
+With no `--model`, `chat` opens a picker built from the live support ledger (`/api/capabilities`) — it lists only **supported** rows and shows which are already downloaded. Switch models any time in-session with `/models` (history resets on a switch); `/help` lists the rest (`/system`, `/tokens`, `/reset`, `/pull`, `/exit`). Pointing `--model` at a GGUF whose architecture Camelid doesn't support is refused with the same typed error the rest of the engine uses — the terminal is not a backdoor around the support contract. Gemma 4 12B/26B remain **two-Mac distributed only** and are not single-node chat rows.
+
+---
+
+## Which model should I try first?
+
+Every row below is a **supported exact row** with committed evidence; the caveat column is the real support envelope from [`STATUS.md`](STATUS.md), not marketing. The three rows in `camelid pull` are the frictionless path — pick one and you're chatting in two commands (or run `scripts/smoke.sh` for the zero-decision path).
+
+| If you want… | Try this row | One command | First-run reality (from STATUS.md) |
+|---|---|---|---|
+| **The fastest "does it work" check** | TinyLlama 1.1B Chat Q8_0 | `camelid pull tinyllama` | The baseline gate — ~1.2 GB, single-node, runs anywhere. This is exactly what `scripts/smoke.sh` exercises. |
+| **A solid single-node default** | Llama 3.2 3B Instruct Q8_0 | `camelid pull llama32_3b` | Exact-row smoke + API/WebUI, single-node Apple Silicon or CPU. Verified context is **bounded to 512/1024/2048** — longer contexts aren't a support claim yet. |
+| **A small Gemma 4** | Gemma 4 E4B-It Q8_0 | `camelid pull gemma4_e4b` | Greedy parity on **both** CPU and the Metal GPU-resident runtime, **bounded context 512→8192**. Multimodal input fails closed by design. |
+
+**Also supported — bring the official Q8_0 GGUF and point `serve` at it** (these exact rows aren't in `camelid pull` yet):
+
+- **Most capable on a 16 GB Mac — Mistral 7B Instruct v0.3 Q8_0.** Exact-row smoke with **bounded context 512→8192** and GPU-vs-CPU greedy parity; the 7B parity receipt re-verifies on a 16 GB host.
+- **Kick the tires on Qwen — Qwen3 1.7B Q8_0** (`Qwen/Qwen3-1.7B-GGUF`). **ChatML, thinking-disabled smoke only:** token-and-text parity at 1/5/50 tokens plus API smoke. **No context bucket beyond the short chat smoke**, and GPU-resident decode fails closed (CPU path) when QK-norm is present.
+
+> **Not a single-node first demo:** **Gemma 4 12B-It** (and the 26B-A4B MoE) is supported **only** through the **two-Mac distributed serve lane** — single-node on a 16 GB host is memory-bound and **unsupported**. Treat it as a deliberate two-machine setup ([`docs/gemma4-two-mac-cluster.md`](docs/gemma4-two-mac-cluster.md)), not a casual demo.
+
+Anything not in [Supported models](#supported-models) fails closed with a typed error — that's the contract, not a limitation to work around.
+
 ---
 
 ## Why Camelid

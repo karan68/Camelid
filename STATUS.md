@@ -1,6 +1,6 @@
 # Camelid Status
 
-Last updated: 2026-06-01
+Last updated: 2026-06-14
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md).
 
