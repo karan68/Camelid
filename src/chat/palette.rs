@@ -108,6 +108,12 @@ pub const COMMANDS: &[Cmd] = &[
         aliases: &[],
     },
     Cmd {
+        name: "agent",
+        args: "",
+        desc: "how to start the sandboxed tool-calling agent",
+        aliases: &[],
+    },
+    Cmd {
         name: "help",
         args: "",
         desc: "show keys & commands",

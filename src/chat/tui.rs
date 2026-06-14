@@ -403,6 +403,10 @@ impl<'a> App<'a> {
                     self.pending = Some(Suspend::Pull(arg.to_string()));
                 }
             }
+            "agent" => {
+                self.status =
+                    "agent mode: relaunch with  camelid chat --agent --model <gguf>".into()
+            }
             "help" => self.mode = Mode::Help,
             "exit" => self.quit = true,
             other => self.status = format!("unknown command /{other} — type / to browse"),

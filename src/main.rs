@@ -143,6 +143,26 @@ enum Command {
         /// Directory holding downloaded GGUFs (picker availability + pull target).
         #[arg(long, env = "CAMELID_MODELS_DIR")]
         models_dir: Option<PathBuf>,
+        /// Enter agent mode: a sandboxed tool-calling loop (requires a
+        /// tool-capable supported model and `--model`).
+        #[arg(long, default_value_t = false)]
+        agent: bool,
+        /// Sandbox root for agent file/shell tools (default: current directory).
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Max agent steps (tool-call rounds) per goal.
+        #[arg(long, default_value_t = 25)]
+        max_steps: usize,
+        /// Agent: run write/exec/network tools WITHOUT prompting (sandbox still
+        /// enforced). Prints a warning; not recommended.
+        #[arg(long, default_value_t = false)]
+        auto_approve: bool,
+        /// Agent: offer the network tool (`http_fetch`). Off by default.
+        #[arg(long, default_value_t = false)]
+        allow_net: bool,
+        /// Agent: shell-command timeout in seconds.
+        #[arg(long, default_value_t = 30)]
+        shell_timeout: u64,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -527,6 +547,12 @@ async fn main() -> anyhow::Result<()> {
             no_stream,
             plain,
             models_dir,
+            agent,
+            workdir,
+            max_steps,
+            auto_approve,
+            allow_net,
+            shell_timeout,
         } => {
             let code = chat::run_chat(chat::ChatOptions {
                 model,
@@ -540,6 +566,12 @@ async fn main() -> anyhow::Result<()> {
                 no_stream,
                 plain,
                 models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+                agent,
+                workdir,
+                max_steps,
+                auto_approve,
+                allow_net,
+                shell_timeout,
             })?;
             if code != 0 {
                 std::process::exit(code);

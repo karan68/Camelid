@@ -84,8 +84,10 @@ mod tests {
     fn row(id: &str, status: &str) -> CompatRow {
         CompatRow {
             id: id.into(),
+            family: "fam".into(),
             quantization: "Q8_0".into(),
             status: status.into(),
+            tool_capable: false,
         }
     }
 

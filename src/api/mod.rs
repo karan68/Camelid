@@ -403,6 +403,11 @@ pub struct ChatCompletionRequest {
     /// channels are stripped from chat output either way. Default: false (the
     /// reference's `enable_thinking:false` rendering).
     pub camelid_enable_thinking: Option<bool>,
+    /// OpenAI-style tool/function definitions. When present, they are rendered
+    /// into the prompt through the loaded model's own chat template (Hybrid agent
+    /// mode); the model's tool-call output is parsed by the client. Models whose
+    /// template does not render tools simply ignore them.
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -833,6 +838,10 @@ pub struct GenerationSessionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Tool/function definitions, rendered into the prompt via the model's chat
+    /// template (agent mode). `None` renders identically to before.
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
@@ -1763,6 +1772,7 @@ async fn llama_server_completion(
         camelid_prompt_token_ids,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -4444,6 +4454,7 @@ async fn completions(
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
     };
@@ -4590,6 +4601,7 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -4874,6 +4886,7 @@ pub async fn replay_receipt_request(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
     };
@@ -5176,6 +5189,7 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
+    let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
     let sampling = sampling_config_from_request(&req).map_err(|response| *response)?;
@@ -5265,11 +5279,16 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
-            let rendered_prompt = render_chat_prompt_for_tokenization_for_model_result(
-                &messages,
-                &tokenizer,
-                Some(&model.id),
-            )
+            let rendered_prompt = match request_tools.as_deref() {
+                Some(tools) if !tools.is_empty() => {
+                    render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
+                }
+                _ => render_chat_prompt_for_tokenization_for_model_result(
+                    &messages,
+                    &tokenizer,
+                    Some(&model.id),
+                ),
+            }
             .map_err(|err| {
                 api_error(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -7608,11 +7627,13 @@ fn render_chat_prompt_for_tokenization_for_model_result(
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
         if metadata_chat_template_enabled() {
-            return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
+            return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
         if let Some(row_label) = exact_llama32_metadata_jinja_row {
             if is_llama3_instruct_template(template) {
-                return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
+                return render_metadata_jinja_chat_template_prompt(
+                    messages, tokenizer, template, None,
+                );
             }
             return Err(exact_llama32_metadata_jinja_chat_template_error(
                 &format!(
@@ -7626,6 +7647,27 @@ fn render_chat_prompt_for_tokenization_for_model_result(
         )));
     }
 
+    Ok(render_chat_prompt_for_tokenization_fallback(
+        messages, tokenizer,
+    ))
+}
+
+/// Agent mode: render the chat prompt with tool definitions threaded into the
+/// model's own chat template. Used only when a request carries `tools`; when the
+/// model has no chat template, tools cannot be rendered and we fall back.
+fn render_chat_prompt_for_tokenization_with_tools(
+    messages: &[ChatMessage],
+    tokenizer: &Tokenizer,
+    tools: &[serde_json::Value],
+) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
+    if let Some(template) = tokenizer.chat_template.as_deref() {
+        return render_metadata_jinja_chat_template_prompt(
+            messages,
+            tokenizer,
+            template,
+            Some(tools),
+        );
+    }
     Ok(render_chat_prompt_for_tokenization_fallback(
         messages, tokenizer,
     ))
@@ -7813,8 +7855,9 @@ fn render_metadata_jinja_chat_template_prompt(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     template: &str,
+    tools: Option<&[serde_json::Value]>,
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
-    let rendered = render_jinja_chat_template(messages, tokenizer, template)?;
+    let rendered = render_jinja_chat_template(messages, tokenizer, template, tools)?;
     Ok(RenderedPrompt {
         add_special: !rendered_prompt_starts_with_token_text(
             &rendered,
@@ -7830,6 +7873,7 @@ fn render_jinja_chat_template(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     template: &str,
+    tools: Option<&[serde_json::Value]>,
 ) -> std::result::Result<String, MiniJinjaError> {
     let template_messages = messages
         .iter()
@@ -7854,6 +7898,11 @@ fn render_jinja_chat_template(
         eom_token => eom_token,
         unk_token => unk_token,
         add_generation_prompt => true,
+        // Agent mode: the model's own template renders these. When `tools` is
+        // None both resolve to none, so the template takes its no-tools path and
+        // the render is byte-identical to before.
+        tools => tools,
+        custom_tools => tools,
     })
 }
 
@@ -10156,8 +10205,8 @@ mod tests {
         let template = "{{ raise_exception('unsupported chat-template branch') }}";
         let tokenizer = llama3_tokenizer_with_template(template);
 
-        let err =
-            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+        let err = render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template, None)
+            .unwrap_err();
         assert!(err.to_string().contains("unsupported chat-template branch"));
 
         let rendered = render_chat_prompt_for_tokenization(
@@ -10332,8 +10381,8 @@ mod tests {
         let template = "{{ unsupported_template_variable }}";
         let tokenizer = llama3_tokenizer_with_template(template);
 
-        let err =
-            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+        let err = render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template, None)
+            .unwrap_err();
 
         assert_eq!(err.kind(), MiniJinjaErrorKind::UndefinedError);
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);

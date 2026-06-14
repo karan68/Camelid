@@ -266,3 +266,92 @@ HTTP/SSE lane:
 
 Note: ratatui's diff renderer interleaves cursor escapes between characters, so PTY screen-scrape
 string matching is unreliable; verify features by reconstructing the screen, not substring search.
+
+## D9 — `camelid chat` agent mode (2026-06-14) — Phase 0
+
+Recon: `RECON_AGENT.md`. Agent mode = a tool-calling plan-act-observe loop built as a mode of the
+existing `chat` subcommand (new `src/chat/agent.rs`, driven from the session core; `--agent` flag
++ `/agent` toggle). Reuses the inference client, splash/turn-marker, and TTY/color helpers.
+
+**Decision A — ledger `tool_capable`: PROGRAMMATIC.** `ModelCompatibilityTarget` is structured
+Rust surfaced by `/api/capabilities`; add `tool_capable: bool` per row (default false), read by the
+agent gate + a future frontend from the same source — no second parser. Rows stay `false` until a
+real tool-call round-trip promotes one (same evidence bar as the support gate), so agent mode is
+built+tested but honestly refuses every supported row until then. The "stop if prose-only" boundary
+does not trigger.
+
+**Decision B — sandbox root: cwd (or `--workdir`), enforced.** Canonicalized absolute root; every
+file-tool path is joined, canonicalized, and required to be the root or a descendant (rejects
+`..`, outside-absolute, escaping symlinks). For new write targets the parent is checked. Enforced
+in code before I/O.
+
+**Decision C — shell: `/bin/sh -c`, cwd-pinned, timed, verbatim-approved.** Model supplies the
+whole command; the verbatim string (from the parsed call, not model prose) is shown at approval;
+cwd = sandbox root; default 30s timeout; captured stdout/stderr/exit. Honest limitation: `sh` runs
+with the user's permissions and can leave the root cwd — `run_shell` is cwd-confined + approval-
+gated, NOT a filesystem jail (true jailing = `sandbox-exec`/namespaces, a documented follow-up).
+Exec is therefore the highest risk class: always prompts, never in an auto-approve default.
+
+**Auto-approve stance.** `--auto-approve` may exist for power users but prints a prominent warning,
+is never a README default, and only relaxes *prompting* — never the sandbox (file tools) or the
+prompt-injection rule (tool-result content is data, never permission to escalate or act).
+
+**Phase 1 (tool-calling in inference) is a SUBSTANTIAL scope boundary** — confirming the approach
+(server-side / client-side / hybrid; see RECON_AGENT) before building it. The deterministic core
+(loop/tools/sandbox/approval/mock/tests) is buildable first and independent of that choice.
+
+### D9 (cont.) — agent mode: deterministic core DONE; Phase 1 + promotion pending
+
+**Built + tested (Phases 0, 2–6, 8-core):** `src/chat/{tools,tool_parse,agent}.rs`. The
+plan-act-observe loop is UI/model-agnostic (`ModelDriver`/`Approver`/`Reporter` traits), bounded
+(`--max-steps`, default 25) and cancellable; the full tool set (read_file/list_dir/search/
+write_file/edit_file/run_shell/http_fetch) is sandbox-confined; the approval gate is
+y/a/n/q with session policy; the Llama/Hermes tool-call parser is in `tool_parse.rs`. **44 bin
+unit tests** cover sandbox-escape rejection, each tool, parse (valid Llama/Qwen + malformed →
+clean), loop-with-mock (threads results, step cap), denial handling, **prompt-injection in a tool
+result does not execute**, and **--auto-approve still enforces the sandbox**. fmt/clippy/test/doc
+green. Capability gate verified live: `--agent` on a non-tool-capable row refuses (typed error,
+exit 2).
+
+**Front-end decision:** agent mode runs in the **line renderer** (synchronous, readline approvals,
+clean redirected transcripts) — entered via `--agent`. `/agent` in the chat front ends is a
+discoverable pointer to it. The full-screen TUI agent (modal approvals inside the redraw loop) is
+a documented follow-up.
+
+**Phase 1 (Hybrid tool-calling) — PENDING, scoped:** the server currently rejects `tools` (it
+falls into `#[serde(flatten)] unsupported_fields`). To enable: add `tools: Option<Vec<Value>>` to
+`ChatCompletionRequest` + `GenerationSessionRequest` (+ the handler conversion), and thread it into
+the Jinja render context (`render_jinja_chat_template` → add `custom_tools`/`tools` to `context!`;
+`render_metadata_jinja_chat_template_prompt` + `render_chat_prompt_for_tokenization_for_model_result`
+gain an `Option<&[Value]>` param — the ~12 existing callers, mostly tests, pass `None`). Backward-
+compatible: `tools=none` → the template's no-tools path → byte-identical render. The model's own
+chat template then renders tools; the client parses output (already built).
+
+**Promotion — PENDING, evidence-gated:** set `tool_capable=true` on `llama32_3b_instruct_q8_0`
+**only after** a real round-trip shows it emits a parseable tool call. Llama 3.2 3B is a small
+model and tool-calling reliability is genuinely uncertain — if it doesn't round-trip cleanly, the
+row stays `false` and that is reported honestly (no demo claimed without evidence).
+
+### D9 (cont.) — Phase 1 SHIPPED; promotion NOT earned (evidence)
+
+**Phase 1 (Hybrid tool-calling) — DONE.** `tools` is now an accepted field on
+`ChatCompletionRequest`/`GenerationSessionRequest` and is threaded into the model's own Jinja
+chat template (`render_jinja_chat_template` gained `custom_tools`/`tools` in its `context!`; a
+dedicated `render_chat_prompt_for_tokenization_with_tools` is used only when a request carries
+tools, so the shared render chain and its ~12 callers are untouched). Backward-compatible:
+`tools=None` → the template's no-tools path → byte-identical render (lib's 438 tests still pass).
+Verified live: a request with `tools` is no longer rejected (it reached model resolution), and the
+model renders + emits tool calls.
+
+**Promotion — NOT done (honest, evidence-gated).** A live round-trip on Llama 3.2 **1B** Q8_0
+(the 3B would not load under severe box contention — 140–168s even for the 1B) showed the model
+**emits the correct Llama tool-call format** (`{"name":"read_file","parameters":{…}}`) — so the
+threading + parser work end-to-end — **but with malformed arguments** (it echoed the JSON schema
+instead of `{"path":"notes.txt"}`) and looped to the length cap. That is not a usable tool call,
+so **no row is promoted**: `tool_capable` stays false for every row and agent mode keeps refusing
+(verified: exit 2). This matches the spec's capability tension exactly — small Llama 3.2 models
+don't tool-call reliably, and the more-capable 3B/8B (or Qwen3/Mistral) round-trip awaits a calm
+box. The server-side `tool_capable` ledger column is added the moment a row earns it (add the
+field to `ModelCompatibilityTarget` + set the promoted row true); until then the client's
+`CompatRow.tool_capable` defaults false, so the gate is correct without it. No capability is
+published that no model has demonstrated.
