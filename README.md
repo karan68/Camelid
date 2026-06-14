@@ -69,7 +69,7 @@ Every row below is a **supported exact row** with committed evidence; the caveat
 **Also supported — bring the official Q8_0 GGUF and point `serve` at it** (these exact rows aren't in `camelid pull` yet):
 
 - **Most capable on a 16 GB Mac — Mistral 7B Instruct v0.3 Q8_0.** Exact-row smoke with **bounded context 512→8192** and GPU-vs-CPU greedy parity; the 7B parity receipt re-verifies on a 16 GB host.
-- **Kick the tires on Qwen — Qwen3 1.7B Q8_0** (`Qwen/Qwen3-1.7B-GGUF`). **ChatML, thinking-disabled smoke only:** token-and-text parity at 1/5/50 tokens plus API smoke. Runs on the **GPU-resident decode + single-shot prefill** path (per-head QK-norm applied in-kernel), validated token-and-text-identical to llama.cpp at a **15,373-token single-shot prefill context** (ceilings: 16,384 single-shot prefill / 40,960 KV).
+- **Kick the tires on Qwen — Qwen3 1.7B Q8_0** (`Qwen/Qwen3-1.7B-GGUF`). **ChatML** with token-and-text parity at 1/5/50 tokens plus API smoke (thinking-disabled is the parity-locked mode). Runs on the **GPU-resident decode + single-shot prefill** path (per-head QK-norm applied in-kernel), validated token-and-text-identical to llama.cpp at a **15,373-token single-shot prefill context** (ceilings: 16,384 single-shot prefill / 40,960 KV). **Thinking mode** is available opt-in (`camelid_enable_thinking:true`): the model emits its own `<think>…</think>` reasoning, token-identical to llama.cpp for the leading trace (26–205-token envelope) before the documented f32 frontier.
 
 > **Not a single-node first demo:** **Gemma 4 12B-It** (and the 26B-A4B MoE) is supported **only** through the **two-Mac distributed serve lane** — single-node on a 16 GB host is memory-bound and **unsupported**. Treat it as a deliberate two-machine setup ([`docs/gemma4-two-mac-cluster.md`](docs/gemma4-two-mac-cluster.md)), not a casual demo.
 
@@ -103,7 +103,7 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 | Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + API/WebUI + bounded context |
 | Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
 | Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
-| **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke; GPU-resident decode+prefill validated to a 15,373-token context (vs llama.cpp) |
+| **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke; GPU-resident decode+prefill validated to a 15,373-token context (vs llama.cpp); thinking mode opt-in (leading-trace parity) |
 | **Qwen3 0.6B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (explicit head_dim path) |
 | **Qwen3 4B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim); one probe is a documented first-token near-tie |
 | **Qwen3 8B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (untied embeddings); also on the GPU-resident decode+prefill path (same support bar vs llama.cpp), resident prefill engages at large context |
@@ -112,7 +112,7 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 | **Gemma 4 12B-It** | Q8_0 | two-Mac distributed | Distributed parity + serve/WebUI smoke |
 | **Gemma 4 26B-A4B-It QAT** | Q4_0 (128-expert MoE) | two-Mac distributed | Distributed parity + serve/WebUI smoke |
 
-> **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); other Qwen3 sizes (14B/32B), base variants, Qwen3-MoE (A3B), and Qwen3 thinking-mode generation; Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
+> **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); other Qwen3 sizes (14B/32B), base variants, Qwen3-MoE (A3B), and full-trace Qwen3 thinking-mode token-parity (thinking is available opt-in with leading-trace parity); Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
 
 Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) and [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
