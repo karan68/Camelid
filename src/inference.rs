@@ -1572,17 +1572,9 @@ impl LlamaInferenceSession {
         if self.config.moe.is_some() {
             bail!("moe config");
         }
-        // QK-norm (Qwen3) is only wired in the CPU reference forward path; the
-        // GPU-resident decode kernels do not yet apply per-head Q/K RMSNorm. Fail
-        // closed to the CPU path rather than silently dropping the QK-norm weights.
-        if self
-            .weights
-            .layers
-            .iter()
-            .any(|layer| layer.attention_q_norm.is_some() || layer.attention_k_norm.is_some())
-        {
-            bail!("model uses QK-norm (Qwen3); resident decode kernels do not apply it yet");
-        }
+        // QK-norm (Qwen3) is applied in the resident path (decode:
+        // encode_attention_block, prefill: prefill_tokens) via the per-head
+        // RMSNorm kernel, so it no longer disqualifies the resident path.
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
             || diagnostic_ffn_gate_up_order()? != FfnGateUpOrder::GateUp
@@ -1752,6 +1744,8 @@ impl LlamaInferenceSession {
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
                 ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -1930,6 +1924,8 @@ impl LlamaInferenceSession {
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
                 ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
