@@ -102,6 +102,13 @@ enum Command {
         /// interactively, `serve` opens the chat surface automatically.
         #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
         no_open: bool,
+        /// Opt into deterministic inference: pin the forward pass to the order-stable
+        /// CPU path (the whole Metal/GPU fast stack is forced off) so the supported
+        /// TinyLlama 1.1B Q8_0 lane is bit-exact and reduction-order-stable across runs.
+        /// Slower than the default GPU path; the default path is unchanged. Reduction
+        /// order follows the llama.cpp reference Q8_0 layout (see DECISIONS.md §D9).
+        #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
+        deterministic: bool,
     },
     /// Interactive terminal chat REPL over the local Camelid API.
     ///
@@ -415,6 +422,12 @@ enum Command {
         /// Accepted for compatibility; JSON is always emitted to stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Opt into deterministic inference: pin generation to the order-stable CPU
+        /// forward pass (Metal/GPU fast stack forced off) so the supported TinyLlama
+        /// 1.1B Q8_0 lane is bit-exact across runs, thread counts, and processes.
+        /// Slower than the default GPU path; the default path is unchanged.
+        #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
+        deterministic: bool,
     },
     /// EXPERIMENTAL ghost (layer-streaming) mode: execute a model one transformer block at
     /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
@@ -498,9 +511,17 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    apply_default_fast_stack();
+    let command = Cli::parse().command;
+    // Deterministic mode opts out of the GPU fast stack entirely; otherwise the CLI
+    // defaults to the measured-fastest Metal configuration. Branch before any env is set
+    // so the deterministic path never even arms the GPU defaults.
+    if command_requests_deterministic(&command) {
+        apply_deterministic_mode();
+    } else {
+        apply_default_fast_stack();
+    }
 
-    match Cli::parse().command {
+    match command {
         Command::Serve {
             addr,
             model,
@@ -514,16 +535,22 @@ async fn main() -> anyhow::Result<()> {
             spec_draft_model,
             spec_draft_tokens,
             no_open,
+            deterministic,
         } => {
             configure_rayon_threads(threads)?;
+            // In deterministic mode the engine fails every Metal gate closed (see
+            // `apply_deterministic_mode`); don't also arm the Metal tuning env or the
+            // GPU fast-load nocopy default, which would only be contradictory no-ops.
             apply_runtime_tuning_env(
                 parallel_linear_min_outputs,
                 apple_accelerate_min_elements,
-                metal_linear,
-                metal_q8,
+                metal_linear && !deterministic,
+                metal_q8 && !deterministic,
             );
             apply_spec_decode_env(spec_decode, spec_draft_model, spec_draft_tokens);
-            apply_serve_nocopy_default();
+            if !deterministic {
+                apply_serve_nocopy_default();
+            }
             if log_acceleration {
                 log_acceleration_state();
             }
@@ -881,6 +908,10 @@ async fn main() -> anyhow::Result<()> {
             warmup,
             threads,
             json: _,
+            // `apply_deterministic_mode` already set CAMELID_DETERMINISTIC + forced the
+            // Metal stack off before this match, so generation rides the CPU path; the
+            // engine reads the env directly.
+            deterministic: _,
         } => {
             run_bench_generate(
                 model,
@@ -1578,6 +1609,56 @@ fn apply_default_fast_stack() {
             std::env::set_var(key, "1");
         }
     }
+}
+
+/// True when the parsed subcommand opted into deterministic inference (`--deterministic`).
+/// Only `serve` and `bench-generate` expose the flag today (the supported single-node
+/// generate/serve path); every other subcommand keeps the default fast stack.
+fn command_requests_deterministic(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Serve {
+            deterministic: true,
+            ..
+        } | Command::BenchGenerate {
+            deterministic: true,
+            ..
+        }
+    )
+}
+
+/// Pin the process to the opt-in deterministic CPU forward pass. Sets
+/// `CAMELID_DETERMINISTIC=1` — which the engine reads (`inference::deterministic_mode_enabled`)
+/// to fail every Metal/GPU dispatch gate closed to its order-stable CPU equivalent — then
+/// forces the whole Metal fast stack off and disables GPU sampling so greedy decode also
+/// stays on the CPU path. The result is bit-exact, reduction-order-stable logits for the
+/// supported TinyLlama 1.1B Q8_0 lane. Only the CLI entry calls this; library defaults and
+/// the default (GPU) fast path are byte-for-byte unchanged. The pinned reduction order
+/// mirrors the llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated
+/// against (see DECISIONS.md §D9 and `qa/determinism/determinism-baseline-*.md`).
+fn apply_deterministic_mode() {
+    std::env::set_var("CAMELID_DETERMINISTIC", "1");
+    for key in [
+        "CAMELID_METAL_RESIDENT_DECODE",
+        "CAMELID_METAL_F32Y",
+        "CAMELID_METAL_WIRE",
+        "CAMELID_METAL_WIRE_NSG8",
+        "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_MM",
+        "CAMELID_METAL_LINEAR",
+        "CAMELID_METAL_Q8",
+        "CAMELID_METAL_Q8_RETAINED",
+        "CAMELID_HYBRID_Q8_RETAINED",
+        "CAMELID_METAL_NOCOPY",
+    ] {
+        std::env::set_var(key, "0");
+    }
+    std::env::set_var("CAMELID_NO_GPU_SAMPLE", "1");
+    eprintln!(
+        "[deterministic] pinned to the order-stable CPU forward pass (Metal/GPU stack off). \
+         Reduction order follows the llama.cpp reference block-wise Q8_0 layout; see DECISIONS.md \u{a7}D9."
+    );
 }
 
 /// Default the single-node `serve` path to fast-load (CAMELID_METAL_NOCOPY): Q8_0

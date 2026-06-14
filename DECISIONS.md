@@ -267,7 +267,73 @@ HTTP/SSE lane:
 Note: ratatui's diff renderer interleaves cursor escapes between characters, so PTY screen-scrape
 string matching is unreliable; verify features by reconstructing the screen, not substring search.
 
-## D9 — `camelid chat` agent mode (2026-06-14) — Phase 0
+## D9 — Deterministic CPU forward pass, Pillar One (2026-06-14)
+
+Opt-in deterministic inference for the supported **TinyLlama 1.1B Chat Q8_0** lane, behind
+`--deterministic` (`serve` and `bench-generate`; env `CAMELID_DETERMINISTIC=1`). The default
+(GPU resident-decode) fast path is untouched — verified byte-for-byte identical token stream
+before/after the change at ~88 tok/s on M4. Credit: the pinned reduction order mirrors the
+llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated against.
+
+**Flag, not a Cargo feature.** Determinism is a *runtime path choice* (CPU vs the Metal GPU
+fast stack), not a compile-time one: the same shipped binary serves both the default fast path
+and the deterministic path, and nothing in the default build changes. A Cargo feature would
+fork the binary and risk a different default artifact; a runtime flag keeps one byte-identical
+default binary and lets a caller opt in per invocation (or per process via the env var, which
+the engine reads directly so library embedders get the same guarantee).
+
+**Mechanism (fail-closed in the engine).** `apply_deterministic_mode()` (CLI) sets
+`CAMELID_DETERMINISTIC=1`, forces the whole Metal stack off, and disables GPU sampling. The
+engine reads `inference::deterministic_mode_enabled()` and **ANDs every Metal/GPU dispatch gate
+with `!deterministic`** (`q8_0_metal_enabled`, `resident_decode_metal_enabled`,
+`q8_0_metal_retained_enabled`, `q8_0_hybrid_retained_enabled`, and the two
+`try_*_linear_row_metal` paths). So even if a `CAMELID_METAL_*` override is present, deterministic
+mode still resolves to the order-stable CPU kernels. The default path (`deterministic == false`)
+takes the existing branch unchanged.
+
+**Why this is bit-exact for free on the CPU path.** Phase 0 (see
+`qa/determinism/determinism-baseline-*.md`) established that the CPU forward pass is *already*
+order-stable: every reduction site parallelizes over the **output** dimension (one thread owns a
+disjoint set of outputs and runs that output's entire reduction serially), with no cross-thread
+float combine, no atomics, no parallel sum/reduce/fold, and a compile-time-fixed SIMD lane
+layout. Empirically the CPU stream is byte-identical across runs, across processes, and between
+`--threads 1` and `--threads 10`. So `--deterministic` adds **no determinism penalty inside the
+CPU computation** — its only cost is forgoing the GPU fast path (~12.5 vs ~88 tok/s on M4).
+
+### The pinned reduction order (the contract a future portable trace depends on)
+
+This order is **order-stable** on a given binary + host (identical across runs/processes/thread
+counts). The *values* remain ISA-dependent (i8mm vs dotprod vs scalar round differently), so a
+cross-machine trace must pin the host/ISA, not assume cross-ISA bit-equality.
+
+- **Site 1 — Linear / matmul** (Q, K, V, attention-output, FFN gate/up/down) **and Site 3 — lm_head**
+  (same kernels, `q8_0_packed_rows4_dot_i8_matmul` / `dot_product_row`):
+  1. Output-partitioned across rayon — each output element (or packed group of 4) is computed
+     entirely by one thread; parallelism **never** splits a single output's reduction.
+  2. The activation row is quantized once (`quantize_q8_0_row`, an order-independent transform),
+     then the dot over the K dimension accumulates **block by block in ascending Q8_0 block
+     index** (32 values/block), each block scaled by its f32 scale, summed left-to-right into a
+     fixed scalar/lane accumulator.
+  3. The per-block 32-wide product reduces in a **compile-time-fixed lane layout** (i8mm/dotprod
+     `q8_0_packed_4x8` → fixed `sums[0..4]`; scalar fallback unrolled-by-4, left-to-right).
+
+- **Site 2 — Attention** (`attention_context_for_head_into`):
+  1. **QKᵀ scores:** each score is a serial `dot_product_row(query, key@pos)` over `head_dim`,
+     fixed left-to-right order (vDSP_dotpr on macOS / unrolled-by-4 scalar elsewhere).
+  2. **Softmax:** max via `fold(NEG_INFINITY, f32::max)` over positions in **ascending position
+     order**; exp + sum accumulated in ascending position order; normalize by `1.0 / sum`.
+  3. **Value accumulation:** `out += prob * value` summed over cached positions in **ascending
+     position order**. Prefill batches partition over output rows (one thread per row); single-
+     token decode is serial per head. Neither splits a reduction across threads.
+
+### Measured overhead (M4, TinyLlama 1.1B Q8_0, hello → 50 tok, greedy, median of 5)
+
+| Path | tok/s | Determinism |
+|---|---|---|
+| Default (GPU resident decode) | ~88 | self-identical per process; **diverges from CPU at tok 25** (not a bit-reproducible reference) |
+| `--deterministic` (CPU) | ~12.5 | **bit-exact** across runs, processes, and thread counts |
+
+## D10 — `camelid chat` agent mode (2026-06-14) — Phase 0
 
 Recon: `RECON_AGENT.md`. Agent mode = a tool-calling plan-act-observe loop built as a mode of the
 existing `chat` subcommand (new `src/chat/agent.rs`, driven from the session core; `--agent` flag
@@ -300,7 +366,7 @@ prompt-injection rule (tool-result content is data, never permission to escalate
 (server-side / client-side / hybrid; see RECON_AGENT) before building it. The deterministic core
 (loop/tools/sandbox/approval/mock/tests) is buildable first and independent of that choice.
 
-### D9 (cont.) — agent mode: deterministic core DONE; Phase 1 + promotion pending
+### D10 (cont.) — agent mode: deterministic core DONE; Phase 1 + promotion pending
 
 **Built + tested (Phases 0, 2–6, 8-core):** `src/chat/{tools,tool_parse,agent}.rs`. The
 plan-act-observe loop is UI/model-agnostic (`ModelDriver`/`Approver`/`Reporter` traits), bounded
@@ -332,7 +398,7 @@ chat template then renders tools; the client parses output (already built).
 model and tool-calling reliability is genuinely uncertain — if it doesn't round-trip cleanly, the
 row stays `false` and that is reported honestly (no demo claimed without evidence).
 
-### D9 (cont.) — Phase 1 SHIPPED; promotion NOT earned (evidence)
+### D10 (cont.) — Phase 1 SHIPPED; promotion NOT earned (evidence)
 
 **Phase 1 (Hybrid tool-calling) — DONE.** `tools` is now an accepted field on
 `ChatCompletionRequest`/`GenerationSessionRequest` and is threaded into the model's own Jinja

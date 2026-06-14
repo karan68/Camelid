@@ -65,7 +65,7 @@ Every row below is a **supported exact row** with committed evidence; the caveat
 **Also supported — bring the official Q8_0 GGUF and point `serve` at it** (these exact rows aren't in `camelid pull` yet):
 
 - **Most capable on a 16 GB Mac — Mistral 7B Instruct v0.3 Q8_0.** Exact-row smoke with **bounded context 512→8192** and GPU-vs-CPU greedy parity; the 7B parity receipt re-verifies on a 16 GB host.
-- **Kick the tires on Qwen — Qwen3 1.7B Q8_0** (`Qwen/Qwen3-1.7B-GGUF`). **ChatML, thinking-disabled smoke only:** token-and-text parity at 1/5/50 tokens plus API smoke. **No context bucket beyond the short chat smoke**, and GPU-resident decode fails closed (CPU path) when QK-norm is present.
+- **Kick the tires on Qwen — Qwen3 1.7B Q8_0** (`Qwen/Qwen3-1.7B-GGUF`). **ChatML, thinking-disabled smoke only:** token-and-text parity at 1/5/50 tokens plus API smoke. Runs on the **GPU-resident decode + single-shot prefill** path (per-head QK-norm applied in-kernel), validated token-and-text-identical to llama.cpp at a **15,373-token single-shot prefill context** (ceilings: 16,384 single-shot prefill / 40,960 KV).
 
 > **Not a single-node first demo:** **Gemma 4 12B-It** (and the 26B-A4B MoE) is supported **only** through the **two-Mac distributed serve lane** — single-node on a 16 GB host is memory-bound and **unsupported**. Treat it as a deliberate two-machine setup ([`docs/gemma4-two-mac-cluster.md`](docs/gemma4-two-mac-cluster.md)), not a casual demo.
 
@@ -99,7 +99,7 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 | Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + API/WebUI + bounded context |
 | Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
 | Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
-| **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke |
+| **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke; GPU-resident decode+prefill validated to a 15,373-token context (vs llama.cpp) |
 | **Qwen3 0.6B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (explicit head_dim path) |
 | **Qwen3 4B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim); one probe is a documented first-token near-tie |
 | **Qwen3 8B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (untied embeddings) |

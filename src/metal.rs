@@ -8828,6 +8828,8 @@ fn encode_attention_block(
     out_buf: &Buffer,
     attn_norm: &[f32],
     eps: f32,
+    q_norm: Option<&[f32]>,
+    k_norm: Option<&[f32]>,
     q_w_buf: &Buffer,
     k_w_buf: &Buffer,
     v_w_buf: &Buffer,
@@ -8967,6 +8969,40 @@ fn encode_attention_block(
         );
         None
     };
+    // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projection and BEFORE RoPE.
+    // In-place is safe — the per-head kernel reduces the sum-of-squares via
+    // threadgroup memory before the (per-index) write. No-op for Llama rows.
+    if let (Some(qn), Some(kn)) = (q_norm, k_norm) {
+        let qnorm_w_buf = f32b(head_dim);
+        let knorm_w_buf = f32b(head_dim);
+        let perhead_scalar = nb(12);
+        write_buffer_f32(&qnorm_w_buf, qn);
+        write_buffer_f32(&knorm_w_buf, kn);
+        unsafe {
+            let p = perhead_scalar.contents() as *mut u8;
+            *(p as *mut u32) = head_dim as u32;
+            *(p.add(4) as *mut f32) = eps;
+            *(p.add(8) as *mut u32) = 1; // use_weight
+        }
+        encode_rms_norm_per_head(
+            e,
+            k,
+            &query_buf,
+            &qnorm_w_buf,
+            &query_buf,
+            &perhead_scalar,
+            n_heads,
+        );
+        encode_rms_norm_per_head(
+            e,
+            k,
+            &key_buf,
+            &knorm_w_buf,
+            &key_buf,
+            &perhead_scalar,
+            n_kv_heads,
+        );
+    }
     encode_rope(
         e,
         k,
@@ -9304,6 +9340,8 @@ pub fn try_attention_block_resident(
         &out_buf,
         attn_norm,
         eps,
+        None,
+        None,
         &q_w,
         &k_w,
         &v_w,
@@ -9430,6 +9468,8 @@ pub fn try_decode_layer_resident(
         &attn_buf,
         attn_norm,
         eps,
+        None,
+        None,
         &q_w,
         &k_w,
         &v_w,
@@ -9597,6 +9637,8 @@ pub fn try_decode_forward_resident(
             &mid,
             layer.attn_norm,
             eps,
+            None,
+            None,
             &w[0],
             &w[1],
             &w[2],
@@ -9650,6 +9692,10 @@ pub fn try_decode_forward_resident(
 pub struct ResidentLayerWeights<'a> {
     pub attn_norm: &'a [f32],
     pub ffn_norm: &'a [f32],
+    /// Per-head QK-norm weights (`[head_dim]`, F32), applied to Q/K after the
+    /// projection and before RoPE (Qwen3). `None` for plain Llama-family rows.
+    pub q_norm: Option<&'a [f32]>,
+    pub k_norm: Option<&'a [f32]>,
     pub q_weight_blocks: ResidentWeightBytes<'a>,
     pub k_weight_blocks: ResidentWeightBytes<'a>,
     pub v_weight_blocks: ResidentWeightBytes<'a>,
@@ -10301,6 +10347,8 @@ impl ResidentDecodeState {
                 &self.mid,
                 layer.attn_norm,
                 self.eps,
+                layer.q_norm,
+                layer.k_norm,
                 &w[0],
                 &w[1],
                 &w[2],
@@ -10482,6 +10530,12 @@ impl ResidentDecodeState {
             return None;
         }
         let k = metal_linear_kernel()?;
+        // Qwen3 per-head QK-norm: when the layers carry q_norm/k_norm we apply an
+        // in-place per-head RMSNorm to Q and K (after the QKV GEMM, before RoPE).
+        // The per-head norm kernel is f32, so we force the f32 activation path
+        // (disabling the mm / half / attn-as-mm lanes) to keep Q/K materialized as
+        // f32 [token][head][head_dim] — bit-identical to the cpu_reference order.
+        let has_qk_norm = layers.first().is_some_and(|l| l.q_norm.is_some());
         let q_dim = self.n_heads * self.head_dim;
         let kv_dim = self.n_kv_heads * self.head_dim;
         let bpr_hidden = self.hidden / 32;
@@ -10526,6 +10580,7 @@ impl ResidentDecodeState {
         let n_pad = n_tokens.next_multiple_of(128);
         let gqa_group = self.n_heads / self.n_kv_heads;
         let use_attn_mm = mm_prefill_enabled()
+            && !has_qk_norm
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
@@ -10639,6 +10694,18 @@ impl ResidentDecodeState {
             *(a.add(24) as *mut u32) = 0u32; // kv base offset
             *(a.add(28) as *mut u32) = n_tokens as u32;
         }
+        // Per-head QK-norm scalar (Qwen3): head_dim(u32) | eps(f32) | use_weight(u32).
+        // Shared by every layer; the per-layer q_norm/k_norm weights vary, the geometry
+        // does not. Built only when QK-norm is in play.
+        let perhead_qk_scalar = nb(12);
+        if has_qk_norm {
+            unsafe {
+                let p = perhead_qk_scalar.contents() as *mut u8;
+                *(p as *mut u32) = self.head_dim as u32;
+                *(p.add(4) as *mut f32) = self.eps;
+                *(p.add(8) as *mut u32) = 1u32; // use_weight
+            }
+        }
 
         // CAMELID_PREFILL_TRACE=1: split each stage into its own command buffer and
         // report accumulated hardware GPU-busy time per stage (per-stage waits inflate
@@ -10665,6 +10732,7 @@ impl ResidentDecodeState {
         // (BK=64 = 2 blocks/step), and half activations — decided once for the whole
         // prefill since the activation buffers are emitted in the matching precision.
         let use_mm = mm_prefill_enabled()
+            && !has_qk_norm
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)
@@ -10922,6 +10990,37 @@ impl ResidentDecodeState {
             gemm(&e, qkv_y, &w[1], &k_buf, &qkv_scalar, 0, 8, 12, kv_dim);
             gemm(&e, qkv_y, &w[2], &v_buf, &qkv_scalar, 0, 8, 12, kv_dim);
             stage!("2:gemm_qkv");
+            // Qwen3 per-head QK-norm: in-place RMSNorm over each head's head_dim slice
+            // of the f32 Q/K buffers (layout [token][head][head_dim] -> n_tokens*heads
+            // contiguous groups), applied after the QKV GEMM and before RoPE. has_qk_norm
+            // forces the f32 path, so q_buf/k_buf are f32 here.
+            if let (Some(qn), Some(kn)) = (layer.q_norm, layer.k_norm) {
+                let qnorm_buf = nb(self.head_dim * 4);
+                let knorm_buf = nb(self.head_dim * 4);
+                write_buffer_f32(&qnorm_buf, qn);
+                write_buffer_f32(&knorm_buf, kn);
+                if !last_layer {
+                    encode_rms_norm_per_head(
+                        &e,
+                        k,
+                        &q_buf,
+                        &qnorm_buf,
+                        &q_buf,
+                        &perhead_qk_scalar,
+                        n_tokens * self.n_heads,
+                    );
+                }
+                encode_rms_norm_per_head(
+                    &e,
+                    k,
+                    &k_buf,
+                    &knorm_buf,
+                    &k_buf,
+                    &perhead_qk_scalar,
+                    n_tokens * self.n_kv_heads,
+                );
+                stage!("2b:qk_norm");
+            }
             let use_fused_rope = use_attn_mm && half_rope * 2 == self.head_dim;
             if use_fused_rope {
                 // Fused rope(Q)->half panel + rope(K)->caches + V scatter, one dispatch.
@@ -16529,6 +16628,8 @@ mod tests {
                 gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
                 up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
                 down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                q_norm: None,
+                k_norm: None,
             })
             .collect();
 
