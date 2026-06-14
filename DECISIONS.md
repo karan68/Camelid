@@ -113,9 +113,9 @@ speed).
 Reported, not faked (operating rule #5). Two distinct results:
 
 **RESOLVED — camelid is portable to aarch64-Linux (the spec's assumed hard blocker).**
-- All 3 Pis found: `camelid1` 192.168.86.20, `camelid2` .48, `camelid3` .39 — Pi 5, 16 GB,
-  aarch64 Linux (kernel 6.12 rpi-2712), running NanoCamelid. Key `~/Documents/cert/pi5_tooleman_ed25519`,
-  user `tooleman`. (The old ssh-config `192.168.86.27` is now a different device.)
+- All 3 Pis found: `camelid1`/`camelid2`/`camelid3` on the local LAN (IPs redacted) — Pi 5, 16 GB,
+  aarch64 Linux (kernel 6.12 rpi-2712), running NanoCamelid. Operator SSH key path redacted,
+  user `tooleman`. (An older ssh-config LAN entry now points at a different device.)
 - `build.rs` portable (x86 AMX gated to linux+x86_64; Accelerate macOS; Metal cfg(macos)).
   No rust cross-target locally (Homebrew, no rustup), so built **natively on camelid1**:
   installed rustup (1.96), rsynced source, `cargo build --release --example parity_node`

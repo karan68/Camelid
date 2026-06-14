@@ -31,7 +31,7 @@
     },
     {
       "node": "camelid1-pi",
-      "host": "192.168.86.20:9315",
+      "host": "192.168.x.x:9315",
       "role": "shard",
       "layer_range": [
         11,

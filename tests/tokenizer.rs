@@ -347,15 +347,29 @@ fn encodes_mistral_real_prompts_like_llama_cpp_when_available() {
 }
 
 #[test]
-fn rejects_gpt2_bpe_without_llama_pre_tokenizer() {
+fn rejects_gpt2_bpe_without_supported_pre_tokenizer() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tokenizer-gpt2-wrong-pre.gguf");
-    write_gpt2_bpe_tokenizer_gguf_with_pre(&path, "qwen2");
+    // A GPT-2/BPE pre-tokenizer we do not support (not llama-bpe or qwen2) must
+    // still fail closed.
+    write_gpt2_bpe_tokenizer_gguf_with_pre(&path, "deepseek-llm");
 
     let gguf = read_metadata(&path).unwrap();
     let err = Tokenizer::from_gguf(&gguf).unwrap_err().to_string();
     assert!(err.contains("unsupported GPT-2/BPE pre-tokenizer"));
     assert!(err.contains("llama-bpe"));
+    assert!(err.contains("qwen2"));
+}
+
+#[test]
+fn accepts_qwen2_gpt2_bpe_pre_tokenizer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer-gpt2-qwen2-pre.gguf");
+    write_gpt2_bpe_tokenizer_gguf_with_pre(&path, "qwen2");
+
+    let gguf = read_metadata(&path).unwrap();
+    // Qwen2/Qwen3 GPT-2/BPE pre-tokenizer is supported (single-digit grouping).
+    Tokenizer::from_gguf(&gguf).expect("qwen2 pre-tokenizer must be accepted");
 }
 
 #[test]

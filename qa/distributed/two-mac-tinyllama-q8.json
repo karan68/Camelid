@@ -31,7 +31,7 @@
     },
     {
       "node": "mini2",
-      "host": "192.168.86.50:9311",
+      "host": "192.168.x.x:9311",
       "role": "shard",
       "layer_range": [
         11,
