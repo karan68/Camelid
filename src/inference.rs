@@ -14940,7 +14940,7 @@ fn horizontal_sum_i32x4(acc: std::arch::aarch64::int32x4_t) -> i32 {
     unsafe { std::arch::aarch64::vaddvq_s32(acc) }
 }
 
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
@@ -14976,7 +14976,7 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     half
 }
 
-fn f16_bits_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = (u32::from(bits & 0x8000)) << 16;
     let exp = (bits & 0x7c00) >> 10;
     let frac = u32::from(bits & 0x03ff);

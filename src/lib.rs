@@ -2,6 +2,8 @@ pub mod api;
 pub mod catalog;
 pub mod cluster;
 pub mod cuda;
+#[cfg(feature = "cuda")]
+pub mod cuda_resident;
 pub mod distributed;
 pub mod error;
 pub mod execution_plan;
