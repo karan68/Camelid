@@ -181,6 +181,13 @@ pub struct LlamaLayerWeights {
     pub attention_k: CpuTensor,
     pub attention_v: CpuTensor,
     pub attention_output: CpuTensor,
+    /// Per-head RMSNorm weight (`[head_dim]`, F32) applied to the Q projection
+    /// after reshape-to-heads and before RoPE. `Some` only for Qwen3-style rows
+    /// (QK-norm); `None` for plain Llama-family rows.
+    pub attention_q_norm: Option<CpuTensor>,
+    /// Per-head RMSNorm weight for the K projection; bound in lockstep with
+    /// [`Self::attention_q_norm`].
+    pub attention_k_norm: Option<CpuTensor>,
     pub ffn_norm: CpuTensor,
     pub ffn_gate: CpuTensor,
     pub ffn_up: CpuTensor,
@@ -475,12 +482,38 @@ impl LlamaLoadedWeights {
                         Some(store.load_cpu_f32(&router.name)?),
                     ),
                 };
+                // DEBUG ONLY: CAMELID_DEBUG_DISABLE_QK_NORM=1 skips loading the
+                // QK-norm weights so a Qwen3 forward runs as if it had none — used
+                // to bisect whether QK-norm is the source of a parity gap. Never
+                // set in production.
+                let debug_disable_qk_norm =
+                    std::env::var_os("CAMELID_DEBUG_DISABLE_QK_NORM").is_some();
+                let attention_q_norm = if debug_disable_qk_norm {
+                    None
+                } else {
+                    layer
+                        .attention_q_norm
+                        .as_ref()
+                        .map(|desc| store.load_cpu_f32(&desc.name))
+                        .transpose()?
+                };
+                let attention_k_norm = if debug_disable_qk_norm {
+                    None
+                } else {
+                    layer
+                        .attention_k_norm
+                        .as_ref()
+                        .map(|desc| store.load_cpu_f32(&desc.name))
+                        .transpose()?
+                };
                 layers.push(LlamaLayerWeights {
                     attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
                     attention_q: load_linear(&layer.attention_q.name)?,
                     attention_k: load_linear(&layer.attention_k.name)?,
                     attention_v: load_linear(&layer.attention_v.name)?,
                     attention_output: load_linear(&layer.attention_output.name)?,
+                    attention_q_norm,
+                    attention_k_norm,
                     ffn_norm: store.load_cpu_f32(&layer.ffn_norm.name)?,
                     ffn_gate,
                     ffn_up,
@@ -502,6 +535,10 @@ impl LlamaLoadedWeights {
                         vec![0],
                         vec![],
                     )?,
+                    // Unowned pipeline layers carry empty placeholders; QK-norm is
+                    // applied by the owning node, so leave these None here.
+                    attention_q_norm: None,
+                    attention_k_norm: None,
                     ffn_norm: CpuTensor::from_f32(&layer.ffn_norm.name, vec![0], vec![])?,
                     ffn_gate: CpuTensor::from_f32(
                         match &layer.ffn {
@@ -1534,6 +1571,17 @@ impl LlamaInferenceSession {
         }
         if self.config.moe.is_some() {
             bail!("moe config");
+        }
+        // QK-norm (Qwen3) is only wired in the CPU reference forward path; the
+        // GPU-resident decode kernels do not yet apply per-head Q/K RMSNorm. Fail
+        // closed to the CPU path rather than silently dropping the QK-norm weights.
+        if self
+            .weights
+            .layers
+            .iter()
+            .any(|layer| layer.attention_q_norm.is_some() || layer.attention_k_norm.is_some())
+        {
+            bail!("model uses QK-norm (Qwen3); resident decode kernels do not apply it yet");
         }
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
@@ -4289,6 +4337,26 @@ fn forward_layer_timed(
 
     let started = Instant::now();
     metal::synchronize_active_session();
+    // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projections (reshaped to
+    // heads) and BEFORE RoPE. No-op for plain Llama-family rows (norm is None).
+    let q = match &layer.attention_q_norm {
+        Some(weight) => q.per_head_rms_norm(
+            weight,
+            config.attention_head_count as usize,
+            rms_norm_epsilon,
+            format!("layer_{layer_idx}_attention_q_norm"),
+        )?,
+        None => q,
+    };
+    let k = match &layer.attention_k_norm {
+        Some(weight) => k.per_head_rms_norm(
+            weight,
+            config.attention_head_count_kv as usize,
+            rms_norm_epsilon,
+            format!("layer_{layer_idx}_attention_k_norm"),
+        )?,
+        None => k,
+    };
     let q_before_rope = q;
     let k_before_rope = k;
     let q = apply_rope(
@@ -4795,6 +4863,26 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("attention_k_done");
 
     let started = Instant::now();
+    // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projections and BEFORE
+    // RoPE (batched prefill path). No-op for plain Llama-family rows.
+    let q = match &layer.attention_q_norm {
+        Some(weight) => q.per_head_rms_norm(
+            weight,
+            config.attention_head_count as usize,
+            params.rms_norm_epsilon,
+            format!("layer_{layer_idx}_prefill_attention_q_norm"),
+        )?,
+        None => q,
+    };
+    let k = match &layer.attention_k_norm {
+        Some(weight) => k.per_head_rms_norm(
+            weight,
+            config.attention_head_count_kv as usize,
+            params.rms_norm_epsilon,
+            format!("layer_{layer_idx}_prefill_attention_k_norm"),
+        )?,
+        None => k,
+    };
     let q = apply_rope_batch(
         &q,
         params.base_position,

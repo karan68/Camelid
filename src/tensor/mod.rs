@@ -1723,6 +1723,42 @@ impl CpuTensor {
         Self::from_f32(name, self.shape.dims.clone(), out)
     }
 
+    /// Per-head RMSNorm (Qwen3 QK-norm). Treats each row of this `[rows, cols]`
+    /// tensor as `head_count` contiguous heads of `head_dim = cols / head_count`
+    /// and RMS-normalizes each head independently with the shared `[head_dim]`
+    /// weight. This is what Qwen3 applies to the Q and K projections after
+    /// reshape-to-heads and before RoPE.
+    ///
+    /// Because the data is row-major, the head slices of a `[rows, cols]` tensor
+    /// are exactly the rows of a `[rows*head_count, head_dim]` tensor, so this
+    /// reuses [`Self::rms_norm`] verbatim — same numeric path as every other RMS
+    /// norm in the engine.
+    pub fn per_head_rms_norm(
+        &self,
+        weight: &Self,
+        head_count: usize,
+        eps: f32,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        require_rank(self, 2, "per_head_rms_norm input")?;
+        let rows = self.dim(0)?;
+        let cols = self.dim(1)?;
+        if head_count == 0 || !cols.is_multiple_of(head_count) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "per_head_rms_norm width {cols} is not divisible by head count {head_count}"
+            )));
+        }
+        let head_dim = cols / head_count;
+        let name = name.into();
+        let per_head = Self::from_f32(
+            name.clone(),
+            vec![rows * head_count, head_dim],
+            self.data.clone(),
+        )?;
+        let normed = per_head.rms_norm(weight, eps, name.clone())?;
+        Self::from_f32(name, vec![rows, cols], normed.data)
+    }
+
     pub fn softmax_last_dim(&self, name: impl Into<String>) -> Result<Self> {
         if self.shape.dims.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(

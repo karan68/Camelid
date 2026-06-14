@@ -10779,6 +10779,7 @@ mod tests {
             rms_norm_epsilon: 1e-6,
             vocab_size: Some(3),
             file_type: Some(0),
+            rope_neox_pairing: false,
             moe: None,
             gemma4: None,
         }
@@ -10815,6 +10816,8 @@ mod tests {
                 ffn_gate: select_rows("blk.0.ffn_gate.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_up: select_rows("blk.0.ffn_up.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_down: select_rows("blk.0.ffn_down.weight", hidden, ffn, &[0, 1, 2, 3]),
+                attention_q_norm: None,
+                attention_k_norm: None,
                 moe_router: None,
             }],
             layer_range: None,

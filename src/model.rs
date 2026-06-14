@@ -23,6 +23,14 @@ pub struct LlamaModelConfig {
     pub rms_norm_epsilon: f32,
     pub vocab_size: Option<u32>,
     pub file_type: Option<u32>,
+    /// RoPE uses NEOX "split-half" pairing (dim `d` rotated with `d + rope_dim/2`)
+    /// rather than the default "adjacent even/odd" pairing. llama.cpp permutes the
+    /// Q/K projection weights for LLaMA-family conversions so that the adjacent
+    /// pairing reproduces rotate-half; Qwen GGUFs are NOT permuted, so they must
+    /// be roped with split-half to match the reference. `true` for qwen3 (verified
+    /// against llama.cpp); `false` for llama/mistral/etc. The env override
+    /// `CAMELID_ROPE_PAIRING` still takes precedence for diagnostics.
+    pub rope_neox_pairing: bool,
     pub moe: Option<MixtralMoeMetadata>,
     /// Gemma 4 (`general.architecture = "gemma4"`) specific metadata. `None` for
     /// every other architecture. Holds the per-layer-type attention dims, dual
@@ -154,6 +162,13 @@ impl LlamaModelConfig {
                     )
                 }),
             file_type: gguf.metadata_u32("general.file_type"),
+            // Qwen3 GGUFs are not weight-permuted (unlike LLaMA conversions), so
+            // their RoPE must use NEOX split-half pairing to match llama.cpp.
+            // Verified token-identical against the pinned reference for
+            // Qwen3-1.7B Q8_0. Other unpermuted archs (qwen2/gemma3/phi3/…) very
+            // likely need this too but are out of scope and unverified, so we
+            // only flip it for the proven row here.
+            rope_neox_pairing: architecture == "qwen3",
             moe,
             gemma4,
         })

@@ -335,6 +335,12 @@ impl GhostFile {
                 attention_k: take("attn_k")?,
                 attention_v: take("attn_v")?,
                 attention_output: take("attn_output")?,
+                // The ghost (.cghost layer-streaming) format predates QK-norm and
+                // carries no attn_q_norm/attn_k_norm roles, so ghost mode does not
+                // support Qwen3-style models. Left None here; a Qwen3 ghost run is
+                // not a supported configuration.
+                attention_q_norm: None,
+                attention_k_norm: None,
                 ffn_norm: take("ffn_norm")?,
                 ffn_gate: take("ffn_gate")?,
                 ffn_up: take("ffn_up")?,
