@@ -1422,6 +1422,10 @@ pub struct LlamaInferenceSession {
     /// Lazily-built GPU resident-decode session (a transient on-GPU cache; rebuilt on demand
     /// and not part of the session's logical identity, so it is skipped by Clone/PartialEq/Debug).
     resident_decode: Option<metal::ResidentDecodeState>,
+    /// CUDA analog of `resident_decode` (the GPU-resident decode engine on
+    /// NVIDIA hardware). Same transient-cache role; skipped by Clone/PartialEq/Debug.
+    #[cfg(feature = "cuda")]
+    resident_decode_cuda: Option<crate::cuda_resident::CudaResidentDecode>,
     /// When set, the session never takes the GPU-resident prefill/decode paths, keeping the
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
@@ -1456,6 +1460,8 @@ impl LlamaInferenceSession {
                 },
             ),
             resident_decode: self.resident_decode.take(),
+            #[cfg(feature = "cuda")]
+            resident_decode_cuda: self.resident_decode_cuda.take(),
             resident_paths_disabled: self.resident_paths_disabled,
             execution_trace: self.execution_trace.take(),
         }
@@ -1479,6 +1485,8 @@ impl Clone for LlamaInferenceSession {
             weights: self.weights.clone(),
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
+            #[cfg(feature = "cuda")]
+            resident_decode_cuda: None,
             resident_paths_disabled: self.resident_paths_disabled,
             execution_trace: None,
         }
@@ -1516,6 +1524,8 @@ impl LlamaInferenceSession {
             weights,
             kv_cache: LlamaKvCache::new(plan)?,
             resident_decode: None,
+            #[cfg(feature = "cuda")]
+            resident_decode_cuda: None,
             resident_paths_disabled: false,
             execution_trace: None,
         })
@@ -1609,8 +1619,8 @@ impl LlamaInferenceSession {
         if self.resident_paths_disabled {
             bail!("resident paths disabled for this session (CPU-authoritative KV required)");
         }
-        if !resident_decode_metal_enabled() {
-            bail!("CAMELID_METAL_RESIDENT_DECODE not enabled");
+        if !resident_decode_metal_enabled() && !resident_decode_cuda_enabled() {
+            bail!("neither CAMELID_METAL_RESIDENT_DECODE nor CAMELID_CUDA_RESIDENT_DECODE enabled");
         }
         if self.config.moe.is_some() {
             bail!("moe config");
@@ -1869,7 +1879,252 @@ impl LlamaInferenceSession {
         }
     }
 
+    /// Dispatch the resident-decode fast lane to the active GPU backend: CUDA when
+    /// `CAMELID_CUDA_RESIDENT_DECODE` is enabled (and the feature is built), otherwise the
+    /// Metal seam. Either backend returns `Ok(None)` to fall back to the CPU layer loop.
     fn try_resident_decode_forward(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample_token: Option<u32>,
+    ) -> Result<Option<ResidentForward>> {
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            use std::sync::Once;
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[resident-dispatch] cuda_enabled={} metal_enabled={}",
+                    resident_decode_cuda_enabled(),
+                    resident_decode_metal_enabled(),
+                );
+            });
+        }
+        if resident_decode_cuda_enabled() {
+            return self.try_resident_decode_forward_cuda(
+                embedding,
+                compute_logits,
+                gpu_sample_token,
+            );
+        }
+        self.try_resident_decode_forward_metal(embedding, compute_logits, gpu_sample_token)
+    }
+
+    /// CUDA GPU-resident decode: full forward on the NVIDIA device with weights + KV cache
+    /// resident and exactly one host sync per token. Token-identical to the CPU reference
+    /// (validated per-kernel + full-forward in `cuda_resident::tests`). Returns `Ok(None)`
+    /// for any unsupported config so the caller falls back to the CPU path.
+    #[cfg(feature = "cuda")]
+    fn try_resident_decode_forward_cuda(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample_token: Option<u32>,
+    ) -> Result<Option<ResidentForward>> {
+        use crate::cuda_resident::CudaResidentDecode;
+        if !self.resident_decode_eligible(compute_logits)? {
+            return Ok(None);
+        }
+        // The CUDA engine implements the GPU-sampled greedy decode tail only; prefill-hidden
+        // threading and logits-readback variants stay on the CPU/general path.
+        if !compute_logits || gpu_sample_token.is_none() {
+            return Ok(None);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_heads = self.config.attention_head_count as usize;
+        let n_kv = dims.attention_head_count_kv;
+        let head_dim = dims.head_dim;
+        let hidden = dims.embedding_length;
+        let ffn_dim = dims.feed_forward_length;
+        let range = weights.layer_range.clone().unwrap_or(0..dims.block_count);
+        let n_layers = range.len();
+        let vocab = dims.vocab_size;
+        let kv_cap = self.config.context_length as usize;
+        let position = self.kv_cache.position;
+        if position >= kv_cap
+            || embedding.data.len() != hidden
+            || weights.layers.len() != dims.block_count
+            || range.end > weights.layers.len()
+        {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda] dim guard: pos={position} kv_cap={kv_cap} emb={} hidden={hidden} layers={} blocks={}",
+                    embedding.data.len(),
+                    weights.layers.len(),
+                    dims.block_count
+                );
+            }
+            return Ok(None);
+        }
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let tables = match rope::resident_decode_rope_tables(
+            position,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(t) => t,
+            None => {
+                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    eprintln!("[resident-cuda] rope tables None");
+                }
+                return Ok(None);
+            }
+        };
+        // The CUDA RoPE kernel implements adjacent-even-odd pairing (Llama). Split-half
+        // (Qwen3) is not yet ported, so fall back rather than mis-rotate.
+        if tables.split_half_pairing {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[resident-cuda] split_half_pairing (Qwen3) unsupported");
+            }
+            return Ok(None);
+        }
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let rope_dim = self
+            .config
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+
+        // Raw 36-byte Q8_0 block bytes for upload; wire-page (34-byte mmap) tensors fall back.
+        fn raw(t: &CpuTensor) -> Option<&[u8]> {
+            t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
+        }
+
+        let rebuild = match &self.resident_decode_cuda {
+            Some(s) => s.filled() != position || !s.weights_ready(),
+            None => true,
+        };
+        if rebuild {
+            let mut engine = match CudaResidentDecode::new(
+                n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, kv_cap, vocab,
+                rms_eps,
+            ) {
+                Ok(e) => e,
+                Err(e) => {
+                    if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                        eprintln!("[resident-cuda] engine new failed: {e}");
+                    }
+                    return Ok(None);
+                }
+            };
+            for l in &weights.layers[range.clone()] {
+                let (q, k, v, o, gate, up, down) = match (
+                    raw(&l.attention_q),
+                    raw(&l.attention_k),
+                    raw(&l.attention_v),
+                    raw(&l.attention_output),
+                    raw(&l.ffn_gate),
+                    raw(&l.ffn_up),
+                    raw(&l.ffn_down),
+                ) {
+                    (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) => {
+                        (q, k, v, o, g, u, d)
+                    }
+                    _ => {
+                        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                            eprintln!("[resident-cuda] layer weight not q8_0_blocks (wire-page mmap?); falling back");
+                        }
+                        return Ok(None);
+                    }
+                };
+                if engine
+                    .set_layer(
+                        q,
+                        k,
+                        v,
+                        o,
+                        gate,
+                        up,
+                        down,
+                        &l.attention_norm.data,
+                        &l.ffn_norm.data,
+                    )
+                    .is_err()
+                {
+                    return Ok(None);
+                }
+            }
+            let out_blocks = match raw(weights.output_projection()) {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            if engine
+                .set_output(&weights.output_norm.data, out_blocks)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            // Seed the GPU KV cache from the CPU prefill history [0, position).
+            if position > 0 {
+                let kv_dim = n_kv * head_dim;
+                for layer in 0..n_layers {
+                    let mut ck = vec![0.0f32; kv_dim * position];
+                    let mut cv = vec![0.0f32; kv_dim * position];
+                    for p in 0..position {
+                        for h in 0..n_kv {
+                            let src = self.kv_cache.offset(range.start + layer, p, h);
+                            let dst = (h * position + p) * head_dim;
+                            ck[dst..dst + head_dim]
+                                .copy_from_slice(&self.kv_cache.keys[src..src + head_dim]);
+                            cv[dst..dst + head_dim]
+                                .copy_from_slice(&self.kv_cache.values[src..src + head_dim]);
+                        }
+                    }
+                    if engine.seed_layer(layer, &ck, &cv, position).is_err() {
+                        return Ok(None);
+                    }
+                }
+            }
+            engine.set_filled(position);
+            self.resident_decode_cuda = Some(engine);
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[resident-cuda] rebuilt+seeded engine at position {position}");
+            }
+        }
+
+        let engine = self
+            .resident_decode_cuda
+            .as_mut()
+            .expect("resident CUDA session built above");
+        let token = match engine.forward_token(
+            &embedding.data,
+            &tables.cos,
+            &tables.sin,
+            position,
+            scale,
+            true,
+        ) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
+                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    eprintln!("[resident-cuda] forward_token None at {position} (fallback)");
+                }
+                return Ok(None);
+            }
+            Err(e) => {
+                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    eprintln!("[resident-cuda] forward_token err at {position}: {e}");
+                }
+                return Ok(None);
+            }
+        };
+        engine.set_filled(position + 1);
+        Ok(Some(ResidentForward::Sampled(token)))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_variables)]
+    fn try_resident_decode_forward_cuda(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample_token: Option<u32>,
+    ) -> Result<Option<ResidentForward>> {
+        Ok(None)
+    }
+
+    fn try_resident_decode_forward_metal(
         &mut self,
         embedding: &CpuTensor,
         compute_logits: bool,
@@ -8643,6 +8898,20 @@ fn q8_0_metal_enabled() -> bool {
 fn resident_decode_metal_enabled() -> bool {
     !deterministic_mode_enabled()
         && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+}
+
+/// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). Off
+/// without the `cuda` feature; on with `CAMELID_CUDA_RESIDENT_DECODE`.
+#[cfg(feature = "cuda")]
+fn resident_decode_cuda_enabled() -> bool {
+    !deterministic_mode_enabled()
+        && q8_0_env_flag_enabled_default_off("CAMELID_CUDA_RESIDENT_DECODE")
+        && crate::cuda::is_available()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn resident_decode_cuda_enabled() -> bool {
+    false
 }
 
 #[allow(dead_code)]

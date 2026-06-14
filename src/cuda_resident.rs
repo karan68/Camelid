@@ -20,24 +20,91 @@ use cudarc::nvrtc::{CompileOptions, Ptx};
 /// CUDA C source for every resident-decode kernel. Compiled once via NVRTC with
 /// `--fmad=false` and `arch=compute_61` (for `__dp4a`).
 const KERNELS: &str = r#"
+// ---- f16 round-trip (header-free) ------------------------------------------
+// Bit-exact port of inference.rs f32_to_f16_bits / f16_bits_to_f32 (IEEE-754
+// round-half-to-even). Used wherever the CPU reference rounds a value through
+// f16 (Q8_0 block scales, KV cache writes). Pure integer/float bit ops via the
+// always-available __float_as_uint / __uint_as_float builtins, so NVRTC needs
+// no cuda_fp16.h (whose __float2half/__half2float are not always defined).
+__device__ __forceinline__ unsigned short f32_to_f16_bits(float value) {
+    unsigned int bits = __float_as_uint(value);
+    unsigned short sign = (unsigned short)((bits >> 16) & 0x8000u);
+    int exp = (int)((bits >> 23) & 0xffu);
+    unsigned int mant = bits & 0x007fffffu;
+    if (exp == 0xff) {
+        return (unsigned short)(sign | (mant == 0u ? 0x7c00u : 0x7e00u));
+    }
+    int half_exp = exp - 127 + 15;
+    if (half_exp >= 0x1f) {
+        return (unsigned short)(sign | 0x7c00u);
+    }
+    if (half_exp <= 0) {
+        if (half_exp < -10) return sign;
+        unsigned int mantissa = mant | 0x00800000u;
+        int shift = 14 - half_exp;
+        unsigned short half_mant = (unsigned short)(mantissa >> shift);
+        unsigned int round_bit = 1u << (shift - 1);
+        if ((mantissa & round_bit) != 0u &&
+            ((mantissa & (round_bit - 1u)) != 0u || (half_mant & 1u) != 0u)) {
+            half_mant = (unsigned short)(half_mant + 1);
+        }
+        return (unsigned short)(sign | half_mant);
+    }
+    unsigned short half = (unsigned short)(sign
+        | ((unsigned short)half_exp << 10) | (unsigned short)(mant >> 13));
+    if ((mant & 0x00001000u) != 0u && ((mant & 0x00000fffu) != 0u || (half & 1u) != 0u)) {
+        half = (unsigned short)(half + 1);
+    }
+    return half;
+}
+__device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
+    unsigned int sign = ((unsigned int)(bits & 0x8000u)) << 16;
+    unsigned int exp = (bits & 0x7c00u) >> 10;
+    unsigned int frac = (unsigned int)(bits & 0x03ffu);
+    unsigned int out;
+    if (exp == 0u) {
+        if (frac == 0u) {
+            out = sign;
+        } else {
+            unsigned int mant = frac;
+            int e = -14;
+            while ((mant & 0x0400u) == 0u) { mant <<= 1; e -= 1; }
+            mant &= 0x03ffu;
+            unsigned int exp32 = (unsigned int)(e + 127);
+            out = sign | (exp32 << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1fu) {
+        out = sign | 0x7f800000u | (frac << 13);
+    } else {
+        unsigned int exp32 = exp + (127u - 15u);
+        out = sign | (exp32 << 23) | (frac << 13);
+    }
+    return __uint_as_float(out);
+}
+__device__ __forceinline__ float f16_round(float x) {
+    return f16_bits_to_f32(f32_to_f16_bits(x));
+}
+
 // ---- RMSNorm: out[i] = x[i] * rsqrt(mean(x^2)+eps) * weight[i] -------------
 // One block, blockDim threads, shared-memory sum of squares.
 extern "C" __global__ void rms_norm_f32(
     const float* __restrict__ x, const float* __restrict__ weight,
     float* __restrict__ out, int n, float eps
 ) {
-    extern __shared__ float sdata[];
+    // Thread 0 sums the squares sequentially (i = 0,1,2,...) to match the CPU
+    // reference's reduction order exactly; a tree reduction reassociates the sum
+    // and shifts mean_square in the last bits, which over 22 layers can flip a
+    // near-tie token. The per-element apply below is order-independent.
+    __shared__ float s_scale;
     int tid = threadIdx.x;
-    float local = 0.0f;
-    for (int i = tid; i < n; i += blockDim.x) local += x[i] * x[i];
-    sdata[tid] = local;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s) sdata[tid] += sdata[tid + s];
-        __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += x[i] * x[i];
+        float mean_sq = sum / (float)n;
+        s_scale = 1.0f / sqrtf(mean_sq + eps);
     }
-    float mean_sq = sdata[0] / (float)n;
-    float scale = 1.0f / sqrtf(mean_sq + eps);
+    __syncthreads();
+    float scale = s_scale;
     for (int i = tid; i < n; i += blockDim.x) out[i] = x[i] * scale * weight[i];
 }
 
@@ -54,7 +121,7 @@ extern "C" __global__ void quantize_q8_0(
     float max_abs = 0.0f;
     for (int j = 0; j < 32; j++) { float a = fabsf(xb[j]); if (a > max_abs) max_abs = a; }
     float unrounded = max_abs / 127.0f;
-    scales[b] = __half2float(__float2half(unrounded)); // f16-rounded block scale
+    scales[b] = f16_round(unrounded); // f16-rounded block scale
     float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
     signed char* qb = quants + (long)b * 32;
     for (int j = 0; j < 32; j++) {
@@ -73,25 +140,40 @@ extern "C" __global__ void q8_gemv(
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
     float* __restrict__ output
 ) {
-    int gtid = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = gtid >> 5;
-    int lane = gtid & 31;
-    if (row >= rows) return;
-    const unsigned char* wrow = weight_bytes + (long)row * blocks_per_row * 36;
-    float partial = 0.0f;
-    for (int b = lane; b < blocks_per_row; b += 32) {
-        const unsigned char* blk = wrow + (long)b * 36;
-        float w_scale = __ldg(reinterpret_cast<const float*>(blk));
-        const int* wq = reinterpret_cast<const int*>(blk + 4);
-        const int* iq = reinterpret_cast<const int*>(input_quants + (long)b * 32);
-        int int_sum = 0;
-        #pragma unroll
-        for (int k = 0; k < 8; k++) int_sum = __dp4a(wq[k], iq[k], int_sum);
-        partial += (float)int_sum * w_scale * input_scales[b];
+    // Warp per output row: the 32 lanes load the row's blocks coalesced (lane L
+    // reads block L, L+32, ...) and the integer block dot (__dp4a) is exact, but
+    // the per-block float terms are summed sequentially by lane 0 in block order
+    // (b = 0,1,2,...). That reproduces the CPU reference's exact float summation
+    // order (acc += int_sum * w_scale * x_scale, left-associated) so the decode
+    // is token-identical to the CPU path rather than merely close — a warp
+    // tree-reduction reassociates the block sum and, compounded over the layers,
+    // can flip a near-tie argmax. Coalesced loads keep it fast; only the final
+    // accumulation is serial (blocks_per_row adds, cheap).
+    extern __shared__ float terms[]; // (blockDim/32) * blocks_per_row
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    if (row < rows) {
+        const unsigned char* wrow = weight_bytes + (long)row * blocks_per_row * 36;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = wrow + (long)b * 36;
+            float w_scale = __ldg(reinterpret_cast<const float*>(blk));
+            const int* wq = reinterpret_cast<const int*>(blk + 4);
+            const int* iq = reinterpret_cast<const int*>(input_quants + (long)b * 32);
+            int int_sum = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; k++) int_sum = __dp4a(wq[k], iq[k], int_sum);
+            myterms[b] = (float)int_sum * w_scale * input_scales[b];
+        }
     }
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(0xffffffffu, partial, off);
-    if (lane == 0) output[row] = partial;
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[row] = acc;
+    }
 }
 
 // ---- RoPE: adjacent-even-odd, forward. cos/sin are per-pair (rope_dim/2). ---
@@ -122,7 +204,7 @@ extern "C" __global__ void kv_scatter(
     if (idx >= n_kv_heads * head_dim) return;
     int kv_head = idx / head_dim;
     int d = idx % head_dim;
-    float v = __half2float(__float2half(src[(long)kv_head * head_dim + d]));
+    float v = f16_round(src[(long)kv_head * head_dim + d]);
     cache[((long)kv_head * max_pos + position) * head_dim + d] = v;
 }
 
@@ -341,11 +423,14 @@ fn launch_gemv(
     blocks_per_row: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
+    // 8 warps/block, one warp per output row; shared holds each warp's per-block
+    // float terms for the in-order lane-0 reduction.
     let block = 256u32;
+    let warps_per_block = block / 32;
     let cfg = LaunchConfig {
-        grid_dim: (((rows as u32) * 32).div_ceil(block), 1, 1),
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: 0,
+        shared_mem_bytes: warps_per_block * (blocks_per_row as u32) * 4,
     };
     let (r, bpr) = (rows as i32, blocks_per_row as i32);
     let mut b = s.launch_builder(f);
@@ -540,6 +625,9 @@ pub struct CudaResidentDecode {
     output_weight: CudaSlice<u8>,
     cache_k: Vec<CudaSlice<f32>>,
     cache_v: Vec<CudaSlice<f32>>,
+    /// Number of KV positions materialized on the GPU (so the driver knows
+    /// whether the session needs (re)seeding from the CPU history).
+    filled: usize,
     // per-token scratch (reused)
     d_hidden: CudaSlice<f32>,
     d_normed: CudaSlice<f32>,
@@ -605,6 +693,7 @@ impl CudaResidentDecode {
             output_weight: s.alloc_zeros::<u8>(1).map_err(|e| format!("alloc: {e}"))?,
             cache_k,
             cache_v,
+            filled: 0,
             d_hidden: alloc_f(hidden)?,
             d_normed: alloc_f(max_in)?,
             d_q: alloc_f(q_width)?,
@@ -664,6 +753,54 @@ impl CudaResidentDecode {
         self.output_weight = s
             .clone_htod(output_weight)
             .map_err(|e| format!("htod: {e}"))?;
+        Ok(())
+    }
+
+    /// Whether `set_layer` has been called for every layer + the output stage.
+    pub fn weights_ready(&self) -> bool {
+        self.layers.len() == self.n_layers && self.output_weight.len() > 1
+    }
+
+    pub fn filled(&self) -> usize {
+        self.filled
+    }
+
+    pub fn set_filled(&mut self, filled: usize) {
+        self.filled = filled;
+    }
+
+    /// Seed one layer's KV cache from CPU history. `ck`/`cv` hold positions
+    /// `[0, position)` laid out `[kv_head][position'][head_dim]` (stride
+    /// `position`); they are placed at the GPU cache's `max_pos` stride. The CPU
+    /// history is already f16-rounded, so it is copied as-is.
+    pub fn seed_layer(
+        &mut self,
+        layer: usize,
+        ck: &[f32],
+        cv: &[f32],
+        position: usize,
+    ) -> Result<(), String> {
+        if layer >= self.n_layers {
+            return Err("seed_layer: layer out of range".into());
+        }
+        let hd = self.head_dim;
+        let mut full_k = vec![0f32; self.kv_width * self.max_pos];
+        let mut full_v = vec![0f32; self.kv_width * self.max_pos];
+        for h in 0..self.n_kv_heads {
+            for p in 0..position {
+                let src = (h * position + p) * hd;
+                let dst = (h * self.max_pos + p) * hd;
+                full_k[dst..dst + hd].copy_from_slice(&ck[src..src + hd]);
+                full_v[dst..dst + hd].copy_from_slice(&cv[src..src + hd]);
+            }
+        }
+        let s = &self.k.stream;
+        self.cache_k[layer] = s
+            .clone_htod(&full_k)
+            .map_err(|e| format!("seed htod: {e}"))?;
+        self.cache_v[layer] = s
+            .clone_htod(&full_v)
+            .map_err(|e| format!("seed htod: {e}"))?;
         Ok(())
     }
 
