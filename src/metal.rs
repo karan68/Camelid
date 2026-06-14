@@ -10532,9 +10532,10 @@ impl ResidentDecodeState {
         let k = metal_linear_kernel()?;
         // Qwen3 per-head QK-norm: when the layers carry q_norm/k_norm we apply an
         // in-place per-head RMSNorm to Q and K (after the QKV GEMM, before RoPE).
-        // The per-head norm kernel is f32, so we force the f32 activation path
-        // (disabling the mm / half / attn-as-mm lanes) to keep Q/K materialized as
-        // f32 [token][head][head_dim] — bit-identical to the cpu_reference order.
+        // The per-head norm kernel is f32, so we keep the tiled-MM GEMM (fast) but
+        // force off use_attn_mm/use_h16: that makes the MM GEMM emit f32 Q/K
+        // [token][head][head_dim] and routes attention through the validated
+        // non-attn-mm path, so the per-head norm runs in the cpu_reference order.
         let has_qk_norm = layers.first().is_some_and(|l| l.q_norm.is_some());
         let q_dim = self.n_heads * self.head_dim;
         let kv_dim = self.n_kv_heads * self.head_dim;
@@ -10731,8 +10732,13 @@ impl ResidentDecodeState {
         // The tiled-MM prefill GEMM needs 32-multiple row counts, paired Q8_0 blocks
         // (BK=64 = 2 blocks/step), and half activations — decided once for the whole
         // prefill since the activation buffers are emitted in the matching precision.
+        // QK-norm (Qwen3) keeps the tiled-MM GEMM (the dominant prefill cost: weights
+        // stream once per 64 tokens instead of once per 8) — only use_attn_mm/use_h16
+        // are forced off so Q/K stay f32 [token][head][head_dim] for the per-head norm
+        // and the validated non-attn-mm attention path. The MM GEMM here outputs f32
+        // (use_h16 is false), so the per-head norm runs in f32 against the existing
+        // rms_norm_per_head_f32 kernel.
         let use_mm = mm_prefill_enabled()
-            && !has_qk_norm
             && q_dim.is_multiple_of(128)
             && kv_dim.is_multiple_of(128)
             && self.hidden.is_multiple_of(128)

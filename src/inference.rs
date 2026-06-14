@@ -15786,6 +15786,24 @@ fn accumulate_transposed_linear_row_q8_0_block_dot_quantized_with_flags(
             return;
         }
     }
+    if q8_flags.cuda {
+        // Opt-in CUDA Q8 hybrid decode over the retained block layout. The
+        // kernel mirrors q8_0_dot_rows' term order; on any error it returns
+        // false and the CPU reference below runs unchanged.
+        let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
+        if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
+            crate::cuda::try_q8_0_block_linear_row(
+                input_scales,
+                input_quants,
+                weight_bytes,
+                output.len(),
+                blocks_per_row,
+                output,
+            )
+        }) {
+            return;
+        }
+    }
     accumulate_q8_0_block_dot_quantized_cpu(quantized_input, weight_blocks, output);
 }
 

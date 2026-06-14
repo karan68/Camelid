@@ -518,10 +518,21 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
 }
 
 fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
-    // `/bin/sh -c <command>`, cwd pinned to the sandbox root, with a timeout.
-    let mut child = match Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
+    // Platform shell, cwd pinned to the sandbox root, with a timeout:
+    // `/bin/sh -c <command>` on Unix, `cmd /C <command>` on Windows.
+    #[cfg(unix)]
+    let mut builder = {
+        let mut c = Command::new("/bin/sh");
+        c.arg("-c").arg(command);
+        c
+    };
+    #[cfg(windows)]
+    let mut builder = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    };
+    let mut child = match builder
         .current_dir(&sandbox.root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -716,7 +727,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
         let sb = sandbox(dir.path());
-        let a = validate(&call("run_shell", json!({"command":"ls"})), &sb).unwrap();
+        // Platform-appropriate directory listing: `ls` on Unix, `dir /b` on Windows.
+        #[cfg(unix)]
+        let command = "ls";
+        #[cfg(windows)]
+        let command = "dir /b";
+        let a = validate(&call("run_shell", json!({ "command": command })), &sb).unwrap();
         assert_eq!(a.risk(), Risk::Exec);
         let out = a.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
