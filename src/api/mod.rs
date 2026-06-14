@@ -841,6 +841,11 @@ pub struct GenerationSessionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Opt-in Qwen3/gemma4 thinking mode: when true the chat renderer emits the
+    /// template's thinking generation prompt (the model produces its own
+    /// `<think>…</think>` block) instead of the deterministic thinking-disabled
+    /// shape. `None`/false preserves the parity-locked thinking-disabled default.
+    pub camelid_enable_thinking: Option<bool>,
     /// Tool/function definitions, rendered into the prompt via the model's chat
     /// template (agent mode). `None` renders identically to before.
     #[serde(default)]
@@ -1780,6 +1785,7 @@ async fn llama_server_completion(
         camelid_prompt_token_ids,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
@@ -2794,11 +2800,28 @@ mod gemma4_template_tests {
             role: "user".to_string(),
             content: "What is the capital of France?".to_string(),
         }];
-        let prompt = render_qwen3_chatml_prompt(&messages);
+        let prompt = render_qwen3_chatml_prompt(&messages, false);
         assert_eq!(
             prompt,
             "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn qwen3_chatml_prompt_renders_thinking_enabled_generation_prompt() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "What is the capital of France?".to_string(),
+        }];
+        let prompt = render_qwen3_chatml_prompt(&messages, true);
+        // Thinking enabled: bare assistant turn, no pre-filled <think></think>
+        // block — the model emits its own reasoning (the template default branch).
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
+             <|im_start|>assistant\n"
         );
     }
 
@@ -2823,7 +2846,7 @@ mod gemma4_template_tests {
                 content: "hello".to_string(),
             },
         ];
-        let prompt = render_qwen3_chatml_prompt(&messages);
+        let prompt = render_qwen3_chatml_prompt(&messages, false);
         assert_eq!(
             prompt,
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
@@ -4305,6 +4328,9 @@ async fn llama_server_apply_template(
         &messages,
         &tokenizer,
         Some(&model.id),
+        // Template-preview endpoint: render the deterministic thinking-disabled
+        // shape (the generation path honors camelid_enable_thinking per request).
+        false,
     ) {
         Ok(rendered) => rendered,
         Err(err) => {
@@ -4476,6 +4502,7 @@ async fn completions(
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
@@ -4624,6 +4651,7 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_enable_thinking: req.camelid_enable_thinking,
         tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
@@ -4927,6 +4955,7 @@ pub async fn replay_receipt_request(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_enable_thinking: None,
         tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
@@ -5329,6 +5358,7 @@ async fn prepare_generation(
                     &messages,
                     &tokenizer,
                     Some(&model.id),
+                    req.camelid_enable_thinking.unwrap_or(false),
                 ),
             }
             .map_err(|err| {
@@ -7686,6 +7716,7 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     model_id: Option<&str>,
+    enable_thinking: bool,
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
@@ -7712,7 +7743,9 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     }
 
     Ok(render_chat_prompt_for_tokenization_fallback(
-        messages, tokenizer,
+        messages,
+        tokenizer,
+        enable_thinking,
     ))
 }
 
@@ -7747,8 +7780,9 @@ fn render_chat_prompt_for_tokenization_with_tools(
             Some(&normalized),
         );
     }
+    // Agent/tools rendering is the deterministic thinking-disabled path.
     Ok(render_chat_prompt_for_tokenization_fallback(
-        messages, tokenizer,
+        messages, tokenizer, false,
     ))
 }
 
@@ -7758,13 +7792,16 @@ fn render_chat_prompt_for_tokenization_for_model(
     tokenizer: &Tokenizer,
     model_id: Option<&str>,
 ) -> RenderedPrompt {
-    render_chat_prompt_for_tokenization_for_model_result(messages, tokenizer, model_id)
-        .unwrap_or_else(|_| render_chat_prompt_for_tokenization_fallback(messages, tokenizer))
+    render_chat_prompt_for_tokenization_for_model_result(messages, tokenizer, model_id, false)
+        .unwrap_or_else(|_| {
+            render_chat_prompt_for_tokenization_fallback(messages, tokenizer, false)
+        })
 }
 
 fn render_chat_prompt_for_tokenization_fallback(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
+    enable_thinking: bool,
 ) -> RenderedPrompt {
     if let Some(template) = tokenizer.chat_template.as_deref() {
         // The marker strings themselves (<|user|>, <|assistant|>, <|system|>)
@@ -7802,7 +7839,7 @@ fn render_chat_prompt_for_tokenization_fallback(
         }
         if is_qwen3_chatml_template(template) {
             return RenderedPrompt {
-                text: render_qwen3_chatml_prompt(messages),
+                text: render_qwen3_chatml_prompt(messages, enable_thinking),
                 // Qwen3 has add_bos_token=false; the ChatML template fully
                 // specifies the prompt. Parse specials so <|im_start|>/<|im_end|>
                 // become control token ids (151644/151645), not literal text.
@@ -7819,12 +7856,17 @@ fn render_chat_prompt_for_tokenization_fallback(
     }
 }
 
-/// Render a Qwen3 ChatML prompt with thinking **disabled** (the deterministic,
-/// parity-locked mode). Mirrors the GGUF jinja template for the standard cases
-/// (optional leading system turn, then user/assistant turns), then appends the
-/// thinking-disabled generation prompt `<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+/// Render a Qwen3 ChatML prompt. Mirrors the GGUF jinja template for the standard
+/// cases (optional leading system turn, then user/assistant turns), then appends
+/// the generation prompt for the requested thinking mode:
+/// - `enable_thinking = false` (the deterministic, parity-locked default):
+///   `<|im_start|>assistant\n<think>\n\n</think>\n\n` (the template's
+///   `enable_thinking is false` branch — a direct answer, no reasoning).
+/// - `enable_thinking = true`: `<|im_start|>assistant\n` (the template's default
+///   branch — the model emits its own `<think>…</think>` reasoning block first).
+///
 /// Verified token-identical to the reference for single-turn user prompts.
-fn render_qwen3_chatml_prompt(messages: &[ChatMessage]) -> String {
+fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
     let mut prompt = String::new();
     let mut append_generation_prompt = true;
     for message in messages {
@@ -7839,10 +7881,16 @@ fn render_qwen3_chatml_prompt(messages: &[ChatMessage]) -> String {
         append_generation_prompt = role != "assistant";
     }
     if append_generation_prompt {
-        // Thinking disabled: the empty <think></think> block matches the GGUF
-        // template's `enable_thinking is false` branch, giving a direct,
-        // deterministic answer for parity.
-        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        if enable_thinking {
+            // Thinking enabled: the bare assistant turn matches the GGUF template's
+            // default branch; the model generates its own <think>…</think> block.
+            prompt.push_str("<|im_start|>assistant\n");
+        } else {
+            // Thinking disabled: the empty <think></think> block matches the GGUF
+            // template's `enable_thinking is false` branch, giving a direct,
+            // deterministic answer for parity.
+            prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        }
     }
     prompt
 }
@@ -10349,6 +10397,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10371,6 +10420,7 @@ mod tests {
             }],
             &tokenizer,
             Some("llama32_3b_instruct_q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10398,6 +10448,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10423,6 +10474,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-3B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10449,6 +10501,7 @@ mod tests {
             }],
             &tokenizer,
             Some("llama32_1b_instruct_q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10475,6 +10528,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Meta-Llama-3.2-3B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10517,6 +10571,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10539,6 +10594,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Meta-Llama-3.2-3B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
