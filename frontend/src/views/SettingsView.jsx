@@ -38,9 +38,43 @@ export default function SettingsView({
   const [showAdvanced, setShowAdvanced] = useState(Boolean(command))
   const [showLogs, setShowLogs] = useState(false)
   const [maxTokens, setMaxTokens] = useState(() => getConfiguredMaxTokens(selectedModel?.id))
+  const [gpu, setGpu] = useState(null)
+  const [gpuBusy, setGpuBusy] = useState(false)
   const copyResetRef = useRef(null)
 
   useEffect(() => () => { if (copyResetRef.current) window.clearTimeout(copyResetRef.current) }, [])
+
+  // GPU (CUDA) acceleration availability + on/off state. Only present on a
+  // CUDA-capable build/host; the card stays hidden everywhere else.
+  useEffect(() => {
+    if (!online) { setGpu(null); return }
+    let cancelled = false
+    const base = (apiBase || '').replace(/\/$/, '')
+    fetch(`${base}/api/runtime/gpu`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled) setGpu(d) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [online, apiBase])
+
+  const toggleGpu = async (enabled) => {
+    const base = (apiBase || '').replace(/\/$/, '')
+    setGpuBusy(true)
+    try {
+      const r = await fetch(`${base}/api/runtime/gpu`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      const d = await r.json()
+      setGpu(d)
+      showNotice?.(`GPU acceleration ${d.enabled ? 'enabled' : 'disabled'}${d.device ? ` (${d.device})` : ''}.`, 'success')
+    } catch {
+      showNotice?.('Could not change GPU acceleration.', 'error')
+    } finally {
+      setGpuBusy(false)
+    }
+  }
 
   const handleCopy = async () => {
     await copyText(resolvedCommand || 'camelid serve')
@@ -151,6 +185,29 @@ export default function SettingsView({
           </div>
         </CardBody>
       </Card>
+
+      {gpu?.available && (
+        <Card>
+          <CardHeader icon={<IconServer size={20} />} eyebrow="Hardware" title="GPU acceleration" actions={
+            <span className="settings-status"><StatusDot tone={gpu.enabled ? 'ready' : 'offline'} pulse={gpu.enabled} /> <strong>{gpu.enabled ? 'On' : 'Off'}</strong></span>
+          } />
+          <CardBody>
+            <p className="settings-help">
+              Run the Q8_0 decode on {gpu.device || 'the CUDA GPU'} instead of the CPU. The CPU path stays the correctness reference and the output is token-identical either way. Small models (e.g. TinyLlama) speed up noticeably; larger models may not, because this path uploads weights to the GPU per step.
+            </p>
+            <div className="settings-actions">
+              <Button
+                variant={gpu.enabled ? 'tonal' : 'primary'}
+                onClick={() => toggleGpu(!gpu.enabled)}
+                loading={gpuBusy}
+                disabled={gpuBusy}
+              >
+                {gpu.enabled ? 'Disable GPU acceleration' : 'Enable GPU acceleration'}
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+      )}
 
       <Card interactive className="settings-cluster-card" onClick={onOpenCluster} role="button" tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter') onOpenCluster() }}>

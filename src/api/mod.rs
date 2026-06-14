@@ -1247,6 +1247,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/api/runtime/gpu", get(gpu_runtime).post(set_gpu_runtime))
         .route("/api/telemetry/stream", get(telemetry_stream))
         .route("/execution-plan", get(execution_plan))
         .route("/api/execution-plan", get(execution_plan))
@@ -1927,6 +1928,48 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
     model.llama_config.is_some()
         && matches!(model.tokenizer, TokenizerLoadState::Available(_))
         && guard_cpu_weight_materialization_budget(binding).is_ok()
+}
+
+/// Runtime GPU (CUDA) state for the UI toggle. `available` is whether a usable
+/// CUDA device is present (the UI shows the toggle only when true); `enabled` is
+/// the current switch position. On non-CUDA builds/hosts `available` is false.
+#[derive(Serialize)]
+struct GpuRuntimeState {
+    available: bool,
+    enabled: bool,
+    device: Option<String>,
+    backend: &'static str,
+    /// Number of Q8_0 matmuls run on the GPU so far this process (0 if the GPU
+    /// path has never executed). Lets the UI/tests confirm the toggle is live.
+    run_count: u64,
+}
+
+#[derive(Deserialize)]
+struct GpuRuntimeRequest {
+    enabled: bool,
+}
+
+fn current_gpu_runtime() -> GpuRuntimeState {
+    GpuRuntimeState {
+        available: crate::cuda::is_available(),
+        enabled: crate::cuda::runtime_enabled(),
+        device: crate::cuda::device_name(),
+        backend: "cuda",
+        run_count: crate::cuda::cuda_q8_run_count(),
+    }
+}
+
+/// GET `/api/runtime/gpu` — current GPU-acceleration availability + on/off state.
+async fn gpu_runtime() -> Json<GpuRuntimeState> {
+    Json(current_gpu_runtime())
+}
+
+/// POST `/api/runtime/gpu` `{ "enabled": bool }` — flip GPU acceleration at
+/// runtime (no restart). A no-op effect when no CUDA device is present, since
+/// the inference dispatch falls back to the CPU reference either way.
+async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeState> {
+    crate::cuda::set_runtime_enabled(req.enabled);
+    Json(current_gpu_runtime())
 }
 
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {

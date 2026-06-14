@@ -24,6 +24,61 @@ pub struct CudaDeviceInfo {
     pub reason: Option<String>,
 }
 
+// Runtime GPU-enable switch, so the UI can toggle the CUDA decode path on/off
+// without restarting. Seeded from `CAMELID_CUDA_Q8` on first read, then owned by
+// `set_runtime_enabled`. 0 = uninitialised, 1 = disabled, 2 = enabled. This flag
+// only *gates* the path; if no CUDA device is present the dispatch still falls
+// back to the CPU reference, so enabling it on an unsupported host is harmless.
+static RUNTIME_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn seed_runtime_from_env() -> bool {
+    std::env::var("CAMELID_CUDA_Q8")
+        .map(|value| {
+            let value = value.trim();
+            value.eq_ignore_ascii_case("1")
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("on")
+                || value.eq_ignore_ascii_case("enabled")
+                || value.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the CUDA Q8 decode path is currently enabled (UI/env switch). This is
+/// the gate the inference dispatch reads; it is independent of whether a device
+/// is actually present (see [`is_available`]).
+pub fn runtime_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match RUNTIME_STATE.load(Ordering::Relaxed) {
+        0 => {
+            let enabled = seed_runtime_from_env();
+            RUNTIME_STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+            enabled
+        }
+        2 => true,
+        _ => false,
+    }
+}
+
+/// Turn the CUDA Q8 decode path on or off at runtime (the UI toggle calls this).
+pub fn set_runtime_enabled(enabled: bool) {
+    RUNTIME_STATE.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Whether a usable CUDA device is actually present (feature built + device + a
+/// kernel that compiled). The UI uses this to decide whether to show the toggle.
+pub fn is_available() -> bool {
+    detect_cuda_device().available
+}
+
+/// The CUDA device name, if a device is present (for the UI label).
+pub fn device_name() -> Option<String> {
+    detect_cuda_device().device_name
+}
+
 #[cfg(feature = "cuda")]
 pub use backend::{
     detect_cuda_device, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
@@ -109,10 +164,13 @@ pub fn cuda_q8_run_count() -> u64 {
 
 #[cfg(feature = "cuda")]
 mod backend {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Mutex, OnceLock};
 
-    use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{
+        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    };
     use cudarc::nvrtc::{CompileOptions, Ptx};
     use std::sync::Arc;
 
@@ -166,11 +224,15 @@ extern "C" __global__ void q8_0_encoded_linear_rows(
     output[(long)in_row * weight_rows + w_row] = sum;
 }
 
-// Decode matvec over the in-memory Q8_0Block byte layout (36 bytes/block:
-// f32 scale at offset 0, then 32 i8 quants). One input row (given as separate
-// scales + quants) against `rows` weight rows. Mirrors the CPU `q8_0_dot_rows`
-// term order: per row, sequential over blocks, `(int_sum as f32) * w_scale *
-// i_scale`, summed left-to-right. fmad=false keeps the multiply/add unfused.
+// Fast decode matvec over the in-memory Q8_0Block byte layout (36 bytes/block:
+// f32 scale at offset 0, then 32 i8 quants). One *warp* per output row: the 32
+// lanes stride over the row's blocks so consecutive lanes read consecutive
+// blocks (coalesced global loads), each block's 32 i8*i8 products are summed
+// exactly with `__dp4a` (4-wide integer dot), the per-block f32 terms are
+// accumulated per lane, then a warp-shuffle reduction sums the lanes. The
+// per-block integer dot is exact; the cross-block f32 reduction is reassociated
+// vs the CPU's sequential sum, so this is token-identical (not bit-identical) —
+// the same standard as the Metal GPU path. Verified by the parity audit.
 extern "C" __global__ void q8_0_block_linear_row(
     const float* __restrict__ input_scales,   // [blocks_per_row]
     const signed char* __restrict__ input_quants, // [blocks_per_row * 32]
@@ -179,22 +241,30 @@ extern "C" __global__ void q8_0_block_linear_row(
     const int blocks_per_row,
     float* __restrict__ output                 // [rows]
 ) {
-    long r = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const unsigned char* wrow = weight_bytes + (long)r * blocks_per_row * 36;
-    float sum = 0.0f;
-    for (int b = 0; b < blocks_per_row; b++) {
+    int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = gtid >> 5;          // one warp per output row
+    int lane = gtid & 31;
+    if (row >= rows) return;
+    const unsigned char* wrow = weight_bytes + (long)row * blocks_per_row * 36;
+    float partial = 0.0f;
+    for (int b = lane; b < blocks_per_row; b += 32) {
         const unsigned char* blk = wrow + (long)b * 36;
-        float w_scale = *reinterpret_cast<const float*>(blk);
-        const signed char* wq = reinterpret_cast<const signed char*>(blk + 4);
-        const signed char* iq = input_quants + (long)b * 32;
+        float w_scale = __ldg(reinterpret_cast<const float*>(blk));
+        // 32 i8 quants = 8 ints; blk+4 and input are 4-byte aligned.
+        const int* wq = reinterpret_cast<const int*>(blk + 4);
+        const int* iq = reinterpret_cast<const int*>(input_quants + (long)b * 32);
         int int_sum = 0;
-        for (int j = 0; j < 32; j++) {
-            int_sum += (int)wq[j] * (int)iq[j];
+        #pragma unroll
+        for (int k = 0; k < 8; k++) {
+            int_sum = __dp4a(wq[k], iq[k], int_sum);
         }
-        sum += (float)int_sum * w_scale * input_scales[b];
+        partial += (float)int_sum * w_scale * input_scales[b];
     }
-    output[r] = sum;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        partial += __shfl_down_sync(0xffffffffu, partial, off);
+    }
+    if (lane == 0) output[row] = partial;
 }
 "#;
 
@@ -204,6 +274,13 @@ extern "C" __global__ void q8_0_block_linear_row(
         kernel: CudaFunction,
         kernel_block: CudaFunction,
         device_name: String,
+        /// GPU-resident weight cache: each Q8_0 weight is uploaded to the GPU
+        /// once (keyed by its stable host pointer + length) and reused across
+        /// every token, instead of being re-uploaded each step. This is what
+        /// makes decode compute-bound (fast) rather than PCIe-bound (slow). The
+        /// model's `q8_0_blocks` live for the model's lifetime, so the pointer
+        /// is a stable identity; distinct models map at distinct addresses.
+        weight_cache: HashMap<(usize, usize), CudaSlice<u8>>,
     }
 
     // SAFETY: cudarc's context/stream/function handles are Send + Sync; we
@@ -224,6 +301,10 @@ extern "C" __global__ void q8_0_block_linear_row(
             // compiler contract `a*b*c + sum` into a fused multiply-add, which
             // would round differently and could flip a near-tie token.
             fmad: Some(false),
+            // Target a virtual arch that supports the `__dp4a` 8-bit dot
+            // intrinsic (compute_61, Pascal+). The PTX is forward-compatible, so
+            // the driver JITs it for whatever newer GPU is present (e.g. sm_86).
+            arch: Some("compute_61"),
             ..Default::default()
         }
     }
@@ -251,6 +332,7 @@ extern "C" __global__ void q8_0_block_linear_row(
             kernel,
             kernel_block,
             device_name,
+            weight_cache: HashMap::new(),
         })
     }
 
@@ -473,9 +555,9 @@ extern "C" __global__ void q8_0_block_linear_row(
         let Some(b) = backend() else {
             return false;
         };
-        let guard = b.lock().expect("cuda backend mutex poisoned");
+        let mut guard = b.lock().expect("cuda backend mutex poisoned");
         match run_block_inner(
-            &guard,
+            &mut guard,
             input_scales,
             input_quants,
             weight_bytes,
@@ -498,7 +580,7 @@ extern "C" __global__ void q8_0_block_linear_row(
     }
 
     fn run_block_inner(
-        b: &CudaBackend,
+        b: &mut CudaBackend,
         input_scales: &[f32],
         input_quants: &[i8],
         weight_bytes: &[u8],
@@ -506,14 +588,26 @@ extern "C" __global__ void q8_0_block_linear_row(
         blocks_per_row: usize,
         output: &mut [f32],
     ) -> Result<(), cudarc::driver::DriverError> {
+        // Upload this weight to the GPU once and keep it resident; reuse the
+        // cached device buffer on every later token. The per-token traffic is
+        // then just the small input vector and output vector, so decode becomes
+        // GPU-compute-bound instead of PCIe-bound. On a failed upload (e.g. out
+        // of VRAM) the `?` propagates and the caller falls back to the CPU dot.
+        let key = (weight_bytes.as_ptr() as usize, weight_bytes.len());
+        if !b.weight_cache.contains_key(&key) {
+            let resident = b.stream.clone_htod(weight_bytes)?;
+            b.weight_cache.insert(key, resident);
+        }
+        let d_w_bytes = b.weight_cache.get(&key).expect("weight just inserted");
+
         let stream = &b.stream;
         let d_in_scales = stream.clone_htod(input_scales)?;
         let d_in_quants = stream.clone_htod(input_quants)?;
-        let d_w_bytes = stream.clone_htod(weight_bytes)?;
         let mut d_out = stream.alloc_zeros::<f32>(output.len())?;
 
+        // One warp (32 threads) per output row.
         let block_dim = 256u32;
-        let grid_dim = (rows as u32).div_ceil(block_dim);
+        let grid_dim = ((rows as u32) * 32).div_ceil(block_dim);
         let cfg = LaunchConfig {
             grid_dim: (grid_dim, 1, 1),
             block_dim: (block_dim, 1, 1),
@@ -525,7 +619,7 @@ extern "C" __global__ void q8_0_block_linear_row(
         builder
             .arg(&d_in_scales)
             .arg(&d_in_quants)
-            .arg(&d_w_bytes)
+            .arg(d_w_bytes)
             .arg(&rows_i)
             .arg(&blocks_per_row_i)
             .arg(&mut d_out);
@@ -693,9 +787,13 @@ extern "C" __global__ void q8_0_block_linear_row(
             );
         }
 
+        // The fast block kernel sums blocks across a warp (reassociated f32), so
+        // it matches the CPU reference very closely but not bit-for-bit. Assert a
+        // tight relative tolerance; end-to-end token identity is covered by the
+        // TinyLlama parity audit.
         #[test]
         #[ignore = "requires a CUDA device"]
-        fn cuda_block_kernel_is_bit_identical_to_cpu_reference() {
+        fn cuda_block_kernel_matches_cpu_reference_within_tolerance() {
             if !detect_cuda_device().available {
                 eprintln!("skipping: no CUDA device available");
                 return;
@@ -758,15 +856,14 @@ extern "C" __global__ void q8_0_block_linear_row(
             );
             assert!(ok, "GPU block kernel did not run");
 
-            let mut mismatches = 0;
+            let mut worst = 0.0f32;
             for (g, e) in got.iter().zip(expected.iter()) {
-                if g.to_bits() != e.to_bits() {
-                    mismatches += 1;
-                }
+                let denom = e.abs().max(1.0);
+                worst = worst.max((g - e).abs() / denom);
             }
-            assert_eq!(
-                mismatches, 0,
-                "{mismatches}/{weight_rows} block-kernel rows differ bit-for-bit from CPU reference"
+            assert!(
+                worst < 1e-4,
+                "block-kernel worst relative error {worst} exceeds 1e-4 vs CPU reference"
             );
         }
     }
