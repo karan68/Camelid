@@ -106,7 +106,7 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 | **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke; GPU-resident decode+prefill validated to a 15,373-token context (vs llama.cpp) |
 | **Qwen3 0.6B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (explicit head_dim path) |
 | **Qwen3 4B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim); one probe is a documented first-token near-tie |
-| **Qwen3 8B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (untied embeddings) |
+| **Qwen3 8B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (untied embeddings); also on the GPU-resident decode+prefill path (same support bar vs llama.cpp), resident prefill engages at large context |
 | **Gemma 4 E2B-It** | Q8_0 | single-node (CPU + Metal) | Greedy parity + bounded context **512→8192** |
 | **Gemma 4 E4B-It** | Q8_0 | single-node (CPU + Metal) | Greedy parity + bounded context **512→8192** |
 | **Gemma 4 12B-It** | Q8_0 | two-Mac distributed | Distributed parity + serve/WebUI smoke |
