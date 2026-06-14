@@ -1939,7 +1939,16 @@ impl LlamaInferenceSession {
         let range = weights.layer_range.clone().unwrap_or(0..dims.block_count);
         let n_layers = range.len();
         let vocab = dims.vocab_size;
-        let kv_cap = self.config.context_length as usize;
+        // The GPU KV cache is allocated once at `kv_cap` positions. Sizing it to a
+        // model's full trained context (e.g. Llama 3.2's 131072) would allocate
+        // many GB of VRAM up front; on a card without the room the driver
+        // oversubscribes into shared host memory and every attention read crosses
+        // PCIe, collapsing throughput. Cap it to a practical chat context that fits
+        // comfortably; beyond it the per-token guard below falls back to the CPU.
+        const RESIDENT_DECODE_CUDA_MAX_CONTEXT: usize = 8192;
+        let kv_cap = (self.config.context_length as usize)
+            .min(self.kv_cache.plan.max_sequence_length)
+            .min(RESIDENT_DECODE_CUDA_MAX_CONTEXT);
         let position = self.kv_cache.position;
         if position >= kv_cap
             || embedding.data.len() != hidden
@@ -8900,13 +8909,30 @@ fn resident_decode_metal_enabled() -> bool {
         && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
 }
 
-/// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). Off
-/// without the `cuda` feature; on with `CAMELID_CUDA_RESIDENT_DECODE`.
+/// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On
+/// automatically whenever a usable CUDA device is present — the end-user app
+/// "just works" fast on the GPU with no flag or toggle. Deterministic mode
+/// (opt-in) forces the CPU reference; `CAMELID_CUDA_RESIDENT_DECODE=0` is an
+/// explicit escape hatch for debugging. Falls back to CPU per token for any
+/// model/config the resident engine does not support.
 #[cfg(feature = "cuda")]
 fn resident_decode_cuda_enabled() -> bool {
-    !deterministic_mode_enabled()
-        && q8_0_env_flag_enabled_default_off("CAMELID_CUDA_RESIDENT_DECODE")
-        && crate::cuda::is_available()
+    if deterministic_mode_enabled() {
+        return false;
+    }
+    // Explicit off switch only: `CAMELID_CUDA_RESIDENT_DECODE=0/false/off`.
+    if let Some(value) = std::env::var_os("CAMELID_CUDA_RESIDENT_DECODE") {
+        let value = value.to_string_lossy();
+        let value = value.trim();
+        let off = value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no");
+        if off {
+            return false;
+        }
+    }
+    crate::cuda::is_available()
 }
 
 #[cfg(not(feature = "cuda"))]

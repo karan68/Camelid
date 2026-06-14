@@ -52,8 +52,120 @@ const VERSION: &str = match option_env!("CAMELID_GIT_DESCRIBE") {
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
+
+/// The action taken when the binary is launched with no subcommand (e.g. a
+/// double-click of `camelid.exe`): start the local server and open the chat UI,
+/// with the GPU resident-decode path armed automatically. This is what makes the
+/// shipped Windows build a single open-and-use app — no terminal, flags, or
+/// toggles required.
+fn default_launch_command() -> Command {
+    Command::Serve {
+        addr: "127.0.0.1:8181".parse().expect("valid default serve addr"),
+        model: std::env::var_os("CAMELID_MODEL").map(PathBuf::from),
+        threads: None,
+        parallel_linear_min_outputs: None,
+        apple_accelerate_min_elements: None,
+        metal_linear: false,
+        metal_q8: false,
+        log_acceleration: true,
+        spec_decode: None,
+        spec_draft_model: None,
+        spec_draft_tokens: None,
+        no_open: false,
+        deterministic: false,
+    }
+}
+
+/// Find a GGUF to load when `serve` is started without an explicit `--model`,
+/// so the open-and-use launch lands directly in a usable chat. Looks next to the
+/// executable (the shipped layout: `camelid.exe` beside a `models/` folder) and
+/// in the working directory; returns the first `*.gguf` found.
+fn auto_select_model() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("models"));
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.push(PathBuf::from("models"));
+    dirs.push(PathBuf::from("."));
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut ggufs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                })
+                .collect();
+            ggufs.sort();
+            if let Some(first) = ggufs.into_iter().next() {
+                return Some(first);
+            }
+        }
+    }
+    None
+}
+
+/// Windows + CUDA: make the NVIDIA runtime DLLs (NVRTC etc.) loadable without the
+/// user having to add the CUDA `bin` directory to PATH. Locates the installed
+/// toolkit (via `CUDA_PATH*` or the standard install root) and prepends its `bin`
+/// to the process PATH before any GPU code runs, so the shipped app finds the GPU
+/// on its own. No-op if the toolkit is absent (the engine then falls back to CPU).
+#[cfg(all(windows, feature = "cuda"))]
+fn ensure_cuda_runtime_on_path() {
+    use std::path::{Path, PathBuf};
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key == "CUDA_PATH" || key.starts_with("CUDA_PATH_V") {
+            let bin = Path::new(&value).join("bin");
+            if bin.is_dir() {
+                candidates.push(bin);
+            }
+        }
+    }
+    let root = Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut versions: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        versions.sort();
+        for version in versions.into_iter().rev() {
+            let bin = version.join("bin");
+            if bin.is_dir() {
+                candidates.push(bin);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let current_lower = current.to_string_lossy().to_lowercase();
+    let mut prefix = std::ffi::OsString::new();
+    for bin in &candidates {
+        if !current_lower.contains(&bin.to_string_lossy().to_lowercase()) {
+            prefix.push(bin);
+            prefix.push(";");
+        }
+    }
+    if prefix.is_empty() {
+        return;
+    }
+    prefix.push(current);
+    std::env::set_var("PATH", prefix);
+}
+
+#[cfg(not(all(windows, feature = "cuda")))]
+fn ensure_cuda_runtime_on_path() {}
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -534,7 +646,12 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let command = Cli::parse().command;
+    // Make the GPU runtime discoverable before anything probes for a device, so
+    // the shipped app needs no PATH setup (no-op off Windows / without CUDA).
+    ensure_cuda_runtime_on_path();
+
+    // No subcommand (a bare double-click of the exe) launches the open-and-use app.
+    let command = Cli::parse().command.unwrap_or_else(default_launch_command);
     // Deterministic mode opts out of the GPU fast stack entirely; otherwise the CLI
     // defaults to the measured-fastest Metal configuration. Branch before any env is set
     // so the deterministic path never even arms the GPU defaults.
@@ -581,6 +698,9 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
             }
+            // Open-and-use launch: if no model was named, load the first GGUF we
+            // can find (beside the exe or in ./models) so the UI lands in a chat.
+            let model = model.or_else(auto_select_model);
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
             api::serve(addr, threads, model, open_ui).await?
