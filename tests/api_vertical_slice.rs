@@ -1578,9 +1578,11 @@ async fn chat_completion_rejects_top_logprobs_without_logprobs_before_runtime() 
 }
 
 #[tokio::test]
-async fn chat_completion_rejects_tool_fields_before_runtime() {
-    let app = camelid::api::router();
-    let response = app
+async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
+    // `tools` is now an accepted field (rendered into the model's own chat
+    // template for agent mode), so it is NOT rejected as an unsupported
+    // parameter — the request falls through to model resolution instead.
+    let response = camelid::api::router()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -1593,12 +1595,31 @@ async fn chat_completion_rejects_tool_fields_before_runtime() {
         )
         .await
         .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_ne!(body["error"]["code"], "unsupported_parameter");
+
+    // The other tool/function-calling fields remain unsupported and are still
+    // rejected before runtime.
+    let response = camelid::api::router()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"tool_choice":"auto"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
-    assert_eq!(body["error"]["param"], "tools");
+    assert_eq!(body["error"]["param"], "tool_choice");
 }
 
 #[tokio::test]
