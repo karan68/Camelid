@@ -8984,8 +8984,24 @@ fn encode_attention_block(
             *(p.add(4) as *mut f32) = eps;
             *(p.add(8) as *mut u32) = 1; // use_weight
         }
-        encode_rms_norm_per_head(e, k, &query_buf, &qnorm_w_buf, &query_buf, &perhead_scalar, n_heads);
-        encode_rms_norm_per_head(e, k, &key_buf, &knorm_w_buf, &key_buf, &perhead_scalar, n_kv_heads);
+        encode_rms_norm_per_head(
+            e,
+            k,
+            &query_buf,
+            &qnorm_w_buf,
+            &query_buf,
+            &perhead_scalar,
+            n_heads,
+        );
+        encode_rms_norm_per_head(
+            e,
+            k,
+            &key_buf,
+            &knorm_w_buf,
+            &key_buf,
+            &perhead_scalar,
+            n_kv_heads,
+        );
     }
     encode_rope(
         e,
