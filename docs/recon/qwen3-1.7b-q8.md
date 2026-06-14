@@ -18,9 +18,9 @@ until separately proven.
   - size 1,834,426,016 bytes; GGUF version 3; 310 tensors; 28 metadata keys;
     alignment 32; data_start_offset 5,951,136.
 - Oracle: pinned llama.cpp `1 (5d56eff)` (built 2025-04-28, recognizes `qwen3`
-  arch with `n_embd_head_k=128`), at
-  `/Users/timtoole/Desktop/Code/backend/target 2/reference/llama.cpp/build/bin/llama-server`
-  (needs `DYLD_LIBRARY_PATH` set to that bin dir — @rpath broken by `target`→`target 2` rename).
+  arch with `n_embd_head_k=128`), from the local pinned llama.cpp `build/bin/llama-server`
+  (needs `DYLD_LIBRARY_PATH` set to that bin dir when the build tree was renamed,
+  so @rpath resolves). Path kept out of the public tree per the repo scrub.
 
 ## The trap (why this is NOT already supported)
 
