@@ -95,12 +95,14 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 | Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
 | **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke |
 | **Qwen3 0.6B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (explicit head_dim path) |
+| **Qwen3 4B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim); one probe is a documented first-token near-tie |
+| **Qwen3 8B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (untied embeddings) |
 | **Gemma 4 E2B-It** | Q8_0 | single-node (CPU + Metal) | Greedy parity + bounded context **512→8192** |
 | **Gemma 4 E4B-It** | Q8_0 | single-node (CPU + Metal) | Greedy parity + bounded context **512→8192** |
 | **Gemma 4 12B-It** | Q8_0 | two-Mac distributed | Distributed parity + serve/WebUI smoke |
 | **Gemma 4 26B-A4B-It QAT** | Q4_0 (128-expert MoE) | two-Mac distributed | Distributed parity + serve/WebUI smoke |
 
-> **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); other Qwen3 sizes (0.6B/4B/8B/14B/32B), base variants, Qwen3-MoE (A3B), and Qwen3 thinking-mode generation; Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
+> **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); other Qwen3 sizes (14B/32B), base variants, Qwen3-MoE (A3B), and Qwen3 thinking-mode generation; Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
 
 Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md`](SUPPORT_MATRIX_v0.1.md) and [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
