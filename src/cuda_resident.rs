@@ -283,5 +283,692 @@ impl CudaResidentKernels {
     }
 }
 
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+
+// ---- Free launch helpers (take explicit refs so callers can pass disjoint
+// fields of the resident state without the `&self` whole-struct borrow). ----
+
+#[allow(clippy::too_many_arguments)]
+fn launch_rmsnorm(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 4,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(w).arg(out).arg(&n_i).arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+fn launch_quantize(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n_blocks: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_blocks as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb = n_blocks as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(quants).arg(scales).arg(&nb);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (((rows as u32) * 32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (r, bpr) = (rows as i32, blocks_per_row as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&bpr)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_rope(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    vec: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (n_heads * (rope_dim / 2)) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nh, hd, rd) = (n_heads as i32, head_dim as i32, rope_dim as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(vec).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&rd);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_kv_scatter(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    cache: &mut CudaSlice<f32>,
+    position: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (p, nkv, hd, mp) = (
+        position as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(src).arg(cache).arg(&p).arg(&nkv).arg(&hd).arg(&mp);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<f32>,
+    cache_v: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    max_pos: usize,
+    scale: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: ((head_dim + position_count) * 4) as u32,
+    };
+    let (nh, nkv, hd, pc, mp) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        position_count as i32,
+        max_pos as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(q)
+        .arg(cache_k)
+        .arg(cache_v)
+        .arg(out)
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&pc)
+        .arg(&mp)
+        .arg(&scale);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+fn launch_silu_mul(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    n: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(gate).arg(up).arg(out).arg(&n_i);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+fn launch_residual(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    acc: &mut CudaSlice<f32>,
+    add: &CudaSlice<f32>,
+    n: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(acc).arg(add).arg(&n_i);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+fn launch_argmax(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    logits: &CudaSlice<f32>,
+    n: usize,
+    out_idx: &mut CudaSlice<u32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 8,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(logits).arg(&n_i).arg(out_idx);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// One layer's GPU-resident Q8_0 weights + norm vectors.
+struct ResidentLayer {
+    q: CudaSlice<u8>,
+    k: CudaSlice<u8>,
+    v: CudaSlice<u8>,
+    o: CudaSlice<u8>,
+    gate: CudaSlice<u8>,
+    up: CudaSlice<u8>,
+    down: CudaSlice<u8>,
+    attn_norm: CudaSlice<f32>,
+    ffn_norm: CudaSlice<f32>,
+}
+
+/// GPU-resident Llama decode engine. Weights and KV cache live on the GPU; one
+/// `forward_token` call runs the whole per-token forward with a single sync.
+pub struct CudaResidentDecode {
+    k: CudaResidentKernels,
+    n_layers: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn_dim: usize,
+    rope_dim: usize,
+    max_pos: usize,
+    vocab: usize,
+    eps: f32,
+    q_width: usize,
+    kv_width: usize,
+    layers: Vec<ResidentLayer>,
+    final_norm: CudaSlice<f32>,
+    output_weight: CudaSlice<u8>,
+    cache_k: Vec<CudaSlice<f32>>,
+    cache_v: Vec<CudaSlice<f32>>,
+    // per-token scratch (reused)
+    d_hidden: CudaSlice<f32>,
+    d_normed: CudaSlice<f32>,
+    d_q: CudaSlice<f32>,
+    d_k: CudaSlice<f32>,
+    d_v: CudaSlice<f32>,
+    d_attn: CudaSlice<f32>,
+    d_proj: CudaSlice<f32>,
+    d_gate: CudaSlice<f32>,
+    d_up: CudaSlice<f32>,
+    d_ffn_act: CudaSlice<f32>,
+    d_in_scales: CudaSlice<f32>,
+    d_in_quants: CudaSlice<i8>,
+    d_logits: CudaSlice<f32>,
+    d_sampled: CudaSlice<u32>,
+    d_cos: CudaSlice<f32>,
+    d_sin: CudaSlice<f32>,
+}
+
+impl CudaResidentDecode {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        n_layers: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        hidden: usize,
+        ffn_dim: usize,
+        rope_dim: usize,
+        max_pos: usize,
+        vocab: usize,
+        eps: f32,
+    ) -> Result<Self, String> {
+        let k = CudaResidentKernels::new()?;
+        let s = &k.stream;
+        let q_width = n_heads * head_dim;
+        let kv_width = n_kv_heads * head_dim;
+        let max_in = hidden.max(ffn_dim).max(q_width); // widest quantize input
+        let alloc_f = |n: usize| s.alloc_zeros::<f32>(n).map_err(|e| format!("alloc: {e}"));
+        let cache_k = (0..n_layers)
+            .map(|_| s.alloc_zeros::<f32>(kv_width * max_pos))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("kv alloc: {e}"))?;
+        let cache_v = (0..n_layers)
+            .map(|_| s.alloc_zeros::<f32>(kv_width * max_pos))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("kv alloc: {e}"))?;
+        Ok(Self {
+            n_layers,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            hidden,
+            ffn_dim,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            q_width,
+            kv_width,
+            layers: Vec::with_capacity(n_layers),
+            final_norm: alloc_f(hidden)?,
+            output_weight: s.alloc_zeros::<u8>(1).map_err(|e| format!("alloc: {e}"))?,
+            cache_k,
+            cache_v,
+            d_hidden: alloc_f(hidden)?,
+            d_normed: alloc_f(max_in)?,
+            d_q: alloc_f(q_width)?,
+            d_k: alloc_f(kv_width)?,
+            d_v: alloc_f(kv_width)?,
+            d_attn: alloc_f(q_width)?,
+            d_proj: alloc_f(hidden)?,
+            d_gate: alloc_f(ffn_dim)?,
+            d_up: alloc_f(ffn_dim)?,
+            d_ffn_act: alloc_f(ffn_dim)?,
+            d_in_scales: alloc_f(max_in / 32)?,
+            d_in_quants: s
+                .alloc_zeros::<i8>(max_in)
+                .map_err(|e| format!("alloc: {e}"))?,
+            d_logits: alloc_f(vocab)?,
+            d_sampled: s.alloc_zeros::<u32>(1).map_err(|e| format!("alloc: {e}"))?,
+            d_cos: alloc_f(rope_dim / 2)?,
+            d_sin: alloc_f(rope_dim / 2)?,
+            k,
+        })
+    }
+
+    /// Upload one layer's resident weights (Q8_0 36-byte block bytes) + norms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_layer(
+        &mut self,
+        q: &[u8],
+        kk: &[u8],
+        v: &[u8],
+        o: &[u8],
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        attn_norm: &[f32],
+        ffn_norm: &[f32],
+    ) -> Result<(), String> {
+        let s = &self.k.stream;
+        let up_u8 = |b: &[u8]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
+        let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
+        self.layers.push(ResidentLayer {
+            q: up_u8(q)?,
+            k: up_u8(kk)?,
+            v: up_u8(v)?,
+            o: up_u8(o)?,
+            gate: up_u8(gate)?,
+            up: up_u8(up)?,
+            down: up_u8(down)?,
+            attn_norm: up_f(attn_norm)?,
+            ffn_norm: up_f(ffn_norm)?,
+        });
+        Ok(())
+    }
+
+    pub fn set_output(&mut self, final_norm: &[f32], output_weight: &[u8]) -> Result<(), String> {
+        let s = &self.k.stream;
+        self.final_norm = s.clone_htod(final_norm).map_err(|e| format!("htod: {e}"))?;
+        self.output_weight = s
+            .clone_htod(output_weight)
+            .map_err(|e| format!("htod: {e}"))?;
+        Ok(())
+    }
+
+    /// Run one decode step on the GPU. `embedding` is the current token's f32
+    /// embedding; `cos`/`sin` are the per-pair RoPE tables for `position`;
+    /// `scale` = 1/sqrt(head_dim). With `compute_logits`, also runs the final
+    /// norm + output projection + greedy argmax and returns the sampled token.
+    /// One device sync at the end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        compute_logits: bool,
+    ) -> Result<Option<u32>, String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
+        let s = self.k.stream.clone();
+        let hb = self.hidden / 32; // hidden blocks
+        let fb = self.ffn_dim / 32; // ffn blocks
+        let qb = self.q_width / 32; // q_width blocks
+        let pos_count = position + 1;
+
+        s.memcpy_htod(embedding, &mut self.d_hidden).map_err(map)?;
+        s.memcpy_htod(cos, &mut self.d_cos).map_err(map)?;
+        s.memcpy_htod(sin, &mut self.d_sin).map_err(map)?;
+
+        for li in 0..self.n_layers {
+            // attention norm + quantize
+            launch_rmsnorm(
+                &s,
+                &self.k.rms_norm,
+                &self.d_hidden,
+                &self.layers[li].attn_norm,
+                &mut self.d_normed,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &self.d_normed,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                hb,
+            )
+            .map_err(map)?;
+            // Q,K,V
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].q,
+                self.q_width,
+                hb,
+                &mut self.d_q,
+            )
+            .map_err(map)?;
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].k,
+                self.kv_width,
+                hb,
+                &mut self.d_k,
+            )
+            .map_err(map)?;
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].v,
+                self.kv_width,
+                hb,
+                &mut self.d_v,
+            )
+            .map_err(map)?;
+            // RoPE on Q and K
+            launch_rope(
+                &s,
+                &self.k.rope,
+                &mut self.d_q,
+                &self.d_cos,
+                &self.d_sin,
+                self.n_heads,
+                self.head_dim,
+                self.rope_dim,
+            )
+            .map_err(map)?;
+            launch_rope(
+                &s,
+                &self.k.rope,
+                &mut self.d_k,
+                &self.d_cos,
+                &self.d_sin,
+                self.n_kv_heads,
+                self.head_dim,
+                self.rope_dim,
+            )
+            .map_err(map)?;
+            // KV write
+            launch_kv_scatter(
+                &s,
+                &self.k.kv_scatter,
+                &self.d_k,
+                &mut self.cache_k[li],
+                position,
+                self.n_kv_heads,
+                self.head_dim,
+                self.max_pos,
+            )
+            .map_err(map)?;
+            launch_kv_scatter(
+                &s,
+                &self.k.kv_scatter,
+                &self.d_v,
+                &mut self.cache_v[li],
+                position,
+                self.n_kv_heads,
+                self.head_dim,
+                self.max_pos,
+            )
+            .map_err(map)?;
+            // attention
+            launch_attention(
+                &s,
+                &self.k.attention,
+                &self.d_q,
+                &self.cache_k[li],
+                &self.cache_v[li],
+                &mut self.d_attn,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                pos_count,
+                self.max_pos,
+                scale,
+            )
+            .map_err(map)?;
+            // O projection + residual
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &self.d_attn,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                qb,
+            )
+            .map_err(map)?;
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].o,
+                self.hidden,
+                qb,
+                &mut self.d_proj,
+            )
+            .map_err(map)?;
+            launch_residual(
+                &s,
+                &self.k.residual_add,
+                &mut self.d_hidden,
+                &self.d_proj,
+                self.hidden,
+            )
+            .map_err(map)?;
+            // ffn norm + gate/up + silu + down + residual
+            launch_rmsnorm(
+                &s,
+                &self.k.rms_norm,
+                &self.d_hidden,
+                &self.layers[li].ffn_norm,
+                &mut self.d_normed,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &self.d_normed,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                hb,
+            )
+            .map_err(map)?;
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].gate,
+                self.ffn_dim,
+                hb,
+                &mut self.d_gate,
+            )
+            .map_err(map)?;
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].up,
+                self.ffn_dim,
+                hb,
+                &mut self.d_up,
+            )
+            .map_err(map)?;
+            launch_silu_mul(
+                &s,
+                &self.k.silu_mul,
+                &self.d_gate,
+                &self.d_up,
+                &mut self.d_ffn_act,
+                self.ffn_dim,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &self.d_ffn_act,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                fb,
+            )
+            .map_err(map)?;
+            launch_gemv(
+                &s,
+                &self.k.gemv,
+                &self.d_in_scales,
+                &self.d_in_quants,
+                &self.layers[li].down,
+                self.hidden,
+                fb,
+                &mut self.d_proj,
+            )
+            .map_err(map)?;
+            launch_residual(
+                &s,
+                &self.k.residual_add,
+                &mut self.d_hidden,
+                &self.d_proj,
+                self.hidden,
+            )
+            .map_err(map)?;
+        }
+
+        if !compute_logits {
+            self.k.ctx.synchronize().map_err(map)?;
+            return Ok(None);
+        }
+        // final norm + output projection + greedy argmax
+        launch_rmsnorm(
+            &s,
+            &self.k.rms_norm,
+            &self.d_hidden,
+            &self.final_norm,
+            &mut self.d_normed,
+            self.hidden,
+            self.eps,
+        )
+        .map_err(map)?;
+        launch_quantize(
+            &s,
+            &self.k.quantize,
+            &self.d_normed,
+            &mut self.d_in_quants,
+            &mut self.d_in_scales,
+            hb,
+        )
+        .map_err(map)?;
+        launch_gemv(
+            &s,
+            &self.k.gemv,
+            &self.d_in_scales,
+            &self.d_in_quants,
+            &self.output_weight,
+            self.vocab,
+            hb,
+            &mut self.d_logits,
+        )
+        .map_err(map)?;
+        launch_argmax(
+            &s,
+            &self.k.argmax,
+            &self.d_logits,
+            self.vocab,
+            &mut self.d_sampled,
+        )
+        .map_err(map)?;
+        let mut out = [0u32; 1];
+        s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(Some(out[0]))
+    }
+}
+
 #[cfg(test)]
 mod tests;
