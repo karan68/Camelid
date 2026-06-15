@@ -2039,6 +2039,118 @@ impl LlamaInferenceSession {
         }
     }
 
+    /// One round of greedy speculative decoding on the GPU. An n-gram drafter
+    /// proposes up to `max_draft` tokens from `history`; the model verifies them in
+    /// ONE batched forward (`verify_batch`), and the longest correct prefix plus
+    /// one bonus token are accepted. Output is exactly what greedy decode would
+    /// have produced (the model's argmax verifies every token) — lossless — but a
+    /// single memory-bound forward can emit several tokens. Returns the accepted
+    /// tokens (1..=max_draft+1) and advances the KV position, or `Ok(None)` when no
+    /// draft is available or the GPU engine isn't ready (caller does a normal step).
+    #[cfg(feature = "cuda")]
+    pub fn generate_next_tokens_speculative(
+        &mut self,
+        last_token: u32,
+        history: &[u32],
+        max_draft: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
+            return Ok(None);
+        }
+        let max_draft = max_draft.min(crate::cuda_resident::MAX_VERIFY_K - 1);
+        // 3-gram match: high enough precision that diverse text (where a draft would
+        // mispredict and waste a verify) simply doesn't draft, so spec decode never
+        // slows the non-repetitive case while still firing on repeated phrases.
+        let drafts = draft_ngram(history, max_draft, 3);
+        if drafts.is_empty() {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        let k = drafts.len() + 1;
+        if position + k > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(None);
+        }
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // Inputs: [last_token, drafts...] at positions [position, position+k).
+        let mut inputs = Vec::with_capacity(k);
+        inputs.push(last_token);
+        inputs.extend_from_slice(&drafts);
+        let embeddings = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&inputs, "token_embedding_spec_verify")?;
+        let mut cos_all = Vec::with_capacity(k * head_dim);
+        let mut sin_all = Vec::with_capacity(k * head_dim);
+        for i in 0..k {
+            match rope::resident_decode_rope_tables(
+                position + i,
+                head_dim,
+                &self.config,
+                self.weights.rope_freqs.as_ref(),
+            )? {
+                Some(t) if !t.split_half_pairing => {
+                    cos_all.extend_from_slice(&t.cos);
+                    sin_all.extend_from_slice(&t.sin);
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let key = Arc::as_ptr(&self.weights) as *const () as usize;
+        let cache = resident_cuda_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only run when the global engine already holds this model with the KV
+        // materialized exactly up to `position` (i.e. mid-decode). Otherwise let the
+        // caller take a normal step, which builds/seeds the engine.
+        let ready = guard.as_ref().is_some_and(|slot| {
+            slot.key == key && slot.engine.weights_ready() && slot.engine.filled() == position
+        });
+        if !ready {
+            return Ok(None);
+        }
+        let slot = guard.as_mut().expect("ready checked above");
+        let predicted =
+            match slot
+                .engine
+                .verify_batch(&embeddings.data, &cos_all, &sin_all, position, k, scale)
+            {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+
+        // Accept the longest prefix of drafts that the model confirms, plus the
+        // bonus token at the first mismatch (predicted[0] is always taken).
+        let mut accepted = vec![predicted[0]];
+        let mut j = 0usize;
+        while j < drafts.len() && drafts[j] == predicted[j] {
+            accepted.push(predicted[j + 1]);
+            j += 1;
+        }
+        let new_position = position + accepted.len();
+        slot.engine.set_filled(new_position);
+        drop(guard);
+        self.kv_cache.position = new_position;
+        Ok(Some(accepted))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_variables)]
+    pub fn generate_next_tokens_speculative(
+        &mut self,
+        last_token: u32,
+        history: &[u32],
+        max_draft: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
     /// Dispatch the resident-decode fast lane to the active GPU backend: CUDA when
     /// `CAMELID_CUDA_RESIDENT_DECODE` is enabled (and the feature is built), otherwise the
     /// Metal seam. Either backend returns `Ok(None)` to fall back to the CPU layer loop.
@@ -9122,6 +9234,30 @@ fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> 
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
+/// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
+/// Cheap (no model), and it hits whenever the model repeats a phrase already in
+/// the context (code, lists, quoted text) — exactly where greedy decode is
+/// predictable. Empty when there's no match.
+#[cfg(feature = "cuda")]
+fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
+    if max_draft == 0 || ngram == 0 || history.len() <= ngram {
+        return Vec::new();
+    }
+    let suffix = &history[history.len() - ngram..];
+    let limit = history.len() - ngram;
+    for start in (0..limit).rev() {
+        if &history[start..start + ngram] == suffix {
+            let follow = &history[start + ngram..];
+            let take = follow.len().min(max_draft);
+            if take > 0 {
+                return follow[..take].to_vec();
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate

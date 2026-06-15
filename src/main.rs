@@ -1586,9 +1586,42 @@ fn generate_run(
     let (mut emb_us, mut layers_us) = (0u128, 0u128);
     let greedy = matches!(sampler, LlamaSampler::Greedy)
         && std::env::var_os("CAMELID_NO_GPU_SAMPLE").is_none();
+    // CAMELID_SPEC_NGRAM=<max_draft>: greedy GPU speculative decoding (lossless).
+    let spec_draft = std::env::var("CAMELID_SPEC_NGRAM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
     let decode_start = Instant::now();
     while !finished && generated.len() < max_tokens {
         let step_started = Instant::now();
+        // Greedy speculative decoding: one batched verify can emit several tokens.
+        // Falls through to the single-token path when no draft / engine not ready.
+        if greedy {
+            if let Some(nd) = spec_draft {
+                if let Some(toks) =
+                    session.generate_next_tokens_speculative(input[0], &history, nd)?
+                {
+                    if time_decode {
+                        wall_us += step_started.elapsed().as_micros();
+                        steps += 1;
+                    }
+                    for t in toks {
+                        if generated.len() >= max_tokens {
+                            break;
+                        }
+                        generated.push(t);
+                        history.push(t);
+                        if tokenizer.special.eog.contains(&t) {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    input.clear();
+                    input.push(*generated.last().expect("at least one token"));
+                    continue;
+                }
+            }
+        }
         // Greedy decode rides the resident fast lane (GPU argmax + embedding gather,
         // next graph pre-released); anything else takes the general sampling path.
         let next = if greedy {

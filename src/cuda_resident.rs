@@ -213,24 +213,23 @@ extern "C" __global__ void q8_gemv(
 // The speculative-decode verify runs K tokens through the model in one pass; the
 // win is that each weight block is read from global ONCE and reused for all K
 // tokens (vs K separate GEMVs reading the weights K times). One warp per output
-// row computes K dots, accumulating K partials in registers, then a warp-shuffle
-// tree reduction per token. Inputs are laid out [token][block]; outputs
-// [token][row]. The tree reduction reassociates the float sum (vs the single-
-// token GEMV's ordered sum) but the verify is authoritative — the accepted tokens
-// are argmax of THESE logits — so the decode stays token-identical to the CPU
-// reference modulo the usual near-ties. K is capped at 8 (register array).
+// row; for each block the weight is loaded once and dotted against all K inputs.
+// The per-block float terms are summed by lane 0 in block order (per token), the
+// SAME ordered sum as the single-token q8_gemv, so verify_batch is bit-identical
+// to K sequential forward_token calls — which makes speculative decode losslessly
+// reproduce greedy decode (not just token-identical-modulo-near-ties). Shared
+// holds [warp][token][block] terms; K is bounded by MAX_VERIFY_K so this fits.
 extern "C" __global__ void q8_gemm_batched(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
     int k_tokens, float* __restrict__ output
 ) {
+    extern __shared__ float terms[]; // warps_per_block * k_tokens * blocks_per_row
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
-    float partial[8];
-    #pragma unroll
-    for (int t = 0; t < 8; t++) partial[t] = 0.0f;
+    float* myterms = terms + (long)warp * k_tokens * blocks_per_row; // [token][block]
     if (row < rows) {
         long total_blocks = (long)rows * blocks_per_row;
         const signed char* quants = reinterpret_cast<const signed char*>(weight_bytes);
@@ -254,16 +253,18 @@ extern "C" __global__ void q8_gemm_batched(
                 s = __dp4a(w1.y, i1.y, s);
                 s = __dp4a(w1.z, i1.z, s);
                 s = __dp4a(w1.w, i1.w, s);
-                partial[t] += (float)s * w_scale * input_scales[(long)t * blocks_per_row + b];
+                myterms[t * blocks_per_row + b] =
+                    (float)s * w_scale * input_scales[(long)t * blocks_per_row + b];
             }
         }
     }
-    for (int t = 0; t < k_tokens; t++) {
-        float p = partial[t];
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-            p += __shfl_down_sync(0xffffffffu, p, off);
-        if (row < rows && lane == 0) output[(long)t * rows + row] = p;
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        for (int t = 0; t < k_tokens; t++) {
+            float acc = 0.0f;
+            for (int b = 0; b < blocks_per_row; b++) acc += myterms[t * blocks_per_row + b];
+            output[(long)t * rows + row] = acc;
+        }
     }
 }
 
@@ -791,7 +792,8 @@ fn launch_gemm_batched(
     let cfg = LaunchConfig {
         grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: 0,
+        // [warp][token][block] ordered-sum scratch.
+        shared_mem_bytes: warps_per_block * (k_tokens as u32) * (blocks_per_row as u32) * 4,
     };
     let (r, bpr, kt) = (rows as i32, blocks_per_row as i32, k_tokens as i32);
     let mut b = s.launch_builder(f);
@@ -1208,9 +1210,10 @@ pub struct CudaResidentDecode {
     verify_scratch: Option<VerifyScratch>,
 }
 
-/// Max draft tokens verified per speculative round (the batched GEMM's register
-/// array bounds this).
-const MAX_VERIFY_K: usize = 8;
+/// Max tokens verified per speculative round. The batched GEMM keeps the ordered
+/// per-(token,block) sum in shared memory, so `MAX_VERIFY_K * blocks_per_row *
+/// warps_per_block * 4` must fit (4 * 256 * 8 * 4 = 32 KiB for the 1B/3B FFN).
+pub(crate) const MAX_VERIFY_K: usize = 4;
 
 /// K-batched scratch buffers for `verify_batch`, sized `MAX_VERIFY_K * dim`.
 struct VerifyScratch {
