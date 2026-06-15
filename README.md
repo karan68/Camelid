@@ -8,6 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
 ![Platform: Apple Silicon · CPU](https://img.shields.io/badge/platform-Apple%20Silicon%20·%20CPU-lightgrey.svg)
+![Verified gate: TinyLlama 1.1B Q8_0](https://img.shields.io/badge/verified%20gate-TinyLlama%201.1B%20Q8__0-success.svg)
 
 </div>
 
@@ -16,6 +17,17 @@ Camelid loads GGUF models directly, serves them over a local OpenAI-style API, a
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
 <div align="center"><sub>The local web frontend — a dark, collapsed-rail chat surface that unlocks chat only for model rows the compatibility contract recognizes.</sub></div>
+
+---
+
+## Why Camelid is different
+
+Most local runtimes optimize for breadth — "point it at any GGUF." Camelid optimizes for **trust**, and treats the boundary as the feature:
+
+- **Every claim is backed by a re-runnable receipt.** Support is per *exact* model row — a specific GGUF at a specific quant — and an optimized path ships only after it matches a reference token-for-token. No "same family, probably fine."
+- **It fails closed, on purpose.** Point it at an unsupported model and you get a typed error, not a silent wrong answer. The honest boundary *is* the product.
+- **One Rust binary, no Python.** Tokenizer, GGUF loader, CPU kernels, and the Metal GPU path all live in this repo and ship as a single static binary — `serve` even embeds the web UI.
+- **Numbers come with logs or they don't ship.** Every published benchmark links to a committed bundle with raw logs, exact commands, and versions. No raw log, no claim.
 
 ---
 
@@ -31,6 +43,9 @@ Grab the binary for your platform from the [latest release](https://github.com/t
 `serve` opens the chat UI in your browser automatically. **No Python, no Node, no Docker, no separate server** — one static binary that serves the OpenAI-style API and the web UI on the same port. Full details in [Install](#install) and [Quickstart](#quickstart).
 
 Want a single command that proves the whole path end to end? `scripts/smoke.sh` pulls TinyLlama, serves it, does one real chat round-trip, and asserts on the reply — no mocks. See [Quickstart](#quickstart).
+
+<!-- TODO(tim): record and embed demo — a terminal cast of this exact supported path (serve → load TinyLlama → first token 29907/"C" → 50-token completion). Exact asciinema + svg-term commands are in assets/DEMO_RECORDING.md; replace this comment with ![…](assets/camelid-demo.svg) once rendered. -->
+<sub>📽️ A terminal cast of this exact path is on the way — see [`assets/DEMO_RECORDING.md`](assets/DEMO_RECORDING.md) for the recording recipe.</sub>
 
 ### Run in the terminal
 
@@ -264,6 +279,18 @@ camelid verify-receipt receipt.json --gguf path/to/exact-model.Q8_0.gguf
 The verifier recomputes the receipt's digest, confirms your GGUF is the named file, replays the request through Camelid, and re-runs it through llama.cpp — in two isolated passes so each model loads within one model's memory footprint, which lets a 7B receipt verify on a 16 GB Mac. Receipts exist only for deterministic (greedy) runs; sampled runs are stamped `reproducible: false`. **A receipt verifies a single request; it does not change the release ledger or promote any lane.** Details in [`RECEIPTS.md`](RECEIPTS.md).
 
 To measure *any* local runtime — not only Camelid — by determinism, cross-runtime agreement, tokenizer parity, and provability on the same model bytes, see the [conformance suite](docs/CONFORMANCE.md).
+
+---
+
+## Under the hood
+
+For the reader who wants the engineering, not the pitch — a few of the genuinely interesting artifacts:
+
+- **The token-major `output.weight` guardrail.** TinyLlama had perfect tokenizer parity but *wrong first-token logits* until the final vocab projection was read as token-major rows. The fix, the rationale, and the regression guard are pinned in [`DECISIONS.md` D0007](docs/architecture/DECISIONS.md).
+- **Reproduce any supported row's parity yourself.** Each row's greedy parity is re-runnable with a committed harness against pinned llama.cpp — methodology and per-row reproduction steps in [`CORRECTNESS_v0.1.md`](docs/release/CORRECTNESS_v0.1.md).
+- **One four-row story across every surface.** README, `STATUS.md`, `/api/capabilities`, and the UI are held to the same ledger by the readiness-gate inventory in [`VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — drift on any surface is treated as a bug.
+- **Sealed, portable parity receipts.** Any greedy request can emit a SHA-256-anchored receipt that re-verifies against llama.cpp on a different machine (incl. a 7B receipt on a 16 GB Mac) — [`RECEIPTS.md`](RECEIPTS.md).
+- **Engine internals.** The from-scratch tokenizer, GGUF loader, CPU kernels, and Metal-resident pipeline are mapped in [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
 
 ---
 
