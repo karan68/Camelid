@@ -24,6 +24,18 @@ pub struct CudaDeviceInfo {
     pub reason: Option<String>,
 }
 
+/// Lightweight device capability snapshot (no kernel compilation), used by the
+/// startup hardware-profile probe so VRAM-driven tunables can size to the device.
+#[derive(Debug, Clone, Default)]
+pub struct CudaCapability {
+    pub device_count: usize,
+    pub device_name: String,
+    /// (major, minor) compute capability; tensor cores require major >= 7.
+    pub compute_capability: (u32, u32),
+    pub vram_total_bytes: u64,
+    pub vram_free_bytes: u64,
+}
+
 // Runtime GPU-enable switch, so the UI can toggle the CUDA decode path on/off
 // without restarting. Seeded from `CAMELID_CUDA_Q8` on first read, then owned by
 // `set_runtime_enabled`. 0 = uninitialised, 1 = disabled, 2 = enabled. This flag
@@ -93,19 +105,23 @@ pub fn selected_device_ordinal() -> usize {
 
 #[cfg(feature = "cuda")]
 pub use backend::{
-    detect_cuda_device, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
+    detect_cuda_device, probe_capability, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
     try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
 pub use stub::{
-    detect_cuda_device, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
+    detect_cuda_device, probe_capability, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
     try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
 mod stub {
-    use super::CudaDeviceInfo;
+    use super::{CudaCapability, CudaDeviceInfo};
+
+    pub fn probe_capability() -> Option<CudaCapability> {
+        None
+    }
 
     pub fn detect_cuda_device() -> CudaDeviceInfo {
         CudaDeviceInfo {
@@ -366,6 +382,35 @@ extern "C" __global__ void q8_0_block_linear_row(
             kernel_block,
             device_name,
             weight_cache: HashMap::new(),
+        })
+    }
+
+    /// Light device probe for the startup hardware profile: opens the CUDA context
+    /// and reads device count / name / compute capability / VRAM, WITHOUT compiling
+    /// kernels (so it is cheap and side-effect-free relative to full init). Returns
+    /// `None` on any machine without a usable CUDA device.
+    pub fn probe_capability() -> Option<super::CudaCapability> {
+        let ordinal = super::selected_device_ordinal();
+        let ctx = CudaContext::new(ordinal).ok()?;
+        let device_count = result::device::get_count().unwrap_or(0).max(0) as usize;
+        let device_name = ctx
+            .name()
+            .unwrap_or_else(|_| "unknown CUDA device".to_string());
+        let cc_major = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .unwrap_or(0)
+            .max(0) as u32;
+        let cc_minor = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .unwrap_or(0)
+            .max(0) as u32;
+        let (vram_free, vram_total) = result::mem_get_info().unwrap_or((0, 0));
+        Some(super::CudaCapability {
+            device_count,
+            device_name,
+            compute_capability: (cc_major, cc_minor),
+            vram_total_bytes: vram_total as u64,
+            vram_free_bytes: vram_free as u64,
         })
     }
 
