@@ -393,6 +393,26 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Layer offloading — Phase 1: print the planned VRAM/host layer split for a
+    /// model (no weights loaded, no compute). `--budget-mb` forces a small VRAM
+    /// budget to demonstrate partial offload; `--arch <name>` plans a known
+    /// architecture without its GGUF file.
+    PlanOffload {
+        /// GGUF model to plan (reads real per-layer tensor sizes).
+        model: Option<PathBuf>,
+        /// Known architecture to plan without a file (e.g. "llama-8b").
+        #[arg(long)]
+        arch: Option<String>,
+        /// Override detected free VRAM (MiB) to force a split.
+        #[arg(long)]
+        budget_mb: Option<u64>,
+        /// KV-cache context length to reserve (default 4096).
+        #[arg(long)]
+        context: Option<u64>,
+        /// Safety margin in MiB (default 256).
+        #[arg(long)]
+        safety_mb: Option<u64>,
+    },
     /// Download a supported model (a known-good Q8_0 GGUF) into ./models.
     ///
     /// Run with no argument to list the catalog. Accepts a catalog id or a
@@ -909,6 +929,69 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::PlanOffload {
+            model,
+            arch,
+            budget_mb,
+            context,
+            safety_mb,
+        } => {
+            let profile = camelid::capability::HardwareProfile::detect();
+            profile.log();
+            let free_vram = match budget_mb {
+                Some(mb) => {
+                    println!("[offload] forced VRAM budget: {mb} MiB");
+                    mb * 1024 * 1024
+                }
+                None => {
+                    anyhow::ensure!(
+                        profile.cuda_available,
+                        "no CUDA device — offloading is a no-op; the CPU backend already \
+                         holds all weights in system RAM"
+                    );
+                    profile.cuda_vram_free_bytes
+                }
+            };
+            let context = context.unwrap_or(4096);
+            let safety_mb = safety_mb.unwrap_or(256);
+            let (config, plan) = if let Some(path) = model {
+                let gguf = read_metadata(&path)?;
+                let config = LlamaModelConfig::from_gguf(&gguf)?;
+                let plan = camelid::offload::OffloadPlan::from_gguf(
+                    &gguf, &config, free_vram, context, safety_mb,
+                );
+                (config, plan)
+            } else if let Some(arch) = arch {
+                let config = known_arch_config(&arch)?;
+                let plan = camelid::offload::OffloadPlan::from_dims(
+                    &config, free_vram, context, safety_mb,
+                );
+                (config, plan)
+            } else {
+                anyhow::bail!("provide a model path or --arch <name>");
+            };
+            let head_dim = config
+                .attention_key_length
+                .unwrap_or(config.embedding_length / config.attention_head_count.max(1));
+            println!(
+                "model: layers={} hidden={} ffn={} heads={} kv_heads={} head_dim={} vocab={:?} | KV reserved at context={}",
+                config.block_count,
+                config.embedding_length,
+                config.feed_forward_length,
+                config.attention_head_count,
+                config.attention_head_count_kv,
+                head_dim,
+                config.vocab_size,
+                context,
+            );
+            println!("{}", plan.describe());
+            let map: String = plan
+                .layer_resident
+                .iter()
+                .map(|&r| if r { 'V' } else { 'H' })
+                .collect();
+            println!("[offload] layer map (V=VRAM, H=host): {map}");
         }
         Command::Pull { model, models_dir } => {
             let dir = models_dir.unwrap_or_else(|| PathBuf::from("models"));
@@ -1786,6 +1869,47 @@ fn accumulate_stage_timings(
         *acc.entry("ffn_down").or_default() += l.ffn_down;
         *acc.entry("ffn_residual").or_default() += l.ffn_residual;
     }
+}
+
+/// A LlamaModelConfig for a known architecture, so `plan-offload --arch` can size
+/// a model whose GGUF isn't on disk. Only the fields the offload planner reads
+/// (dims, vocab, quant) are meaningful; the rest take neutral defaults.
+fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
+    // (block_count, hidden, ffn, heads, kv_heads, vocab, context)
+    let (
+        block_count,
+        embedding_length,
+        feed_forward_length,
+        heads,
+        kv_heads,
+        vocab,
+        context_length,
+    ) = match arch.to_lowercase().as_str() {
+        "llama-8b" | "llama3-8b" | "llama3.1-8b" | "8b" => (32, 4096, 14336, 32, 8, 128256, 131072),
+        other => anyhow::bail!("unknown --arch {other:?}; known: llama-8b"),
+    };
+    Ok(LlamaModelConfig {
+        context_length,
+        embedding_length,
+        block_count,
+        feed_forward_length,
+        attention_head_count: heads,
+        attention_head_count_kv: kv_heads,
+        rope_dimension_count: None,
+        rope_freq_base: None,
+        rope_scaling_type: None,
+        rope_scaling_factor: None,
+        rope_scaling_original_context_length: None,
+        rope_scaling_low_freq_factor: None,
+        rope_scaling_high_freq_factor: None,
+        rms_norm_epsilon: 1e-5,
+        vocab_size: Some(vocab),
+        file_type: Some(7), // Q8_0
+        attention_key_length: None,
+        rope_neox_pairing: false,
+        moe: None,
+        gemma4: None,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -16,6 +16,7 @@ pub mod inference;
 pub mod metal;
 pub mod model;
 pub mod model_source;
+pub mod offload;
 pub mod platform_fs;
 pub mod receipt;
 pub mod telemetry;
