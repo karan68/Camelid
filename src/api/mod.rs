@@ -6287,6 +6287,34 @@ async fn generate_stream_step_blocking(
                 return Ok(TimedGenerationStep { session, step });
             }
         }
+        // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
+        // instead of copying the full logits row to the host and sorting it on the
+        // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
+        if !collect_dense_diagnostics {
+            if let LlamaSampler::Sampling(cfg) = &sampler {
+                if let Some((id, forward_us)) = session
+                    .generate_next_token_sampled_resident(input[0], cfg)
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?
+                {
+                    let step = gpu_sampled_generation_step(id, forward_us).map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?;
+                    return Ok(TimedGenerationStep { session, step });
+                }
+            }
+        }
         let step = session
             .generate_next_token_with_history_diagnostics(
                 &input,
@@ -6817,25 +6845,38 @@ fn generate_token_ids(
                 continue;
             }
         }
-        // Greedy single-token continuations with no per-step logit consumers ride the
-        // resident GPU-sampling fast lane; everything else takes the general step.
+        // Single-token continuations with no per-step logit consumers ride the
+        // resident GPU fast lane: greedy via GPU argmax, temperature-only sampling
+        // via GPU Gumbel-max. Everything else takes the general step.
         let fast_step = if input.len() == 1
-            && matches!(sampler, LlamaSampler::Greedy)
             && !collect_dense_for_step
             && !collect_step_top_logits
             && !top_logits.is_empty()
         {
-            prepared
-                .session
-                .generate_next_token_greedy_resident(input[0])
-                .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "generation_step_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?
+            match &sampler {
+                LlamaSampler::Greedy => prepared
+                    .session
+                    .generate_next_token_greedy_resident(input[0])
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?,
+                LlamaSampler::Sampling(cfg) => prepared
+                    .session
+                    .generate_next_token_sampled_resident(input[0], cfg)
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?,
+            }
         } else {
             None
         };

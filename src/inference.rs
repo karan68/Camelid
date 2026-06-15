@@ -1988,6 +1988,57 @@ impl LlamaInferenceSession {
         }
     }
 
+    /// Temperature-sampling analog of the greedy resident fast lane: when the
+    /// sampler is plain temperature (no top-k / top-p / penalties / logit-bias),
+    /// draw the next token on the GPU via Gumbel-max — no 128K-logit host copy and
+    /// no CPU sort, which the profiler showed cost ~7 ms/token (more than the whole
+    /// forward). Returns `Ok(None)` when the config isn't GPU-eligible or CUDA
+    /// resident decode is off, so the caller uses the CPU logits path unchanged.
+    pub fn generate_next_token_sampled_resident(
+        &mut self,
+        token_id: u32,
+        config: &SamplingConfig,
+    ) -> Result<Option<(u32, u128)>> {
+        if !resident_decode_cuda_enabled()
+            || config.temperature <= 0.0
+            || config.top_k.is_some()
+            || config.top_p.is_some_and(|p| p < 1.0)
+            || config.presence_penalty != 0.0
+            || config.frequency_penalty != 0.0
+            || !config.logit_bias.is_empty()
+        {
+            return Ok(None);
+        }
+        if !self.kv_cache.can_append() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV cache is full at context length {}",
+                self.kv_cache.plan.max_sequence_length
+            )));
+        }
+        let started = Instant::now();
+        let embedding = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&[token_id], "token_embedding")?;
+        let inv_temp = 1.0 / config.temperature;
+        // Per-token seed so the Gumbel draw differs each step (the CPU sampler's
+        // fixed seed=0 draw is replaced; temperature sampling is random regardless).
+        let base = config.seed.unwrap_or(0);
+        let seed = base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
+        match self.try_resident_decode_forward_cuda(
+            &embedding,
+            true,
+            None,
+            Some((inv_temp, seed)),
+        )? {
+            Some(ResidentForward::Sampled(id)) => {
+                self.kv_cache.position += 1;
+                Ok(Some((id, started.elapsed().as_micros())))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Dispatch the resident-decode fast lane to the active GPU backend: CUDA when
     /// `CAMELID_CUDA_RESIDENT_DECODE` is enabled (and the feature is built), otherwise the
     /// Metal seam. Either backend returns `Ok(None)` to fall back to the CPU layer loop.
@@ -2013,6 +2064,7 @@ impl LlamaInferenceSession {
                 embedding,
                 compute_logits,
                 gpu_sample_token,
+                None,
             );
         }
         self.try_resident_decode_forward_metal(embedding, compute_logits, gpu_sample_token)
@@ -2028,6 +2080,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
+        sample: Option<(f32, u64)>,
     ) -> Result<Option<ResidentForward>> {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
@@ -2195,11 +2248,29 @@ impl LlamaInferenceSession {
             }
         }
 
-        // Greedy callers (`gpu_sample_token` set) take the GPU argmax tail and get a
-        // sampled token; everyone else (the chat UI's temperature/top-p sampling)
-        // gets the full logits row back to sample on the CPU — both keep the entire
-        // layer stack on the GPU.
-        let forward = if gpu_sample_token.is_some() {
+        // Three GPU tails, all keeping the whole layer stack on the device:
+        // `sample` (temperature sampling) draws the token on the GPU via Gumbel-max;
+        // `gpu_sample_token` set means greedy (GPU argmax); otherwise the full logits
+        // row goes back for the CPU sampler (top-k / top-p / penalties).
+        let forward = if let Some((inv_temp, seed)) = sample {
+            match slot.engine.forward_token_sample(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+                inv_temp,
+                seed,
+            ) {
+                Ok(id) => ResidentForward::Sampled(id),
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token_sample err at {position}: {e}");
+                    }
+                    return Ok(None);
+                }
+            }
+        } else if gpu_sample_token.is_some() {
             match slot.engine.forward_token(
                 &embedding.data,
                 &tables.cos,
@@ -2254,6 +2325,7 @@ impl LlamaInferenceSession {
         embedding: &CpuTensor,
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
+        sample: Option<(f32, u64)>,
     ) -> Result<Option<ResidentForward>> {
         Ok(None)
     }

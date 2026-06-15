@@ -319,6 +319,52 @@ extern "C" __global__ void argmax_f32(
     }
     if (tid == 0) out_idx[0] = (unsigned int)sidx[0];
 }
+
+// ---- Temperature sampling via the Gumbel-max trick --------------------------
+// A draw from softmax(logits/temp) equals argmax_i(logits[i]/temp + g_i) with
+// g_i ~ Gumbel(0,1) = -log(-log(u_i)), u_i ~ Uniform(0,1). One pass over the
+// vocab (same shape as argmax) — no softmax, no sort, no host logits copy. The
+// per-element uniform is a stateless splitmix64 hash of (seed, index), so the
+// whole draw is reproducible from `seed` (varied per token by the host). As
+// temp -> 0, inv_temp -> inf and the (bounded) Gumbel term is dominated by the
+// logits, so this collapses to the exact greedy argmax — matching the greedy
+// gate. Strict-greater tie-break to the lower index, as in argmax_f32.
+__device__ __forceinline__ float splitmix_uniform(unsigned long long seed, unsigned int idx) {
+    unsigned long long z = seed + 0x9E3779B97F4A7C15ULL * (unsigned long long)(idx + 1u);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    z = z ^ (z >> 31);
+    unsigned int m = (unsigned int)(z >> 40); // 24 random bits
+    return ((float)m + 0.5f) / 16777216.0f;   // in (0,1), excludes 0 and 1
+}
+extern "C" __global__ void sample_gumbel(
+    const float* __restrict__ logits, int n, float inv_temp,
+    unsigned long long seed, unsigned int* __restrict__ out_idx
+) {
+    extern __shared__ float sh[];
+    float* sval = sh;
+    int* sidx = (int*)(sh + blockDim.x);
+    int tid = threadIdx.x;
+    float best = -3.4e38f; int besti = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        float u = splitmix_uniform(seed, (unsigned int)i);
+        float g = -logf(-logf(u));
+        float v = logits[i] * inv_temp + g;
+        if (v > best) { best = v; besti = i; }
+    }
+    sval[tid] = best; sidx[tid] = besti;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s]; int oi = sidx[tid + s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
+                sval[tid] = ov; sidx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out_idx[0] = (unsigned int)sidx[0];
+}
 "#;
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -339,6 +385,7 @@ pub struct CudaResidentKernels {
     pub(crate) silu_mul: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
+    pub(crate) sample_gumbel: CudaFunction,
 }
 
 impl CudaResidentKernels {
@@ -371,6 +418,7 @@ impl CudaResidentKernels {
             silu_mul: f("silu_mul")?,
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
+            sample_gumbel: f("sample_gumbel")?,
             ctx,
             stream,
         })
@@ -618,6 +666,32 @@ fn launch_argmax(
     let n_i = n as i32;
     let mut b = s.launch_builder(f);
     b.arg(logits).arg(&n_i).arg(out_idx);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_sample_gumbel(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    logits: &CudaSlice<f32>,
+    n: usize,
+    inv_temp: f32,
+    seed: u64,
+    out_idx: &mut CudaSlice<u32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 8,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(logits)
+        .arg(&n_i)
+        .arg(&inv_temp)
+        .arg(&seed)
+        .arg(out_idx);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -1187,6 +1261,41 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_logits, &mut logits).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(logits)
+    }
+
+    /// Temperature sampling decode entirely on the GPU: full forward, then a
+    /// Gumbel-max draw over the logits (one pass, no softmax/sort/host copy).
+    /// Returns the sampled token id. `inv_temp` is `1.0 / temperature`; `seed`
+    /// varies the draw per token. One device sync. Used for the default chat
+    /// case (temperature only); top-k / top-p / penalties stay on the CPU path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token_sample(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        inv_temp: f32,
+        seed: u64,
+    ) -> Result<u32, String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
+        let s = self.k.stream.clone();
+        self.forward_pass(embedding, cos, sin, position, scale, true)?;
+        launch_sample_gumbel(
+            &s,
+            &self.k.sample_gumbel,
+            &self.d_logits,
+            self.vocab,
+            inv_temp,
+            seed,
+            &mut self.d_sampled,
+        )
+        .map_err(map)?;
+        let mut out = [0u32; 1];
+        s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(out[0])
     }
 
     /// GPU prefill of `n` prompt tokens. Each token's forward runs at its own

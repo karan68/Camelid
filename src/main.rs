@@ -1620,21 +1620,42 @@ fn generate_run(
                 }
             }
         } else {
-            let step = session.generate_next_token_with_history_diagnostics(
-                &input,
-                sampler.clone(),
-                &history,
-                false,
-            )?;
-            if time_decode {
-                wall_us += step_started.elapsed().as_micros();
-                fwd_us += step.timings.total;
-                sample_us += step.sample;
-                emb_us += step.timings.embedding;
-                layers_us += step.timings.layers_total;
-                steps += 1;
+            // Temperature-only sampling rides the GPU Gumbel-max fast lane (no host
+            // logits copy, no CPU sort); top-k / top-p / penalties fall through to
+            // the CPU sampler.
+            let gpu_sampled = match &sampler {
+                LlamaSampler::Sampling(cfg) => {
+                    session.generate_next_token_sampled_resident(input[0], cfg)?
+                }
+                LlamaSampler::Greedy => None,
+            };
+            match gpu_sampled {
+                Some((id, forward_us)) => {
+                    if time_decode {
+                        wall_us += step_started.elapsed().as_micros();
+                        fwd_us += forward_us;
+                        steps += 1;
+                    }
+                    id
+                }
+                None => {
+                    let step = session.generate_next_token_with_history_diagnostics(
+                        &input,
+                        sampler.clone(),
+                        &history,
+                        false,
+                    )?;
+                    if time_decode {
+                        wall_us += step_started.elapsed().as_micros();
+                        fwd_us += step.timings.total;
+                        sample_us += step.sample;
+                        emb_us += step.timings.embedding;
+                        layers_us += step.timings.layers_total;
+                        steps += 1;
+                    }
+                    step.next_token_id
+                }
             }
-            step.next_token_id
         };
         generated.push(next);
         history.push(next);
