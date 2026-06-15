@@ -1,3 +1,7 @@
+> **CORRECTION (artifact-free re-measurement).** The decode-vs-prefill mechanism described below (the "dominant, 3/4 probes" attribution) was a **measurement artifact**: the prefill comparison was fed a detokenized prefix with `parse_special=false`, mis-tokenizing the `<think>`/`<|im_start|>` special tokens. Re-measured with **exact token ids** (`camelid_prompt_token_ids`), **camelid decode == camelid prefill** (capital@73 gap **0.003**, not 0.7; 3/3 captured probes agree). The thinking-trace divergence vs llama.cpp is **entirely cross-implementation rounding**, not decode-vs-prefill. The bundle's **verdict still stands** (full-trace parity is not achievable via a shared-order config) and is strengthened. See `correction-decode-vs-prefill-artifact.json`.
+
+---
+
 # Qwen3-1.7B Q8_0 — thinking-mode deterministic full-trace parity: investigation (negative result)
 
 **Question.** Can Qwen3 thinking-mode *full-trace* token-parity vs the pinned

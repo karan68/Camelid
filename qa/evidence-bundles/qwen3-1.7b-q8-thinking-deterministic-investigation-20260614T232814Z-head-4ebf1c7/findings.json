@@ -1,4 +1,5 @@
 {
+  "CORRECTION_NOTICE": "CORRECTION (later artifact-free re-measurement): the 'two_mechanisms' decode-vs-prefill attribution below was a MEASUREMENT ARTIFACT (the prefill side was fed a detokenized prefix with parse_special=false, mis-tokenizing the <think>/<|im_start|> special tokens). Re-measured with EXACT token ids (camelid_prompt_token_ids), camelid decode == camelid prefill (capital@73 gap 0.003, not 0.7; 3/3 captured probes agree). The divergence vs llama.cpp is ENTIRELY cross-implementation rounding, NOT decode-vs-prefill. The VERDICT (full-trace parity not achievable via a shared-order config) STANDS and is strengthened. See correction-decode-vs-prefill-artifact.json.",
   "schema": "camelid.qwen3.thinking_deterministic_parity_investigation.v1",
   "row_id": "qwen3_1_7b_instruct_q8_0",
   "question": "Can Qwen3 thinking-mode full-trace token-parity vs the pinned llama.cpp reference be achieved via a shared deterministic reduction-order configuration (promoting the leading-trace claim)?",
