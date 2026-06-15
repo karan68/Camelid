@@ -22,8 +22,8 @@ use camelid::{
     gguf::{read_metadata, GgufTensorType},
     ghost::{GhostFile, GhostPrefetcher},
     inference::{
-        LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, LlamaSampler,
-        Q8ResidencyReport, SamplingConfig,
+        LlamaForwardTimings, LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights,
+        LlamaSampler, Q8ResidencyReport, SamplingConfig,
     },
     metal::detect_metal_device,
     model::{LlamaModelConfig, LlamaTensorBinding},
@@ -724,6 +724,7 @@ async fn main() -> anyhow::Result<()> {
             deterministic,
         } => {
             configure_rayon_threads(threads)?;
+            camelid::capability::HardwareProfile::detect().log();
             // In deterministic mode the engine fails every Metal gate closed (see
             // `apply_deterministic_mode`); don't also arm the Metal tuning env or the
             // GPU fast-load nocopy default, which would only be contradictory no-ops.
@@ -1582,6 +1583,12 @@ fn generate_run(
     // Decode the remaining tokens (pure decode throughput).
     // CAMELID_DECODE_TIME=1: split per-token wall into forward / sample / other.
     let time_decode = std::env::var_os("CAMELID_DECODE_TIME").is_some();
+    // Phase 0 instrumentation: per-stage decode time sinks (CPU path). Aggregates the
+    // already-collected per-layer timings across all decode steps. GPU resident decode
+    // runs as one fused call so these stay ~0 there; meaningful on the CPU forward.
+    let stage_timings = std::env::var_os("CAMELID_STAGE_TIMINGS").is_some();
+    let mut stage_us: std::collections::BTreeMap<&'static str, u128> =
+        std::collections::BTreeMap::new();
     let (mut fwd_us, mut sample_us, mut steps, mut wall_us) = (0u128, 0u128, 0u64, 0u128);
     let (mut emb_us, mut layers_us) = (0u128, 0u128);
     let greedy = matches!(sampler, LlamaSampler::Greedy)
@@ -1664,6 +1671,9 @@ fn generate_run(
                         layers_us += step.timings.layers_total;
                         steps += 1;
                     }
+                    if stage_timings {
+                        accumulate_stage_timings(&mut stage_us, &step.timings);
+                    }
                     step.next_token_id
                 }
             }
@@ -1701,6 +1711,9 @@ fn generate_run(
                         layers_us += step.timings.layers_total;
                         steps += 1;
                     }
+                    if stage_timings {
+                        accumulate_stage_timings(&mut stage_us, &step.timings);
+                    }
                     step.next_token_id
                 }
             }
@@ -1712,6 +1725,20 @@ fn generate_run(
         input.push(next);
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    if stage_timings && !stage_us.is_empty() {
+        let total: u128 = stage_us.values().sum();
+        let mut ranked: Vec<(&&str, &u128)> = stage_us.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("[stage-timings] per-decode-step CPU breakdown (sum of all layers), total {:.2} ms/token over {} steps:", total as f64 / generated.len().max(1) as f64 / 1000.0, generated.len());
+        for (name, us) in ranked {
+            eprintln!(
+                "  {:>18}  {:6.2}%  {:8.3} ms/token",
+                name,
+                *us as f64 / total as f64 * 100.0,
+                *us as f64 / generated.len().max(1) as f64 / 1000.0,
+            );
+        }
+    }
     if time_decode && steps > 0 {
         eprintln!(
             "[decode-time] per token: step wall {:.2}ms | forward {:.2}ms (embed {:.3} layers {:.2}) | sample {:.2}ms | in-step other {:.2}ms | loop other {:.2}ms",
@@ -1733,6 +1760,34 @@ fn generate_run(
     })
 }
 
+/// Phase 0 instrumentation: fold one forward step's per-stage timings into a
+/// running per-stage accumulator, so a decode run can report where CPU time goes.
+fn accumulate_stage_timings(
+    acc: &mut std::collections::BTreeMap<&'static str, u128>,
+    t: &LlamaForwardTimings,
+) {
+    *acc.entry("embedding").or_default() += t.embedding;
+    *acc.entry("final_norm").or_default() += t.final_norm;
+    *acc.entry("logits(output_proj)").or_default() += t.logits;
+    for l in &t.layers {
+        *acc.entry("attn_norm").or_default() += l.attention_norm;
+        *acc.entry("attn_q_proj").or_default() += l.attention_q;
+        *acc.entry("attn_k_proj").or_default() += l.attention_k;
+        *acc.entry("attn_v_proj").or_default() += l.attention_v;
+        *acc.entry("attn_rope").or_default() += l.attention_rope;
+        *acc.entry("kv_write").or_default() += l.kv_cache_write;
+        *acc.entry("attn_context").or_default() += l.attention_context;
+        *acc.entry("attn_out_proj").or_default() += l.attention_output;
+        *acc.entry("attn_residual").or_default() += l.attention_residual;
+        *acc.entry("ffn_norm").or_default() += l.ffn_norm;
+        *acc.entry("ffn_gate").or_default() += l.ffn_gate;
+        *acc.entry("ffn_up").or_default() += l.ffn_up;
+        *acc.entry("ffn_activation").or_default() += l.ffn_activation;
+        *acc.entry("ffn_down").or_default() += l.ffn_down;
+        *acc.entry("ffn_residual").or_default() += l.ffn_residual;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_bench_generate(
     model: PathBuf,
@@ -1747,6 +1802,7 @@ fn run_bench_generate(
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
     anyhow::ensure!(iterations >= 1, "--iterations must be at least 1");
     configure_rayon_threads(threads)?;
+    camelid::capability::HardwareProfile::detect().log();
 
     let prompt_text = match (&prompt_file, &prompt) {
         (Some(path), _) => std::fs::read_to_string(path)?,
