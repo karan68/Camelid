@@ -1332,7 +1332,48 @@ pub async fn serve(
     if open_ui {
         crate::web_ui::open_in_browser(&url);
     }
+    // Warm the generation path right after startup so the first real message is
+    // fast. The GPU resident engine (kernels + weights upload + CUDA init) is built
+    // lazily on the first generation — a one-time ~2-3s cost that would otherwise
+    // land on the user's first prompt. This fires one tiny self-request through the
+    // exact same code path (no divergent logic), building the engine before the
+    // user types. Harmless if it fails; it's only a warm-up.
+    if let Some(model_id) = state.active_model_id.read().await.clone() {
+        warmup_generation(addr, model_id);
+    }
     axum::serve(listener, router_with_state(state)).await
+}
+
+/// One-shot self-request to build/warm the generation engine after startup. Sends
+/// a raw HTTP POST (no extra deps, blocking `std::net` on its own thread) to the
+/// server's own chat endpoint and reads the full response so the forward
+/// completes (GPU engine built) before returning. Any failure is ignored — this
+/// only ever shaves the first-request cold start.
+fn warmup_generation(addr: SocketAddr, model_id: String) {
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        std::thread::sleep(Duration::from_millis(700));
+        let body = serde_json::json!({
+            "model": model_id,
+            "messages": [{ "role": "user", "content": "hi" }],
+            "max_tokens": 1,
+            "temperature": 0,
+            "stream": false,
+        })
+        .to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+        if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink);
+                tracing::info!("generation warm-up complete");
+            }
+        }
+    });
 }
 
 /// Print a clear, human-facing pointer to the web UI once the server is up.
