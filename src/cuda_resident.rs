@@ -209,6 +209,64 @@ extern "C" __global__ void q8_gemv(
     }
 }
 
+// ---- Batched Q8 GEMM: K token-inputs against M weight rows ------------------
+// The speculative-decode verify runs K tokens through the model in one pass; the
+// win is that each weight block is read from global ONCE and reused for all K
+// tokens (vs K separate GEMVs reading the weights K times). One warp per output
+// row computes K dots, accumulating K partials in registers, then a warp-shuffle
+// tree reduction per token. Inputs are laid out [token][block]; outputs
+// [token][row]. The tree reduction reassociates the float sum (vs the single-
+// token GEMV's ordered sum) but the verify is authoritative — the accepted tokens
+// are argmax of THESE logits — so the decode stays token-identical to the CPU
+// reference modulo the usual near-ties. K is capped at 8 (register array).
+extern "C" __global__ void q8_gemm_batched(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    int k_tokens, float* __restrict__ output
+) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float partial[8];
+    #pragma unroll
+    for (int t = 0; t < 8; t++) partial[t] = 0.0f;
+    if (row < rows) {
+        long total_blocks = (long)rows * blocks_per_row;
+        const signed char* quants = reinterpret_cast<const signed char*>(weight_bytes);
+        const float* scales =
+            reinterpret_cast<const float*>(weight_bytes + total_blocks * 32);
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            float w_scale = scales[row_block0 + b];
+            const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
+            int4 w0 = wq[0], w1 = wq[1]; // weight block read once, reused for all K
+            for (int t = 0; t < k_tokens; t++) {
+                const int4* iq = reinterpret_cast<const int4*>(
+                    input_quants + ((long)t * blocks_per_row + b) * 32);
+                int4 i0 = iq[0], i1 = iq[1];
+                int s = 0;
+                s = __dp4a(w0.x, i0.x, s);
+                s = __dp4a(w0.y, i0.y, s);
+                s = __dp4a(w0.z, i0.z, s);
+                s = __dp4a(w0.w, i0.w, s);
+                s = __dp4a(w1.x, i1.x, s);
+                s = __dp4a(w1.y, i1.y, s);
+                s = __dp4a(w1.z, i1.z, s);
+                s = __dp4a(w1.w, i1.w, s);
+                partial[t] += (float)s * w_scale * input_scales[(long)t * blocks_per_row + b];
+            }
+        }
+    }
+    for (int t = 0; t < k_tokens; t++) {
+        float p = partial[t];
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            p += __shfl_down_sync(0xffffffffu, p, off);
+        if (row < rows && lane == 0) output[(long)t * rows + row] = p;
+    }
+}
+
 // ---- RoPE: adjacent-even-odd, forward. cos/sin are per-pair (rope_dim/2). ---
 extern "C" __global__ void rope_rotate(
     float* __restrict__ vec, const float* __restrict__ cos_t, const float* __restrict__ sin_t,
@@ -409,6 +467,7 @@ pub struct CudaResidentKernels {
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
+    pub(crate) gemm_batched: CudaFunction,
 }
 
 impl CudaResidentKernels {
@@ -442,6 +501,7 @@ impl CudaResidentKernels {
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
+            gemm_batched: f("q8_gemm_batched")?,
             ctx,
             stream,
         })
@@ -543,6 +603,42 @@ fn launch_gemv(
         .arg(weight)
         .arg(&r)
         .arg(&bpr)
+        .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Batched Q8 GEMM: `k_tokens` inputs (`[token][block]`) against `rows` weight
+/// rows, output `[token][row]`. Weights are read once and reused across tokens.
+// Driven by the batched speculative-verify forward (next stage); the parity test
+// exercises it today.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn launch_gemm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaSlice<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    k_tokens: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (r, bpr, kt) = (rows as i32, blocks_per_row as i32, k_tokens as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&bpr)
+        .arg(&kt)
         .arg(out);
     unsafe { b.launch(cfg) }.map(|_| ())
 }

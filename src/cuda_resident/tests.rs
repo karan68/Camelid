@@ -378,6 +378,56 @@ fn rms_norm_matches_cpu() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn gemm_batched_matches_per_token() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let bpr = 4usize; // K_dim = 128
+    let kdim = bpr * 32;
+    let ktok = 4usize;
+    let mut rng = Lcg(7);
+    // Weight [rows*kdim] -> 36-byte Q8 blocks -> SoA layout the kernel reads.
+    let w: Vec<f32> = (0..rows * kdim).map(|_| rng.next_f32()).collect();
+    let wblocks = quantize_blocks(&w, kdim);
+    let wsoa = super::repack_q8_soa(&wblocks);
+    // K inputs laid out [token][block]; CPU reference per token.
+    let mut in_s = vec![0f32; ktok * bpr];
+    let mut in_q = vec![0i8; ktok * kdim];
+    let mut cpu_out = vec![0f32; ktok * rows];
+    for t in 0..ktok {
+        let x: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+        let (s, q) = quantize_row(&x);
+        in_s[t * bpr..(t + 1) * bpr].copy_from_slice(&s);
+        in_q[t * kdim..(t + 1) * kdim].copy_from_slice(&q);
+        let r = cpu_q8_dot(&s, &q, &wblocks, rows, bpr);
+        cpu_out[t * rows..(t + 1) * rows].copy_from_slice(&r);
+    }
+    let d_is = k.stream.clone_htod(&in_s).unwrap();
+    let d_iq = k.stream.clone_htod(&in_q).unwrap();
+    let d_w = k.stream.clone_htod(&wsoa).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(ktok * rows).unwrap();
+    super::launch_gemm_batched(
+        &k.stream,
+        &k.gemm_batched,
+        &d_is,
+        &d_iq,
+        &d_w,
+        rows,
+        bpr,
+        ktok,
+        &mut d_out,
+    )
+    .unwrap();
+    let mut got = vec![0f32; ktok * rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    // Tree reduction vs the CPU's sequential block sum -> close, not bit-exact.
+    assert!(close(&got, &cpu_out, 1e-3), "batched gemm diverged");
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn quantize_q8_0_matches_cpu() {
     let Some(k) = kernels() else {
         return;
