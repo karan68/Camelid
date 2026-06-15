@@ -2053,15 +2053,15 @@ impl LlamaInferenceSession {
         last_token: u32,
         history: &[u32],
         max_draft: usize,
+        ngram: usize,
     ) -> Result<Option<Vec<u32>>> {
         if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
             return Ok(None);
         }
         let max_draft = max_draft.min(crate::cuda_resident::MAX_VERIFY_K - 1);
-        // 3-gram match: high enough precision that diverse text (where a draft would
-        // mispredict and waste a verify) simply doesn't draft, so spec decode never
-        // slows the non-repetitive case while still firing on repeated phrases.
-        let drafts = draft_ngram(history, max_draft, 3);
+        // The caller adapts `ngram`: a longer match is higher precision (fewer wasted
+        // verifies on non-repetitive text), a shorter one catches more repeats.
+        let drafts = draft_ngram(history, max_draft, ngram);
         if drafts.is_empty() {
             return Ok(None);
         }
@@ -2147,6 +2147,7 @@ impl LlamaInferenceSession {
         last_token: u32,
         history: &[u32],
         max_draft: usize,
+        ngram: usize,
     ) -> Result<Option<Vec<u32>>> {
         Ok(None)
     }

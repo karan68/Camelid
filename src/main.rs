@@ -1591,6 +1591,11 @@ fn generate_run(
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0);
+    // Adaptive drafting: an EMA of how many drafts get accepted per round tunes the
+    // n-gram length. Start conservative (precise 4-gram, which rarely drafts on
+    // non-repetitive text so it isn't slowed) and only loosen to an aggressive
+    // 2-gram once repetition is proven by a high acceptance rate.
+    let mut spec_ema = 0.5f32;
     let decode_start = Instant::now();
     while !finished && generated.len() < max_tokens {
         let step_started = Instant::now();
@@ -1598,9 +1603,19 @@ fn generate_run(
         // Falls through to the single-token path when no draft / engine not ready.
         if greedy {
             if let Some(nd) = spec_draft {
+                let ngram = if spec_ema >= 2.0 {
+                    2
+                } else if spec_ema >= 0.9 {
+                    3
+                } else {
+                    4
+                };
                 if let Some(toks) =
-                    session.generate_next_tokens_speculative(input[0], &history, nd)?
+                    session.generate_next_tokens_speculative(input[0], &history, nd, ngram)?
                 {
+                    // accepted drafts = tokens emitted minus the always-present bonus.
+                    let accepted = toks.len().saturating_sub(1) as f32;
+                    spec_ema = 0.7 * spec_ema + 0.3 * accepted;
                     if time_decode {
                         wall_us += step_started.elapsed().as_micros();
                         steps += 1;
