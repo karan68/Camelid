@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaStream, PinnedHostSlice};
 use cudarc::nvrtc::{CompileOptions, Ptx};
 
 /// CUDA C source for every resident-decode kernel. Compiled once via NVRTC with
@@ -1166,7 +1166,10 @@ fn launch_sample_gumbel(
 /// the math (offloading is a capacity feature, parity is unaffected).
 enum LayerWeight {
     Vram(CudaSlice<u8>),
-    Host(Vec<u8>),
+    /// Offloaded weights live in PINNED (page-locked, write-combined) host memory,
+    /// so the per-forward host->device stream runs at full PCIe bandwidth (a copy
+    /// from pageable memory would stage through a driver bounce buffer).
+    Host(PinnedHostSlice<u8>),
 }
 
 impl LayerWeight {
@@ -1441,6 +1444,7 @@ impl CudaResidentDecode {
         ffn_norm: &[f32],
         resident: bool,
     ) -> Result<(), String> {
+        let ctx = &self.k.ctx;
         let s = &self.k.stream;
         let weight = |b: &[u8]| -> Result<LayerWeight, String> {
             let repacked = repack_q8_soa(b);
@@ -1449,7 +1453,16 @@ impl CudaResidentDecode {
                     s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))?,
                 ))
             } else {
-                Ok(LayerWeight::Host(repacked))
+                // Pinned (page-locked, write-combined) host buffer for full-PCIe
+                // streaming. SAFETY: alloc_pinned hands back a raw host allocation;
+                // we immediately fill it and the returned PinnedHostSlice owns/frees it.
+                let mut pinned = unsafe { ctx.alloc_pinned::<u8>(repacked.len()) }
+                    .map_err(|e| format!("alloc_pinned: {e}"))?;
+                pinned
+                    .as_mut_slice()
+                    .map_err(|e| format!("pinned fill: {e}"))?
+                    .copy_from_slice(&repacked);
+                Ok(LayerWeight::Host(pinned))
             }
         };
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
@@ -1649,31 +1662,31 @@ impl CudaResidentDecode {
             if offloaded {
                 if let LayerWeight::Host(h) = &self.layers[li].q {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.q).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.q).map_err(map)?;
                 }
                 if let LayerWeight::Host(h) = &self.layers[li].k {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.k).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.k).map_err(map)?;
                 }
                 if let LayerWeight::Host(h) = &self.layers[li].v {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.v).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.v).map_err(map)?;
                 }
                 if let LayerWeight::Host(h) = &self.layers[li].o {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.o).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.o).map_err(map)?;
                 }
                 if let LayerWeight::Host(h) = &self.layers[li].gate {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.gate).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.gate).map_err(map)?;
                 }
                 if let LayerWeight::Host(h) = &self.layers[li].up {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.up).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.up).map_err(map)?;
                 }
                 if let LayerWeight::Host(h) = &self.layers[li].down {
                     let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h.as_slice(), &mut sc.down).map_err(map)?;
+                    s.memcpy_htod(h, &mut sc.down).map_err(map)?;
                 }
             }
             let (wq, wk, wv, wo, wgate, wup, wdown): LayerWeightSlices = if offloaded {
