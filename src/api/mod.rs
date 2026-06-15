@@ -1156,6 +1156,18 @@ fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
     }
 }
 
+/// Run speculative decode on the GPU (CAMELID_SPEC_GPU=1): keep the target's
+/// resident decode engine active during speculation and verify drafts via the
+/// batched GPU `verify_batch` instead of the CPU chunk verify. Opt-in while this
+/// lands; lossless either way (the target verify is authoritative), so the flag
+/// only changes where the work runs.
+fn spec_gpu_enabled() -> bool {
+    matches!(
+        env::var("CAMELID_SPEC_GPU").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 fn spec_draft_tokens_from_env(default: usize) -> usize {
     env::var(SPEC_DRAFT_TOKENS_ENV)
         .ok()
@@ -5621,9 +5633,10 @@ async fn prepare_generation(
             accepted_drafts: 0,
         }),
     };
-    // Speculation needs CPU-authoritative KV state for rollback, so the
-    // session stays off the GPU-resident prefill/decode paths.
-    session.set_resident_paths_disabled(speculative.is_some());
+    // CPU speculation needs CPU-authoritative KV for the chunk-verify rollback, so
+    // the target stays off the resident paths. GPU speculation (CAMELID_SPEC_GPU)
+    // keeps the target resident and verifies drafts via the batched GPU verify.
+    session.set_resident_paths_disabled(speculative.is_some() && !spec_gpu_enabled());
 
     let telemetry_backend = {
         let plans = state.execution_plans.read().await;
@@ -6736,7 +6749,7 @@ fn generate_token_ids(
             // that stored it; re-pin for this request's mode.
             prepared
                 .session
-                .set_resident_paths_disabled(prepared.speculative.is_some());
+                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
             input.clear();
             let first_step = sample_cached_prompt_prefix(&cached, &history)?;
             let cached_next_token = first_step.next_token_id;
@@ -6823,38 +6836,67 @@ fn generate_token_ids(
             // single-token step below; a one-token verify chunk would only
             // add chunk-path overhead over the tuned decode step.
             if !drafts.is_empty() {
-                let base_position = prepared.session.kv_position();
-                let mut batch = Vec::with_capacity(1 + drafts.len());
-                batch.push(input[0]);
-                batch.extend_from_slice(&drafts);
-                let (predictions, round_timings) = prepared
-                    .session
-                    .forward_greedy_verify_chunk(&batch)
-                    .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_verify_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
-                let accepted = accepted_draft_prefix(&drafts, &predictions);
-                prepared
-                    .session
-                    .rollback_to_position(base_position + 1 + accepted)
-                    .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_rollback_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
-                spec.rounds += 1;
-                spec.drafted += drafts.len() as u64;
-                spec.accepted_drafts += accepted as u64;
-                forward_timings.add_assign(&round_timings);
-                for &token in &predictions[..=accepted] {
+                // GPU speculative decode (CAMELID_SPEC_GPU=1): verify all drafts in one
+                // batched forward on the target's resident engine, which manages the KV
+                // itself (accept the longest matching prefix, advance position). Falls
+                // back to the CPU chunk verify when the engine isn't resident-ready.
+                // Lossless either way — the emitted tokens are the target's own greedy
+                // argmax given the accepted prefix.
+                let gpu_accepted = if spec_gpu_enabled() {
+                    prepared
+                        .session
+                        .verify_drafts_gpu(input[0], &drafts)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "speculative_verify_failed",
+                                err.to_string(),
+                                None,
+                            ))
+                        })?
+                } else {
+                    None
+                };
+                let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
+                    spec.rounds += 1;
+                    spec.drafted += drafts.len() as u64;
+                    spec.accepted_drafts += (acc.len() as u64).saturating_sub(1);
+                    acc
+                } else {
+                    let base_position = prepared.session.kv_position();
+                    let mut batch = Vec::with_capacity(1 + drafts.len());
+                    batch.push(input[0]);
+                    batch.extend_from_slice(&drafts);
+                    let (predictions, round_timings) = prepared
+                        .session
+                        .forward_greedy_verify_chunk(&batch)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "speculative_verify_failed",
+                                err.to_string(),
+                                None,
+                            ))
+                        })?;
+                    let accepted = accepted_draft_prefix(&drafts, &predictions);
+                    prepared
+                        .session
+                        .rollback_to_position(base_position + 1 + accepted)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "speculative_rollback_failed",
+                                err.to_string(),
+                                None,
+                            ))
+                        })?;
+                    spec.rounds += 1;
+                    spec.drafted += drafts.len() as u64;
+                    spec.accepted_drafts += accepted as u64;
+                    forward_timings.add_assign(&round_timings);
+                    predictions[..=accepted].to_vec()
+                };
+                for &token in &emitted {
                     generated.push(token);
                     history.push(token);
                     if prepared.tokenizer.special.eog.contains(&token) {
