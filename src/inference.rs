@@ -1634,6 +1634,28 @@ impl LlamaInferenceSession {
         self.kv_cache.rollback_to_position(position)
     }
 
+    /// Roll back a GPU-resident drafter session to `position`. Unlike
+    /// [`rollback_to_position`], this does NOT require CPU-authoritative KV: it
+    /// resets the resident CUDA engine's `filled` to `position` so the next decode
+    /// trusts the (still-valid) GPU KV up to `position` instead of reseeding from the
+    /// CPU history. The GPU KV is position-major, so entries past `position` are
+    /// overwritten on the next append. For a CPU drafter (no resident engine in the
+    /// cache) this is just the plain kv_cache rollback.
+    pub fn rollback_resident_to_position(&mut self, position: usize) -> Result<()> {
+        self.kv_cache.rollback_to_position(position)?;
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(mut guard) = self.resident_cache().lock() {
+                if let Some(slot) = guard.as_mut() {
+                    if slot.engine.filled() > position {
+                        slot.engine.set_filled(position);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the GPU-resident decode forward may run for this model+config: flag on, dense
     /// (no MoE), not distributed-sharded, all default diagnostic modes the kernel implements
     /// (Grouped GQA, 1/sqrt(head_dim) scale, gate*swish(up) order), every layer a plain Q8_0
