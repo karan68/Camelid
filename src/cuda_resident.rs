@@ -333,7 +333,9 @@ pub struct CudaResidentKernels {
 
 impl CudaResidentKernels {
     pub fn new() -> Result<Self, String> {
-        let ctx = CudaContext::new(0).map_err(|e| format!("CudaContext::new: {e}"))?;
+        let ordinal = crate::cuda::selected_device_ordinal();
+        let ctx =
+            CudaContext::new(ordinal).map_err(|e| format!("CudaContext::new({ordinal}): {e}"))?;
         let stream = ctx.default_stream();
         let opts = CompileOptions {
             fmad: Some(false),

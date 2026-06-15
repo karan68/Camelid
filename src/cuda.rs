@@ -79,6 +79,18 @@ pub fn device_name() -> Option<String> {
     detect_cuda_device().device_name
 }
 
+/// Which CUDA device every GPU path binds to. Defaults to device 0 — on this
+/// laptop the only CUDA device is the discrete NVIDIA RTX 3060 (the Intel iGPU
+/// is not CUDA-capable and is never enumerated here). Override with
+/// `CAMELID_CUDA_DEVICE=<index>` when a host genuinely has multiple NVIDIA GPUs
+/// and the discrete one is not index 0; the chosen index is logged at startup.
+pub fn selected_device_ordinal() -> usize {
+    std::env::var("CAMELID_CUDA_DEVICE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(feature = "cuda")]
 pub use backend::{
     detect_cuda_device, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
@@ -169,7 +181,7 @@ mod backend {
     use std::sync::{Mutex, OnceLock};
 
     use cudarc::driver::{
-        CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+        result, sys, CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
     };
     use cudarc::nvrtc::{CompileOptions, Ptx};
     use std::sync::Arc;
@@ -310,11 +322,32 @@ extern "C" __global__ void q8_0_block_linear_row(
     }
 
     fn init_backend() -> Result<CudaBackend, String> {
-        let ctx = CudaContext::new(0).map_err(|e| format!("CudaContext::new failed: {e}"))?;
+        let ordinal = super::selected_device_ordinal();
+        let ctx = CudaContext::new(ordinal)
+            .map_err(|e| format!("CudaContext::new({ordinal}) failed: {e}"))?;
+        // After CudaContext::new (which runs cuInit) the driver can report the
+        // device count.
+        let device_count = result::device::get_count().unwrap_or(0);
         let stream = ctx.default_stream();
         let device_name = ctx
             .name()
             .unwrap_or_else(|_| "unknown CUDA device".to_string());
+        // Log the exact device the GPU work binds to, so it is unambiguous which
+        // physical GPU runs inference (the Intel iGPU is not a CUDA device and can
+        // never appear here). Prints once, at first GPU init.
+        let cc_major = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+            .unwrap_or(0);
+        let cc_minor = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+            .unwrap_or(0);
+        let (vram_free, vram_total) = result::mem_get_info().unwrap_or((0, 0));
+        eprintln!(
+            "[cuda] selected device {ordinal} of {device_count}: \"{device_name}\" \
+             (compute capability {cc_major}.{cc_minor}) | VRAM {} MiB free / {} MiB total",
+            vram_free / (1024 * 1024),
+            vram_total / (1024 * 1024),
+        );
         let ptx: Ptx = cudarc::nvrtc::compile_ptx_with_opts(Q8_KERNEL_SRC, compile_options())
             .map_err(|e| format!("nvrtc compile failed: {e}"))?;
         let module = ctx

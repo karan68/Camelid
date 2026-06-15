@@ -2833,6 +2833,17 @@ fn log_acceleration_state() {
         metal_note = metal.note.as_deref().unwrap_or(""),
         "camelid acceleration state"
     );
+    // Probe CUDA at startup so the selected GPU (index, name, compute capability,
+    // VRAM) is logged at launch via cuda::init_backend, and surface availability
+    // here. A present CUDA device is always the discrete NVIDIA GPU — the Intel
+    // iGPU is not CUDA-capable and is never enumerated.
+    let cuda = camelid::cuda::detect_cuda_device();
+    tracing::info!(
+        cuda_available = cuda.available,
+        cuda_device = cuda.device_name.as_deref().unwrap_or("none"),
+        cuda_reason = cuda.reason.as_deref().unwrap_or(""),
+        "camelid cuda state"
+    );
 }
 
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
