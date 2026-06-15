@@ -9509,8 +9509,15 @@ fn build_resident_cuda_engine(
             .map(|b| b.len() as u64)
             .unwrap_or(0);
     // Scratch reserve: logits row (vocab·f32) + per-stage activation buffers + a flat
-    // safety margin for driver/context overhead and fragmentation.
-    let headroom = (vocab as u64 * 4) + (512 * 1024 * 1024);
+    // safety margin for driver/context overhead and fragmentation. The flat margin is
+    // env-overridable (CAMELID_CUDA_RESIDENT_HEADROOM_MB) so a second engine can be
+    // packed onto a small card — e.g. drafter + target for speculative decode, where
+    // the default 512 MiB per engine would not leave room for both.
+    let headroom_mb = std::env::var("CAMELID_CUDA_RESIDENT_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(512);
+    let headroom = (vocab as u64 * 4) + (headroom_mb * 1024 * 1024);
     let cap = match crate::cuda::probe_capability().map(|c| c.vram_free_bytes) {
         Some(free) if kv_bytes_per_pos > 0 => {
             let budget = free.saturating_sub(weights_bytes).saturating_sub(headroom);
