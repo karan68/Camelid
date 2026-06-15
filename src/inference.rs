@@ -9518,33 +9518,116 @@ fn build_resident_cuda_engine(
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(512);
     let headroom = (vocab as u64 * 4) + (headroom_mb * 1024 * 1024);
-    let cap = match crate::cuda::probe_capability().map(|c| c.vram_free_bytes) {
-        Some(free) if kv_bytes_per_pos > 0 => {
-            let budget = free.saturating_sub(weights_bytes).saturating_sub(headroom);
-            let vram_positions = (budget / kv_bytes_per_pos) as usize;
-            let chosen = kv_cap.min(vram_positions);
-            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-                eprintln!(
-                    "[resident-cuda] VRAM sizing: free {} MiB, weights {} MiB, headroom {} MiB, kv {} B/pos -> fits {} pos, requested {} -> cap {}",
-                    free / (1024 * 1024),
-                    weights_bytes / (1024 * 1024),
-                    headroom / (1024 * 1024),
-                    kv_bytes_per_pos,
-                    vram_positions,
-                    kv_cap,
-                    chosen,
-                );
-            }
-            chosen
+    let free_vram = crate::cuda::probe_capability()
+        .map(|c| c.vram_free_bytes)
+        .unwrap_or(0);
+
+    // Per-layer resident weight bytes (raw Q8_0 layout, same unit as `weights_bytes`),
+    // for the offload split decision. Index i is layer `range.start + i`.
+    let per_layer_bytes: Vec<u64> = weights.layers[range.clone()]
+        .iter()
+        .map(|l| {
+            [
+                &l.attention_q,
+                &l.attention_k,
+                &l.attention_v,
+                &l.attention_output,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
+            ]
+            .iter()
+            .filter_map(|t| raw(t).map(|b| b.len() as u64))
+            .sum()
+        })
+        .collect();
+    let per_layer_max = per_layer_bytes.iter().copied().max().unwrap_or(0);
+    // Streaming scratch buffers reserved when offloading (matches
+    // enable_offload_scratch's CAMELID_OFFLOAD_BUFFERS, default 2).
+    let n_buffers = std::env::var("CAMELID_OFFLOAD_BUFFERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(2) as u64;
+    let min_kv = kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
+
+    // Layer-offload split. CAMELID_OFFLOAD_FORCE_LAYERS=N forces the last N layers to
+    // host RAM (test/override hook, fires even on a model that fits). Otherwise the
+    // split is AUTOMATIC: when all weights + a minimum KV cache + headroom cannot fit
+    // in free VRAM, offload the fewest TRAILING layers needed so the rest fit. Each
+    // offloaded layer streams its weights to a GPU scratch buffer every forward — a
+    // capacity tradeoff, token-identical to the all-resident path.
+    let force_offload = std::env::var("CAMELID_OFFLOAD_FORCE_LAYERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(n_layers);
+    let (offload_count, offload_source) = if force_offload > 0 {
+        (force_offload, "forced")
+    } else if free_vram > 0 && weights_bytes + headroom + min_kv > free_vram {
+        // Reserve KV(min) + headroom + scratch; offload trailing layers until the
+        // resident weights fit the remainder.
+        let scratch = per_layer_max * n_buffers;
+        let budget = free_vram
+            .saturating_sub(headroom)
+            .saturating_sub(min_kv)
+            .saturating_sub(scratch);
+        let mut resident_w = weights_bytes;
+        let mut k = 0usize;
+        let mut i = per_layer_bytes.len();
+        while resident_w > budget && i > 0 {
+            i -= 1;
+            resident_w -= per_layer_bytes[i];
+            k += 1;
         }
+        (k, "auto")
+    } else {
+        (0, "none")
+    };
+    let n_resident_layers = n_layers - offload_count;
+
+    // VRAM left for the KV cache after the RESIDENT weights and (if offloading) the
+    // streaming scratch — so freed weight VRAM grows the resident context.
+    let offloaded_bytes: u64 = per_layer_bytes[n_resident_layers..].iter().sum();
+    let resident_weights_bytes = weights_bytes.saturating_sub(offloaded_bytes);
+    let scratch_reserve = if offload_count > 0 {
+        per_layer_max * n_buffers
+    } else {
+        0
+    };
+    let cap = if free_vram > 0 && kv_bytes_per_pos > 0 {
+        let budget = free_vram
+            .saturating_sub(resident_weights_bytes)
+            .saturating_sub(headroom)
+            .saturating_sub(scratch_reserve);
+        let vram_positions = (budget / kv_bytes_per_pos) as usize;
+        let chosen = kv_cap.min(vram_positions);
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cuda] VRAM sizing: free {} MiB, weights {} MiB (resident {} MiB; {}/{} layers offloaded; scratch {} MiB), headroom {} MiB, kv {} B/pos -> fits {} pos, requested {} -> cap {}",
+                free_vram / (1024 * 1024),
+                weights_bytes / (1024 * 1024),
+                resident_weights_bytes / (1024 * 1024),
+                offload_count,
+                n_layers,
+                scratch_reserve / (1024 * 1024),
+                headroom / (1024 * 1024),
+                kv_bytes_per_pos,
+                vram_positions,
+                kv_cap,
+                chosen,
+            );
+        }
+        chosen
+    } else {
         // Could not probe free VRAM: trust the requested cap (the engine's own
         // allocation will fail and fall back if it genuinely does not fit).
-        _ => kv_cap,
+        kv_cap
     };
     if cap < MIN_RESIDENT_CONTEXT {
         if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
             eprintln!(
-                "[resident-cuda] VRAM too small for resident decode (cap {cap} < {MIN_RESIDENT_CONTEXT}); using CPU path"
+                "[resident-cuda] VRAM too small for resident decode even with {offload_count}/{n_layers} layers offloaded (cap {cap} < {MIN_RESIDENT_CONTEXT}); using CPU path"
             );
         }
         return None;
@@ -9553,17 +9636,6 @@ fn build_resident_cuda_engine(
         n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
     )
     .ok()?;
-    // Layer offloading (Phase 2): CAMELID_OFFLOAD_FORCE_LAYERS=N forces the last N
-    // layers onto host RAM (their weights stream to a GPU scratch buffer each
-    // forward), exercising the offload path even on a model that fits. The math is
-    // unchanged, so token output is identical to the all-resident path. The
-    // automatic VRAM-driven split is wired on top of this in a later step.
-    let force_offload = std::env::var("CAMELID_OFFLOAD_FORCE_LAYERS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(n_layers);
-    let n_resident_layers = n_layers - force_offload;
     for (idx, l) in weights.layers[range].iter().enumerate() {
         let (q, k, v, o, gate, up, down) = match (
             raw(&l.attention_q),
@@ -9596,14 +9668,11 @@ fn build_resident_cuda_engine(
     }
     // Honest run labeling (Phase 4): record the offload split and print a one-line
     // load banner so a capacity-mode (offloaded) run never reads like a native one.
-    let free_vram = crate::cuda::probe_capability()
-        .map(|c| c.vram_free_bytes)
-        .unwrap_or(0);
-    let status = if force_offload > 0 {
+    let status = if offload_count > 0 {
         engine.enable_offload_scratch().ok()?;
         // Probe the copy-stream peak once so the banner/record carries a real PCIe
         // number (a one-time ~0.5 s build cost; this run is already paying for offload).
-        let (per_layer_bytes, pcie_gbps) = match engine.probe_offload_pcie(50) {
+        let (streamed_bytes, pcie_gbps) = match engine.probe_offload_pcie(50) {
             Some((bytes, gibs)) => (bytes as u64, Some(gibs * 1.073_741_824)),
             None => (0, None),
         };
@@ -9611,7 +9680,7 @@ fn build_resident_cuda_engine(
             if let Some(g) = pcie_gbps {
                 eprintln!(
                     "[offload] PCIe probe: {} MiB/transfer, copy-stream peak {:.2} GB/s over 50 back-to-back transfers (no compute)",
-                    per_layer_bytes / (1024 * 1024),
+                    streamed_bytes / (1024 * 1024),
                     g,
                 );
             }
@@ -9619,11 +9688,11 @@ fn build_resident_cuda_engine(
         crate::offload::OffloadRunStatus {
             total_layers: n_layers,
             layers_resident: n_resident_layers,
-            layers_offloaded: force_offload,
-            per_layer_bytes,
+            layers_offloaded: offload_count,
+            per_layer_bytes: streamed_bytes,
             free_vram_bytes: free_vram,
             pcie_gbps,
-            source: "forced",
+            source: offload_source,
         }
     } else {
         crate::offload::OffloadRunStatus::resident(n_layers, free_vram)
