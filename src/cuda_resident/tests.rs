@@ -363,7 +363,8 @@ fn rms_norm_matches_cpu() {
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: block * 4,
+        // Stages the full row in shared for the in-order sum (matches launch_rmsnorm).
+        shared_mem_bytes: (n as u32) * 4,
     };
     let n_i = n as i32;
     let mut b = k.stream.launch_builder(&k.rms_norm);

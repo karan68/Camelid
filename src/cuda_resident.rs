@@ -91,22 +91,28 @@ extern "C" __global__ void rms_norm_f32(
     const float* __restrict__ x, const float* __restrict__ weight,
     float* __restrict__ out, int n, float eps
 ) {
-    // Serial sum-of-squares in thread 0 (i = 0,1,2,...) to match the CPU
-    // reference's reduction order. A parallel tree reduction reassociates the sum
-    // and was measured to change the greedy token output on real prompts (a
-    // parity regression), so it is kept serial. The per-element apply is parallel
-    // and order-independent.
+    // The sum-of-squares must stay in CPU order (i = 0,1,2,...): a parallel tree
+    // reduction reassociates it and was measured to change greedy tokens (a parity
+    // regression). But running that serial scan in one thread off global memory
+    // left 255 threads idle and the SM stalled on load latency (~31us). Instead all
+    // threads cooperatively stage the row into shared memory (coalesced), then
+    // thread 0 sums it in order from on-chip shared (~few us) -- identical
+    // arithmetic, identical order, just no global-latency stall. The per-element
+    // apply is parallel and order-independent.
+    extern __shared__ float xs[]; // n floats
     __shared__ float s_scale;
     int tid = threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
     if (tid == 0) {
         float sum = 0.0f;
-        for (int i = 0; i < n; i++) sum += x[i] * x[i];
+        for (int i = 0; i < n; i++) sum += xs[i] * xs[i];
         float mean_sq = sum / (float)n;
         s_scale = 1.0f / sqrtf(mean_sq + eps);
     }
     __syncthreads();
     float scale = s_scale;
-    for (int i = tid; i < n; i += blockDim.x) out[i] = x[i] * scale * weight[i];
+    for (int i = tid; i < n; i += blockDim.x) out[i] = xs[i] * scale * weight[i];
 }
 
 // ---- Quantize f32 row to Q8_0 blocks (matches quantize_q8_0_block) ---------
@@ -462,7 +468,8 @@ fn launch_rmsnorm(
     let cfg = LaunchConfig {
         grid_dim: (1, 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: block * 4,
+        // Stage the whole n-element row in shared memory for the in-order sum.
+        shared_mem_bytes: (n as u32) * 4,
     };
     let n_i = n as i32;
     let mut b = s.launch_builder(f);
