@@ -167,6 +167,51 @@ fn ensure_cuda_runtime_on_path() {
 #[cfg(not(all(windows, feature = "cuda")))]
 fn ensure_cuda_runtime_on_path() {}
 
+// Optimus / Enduro hint variables, exported from the exe via build.rs. A laptop's
+// hybrid-graphics driver reads these at process start and routes the process to
+// the discrete NVIDIA / AMD GPU rather than the integrated Intel one. Without this
+// Windows assigns the process to the iGPU by default, so Task Manager shows the
+// Intel GPU "busy" even though CUDA compute runs (and can only run) on the NVIDIA
+// card — the source of the "it's on Intel" confusion.
+#[cfg(windows)]
+#[no_mangle]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(windows)]
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
+/// Tell Windows to run this executable on the high-performance (discrete NVIDIA)
+/// GPU — the same setting as Settings → System → Display → Graphics → set the app
+/// to "High performance". Writing it (HKCU, no admin needed) makes Windows and
+/// Task Manager attribute the app to the NVIDIA GPU instead of the integrated
+/// Intel one. Idempotent and best-effort; failures are ignored.
+#[cfg(windows)]
+fn pin_to_high_performance_gpu() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.to_string_lossy().to_string();
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences",
+            "/v",
+            &exe,
+            "/t",
+            "REG_SZ",
+            "/d",
+            "GpuPreference=2;",
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn pin_to_high_performance_gpu() {}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the local HTTP API server.
@@ -649,6 +694,7 @@ async fn main() -> anyhow::Result<()> {
     // Make the GPU runtime discoverable before anything probes for a device, so
     // the shipped app needs no PATH setup (no-op off Windows / without CUDA).
     ensure_cuda_runtime_on_path();
+    pin_to_high_performance_gpu();
 
     // No subcommand (a bare double-click of the exe) launches the open-and-use app.
     let command = Cli::parse().command.unwrap_or_else(default_launch_command);
