@@ -1188,6 +1188,41 @@ impl CudaResidentDecode {
         self.k.ctx.synchronize().map_err(map)?;
         Ok(logits)
     }
+
+    /// GPU prefill of `n` prompt tokens. Each token's forward runs at its own
+    /// position (writing its KV); because position i's attention reads the cache
+    /// over `[0, i]` only, the sequence of single-token forwards IS the causal
+    /// prefill — no separate batched kernels needed. All `n` forwards are enqueued
+    /// on the stream back to back with a single device sync at the end (no logits,
+    /// no per-token sync), so the whole prompt is processed in one GPU burst
+    /// instead of on the CPU. `embeddings` is `n * hidden` f32; `cos_all`/`sin_all`
+    /// are the per-position RoPE tables flattened (`n * rope_dim/2`). Leaves the
+    /// GPU KV cache holding positions `0..n`.
+    pub fn prefill(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        n: usize,
+        scale: f32,
+    ) -> Result<(), String> {
+        let half = self.rope_dim / 2;
+        let hidden = self.hidden;
+        if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
+            return Err("prefill: input slices too short".into());
+        }
+        for i in 0..n {
+            let emb = &embeddings[i * hidden..(i + 1) * hidden];
+            let cos = &cos_all[i * half..(i + 1) * half];
+            let sin = &sin_all[i * half..(i + 1) * half];
+            self.forward_pass(emb, cos, sin, i, scale, false)?;
+        }
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|e| format!("cuda prefill sync: {e}"))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

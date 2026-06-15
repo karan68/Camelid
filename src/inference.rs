@@ -1717,6 +1717,13 @@ impl LlamaInferenceSession {
         if self.resident_paths_disabled {
             return Ok(false);
         }
+        // CUDA: run the whole prompt on the GPU resident engine (default on when a
+        // device is present), eliminating the CPU prefill / TTFT. The Metal seam
+        // below is unchanged.
+        #[cfg(feature = "cuda")]
+        if resident_decode_cuda_enabled() {
+            return self.try_resident_prefill_cuda(token_ids);
+        }
         if std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
             .unwrap_or(true)
@@ -1825,6 +1832,116 @@ impl LlamaInferenceSession {
         Ok(true)
     }
 
+    /// CUDA GPU prefill: run the whole prompt through the resident engine on the
+    /// NVIDIA device (one forward per token, KV built incrementally, a single sync
+    /// at the end), then leave the global engine ready at `position = n` so the
+    /// last prompt token decodes straight into the first generated token. Replaces
+    /// the CPU prefill — the main time-to-first-token cost. Returns `false` to fall
+    /// back to the CPU prefill for any unsupported config.
+    #[cfg(feature = "cuda")]
+    fn try_resident_prefill_cuda(&mut self, token_ids: &[u32]) -> Result<bool> {
+        if self.resident_paths_disabled
+            || token_ids.len() < 2
+            || token_ids.len() > 16384
+            || self.kv_cache.position != 0
+            || self.weights.layer_range.is_some()
+            || !self.resident_decode_eligible(false)?
+        {
+            return Ok(false);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_layers = dims.block_count;
+        let n_heads = self.config.attention_head_count as usize;
+        let n_kv = dims.attention_head_count_kv;
+        let head_dim = dims.head_dim;
+        let hidden = dims.embedding_length;
+        let ffn_dim = dims.feed_forward_length;
+        let vocab = dims.vocab_size;
+        let n = token_ids.len();
+        const RESIDENT_DECODE_CUDA_MAX_CONTEXT: usize = 8192;
+        let kv_cap = (self.config.context_length as usize)
+            .min(self.kv_cache.plan.max_sequence_length)
+            .min(RESIDENT_DECODE_CUDA_MAX_CONTEXT);
+        if n >= kv_cap {
+            return Ok(false);
+        }
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let rope_dim = self
+            .config
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let tables = match rope::resident_prefill_rope_tables(
+            n,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+        // The CUDA RoPE kernel implements adjacent-even-odd pairing only.
+        if tables.split_half_pairing {
+            return Ok(false);
+        }
+        let embeddings = weights
+            .token_embedding
+            .embedding_lookup(token_ids, "token_embedding_resident_prefill_cuda")?;
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        let started = std::time::Instant::now();
+
+        let key = Arc::as_ptr(&weights) as *const () as usize;
+        let cache = resident_cuda_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let need_build = guard
+            .as_ref()
+            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+        if need_build {
+            match build_resident_cuda_engine(
+                &weights,
+                0..n_layers,
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn_dim,
+                rope_dim,
+                kv_cap,
+                vocab,
+                rms_eps,
+            ) {
+                Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
+                None => return Ok(false),
+            }
+        }
+        let slot = guard.as_mut().expect("resident CUDA engine built above");
+        if slot
+            .engine
+            .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+            .is_err()
+        {
+            // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
+            // decode path rebuilds/reseeds rather than trusting it.
+            slot.engine.set_filled(0);
+            return Ok(false);
+        }
+        slot.engine.set_filled(n);
+        drop(guard);
+        self.kv_cache.position = n;
+        if trace {
+            eprintln!(
+                "[resident-cuda] GPU prefill {n} tokens in {} ms",
+                started.elapsed().as_millis()
+            );
+        }
+        Ok(true)
+    }
+
     /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
     /// success (the caller applies the existing final norm + output projection), or None to fall
     /// back to the CPU layer loop (ineligible config, unsupported RoPE, or Metal unavailable).
@@ -1912,7 +2029,6 @@ impl LlamaInferenceSession {
         compute_logits: bool,
         gpu_sample_token: Option<u32>,
     ) -> Result<Option<ResidentForward>> {
-        use crate::cuda_resident::CudaResidentDecode;
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
         }
@@ -1990,11 +2106,6 @@ impl LlamaInferenceSession {
             .map(|v| v as usize)
             .unwrap_or(head_dim);
 
-        // Raw 36-byte Q8_0 block bytes for upload; wire-page (34-byte mmap) tensors fall back.
-        fn raw(t: &CpuTensor) -> Option<&[u8]> {
-            t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
-        }
-
         let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
         // The resident engine (compiled kernels + uploaded weights + GPU KV cache)
         // lives in a process-global cache, not the session: the API server clones a
@@ -2016,66 +2127,28 @@ impl LlamaInferenceSession {
             .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
         let build_started = std::time::Instant::now();
         if need_build {
-            let mut engine = match CudaResidentDecode::new(
-                n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, kv_cap, vocab,
+            match build_resident_cuda_engine(
+                &weights,
+                range.clone(),
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn_dim,
+                rope_dim,
+                kv_cap,
+                vocab,
                 rms_eps,
             ) {
-                Ok(e) => e,
-                Err(e) => {
+                Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
+                None => {
                     if trace {
-                        eprintln!("[resident-cuda] engine new failed: {e}");
+                        eprintln!("[resident-cuda] engine build failed (unsupported weights?)");
                     }
                     return Ok(None);
                 }
-            };
-            for l in &weights.layers[range.clone()] {
-                let (q, k, v, o, gate, up, down) = match (
-                    raw(&l.attention_q),
-                    raw(&l.attention_k),
-                    raw(&l.attention_v),
-                    raw(&l.attention_output),
-                    raw(&l.ffn_gate),
-                    raw(&l.ffn_up),
-                    raw(&l.ffn_down),
-                ) {
-                    (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) => {
-                        (q, k, v, o, g, u, d)
-                    }
-                    _ => {
-                        if trace {
-                            eprintln!("[resident-cuda] layer weight not q8_0_blocks (wire-page mmap?); falling back");
-                        }
-                        return Ok(None);
-                    }
-                };
-                if engine
-                    .set_layer(
-                        q,
-                        k,
-                        v,
-                        o,
-                        gate,
-                        up,
-                        down,
-                        &l.attention_norm.data,
-                        &l.ffn_norm.data,
-                    )
-                    .is_err()
-                {
-                    return Ok(None);
-                }
             }
-            let out_blocks = match raw(weights.output_projection()) {
-                Some(b) => b,
-                None => return Ok(None),
-            };
-            if engine
-                .set_output(&weights.output_norm.data, out_blocks)
-                .is_err()
-            {
-                return Ok(None);
-            }
-            *guard = Some(ResidentCudaSlot { key, engine });
             if trace {
                 eprintln!(
                     "[resident-cuda] built engine (weights uploaded) in {} ms",
@@ -8977,6 +9050,69 @@ fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> 
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate
+/// the GPU KV cache, and upload every layer's Q8_0 weights (repacked to SoA) plus
+/// the output stage. Returns `None` for any unsupported tensor (e.g. wire-page
+/// mmap weights that aren't RAM-resident blocks), so the caller falls back.
+/// Shared by the decode and prefill seams so weight upload lives in one place.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn build_resident_cuda_engine(
+    weights: &LlamaLoadedWeights,
+    range: std::ops::Range<usize>,
+    n_layers: usize,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn_dim: usize,
+    rope_dim: usize,
+    kv_cap: usize,
+    vocab: usize,
+    rms_eps: f32,
+) -> Option<crate::cuda_resident::CudaResidentDecode> {
+    fn raw(t: &CpuTensor) -> Option<&[u8]> {
+        t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
+    }
+    let mut engine = crate::cuda_resident::CudaResidentDecode::new(
+        n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, kv_cap, vocab, rms_eps,
+    )
+    .ok()?;
+    for l in &weights.layers[range] {
+        let (q, k, v, o, gate, up, down) = match (
+            raw(&l.attention_q),
+            raw(&l.attention_k),
+            raw(&l.attention_v),
+            raw(&l.attention_output),
+            raw(&l.ffn_gate),
+            raw(&l.ffn_up),
+            raw(&l.ffn_down),
+        ) {
+            (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) => {
+                (q, k, v, o, g, u, d)
+            }
+            _ => return None,
+        };
+        engine
+            .set_layer(
+                q,
+                k,
+                v,
+                o,
+                gate,
+                up,
+                down,
+                &l.attention_norm.data,
+                &l.ffn_norm.data,
+            )
+            .ok()?;
+    }
+    engine
+        .set_output(&weights.output_norm.data, raw(weights.output_projection())?)
+        .ok()?;
+    Some(engine)
 }
 
 /// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On
