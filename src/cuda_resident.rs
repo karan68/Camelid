@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaStream};
 use cudarc::nvrtc::{CompileOptions, Ptx};
 
 /// CUDA C source for every resident-decode kernel. Compiled once via NVRTC with
@@ -290,8 +290,9 @@ extern "C" __global__ void rope_rotate(
 // cache layout [kv_head][position][head_dim].
 extern "C" __global__ void kv_scatter(
     const float* __restrict__ src, float* __restrict__ cache,
-    int position, int n_kv_heads, int head_dim, int max_pos
+    const int* __restrict__ position_ptr, int n_kv_heads, int head_dim, int max_pos
 ) {
+    int position = position_ptr[0];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n_kv_heads * head_dim) return;
     int kv_head = idx / head_dim;
@@ -305,8 +306,11 @@ extern "C" __global__ void kv_scatter(
 extern "C" __global__ void attention_decode(
     const float* __restrict__ q, const float* __restrict__ cache_k,
     const float* __restrict__ cache_v, float* __restrict__ out,
-    int n_heads, int n_kv_heads, int head_dim, int position_count, int max_pos, float scale
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale
 ) {
+    // position_count = current position + 1 (keys [0..=position] including this token).
+    int position_count = position_ptr[0] + 1;
     int head = blockIdx.x;
     if (head >= n_heads) return;
     int repeats = n_heads / n_kv_heads;
@@ -1007,7 +1011,7 @@ fn launch_kv_scatter(
     f: &CudaFunction,
     src: &CudaSlice<f32>,
     cache: &mut CudaSlice<f32>,
-    position: usize,
+    position: &CudaSlice<i32>,
     n_kv_heads: usize,
     head_dim: usize,
     max_pos: usize,
@@ -1018,14 +1022,14 @@ fn launch_kv_scatter(
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
-    let (p, nkv, hd, mp) = (
-        position as i32,
-        n_kv_heads as i32,
-        head_dim as i32,
-        max_pos as i32,
-    );
+    let (nkv, hd, mp) = (n_kv_heads as i32, head_dim as i32, max_pos as i32);
     let mut b = s.launch_builder(f);
-    b.arg(src).arg(cache).arg(&p).arg(&nkv).arg(&hd).arg(&mp);
+    b.arg(src)
+        .arg(cache)
+        .arg(position)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&mp);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -1040,20 +1044,23 @@ fn launch_attention(
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
-    position_count: usize,
+    position: &CudaSlice<i32>,
+    // Positions to size the shared `scores[]` array for. The non-graph path passes
+    // the exact current count (tight, best occupancy); the graph-capture path passes
+    // `max_pos` so the captured launch config holds for every replayed position.
+    shared_positions: usize,
     max_pos: usize,
     scale: f32,
 ) -> Result<(), cudarc::driver::DriverError> {
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (64, 1, 1),
-        shared_mem_bytes: ((head_dim + position_count) * 4) as u32,
+        shared_mem_bytes: ((head_dim + shared_positions) * 4) as u32,
     };
-    let (nh, nkv, hd, pc, mp) = (
+    let (nh, nkv, hd, mp) = (
         n_heads as i32,
         n_kv_heads as i32,
         head_dim as i32,
-        position_count as i32,
         max_pos as i32,
     );
     let mut b = s.launch_builder(f);
@@ -1064,7 +1071,7 @@ fn launch_attention(
         .arg(&nh)
         .arg(&nkv)
         .arg(&hd)
-        .arg(&pc)
+        .arg(position)
         .arg(&mp)
         .arg(&scale);
     unsafe { b.launch(cfg) }.map(|_| ())
@@ -1165,6 +1172,16 @@ struct ResidentLayer {
     ffn_norm: CudaSlice<f32>,
 }
 
+/// A captured CUDA graph, wrapped to be `Send`. cudarc does not mark `CudaGraph`
+/// Send because graphs are not internally synchronized; the resident engine is only
+/// ever accessed under the process-global resident-cache `Mutex`, which serializes
+/// all use, so moving the graph across threads with the engine is sound (the same
+/// justification the rest of the engine's cudarc handles rely on). Every `launch`
+/// binds the context to the calling thread first.
+struct SendCudaGraph(CudaGraph);
+// SAFETY: see the type doc — all access is serialized behind the resident-cache Mutex.
+unsafe impl Send for SendCudaGraph {}
+
 /// GPU-resident Llama decode engine. Weights and KV cache live on the GPU; one
 /// `forward_token` call runs the whole per-token forward with a single sync.
 pub struct CudaResidentDecode {
@@ -1206,6 +1223,18 @@ pub struct CudaResidentDecode {
     d_sampled: CudaSlice<u32>,
     d_cos: CudaSlice<f32>,
     d_sin: CudaSlice<f32>,
+    /// Current decode position, held on the device so `kv_scatter` / `attention`
+    /// read it from memory rather than a launch-time scalar. This is what lets the
+    /// per-token kernel chain be captured once into a CUDA graph and replayed: the
+    /// graph's kernel args are frozen, so the only thing that varies per token
+    /// (position, embedding, RoPE) must arrive through device buffers it reads.
+    d_position: CudaSlice<i32>,
+    /// Captured CUDA graph of the greedy decode forward (layer stack + output proj +
+    /// argmax). Recorded once, then replayed per token with one `launch()` instead of
+    /// ~600 individual kernel launches. The per-token inputs (embedding / RoPE /
+    /// position) are written to device buffers BEFORE replay, so the frozen graph
+    /// reads fresh values each step. Captured at the engine's `eps`/`scale`/`max_pos`.
+    decode_graph: Option<SendCudaGraph>,
     /// Lazily-allocated K-batched scratch for the speculative-verify forward.
     verify_scratch: Option<VerifyScratch>,
 }
@@ -1233,6 +1262,21 @@ struct VerifyScratch {
     vsamp: CudaSlice<u32>,
     vcos: CudaSlice<f32>,
     vsin: CudaSlice<f32>,
+}
+
+/// Whether greedy decode replays a captured CUDA graph. **Default off**: measured on
+/// an RTX 3060, single-token decode is GPU-bandwidth-bound (the dominant q8_gemv runs
+/// at ~76% of peak DRAM), so the ~600 per-token kernel launches enqueue *ahead* of the
+/// GPU and their host overhead is already hidden — replaying them as one graph saved
+/// nothing and cost a small fixed overhead (3B 53.2→52.5, TinyLlama 129→124 tok/s),
+/// at identical tokens. The path is kept (correct + parity-clean) because it pays off
+/// where decode becomes launch-bound: a much faster GPU, or after kernel fusion cuts
+/// GPU time below the launch cost. Opt in with `CAMELID_CUDA_GRAPHS=1`.
+fn cuda_graphs_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_CUDA_GRAPHS").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
 }
 
 impl CudaResidentDecode {
@@ -1300,6 +1344,8 @@ impl CudaResidentDecode {
             d_sampled: s.alloc_zeros::<u32>(1).map_err(|e| format!("alloc: {e}"))?,
             d_cos: alloc_f(rope_dim / 2)?,
             d_sin: alloc_f(rope_dim / 2)?,
+            d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
+            decode_graph: None,
             verify_scratch: None,
             k,
         })
@@ -1361,6 +1407,13 @@ impl CudaResidentDecode {
         self.filled = filled;
     }
 
+    /// Resident KV capacity (positions) this engine was built for. Sized from free
+    /// VRAM at build time, so it is the authoritative cap the decode/prefill seams
+    /// guard against (a position at or beyond it falls back to the CPU path).
+    pub fn max_pos(&self) -> usize {
+        self.max_pos
+    }
+
     /// Seed one layer's KV cache from CPU history. `ck`/`cv` hold positions
     /// `[0, position)` laid out `[kv_head][position'][head_dim]` (stride
     /// `position`); they are written into the existing GPU cache buffers (stride
@@ -1399,6 +1452,40 @@ impl CudaResidentDecode {
         Ok(())
     }
 
+    /// Read back the stored K and V for `layer`, positions `[0, n_positions)`, all KV
+    /// heads, into `[head][position][head_dim]` host order. Used to make the CPU-side
+    /// KV cache authoritative after a GPU prefill so any later CPU-path forward
+    /// (diagnostics, fallback) reads the same history the GPU holds.
+    pub fn read_kv_layer(
+        &self,
+        layer: usize,
+        n_positions: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), String> {
+        let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
+        let s = self.k.stream.clone();
+        let span = n_positions * hd;
+        let mut k_out = vec![0f32; n_kv * span];
+        let mut v_out = vec![0f32; n_kv * span];
+        for h in 0..n_kv {
+            let gsrc = h * max_pos * hd;
+            s.memcpy_dtoh(
+                &self.cache_k[layer].slice(gsrc..gsrc + span),
+                &mut k_out[h * span..(h + 1) * span],
+            )
+            .map_err(|e| format!("read_kv_layer K dtoh: {e}"))?;
+            s.memcpy_dtoh(
+                &self.cache_v[layer].slice(gsrc..gsrc + span),
+                &mut v_out[h * span..(h + 1) * span],
+            )
+            .map_err(|e| format!("read_kv_layer V dtoh: {e}"))?;
+        }
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|e| format!("read_kv_layer sync: {e}"))?;
+        Ok((k_out, v_out))
+    }
+
     /// Run one decode step on the GPU. `embedding` is the current token's f32
     /// embedding; `cos`/`sin` are the per-pair RoPE tables for `position`;
     /// `scale` = 1/sqrt(head_dim). With `compute_logits`, also runs the final
@@ -1417,17 +1504,32 @@ impl CudaResidentDecode {
         position: usize,
         scale: f32,
         compute_logits: bool,
+        // When true the kernel chain is being recorded into a CUDA graph: the
+        // per-token inputs are NOT uploaded here (the replay does that just before
+        // launch) and attention's shared `scores[]` is sized to `max_pos` so the
+        // captured launch config holds for every replayed position.
+        graph_capture: bool,
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
         let hb = self.hidden / 32; // hidden blocks
         let fb = self.ffn_dim / 32; // ffn blocks
         let qb = self.q_width / 32; // q_width blocks
-        let pos_count = position + 1;
+        let attn_shared = if graph_capture {
+            self.max_pos
+        } else {
+            position + 1
+        };
 
-        s.memcpy_htod(embedding, &mut self.d_hidden).map_err(map)?;
-        s.memcpy_htod(cos, &mut self.d_cos).map_err(map)?;
-        s.memcpy_htod(sin, &mut self.d_sin).map_err(map)?;
+        if !graph_capture {
+            s.memcpy_htod(embedding, &mut self.d_hidden).map_err(map)?;
+            s.memcpy_htod(cos, &mut self.d_cos).map_err(map)?;
+            s.memcpy_htod(sin, &mut self.d_sin).map_err(map)?;
+            // Publish the position on the device so kv_scatter/attention read it from
+            // memory (graph-replayable) rather than as a frozen launch scalar.
+            s.memcpy_htod(&[position as i32], &mut self.d_position)
+                .map_err(map)?;
+        }
 
         for li in 0..self.n_layers {
             // attention norm + quantize
@@ -1513,7 +1615,7 @@ impl CudaResidentDecode {
                 &self.k.kv_scatter,
                 &self.d_k,
                 &mut self.cache_k[li],
-                position,
+                &self.d_position,
                 self.n_kv_heads,
                 self.head_dim,
                 self.max_pos,
@@ -1524,7 +1626,7 @@ impl CudaResidentDecode {
                 &self.k.kv_scatter,
                 &self.d_v,
                 &mut self.cache_v[li],
-                position,
+                &self.d_position,
                 self.n_kv_heads,
                 self.head_dim,
                 self.max_pos,
@@ -1541,7 +1643,8 @@ impl CudaResidentDecode {
                 self.n_heads,
                 self.n_kv_heads,
                 self.head_dim,
-                pos_count,
+                &self.d_position,
+                attn_shared,
                 self.max_pos,
                 scale,
             )
@@ -1707,11 +1810,20 @@ impl CudaResidentDecode {
     ) -> Result<Option<u32>, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
-        self.forward_pass(embedding, cos, sin, position, scale, compute_logits)?;
         if !compute_logits {
+            self.forward_pass(embedding, cos, sin, position, scale, false, false)?;
             self.k.ctx.synchronize().map_err(map)?;
             return Ok(None);
         }
+        // Greedy decode: replay the captured CUDA graph when enabled (one launch for
+        // the whole ~600-kernel token), else the per-launch path. Both are byte-exact:
+        // the graph records the identical kernels reading the same device buffers.
+        if cuda_graphs_enabled() {
+            return self
+                .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
+                .map(Some);
+        }
+        self.forward_pass(embedding, cos, sin, position, scale, true, false)?;
         launch_argmax(
             &s,
             &self.k.argmax,
@@ -1724,6 +1836,76 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(Some(out[0]))
+    }
+
+    /// Greedy decode via CUDA graph: upload this token's inputs to device buffers,
+    /// then replay the captured forward (lazily recorded on the first call). One
+    /// `graph.launch()` replaces the ~600 individual kernel launches, cutting the
+    /// host-side launch overhead the profiler flagged. Byte-identical to the
+    /// per-launch path: the same kernels read the same buffers; only `position`,
+    /// the embedding, and the RoPE tables change, and those arrive through the
+    /// device buffers the graph reads.
+    fn forward_token_greedy_graphed(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+    ) -> Result<u32, String> {
+        use cudarc::driver::sys;
+        let map = |e: cudarc::driver::DriverError| format!("cuda graph: {e}");
+        let s = self.k.stream.clone();
+        // Per-token inputs live in device buffers the (frozen) graph reads on replay.
+        s.memcpy_htod(embedding, &mut self.d_hidden).map_err(map)?;
+        s.memcpy_htod(cos, &mut self.d_cos).map_err(map)?;
+        s.memcpy_htod(sin, &mut self.d_sin).map_err(map)?;
+        s.memcpy_htod(&[position as i32], &mut self.d_position)
+            .map_err(map)?;
+
+        if self.decode_graph.is_none() {
+            // Record the greedy forward (layer stack + output projection + argmax)
+            // once. Stream capture records without executing, so this does not write
+            // KV; the first real execution is the `launch()` below.
+            s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(map)?;
+            let recorded = (|| -> Result<(), String> {
+                self.forward_pass(embedding, cos, sin, position, scale, true, true)?;
+                launch_argmax(
+                    &s,
+                    &self.k.argmax,
+                    &self.d_logits,
+                    self.vocab,
+                    &mut self.d_sampled,
+                )
+                .map_err(map)?;
+                Ok(())
+            })();
+            // Always end capture to leave the stream clean, then surface a record error.
+            // flags = 0 (no special instantiation flags); the repr(u32) enum has no
+            // zero variant, and cudarc consumes it via `as u32`, so the 0 bits pass.
+            let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0) };
+            let captured = s.end_capture(flags);
+            recorded?;
+            match captured.map_err(map)? {
+                Some(graph) => {
+                    graph.upload().map_err(map)?;
+                    self.decode_graph = Some(SendCudaGraph(graph));
+                }
+                None => return Err("decode graph capture produced no graph".into()),
+            }
+        }
+
+        self.decode_graph
+            .as_ref()
+            .expect("decode graph present")
+            .0
+            .launch()
+            .map_err(map)?;
+        let mut out = [0u32; 1];
+        s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(out[0])
     }
 
     /// Sampling decode: full forward on the GPU, returns the full f32 logits row
@@ -1741,7 +1923,7 @@ impl CudaResidentDecode {
     ) -> Result<Vec<f32>, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
-        self.forward_pass(embedding, cos, sin, position, scale, true)?;
+        self.forward_pass(embedding, cos, sin, position, scale, true, false)?;
         let mut logits = vec![0f32; self.vocab];
         s.memcpy_dtoh(&self.d_logits, &mut logits).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
@@ -1766,7 +1948,7 @@ impl CudaResidentDecode {
     ) -> Result<u32, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
-        self.forward_pass(embedding, cos, sin, position, scale, true)?;
+        self.forward_pass(embedding, cos, sin, position, scale, true, false)?;
         launch_sample_gumbel(
             &s,
             &self.k.sample_gumbel,
@@ -1809,7 +1991,7 @@ impl CudaResidentDecode {
             let emb = &embeddings[i * hidden..(i + 1) * hidden];
             let cos = &cos_all[i * half..(i + 1) * half];
             let sin = &sin_all[i * half..(i + 1) * half];
-            self.forward_pass(emb, cos, sin, i, scale, false)?;
+            self.forward_pass(emb, cos, sin, i, scale, false, false)?;
         }
         self.k
             .ctx

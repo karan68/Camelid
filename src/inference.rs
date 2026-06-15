@@ -1434,9 +1434,45 @@ pub struct LlamaInferenceSession {
     /// Clone/PartialEq/Debug like `resident_decode`. Only enabled in deterministic mode
     /// (`enable_execution_trace`); the default path never allocates it.
     execution_trace: Option<ExecutionTraceHasher>,
+    /// Stable identity for the process-global GPU resident-decode engine cache. The
+    /// engine is keyed so the same model reuses its uploaded weights across requests;
+    /// without this the key would be the `weights` Arc pointer, which is not stable
+    /// across separately-loaded `Arc<LlamaLoadedWeights>` for the same model (e.g. a
+    /// prompt-prefix-cache-restored session vs a freshly loaded one). When two such
+    /// Arcs alternate, the single-slot engine cache thrashes — a multi-second 3.4 GB
+    /// re-upload on every request. The API sets this from the model id; when unset
+    /// (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
+    /// copied by Clone/take_for_step so restored sessions keep the same key.
+    resident_cache_key: Option<u64>,
+    /// True for a speculative draft-model session: routes its GPU resident engine to
+    /// the dedicated drafter cache so draft + target models stay resident at once.
+    is_drafter: bool,
 }
 
 impl LlamaInferenceSession {
+    /// Set the stable resident-engine cache key (see field docs). The API derives it
+    /// from the model id so every session for one model shares an engine.
+    pub fn set_resident_cache_key(&mut self, key: u64) {
+        self.resident_cache_key = Some(key);
+    }
+
+    /// Mark this session as the speculative draft model so its GPU resident engine
+    /// lives in the dedicated drafter cache (coexisting with the target's engine).
+    pub fn set_is_drafter(&mut self, is_drafter: bool) {
+        self.is_drafter = is_drafter;
+    }
+
+    /// The resident-engine cache this session's GPU decode uses: the drafter cache
+    /// for a draft-model session, the main cache otherwise.
+    #[cfg(feature = "cuda")]
+    fn resident_cache(&self) -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+        if self.is_drafter {
+            resident_cuda_drafter_cache()
+        } else {
+            resident_cuda_cache()
+        }
+    }
+
     /// Move the session out for a blocking generation step, leaving a hollow placeholder
     /// behind (same identity, empty KV, no resident state). Unlike `clone`, this PRESERVES
     /// the resident GPU session — the on-GPU KV cache and encode-ahead pipeline — which is
@@ -1460,6 +1496,8 @@ impl LlamaInferenceSession {
             resident_decode: self.resident_decode.take(),
             resident_paths_disabled: self.resident_paths_disabled,
             execution_trace: self.execution_trace.take(),
+            resident_cache_key: self.resident_cache_key,
+            is_drafter: self.is_drafter,
         }
     }
 
@@ -1483,6 +1521,8 @@ impl Clone for LlamaInferenceSession {
             resident_decode: None,
             resident_paths_disabled: self.resident_paths_disabled,
             execution_trace: None,
+            resident_cache_key: self.resident_cache_key,
+            is_drafter: self.is_drafter,
         }
     }
 }
@@ -1520,6 +1560,8 @@ impl LlamaInferenceSession {
             resident_decode: None,
             resident_paths_disabled: false,
             execution_trace: None,
+            resident_cache_key: None,
+            is_drafter: false,
         })
     }
 
@@ -1840,6 +1882,18 @@ impl LlamaInferenceSession {
     /// back to the CPU prefill for any unsupported config.
     #[cfg(feature = "cuda")]
     fn try_resident_prefill_cuda(&mut self, token_ids: &[u32]) -> Result<bool> {
+        // Explicit escape hatch: `CAMELID_CUDA_RESIDENT_PREFILL=0` keeps prefill on
+        // the CPU while still allowing GPU-resident decode (debugging / isolation).
+        if std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL")
+            .map(|v| {
+                let v = v.to_string_lossy();
+                let v = v.trim();
+                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
         if self.resident_paths_disabled
             || token_ids.len() < 2
             || token_ids.len() > 16384
@@ -1859,10 +1913,9 @@ impl LlamaInferenceSession {
         let ffn_dim = dims.feed_forward_length;
         let vocab = dims.vocab_size;
         let n = token_ids.len();
-        const RESIDENT_DECODE_CUDA_MAX_CONTEXT: usize = 8192;
         let kv_cap = (self.config.context_length as usize)
             .min(self.kv_cache.plan.max_sequence_length)
-            .min(RESIDENT_DECODE_CUDA_MAX_CONTEXT);
+            .min(resident_cuda_max_context());
         if n >= kv_cap {
             return Ok(false);
         }
@@ -1892,8 +1945,13 @@ impl LlamaInferenceSession {
         let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
         let started = std::time::Instant::now();
 
-        let key = Arc::as_ptr(&weights) as *const () as usize;
-        let cache = resident_cuda_cache();
+        // Prefer the stable model-identity key (set by the API) so the resident engine
+        // is reused across requests; fall back to the weights Arc pointer when unset.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
+        let cache = self.resident_cache();
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1920,6 +1978,11 @@ impl LlamaInferenceSession {
             }
         }
         let slot = guard.as_mut().expect("resident CUDA engine built above");
+        // The engine's VRAM-sized capacity is authoritative; a prompt longer than it
+        // fits prefills on the CPU instead of overrunning the resident KV.
+        if n > slot.engine.max_pos() {
+            return Ok(false);
+        }
         if slot
             .engine
             .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
@@ -1931,6 +1994,21 @@ impl LlamaInferenceSession {
             return Ok(false);
         }
         slot.engine.set_filled(n);
+        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
+        // KV cache is authoritative too: otherwise any later forward that takes the
+        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
+        // an all-zero history and generation degenerates. The copy is a few MB of
+        // device->host transfer — negligible next to the prefill compute it follows,
+        // and it keeps both backends in lockstep.
+        if let Err(e) =
+            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+        {
+            if trace {
+                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+            }
+            slot.engine.set_filled(0);
+            return Ok(false);
+        }
         drop(guard);
         self.kv_cache.position = n;
         if trace {
@@ -1940,6 +2018,38 @@ impl LlamaInferenceSession {
             );
         }
         Ok(true)
+    }
+
+    /// Mirror the GPU-resident prefill KV into the CPU KV cache so both backends hold
+    /// the same history. Reads each layer's K/V back from the device (in
+    /// `[head][position][head_dim]` order) and writes it at the CPU cache's
+    /// position-major offsets. Called only right after a successful GPU prefill.
+    #[cfg(feature = "cuda")]
+    fn copy_resident_cuda_kv_to_host(
+        &mut self,
+        engine: &crate::cuda_resident::CudaResidentDecode,
+        n_layers: usize,
+        n: usize,
+        n_kv: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        self.kv_cache.ensure_position_capacity(n)?;
+        for layer in 0..n_layers {
+            let (k, v) = engine
+                .read_kv_layer(layer, n)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+            for p in 0..n {
+                for h in 0..n_kv {
+                    let src = (h * n + p) * head_dim;
+                    let dst = self.kv_cache.offset(layer, p, h);
+                    self.kv_cache.keys[dst..dst + head_dim]
+                        .copy_from_slice(&k[src..src + head_dim]);
+                    self.kv_cache.values[dst..dst + head_dim]
+                        .copy_from_slice(&v[src..src + head_dim]);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
@@ -2062,12 +2172,28 @@ impl LlamaInferenceSession {
         // The caller adapts `ngram`: a longer match is higher precision (fewer wasted
         // verifies on non-repetitive text), a shorter one catches more repeats.
         let drafts = draft_ngram(history, max_draft, ngram);
-        if drafts.is_empty() {
+        self.verify_drafts_gpu(last_token, &drafts)
+    }
+
+    /// Verify a batch of draft tokens against the target's resident GPU engine in one
+    /// pass and return the accepted prefix (longest run the model confirms, plus the
+    /// bonus token at the first mismatch). Draft-source-agnostic: works for n-gram or
+    /// model-drafted tokens. Returns `Ok(None)` (caller takes a normal single step)
+    /// unless the engine already holds this model with KV materialized exactly to the
+    /// current position. Lossless: `accepted` is exactly what greedy decode would emit.
+    #[cfg(feature = "cuda")]
+    pub fn verify_drafts_gpu(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled || drafts.is_empty() {
             return Ok(None);
         }
         let position = self.kv_cache.position;
         let k = drafts.len() + 1;
-        if position + k > self.kv_cache.plan.max_sequence_length
+        if k > crate::cuda_resident::MAX_VERIFY_K
+            || position + k > self.kv_cache.plan.max_sequence_length
             || !self.resident_decode_eligible(true)?
         {
             return Ok(None);
@@ -2079,7 +2205,7 @@ impl LlamaInferenceSession {
         // Inputs: [last_token, drafts...] at positions [position, position+k).
         let mut inputs = Vec::with_capacity(k);
         inputs.push(last_token);
-        inputs.extend_from_slice(&drafts);
+        inputs.extend_from_slice(drafts);
         let embeddings = self
             .weights
             .token_embedding
@@ -2101,14 +2227,19 @@ impl LlamaInferenceSession {
             }
         }
 
-        let key = Arc::as_ptr(&self.weights) as *const () as usize;
-        let cache = resident_cuda_cache();
+        // Same key the build/decode wrappers use (stable model identity when set,
+        // else the weights Arc pointer) — otherwise the readiness check never matches.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        let cache = self.resident_cache();
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Only run when the global engine already holds this model with the KV
-        // materialized exactly up to `position` (i.e. mid-decode). Otherwise let the
-        // caller take a normal step, which builds/seeds the engine.
+        // Only run when the engine already holds this model with the KV materialized
+        // exactly up to `position` (mid-decode). Otherwise let the caller take a normal
+        // step, which builds/seeds the engine.
         let ready = guard.as_ref().is_some_and(|slot| {
             slot.key == key && slot.engine.weights_ready() && slot.engine.filled() == position
         });
@@ -2222,10 +2353,9 @@ impl LlamaInferenceSession {
         // oversubscribes into shared host memory and every attention read crosses
         // PCIe, collapsing throughput. Cap it to a practical chat context that fits
         // comfortably; beyond it the per-token guard below falls back to the CPU.
-        const RESIDENT_DECODE_CUDA_MAX_CONTEXT: usize = 8192;
         let kv_cap = (self.config.context_length as usize)
             .min(self.kv_cache.plan.max_sequence_length)
-            .min(RESIDENT_DECODE_CUDA_MAX_CONTEXT);
+            .min(resident_cuda_max_context());
         let position = self.kv_cache.position;
         if position >= kv_cap
             || embedding.data.len() != hidden
@@ -2282,8 +2412,13 @@ impl LlamaInferenceSession {
         // turn; the lock is held only for this one token's forward. Steady-state
         // decode was already fast (~54 tok/s); this removes the ~0.5s cold rebuild
         // that made short replies feel slow.
-        let key = Arc::as_ptr(&weights) as *const () as usize;
-        let cache = resident_cuda_cache();
+        // Prefer the stable model-identity key (set by the API) so the resident engine
+        // is reused across requests; fall back to the weights Arc pointer when unset.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
+        let cache = self.resident_cache();
         let mut guard = cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2291,6 +2426,17 @@ impl LlamaInferenceSession {
         let need_build = guard
             .as_ref()
             .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+        if trace && need_build {
+            match guard.as_ref() {
+                None => eprintln!("[resident-cuda] need_build: cache EMPTY (key={key:#x})"),
+                Some(slot) => eprintln!(
+                    "[resident-cuda] need_build: cached_key={:#x} req_key={key:#x} key_match={} ready={}",
+                    slot.key,
+                    slot.key == key,
+                    slot.engine.weights_ready()
+                ),
+            }
+        }
         let build_started = std::time::Instant::now();
         if need_build {
             match build_resident_cuda_engine(
@@ -2324,6 +2470,20 @@ impl LlamaInferenceSession {
         }
 
         let slot = guard.as_mut().expect("resident CUDA engine built above");
+
+        // The engine's VRAM-sized capacity is authoritative: a position at or beyond
+        // it (this token would write KV slot `position`) decodes on the CPU instead of
+        // overrunning the resident KV cache. This is the cap guard, since the engine
+        // may have been built with fewer positions than the request asked for.
+        if position >= slot.engine.max_pos() {
+            if trace {
+                eprintln!(
+                    "[resident-cuda] position {position} >= resident cap {}; CPU fallback",
+                    slot.engine.max_pos()
+                );
+            }
+            return Ok(None);
+        }
 
         // (Re)seed the GPU KV cache from the CPU history [0, position) when
         // starting or resuming a sequence at a position the engine has not
@@ -9237,6 +9397,18 @@ fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> 
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Second resident-engine cache, dedicated to the speculative draft model. Draft
+/// and target are different models (different weight identities), so giving them
+/// separate single-slot caches lets BOTH stay GPU-resident at once — sharing one
+/// slot would thrash (rebuild + 3.4 GB re-upload) every time control passed between
+/// drafter and target. Routed by `LlamaInferenceSession::is_drafter`.
+#[cfg(feature = "cuda")]
+fn resident_cuda_drafter_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
 /// Cheap (no model), and it hits whenever the model repeats a phrase already in
@@ -9285,8 +9457,71 @@ fn build_resident_cuda_engine(
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
         t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
     }
+    // VRAM-driven resident-context sizing (portability, not hardcoded to any card):
+    //   resident weights are uploaded once and live for the engine's lifetime; the
+    //   GPU KV cache is allocated once at `cap` positions, costing
+    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 4(f32) each. Size the
+    //   cap so weights + KV + a scratch/headroom reserve fit in *detected free* VRAM:
+    //     cap = min(requested, (free_vram − weights − headroom) / kv_bytes_per_pos)
+    //   On a 6 GB card this stays conservative; on a 24 GB card it grows automatically
+    //   to a long context. If even the floor (256) cannot fit, return None so the
+    //   caller runs the model on the CPU path rather than oversubscribing VRAM.
+    const MIN_RESIDENT_CONTEXT: usize = 256;
+    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 4) as u64;
+    let weights_bytes: u64 = weights.layers[range.clone()]
+        .iter()
+        .flat_map(|l| {
+            [
+                &l.attention_q,
+                &l.attention_k,
+                &l.attention_v,
+                &l.attention_output,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
+            ]
+        })
+        .filter_map(|t| raw(t).map(|b| b.len() as u64))
+        .sum::<u64>()
+        + raw(weights.output_projection())
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
+    // Scratch reserve: logits row (vocab·f32) + per-stage activation buffers + a flat
+    // safety margin for driver/context overhead and fragmentation.
+    let headroom = (vocab as u64 * 4) + (512 * 1024 * 1024);
+    let cap = match crate::cuda::probe_capability().map(|c| c.vram_free_bytes) {
+        Some(free) if kv_bytes_per_pos > 0 => {
+            let budget = free.saturating_sub(weights_bytes).saturating_sub(headroom);
+            let vram_positions = (budget / kv_bytes_per_pos) as usize;
+            let chosen = kv_cap.min(vram_positions);
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda] VRAM sizing: free {} MiB, weights {} MiB, headroom {} MiB, kv {} B/pos -> fits {} pos, requested {} -> cap {}",
+                    free / (1024 * 1024),
+                    weights_bytes / (1024 * 1024),
+                    headroom / (1024 * 1024),
+                    kv_bytes_per_pos,
+                    vram_positions,
+                    kv_cap,
+                    chosen,
+                );
+            }
+            chosen
+        }
+        // Could not probe free VRAM: trust the requested cap (the engine's own
+        // allocation will fail and fall back if it genuinely does not fit).
+        _ => kv_cap,
+    };
+    if cap < MIN_RESIDENT_CONTEXT {
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cuda] VRAM too small for resident decode (cap {cap} < {MIN_RESIDENT_CONTEXT}); using CPU path"
+            );
+        }
+        return None;
+    }
     let mut engine = crate::cuda_resident::CudaResidentDecode::new(
-        n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, kv_cap, vocab, rms_eps,
+        n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
     )
     .ok()?;
     for l in &weights.layers[range] {
@@ -9353,6 +9588,30 @@ fn resident_decode_cuda_enabled() -> bool {
 #[cfg(not(feature = "cuda"))]
 fn resident_decode_cuda_enabled() -> bool {
     false
+}
+
+/// Maximum sequence length the CUDA resident engine keeps on the GPU. The GPU KV
+/// cache is allocated once at this many positions, so it directly sets the engine's
+/// VRAM footprint (≈ n_layers·n_kv·head_dim·2·4 bytes per position) on top of the
+/// resident weights. On a 6 GB laptop card a 3B Q8_0 model's weights already take
+/// ~3.4 GB, so an 8192-position KV (~1.8 GB for 3B) leaves almost no headroom — any
+/// other GPU app then pushes the engine past VRAM, it can no longer stay resident,
+/// and it is rebuilt (a multi-second 3.4 GB re-upload) on every request. A 4096 cap
+/// halves the KV footprint and keeps the engine resident with room to spare; beyond
+/// it the per-token guard falls back to the CPU. Override with
+/// Optional hard ceiling on the resident KV context the wrappers *request*. The
+/// real limit is VRAM-driven inside `build_resident_cuda_engine` (which sizes the
+/// cap to detected free VRAM and reports it), so by default this imposes no extra
+/// cap — a big card gets a long resident context automatically. Set
+/// `CAMELID_CUDA_RESIDENT_MAX_CONTEXT` to force a lower ceiling (e.g. to leave more
+/// VRAM for other apps).
+#[cfg(feature = "cuda")]
+fn resident_cuda_max_context() -> usize {
+    std::env::var("CAMELID_CUDA_RESIDENT_MAX_CONTEXT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 256)
+        .unwrap_or(usize::MAX)
 }
 
 #[allow(dead_code)]

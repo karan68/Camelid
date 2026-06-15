@@ -5550,6 +5550,15 @@ async fn prepare_generation(
             Some("model"),
         )
     })?;
+    // Pin the GPU resident-decode engine cache to the model identity (not the
+    // per-load weights Arc pointer), so every request for this model reuses the
+    // uploaded weights instead of rebuilding the engine each time.
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        model.id.hash(&mut hasher);
+        session.set_resident_cache_key(hasher.finish());
+    }
     timings.session_create = session_create_started.elapsed().as_millis();
 
     let collect_dense_diagnostics = req.camelid_dense_diagnostics.unwrap_or(false)

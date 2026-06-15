@@ -317,6 +317,161 @@ fn full_forward_token_matches_cpu() {
     }
 }
 
+// The GPU `prefill` loop (no per-token sync) must build exactly the same KV
+// cache as running `forward_token` sequentially per position. The real decode
+// seam prefills the first n-1 prompt tokens, then decodes the last token at
+// position n-1 — so the token produced at position n-1 must be identical
+// whether the earlier KV came from `prefill` or from sequential forwards.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn prefill_then_decode_matches_sequential() {
+    let Some(_k) = kernels() else {
+        return;
+    };
+    // Real TinyLlama-shaped dims (GQA n_kv=4, head_dim=64, hidden=2048, ffn=5632,
+    // vocab=32000) — the prefill bug is dimension-specific and does not show at
+    // toy sizes. Two layers and a short context keep the test fast.
+    let n_layers = 3usize;
+    let hidden = 2048usize;
+    let n_heads = 32usize;
+    let n_kv = 4usize;
+    let head_dim = 64usize;
+    let rope_dim = 64usize;
+    let ffn = 5632usize;
+    let vocab = 32000usize;
+    let max_pos = 64usize;
+    let eps = 1e-5f32;
+    let base = 10000f32;
+    let q_width = n_heads * head_dim;
+    let kv_width = n_kv * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut rng = Lcg(0x1234_5678);
+    let rand = |rng: &mut Lcg, n: usize| (0..n).map(|_| rng.next_f32()).collect::<Vec<f32>>();
+
+    // Identical weights feed both engines.
+    struct LayerF {
+        q: Vec<u8>,
+        k: Vec<u8>,
+        v: Vec<u8>,
+        o: Vec<u8>,
+        gate: Vec<u8>,
+        up: Vec<u8>,
+        down: Vec<u8>,
+        an: Vec<f32>,
+        fnv: Vec<f32>,
+    }
+    let build_engine = |layers: &[LayerF], final_norm: &[f32], output_w: &[u8]| {
+        let mut engine = CudaResidentDecode::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps,
+        )
+        .unwrap();
+        for l in layers {
+            engine
+                .set_layer(
+                    &l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down, &l.an, &l.fnv,
+                )
+                .unwrap();
+        }
+        engine.set_output(final_norm, output_w).unwrap();
+        engine
+    };
+
+    let layers: Vec<LayerF> = (0..n_layers)
+        .map(|_| LayerF {
+            q: quantize_blocks(&rand(&mut rng, q_width * hidden), hidden),
+            k: quantize_blocks(&rand(&mut rng, kv_width * hidden), hidden),
+            v: quantize_blocks(&rand(&mut rng, kv_width * hidden), hidden),
+            o: quantize_blocks(&rand(&mut rng, hidden * q_width), q_width),
+            gate: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
+            up: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
+            down: quantize_blocks(&rand(&mut rng, hidden * ffn), ffn),
+            an: rand(&mut rng, hidden)
+                .iter()
+                .map(|v| v * 0.2 + 1.0)
+                .collect(),
+            fnv: rand(&mut rng, hidden)
+                .iter()
+                .map(|v| v * 0.2 + 1.0)
+                .collect(),
+        })
+        .collect();
+    let final_norm: Vec<f32> = rand(&mut rng, hidden)
+        .iter()
+        .map(|v| v * 0.2 + 1.0)
+        .collect();
+    let output_w = quantize_blocks(&rand(&mut rng, vocab * hidden), hidden);
+
+    // A short prompt of n tokens (random embeddings) plus per-position RoPE tables.
+    let n = 10usize;
+    let half = rope_dim / 2;
+    let embeddings: Vec<Vec<f32>> = (0..n).map(|_| rand(&mut rng, hidden)).collect();
+    let mut cos_all = vec![0f32; n * half];
+    let mut sin_all = vec![0f32; n * half];
+    for pos in 0..n {
+        for p in 0..half {
+            let theta = base.powf(-(2.0 * p as f32) / rope_dim as f32);
+            cos_all[pos * half + p] = (pos as f32 * theta).cos();
+            sin_all[pos * half + p] = (pos as f32 * theta).sin();
+        }
+    }
+
+    // Sequential reference: forward every position through forward_token_logits.
+    let mut seq = build_engine(&layers, &final_norm, &output_w);
+    let mut seq_logits = Vec::new();
+    for pos in 0..n {
+        seq_logits = seq
+            .forward_token_logits(
+                &embeddings[pos],
+                &cos_all[pos * half..(pos + 1) * half],
+                &sin_all[pos * half..(pos + 1) * half],
+                pos,
+                scale,
+            )
+            .unwrap();
+    }
+
+    // Prefill the first n-1 tokens in one batched loop, then decode the last.
+    let mut pre = build_engine(&layers, &final_norm, &output_w);
+    let flat_emb: Vec<f32> = embeddings[..n - 1].iter().flatten().copied().collect();
+    pre.prefill(
+        &flat_emb,
+        &cos_all[..(n - 1) * half],
+        &sin_all[..(n - 1) * half],
+        n - 1,
+        scale,
+    )
+    .unwrap();
+    let pre_logits = pre
+        .forward_token_logits(
+            &embeddings[n - 1],
+            &cos_all[(n - 1) * half..n * half],
+            &sin_all[(n - 1) * half..n * half],
+            n - 1,
+            scale,
+        )
+        .unwrap();
+
+    let argmax = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold(
+                (0usize, f32::MIN),
+                |(bi, bv), (i, &x)| if x > bv { (i, x) } else { (bi, bv) },
+            )
+            .0
+    };
+    assert_eq!(
+        argmax(&pre_logits),
+        argmax(&seq_logits),
+        "prefill+decode produced a different token than sequential forwards"
+    );
+    assert!(
+        close(&pre_logits, &seq_logits, 1e-3),
+        "prefill logits diverged from sequential logits at position {}",
+        n - 1
+    );
+}
+
 // Deterministic LCG so the tests need no rand dependency.
 struct Lcg(u64);
 impl Lcg {
@@ -755,13 +910,13 @@ fn attention_decode_matches_cpu() {
         let kv_head = head / repeats;
         let qh = &q[head * head_dim..head * head_dim + head_dim];
         let mut scores = vec![0f32; position_count];
-        for p in 0..position_count {
+        for (p, score) in scores.iter_mut().enumerate() {
             let kbase = (kv_head * max_pos + p) * head_dim;
             let mut dot = 0f32;
             for d in 0..head_dim {
                 dot += qh[d] * cache_k[kbase + d];
             }
-            scores[p] = dot * scale;
+            *score = dot * scale;
         }
         let m = scores.iter().cloned().fold(f32::MIN, f32::max);
         let mut sum = 0f32;
@@ -783,13 +938,9 @@ fn attention_decode_matches_cpu() {
     let dk = k.stream.clone_htod(&cache_k).unwrap();
     let dv = k.stream.clone_htod(&cache_v).unwrap();
     let mut dout = k.stream.alloc_zeros::<f32>(n_heads * head_dim).unwrap();
-    let (nh, nkv, hd, pc, mp) = (
-        n_heads as i32,
-        n_kv as i32,
-        head_dim as i32,
-        position_count as i32,
-        max_pos as i32,
-    );
+    let (nh, nkv, hd, mp) = (n_heads as i32, n_kv as i32, head_dim as i32, max_pos as i32);
+    // The kernel reads position from device memory and uses position_count = pos+1.
+    let dpos = k.stream.clone_htod(&[(position_count - 1) as i32]).unwrap();
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
         block_dim: (64, 1, 1),
@@ -803,7 +954,7 @@ fn attention_decode_matches_cpu() {
         .arg(&nh)
         .arg(&nkv)
         .arg(&hd)
-        .arg(&pc)
+        .arg(&dpos)
         .arg(&mp)
         .arg(&scale);
     unsafe { b.launch(cfg).unwrap() };
