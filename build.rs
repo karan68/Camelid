@@ -16,8 +16,14 @@ fn main() {
         // integrated Intel one. Reading these exported DWORDs at process start is
         // the documented mechanism; combined with the per-app GPU preference the
         // binary sets at runtime, Windows attributes the app to the dGPU.
-        println!("cargo:rustc-link-arg-bins=/EXPORT:NvOptimusEnablement,DATA");
-        println!("cargo:rustc-link-arg-bins=/EXPORT:AmdPowerXpressRequestHighPerformance,DATA");
+        //
+        // Scope the /EXPORT to the `camelid` bin only: the backing statics live in
+        // src/main.rs, so exporting them from sibling bins (e.g. repack-ghost)
+        // would be an unresolved external (LNK2001).
+        println!("cargo:rustc-link-arg-bin=camelid=/EXPORT:NvOptimusEnablement,DATA");
+        println!(
+            "cargo:rustc-link-arg-bin=camelid=/EXPORT:AmdPowerXpressRequestHighPerformance,DATA"
+        );
     }
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_os != "linux" || target_arch != "x86_64" {
