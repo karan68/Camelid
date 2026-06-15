@@ -512,3 +512,22 @@ when the verifier's ISA matches; otherwise it prints `SKIP execution-trace` rath
 prompt-sensitive + pinned + fail-closed) and `tests/execution_trace_receipt.rs` (the full
 emit→re-derive round trip through the real API replay path). Not built here: per-layer/per-token
 localization, distributed (per-shard) trace chains, signing.
+
+### D10 (cont.) — evaluating 8B / Mistral; system-prompt fold (2026-06-14)
+
+Ran `agent-eval` against the other tool-capable-family ledger rows; **neither earns a PASS, so
+neither is promoted** (the gate holds):
+- `llama3_8b_instruct_q8_0` — **FAIL** (genuine): Meta-Llama-3 8B is *original* Llama 3, which lacks
+  the Llama 3.1+ tool-calling training/template. It hallucinated a result in prose instead of
+  emitting a structured call. Bigger ≠ tool-capable; it's training+template.
+- `mistral_7b_instruct_v0_3_q8_0` — **FAIL** (not a clean capability verdict): its v0.3 template
+  first rejected a standalone `system` role ("roles must alternate"). Fix below cleared that, after
+  which it *rendered* but still didn't emit a structured call — the GGUF template doesn't present
+  tools in Mistral's `[AVAILABLE_TOOLS]` form, so Mistral improvised a shell command in prose.
+  Promoting it needs Mistral-specific tool-template rendering — a real follow-up, not done here.
+
+**System-prompt fold (kept).** `LiveDriver::step` now retries with the system prompt folded into the
+first user message **only when the template rejects a standalone system role** (Mistral v0.3, Gemma).
+The system-role path is tried first and is unchanged, so the promoted 3B is unaffected (re-verified
+PASS). This is a correct robustness fix (system-less templates no longer error) and a stepping stone
+toward Mistral support. The only promoted row remains `llama32_3b_instruct_q8_0`.
