@@ -13,8 +13,91 @@
 
 use crate::gguf::GgufFile;
 use crate::model::LlamaModelConfig;
+use serde::Serialize;
+use std::sync::{Mutex, OnceLock};
 
 const MIB: u64 = 1024 * 1024;
+
+/// Honest run labeling for layer offloading (Phase 4). A model run that streams some
+/// layers from host RAM each forward is a *capacity* mode with materially lower
+/// throughput than an all-resident run; this status makes that visible everywhere a
+/// run is reported (load banner, bench record) so an offloaded run never reads like a
+/// native one. `None`/`source == "none"` means the model is fully resident.
+#[derive(Debug, Clone, Serialize)]
+pub struct OffloadRunStatus {
+    pub total_layers: usize,
+    pub layers_resident: usize,
+    pub layers_offloaded: usize,
+    /// Bytes streamed host->device per offloaded layer, per forward.
+    pub per_layer_bytes: u64,
+    /// Detected free VRAM at engine-build time.
+    pub free_vram_bytes: u64,
+    /// Measured copy-stream peak H2D throughput (GB/s), if probed at build.
+    pub pcie_gbps: Option<f64>,
+    /// How the split was decided: "forced" (CAMELID_OFFLOAD_FORCE_LAYERS), "auto"
+    /// (VRAM-driven), or "none" (fully resident).
+    pub source: &'static str,
+}
+
+impl OffloadRunStatus {
+    /// Fully-resident marker — nothing offloaded.
+    pub fn resident(total_layers: usize, free_vram_bytes: u64) -> Self {
+        Self {
+            total_layers,
+            layers_resident: total_layers,
+            layers_offloaded: 0,
+            per_layer_bytes: 0,
+            free_vram_bytes,
+            pcie_gbps: None,
+            source: "none",
+        }
+    }
+
+    /// One-line, human-facing summary for the load banner. Offloaded runs lead with a
+    /// clear capacity-mode warning and the measured PCIe rate; resident runs are terse.
+    pub fn describe(&self) -> String {
+        if self.layers_offloaded == 0 {
+            return format!(
+                "[gpu] all {} layers resident in VRAM ({} MiB free) — full GPU speed",
+                self.total_layers,
+                self.free_vram_bytes / MIB,
+            );
+        }
+        let pcie = match self.pcie_gbps {
+            Some(g) => format!("{g:.1} GB/s H2D"),
+            None => "unmeasured".to_string(),
+        };
+        format!(
+            "[gpu] CAPACITY MODE: {}/{} layers offloaded to host RAM ({} resident), \
+             streaming {} MiB/layer per forward over PCIe ({pcie}); expect REDUCED tok/s \
+             vs fully-resident. split={}",
+            self.layers_offloaded,
+            self.total_layers,
+            self.layers_resident,
+            self.per_layer_bytes / MIB,
+            self.source,
+        )
+    }
+}
+
+static OFFLOAD_RUN_STATUS: OnceLock<Mutex<Option<OffloadRunStatus>>> = OnceLock::new();
+
+fn status_cell() -> &'static Mutex<Option<OffloadRunStatus>> {
+    OFFLOAD_RUN_STATUS.get_or_init(|| Mutex::new(None))
+}
+
+/// Record the active engine's offload split (called once per resident-engine build).
+pub fn set_offload_run_status(status: Option<OffloadRunStatus>) {
+    *status_cell().lock().unwrap_or_else(|p| p.into_inner()) = status;
+}
+
+/// The active engine's offload split, if a resident engine has been built this process.
+pub fn offload_run_status() -> Option<OffloadRunStatus> {
+    status_cell()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
 
 /// GPU-resident byte cost of one GGUF tensor. Q8_0 is stored on disk as 34-byte
 /// blocks (f16 scale + 32 i8) but the engine holds/uploads it as 36-byte blocks
@@ -284,5 +367,39 @@ mod tests {
         assert_eq!(parse_layer_index("token_embd.weight"), None);
         assert_eq!(parse_layer_index("output.weight"), None);
         assert_eq!(parse_layer_index("output_norm.weight"), None);
+    }
+
+    #[test]
+    fn resident_status_reads_as_full_speed() {
+        let s = OffloadRunStatus::resident(28, 5 * 1024 * MIB);
+        assert_eq!(s.layers_offloaded, 0);
+        assert_eq!(s.source, "none");
+        let line = s.describe();
+        assert!(line.contains("all 28 layers resident"));
+        assert!(line.contains("full GPU speed"));
+        // A fully-resident run must never carry a capacity-mode warning.
+        assert!(!line.to_lowercase().contains("capacity mode"));
+        assert!(!line.contains("REDUCED"));
+    }
+
+    #[test]
+    fn offloaded_status_labels_capacity_mode_with_pcie() {
+        let s = OffloadRunStatus {
+            total_layers: 28,
+            layers_resident: 14,
+            layers_offloaded: 14,
+            per_layer_bytes: 108 * MIB,
+            free_vram_bytes: 2 * 1024 * MIB,
+            pcie_gbps: Some(11.9),
+            source: "forced",
+        };
+        let line = s.describe();
+        // The tradeoff must be visible: split, per-layer streaming, PCIe, and a warning.
+        assert!(line.contains("CAPACITY MODE"));
+        assert!(line.contains("14/28 layers offloaded"));
+        assert!(line.contains("108 MiB/layer"));
+        assert!(line.contains("11.9 GB/s"));
+        assert!(line.contains("REDUCED tok/s"));
+        assert!(line.contains("split=forced"));
     }
 }

@@ -1621,6 +1621,13 @@ struct BenchGenerateRecord {
     decode_ms: f64,
     tokens_per_second: f64,
     peak_memory_bytes: u64,
+    /// GPU layer-offload split for this run (Phase 4 honest labeling). `None` on the
+    /// CPU path; `source == "none"` means fully resident on the GPU. A non-zero
+    /// `layers_offloaded` means a tok/s number here is a capacity-mode result, not a
+    /// fully-resident one — the field carries the split + measured PCIe so it can't be
+    /// read as native.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offload: Option<camelid::offload::OffloadRunStatus>,
     output_text: String,
     output_token_ids: Vec<u32>,
 }
@@ -2005,6 +2012,7 @@ fn run_bench_generate(
             decode_ms: run.decode_ms,
             tokens_per_second,
             peak_memory_bytes: peak_rss_bytes(),
+            offload: camelid::offload::offload_run_status(),
             output_text,
             output_token_ids: run.generated,
         };

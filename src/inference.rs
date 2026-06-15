@@ -9594,24 +9594,42 @@ fn build_resident_cuda_engine(
             )
             .ok()?;
     }
-    if force_offload > 0 {
+    // Honest run labeling (Phase 4): record the offload split and print a one-line
+    // load banner so a capacity-mode (offloaded) run never reads like a native one.
+    let free_vram = crate::cuda::probe_capability()
+        .map(|c| c.vram_free_bytes)
+        .unwrap_or(0);
+    let status = if force_offload > 0 {
         engine.enable_offload_scratch().ok()?;
-        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-            eprintln!(
-                "[offload] {force_offload}/{n_layers} layers offloaded to host (forced); {n_resident_layers} resident"
-            );
-        }
+        // Probe the copy-stream peak once so the banner/record carries a real PCIe
+        // number (a one-time ~0.5 s build cost; this run is already paying for offload).
+        let (per_layer_bytes, pcie_gbps) = match engine.probe_offload_pcie(50) {
+            Some((bytes, gibs)) => (bytes as u64, Some(gibs * 1.073_741_824)),
+            None => (0, None),
+        };
         if std::env::var_os("CAMELID_OFFLOAD_PCIE_PROBE").is_some() {
-            if let Some((bytes, gibs)) = engine.probe_offload_pcie(50) {
+            if let Some(g) = pcie_gbps {
                 eprintln!(
-                    "[offload] PCIe probe: {} MiB/transfer, copy-stream peak {:.2} GiB/s ({:.2} GB/s) over 50 back-to-back transfers (no compute)",
-                    bytes / (1024 * 1024),
-                    gibs,
-                    gibs * 1.073741824,
+                    "[offload] PCIe probe: {} MiB/transfer, copy-stream peak {:.2} GB/s over 50 back-to-back transfers (no compute)",
+                    per_layer_bytes / (1024 * 1024),
+                    g,
                 );
             }
         }
-    }
+        crate::offload::OffloadRunStatus {
+            total_layers: n_layers,
+            layers_resident: n_resident_layers,
+            layers_offloaded: force_offload,
+            per_layer_bytes,
+            free_vram_bytes: free_vram,
+            pcie_gbps,
+            source: "forced",
+        }
+    } else {
+        crate::offload::OffloadRunStatus::resident(n_layers, free_vram)
+    };
+    eprintln!("{}", status.describe());
+    crate::offload::set_offload_run_status(Some(status));
     engine
         .set_output(&weights.output_norm.data, raw(weights.output_projection())?)
         .ok()?;
