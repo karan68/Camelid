@@ -80,6 +80,42 @@ pub fn set_runtime_enabled(enabled: bool) {
     );
 }
 
+// Master "GPU acceleration" switch as the user sees it in the UI. This gates the
+// GPU-RESIDENT decode engine — the primary, fast GPU path (the legacy `RUNTIME_STATE`
+// above only gates the opt-in hybrid Q8 *matmul* used on the CPU-forward fallback, so
+// reporting that as "GPU acceleration" read as OFF even while the resident engine ran
+// the whole model on the GPU). Defaults ON whenever a CUDA device is present so the
+// app uses the GPU out of the box; the UI toggle flips it. 0 = uninitialised,
+// 1 = disabled, 2 = enabled.
+static GPU_ACCEL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether GPU acceleration (the resident decode engine) is enabled. On by default
+/// when a CUDA device is present; flipped by the UI toggle. Independent of the hybrid
+/// `runtime_enabled()` switch. Deterministic mode and `CAMELID_CUDA_RESIDENT_DECODE=0`
+/// still force it off at their own call sites.
+pub fn gpu_accel_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+    match GPU_ACCEL_STATE.load(Ordering::Relaxed) {
+        0 => {
+            let on = is_available();
+            GPU_ACCEL_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        2 => true,
+        _ => false,
+    }
+}
+
+/// Turn GPU acceleration (the resident decode engine) on or off at runtime — the UI
+/// "GPU acceleration" toggle calls this. A no-op effect on a host without a CUDA
+/// device, since inference falls back to the CPU reference either way.
+pub fn set_gpu_accel_enabled(enabled: bool) {
+    GPU_ACCEL_STATE.store(
+        if enabled { 2 } else { 1 },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// Whether a usable CUDA device is actually present (feature built + device + a
 /// kernel that compiled). The UI uses this to decide whether to show the toggle.
 pub fn is_available() -> bool {

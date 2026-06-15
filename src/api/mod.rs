@@ -1345,52 +1345,77 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "camelid server listening");
     let url = format!("http://{addr}");
+
+    // Warm the generation path BEFORE telling the user we're ready. The GPU resident
+    // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
+    // lazily on the first generation — a one-time cost of several seconds. If it lands
+    // on the user's first prompt the model looks "dog slow" (it's really the cold
+    // build, on the GPU the whole time). So: start serving in the background, fire one
+    // tiny self-request through the exact same code path to build the engine, BLOCK on
+    // it, and only then print "ready". After this the first real request is warm
+    // (~0.5s) instead of ~10s. The warm-up is best-effort — any failure just falls back
+    // to the old lazy build and is not fatal.
+    let warm_model_id = state.active_model_id.read().await.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
+    if let Some(model_id) = warm_model_id {
+        eprintln!("\n  🐪 Warming up the GPU (building the resident engine, one-time)…");
+        warmup_generation_blocking(addr, model_id).await;
+    }
     print_ready_banner(&url);
     if open_ui {
         crate::web_ui::open_in_browser(&url);
     }
-    // Warm the generation path right after startup so the first real message is
-    // fast. The GPU resident engine (kernels + weights upload + CUDA init) is built
-    // lazily on the first generation — a one-time ~2-3s cost that would otherwise
-    // land on the user's first prompt. This fires one tiny self-request through the
-    // exact same code path (no divergent logic), building the engine before the
-    // user types. Harmless if it fails; it's only a warm-up.
-    if let Some(model_id) = state.active_model_id.read().await.clone() {
-        warmup_generation(addr, model_id);
-    }
-    axum::serve(listener, router_with_state(state)).await
+    server.await.map_err(std::io::Error::other)?
 }
 
-/// One-shot self-request to build/warm the generation engine after startup. Sends
-/// a raw HTTP POST (no extra deps, blocking `std::net` on its own thread) to the
-/// server's own chat endpoint and reads the full response so the forward
-/// completes (GPU engine built) before returning. Any failure is ignored — this
-/// only ever shaves the first-request cold start.
-fn warmup_generation(addr: SocketAddr, model_id: String) {
-    std::thread::spawn(move || {
-        use std::io::{Read, Write};
-        std::thread::sleep(Duration::from_millis(700));
-        let body = serde_json::json!({
-            "model": model_id,
-            "messages": [{ "role": "user", "content": "hi" }],
-            "max_tokens": 1,
-            "temperature": 0,
-            "stream": false,
-        })
-        .to_string();
-        let request = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body,
-        );
-        if let Ok(mut stream) = std::net::TcpStream::connect(addr) {
-            if stream.write_all(request.as_bytes()).is_ok() {
-                let mut sink = Vec::new();
-                let _ = stream.read_to_end(&mut sink);
-                tracing::info!("generation warm-up complete");
+/// One-shot self-request to build/warm the generation engine, awaited so startup
+/// blocks until the GPU resident engine is built (kernels compiled, weights uploaded,
+/// first prefill run). Runs the blocking `std::net` round-trip on the blocking pool so
+/// the spawned server task can answer it concurrently. Best-effort: any failure (or
+/// the 180s safety timeout) just returns, leaving the old lazy-build behaviour.
+async fn warmup_generation_blocking(addr: SocketAddr, model_id: String) {
+    let _ = tokio::task::spawn_blocking(move || warmup_request(addr, &model_id)).await;
+}
+
+/// Send the warm-up chat request and read the full response (blocking). Returns once
+/// the forward has completed so the resident engine is built before the caller
+/// proceeds. Errors are swallowed by the caller — this only shaves the cold start.
+fn warmup_request(addr: SocketAddr, model_id: &str) {
+    use std::io::{Read, Write};
+    // Give the just-spawned listener a moment to start accepting; retry briefly.
+    let mut stream = None;
+    for _ in 0..40 {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
             }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
         }
-    });
+    }
+    let Some(mut stream) = stream else {
+        return;
+    };
+    // Don't let a stuck forward hang startup forever.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(180)));
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": false,
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    if stream.write_all(request.as_bytes()).is_ok() {
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink);
+        tracing::info!("generation warm-up complete");
+    }
 }
 
 /// Print a clear, human-facing pointer to the web UI once the server is up.
@@ -2011,7 +2036,10 @@ struct GpuRuntimeRequest {
 fn current_gpu_runtime() -> GpuRuntimeState {
     GpuRuntimeState {
         available: crate::cuda::is_available(),
-        enabled: crate::cuda::runtime_enabled(),
+        // Report the MASTER GPU-acceleration switch (resident decode), which is what
+        // actually runs the model on the GPU — not the legacy hybrid-matmul flag, which
+        // defaults off and made the UI read "GPU off" while the GPU did all the work.
+        enabled: crate::cuda::gpu_accel_enabled(),
         device: crate::cuda::device_name(),
         backend: "cuda",
         run_count: crate::cuda::cuda_q8_run_count(),
@@ -2027,6 +2055,10 @@ async fn gpu_runtime() -> Json<GpuRuntimeState> {
 /// runtime (no restart). A no-op effect when no CUDA device is present, since
 /// the inference dispatch falls back to the CPU reference either way.
 async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeState> {
+    // Flip the master GPU-acceleration switch (the resident decode engine) AND the
+    // legacy hybrid Q8 matmul switch together, so "GPU acceleration" is one coherent
+    // control: on => resident decode runs on the GPU; off => pure CPU reference.
+    crate::cuda::set_gpu_accel_enabled(req.enabled);
     crate::cuda::set_runtime_enabled(req.enabled);
     Json(current_gpu_runtime())
 }

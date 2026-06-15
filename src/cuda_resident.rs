@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaStream, PinnedHostSlice};
+use cudarc::driver::{CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaStream, CudaView};
 use cudarc::nvrtc::{CompileOptions, Ptx};
 
 /// CUDA C source for every resident-decode kernel. Compiled once via NVRTC with
@@ -747,7 +747,7 @@ fn launch_gemv(
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
     in_quants: &CudaSlice<i8>,
-    weight: &CudaSlice<u8>,
+    weight: &CudaView<u8>,
     rows: usize,
     blocks_per_row: usize,
     out: &mut CudaSlice<f32>,
@@ -1164,46 +1164,90 @@ fn launch_sample_gumbel(
 /// streamed into the shared scratch buffer before the layer computes. The bytes
 /// are the repacked Q8_0 SoA layout in both cases — where they live never changes
 /// the math (offloading is a capacity feature, parity is unaffected).
-enum LayerWeight {
-    Vram(CudaSlice<u8>),
-    /// Offloaded weights live in PINNED (page-locked, write-combined) host memory,
-    /// so the per-forward host->device stream runs at full PCIe bandwidth (a copy
-    /// from pageable memory would stage through a driver bounce buffer).
-    Host(PinnedHostSlice<u8>),
+/// Page-locked (pinned) host memory allocated with DEFAULT (cacheable) flags rather
+/// than write-combined. `CudaContext::alloc_pinned` hardcodes WRITE_COMBINED, but on
+/// this platform's PCIe link cacheable pinned memory reads ~18% FASTER for host->device
+/// DMA (measured 9.4 vs 7.9 GB/s back-to-back). Offloaded weights stream H2D every
+/// forward, so that 18% is a direct decode-throughput win. The driver auto-detects the
+/// pinned pointer, so a plain `&[u8]` view drives the fast async DMA path.
+struct CacheablePinned {
+    ptr: *mut u8,
+    len: usize,
+    ctx: Arc<CudaContext>,
 }
 
-impl LayerWeight {
-    fn byte_len(&self) -> usize {
-        match self {
-            LayerWeight::Vram(s) => s.len(),
-            LayerWeight::Host(v) => v.len(),
-        }
+// SAFETY: `ptr` is a pinned host allocation owned solely by this struct (freed on drop).
+// The resident engine is only ever accessed under the process-global resident-cache
+// mutex — the same discipline that lets its `CudaGraph` be `Send` — so the pointer is
+// never touched from two threads at once.
+unsafe impl Send for CacheablePinned {}
+
+impl CacheablePinned {
+    fn from_bytes(ctx: &Arc<CudaContext>, bytes: &[u8]) -> Result<Self, String> {
+        use cudarc::driver::result;
+        ctx.bind_to_thread().map_err(|e| format!("bind: {e}"))?;
+        // flags = 0 → cacheable (NOT write-combined). max(1) avoids a zero-size alloc.
+        let ptr = unsafe { result::malloc_host(bytes.len().max(1), 0) }
+            .map_err(|e| format!("malloc_host: {e}"))? as *mut u8;
+        assert!(!ptr.is_null());
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        Ok(Self {
+            ptr,
+            len: bytes.len(),
+            ctx: ctx.clone(),
+        })
     }
-    /// The VRAM slice for a resident weight. Offloaded layers resolve their slice
-    /// through the scratch buffer instead, so this is only called for resident ones.
-    fn vram(&self) -> &CudaSlice<u8> {
-        match self {
-            LayerWeight::Vram(s) => s,
-            LayerWeight::Host(_) => panic!("vram() on an offloaded (host) layer weight"),
+
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for CacheablePinned {
+    fn drop(&mut self) {
+        use cudarc::driver::result;
+        let _ = self.ctx.bind_to_thread();
+        unsafe {
+            let _ = result::free_host(self.ptr as *mut std::ffi::c_void);
         }
     }
 }
 
-/// The seven projection-weight GPU slices used by one layer's forward, resolved
-/// from VRAM-resident slices or (for an offloaded layer) the streamed scratch.
-type LayerWeightSlices<'a> = (
-    &'a CudaSlice<u8>,
-    &'a CudaSlice<u8>,
-    &'a CudaSlice<u8>,
-    &'a CudaSlice<u8>,
-    &'a CudaSlice<u8>,
-    &'a CudaSlice<u8>,
-    &'a CudaSlice<u8>,
-);
+/// The seven projection weights of one offloaded layer, packed CONTIGUOUSLY in one
+/// pinned host buffer so the per-forward host->device stream is a SINGLE transfer.
+/// Splitting it into seven separate `memcpy_htod` calls (one per projection) added a
+/// little DMA ramp-up per sub-transfer; one contiguous copy is marginally faster and
+/// simpler. `off[i]..off[i+1]` is projection i's byte range (order q,k,v,o,gate,up,
+/// down); `off[7]` is the total.
+struct OffloadedLayer {
+    host: CacheablePinned,
+    off: [usize; 8],
+}
 
-/// Shared GPU scratch the offloaded layers stream into, one buffer per projection
-/// (sized to the largest layer). Reused for every offloaded layer in forward order.
-struct OffloadScratch {
+/// Multi-buffered offload streaming state. The weights of the next `N-1` offloaded
+/// layers are prefetched into idle scratch buffers on `copy_stream` while the compute
+/// stream runs the current layer, so the PCIe transfers overlap useful work and the
+/// copy stream stays saturated near the link's peak (a single look-ahead buffer left
+/// the link idle in the bubbles between transfers). `N` = `scratch.len()`
+/// (`CAMELID_OFFLOAD_BUFFERS`, default 4). Each `scratch[b]` is ONE contiguous buffer
+/// sized to the largest layer's total weight bytes; a layer's seven projections are
+/// sub-views (`scratch[b].slice(off[i]..off[i+1])`) into it.
+struct OffloadState {
+    scratch: Vec<CudaSlice<u8>>,
+    copy_stream: std::sync::Arc<CudaStream>,
+    /// `copy_done[b]`: prefetch into buffer b finished — the compute stream waits on
+    /// it before reading buffer b. `compute_done[b]`: the compute that last read
+    /// buffer b finished — the copy stream waits on it before overwriting buffer b
+    /// (write-after-read). A fresh event reads as already-occurred, so the first use
+    /// of each buffer doesn't block. Both indexed by buffer (length = `scratch.len()`).
+    copy_done: Vec<CudaEvent>,
+    compute_done: Vec<CudaEvent>,
+}
+
+struct ResidentLayer {
+    // Resident VRAM projections. For an OFFLOADED layer (`offloaded.is_some()`) these
+    // are 1-byte placeholders that are never read — the real bytes live in `offloaded`
+    // and stream into scratch each forward.
     q: CudaSlice<u8>,
     k: CudaSlice<u8>,
     v: CudaSlice<u8>,
@@ -1211,18 +1255,9 @@ struct OffloadScratch {
     gate: CudaSlice<u8>,
     up: CudaSlice<u8>,
     down: CudaSlice<u8>,
-}
-
-struct ResidentLayer {
-    q: LayerWeight,
-    k: LayerWeight,
-    v: LayerWeight,
-    o: LayerWeight,
-    gate: LayerWeight,
-    up: LayerWeight,
-    down: LayerWeight,
     attn_norm: CudaSlice<f32>,
     ffn_norm: CudaSlice<f32>,
+    offloaded: Option<OffloadedLayer>,
 }
 
 /// A captured CUDA graph, wrapped to be `Send`. cudarc does not mark `CudaGraph`
@@ -1292,7 +1327,7 @@ pub struct CudaResidentDecode {
     verify_scratch: Option<VerifyScratch>,
     /// Shared GPU scratch for offloaded layers (None when every layer is resident).
     /// Allocated by `enable_offload_scratch` when the build decides to offload.
-    offload_scratch: Option<OffloadScratch>,
+    offload: Option<OffloadState>,
 }
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
@@ -1403,7 +1438,7 @@ impl CudaResidentDecode {
             d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
             decode_graph: None,
             verify_scratch: None,
-            offload_scratch: None,
+            offload: None,
             k,
         })
     }
@@ -1446,63 +1481,155 @@ impl CudaResidentDecode {
     ) -> Result<(), String> {
         let ctx = &self.k.ctx;
         let s = &self.k.stream;
-        let weight = |b: &[u8]| -> Result<LayerWeight, String> {
-            let repacked = repack_q8_soa(b);
-            if resident {
-                Ok(LayerWeight::Vram(
-                    s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))?,
-                ))
-            } else {
-                // Pinned (page-locked, write-combined) host buffer for full-PCIe
-                // streaming. SAFETY: alloc_pinned hands back a raw host allocation;
-                // we immediately fill it and the returned PinnedHostSlice owns/frees it.
-                let mut pinned = unsafe { ctx.alloc_pinned::<u8>(repacked.len()) }
-                    .map_err(|e| format!("alloc_pinned: {e}"))?;
-                pinned
-                    .as_mut_slice()
-                    .map_err(|e| format!("pinned fill: {e}"))?
-                    .copy_from_slice(&repacked);
-                Ok(LayerWeight::Host(pinned))
-            }
-        };
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
+        let projections = [q, kk, v, o, gate, up, down];
+        let (attn_norm, ffn_norm) = (up_f(attn_norm)?, up_f(ffn_norm)?);
+
+        if resident {
+            // Resident: each projection uploaded once to its own VRAM slice; no
+            // offload metadata.
+            let vram = |b: &[u8]| -> Result<CudaSlice<u8>, String> {
+                s.clone_htod(&repack_q8_soa(b))
+                    .map_err(|e| format!("htod: {e}"))
+            };
+            self.layers.push(ResidentLayer {
+                q: vram(projections[0])?,
+                k: vram(projections[1])?,
+                v: vram(projections[2])?,
+                o: vram(projections[3])?,
+                gate: vram(projections[4])?,
+                up: vram(projections[5])?,
+                down: vram(projections[6])?,
+                attn_norm,
+                ffn_norm,
+                offloaded: None,
+            });
+            return Ok(());
+        }
+
+        // Offloaded: repack all seven projections and lay them out contiguously in
+        // one pinned host buffer so the per-forward transfer is a single memcpy.
+        let repacked: Vec<Vec<u8>> = projections.iter().map(|b| repack_q8_soa(b)).collect();
+        let mut off = [0usize; 8];
+        for (i, r) in repacked.iter().enumerate() {
+            off[i + 1] = off[i] + r.len();
+        }
+        let total = off[7];
+        // Cacheable pinned host buffer (faster H2D than write-combined here), filled
+        // with the seven projections laid out back-to-back.
+        let mut packed = vec![0u8; total];
+        for (i, r) in repacked.iter().enumerate() {
+            packed[off[i]..off[i + 1]].copy_from_slice(r);
+        }
+        let pinned = CacheablePinned::from_bytes(ctx, &packed)?;
+        // 1-byte placeholders for the resident-projection fields (never read while
+        // offloaded — the forward resolves weights from the streamed scratch).
+        let ph = || s.clone_htod(&[0u8]).map_err(|e| format!("htod: {e}"));
         self.layers.push(ResidentLayer {
-            q: weight(q)?,
-            k: weight(kk)?,
-            v: weight(v)?,
-            o: weight(o)?,
-            gate: weight(gate)?,
-            up: weight(up)?,
-            down: weight(down)?,
-            attn_norm: up_f(attn_norm)?,
-            ffn_norm: up_f(ffn_norm)?,
+            q: ph()?,
+            k: ph()?,
+            v: ph()?,
+            o: ph()?,
+            gate: ph()?,
+            up: ph()?,
+            down: ph()?,
+            attn_norm,
+            ffn_norm,
+            offloaded: Some(OffloadedLayer { host: pinned, off }),
         });
         Ok(())
     }
 
-    /// Allocate the shared offload scratch, sized to the largest layer's per-weight
-    /// bytes. Call after all layers are set, only when at least one is offloaded.
+    /// Allocate the multi-buffered offload state: `N` scratch buffers (each sized to
+    /// the largest offloaded layer's total weight bytes), a dedicated copy stream, and
+    /// `N` copy-done + `N` compute-done events. `N` is `CAMELID_OFFLOAD_BUFFERS`
+    /// (default 2, clamped to >=2). More buffers let the copy stream run further ahead,
+    /// but on this hardware throughput is flat past 2: during generation the H2D link is
+    /// slower than its idle peak because the compute kernels contend for the memory
+    /// controller, so offload is link-bound, not buffer-bound — the extra buffers only
+    /// cost VRAM. The knob stays for hardware where the loaded link has more headroom.
+    /// Call after all layers are set, only when at least one layer is offloaded.
     pub fn enable_offload_scratch(&mut self) -> Result<(), String> {
-        if self.offload_scratch.is_some() {
+        if self.offload.is_some() {
             return Ok(());
         }
-        let max_of = |pick: &dyn Fn(&ResidentLayer) -> usize| {
-            self.layers.iter().map(pick).max().unwrap_or(0)
+        let n_buffers = std::env::var("CAMELID_OFFLOAD_BUFFERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+            .max(2);
+        // Each scratch buffer is sized to the largest offloaded layer's TOTAL weight
+        // bytes (all seven projections contiguous).
+        let max_total = self
+            .layers
+            .iter()
+            .filter_map(|l| l.offloaded.as_ref().map(|ol| ol.off[7]))
+            .max()
+            .unwrap_or(0);
+        let copy_stream = self
+            .k
+            .ctx
+            .new_stream()
+            .map_err(|e| format!("offload copy stream: {e}"))?;
+        let ev = || {
+            self.k
+                .ctx
+                .new_event(None)
+                .map_err(|e| format!("offload event: {e}"))
         };
-        let s = &self.k.stream;
-        let alloc = |n: usize| {
-            s.alloc_zeros::<u8>(n)
-                .map_err(|e| format!("scratch alloc: {e}"))
-        };
-        self.offload_scratch = Some(OffloadScratch {
-            q: alloc(max_of(&|l| l.q.byte_len()))?,
-            k: alloc(max_of(&|l| l.k.byte_len()))?,
-            v: alloc(max_of(&|l| l.v.byte_len()))?,
-            o: alloc(max_of(&|l| l.o.byte_len()))?,
-            gate: alloc(max_of(&|l| l.gate.byte_len()))?,
-            up: alloc(max_of(&|l| l.up.byte_len()))?,
-            down: alloc(max_of(&|l| l.down.byte_len()))?,
+        let s = self.k.stream.clone();
+        let mut scratch = Vec::with_capacity(n_buffers);
+        let mut copy_done = Vec::with_capacity(n_buffers);
+        let mut compute_done = Vec::with_capacity(n_buffers);
+        for _ in 0..n_buffers {
+            scratch.push(
+                s.alloc_zeros::<u8>(max_total)
+                    .map_err(|e| format!("scratch alloc: {e}"))?,
+            );
+            copy_done.push(ev()?);
+            compute_done.push(ev()?);
+        }
+        self.offload = Some(OffloadState {
+            scratch,
+            copy_stream,
+            copy_done,
+            compute_done,
         });
+        Ok(())
+    }
+
+    /// Stream layer `li`'s offloaded weights into scratch buffer `buf` on the copy
+    /// stream (asynchronous; the caller records an event and the compute stream waits
+    /// on it before reading the buffer).
+    fn prefetch_offloaded(
+        &mut self,
+        li: usize,
+        buf: usize,
+        copy_stream: &std::sync::Arc<CudaStream>,
+    ) -> Result<(), String> {
+        let map = |e: cudarc::driver::DriverError| format!("offload prefetch: {e}");
+        // Write-after-read: don't overwrite buffer `buf` until the compute that last
+        // read it has finished (a no-op the first time the buffer is used).
+        copy_stream
+            .wait(&self.offload.as_ref().expect("offload state").compute_done[buf])
+            .map_err(map)?;
+        // ONE contiguous host->device transfer for all seven projections. (The scratch
+        // buffer is sized to the largest layer; memcpy_htod copies only host.len()
+        // bytes into the front, exactly the range the gemv sub-views read.)
+        if self.layers[li].offloaded.is_some() {
+            // Borrow the host buffer and the scratch separately (disjoint fields).
+            let offloaded = self.offload.as_mut().expect("offload state");
+            let sc = &mut offloaded.scratch[buf];
+            // SAFETY of the index: `li` is an offloaded layer (checked above). The
+            // `&[u8]` view points at pinned memory, so this is the fast async DMA.
+            let host = self.layers[li].offloaded.as_ref().unwrap().host.as_bytes();
+            copy_stream.memcpy_htod(host, sc).map_err(map)?;
+        }
+        // Signal that buffer `buf` now holds this layer's weights; the compute
+        // stream waits on this before reading the scratch.
+        self.offload.as_ref().expect("offload state").copy_done[buf]
+            .record(copy_stream)
+            .map_err(map)?;
         Ok(())
     }
 
@@ -1513,6 +1640,42 @@ impl CudaResidentDecode {
             .clone_htod(&repack_q8_soa(output_weight))
             .map_err(|e| format!("htod: {e}"))?;
         Ok(())
+    }
+
+    /// Diagnostic: time `iters` back-to-back host->device transfers of the largest
+    /// offloaded layer on the copy stream, with NO interleaved compute, and return
+    /// (bytes_per_transfer, peak_GiB_per_s). This isolates the copy stream's saturated
+    /// throughput from the per-forward pipeline's average (which includes compute and
+    /// sync gaps), so we can tell whether offload is link-bound or pipeline-bound.
+    /// Returns None if nothing is offloaded.
+    pub fn probe_offload_pcie(&mut self, iters: usize) -> Option<(usize, f64)> {
+        let bytes = self
+            .layers
+            .iter()
+            .filter_map(|l| l.offloaded.as_ref().map(|o| o.off[7]))
+            .max()?;
+        // Index of the largest offloaded layer (to read its pinned host buffer).
+        let li = (0..self.n_layers)
+            .filter(|&i| self.layers[i].offloaded.is_some())
+            .max_by_key(|&i| self.layers[i].offloaded.as_ref().unwrap().off[7])?;
+        let cs = self.offload.as_ref()?.copy_stream.clone();
+        // Warmup (ramp the link / first-touch the buffers), then timed loop.
+        for _ in 0..3.min(iters) {
+            let sc = &mut self.offload.as_mut().unwrap().scratch[0];
+            let host = self.layers[li].offloaded.as_ref().unwrap().host.as_bytes();
+            cs.memcpy_htod(host, sc).ok()?;
+        }
+        cs.synchronize().ok()?;
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let sc = &mut self.offload.as_mut().unwrap().scratch[0];
+            let host = self.layers[li].offloaded.as_ref().unwrap().host.as_bytes();
+            cs.memcpy_htod(host, sc).ok()?;
+        }
+        cs.synchronize().ok()?;
+        let secs = start.elapsed().as_secs_f64();
+        let gibs = (bytes as f64 * iters as f64) / secs / (1024.0 * 1024.0 * 1024.0);
+        Some((bytes, gibs))
     }
 
     /// Whether `set_layer` has been called for every layer + the output stage.
@@ -1652,56 +1815,73 @@ impl CudaResidentDecode {
                 .map_err(map)?;
         }
 
+        // Multi-buffered offload streaming (Phase 3c): the weights of the next N-1
+        // offloaded layers are prefetched on a separate copy stream so the copy engine
+        // stays saturated while the compute stream runs the current layer. `off_idx` is
+        // the ordered list of offloaded layer indices; the offloaded layer at sequence
+        // position `seq` reads scratch buffer `seq % N` (and that buffer is reused for
+        // `seq + N`). Priming fills all N buffers up front so every in-loop wait already
+        // has a copy in flight. Where the bytes came from never changes the math.
+        let copy_stream = self.offload.as_ref().map(|o| o.copy_stream.clone());
+        let n_buf = self.offload.as_ref().map(|o| o.scratch.len()).unwrap_or(0);
+        let off_idx: Vec<usize> = if n_buf > 0 {
+            (0..self.n_layers)
+                .filter(|&i| self.layers[i].offloaded.is_some())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(cs) = &copy_stream {
+            for (seq, &li) in off_idx.iter().enumerate().take(n_buf) {
+                self.prefetch_offloaded(li, seq % n_buf, cs)?;
+            }
+        }
+        let mut off_seq = 0usize;
+
         for li in 0..self.n_layers {
             // Resolve this layer's seven projection weights to GPU slices. An
-            // offloaded layer (weights in host RAM) streams its repacked bytes into
-            // the shared scratch first; a resident layer uses its VRAM slice. The
-            // streaming is synchronous — no overlap with compute (Phase 2). The math
-            // is identical regardless of where the bytes came from.
-            let offloaded = matches!(self.layers[li].q, LayerWeight::Host(_));
-            if offloaded {
-                if let LayerWeight::Host(h) = &self.layers[li].q {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.q).map_err(map)?;
-                }
-                if let LayerWeight::Host(h) = &self.layers[li].k {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.k).map_err(map)?;
-                }
-                if let LayerWeight::Host(h) = &self.layers[li].v {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.v).map_err(map)?;
-                }
-                if let LayerWeight::Host(h) = &self.layers[li].o {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.o).map_err(map)?;
-                }
-                if let LayerWeight::Host(h) = &self.layers[li].gate {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.gate).map_err(map)?;
-                }
-                if let LayerWeight::Host(h) = &self.layers[li].up {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.up).map_err(map)?;
-                }
-                if let LayerWeight::Host(h) = &self.layers[li].down {
-                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
-                    s.memcpy_htod(h, &mut sc.down).map_err(map)?;
-                }
+            // offloaded layer (weights in host RAM) reads from the scratch buffer its
+            // prefetch streamed into; a resident layer uses its VRAM slice. The math
+            // is identical regardless of where the bytes came from — parity holds.
+            let offloaded = self.layers[li].offloaded.is_some();
+            let cur_buf = if n_buf > 0 { off_seq % n_buf } else { 0 };
+            if offloaded && copy_stream.is_some() {
+                // Wait for THIS layer's prefetch to land in scratch[cur_buf] before the
+                // compute stream reads it. (The look-ahead prefetch that refills this
+                // buffer is issued at the END of the layer, AFTER compute_done is
+                // recorded — issuing it here would let the copy clobber the buffer this
+                // layer is about to read, since its write-after-read event is not yet
+                // recorded.)
+                s.wait(&self.offload.as_ref().expect("offload state").copy_done[cur_buf])
+                    .map_err(map)?;
             }
-            let (wq, wk, wv, wo, wgate, wup, wdown): LayerWeightSlices = if offloaded {
-                let sc = self.offload_scratch.as_ref().expect("offload scratch");
-                (&sc.q, &sc.k, &sc.v, &sc.o, &sc.gate, &sc.up, &sc.down)
+            // Seven projection weights as GPU views. Offloaded: sub-views into the
+            // single streamed scratch buffer at each projection's byte range. Resident:
+            // a full-buffer view of each VRAM slice. (Views unify both into the same
+            // type for `launch_gemv`; they are zero-copy handles, not allocations.)
+            type W<'a> = CudaView<'a, u8>;
+            let (wq, wk, wv, wo, wgate, wup, wdown): (W, W, W, W, W, W, W) = if offloaded {
+                let off = self.layers[li].offloaded.as_ref().expect("offloaded").off;
+                let sc = &self.offload.as_ref().expect("offload state").scratch[cur_buf];
+                (
+                    sc.slice(off[0]..off[1]),
+                    sc.slice(off[1]..off[2]),
+                    sc.slice(off[2]..off[3]),
+                    sc.slice(off[3]..off[4]),
+                    sc.slice(off[4]..off[5]),
+                    sc.slice(off[5]..off[6]),
+                    sc.slice(off[6]..off[7]),
+                )
             } else {
                 let l = &self.layers[li];
                 (
-                    l.q.vram(),
-                    l.k.vram(),
-                    l.v.vram(),
-                    l.o.vram(),
-                    l.gate.vram(),
-                    l.up.vram(),
-                    l.down.vram(),
+                    l.q.as_view(),
+                    l.k.as_view(),
+                    l.v.as_view(),
+                    l.o.as_view(),
+                    l.gate.as_view(),
+                    l.up.as_view(),
+                    l.down.as_view(),
                 )
             };
             // attention norm + quantize
@@ -1730,7 +1910,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wq,
+                &wq,
                 self.q_width,
                 hb,
                 &mut self.d_q,
@@ -1741,7 +1921,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wk,
+                &wk,
                 self.kv_width,
                 hb,
                 &mut self.d_k,
@@ -1752,7 +1932,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wv,
+                &wv,
                 self.kv_width,
                 hb,
                 &mut self.d_v,
@@ -1836,7 +2016,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wo,
+                &wo,
                 self.hidden,
                 qb,
                 &mut self.d_proj,
@@ -1875,7 +2055,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wgate,
+                &wgate,
                 self.ffn_dim,
                 hb,
                 &mut self.d_gate,
@@ -1886,7 +2066,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wup,
+                &wup,
                 self.ffn_dim,
                 hb,
                 &mut self.d_up,
@@ -1915,7 +2095,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                wdown,
+                &wdown,
                 self.hidden,
                 fb,
                 &mut self.d_proj,
@@ -1929,6 +2109,23 @@ impl CudaResidentDecode {
                 self.hidden,
             )
             .map_err(map)?;
+            if offloaded {
+                if let Some(cs) = &copy_stream {
+                    // This layer is done reading scratch[cur_buf]: record compute_done so
+                    // the copy stream may reuse the buffer, THEN issue the look-ahead
+                    // prefetch of the layer N positions ahead into it. Doing it here (not
+                    // at the layer's start) makes the prefetch's write-after-read wait on
+                    // a compute_done that is actually recorded, so it never overwrites a
+                    // buffer still being read. N-1 transfers stay in flight ahead.
+                    self.offload.as_ref().expect("offload state").compute_done[cur_buf]
+                        .record(&s)
+                        .map_err(map)?;
+                    if let Some(&li_ahead) = off_idx.get(off_seq + n_buf) {
+                        self.prefetch_offloaded(li_ahead, cur_buf, cs)?;
+                    }
+                }
+                off_seq += 1;
+            }
         }
 
         if !compute_logits {
@@ -1959,7 +2156,7 @@ impl CudaResidentDecode {
             &self.k.gemv,
             &self.d_in_scales,
             &self.d_in_quants,
-            &self.output_weight,
+            &self.output_weight.as_view(),
             self.vocab,
             hb,
             &mut self.d_logits,
@@ -2286,7 +2483,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.q.vram(),
+                &layer.q,
                 q_width,
                 hb,
                 k,
@@ -2298,7 +2495,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.k.vram(),
+                &layer.k,
                 kv_width,
                 hb,
                 k,
@@ -2310,7 +2507,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.v.vram(),
+                &layer.v,
                 kv_width,
                 hb,
                 k,
@@ -2400,7 +2597,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.o.vram(),
+                &layer.o,
                 hidden,
                 qb,
                 k,
@@ -2434,7 +2631,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.gate.vram(),
+                &layer.gate,
                 ffn_dim,
                 hb,
                 k,
@@ -2446,7 +2643,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.up.vram(),
+                &layer.up,
                 ffn_dim,
                 hb,
                 k,
@@ -2476,7 +2673,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                layer.down.vram(),
+                &layer.down,
                 hidden,
                 fb,
                 k,

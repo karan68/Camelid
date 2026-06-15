@@ -9601,6 +9601,16 @@ fn build_resident_cuda_engine(
                 "[offload] {force_offload}/{n_layers} layers offloaded to host (forced); {n_resident_layers} resident"
             );
         }
+        if std::env::var_os("CAMELID_OFFLOAD_PCIE_PROBE").is_some() {
+            if let Some((bytes, gibs)) = engine.probe_offload_pcie(50) {
+                eprintln!(
+                    "[offload] PCIe probe: {} MiB/transfer, copy-stream peak {:.2} GiB/s ({:.2} GB/s) over 50 back-to-back transfers (no compute)",
+                    bytes / (1024 * 1024),
+                    gibs,
+                    gibs * 1.073741824,
+                );
+            }
+        }
     }
     engine
         .set_output(&weights.output_norm.data, raw(weights.output_projection())?)
@@ -9631,7 +9641,9 @@ fn resident_decode_cuda_enabled() -> bool {
             return false;
         }
     }
-    crate::cuda::is_available()
+    // The user-facing "GPU acceleration" switch (default on when a device is present;
+    // flippable from the UI). gpu_accel_enabled() already requires a usable device.
+    crate::cuda::gpu_accel_enabled()
 }
 
 #[cfg(not(feature = "cuda"))]
