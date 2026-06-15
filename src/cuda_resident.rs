@@ -149,14 +149,31 @@ extern "C" __global__ void quantize_q8_0(
 // summed sequentially by lane 0 in block order (acc += int_sum * w_scale *
 // x_scale), reproducing the CPU reference's summation order so the decode stays
 // token-identical. Only the load instructions change, not the arithmetic.
+// The input activation (quants + scales) is the SAME for every output row, so
+// instead of each of the block's 8 warps re-reading it from global for its row,
+// the block stages the whole input vector into shared memory once and every warp
+// reads it from on-chip shared. That removes a chunk of memory traffic roughly
+// equal to the weight traffic for the larger projections (down/gate/up), where
+// the input is as big as one weight row. Shared layout: input quants, then input
+// scales, then the per-warp ordered-sum scratch.
 extern "C" __global__ void q8_gemv(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
     float* __restrict__ output
 ) {
-    extern __shared__ float terms[]; // (blockDim/32) * blocks_per_row
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
+    extern __shared__ unsigned char smem[];
+    signed char* s_iq = (signed char*)smem;                          // blocks_per_row*32 i8
+    float* s_is = (float*)(smem + (long)blocks_per_row * 32);         // blocks_per_row f32
+    float* terms = (float*)(smem + (long)blocks_per_row * 36);        // warps*blocks_per_row f32
+    int tid = threadIdx.x;
+    // Stage the shared input vector cooperatively (coalesced), once per block.
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // blocks_per_row*32 bytes as ints
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
     float* myterms = terms + (long)warp * blocks_per_row;
@@ -166,12 +183,12 @@ extern "C" __global__ void q8_gemv(
         const float* scales =
             reinterpret_cast<const float*>(weight_bytes + total_blocks * 32);
         long row_block0 = (long)row * blocks_per_row;
-        const int4* iq4 = reinterpret_cast<const int4*>(input_quants);
+        const int4* siq = reinterpret_cast<const int4*>(s_iq);
         for (int b = lane; b < blocks_per_row; b += 32) {
             float w_scale = scales[row_block0 + b];
             const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
             int4 w0 = wq[0], w1 = wq[1];
-            int4 i0 = iq4[b * 2], i1 = iq4[b * 2 + 1];
+            int4 i0 = siq[b * 2], i1 = siq[b * 2 + 1];
             int int_sum = 0;
             int_sum = __dp4a(w0.x, i0.x, int_sum);
             int_sum = __dp4a(w0.y, i0.y, int_sum);
@@ -181,7 +198,7 @@ extern "C" __global__ void q8_gemv(
             int_sum = __dp4a(w1.y, i1.y, int_sum);
             int_sum = __dp4a(w1.z, i1.z, int_sum);
             int_sum = __dp4a(w1.w, i1.w, int_sum);
-            myterms[b] = (float)int_sum * w_scale * input_scales[b];
+            myterms[b] = (float)int_sum * w_scale * s_is[b];
         }
     }
     __syncwarp();
@@ -508,14 +525,16 @@ fn launch_gemv(
     blocks_per_row: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
-    // 8 warps/block, one warp per output row; shared holds each warp's per-block
-    // float terms for the in-order lane-0 reduction.
+    // 8 warps/block, one warp per output row. Shared holds the staged input
+    // vector (quants `bpr*32` + scales `bpr*4`) shared by all warps, then each
+    // warp's per-block float terms for the in-order lane-0 reduction.
     let block = 256u32;
     let warps_per_block = block / 32;
+    let bpr_u = blocks_per_row as u32;
     let cfg = LaunchConfig {
         grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
         block_dim: (block, 1, 1),
-        shared_mem_bytes: warps_per_block * (blocks_per_row as u32) * 4,
+        shared_mem_bytes: bpr_u * 36 + warps_per_block * bpr_u * 4,
     };
     let (r, bpr) = (rows as i32, blocks_per_row as i32);
     let mut b = s.launch_builder(f);
