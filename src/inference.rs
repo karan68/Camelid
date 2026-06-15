@@ -9553,7 +9553,18 @@ fn build_resident_cuda_engine(
         n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
     )
     .ok()?;
-    for l in &weights.layers[range] {
+    // Layer offloading (Phase 2): CAMELID_OFFLOAD_FORCE_LAYERS=N forces the last N
+    // layers onto host RAM (their weights stream to a GPU scratch buffer each
+    // forward), exercising the offload path even on a model that fits. The math is
+    // unchanged, so token output is identical to the all-resident path. The
+    // automatic VRAM-driven split is wired on top of this in a later step.
+    let force_offload = std::env::var("CAMELID_OFFLOAD_FORCE_LAYERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(n_layers);
+    let n_resident_layers = n_layers - force_offload;
+    for (idx, l) in weights.layers[range].iter().enumerate() {
         let (q, k, v, o, gate, up, down) = match (
             raw(&l.attention_q),
             raw(&l.attention_k),
@@ -9569,7 +9580,7 @@ fn build_resident_cuda_engine(
             _ => return None,
         };
         engine
-            .set_layer(
+            .set_layer_located(
                 q,
                 k,
                 v,
@@ -9579,8 +9590,17 @@ fn build_resident_cuda_engine(
                 down,
                 &l.attention_norm.data,
                 &l.ffn_norm.data,
+                idx < n_resident_layers,
             )
             .ok()?;
+    }
+    if force_offload > 0 {
+        engine.enable_offload_scratch().ok()?;
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[offload] {force_offload}/{n_layers} layers offloaded to host (forced); {n_resident_layers} resident"
+            );
+        }
     }
     engine
         .set_output(&weights.output_norm.data, raw(weights.output_projection())?)

@@ -1160,7 +1160,47 @@ fn launch_sample_gumbel(
 }
 
 /// One layer's GPU-resident Q8_0 weights + norm vectors.
-struct ResidentLayer {
+/// One layer's projection weight: resident in VRAM, or offloaded to host RAM and
+/// streamed into the shared scratch buffer before the layer computes. The bytes
+/// are the repacked Q8_0 SoA layout in both cases — where they live never changes
+/// the math (offloading is a capacity feature, parity is unaffected).
+enum LayerWeight {
+    Vram(CudaSlice<u8>),
+    Host(Vec<u8>),
+}
+
+impl LayerWeight {
+    fn byte_len(&self) -> usize {
+        match self {
+            LayerWeight::Vram(s) => s.len(),
+            LayerWeight::Host(v) => v.len(),
+        }
+    }
+    /// The VRAM slice for a resident weight. Offloaded layers resolve their slice
+    /// through the scratch buffer instead, so this is only called for resident ones.
+    fn vram(&self) -> &CudaSlice<u8> {
+        match self {
+            LayerWeight::Vram(s) => s,
+            LayerWeight::Host(_) => panic!("vram() on an offloaded (host) layer weight"),
+        }
+    }
+}
+
+/// The seven projection-weight GPU slices used by one layer's forward, resolved
+/// from VRAM-resident slices or (for an offloaded layer) the streamed scratch.
+type LayerWeightSlices<'a> = (
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<u8>,
+    &'a CudaSlice<u8>,
+);
+
+/// Shared GPU scratch the offloaded layers stream into, one buffer per projection
+/// (sized to the largest layer). Reused for every offloaded layer in forward order.
+struct OffloadScratch {
     q: CudaSlice<u8>,
     k: CudaSlice<u8>,
     v: CudaSlice<u8>,
@@ -1168,6 +1208,16 @@ struct ResidentLayer {
     gate: CudaSlice<u8>,
     up: CudaSlice<u8>,
     down: CudaSlice<u8>,
+}
+
+struct ResidentLayer {
+    q: LayerWeight,
+    k: LayerWeight,
+    v: LayerWeight,
+    o: LayerWeight,
+    gate: LayerWeight,
+    up: LayerWeight,
+    down: LayerWeight,
     attn_norm: CudaSlice<f32>,
     ffn_norm: CudaSlice<f32>,
 }
@@ -1237,6 +1287,9 @@ pub struct CudaResidentDecode {
     decode_graph: Option<SendCudaGraph>,
     /// Lazily-allocated K-batched scratch for the speculative-verify forward.
     verify_scratch: Option<VerifyScratch>,
+    /// Shared GPU scratch for offloaded layers (None when every layer is resident).
+    /// Allocated by `enable_offload_scratch` when the build decides to offload.
+    offload_scratch: Option<OffloadScratch>,
 }
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
@@ -1347,6 +1400,7 @@ impl CudaResidentDecode {
             d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
             decode_graph: None,
             verify_scratch: None,
+            offload_scratch: None,
             k,
         })
     }
@@ -1365,22 +1419,76 @@ impl CudaResidentDecode {
         attn_norm: &[f32],
         ffn_norm: &[f32],
     ) -> Result<(), String> {
+        // Default: every layer resident in VRAM (unchanged behavior).
+        self.set_layer_located(q, kk, v, o, gate, up, down, attn_norm, ffn_norm, true)
+    }
+
+    /// As `set_layer`, but `resident` chooses where the projection weights live:
+    /// VRAM (resident, uploaded once) or host RAM (offloaded, streamed to scratch
+    /// each forward). The repacked SoA bytes are identical either way. The small
+    /// norms always stay resident.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_layer_located(
+        &mut self,
+        q: &[u8],
+        kk: &[u8],
+        v: &[u8],
+        o: &[u8],
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        attn_norm: &[f32],
+        ffn_norm: &[f32],
+        resident: bool,
+    ) -> Result<(), String> {
         let s = &self.k.stream;
-        let up_u8 = |b: &[u8]| {
-            s.clone_htod(&repack_q8_soa(b))
-                .map_err(|e| format!("htod: {e}"))
+        let weight = |b: &[u8]| -> Result<LayerWeight, String> {
+            let repacked = repack_q8_soa(b);
+            if resident {
+                Ok(LayerWeight::Vram(
+                    s.clone_htod(&repacked).map_err(|e| format!("htod: {e}"))?,
+                ))
+            } else {
+                Ok(LayerWeight::Host(repacked))
+            }
         };
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
         self.layers.push(ResidentLayer {
-            q: up_u8(q)?,
-            k: up_u8(kk)?,
-            v: up_u8(v)?,
-            o: up_u8(o)?,
-            gate: up_u8(gate)?,
-            up: up_u8(up)?,
-            down: up_u8(down)?,
+            q: weight(q)?,
+            k: weight(kk)?,
+            v: weight(v)?,
+            o: weight(o)?,
+            gate: weight(gate)?,
+            up: weight(up)?,
+            down: weight(down)?,
             attn_norm: up_f(attn_norm)?,
             ffn_norm: up_f(ffn_norm)?,
+        });
+        Ok(())
+    }
+
+    /// Allocate the shared offload scratch, sized to the largest layer's per-weight
+    /// bytes. Call after all layers are set, only when at least one is offloaded.
+    pub fn enable_offload_scratch(&mut self) -> Result<(), String> {
+        if self.offload_scratch.is_some() {
+            return Ok(());
+        }
+        let max_of = |pick: &dyn Fn(&ResidentLayer) -> usize| {
+            self.layers.iter().map(pick).max().unwrap_or(0)
+        };
+        let s = &self.k.stream;
+        let alloc = |n: usize| {
+            s.alloc_zeros::<u8>(n)
+                .map_err(|e| format!("scratch alloc: {e}"))
+        };
+        self.offload_scratch = Some(OffloadScratch {
+            q: alloc(max_of(&|l| l.q.byte_len()))?,
+            k: alloc(max_of(&|l| l.k.byte_len()))?,
+            v: alloc(max_of(&|l| l.v.byte_len()))?,
+            o: alloc(max_of(&|l| l.o.byte_len()))?,
+            gate: alloc(max_of(&|l| l.gate.byte_len()))?,
+            up: alloc(max_of(&|l| l.up.byte_len()))?,
+            down: alloc(max_of(&|l| l.down.byte_len()))?,
         });
         Ok(())
     }
@@ -1532,6 +1640,57 @@ impl CudaResidentDecode {
         }
 
         for li in 0..self.n_layers {
+            // Resolve this layer's seven projection weights to GPU slices. An
+            // offloaded layer (weights in host RAM) streams its repacked bytes into
+            // the shared scratch first; a resident layer uses its VRAM slice. The
+            // streaming is synchronous — no overlap with compute (Phase 2). The math
+            // is identical regardless of where the bytes came from.
+            let offloaded = matches!(self.layers[li].q, LayerWeight::Host(_));
+            if offloaded {
+                if let LayerWeight::Host(h) = &self.layers[li].q {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.q).map_err(map)?;
+                }
+                if let LayerWeight::Host(h) = &self.layers[li].k {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.k).map_err(map)?;
+                }
+                if let LayerWeight::Host(h) = &self.layers[li].v {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.v).map_err(map)?;
+                }
+                if let LayerWeight::Host(h) = &self.layers[li].o {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.o).map_err(map)?;
+                }
+                if let LayerWeight::Host(h) = &self.layers[li].gate {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.gate).map_err(map)?;
+                }
+                if let LayerWeight::Host(h) = &self.layers[li].up {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.up).map_err(map)?;
+                }
+                if let LayerWeight::Host(h) = &self.layers[li].down {
+                    let sc = self.offload_scratch.as_mut().expect("offload scratch");
+                    s.memcpy_htod(h.as_slice(), &mut sc.down).map_err(map)?;
+                }
+            }
+            let (wq, wk, wv, wo, wgate, wup, wdown): LayerWeightSlices = if offloaded {
+                let sc = self.offload_scratch.as_ref().expect("offload scratch");
+                (&sc.q, &sc.k, &sc.v, &sc.o, &sc.gate, &sc.up, &sc.down)
+            } else {
+                let l = &self.layers[li];
+                (
+                    l.q.vram(),
+                    l.k.vram(),
+                    l.v.vram(),
+                    l.o.vram(),
+                    l.gate.vram(),
+                    l.up.vram(),
+                    l.down.vram(),
+                )
+            };
             // attention norm + quantize
             launch_rmsnorm(
                 &s,
@@ -1558,7 +1717,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].q,
+                wq,
                 self.q_width,
                 hb,
                 &mut self.d_q,
@@ -1569,7 +1728,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].k,
+                wk,
                 self.kv_width,
                 hb,
                 &mut self.d_k,
@@ -1580,7 +1739,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].v,
+                wv,
                 self.kv_width,
                 hb,
                 &mut self.d_v,
@@ -1664,7 +1823,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].o,
+                wo,
                 self.hidden,
                 qb,
                 &mut self.d_proj,
@@ -1703,7 +1862,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].gate,
+                wgate,
                 self.ffn_dim,
                 hb,
                 &mut self.d_gate,
@@ -1714,7 +1873,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].up,
+                wup,
                 self.ffn_dim,
                 hb,
                 &mut self.d_up,
@@ -1743,7 +1902,7 @@ impl CudaResidentDecode {
                 &self.k.gemv,
                 &self.d_in_scales,
                 &self.d_in_quants,
-                &self.layers[li].down,
+                wdown,
                 self.hidden,
                 fb,
                 &mut self.d_proj,
@@ -2114,7 +2273,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.q,
+                layer.q.vram(),
                 q_width,
                 hb,
                 k,
@@ -2126,7 +2285,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.k,
+                layer.k.vram(),
                 kv_width,
                 hb,
                 k,
@@ -2138,7 +2297,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.v,
+                layer.v.vram(),
                 kv_width,
                 hb,
                 k,
@@ -2228,7 +2387,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.o,
+                layer.o.vram(),
                 hidden,
                 qb,
                 k,
@@ -2262,7 +2421,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.gate,
+                layer.gate.vram(),
                 ffn_dim,
                 hb,
                 k,
@@ -2274,7 +2433,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.up,
+                layer.up.vram(),
                 ffn_dim,
                 hb,
                 k,
@@ -2304,7 +2463,7 @@ impl CudaResidentDecode {
                 &self.k.gemm_batched,
                 &sc.vis,
                 &sc.viq,
-                &layer.down,
+                layer.down.vram(),
                 hidden,
                 fb,
                 k,
