@@ -773,7 +773,12 @@ impl CudaResidentDecode {
 
     /// Seed one layer's KV cache from CPU history. `ck`/`cv` hold positions
     /// `[0, position)` laid out `[kv_head][position'][head_dim]` (stride
-    /// `position`); they are placed at the GPU cache's `max_pos` stride. The CPU
+    /// `position`); they are written into the existing GPU cache buffers (stride
+    /// `max_pos`) in place. For each KV head, positions `[0, position)` are
+    /// contiguous in both layouts, so this is one host->device copy of
+    /// `position * head_dim` floats per head — `position * kv_width` total, not
+    /// the whole `max_pos`-sized buffer. (Re-uploading the full buffer made
+    /// seeding a 14-token prompt cost ~160 ms of pointless PCIe traffic.) The CPU
     /// history is already f16-rounded, so it is copied as-is.
     pub fn seed_layer(
         &mut self,
@@ -785,24 +790,22 @@ impl CudaResidentDecode {
         if layer >= self.n_layers {
             return Err("seed_layer: layer out of range".into());
         }
-        let hd = self.head_dim;
-        let mut full_k = vec![0f32; self.kv_width * self.max_pos];
-        let mut full_v = vec![0f32; self.kv_width * self.max_pos];
-        for h in 0..self.n_kv_heads {
-            for p in 0..position {
-                let src = (h * position + p) * hd;
-                let dst = (h * self.max_pos + p) * hd;
-                full_k[dst..dst + hd].copy_from_slice(&ck[src..src + hd]);
-                full_v[dst..dst + hd].copy_from_slice(&cv[src..src + hd]);
-            }
+        if position == 0 {
+            return Ok(());
         }
-        let s = &self.k.stream;
-        self.cache_k[layer] = s
-            .clone_htod(&full_k)
-            .map_err(|e| format!("seed htod: {e}"))?;
-        self.cache_v[layer] = s
-            .clone_htod(&full_v)
-            .map_err(|e| format!("seed htod: {e}"))?;
+        let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
+        let span = position * hd;
+        let s = self.k.stream.clone();
+        for h in 0..n_kv {
+            let hsrc = h * span; // host: head h's [0,position) block
+            let gdst = h * max_pos * hd; // gpu: head h's base (positions 0..)
+            let mut vk = self.cache_k[layer].slice_mut(gdst..gdst + span);
+            s.memcpy_htod(&ck[hsrc..hsrc + span], &mut vk)
+                .map_err(|e| format!("seed htod k: {e}"))?;
+            let mut vv = self.cache_v[layer].slice_mut(gdst..gdst + span);
+            s.memcpy_htod(&cv[hsrc..hsrc + span], &mut vv)
+                .map_err(|e| format!("seed htod v: {e}"))?;
+        }
         Ok(())
     }
 
@@ -811,8 +814,12 @@ impl CudaResidentDecode {
     /// `scale` = 1/sqrt(head_dim). With `compute_logits`, also runs the final
     /// norm + output projection + greedy argmax and returns the sampled token.
     /// One device sync at the end.
+    /// Run the full per-token forward on the GPU, leaving the final logits in
+    /// `d_logits` when `compute_logits`. Does NOT sample or sync — the public
+    /// wrappers (`forward_token` greedy, `forward_token_logits` sampling) add the
+    /// tail they need so the forward body is shared.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_token(
+    fn forward_pass(
         &mut self,
         embedding: &[f32],
         cos: &[f32],
@@ -820,7 +827,7 @@ impl CudaResidentDecode {
         position: usize,
         scale: f32,
         compute_logits: bool,
-    ) -> Result<Option<u32>, String> {
+    ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
         let hb = self.hidden / 32; // hidden blocks
@@ -1060,10 +1067,9 @@ impl CudaResidentDecode {
         }
 
         if !compute_logits {
-            self.k.ctx.synchronize().map_err(map)?;
-            return Ok(None);
+            return Ok(());
         }
-        // final norm + output projection + greedy argmax
+        // final norm + output projection -> d_logits (no argmax / no sync here).
         launch_rmsnorm(
             &s,
             &self.k.rms_norm,
@@ -1094,6 +1100,28 @@ impl CudaResidentDecode {
             &mut self.d_logits,
         )
         .map_err(map)?;
+        Ok(())
+    }
+
+    /// Greedy decode: full forward + GPU argmax. Returns the sampled token id, or
+    /// `None` when logits were not requested. One device sync at the end.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+        compute_logits: bool,
+    ) -> Result<Option<u32>, String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
+        let s = self.k.stream.clone();
+        self.forward_pass(embedding, cos, sin, position, scale, compute_logits)?;
+        if !compute_logits {
+            self.k.ctx.synchronize().map_err(map)?;
+            return Ok(None);
+        }
         launch_argmax(
             &s,
             &self.k.argmax,
@@ -1106,6 +1134,28 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(Some(out[0]))
+    }
+
+    /// Sampling decode: full forward on the GPU, returns the full f32 logits row
+    /// so the CPU sampler can apply temperature / top-p / top-k. This keeps the
+    /// whole layer stack on the GPU for non-greedy generation (the chat UI's
+    /// default), instead of falling back to the CPU layer loop. One device sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_token_logits(
+        &mut self,
+        embedding: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        position: usize,
+        scale: f32,
+    ) -> Result<Vec<f32>, String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
+        let s = self.k.stream.clone();
+        self.forward_pass(embedding, cos, sin, position, scale, true)?;
+        let mut logits = vec![0f32; self.vocab];
+        s.memcpy_dtoh(&self.d_logits, &mut logits).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(logits)
     }
 }
 

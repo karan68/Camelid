@@ -1424,8 +1424,6 @@ pub struct LlamaInferenceSession {
     resident_decode: Option<metal::ResidentDecodeState>,
     /// CUDA analog of `resident_decode` (the GPU-resident decode engine on
     /// NVIDIA hardware). Same transient-cache role; skipped by Clone/PartialEq/Debug.
-    #[cfg(feature = "cuda")]
-    resident_decode_cuda: Option<crate::cuda_resident::CudaResidentDecode>,
     /// When set, the session never takes the GPU-resident prefill/decode paths, keeping the
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
@@ -1460,8 +1458,6 @@ impl LlamaInferenceSession {
                 },
             ),
             resident_decode: self.resident_decode.take(),
-            #[cfg(feature = "cuda")]
-            resident_decode_cuda: self.resident_decode_cuda.take(),
             resident_paths_disabled: self.resident_paths_disabled,
             execution_trace: self.execution_trace.take(),
         }
@@ -1485,8 +1481,6 @@ impl Clone for LlamaInferenceSession {
             weights: self.weights.clone(),
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
-            #[cfg(feature = "cuda")]
-            resident_decode_cuda: None,
             resident_paths_disabled: self.resident_paths_disabled,
             execution_trace: None,
         }
@@ -1524,8 +1518,6 @@ impl LlamaInferenceSession {
             weights,
             kv_cache: LlamaKvCache::new(plan)?,
             resident_decode: None,
-            #[cfg(feature = "cuda")]
-            resident_decode_cuda: None,
             resident_paths_disabled: false,
             execution_trace: None,
         })
@@ -1924,9 +1916,12 @@ impl LlamaInferenceSession {
         if !self.resident_decode_eligible(compute_logits)? {
             return Ok(None);
         }
-        // The CUDA engine implements the GPU-sampled greedy decode tail only; prefill-hidden
-        // threading and logits-readback variants stay on the CPU/general path.
-        if !compute_logits || gpu_sample_token.is_none() {
+        // The CUDA engine runs the whole forward on the GPU and produces logits;
+        // it serves both greedy decode (GPU argmax -> sampled token) and sampling
+        // (returns the full logits row for the CPU temperature/top-p/top-k
+        // sampler). Only the hidden-state-threading variant (compute_logits =
+        // false) stays on the CPU path.
+        if !compute_logits {
             return Ok(None);
         }
         let weights = Arc::clone(&self.weights);
@@ -2000,18 +1995,34 @@ impl LlamaInferenceSession {
             t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
         }
 
-        let rebuild = match &self.resident_decode_cuda {
-            Some(s) => s.filled() != position || !s.weights_ready(),
-            None => true,
-        };
-        if rebuild {
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        // The resident engine (compiled kernels + uploaded weights + GPU KV cache)
+        // lives in a process-global cache, not the session: the API server clones a
+        // fresh session per request and Clone cannot duplicate GPU buffers, so a
+        // per-session engine rebuilt (recompiled kernels + re-uploaded ~GBs of
+        // weights) on every request. Keyed by the model's weight identity, the
+        // global engine is built once and reused across every request and chat
+        // turn; the lock is held only for this one token's forward. Steady-state
+        // decode was already fast (~54 tok/s); this removes the ~0.5s cold rebuild
+        // that made short replies feel slow.
+        let key = Arc::as_ptr(&weights) as *const () as usize;
+        let cache = resident_cuda_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let need_build = guard
+            .as_ref()
+            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+        let build_started = std::time::Instant::now();
+        if need_build {
             let mut engine = match CudaResidentDecode::new(
                 n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, kv_cap, vocab,
                 rms_eps,
             ) {
                 Ok(e) => e,
                 Err(e) => {
-                    if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    if trace {
                         eprintln!("[resident-cuda] engine new failed: {e}");
                     }
                     return Ok(None);
@@ -2031,7 +2042,7 @@ impl LlamaInferenceSession {
                         (q, k, v, o, g, u, d)
                     }
                     _ => {
-                        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                        if trace {
                             eprintln!("[resident-cuda] layer weight not q8_0_blocks (wire-page mmap?); falling back");
                         }
                         return Ok(None);
@@ -2064,7 +2075,24 @@ impl LlamaInferenceSession {
             {
                 return Ok(None);
             }
-            // Seed the GPU KV cache from the CPU prefill history [0, position).
+            *guard = Some(ResidentCudaSlot { key, engine });
+            if trace {
+                eprintln!(
+                    "[resident-cuda] built engine (weights uploaded) in {} ms",
+                    build_started.elapsed().as_millis()
+                );
+            }
+        }
+
+        let slot = guard.as_mut().expect("resident CUDA engine built above");
+
+        // (Re)seed the GPU KV cache from the CPU history [0, position) when
+        // starting or resuming a sequence at a position the engine has not
+        // materialized (a fresh build, or a new turn after CPU prefill). During
+        // steady decode `filled == position`, so this is skipped.
+        let need_seed = slot.engine.filled() != position;
+        let seed_started = std::time::Instant::now();
+        if need_seed {
             if position > 0 {
                 let kv_dim = n_kv * head_dim;
                 for layer in 0..n_layers {
@@ -2080,46 +2108,70 @@ impl LlamaInferenceSession {
                                 .copy_from_slice(&self.kv_cache.values[src..src + head_dim]);
                         }
                     }
-                    if engine.seed_layer(layer, &ck, &cv, position).is_err() {
+                    if slot.engine.seed_layer(layer, &ck, &cv, position).is_err() {
                         return Ok(None);
                     }
                 }
             }
-            engine.set_filled(position);
-            self.resident_decode_cuda = Some(engine);
-            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-                eprintln!("[resident-cuda] rebuilt+seeded engine at position {position}");
+            slot.engine.set_filled(position);
+            if trace {
+                eprintln!(
+                    "[resident-cuda] seeded KV at position {position} in {} ms",
+                    seed_started.elapsed().as_millis()
+                );
             }
         }
 
-        let engine = self
-            .resident_decode_cuda
-            .as_mut()
-            .expect("resident CUDA session built above");
-        let token = match engine.forward_token(
-            &embedding.data,
-            &tables.cos,
-            &tables.sin,
-            position,
-            scale,
-            true,
-        ) {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-                    eprintln!("[resident-cuda] forward_token None at {position} (fallback)");
+        // Greedy callers (`gpu_sample_token` set) take the GPU argmax tail and get a
+        // sampled token; everyone else (the chat UI's temperature/top-p sampling)
+        // gets the full logits row back to sample on the CPU — both keep the entire
+        // layer stack on the GPU.
+        let forward = if gpu_sample_token.is_some() {
+            match slot.engine.forward_token(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+                true,
+            ) {
+                Ok(Some(id)) => ResidentForward::Sampled(id),
+                Ok(None) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token None at {position} (fallback)");
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token err at {position}: {e}");
+                    }
+                    return Ok(None);
+                }
             }
-            Err(e) => {
-                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-                    eprintln!("[resident-cuda] forward_token err at {position}: {e}");
+        } else {
+            match slot.engine.forward_token_logits(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+            ) {
+                Ok(logits) => ResidentForward::Logits(CpuTensor::from_f32(
+                    "resident_logits",
+                    vec![1, vocab],
+                    logits,
+                )?),
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token_logits err at {position}: {e}");
+                    }
+                    return Ok(None);
                 }
-                return Ok(None);
             }
         };
-        engine.set_filled(position + 1);
-        Ok(Some(ResidentForward::Sampled(token)))
+        slot.engine.set_filled(position + 1);
+        Ok(Some(forward))
     }
 
     #[cfg(not(feature = "cuda"))]
@@ -8907,6 +8959,24 @@ fn q8_0_metal_enabled() -> bool {
 fn resident_decode_metal_enabled() -> bool {
     !deterministic_mode_enabled()
         && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+}
+
+/// Process-global resident CUDA engine, keyed by the model's weight identity.
+/// The engine holds compiled kernels, the uploaded weights, and the GPU KV
+/// cache; it is built once and reused across every request and chat turn (the
+/// API server clones a fresh session per request, so this can't live in the
+/// session). The mutex is held only for a single token's forward.
+#[cfg(feature = "cuda")]
+struct ResidentCudaSlot {
+    key: usize,
+    engine: crate::cuda_resident::CudaResidentDecode,
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 /// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On
