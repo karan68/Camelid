@@ -446,6 +446,158 @@ extern "C" __global__ void sample_gumbel(
     }
     if (tid == 0) out_idx[0] = (unsigned int)sidx[0];
 }
+
+// ---- Batched (K-token) variants for the speculative-verify forward ----------
+// Each processes K tokens laid out [token][...] in one launch. Elementwise
+// kernels (quantize/silu/residual) are batched just by launching over K x the
+// work, so only the per-token ops below need dedicated variants.
+
+// One block per token; staged-shared serial sum (matches rms_norm_f32 order).
+extern "C" __global__ void rms_norm_batched(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    float* __restrict__ out, int n, float eps, int k_tokens
+) {
+    int t = blockIdx.x;
+    if (t >= k_tokens) return;
+    const float* xt = x + (long)t * n;
+    float* outt = out + (long)t * n;
+    extern __shared__ float xs[];
+    __shared__ float s_scale;
+    int tid = threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = xt[i];
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += xs[i] * xs[i];
+        s_scale = 1.0f / sqrtf(sum / (float)n + eps);
+    }
+    __syncthreads();
+    float sc = s_scale;
+    for (int i = tid; i < n; i += blockDim.x) outt[i] = xs[i] * sc * weight[i];
+}
+
+// RoPE for K tokens; cos/sin are per-token tables [token][rope_dim/2].
+extern "C" __global__ void rope_batched(
+    float* __restrict__ vec, const float* __restrict__ cos_t, const float* __restrict__ sin_t,
+    int n_heads, int head_dim, int rope_dim, int per_token_dim, int half, int k_tokens
+) {
+    int pairs = rope_dim >> 1;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = k_tokens * n_heads * pairs;
+    if (idx >= total) return;
+    int t = idx / (n_heads * pairs);
+    int rem = idx % (n_heads * pairs);
+    int head = rem / pairs;
+    int pair = rem % pairs;
+    float c = cos_t[(long)t * half + pair], s = sin_t[(long)t * half + pair];
+    float* h = vec + (long)t * per_token_dim + (long)head * head_dim;
+    int d0 = 2 * pair, d1 = d0 + 1;
+    float x0 = h[d0], x1 = h[d1];
+    h[d0] = x0 * c - x1 * s;
+    h[d1] = x0 * s + x1 * c;
+}
+
+// Scatter K tokens' K/V into the cache at consecutive positions base..base+K-1.
+extern "C" __global__ void kv_scatter_batched(
+    const float* __restrict__ src, float* __restrict__ cache, int base_position,
+    int n_kv_heads, int head_dim, int max_pos, int per_token_dim, int k_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = k_tokens * n_kv_heads * head_dim;
+    if (idx >= total) return;
+    int t = idx / (n_kv_heads * head_dim);
+    int rem = idx % (n_kv_heads * head_dim);
+    int kv_head = rem / head_dim;
+    int d = rem % head_dim;
+    int position = base_position + t;
+    float v = f16_round(src[(long)t * per_token_dim + (long)kv_head * head_dim + d]);
+    cache[((long)kv_head * max_pos + position) * head_dim + d] = v;
+}
+
+// Causal attention for K tokens: token t (at position base+t) attends [0, base+t].
+// One block per (token, query head). Shared sized for the longest prefix (base+K).
+extern "C" __global__ void attention_batched(
+    const float* __restrict__ q, const float* __restrict__ cache_k,
+    const float* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
+    int q_per_token, int k_tokens
+) {
+    int t = blockIdx.x / n_heads;
+    int head = blockIdx.x % n_heads;
+    if (t >= k_tokens) return;
+    int position_count = base_position + t + 1;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)t * q_per_token + (long)head * head_dim;
+    const float* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const float* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+
+    extern __shared__ float shared[];
+    float* qsh = shared;               // head_dim
+    float* scores = shared + head_dim; // position_count
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x) {
+        const float* kp = kbase + (long)p * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * kp[d];
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int p = 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int p = tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < position_count; p++) sum += scores[p];
+        s_sum = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int p = 0; p < position_count; p++)
+            acc += (scores[p] * inv) * vbase[(long)p * head_dim + d];
+        out[(long)t * q_per_token + (long)head * head_dim + d] = acc;
+    }
+}
+
+// Argmax of each of K logit rows (one block per token). Strict-greater, lowest
+// index — the greedy choice used to verify drafts.
+extern "C" __global__ void argmax_batched(
+    const float* __restrict__ logits, int n, int k_tokens, unsigned int* __restrict__ out
+) {
+    int t = blockIdx.x;
+    if (t >= k_tokens) return;
+    const float* lt = logits + (long)t * n;
+    extern __shared__ float sh[];
+    float* sval = sh;
+    int* sidx = (int*)(sh + blockDim.x);
+    int tid = threadIdx.x;
+    float best = -3.4e38f; int besti = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        if (lt[i] > best) { best = lt[i]; besti = i; }
+    }
+    sval[tid] = best; sidx[tid] = besti;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) {
+            float ov = sval[tid + s]; int oi = sidx[tid + s];
+            if (ov > sval[tid] || (ov == sval[tid] && oi < sidx[tid])) {
+                sval[tid] = ov; sidx[tid] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) out[t] = (unsigned int)sidx[0];
+}
 "#;
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -468,6 +620,11 @@ pub struct CudaResidentKernels {
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
+    pub(crate) rms_norm_batched: CudaFunction,
+    pub(crate) rope_batched: CudaFunction,
+    pub(crate) kv_scatter_batched: CudaFunction,
+    pub(crate) attention_batched: CudaFunction,
+    pub(crate) argmax_batched: CudaFunction,
 }
 
 impl CudaResidentKernels {
@@ -502,6 +659,11 @@ impl CudaResidentKernels {
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
             gemm_batched: f("q8_gemm_batched")?,
+            rms_norm_batched: f("rms_norm_batched")?,
+            rope_batched: f("rope_batched")?,
+            kv_scatter_batched: f("kv_scatter_batched")?,
+            attention_batched: f("attention_batched")?,
+            argmax_batched: f("argmax_batched")?,
             ctx,
             stream,
         })
@@ -640,6 +802,177 @@ fn launch_gemm_batched(
         .arg(&bpr)
         .arg(&kt)
         .arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_rms_norm_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (k as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (n as u32) * 4,
+    };
+    let (n_i, k_i) = (n as i32, k as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(w).arg(out).arg(&n_i).arg(&eps).arg(&k_i);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_rope_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    vec: &mut CudaSlice<f32>,
+    cos: &CudaSlice<f32>,
+    sin: &CudaSlice<f32>,
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    per_token_dim: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let half = rope_dim / 2;
+    let total = (k * n_heads * half) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nh, hd, rd, ptd, hf, ki) = (
+        n_heads as i32,
+        head_dim as i32,
+        rope_dim as i32,
+        per_token_dim as i32,
+        half as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(vec)
+        .arg(cos)
+        .arg(sin)
+        .arg(&nh)
+        .arg(&hd)
+        .arg(&rd)
+        .arg(&ptd)
+        .arg(&hf)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_kv_scatter_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    cache: &mut CudaSlice<f32>,
+    base_position: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+    per_token_dim: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (k * n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (bp, nkv, hd, mp, ptd, ki) = (
+        base_position as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        per_token_dim as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(src)
+        .arg(cache)
+        .arg(&bp)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&mp)
+        .arg(&ptd)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<f32>,
+    cache_v: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    base_position: usize,
+    max_pos: usize,
+    scale: f32,
+    q_per_token: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    // Shared = query (head_dim) + scores (longest prefix = base + k).
+    let shared = ((head_dim + base_position + k) as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim: ((k * n_heads) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    let (nh, nkv, hd, bp, mp, qpt, ki) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        base_position as i32,
+        max_pos as i32,
+        q_per_token as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(q)
+        .arg(cache_k)
+        .arg(cache_v)
+        .arg(out)
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&bp)
+        .arg(&mp)
+        .arg(&scale)
+        .arg(&qpt)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+fn launch_argmax_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    logits: &CudaSlice<f32>,
+    n: usize,
+    k: usize,
+    out: &mut CudaSlice<u32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (k as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 8,
+    };
+    let (n_i, k_i) = (n as i32, k as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(logits).arg(&n_i).arg(&k_i).arg(out);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -871,6 +1204,32 @@ pub struct CudaResidentDecode {
     d_sampled: CudaSlice<u32>,
     d_cos: CudaSlice<f32>,
     d_sin: CudaSlice<f32>,
+    /// Lazily-allocated K-batched scratch for the speculative-verify forward.
+    verify_scratch: Option<VerifyScratch>,
+}
+
+/// Max draft tokens verified per speculative round (the batched GEMM's register
+/// array bounds this).
+const MAX_VERIFY_K: usize = 8;
+
+/// K-batched scratch buffers for `verify_batch`, sized `MAX_VERIFY_K * dim`.
+struct VerifyScratch {
+    vh: CudaSlice<f32>,
+    vn: CudaSlice<f32>,
+    viq: CudaSlice<i8>,
+    vis: CudaSlice<f32>,
+    vq: CudaSlice<f32>,
+    vk: CudaSlice<f32>,
+    vv: CudaSlice<f32>,
+    vattn: CudaSlice<f32>,
+    vproj: CudaSlice<f32>,
+    vgate: CudaSlice<f32>,
+    vup: CudaSlice<f32>,
+    vact: CudaSlice<f32>,
+    vlogits: CudaSlice<f32>,
+    vsamp: CudaSlice<u32>,
+    vcos: CudaSlice<f32>,
+    vsin: CudaSlice<f32>,
 }
 
 impl CudaResidentDecode {
@@ -938,6 +1297,7 @@ impl CudaResidentDecode {
             d_sampled: s.alloc_zeros::<u32>(1).map_err(|e| format!("alloc: {e}"))?,
             d_cos: alloc_f(rope_dim / 2)?,
             d_sin: alloc_f(rope_dim / 2)?,
+            verify_scratch: None,
             k,
         })
     }
@@ -1453,6 +1813,369 @@ impl CudaResidentDecode {
             .synchronize()
             .map_err(|e| format!("cuda prefill sync: {e}"))?;
         Ok(())
+    }
+
+    /// Speculative-verify forward: run `k` tokens at consecutive positions
+    /// `[base_position, base_position+k)` through the whole model in one batched
+    /// pass and return the greedy argmax at each position. Each weight is read
+    /// once and reused across the `k` tokens (via `q8_gemm_batched`), so this is
+    /// much cheaper than `k` separate `forward_token` calls. The K tokens' K/V are
+    /// written to the cache at their positions; the caller decides how many to
+    /// keep (accepted prefix) and rewinds `filled`/position accordingly. One sync.
+    /// `embeddings` is `k*hidden`; `cos_all`/`sin_all` are per-token RoPE tables
+    /// (`k*rope_dim/2`). `k` must be in `1..=MAX_VERIFY_K`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Result<Vec<u32>, String> {
+        if k == 0 || k > MAX_VERIFY_K {
+            return Err(format!("verify_batch: k={k} out of 1..={MAX_VERIFY_K}"));
+        }
+        let map = |e: cudarc::driver::DriverError| format!("cuda verify: {e}");
+        let (hidden, q_width, kv_width, ffn_dim, vocab) = (
+            self.hidden,
+            self.q_width,
+            self.kv_width,
+            self.ffn_dim,
+            self.vocab,
+        );
+        let (head_dim, n_heads, n_kv, rope_dim, max_pos, eps) = (
+            self.head_dim,
+            self.n_heads,
+            self.n_kv_heads,
+            self.rope_dim,
+            self.max_pos,
+            self.eps,
+        );
+        let half = rope_dim / 2;
+        let (hb, qb, fb) = (hidden / 32, q_width / 32, ffn_dim / 32);
+        if embeddings.len() < k * hidden || cos_all.len() < k * half || sin_all.len() < k * half {
+            return Err("verify_batch: input slices too short".into());
+        }
+        if self.verify_scratch.is_none() {
+            let st = &self.k.stream;
+            let mk = MAX_VERIFY_K;
+            let max_in = hidden.max(q_width).max(ffn_dim);
+            let af = |n: usize| {
+                st.alloc_zeros::<f32>(n)
+                    .map_err(|e| format!("verify alloc: {e}"))
+            };
+            self.verify_scratch = Some(VerifyScratch {
+                vh: af(mk * hidden)?,
+                vn: af(mk * hidden)?,
+                viq: st
+                    .alloc_zeros::<i8>(mk * max_in)
+                    .map_err(|e| format!("verify alloc: {e}"))?,
+                vis: af(mk * (max_in / 32))?,
+                vq: af(mk * q_width)?,
+                vk: af(mk * kv_width)?,
+                vv: af(mk * kv_width)?,
+                vattn: af(mk * q_width)?,
+                vproj: af(mk * hidden)?,
+                vgate: af(mk * ffn_dim)?,
+                vup: af(mk * ffn_dim)?,
+                vact: af(mk * ffn_dim)?,
+                vlogits: af(mk * vocab)?,
+                vsamp: st
+                    .alloc_zeros::<u32>(mk)
+                    .map_err(|e| format!("verify alloc: {e}"))?,
+                vcos: af(mk * half)?,
+                vsin: af(mk * half)?,
+            });
+        }
+        let s = self.k.stream.clone();
+        let mut sc = self.verify_scratch.take().expect("allocated above");
+
+        s.memcpy_htod(
+            &embeddings[..k * hidden],
+            &mut sc.vh.slice_mut(0..k * hidden),
+        )
+        .map_err(map)?;
+        s.memcpy_htod(&cos_all[..k * half], &mut sc.vcos.slice_mut(0..k * half))
+            .map_err(map)?;
+        s.memcpy_htod(&sin_all[..k * half], &mut sc.vsin.slice_mut(0..k * half))
+            .map_err(map)?;
+
+        for li in 0..self.n_layers {
+            let layer = &self.layers[li];
+            launch_rms_norm_batched(
+                &s,
+                &self.k.rms_norm_batched,
+                &sc.vh,
+                &layer.attn_norm,
+                &mut sc.vn,
+                hidden,
+                eps,
+                k,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vn,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * hb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.q,
+                q_width,
+                hb,
+                k,
+                &mut sc.vq,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.k,
+                kv_width,
+                hb,
+                k,
+                &mut sc.vk,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.v,
+                kv_width,
+                hb,
+                k,
+                &mut sc.vv,
+            )
+            .map_err(map)?;
+            launch_rope_batched(
+                &s,
+                &self.k.rope_batched,
+                &mut sc.vq,
+                &sc.vcos,
+                &sc.vsin,
+                n_heads,
+                head_dim,
+                rope_dim,
+                q_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_rope_batched(
+                &s,
+                &self.k.rope_batched,
+                &mut sc.vk,
+                &sc.vcos,
+                &sc.vsin,
+                n_kv,
+                head_dim,
+                rope_dim,
+                kv_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_kv_scatter_batched(
+                &s,
+                &self.k.kv_scatter_batched,
+                &sc.vk,
+                &mut self.cache_k[li],
+                base_position,
+                n_kv,
+                head_dim,
+                max_pos,
+                kv_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_kv_scatter_batched(
+                &s,
+                &self.k.kv_scatter_batched,
+                &sc.vv,
+                &mut self.cache_v[li],
+                base_position,
+                n_kv,
+                head_dim,
+                max_pos,
+                kv_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_attention_batched(
+                &s,
+                &self.k.attention_batched,
+                &sc.vq,
+                &self.cache_k[li],
+                &self.cache_v[li],
+                &mut sc.vattn,
+                n_heads,
+                n_kv,
+                head_dim,
+                base_position,
+                max_pos,
+                scale,
+                q_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vattn,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * qb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.o,
+                hidden,
+                qb,
+                k,
+                &mut sc.vproj,
+            )
+            .map_err(map)?;
+            launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+                .map_err(map)?;
+            launch_rms_norm_batched(
+                &s,
+                &self.k.rms_norm_batched,
+                &sc.vh,
+                &layer.ffn_norm,
+                &mut sc.vn,
+                hidden,
+                eps,
+                k,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vn,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * hb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.gate,
+                ffn_dim,
+                hb,
+                k,
+                &mut sc.vgate,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.up,
+                ffn_dim,
+                hb,
+                k,
+                &mut sc.vup,
+            )
+            .map_err(map)?;
+            launch_silu_mul(
+                &s,
+                &self.k.silu_mul,
+                &sc.vgate,
+                &sc.vup,
+                &mut sc.vact,
+                k * ffn_dim,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vact,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * fb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.down,
+                hidden,
+                fb,
+                k,
+                &mut sc.vproj,
+            )
+            .map_err(map)?;
+            launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+                .map_err(map)?;
+        }
+        launch_rms_norm_batched(
+            &s,
+            &self.k.rms_norm_batched,
+            &sc.vh,
+            &self.final_norm,
+            &mut sc.vn,
+            hidden,
+            eps,
+            k,
+        )
+        .map_err(map)?;
+        launch_quantize(
+            &s,
+            &self.k.quantize,
+            &sc.vn,
+            &mut sc.viq,
+            &mut sc.vis,
+            k * hb,
+        )
+        .map_err(map)?;
+        launch_gemm_batched(
+            &s,
+            &self.k.gemm_batched,
+            &sc.vis,
+            &sc.viq,
+            &self.output_weight,
+            vocab,
+            hb,
+            k,
+            &mut sc.vlogits,
+        )
+        .map_err(map)?;
+        launch_argmax_batched(
+            &s,
+            &self.k.argmax_batched,
+            &sc.vlogits,
+            vocab,
+            k,
+            &mut sc.vsamp,
+        )
+        .map_err(map)?;
+        let mut out = vec![0u32; MAX_VERIFY_K];
+        s.memcpy_dtoh(&sc.vsamp, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        out.truncate(k);
+        self.verify_scratch = Some(sc);
+        Ok(out)
     }
 }
 

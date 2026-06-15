@@ -428,6 +428,116 @@ fn gemm_batched_matches_per_token() {
 
 #[test]
 #[ignore = "requires a CUDA device"]
+fn verify_batch_matches_sequential() {
+    if kernels().is_none() {
+        return;
+    }
+    let n_layers = 2usize;
+    let hidden = 64usize;
+    let n_heads = 2usize;
+    let n_kv = 1usize;
+    let head_dim = 32usize;
+    let rope_dim = 32usize;
+    let ffn = 128usize;
+    let vocab = 96usize;
+    let max_pos = 16usize;
+    let eps = 1e-5f32;
+    let base = 10000f32;
+    let q_width = n_heads * head_dim;
+    let kv_width = n_kv * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut rng = Lcg(0x13579);
+    let rand = |rng: &mut Lcg, n: usize| (0..n).map(|_| rng.next_f32()).collect::<Vec<f32>>();
+    struct L {
+        q: Vec<u8>,
+        k: Vec<u8>,
+        v: Vec<u8>,
+        o: Vec<u8>,
+        gate: Vec<u8>,
+        up: Vec<u8>,
+        down: Vec<u8>,
+        an: Vec<f32>,
+        fnv: Vec<f32>,
+    }
+    let layers: Vec<L> = (0..n_layers)
+        .map(|_| L {
+            q: quantize_blocks(&rand(&mut rng, q_width * hidden), hidden),
+            k: quantize_blocks(&rand(&mut rng, kv_width * hidden), hidden),
+            v: quantize_blocks(&rand(&mut rng, kv_width * hidden), hidden),
+            o: quantize_blocks(&rand(&mut rng, hidden * q_width), q_width),
+            gate: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
+            up: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
+            down: quantize_blocks(&rand(&mut rng, hidden * ffn), ffn),
+            an: rand(&mut rng, hidden)
+                .iter()
+                .map(|v| v * 0.2 + 1.0)
+                .collect(),
+            fnv: rand(&mut rng, hidden)
+                .iter()
+                .map(|v| v * 0.2 + 1.0)
+                .collect(),
+        })
+        .collect();
+    let final_norm: Vec<f32> = rand(&mut rng, hidden)
+        .iter()
+        .map(|v| v * 0.2 + 1.0)
+        .collect();
+    let output_w = quantize_blocks(&rand(&mut rng, vocab * hidden), hidden);
+    let build = || {
+        let mut e = CudaResidentDecode::new(
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps,
+        )
+        .unwrap();
+        for l in &layers {
+            e.set_layer(
+                &l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down, &l.an, &l.fnv,
+            )
+            .unwrap();
+        }
+        e.set_output(&final_norm, &output_w).unwrap();
+        e
+    };
+    let ktok = 4usize;
+    let pairs = rope_dim / 2;
+    let mut embs = vec![0f32; ktok * hidden];
+    let mut cos_all = vec![0f32; ktok * pairs];
+    let mut sin_all = vec![0f32; ktok * pairs];
+    let mut per_emb = Vec::new();
+    for t in 0..ktok {
+        let emb = rand(&mut rng, hidden);
+        embs[t * hidden..(t + 1) * hidden].copy_from_slice(&emb);
+        per_emb.push(emb);
+        for p in 0..pairs {
+            let theta = base.powf(-(2.0 * p as f32) / rope_dim as f32);
+            cos_all[t * pairs + p] = (t as f32 * theta).cos();
+            sin_all[t * pairs + p] = (t as f32 * theta).sin();
+        }
+    }
+    // Sequential forward_token at positions 0..ktok (the proven single-token path).
+    let mut seq = build();
+    let mut expected = Vec::new();
+    for t in 0..ktok {
+        let cos = &cos_all[t * pairs..(t + 1) * pairs];
+        let sin = &sin_all[t * pairs..(t + 1) * pairs];
+        let tok = seq
+            .forward_token(&per_emb[t], cos, sin, t, scale, true)
+            .unwrap()
+            .unwrap();
+        expected.push(tok);
+    }
+    // Batched verify over the same K tokens.
+    let mut bat = build();
+    let got = bat
+        .verify_batch(&embs, &cos_all, &sin_all, 0, ktok, scale)
+        .unwrap();
+    assert_eq!(
+        got, expected,
+        "verify_batch tokens != sequential forward_token"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
 fn quantize_q8_0_matches_cpu() {
     let Some(k) = kernels() else {
         return;
