@@ -102,10 +102,28 @@ pub(crate) fn vec_dot_f32(x: &[f32], y: &[f32]) -> f32 {
         acc[0][l] += acc[1][l];
     }
     let mut sumf = (acc[0][0] + acc[0][1]) + (acc[0][2] + acc[0][3]);
-    for k in np..n {
-        // the reference's scalar leftover `sumf += x[i]*y[i]` contracts to a
-        // fused fmadd under clang's default -ffp-contract=on
-        sumf = x[k].mul_add(y[k], sumf);
+    // The reference's scalar-leftover loop `for(i=np;i<n) sumf += x[i]*y[i]`
+    // is AUTO-VECTORIZED by clang (-O2) into a hybrid — disassembled from the
+    // pinned build's kernel object: the 4-aligned bulk (`L & !3` elements)
+    // runs as `fmul` then sequential `fadd` (NON-fused, two roundings, in
+    // element order), and only the final `L & 3` scalar remainder is a
+    // contracted `fmadd` (fused, one rounding). Matching just one of the two
+    // forms is wrong: head-dim reductions have zero leftovers, the single
+    // leftover at n_kv 17/273 is pure-fused (L&3==1) — which is why earlier
+    // phases passed — but n_kv 297/553 (L==9 → 8 non-fused + 1 fused) needs
+    // both. (Reproduced bit-for-bit by a clang -O2 micro-harness;
+    // scripts/dg-kqv-elem.cpp.) This mirrors a specific clang codegen, so it
+    // is pinned to the reference build's compiler.
+    let l = n - np;
+    let lead = np + (l & !3);
+    for k in np..lead {
+        // non-fused: Rust never contracts `+=` to fma, so this is the
+        // two-rounding f32 multiply-then-add that matches clang's fmul+fadd
+        // lanes (NOT x.mul_add(y, sumf), which would be one rounding)
+        sumf += x[k] * y[k];
+    }
+    for k in lead..n {
+        sumf = x[k].mul_add(y[k], sumf); // fused scalar tail
     }
     sumf
 }
@@ -574,6 +592,57 @@ mod tests {
             .map(|(&a, &b)| (a as f64) * (b as f64))
             .sum();
         assert!((tree as f64 - naive).abs() < 1e-5);
+    }
+
+    /// Phase 5 attention-reduction diagnostic: vec_dot_f32 and softmax_row
+    /// vs the exact ggml NEON kernels (scripts/dg-vec-dump.cpp) at several
+    /// n_kv lengths incl. hello 273 and story 297. Env CAMELID_DG_VEC_REF.
+    #[test]
+    fn vec_kernels_match_ggml_neon_across_lengths() {
+        let Ok(dir) = std::env::var("CAMELID_DG_VEC_REF") else {
+            eprintln!("skipping: CAMELID_DG_VEC_REF not set");
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let rd = |p: std::path::PathBuf| std::fs::read(p).unwrap();
+        let f32v = |b: &[u8]| -> Vec<f32> {
+            b.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        };
+        for n in [
+            256usize, 273, 288, 296, 297, 304, 305, 512, 528, 540, 544, 549, 552, 553, 560,
+        ] {
+            // vec_dot
+            let raw = rd(dir.join(format!("vecdot-{n}.bin")));
+            let x = f32v(&raw[..n * 4]);
+            let y = f32v(&raw[n * 4..n * 8]);
+            let want =
+                f32::from_le_bytes([raw[n * 8], raw[n * 8 + 1], raw[n * 8 + 2], raw[n * 8 + 3]]);
+            let got = vec_dot_f32(&x, &y);
+            eprintln!(
+                "vecdot n={n}: {} (got={got:.9e} want={want:.9e})",
+                if got.to_bits() == want.to_bits() {
+                    "BIT-EXACT"
+                } else {
+                    "DIVERGES"
+                }
+            );
+            // softmax
+            let sraw = rd(dir.join(format!("softmax-{n}.bin")));
+            let mut sx = f32v(&sraw[..n * 4]);
+            let sout = f32v(&sraw[n * 4..n * 8]);
+            softmax_row(&mut sx);
+            let sbad = sx
+                .iter()
+                .zip(&sout)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            eprintln!(
+                "softmax n={n}: {} ({sbad}/{n} differ)",
+                if sbad == 0 { "BIT-EXACT" } else { "DIVERGES" }
+            );
+        }
     }
 
     #[test]

@@ -130,6 +130,9 @@ int main(int argc, char ** argv) {
     int   held          = 0;
     bool  finished      = false;
     int   executed      = 0;
+    // Diagnostic-only executed-step cap (does NOT change the t-schedule, which
+    // is driven by S): stop after this many steps for the block-1 logit ladder.
+    const int cap = getenv("DG_EB_CAP") ? atoi(getenv("DG_EB_CAP")) : 0;
 
     for (int32_t cur_step = S; cur_step >= 1 && !finished; --cur_step) {
         const int32_t step_idx = S - cur_step;
@@ -143,6 +146,13 @@ int main(int argc, char ** argv) {
             batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = 0;
             batch.logits[i]    = 1;
+        }
+        // DG-FORENSICS: optionally force pure stateless UNIFIED per step (clear
+        // KV memory + pin PKV_UNIFIED), to test whether dg-eb-loop's default
+        // (no clear, no set_phase) carries cross-step state at block-1's N.
+        if (getenv("DG_EB_FRESH")) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            llama_diffusion_set_phase(model, /*PKV_UNIFIED=*/0, 0);
         }
         llama_diffusion_set_sc(model, sc_buffer.data(), step_idx == 0 ? 0.0f : 1.0f,
                                prev_temp_inv, true);
@@ -225,6 +235,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "step %d done: t=%.6f n_accepted=%d entropy_sum=%.4f finished=%d\n",
                 step_idx, t, (int) std::count(accepted.begin(), accepted.end(), 1), entropy_sum,
                 (int) finished);
+        if (cap > 0 && executed >= cap) { break; }
     }
 
     char meta[256];

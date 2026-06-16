@@ -24,11 +24,73 @@
 
 use std::path::Path;
 
+pub mod chat;
 mod reff16;
 mod refmath;
 pub mod refrng;
 
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
+
+// Expert-selection argsort that bit-exactly matches the reference's
+// `ggml_argsort_top_k` (libc++ `std::sort` over indices by DESC key, with the
+// strict no-tie-break comparator — UNSTABLE tie order). Implemented as a C++
+// shim (src/dg_argsort.cpp) so the tie order is the SAME libc++ std::sort as
+// the pinned reference build, rather than a fragile hand-port of clang's
+// introsort. Camelid's prior `sort_unstable_by(...).then(idx)` forced
+// lower-index-first ties, which swapped equal-probability experts' slots and
+// perturbed the MoE weighted-sum accumulation order.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn dg_argsort_desc_f32(keys: *const f32, n: i32, out_idx: *mut i32);
+    fn dg_argsort_asc_f32(keys: *const f32, n: i32, out_idx: *mut i32);
+}
+
+/// Indices `[0..keys.len())` ordered by DESCENDING `keys`, matching the
+/// reference's libc++ `std::sort` (including its unstable tie order). Use the
+/// bit-exact router logits as the key (comparison-identical to softmax probs).
+#[cfg(target_os = "macos")]
+fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
+    let mut out = vec![0i32; keys.len()];
+    // SAFETY: out has keys.len() slots; the shim writes exactly that many.
+    unsafe { dg_argsort_desc_f32(keys.as_ptr(), keys.len() as i32, out.as_mut_ptr()) };
+    out
+}
+
+/// Indices ordered by ASCENDING `keys` via the same libc++ `std::sort` — for
+/// the EB sampler's MI-bound position ordering (reference sorts positions by
+/// entropy with `std::sort`, strict `<`, unstable tie order).
+#[cfg(target_os = "macos")]
+fn argsort_asc_libcpp(keys: &[f32]) -> Vec<i32> {
+    let mut out = vec![0i32; keys.len()];
+    unsafe { dg_argsort_asc_f32(keys.as_ptr(), keys.len() as i32, out.as_mut_ptr()) };
+    out
+}
+
+/// Non-macOS fallback (the lane is Apple-Silicon-only; this keeps other
+/// targets compiling): descending key with lower-index tie-break.
+#[cfg(not(target_os = "macos"))]
+fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
+    let mut out: Vec<i32> = (0..keys.len() as i32).collect();
+    out.sort_unstable_by(|&a, &b| {
+        keys[b as usize]
+            .partial_cmp(&keys[a as usize])
+            .unwrap()
+            .then(a.cmp(&b))
+    });
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+fn argsort_asc_libcpp(keys: &[f32]) -> Vec<i32> {
+    let mut out: Vec<i32> = (0..keys.len() as i32).collect();
+    out.sort_unstable_by(|&a, &b| {
+        keys[a as usize]
+            .partial_cmp(&keys[b as usize])
+            .unwrap()
+            .then(a.cmp(&b))
+    });
+    out
+}
 
 use crate::inference::{
     q6_k_wire_block_dequant, quantize_q8_k_blocks, Q8KBlock, Q4_K_WIRE_BYTES_PER_BLOCK,
@@ -322,6 +384,17 @@ pub struct DgLayerTrace {
     pub moe_weights_norm: Vec<f32>,
     /// PRE-norm weighted slot sum — "ffn_moe_out".
     pub moe_pre_norm: Vec<f32>,
+    /// Pre-scalar FFN block output (attn_resid + post_ffw_norm(mlp+moe)) —
+    /// reference "ffn_block_out" (cb'd before the region scalar).
+    pub ffn_block_out: Vec<f32>,
+    /// Phase 5 attention-internal diagnostic: the pre-`wo` KQV in the
+    /// reference's "kqv" layout `[head_dim, n_q, n_head]` (index
+    /// `d + q*head_dim + h*head_dim*n_q`). Captured for layer 0 only.
+    pub kqv: Vec<f32>,
+    /// Phase 5: the post-softmax attention weights in the reference's
+    /// "kq_soft_max" layout `[n_kv, n_q, n_head]` (index
+    /// `k + q*n_kv + h*n_kv*n_q`). Captured for layer 0 only.
+    pub kq_soft_max: Vec<f32>,
 }
 
 pub struct DgEncoderTrace {
@@ -740,14 +813,19 @@ impl DgEncoderRuntime {
                 moe_logits_all.extend_from_slice(&logits);
 
                 // softmax over all experts (the reference's ggml_soft_max —
-                // same kernel semantics as the attention softmax), then top-k
+                // same kernel semantics as the attention softmax); weights come
+                // from these probs.
                 let mut probs: Vec<f32> = logits.clone();
                 refmath::softmax_row(&mut probs);
-                let mut idx: Vec<usize> = (0..self.n_expert).collect();
-                idx.sort_unstable_by(|&a, &b| {
-                    probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b))
-                });
-                idx.truncate(self.n_expert_used);
+                // expert ORDER must match the reference's ggml_argsort_top_k =
+                // libc++ std::sort over DESC router logits (unstable tie order;
+                // see dg_argsort.cpp). Sorting by the bit-exact logits is
+                // comparison-identical to sorting softmax probs.
+                let order = argsort_desc_experts(&logits);
+                let mut idx: Vec<usize> = order[..self.n_expert_used]
+                    .iter()
+                    .map(|&e| e as usize)
+                    .collect();
                 for &e in &idx {
                     moe_topk_all.push(e as i32);
                     moe_weights_all.push(probs[e]);
@@ -838,6 +916,9 @@ impl DgEncoderRuntime {
                 moe_down_scaled: moe_down_scaled_all,
                 moe_weights_norm: moe_weights_norm_all,
                 moe_pre_norm: moe_pre_norm_all,
+                ffn_block_out: Vec::new(),
+                kqv: Vec::new(),
+                kq_soft_max: Vec::new(),
             });
         }
 
@@ -1001,6 +1082,13 @@ impl DgEncoderRuntime {
         let embed_scale = (hidden as f32).sqrt();
 
         let mut sigs = Vec::with_capacity(c);
+        // Phase 5 SC-stage forensics dump (env-gated): concatenated [c][dim]
+        // for each stage, compared against the reference's cb'd sc_* tensors.
+        let sc_dump = std::env::var("CAMELID_DG_SC_DUMP_DIR").ok();
+        let mut d_soft: Vec<f32> = Vec::new();
+        let mut d_normed: Vec<f32> = Vec::new();
+        let mut d_g: Vec<f32> = Vec::new();
+        let mut d_sig: Vec<f32> = Vec::new();
         for pos in 0..c {
             // probs = soft_max(scale(sc_logits, temp_inv)) — f32, same
             // kernel as every other softmax; then the F16 src1 conversion
@@ -1044,7 +1132,27 @@ impl DgEncoderRuntime {
             let u = self.sc_up.matvec_dense(&nq)?;
             let h: Vec<f32> = g.iter().zip(&u).map(|(gv, uv)| dg_gelu(*gv) * uv).collect();
             let hq = DgActivation::new(&h);
-            sigs.push(self.sc_down.matvec_dense(&hq)?);
+            let sig = self.sc_down.matvec_dense(&hq)?;
+            if sc_dump.is_some() {
+                // g here is the PRE-gelu gate matmul; the reference cb's sc_g
+                // AFTER gelu — store gelu(g) to match.
+                d_soft.extend_from_slice(&soft);
+                d_normed.extend_from_slice(&normed);
+                d_g.extend(g.iter().map(|&gv| dg_gelu(gv)));
+                d_sig.extend_from_slice(&sig);
+            }
+            sigs.push(sig);
+        }
+        if let Some(dir) = sc_dump {
+            let w = |name: &str, v: &[f32]| {
+                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let _ = std::fs::write(format!("{dir}/{name}.bin"), bytes);
+            };
+            w("cam_sc_soft", &d_soft);
+            w("cam_sc_normed", &d_normed);
+            w("cam_sc_g", &d_g);
+            w("cam_sc_sig", &d_sig);
+            eprintln!("[sc-dump] wrote cam_sc_{{soft,normed,g,sig}} to {dir}");
         }
         Ok(sigs)
     }
@@ -1209,6 +1317,19 @@ impl DgEncoderRuntime {
             }
 
             let mut attn_out = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
+            // Phase 5 KQV capture (layer 0 only): reference "kqv" layout
+            // [head_dim, n_q, n_head], index d + q*head_dim + h*head_dim*n_q
+            let capture_kqv = want_trace && l == 0;
+            let mut kqv_cap = if capture_kqv {
+                vec![0f32; head_dim * n * heads]
+            } else {
+                Vec::new()
+            };
+            let mut softmax_cap = if capture_kqv {
+                vec![0f32; n * n * heads]
+            } else {
+                Vec::new()
+            };
             for pos in 0..n {
                 let mut attn = vec![0f32; q_dim];
                 for hh in 0..heads {
@@ -1225,9 +1346,17 @@ impl DgEncoderRuntime {
                         })
                         .collect();
                     refmath::softmax_row(&mut row);
+                    if capture_kqv {
+                        for (kp, &pr) in row.iter().enumerate() {
+                            softmax_cap[kp + pos * n + hh * n * n] = pr;
+                        }
+                    }
                     let out = &mut attn[hh * head_dim..(hh + 1) * head_dim];
                     for (d, o) in out.iter_mut().enumerate() {
                         *o = refmath::vec_dot_f32(&v_cols[kvh * head_dim + d], &row);
+                        if capture_kqv {
+                            kqv_cap[d + pos * head_dim + hh * head_dim * n] = *o;
+                        }
                     }
                 }
                 let aq = DgActivation::new(&attn);
@@ -1247,6 +1376,17 @@ impl DgEncoderRuntime {
             let mut moe_logits_all = Vec::new();
             let mut moe_topk_all = Vec::new();
             let mut out_scaled = Vec::new();
+            // FFN sub-chain trace buffers (mirror the encoder forward so the
+            // diag actually compares them — they were empty before).
+            let mut ffn_mlp_all = Vec::new();
+            let mut ffn_moe_all = Vec::new();
+            let mut moe_pre_norm_all = Vec::new();
+            let mut moe_weights_norm_all = Vec::new();
+            let mut moe_gate_up_all = Vec::new();
+            let mut moe_geglu_all = Vec::new();
+            let mut moe_down_all = Vec::new();
+            let mut moe_down_scaled_all = Vec::new();
+            let mut ffn_block_out_all = Vec::new();
             for (pos, hp) in h.iter_mut().enumerate() {
                 let attn_resid = hp.clone();
                 let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
@@ -1257,6 +1397,9 @@ impl DgEncoderRuntime {
                 let actq = DgActivation::new(&act);
                 let mlp = lw.ffn_down.matvec_dense(&actq)?;
                 let mlp = refmath::rms_norm(&mlp, Some(&lw.post_norm_1), eps);
+                if want_trace {
+                    ffn_mlp_all.extend_from_slice(&mlp);
+                }
 
                 let mut r = refmath::rms_norm(&attn_resid, None, eps);
                 let inv = 1.0f32 / (hidden as f32).sqrt();
@@ -1269,11 +1412,15 @@ impl DgEncoderRuntime {
 
                 let mut probs: Vec<f32> = logits.clone();
                 refmath::softmax_row(&mut probs);
-                let mut idx: Vec<usize> = (0..self.n_expert).collect();
-                idx.sort_unstable_by(|&a, &b| {
-                    probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b))
-                });
-                idx.truncate(self.n_expert_used);
+                // expert ORDER must match the reference's ggml_argsort_top_k =
+                // libc++ std::sort over DESC router logits (unstable tie order;
+                // see dg_argsort.cpp) — NOT lower-index-first, which swapped
+                // equal-prob experts' slots and perturbed the weighted sum.
+                let order = argsort_desc_experts(&logits);
+                let idx: Vec<usize> = order[..self.n_expert_used]
+                    .iter()
+                    .map(|&e| e as usize)
+                    .collect();
                 if want_trace {
                     moe_logits_all.extend_from_slice(&logits);
                     for &e in &idx {
@@ -1299,11 +1446,24 @@ impl DgEncoderRuntime {
                     let hexp_q = DgActivation::new(&hexp);
                     let y = lw.down_exps.matvec_rows(e * hidden, hidden, &hexp_q)?;
                     let s_e = lw.down_exps_scale[e];
+                    if want_trace {
+                        moe_weights_norm_all.push(w);
+                        moe_gate_up_all.extend_from_slice(&gate_up);
+                        moe_geglu_all.extend_from_slice(&hexp);
+                        moe_down_all.extend_from_slice(&y);
+                        moe_down_scaled_all.extend(y.iter().map(|yv| yv * s_e));
+                    }
                     for (a, yv) in moe_acc.iter_mut().zip(&y) {
                         *a += yv * s_e * w;
                     }
                 }
+                if want_trace {
+                    moe_pre_norm_all.extend_from_slice(&moe_acc);
+                }
                 let moe_out = refmath::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
+                if want_trace {
+                    ffn_moe_all.extend_from_slice(&moe_out);
+                }
 
                 let mut combined = mlp;
                 for (cv, m) in combined.iter_mut().zip(&moe_out) {
@@ -1312,6 +1472,11 @@ impl DgEncoderRuntime {
                 let ffn_out = refmath::rms_norm(&combined, Some(&lw.post_ffw_norm), eps);
                 for (a, b) in hp.iter_mut().zip(&ffn_out) {
                     *a += b;
+                }
+                if want_trace {
+                    // pre-scalar FFN block output (== reference's `cur` after
+                    // gemma4_build_ffn_moe, before the region scalar)
+                    ffn_block_out_all.extend_from_slice(hp);
                 }
                 // region-aware per-layer scalar: prompt rows take the encoder
                 // scalar, canvas rows the decoder scalar
@@ -1342,15 +1507,18 @@ impl DgEncoderRuntime {
                     moe_logits: moe_logits_all,
                     moe_topk: moe_topk_all,
                     out_scaled,
-                    ffn_mlp: Vec::new(),
-                    ffn_moe: Vec::new(),
+                    ffn_mlp: ffn_mlp_all,
+                    ffn_moe: ffn_moe_all,
                     moe_weights: Vec::new(),
-                    moe_gate_up: Vec::new(),
-                    moe_geglu: Vec::new(),
-                    moe_down: Vec::new(),
-                    moe_down_scaled: Vec::new(),
-                    moe_weights_norm: Vec::new(),
-                    moe_pre_norm: Vec::new(),
+                    moe_gate_up: moe_gate_up_all,
+                    moe_geglu: moe_geglu_all,
+                    moe_down: moe_down_all,
+                    moe_down_scaled: moe_down_scaled_all,
+                    moe_weights_norm: moe_weights_norm_all,
+                    moe_pre_norm: moe_pre_norm_all,
+                    ffn_block_out: ffn_block_out_all,
+                    kqv: kqv_cap,
+                    kq_soft_max: softmax_cap,
                 });
             }
         }
@@ -1476,8 +1644,14 @@ impl DgEncoderRuntime {
             denoiser[pos] = sampled;
         }
 
-        let mut order: Vec<usize> = (0..c).collect();
-        order.sort_unstable_by(|&a, &b| entropy[a].partial_cmp(&entropy[b]).unwrap());
+        // MI-bound position order: match the reference's `std::sort(order,
+        // entropy[a] < entropy[b])` (libc++ unstable tie order) so an exact
+        // entropy tie accepts the same positions — same fix class as the
+        // expert argsort (Rust sort_unstable would break ties differently).
+        let order: Vec<usize> = argsort_asc_libcpp(&entropy)
+            .into_iter()
+            .map(|i| i as usize)
+            .collect();
         let mut accepted = vec![false; c];
         let mut cum_e = 0f64;
         for &pos in &order {
@@ -1537,6 +1711,13 @@ impl DgEncoderRuntime {
         let mut held = 0i32;
         let mut records = Vec::new();
 
+        // Diagnostic-only executed-step cap (does NOT alter the temperature
+        // schedule, which is driven by `s`): stop after this many steps so the
+        // block-1 logit ladder runs a few steps instead of the full loop.
+        let exec_cap: Option<usize> = std::env::var("CAMELID_DG_EB_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
         for cur_step in (1..=s).rev() {
             let step_idx = s - cur_step;
             let canvas_u32: Vec<u32> = current_canvas.iter().map(|&v| v as u32).collect();
@@ -1582,8 +1763,112 @@ impl DgEncoderRuntime {
             if finished {
                 break;
             }
+            if let Some(cap) = exec_cap {
+                if records.len() >= cap {
+                    break;
+                }
+            }
         }
         Ok(records)
+    }
+
+    /// `trim_canvas` (diffusion-cli.cpp at the pin): cut at the first
+    /// end-of-generation token, or at the onset of a repetition loop (a
+    /// token recurring at stride 1-2 for >= 6 steps). NOTE the repetition
+    /// scan runs over the FULL canvas length even when an EOG cut already
+    /// shortened `cut` — reference behavior, kept verbatim.
+    pub fn trim_canvas(canvas: &[i32], eog: &std::collections::HashSet<i32>) -> usize {
+        let n = canvas.len();
+        let mut cut = n;
+        for (i, t) in canvas.iter().enumerate() {
+            if eog.contains(t) {
+                cut = i;
+                break;
+            }
+        }
+        let mut i = 0;
+        while i + 1 < cut {
+            let mut found_loop = false;
+            for stride in 1..=2usize {
+                if found_loop {
+                    break;
+                }
+                let mut reps = 0;
+                let mut j = i;
+                while j + stride < n && canvas[j] == canvas[j + stride] {
+                    reps += 1;
+                    j += stride;
+                }
+                found_loop = reps >= 6;
+            }
+            if found_loop {
+                cut = i;
+                break;
+            }
+            i += 1;
+        }
+        cut
+    }
+
+    /// The multi-canvas (block-autoregressive) loop — diffusion-cli.cpp's
+    /// `run_turn` canvas path at the pin: per block one full EB denoise of
+    /// `[prefix | canvas]` (the rng RE-SEEDS with the same seed each block,
+    /// as in the reference where it is local to the EB function), then
+    /// trim; a partial cut (end token / repetition loop) completes the
+    /// answer, a full canvas commits to the prefix; the ubatch budget guard
+    /// stops when `[prefix | canvas]` no longer fits. Returns the per-block
+    /// (final canvas, cut) pairs, the trimmed response tokens, and the stop
+    /// reason.
+    #[allow(clippy::type_complexity)]
+    pub fn mc_generate(
+        &self,
+        prompt: &[u32],
+        params: &DgEbParams,
+        n_blocks: i32,
+        max_ubatch: i32,
+        eog: &std::collections::HashSet<i32>,
+        mut on_block: impl FnMut(usize, &[u32], &[DgEbStepRecord], &[i32], usize),
+    ) -> Result<(Vec<(Vec<i32>, usize)>, Vec<i32>, String)> {
+        let c = self.canvas_length;
+        let mut prefix: Vec<u32> = prompt.to_vec();
+        let mut response: Vec<i32> = Vec::new();
+        let mut blocks: Vec<(Vec<i32>, usize)> = Vec::new();
+        let mut stop_reason = "blocks";
+
+        for b in 0..n_blocks.max(1) {
+            let prefix_len = prefix.len();
+            let max_length = prefix_len + c;
+            if max_length > max_ubatch as usize {
+                if b == 0 {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "[prompt | canvas] needs one ubatch: {prefix_len} + {c} > {max_ubatch}"
+                    )));
+                }
+                stop_reason = "ubatch";
+                break;
+            }
+
+            let records = self.eb_generate(&prefix, params, |_, _| {})?;
+            let final_canvas: Vec<i32> =
+                records
+                    .last()
+                    .map(|r| r.step.argmax.clone())
+                    .ok_or_else(|| {
+                        BackendError::RuntimeShapeMismatch("EB loop produced no steps".into())
+                    })?;
+            let cut = Self::trim_canvas(&final_canvas, eog);
+            on_block(b as usize, &prefix, &records, &final_canvas, cut);
+
+            response.extend_from_slice(&final_canvas[..cut]);
+            let full = cut == c;
+            blocks.push((final_canvas.clone(), cut));
+            if !full {
+                stop_reason = "trim";
+                break;
+            }
+            prefix.extend(final_canvas[..cut].iter().map(|&t| t as u32));
+        }
+        Ok((blocks, response, stop_reason.to_string()))
     }
 }
 
@@ -1643,5 +1928,60 @@ mod tests {
         assert!(matches!(err, BackendError::UnsupportedTensorType(_)));
         let err = DgFormat::from_tensor_type(GgufTensorType::F16, "blk.0.test").unwrap_err();
         assert!(matches!(err, BackendError::UnsupportedTensorType(_)));
+    }
+
+    /// Phase 5 diagnostic: compare camelid's scaled prompt embeddings
+    /// against an oracle `inp_region` dump (env CAMELID_DG_EMB_GGUF /
+    /// CAMELID_DG_EMB_IDS / CAMELID_DG_EMB_REF). Localizes whether the story
+    /// block-0 divergence is already in the token embeddings (high token
+    /// ids never used as direct prompt embeddings before).
+    #[test]
+    fn dg_prompt_embedding_diag() {
+        let (Ok(g), Ok(i), Ok(r)) = (
+            std::env::var("CAMELID_DG_EMB_GGUF"),
+            std::env::var("CAMELID_DG_EMB_IDS"),
+            std::env::var("CAMELID_DG_EMB_REF"),
+        ) else {
+            eprintln!("skipping: CAMELID_DG_EMB_* not set");
+            return;
+        };
+        let prompt: Vec<u32> = std::fs::read(&i)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u32)
+            .collect();
+        let inp_region: Vec<f32> = std::fs::read(&r)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let rt = DgEncoderRuntime::load(Path::new(&g)).expect("load");
+        let h = rt.n_embd;
+        let scale = (h as f32).sqrt();
+        // prompt rows are the first P rows of inp_region (canvas rows are
+        // rms-normed; prompt rows are just scaled embeddings)
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let mut e = rt.embed_row(tok).unwrap();
+            for v in e.iter_mut() {
+                *v *= scale;
+            }
+            let refrow = &inp_region[pos * h..(pos + 1) * h];
+            let bad = e
+                .iter()
+                .zip(refrow)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let maxabs = e
+                .iter()
+                .zip(refrow)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            if bad > 0 {
+                eprintln!(
+                    "EMB DIAG pos {pos} tok {tok}: {bad}/{h} not bit-exact, maxabs={maxabs:.3e}"
+                );
+            }
+        }
+        eprintln!("EMB DIAG done ({} prompt tokens)", prompt.len());
     }
 }

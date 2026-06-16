@@ -219,8 +219,15 @@ first end-of-generation token or repetition loop (a token recurring at stride
 end token, the block budget (`-n` → ⌈n/256⌉ blocks), or the ubatch limit.
 The published "re-encoded and appended to the KV cache" is, in the reference,
 simply the next block's forward over the grown prefix (re-prefill; in cached
-mode a new PREFILL of the full prefix). The RNG stream continues across blocks
-(no reseed). Phase 5's gate is parity over ≥ 2 blocks of exactly this loop.
+mode a new PREFILL of the full prefix). The RNG **re-seeds with the same seed
+at the start of every block**: the per-block call is
+`diffusion_generate_entropy_bound`, which constructs `std::mt19937 rng(params.
+seed)` locally (`diffusion.cpp:467`); the `run_turn` loop
+(`diffusion-cli.cpp:444`) calls it once per block, so each block's canvas init +
+per-step `u`/renoise draws restart from seed (NOT one stream continued across
+blocks — an earlier reading here said "continues", which the pinned source
+disproves; the `mc_generate` impl and the `dg-mc-loop` oracle both re-seed).
+Phase 5's gate is parity over ≥ 2 blocks of exactly this loop.
 
 ## 8. Phase 2 status — encoder checkpoint parity: PASSED, BIT-EXACT
 

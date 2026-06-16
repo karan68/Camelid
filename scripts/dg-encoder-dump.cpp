@@ -49,13 +49,22 @@ static bool want_name(const char * name, int n_layer) {
         strcmp(name, "result_output") == 0) {
         return true;
     }
+    // Phase 5 SC-signal bisection (forensics cb's in diffusion-gemma.cpp):
+    if (strcmp(name, "sc_probs") == 0 || strcmp(name, "sc_soft") == 0 ||
+        strcmp(name, "sc_normed") == 0 || strcmp(name, "sc_g") == 0 ||
+        strcmp(name, "sc_sig") == 0) {
+        return true;
+    }
     static const char * per_layer[] = {
+        "ffn_block_out", // Phase 5: pre-region-scalar FFN block output
         "Kcur_pos",      "Vcur_normed", "attn_out", "ffn_moe_logits",
         "ffn_moe_topk",  "l_out",
         // pre-attention chain bisection (Phase 3: batch-size-dependent
         // reference kernels suspected between inp_region and Kcur_pos)
         "attn_norm",     "Qcur",        "Kcur",     "Vcur",
         "Qcur_normed",   "Kcur_normed",
+        // Phase 5: attention-internal bisection (KQV value-mix vs softmax)
+        "Qcur_pos",      "kq_soft_max", "kqv",
         // FFN-branch bisection points (labels survive cb renames)
         "ffn_mlp",       "ffn_moe",     "ffn_moe_weights",
         // expert-chain bisection points (merged gate_up path)
@@ -136,16 +145,33 @@ static std::vector<int32_t> read_i32(const char * path) {
     return v;
 }
 
+static std::vector<float> read_f32(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", path); exit(1); }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<float> v(sz / 4);
+    if (fread(v.data(), 4, v.size(), f) != v.size()) { fprintf(stderr, "short read\n"); exit(1); }
+    fclose(f);
+    return v;
+}
+
 int main(int argc, char ** argv) {
-    if (argc != 4 && argc != 5) {
-        fprintf(stderr, "usage: %s <model.gguf> <prompt_ids.i32> <out_dir> [canvas_ids.i32]\n",
+    if (argc != 4 && argc != 5 && argc != 7) {
+        fprintf(stderr, "usage: %s <model.gguf> <prompt_ids.i32> <out_dir> [canvas_ids.i32 "
+                        "[sc_logits.f32 temp_inv]]\n",
                 argv[0]);
         return 1;
     }
     const char * model_path  = argv[1];
     const char * ids_path    = argv[2];
     const char * out_dir     = argv[3];
-    const char * canvas_path = (argc == 5) ? argv[4] : nullptr;
+    const char * canvas_path = (argc >= 5) ? argv[4] : nullptr;
+    // Phase 5 SC-active mode: when sc_logits + temp_inv are given, apply
+    // self-conditioning (use_sc=1) so the dump is the SC-active forward.
+    const char * sc_path     = (argc == 7) ? argv[5] : nullptr;
+    const float  sc_temp_inv = (argc == 7) ? (float) atof(argv[6]) : 1.0f;
 
     const std::vector<int32_t> prompt = read_i32(ids_path);
     const int P = (int) prompt.size();
@@ -180,6 +206,7 @@ int main(int argc, char ** argv) {
     llama_model_meta_val_str(model, "diffusion-gemma.block_count", nl_buf, sizeof(nl_buf));
     const int n_layer = atoi(nl_buf);
     if (n_layer <= 0) { fprintf(stderr, "missing diffusion-gemma.block_count\n"); return 1; }
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
     std::string manifest_path = std::string(out_dir) + "/manifest.json";
     FILE * manifest = fopen(manifest_path.c_str(), "wb");
@@ -242,6 +269,21 @@ int main(int argc, char ** argv) {
             batch.n_seq_id[i]  = 1;
             batch.seq_id[i][0] = 0;
             batch.logits[i]    = 1;
+        }
+        // Phase 5 SC-active mode: upload the previous step's raw canvas logits
+        // and enable self-conditioning (use_sc=1) so this dump is the SC-active
+        // forward (the cb'd sc_probs/sc_soft/sc_normed/sc_g/sc_sig get captured).
+        std::vector<float> sc_logits;
+        if (sc_path) {
+            sc_logits = read_f32(sc_path);
+            const size_t want = (size_t) C * n_vocab;
+            if (sc_logits.size() != want) {
+                fprintf(stderr, "sc_logits size %zu != C*n_vocab %zu\n", sc_logits.size(), want);
+                return 1;
+            }
+            llama_diffusion_set_sc(model, sc_logits.data(), /*use_sc=*/1.0f, sc_temp_inv,
+                                   /*enabled=*/true);
+            fprintf(stderr, "SC-ACTIVE: use_sc=1 temp_inv=%.7f\n", sc_temp_inv);
         }
         if (llama_decode(ctx, batch) != 0) {
             fprintf(stderr, "UNIFIED decode failed\n");
