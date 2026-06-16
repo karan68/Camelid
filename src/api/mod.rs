@@ -7981,6 +7981,16 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // Mistral Instruct templates (v0.3 GGUF) don't reference the `tools`
+        // Jinja variable — the generic Jinja render silently drops them. Use
+        // the dedicated renderer that produces [AVAILABLE_TOOLS] natively.
+        if is_mistral_instruct_template(template) {
+            return Ok(RenderedPrompt {
+                text: render_mistral_instruct_prompt_with_tools(messages, tokenizer, tools),
+                add_special: false,
+                parse_special: true,
+            });
+        }
         return render_metadata_jinja_chat_template_prompt(
             messages,
             tokenizer,
@@ -8412,6 +8422,128 @@ fn render_mistral_instruct_prompt(messages: &[ChatMessage], tokenizer: &Tokenize
     }
 
     prompt
+}
+
+/// Mistral Instruct v0.3+ with native tool calling: injects `[AVAILABLE_TOOLS]`
+/// before the conversation and renders tool results as `[TOOL_RESULTS]` blocks.
+/// The GGUF-embedded Jinja template for this model does not reference the `tools`
+/// variable, so the generic Jinja path silently drops them. This renderer produces
+/// the format documented in Mistral's tokenizer v2 spec.
+fn render_mistral_instruct_prompt_with_tools(
+    messages: &[ChatMessage],
+    tokenizer: &Tokenizer,
+    tools: &[serde_json::Value],
+) -> String {
+    let bos = tokenizer.token_text(tokenizer.special.bos).unwrap_or("<s>");
+    let eos = tokenizer
+        .token_text(tokenizer.special.eos)
+        .unwrap_or("</s>");
+    let mut prompt = String::new();
+
+    // [AVAILABLE_TOOLS] block before the conversation.
+    prompt.push_str(bos);
+    prompt.push_str("[AVAILABLE_TOOLS] ");
+    prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".into()));
+    prompt.push_str("[/AVAILABLE_TOOLS]");
+
+    let mut system: Option<&str> = None;
+    let mut idx = 0;
+    let mut tool_call_counter: u32 = 0;
+
+    if let Some(first) = messages.first() {
+        if first.role.trim() == "system" {
+            system = Some(first.content.trim());
+            idx = 1;
+        }
+    }
+
+    while idx < messages.len() {
+        let message = &messages[idx];
+        let role = message.role.trim();
+        match role {
+            "user" => {
+                prompt.push_str("[INST] ");
+                if let Some(sys) = system.take() {
+                    prompt.push_str(sys);
+                    prompt.push_str("\n\n");
+                }
+                prompt.push_str(message.content.trim());
+                prompt.push_str(" [/INST]");
+            }
+            "assistant" => {
+                // If the content looks like tool-call output from the agent loop
+                // (formatted as "name(args)"), wrap it in [TOOL_CALLS] so the model
+                // sees its own output format in multi-turn history. Otherwise emit
+                // as plain assistant text.
+                let content = message.content.trim();
+                if looks_like_agent_tool_call(content) {
+                    tool_call_counter += 1;
+                    let id = format!("call{:05}", tool_call_counter);
+                    let tc_json = agent_call_to_mistral_json(content, &id);
+                    prompt.push_str("[TOOL_CALLS] ");
+                    prompt.push_str(&tc_json);
+                    prompt.push_str(eos);
+                } else {
+                    prompt.push_str(content);
+                    prompt.push_str(eos);
+                }
+            }
+            "tool" => {
+                let id = format!("call{:05}", tool_call_counter);
+                prompt.push_str("[TOOL_RESULTS] ");
+                prompt.push_str(&format!(
+                    "{{\"content\": {}, \"call_id\": \"{}\"}}",
+                    serde_json::to_string(message.content.trim())
+                        .unwrap_or_else(|_| "\"\"".into()),
+                    id
+                ));
+                prompt.push_str("[/TOOL_RESULTS]");
+            }
+            _ => {
+                // Skip unknown roles (system already consumed above).
+            }
+        }
+        idx += 1;
+    }
+
+    prompt
+}
+
+/// Returns true if the content looks like the agent loop's tool-call rendering
+/// (e.g. `read_file({"path":"notes.txt"})`).
+fn looks_like_agent_tool_call(content: &str) -> bool {
+    let first_line = content.lines().next().unwrap_or("");
+    if let Some(paren) = first_line.find('(') {
+        let name = &first_line[..paren];
+        let rest = &first_line[paren..];
+        !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && rest.ends_with(')')
+            && rest.contains('{')
+    } else {
+        false
+    }
+}
+
+/// Convert the agent loop's `name({"key":"val"})` format to Mistral's
+/// `[{"name":"...", "arguments":{...}, "id":"..."}]` JSON array.
+fn agent_call_to_mistral_json(content: &str, id: &str) -> String {
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(paren) = line.find('(') {
+            let name = &line[..paren];
+            let args_str = &line[paren + 1..line.len().saturating_sub(1)];
+            let args: serde_json::Value =
+                serde_json::from_str(args_str).unwrap_or(serde_json::Value::Object(Default::default()));
+            calls.push(serde_json::json!({
+                "name": name,
+                "arguments": args,
+                "id": id,
+            }));
+        }
+    }
+    serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into())
 }
 
 fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
@@ -9999,6 +10131,114 @@ mod tests {
             ),
             "<s>[INST] Complete cam [/INST] elid</s><s>[INST] Now say hi [/INST]"
         );
+    }
+
+    #[test]
+    fn mistral_instruct_with_tools_injects_available_tools() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = mistral_test_tokenizer();
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        })];
+
+        let messages = vec![ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "Read notes.txt".to_string(),
+        }];
+
+        let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
+
+        assert!(rendered.starts_with("<s>[AVAILABLE_TOOLS] "));
+        assert!(rendered.contains("[/AVAILABLE_TOOLS]"));
+        assert!(rendered.contains("[INST] Read notes.txt [/INST]"));
+        assert!(rendered.contains("\"name\":\"read_file\"") || rendered.contains("\"name\": \"read_file\""));
+    }
+
+    #[test]
+    fn mistral_instruct_with_tools_folds_system_message() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = mistral_test_tokenizer();
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "test", "description": "Test tool", "parameters": {}}
+        })];
+
+        let messages = vec![
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "You are helpful.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Do something".to_string(),
+            },
+        ];
+
+        let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
+
+        assert!(rendered.contains("[INST] You are helpful.\n\nDo something [/INST]"));
+    }
+
+    #[test]
+    fn mistral_instruct_with_tools_renders_tool_results() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = mistral_test_tokenizer();
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "read_file", "description": "Read", "parameters": {}}
+        })];
+
+        let messages = vec![
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Read it".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "read_file({\"path\":\"notes.txt\"})".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "tool".to_string(),
+                content: "alpha\nbeta\ngamma".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "How many lines?".to_string(),
+            },
+        ];
+
+        let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
+
+        assert!(rendered.contains("[TOOL_CALLS] "));
+        assert!(rendered.contains("\"name\":\"read_file\"") || rendered.contains("\"name\": \"read_file\""));
+        assert!(rendered.contains("[TOOL_RESULTS] "));
+        assert!(rendered.contains("call_id"));
+        assert!(rendered.contains("[/TOOL_RESULTS]"));
+        assert!(rendered.contains("[INST] How many lines? [/INST]"));
     }
 
     #[test]
