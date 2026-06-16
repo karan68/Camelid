@@ -8463,10 +8463,12 @@ fn render_mistral_instruct_prompt_with_tools(
         match role {
             "user" => {
                 prompt.push_str("[INST] ");
-                if let Some(sys) = system.take() {
-                    prompt.push_str(sys);
-                    prompt.push_str("\n\n");
-                }
+                // When [AVAILABLE_TOOLS] is active, discard the system message.
+                // Mistral v0.3 was fine-tuned on:
+                //   [AVAILABLE_TOOLS]...[/AVAILABLE_TOOLS][INST] query [/INST]
+                // Adding system text inside [INST] pushes the model off-distribution
+                // and causes it to generate prose instead of [TOOL_CALLS].
+                system.take();
                 prompt.push_str(message.content.trim());
                 prompt.push_str(" [/INST]");
             }
@@ -10169,7 +10171,7 @@ mod tests {
     }
 
     #[test]
-    fn mistral_instruct_with_tools_folds_system_message() {
+    fn mistral_instruct_with_tools_omits_system_message() {
         let _guard = crate::test_support::env_lock();
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = mistral_test_tokenizer();
@@ -10194,7 +10196,10 @@ mod tests {
 
         let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
 
-        assert!(rendered.contains("[INST] You are helpful.\n\nDo something [/INST]"));
+        // System content is discarded when [AVAILABLE_TOOLS] is active
+        assert!(!rendered.contains("You are helpful."));
+        assert!(rendered.contains("[INST] Do something [/INST]"));
+        assert!(rendered.starts_with("<s>[AVAILABLE_TOOLS] "));
     }
 
     #[test]
