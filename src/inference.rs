@@ -9774,7 +9774,16 @@ fn build_resident_cuda_engine(
         return None;
     }
     let mut engine = crate::cuda_resident::CudaResidentDecode::new(
-        n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
+        n_layers,
+        n_heads,
+        n_kv,
+        head_dim,
+        hidden,
+        ffn_dim,
+        rope_dim,
+        cap,
+        vocab,
+        rms_eps,
         split_half_pairing,
     )
     .ok()?;

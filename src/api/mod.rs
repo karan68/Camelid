@@ -8361,9 +8361,8 @@ fn render_qwen3_chatml_prompt_with_tools(
     let mut prompt = String::new();
 
     // Build tool definitions block for the system message.
-    let mut tool_block = String::from(
-        "You are a helpful assistant with access to the following tools:\n\n",
-    );
+    let mut tool_block =
+        String::from("You are a helpful assistant with access to the following tools:\n\n");
     for tool in tools {
         if let Ok(json) = serde_json::to_string(tool) {
             tool_block.push_str(&json);

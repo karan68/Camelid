@@ -1047,7 +1047,13 @@ fn launch_rope(
     };
     let (nh, hd, rd) = (n_heads as i32, head_dim as i32, rope_dim as i32);
     let mut b = s.launch_builder(f);
-    b.arg(vec).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&rd).arg(&pairing);
+    b.arg(vec)
+        .arg(cos)
+        .arg(sin)
+        .arg(&nh)
+        .arg(&hd)
+        .arg(&rd)
+        .arg(&pairing);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -1531,7 +1537,9 @@ impl CudaResidentDecode {
         ffn_norm: &[f32],
     ) -> Result<(), String> {
         // Default: every layer resident in VRAM (unchanged behavior).
-        self.set_layer_located(q, kk, v, o, gate, up, down, attn_norm, ffn_norm, None, None, true)
+        self.set_layer_located(
+            q, kk, v, o, gate, up, down, attn_norm, ffn_norm, None, None, true,
+        )
     }
 
     /// As `set_layer`, but `resident` chooses where the projection weights live:
@@ -2020,17 +2028,28 @@ impl CudaResidentDecode {
             )
             .map_err(map)?;
             // Qwen3 QK-norm: per-head RMSNorm on Q and K after projection, before RoPE
-            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm) {
+            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm)
+            {
                 launch_rms_norm_per_head(
-                    &s, &self.k.rms_norm_per_head,
-                    &mut self.d_q, qn,
-                    self.n_heads, self.head_dim, self.eps,
-                ).map_err(map)?;
+                    &s,
+                    &self.k.rms_norm_per_head,
+                    &mut self.d_q,
+                    qn,
+                    self.n_heads,
+                    self.head_dim,
+                    self.eps,
+                )
+                .map_err(map)?;
                 launch_rms_norm_per_head(
-                    &s, &self.k.rms_norm_per_head,
-                    &mut self.d_k, kn,
-                    self.n_kv_heads, self.head_dim, self.eps,
-                ).map_err(map)?;
+                    &s,
+                    &self.k.rms_norm_per_head,
+                    &mut self.d_k,
+                    kn,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.eps,
+                )
+                .map_err(map)?;
             }
             // RoPE on Q and K
             let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
@@ -2612,17 +2631,28 @@ impl CudaResidentDecode {
             )
             .map_err(map)?;
             // Qwen3 QK-norm (batched): per-head RMSNorm on Q and K
-            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm) {
+            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm)
+            {
                 launch_rms_norm_per_head(
-                    &s, &self.k.rms_norm_per_head,
-                    &mut sc.vq, qn,
-                    k * n_heads, head_dim, eps,
-                ).map_err(map)?;
+                    &s,
+                    &self.k.rms_norm_per_head,
+                    &mut sc.vq,
+                    qn,
+                    k * n_heads,
+                    head_dim,
+                    eps,
+                )
+                .map_err(map)?;
                 launch_rms_norm_per_head(
-                    &s, &self.k.rms_norm_per_head,
-                    &mut sc.vk, kn,
-                    k * n_kv, head_dim, eps,
-                ).map_err(map)?;
+                    &s,
+                    &self.k.rms_norm_per_head,
+                    &mut sc.vk,
+                    kn,
+                    k * n_kv,
+                    head_dim,
+                    eps,
+                )
+                .map_err(map)?;
             }
             let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
             launch_rope_batched(

@@ -966,7 +966,13 @@ fn attention_decode_matches_cpu() {
 
 // ---- QK-norm per-head parity ----
 
-fn cpu_rms_norm_per_head(input: &[f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+fn cpu_rms_norm_per_head(
+    input: &[f32],
+    weight: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Vec<f32> {
     let mut out = vec![0f32; n_heads * head_dim];
     for h in 0..n_heads {
         let base = h * head_dim;
@@ -989,7 +995,9 @@ fn rms_norm_per_head_parity() {
     let eps = 1e-6f32;
     let total = n_heads * head_dim;
 
-    let input: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.01 - 1.28).sin()).collect();
+    let input: Vec<f32> = (0..total)
+        .map(|i| ((i as f32) * 0.01 - 1.28).sin())
+        .collect();
     let weight: Vec<f32> = (0..head_dim).map(|i| 1.0 + (i as f32) * 0.001).collect();
 
     let expected = cpu_rms_norm_per_head(&input, &weight, n_heads, head_dim, eps);
@@ -1004,18 +1012,34 @@ fn rms_norm_per_head_parity() {
     };
     let (hd_i, uw) = (head_dim as i32, 1i32);
     let mut b = k.stream.launch_builder(&k.rms_norm_per_head);
-    b.arg(&mut d_buf).arg(&d_weight).arg(&hd_i).arg(&eps).arg(&uw);
+    b.arg(&mut d_buf)
+        .arg(&d_weight)
+        .arg(&hd_i)
+        .arg(&eps)
+        .arg(&uw);
     unsafe { b.launch(cfg).unwrap() };
 
     let mut got = vec![0f32; total];
     k.stream.memcpy_dtoh(&d_buf, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
-    assert!(close(&got, &expected, 1e-5), "rms_norm_per_head diverged\ngot: {:?}\nexp: {:?}", &got[..8], &expected[..8]);
+    assert!(
+        close(&got, &expected, 1e-5),
+        "rms_norm_per_head diverged\ngot: {:?}\nexp: {:?}",
+        &got[..8],
+        &expected[..8]
+    );
 }
 
 // ---- Split-half RoPE parity ----
 
-fn cpu_rope_split_half(vec: &mut [f32], cos: &[f32], sin: &[f32], n_heads: usize, head_dim: usize, rope_dim: usize) {
+fn cpu_rope_split_half(
+    vec: &mut [f32],
+    cos: &[f32],
+    sin: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+) {
     let pairs = rope_dim / 2;
     for h in 0..n_heads {
         let base = h * head_dim;
@@ -1061,13 +1085,24 @@ fn rope_split_half_parity() {
     };
     let (nh, hd, rd, pairing) = (n_heads as i32, head_dim as i32, rope_dim as i32, 1i32);
     let mut b = k.stream.launch_builder(&k.rope);
-    b.arg(&mut d_vec).arg(&d_cos).arg(&d_sin).arg(&nh).arg(&hd).arg(&rd).arg(&pairing);
+    b.arg(&mut d_vec)
+        .arg(&d_cos)
+        .arg(&d_sin)
+        .arg(&nh)
+        .arg(&hd)
+        .arg(&rd)
+        .arg(&pairing);
     unsafe { b.launch(cfg).unwrap() };
 
     let mut got = vec![0f32; total];
     k.stream.memcpy_dtoh(&d_vec, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
-    assert!(close(&got, &expected, 1e-6), "rope_split_half diverged\ngot: {:?}\nexp: {:?}", &got[..8], &expected[..8]);
+    assert!(
+        close(&got, &expected, 1e-6),
+        "rope_split_half diverged\ngot: {:?}\nexp: {:?}",
+        &got[..8],
+        &expected[..8]
+    );
 }
 
 // ---- Adjacent-even-odd RoPE still works (regression check) ----
@@ -1113,11 +1148,22 @@ fn rope_adjacent_parity() {
     };
     let (nh, hd, rd, pairing) = (n_heads as i32, head_dim as i32, rope_dim as i32, 0i32);
     let mut b = k.stream.launch_builder(&k.rope);
-    b.arg(&mut d_vec).arg(&d_cos).arg(&d_sin).arg(&nh).arg(&hd).arg(&rd).arg(&pairing);
+    b.arg(&mut d_vec)
+        .arg(&d_cos)
+        .arg(&d_sin)
+        .arg(&nh)
+        .arg(&hd)
+        .arg(&rd)
+        .arg(&pairing);
     unsafe { b.launch(cfg).unwrap() };
 
     let mut got = vec![0f32; total];
     k.stream.memcpy_dtoh(&d_vec, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
-    assert!(close(&got, &expected, 1e-6), "rope_adjacent diverged\ngot: {:?}\nexp: {:?}", &got[..8], &expected[..8]);
+    assert!(
+        close(&got, &expected, 1e-6),
+        "rope_adjacent diverged\ngot: {:?}\nexp: {:?}",
+        &got[..8],
+        &expected[..8]
+    );
 }
