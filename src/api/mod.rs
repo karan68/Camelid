@@ -2982,6 +2982,63 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn qwen3_chatml_prompt_with_tools_renders_tool_definitions_and_suppresses_thinking() {
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "You are an agent.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Read notes.txt".to_string(),
+            },
+        ];
+        let tools = vec![serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }
+        })];
+        let prompt = render_qwen3_chatml_prompt_with_tools(&messages, &tools);
+        // System turn merges caller system content + tool definitions.
+        assert!(prompt.starts_with("<|im_start|>system\nYou are an agent.\n\n"));
+        assert!(prompt.contains("You are a helpful assistant with access to the following tools:"));
+        assert!(prompt.contains("\"name\":\"read_file\""));
+        assert!(prompt.contains("<tool_call>"));
+        // User turn present.
+        assert!(prompt.contains("<|im_start|>user\nRead notes.txt<|im_end|>"));
+        // Thinking suppressed in assistant generation prompt.
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        // System role only appears once at the start.
+        assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
+    }
+
+    #[test]
+    fn qwen3_chatml_prompt_with_tools_no_system_message() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let tools = vec![serde_json::json!({
+            "name": "search",
+            "description": "Search",
+            "parameters": { "type": "object", "properties": {} }
+        })];
+        let prompt = render_qwen3_chatml_prompt_with_tools(&messages, &tools);
+        // Tool block IS the system message when no caller system content.
+        assert!(prompt.starts_with(
+            "<|im_start|>system\nYou are a helpful assistant with access to the following tools:"
+        ));
+        assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>"));
+    }
+
+    #[test]
     fn strip_channels_removes_thinking_spans() {
         assert_eq!(
             gemma4_strip_channels("<|channel>secret plan<channel|>Paris"),
@@ -7989,6 +8046,15 @@ fn render_chat_prompt_for_tokenization_with_tools(
                 parse_special: true,
             });
         }
+        // Qwen3's full Jinja template uses constructs minijinja can't evaluate;
+        // render tools via the dedicated ChatML+tools path instead.
+        if is_qwen3_chatml_template(template) {
+            return Ok(RenderedPrompt {
+                text: render_qwen3_chatml_prompt_with_tools(messages, &normalized),
+                add_special: false,
+                parse_special: true,
+            });
+        }
         return render_metadata_jinja_chat_template_prompt(
             messages,
             tokenizer,
@@ -8107,6 +8173,75 @@ fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -
             // deterministic answer for parity.
             prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
         }
+    }
+    prompt
+}
+
+/// Renders a Qwen3 ChatML prompt with tool definitions injected into the system
+/// message and thinking suppressed. The format matches Qwen3's expected tool-call
+/// protocol: tools as flat JSON objects in the system turn, model responds with
+/// `<tool_call>{"name":…,"arguments":{…}}</tool_call>`.
+fn render_qwen3_chatml_prompt_with_tools(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+) -> String {
+    let mut prompt = String::new();
+
+    // Build tool definitions block for the system message.
+    let mut tool_block = String::from(
+        "You are a helpful assistant with access to the following tools:\n\n",
+    );
+    for tool in tools {
+        if let Ok(json) = serde_json::to_string(tool) {
+            tool_block.push_str(&json);
+            tool_block.push('\n');
+        }
+    }
+    tool_block.push_str(
+        "\nWhen you need to call a tool, put your tool call in the format:\n\
+         <tool_call>\n\
+         {\"name\": \"tool_name\", \"arguments\": {\"arg\": \"value\"}}\n\
+         </tool_call>",
+    );
+
+    // Emit system turn: merge any existing system content with tool definitions.
+    prompt.push_str("<|im_start|>system\n");
+    let mut has_system = false;
+    for message in messages {
+        if message.role.trim() == "system" {
+            if !message.content.is_empty() {
+                prompt.push_str(&message.content);
+                prompt.push_str("\n\n");
+            }
+            has_system = true;
+        }
+    }
+    if !has_system {
+        // No system message from caller — tool block IS the system message.
+    }
+    prompt.push_str(&tool_block);
+    prompt.push_str("<|im_end|>\n");
+
+    // Emit non-system messages.
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        if role == "system" {
+            continue;
+        }
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+
+    if append_generation_prompt {
+        // Suppress thinking for tool-calling: pre-fill empty <think></think> so
+        // the model proceeds directly to <tool_call> output without burning tokens
+        // on chain-of-thought reasoning.
+        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
     prompt
 }
