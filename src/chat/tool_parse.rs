@@ -11,6 +11,13 @@ use super::tools::ToolCall;
 
 /// Parse `text` into zero or more tool calls. Empty = no tool call (plain answer).
 pub fn parse(text: &str, family: &str) -> Vec<ToolCall> {
+    if family.contains("mistral") {
+        let calls = parse_mistral(text);
+        if !calls.is_empty() {
+            return calls;
+        }
+        return parse_json(text);
+    }
     let hermes_first = family.contains("qwen") || family.contains("hermes");
     if hermes_first {
         let calls = parse_hermes(text);
@@ -24,6 +31,36 @@ pub fn parse(text: &str, family: &str) -> Vec<ToolCall> {
         return calls;
     }
     parse_hermes(text)
+}
+
+/// `[TOOL_CALLS] [{"name": …, "arguments": {…}}, …]` (Mistral Instruct v0.3+).
+fn parse_mistral(text: &str) -> Vec<ToolCall> {
+    let marker = "[TOOL_CALLS]";
+    if let Some(idx) = text.find(marker) {
+        let rest = text[idx + marker.len()..].trim();
+        if let Ok(value) = serde_json::from_str::<Value>(rest) {
+            return calls_from_value(&value);
+        }
+        // The model sometimes appends an EOS token or trailing text after the array;
+        // try to extract the first balanced [...] substring.
+        if let Some(start) = rest.find('[') {
+            let slice = &rest[start..];
+            if let Ok(value) = serde_json::from_str::<Value>(slice) {
+                return calls_from_value(&value);
+            }
+        }
+    }
+    // Mistral v0.3 GGUF emits bare JSON arrays without [TOOL_CALLS] marker.
+    // Extract the first balanced [...] block, ignoring trailing prose.
+    if let Some(arr_slice) = first_json_array(text.trim()) {
+        if let Ok(value) = serde_json::from_str::<Value>(arr_slice) {
+            let calls = calls_from_value(&value);
+            if !calls.is_empty() {
+                return calls;
+            }
+        }
+    }
+    vec![]
 }
 
 /// `<tool_call>{ "name": …, "arguments": { … } }</tool_call>` blocks (Qwen/Hermes).
@@ -162,6 +199,39 @@ fn first_json_object(s: &str) -> Option<&str> {
     None
 }
 
+/// First balanced `[…]` substring (depth-aware, ignores brackets in strings).
+fn first_json_array(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'[')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +352,67 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "read_file");
         assert!(out[0].args.get("path").is_none()); // no real value → gate rejects
+    }
+
+    #[test]
+    fn parses_mistral_tool_calls_marker() {
+        let out = parse(
+            "[TOOL_CALLS] [{\"name\": \"read_file\", \"arguments\": {\"path\": \"notes.txt\"}}]",
+            "mistral",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "notes.txt");
+    }
+
+    #[test]
+    fn parses_mistral_multiple_tool_calls() {
+        let out = parse(
+            "[TOOL_CALLS] [{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.txt\"}}, {\"name\": \"list_dir\", \"arguments\": {\"path\": \".\"}}]",
+            "mistral",
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "a.txt");
+        assert_eq!(out[1].name, "list_dir");
+        assert_eq!(out[1].args["path"], ".");
+    }
+
+    #[test]
+    fn mistral_falls_back_to_json_without_marker() {
+        // If Mistral emits bare JSON (unlikely but possible), the fallback works.
+        let out = parse(
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"x\"}}",
+            "mistral",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+    }
+
+    #[test]
+    fn mistral_plain_answer_yields_no_calls() {
+        assert!(parse("The file contains 3 lines of text.", "mistral").is_empty());
+    }
+
+    #[test]
+    fn mistral_parses_bare_array_without_marker() {
+        let out = parse(
+            " [{\"name\": \"read_file\", \"arguments\": {\"path\": \"notes.txt\"}}]\n\nLet me read it.",
+            "mistral",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "notes.txt");
+    }
+
+    #[test]
+    fn mistral_parses_bare_multi_call_array() {
+        let out = parse(
+            "[{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\"}},{\"name\":\"list_dir\",\"arguments\":{\"path\":\".\"}}]\nDone.",
+            "mistral",
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[1].name, "list_dir");
     }
 }
