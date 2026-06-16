@@ -29,6 +29,12 @@ const args = parseArgs(process.argv.slice(2))
 const camelidBase = (args.get('camelid') || process.env.CAMELID_API_BASE || 'http://127.0.0.1:8185').replace(/\/$/, '')
 const llamaBase = (args.get('llama') || process.env.QWEN3_LLAMA_URL || 'http://127.0.0.1:8090').replace(/\/$/, '')
 const modelId = args.get('model-id') || process.env.QWEN3_MODEL_ID || 'Qwen3 1.7B Instruct'
+const rowId = args.get('row-id') || process.env.QWEN3_ROW_ID || 'qwen3_1_7b_instruct_q8_0'
+const displayName = args.get('display-name') || process.env.QWEN3_DISPLAY_NAME || 'Qwen3 1.7B Instruct Q8_0'
+const comparatorLabel =
+  args.get('comparator') ||
+  process.env.QWEN3_COMPARATOR ||
+  'llama.cpp /completion (ChatML specials parsed), -ctk f32 -ctv f32 -fa off --no-repack'
 const outPath = args.get('out') || process.env.QWEN3_CHAT_PARITY_OUT || null
 const tokenCounts = (args.get('token-counts') || '1,5,50').split(',').map((s) => Number.parseInt(s.trim(), 10))
 
@@ -172,10 +178,10 @@ async function main() {
 
   const report = {
     schema: 'camelid.qwen3.chatml_chat_parity.v1',
-    row_id: 'qwen3_1_7b_instruct_q8_0',
-    display_name: 'Qwen3 1.7B Instruct Q8_0',
+    row_id: rowId,
+    display_name: displayName,
     mode: 'chatml_thinking_disabled_greedy',
-    comparator: 'llama.cpp /completion (ChatML specials parsed), -ctk f32 -ctv f32 -fa off --no-repack',
+    comparator: comparatorLabel,
     camelid_base: camelidBase,
     llama_base: llamaBase,
     token_counts: tokenCounts,
