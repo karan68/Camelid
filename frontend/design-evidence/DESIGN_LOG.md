@@ -731,3 +731,140 @@ lines, captured offline — while a model is loaded the gate's selection snap-ba
 makes metadata-less selection unreachable, which is itself correct behavior) ·
 composer red strip with real numbers (131,072 limit + estimated prompt) and send
 disabled. Gate: 11/11 smokes green, gate libs empty diff, main chunk 104.68 kB gz.
+
+---
+
+# Backend addendum — Agent security hardening (2026-06-16)
+
+These entries cover backend (Rust) agent-loop hardening, logged here because the
+build spec routed the design decisions and threat model to DESIGN_LOG. Code lives
+in `src/chat/{tools,agent,shell_sandbox,audit}.rs`. Companion docs: `AUDIT_EVENTS.md`
+(event schema), `DECISIONS.md` (D9, agent loop).
+
+## run_shell OS sandbox (`shell_sandbox`)
+
+### Decision
+
+`run_shell` is the only tool that hands the model a general-purpose execution
+primitive. The file tools enforce a canonical-root jail *in code*; a shell
+command cannot be jailed that way, so it gets a *kernel*-enforced sandbox.
+
+Three modes, config `--shell-sandbox`:
+
+- **`disabled`** — `run_shell` is not registered with the model at all
+  (`tools::specs` omits it). Defense in depth: `run_shell` execution also refuses
+  if reached.
+- **`sandboxed`** — **the default.** On Linux (x86_64/aarch64) the command runs
+  with, in child `pre_exec` order: chroot into the workspace *iff* it is a usable
+  rootfs (else cwd-confinement, surfaced as a caveat); rlimits (no core, 30 CPU-s,
+  1 GiB AS, 64 fds); supplementary-group drop + setgid + setuid to nobody (65534)
+  when started as root, with a re-`setuid(0)` check that the drop stuck;
+  `PR_SET_NO_NEW_PRIVS`; then a seccomp-BPF filter that **EPERMs** the
+  `ptrace`/`mount`/`socket` families (+ `unshare`/`setns`/module/kexec/reboot/swap)
+  and **kills** on arch mismatch (defeats x32/compat bypass). The existing
+  parent-side wall-clock kill-on-deadline loop is retained.
+- **`unrestricted`** — explicit opt-in; cwd-pinned + timed only. Logs a startup
+  warning.
+
+**Fail closed.** seccomp availability is preflighted (`prctl(PR_GET_SECCOMP)`);
+if seccomp is unavailable, or the host is not Linux/x86_64-aarch64, sandboxed mode
+**refuses to run `run_shell`** rather than silently downgrading to unrestricted.
+The startup banner and the returned tool error report the *actual* enforced layers
+(`EnforcedShell::summary`) — the UI never claims a sandbox the kernel didn't apply.
+
+### Threat model
+
+| Threat | Vector | Mitigation |
+| --- | --- | --- |
+| Prompt-injected destructive command | tool result / file content steers the model to emit a `run_shell` call | Approval tier (`confirm`/`deny`) gates the call before execution; injection tests in `agent.rs` assert result text never auto-executes. |
+| Workspace escape via shell | `cd /`, absolute paths, `..` | chroot (rootfs) or chdir-confined cwd; the file tools' canonical-root check is unaffected. |
+| Local privilege escalation | exploit a setuid binary, load a kernel module, `ptrace` another process | uid/gid drop to nobody + `NO_NEW_PRIVS`; seccomp EPERMs `ptrace`, module load, `mount`. |
+| Network exfiltration / C2 from the shell | open a socket from the command | seccomp blocks `socket`/`socketpair` (the validating test opens a raw socket and asserts EPERM). Note: this is independent of `--allow-net`, which only governs the `http_fetch` tool. |
+| Resource exhaustion (fork bomb, fill disk, hang) | runaway command | rlimits (CPU-s, AS, fds) + parent wall-clock timeout + no core dumps. |
+| Silent loss of protection | seccomp/uid-drop unavailable on host | fail closed: refuse to run; never downgrade silently. |
+
+### Residual risks / follow-ups
+
+- **chroot needs a provisioned rootfs.** Chrooting into a bare scratch dir leaves
+  no shell to exec, so chroot engages only when the workspace has `/bin/sh`;
+  otherwise cwd-confinement is used and the caveat is surfaced. Production-preferred
+  alternative (mount namespace + bind-mount of a minimal rootfs) is a documented
+  follow-up.
+- **Requires root to drop privileges and chroot.** When started unprivileged the
+  uid-drop/chroot layers can't engage; seccomp + rlimits + cwd-confinement still do,
+  and the enforced-layer report says so honestly.
+- **Verification status.** The Linux enforcement is built behind
+  `cfg(target_os="linux", arch ∈ {x86_64,aarch64})` and **type-checks on the Linux
+  target** (verified via `cargo check --target x86_64-unknown-linux-gnu` on the
+  Windows dev box), but its *runtime* behavior — that seccomp actually EPERMs
+  `socket()` — is exercised only by the `socket_is_blocked_under_seccomp` test,
+  which must be run by Linux CI. Until that runs green, sandboxed mode is trusted
+  on Linux only after CI; everywhere else it correctly fails closed. The Windows
+  dev box exercises the fail-closed paths (`*_fails_closed_off_linux`).
+
+## Related: approval tiers + auto-approve (Task 2) and audit events (Task 3)
+
+- **Approval tiers** (`tools::ApprovalPolicy`): every tool resolves to an
+  `auto`/`confirm`/`deny` tier through one chokepoint the loop consults before
+  executing. `--auto-approve` promotes `confirm`→`auto` but **never** exec-risk
+  tools (`run_shell` stays gated) and is **refused (fail closed) under
+  `CAMELID_PRODUCTION`**.
+- **Audit events** (`audit::AuditSink`): each executed tool emits
+  `agent.tool_call`/`agent.tool_result` carrying a SHA-256 *digest* of the args
+  (never raw args — they can hold secrets), the applied tier, outcome and duration.
+  Pluggable sink (no-op default / non-blocking webhook that drops on backpressure).
+  Schema in `AUDIT_EVENTS.md`.
+
+## VRAM headroom policy + contention (Task 4)
+
+- **Headroom policy** (`cuda_vram::evaluate`, pure + unit-tested): at resident
+  load the projected device allocation (resident weights + scratch + sized KV) is
+  checked against free VRAM and a configurable floor
+  (`CAMELID_MIN_VRAM_HEADROOM_MIB`, default 512 MiB) **before** allocating. A
+  violation **refuses the resident load with a named shortfall** (MiB) and falls
+  back to CPU — no mid-load OOM. Wired into `src/inference.rs`'s resident sizing.
+- **Contention harness** (`cuda_vram::measure_contention`, `cfg(cuda)`): occupies
+  a model-sized allocation, attempts a second on the same device ×5, records
+  clean-fail vs OOM with median + variance. Findings + schema:
+  `qa/cuda/CONTENTION_FINDINGS.md` (numbers pending on the CUDA host).
+
+## CPU-vs-CUDA parity (Task 5)
+
+### Tolerance gate (rationale)
+
+The shipped CUDA Q8_0 decode kernel mirrors the CPU reference op-for-op and is
+compiled with `--fmad=false`, so the f32 logits are **bit-identical** and the
+greedy argmax / token IDs match exactly (see `src/cuda.rs` header). The default
+gate (`ToleranceGate::bit_exact`) therefore allows **zero token divergences** and
+**zero logit delta**.
+
+Why a tolerance at all, then? Floating-point matmul *reduction order* is not
+associative, so any path that does not preserve the CPU order (a future
+cuBLAS-backed matmul; the offload streaming path if it ever reorders reductions)
+is not expected to be bit-exact. For those, `ToleranceGate::argmax_stable(tol)`
+defines parity as: **greedy token IDs must still match** (argmax is robust to tiny
+logit noise) with a bounded max absolute logit delta. The gate records which
+regime applied, so a divergence is an explained, documented outcome — not a bare
+pass/fail. This treats divergence with a tolerance rationale rather than as a
+binary, per the spec.
+
+### Artifact + harness
+
+- Schema `camelid.cpu_cuda_parity/v1` (`ParityArtifact::to_json`): model, fixture,
+  verdict, tolerance regime, **first-divergence index**, tokens compared,
+  divergence count, length-mismatch flag, and both token streams.
+- `compare_tokens` reports the first-divergence index token-by-token (pure,
+  unit-tested — 6/6 on the Windows dev box).
+- `tests/cuda_cpu_parity.rs` (ignored) gates a CPU stream against a CUDA stream
+  generated over the frozen fixtures and writes `qa/cuda/parity-latest.json`,
+  reusing the repo's diag-file shape.
+
+### Status
+
+Implemented + unit-tested on the Windows dev box; type-checks under
+`--features cuda`. The **token-by-token run over the frozen fixtures on real CPU
+and CUDA backends is pending the CUDA host** — until then the GPU correctness
+story should state parity is *gated by a ready harness with an explicit
+bit-exact tolerance*, not that the run has been performed. The dev box has no GPU
+build path exercised here; the existing `qa/parity_*_diag.json` files are
+camelid-vs-llama.cpp and are not a CPU-vs-CUDA substitute.

@@ -16,6 +16,7 @@
 
 mod agent;
 mod agent_eval;
+mod audit;
 mod banner;
 mod client;
 mod clipboard;
@@ -25,6 +26,7 @@ mod models;
 mod palette;
 mod server;
 mod session;
+mod shell_sandbox;
 mod theme;
 mod tool_parse;
 mod tools;
@@ -69,6 +71,11 @@ pub struct ChatOptions {
     /// Opt-in thinking mode (`chat --enable-thinking`): the model emits its own
     /// `<think>…</think>` reasoning. NOT parity-locked (leading-trace lane only).
     pub enable_thinking: bool,
+    /// Audit webhook URL (`--audit-webhook` / `CAMELID_AUDIT_WEBHOOK`). When unset,
+    /// the agent uses the no-op sink and emits nothing.
+    pub audit_webhook: Option<String>,
+    /// `run_shell` confinement: `disabled` | `sandboxed` (default) | `unrestricted`.
+    pub shell_sandbox: String,
 }
 
 /// Entry point for the `Chat` subcommand. Returns a process exit code (0 = ok,
@@ -116,6 +123,13 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             eprintln!("agent mode needs a model — pass --model <gguf>");
             return Ok(2);
         }
+        let shell_sandbox = match opts.shell_sandbox.parse::<shell_sandbox::ShellSandbox>() {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("{e}");
+                return Ok(2);
+            }
+        };
         let cfg = agent::AgentConfig {
             workdir: opts.workdir.unwrap_or_else(|| PathBuf::from(".")),
             max_steps: opts.max_steps,
@@ -124,6 +138,8 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             shell_timeout: std::time::Duration::from_secs(opts.shell_timeout),
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,
+            audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
+            shell_sandbox,
         };
         return agent::run_agent(&mut session, opts.addr, cfg);
     }

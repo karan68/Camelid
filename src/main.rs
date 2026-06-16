@@ -343,6 +343,16 @@ enum Command {
         /// thinking-DISABLED rendering.
         #[arg(long, env = "CAMELID_ENABLE_THINKING", default_value_t = false)]
         enable_thinking: bool,
+        /// Agent: POST audit events (agent.tool_call / agent.tool_result) as JSON
+        /// to this URL. Delivery is async + non-blocking (drops on backpressure).
+        /// Unset → no audit. No endpoint is built in.
+        #[arg(long, env = "CAMELID_AUDIT_WEBHOOK")]
+        audit_webhook: Option<String>,
+        /// Agent: run_shell confinement — `disabled` (tool not offered),
+        /// `sandboxed` (default; seccomp+uid-drop on Linux, fails closed where
+        /// unenforceable), or `unrestricted` (cwd-pinned + timed only).
+        #[arg(long, default_value = "sandboxed")]
+        shell_sandbox: String,
     },
     /// Tool-capability promotion harness: decide whether a model drives a clean
     /// tool-call round-trip (PASS / FAIL / INCONCLUSIVE) and emit a receipt. A
@@ -833,6 +843,8 @@ async fn main() -> anyhow::Result<()> {
             allow_net,
             shell_timeout,
             enable_thinking,
+            audit_webhook,
+            shell_sandbox,
         } => {
             let code = chat::run_chat(chat::ChatOptions {
                 model,
@@ -853,6 +865,8 @@ async fn main() -> anyhow::Result<()> {
                 allow_net,
                 shell_timeout,
                 enable_thinking,
+                audit_webhook,
+                shell_sandbox,
             })?;
             if code != 0 {
                 std::process::exit(code);

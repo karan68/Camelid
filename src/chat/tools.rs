@@ -15,6 +15,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::shell_sandbox::{self, ShellSandbox};
+
 /// Risk class — drives the approval gate (Phase 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Risk {
@@ -36,6 +38,107 @@ impl Risk {
     /// Read-only tools may run without prompting (configurable); the rest gate.
     pub fn needs_approval(self) -> bool {
         self != Risk::Read
+    }
+    /// The default approval tier for this risk class (Phase 4 / Task 2). This is
+    /// *policy* (what to do about the risk), distinct from `Risk` (what the risk
+    /// is). Read-only is auto; write/network confirm; exec confirms too — and,
+    /// unlike write/network, exec is never silently promoted to auto by a blanket
+    /// `--auto-approve` (see [`ApprovalPolicy::tier_for`]).
+    pub fn default_tier(self) -> ApprovalTier {
+        match self {
+            Risk::Read => ApprovalTier::Auto,
+            Risk::Write | Risk::Network | Risk::Exec => ApprovalTier::Confirm,
+        }
+    }
+}
+
+/// The approval tier applied to a tool before it runs (Task 2). Each tool
+/// *declares* a tier (derived from its [`Risk`], overridable by config); the
+/// agent loop consults an [`ApprovalPolicy`] for the effective tier and acts on
+/// it — the single chokepoint for "may this run?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalTier {
+    /// Run without prompting.
+    Auto,
+    /// Prompt the approver before running.
+    Confirm,
+    /// Never run; a policy denial is returned to the model.
+    Deny,
+}
+
+impl ApprovalTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            ApprovalTier::Auto => "auto",
+            ApprovalTier::Confirm => "confirm",
+            ApprovalTier::Deny => "deny",
+        }
+    }
+}
+
+/// Resolves the effective [`ApprovalTier`] for each tool call. Built from
+/// per-risk defaults, then layered with: explicit per-tool overrides (config),
+/// a blanket `--auto-approve` promotion (which never touches exec or deny-locked
+/// tools), and per-session grants (the interactive `a` choice). The agent loop
+/// asks this object — never `cfg.auto_approve` directly — so there is exactly
+/// one place that decides whether an action runs.
+#[derive(Default)]
+pub struct ApprovalPolicy {
+    /// Explicit per-tool tier overrides from config (`--tool-tier name=tier`).
+    /// Win over everything except a live session grant.
+    overrides: std::collections::HashMap<String, ApprovalTier>,
+    /// `--auto-approve`: promote every `Confirm` tier to `Auto`, EXCEPT exec-risk
+    /// tools (e.g. `run_shell`), which stay gated unless explicitly overridden.
+    auto_all: bool,
+    /// Session grants from the interactive `a` ("always allow this tool") choice.
+    grants: std::collections::HashSet<String>,
+}
+
+impl ApprovalPolicy {
+    /// Enable/disable the blanket auto-approve promotion. Set from `--auto-approve`
+    /// *after* the production check has passed (see `agent::resolve_policy`).
+    pub fn set_auto_all(&mut self, on: bool) {
+        self.auto_all = on;
+    }
+
+    /// Pin a tool to an explicit tier (config override). Wins over `auto_all`, so
+    /// this is the "explicitly overridden" escape hatch for exec tools. Public
+    /// policy API; reserved for a config/CLI tier override (not yet a flag).
+    #[allow(dead_code)]
+    pub fn set_override(&mut self, tool: &str, tier: ApprovalTier) {
+        self.overrides.insert(tool.to_string(), tier);
+    }
+
+    /// Grant a tool auto-run for the rest of the session (the `a` choice).
+    pub fn grant(&mut self, tool: &str) {
+        self.grants.insert(tool.to_string());
+    }
+
+    /// The tools auto-allowed for this session (for `/tools`).
+    pub fn granted(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.grants.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// The effective tier for `action`, applying (in precedence order): a live
+    /// session grant → an explicit config override → blanket auto-approve → the
+    /// risk default. Exec-risk tools are never promoted to `Auto` by `auto_all`;
+    /// only an explicit override or a session grant can do that.
+    pub fn tier_for(&self, action: &Action) -> ApprovalTier {
+        let name = action.tool_name();
+        if self.grants.contains(name) {
+            return ApprovalTier::Auto;
+        }
+        if let Some(&t) = self.overrides.get(name) {
+            return t;
+        }
+        let base = action.risk().default_tier();
+        if self.auto_all && base == ApprovalTier::Confirm && action.risk() != Risk::Exec {
+            ApprovalTier::Auto
+        } else {
+            base
+        }
     }
 }
 
@@ -77,6 +180,9 @@ pub struct Sandbox {
     root: PathBuf,
     allow_net: bool,
     shell_timeout: Duration,
+    /// OS-level confinement mode for `run_shell` (Task 1). Defaults to
+    /// [`ShellSandbox::Sandboxed`]; production sets it from `--shell-sandbox`.
+    shell_mode: ShellSandbox,
 }
 
 const MAX_READ_BYTES: usize = 64 * 1024;
@@ -98,7 +204,18 @@ impl Sandbox {
             root,
             allow_net,
             shell_timeout,
+            shell_mode: ShellSandbox::default(),
         })
+    }
+
+    /// Set the `run_shell` confinement mode (defaults to sandboxed).
+    pub fn with_shell_mode(mut self, mode: ShellSandbox) -> Self {
+        self.shell_mode = mode;
+        self
+    }
+
+    pub fn shell_mode(&self) -> ShellSandbox {
+        self.shell_mode
     }
 
     pub fn root(&self) -> &Path {
@@ -160,8 +277,9 @@ impl Sandbox {
 // --- tool registry --------------------------------------------------------
 
 /// The tools offered to the model. `http_fetch` is included only when network
-/// access is enabled (`--allow-net`).
-pub fn specs(allow_net: bool) -> Vec<ToolSpec> {
+/// access is enabled (`--allow-net`); `run_shell` is omitted entirely when the
+/// shell sandbox is `disabled` (Task 1 — the tool is not registered at all).
+pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
     let mut tools = vec![
         ToolSpec {
             name: "read_file",
@@ -193,13 +311,15 @@ pub fn specs(allow_net: bool) -> Vec<ToolSpec> {
             risk: Risk::Write,
             params: json!({"type":"object","properties":{"path":{"type":"string"},"old":{"type":"string"},"new":{"type":"string"}},"required":["path","old","new"]}),
         },
-        ToolSpec {
+    ];
+    if shell_mode != ShellSandbox::Disabled {
+        tools.push(ToolSpec {
             name: "run_shell",
             description: "Run a shell command in the workspace and capture its output.",
             risk: Risk::Exec,
             params: json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
-        },
-    ];
+        });
+    }
     if allow_net {
         tools.push(ToolSpec {
             name: "http_fetch",
@@ -518,8 +638,10 @@ fn edit_file(path: &Path, old: &str, new: &str) -> ToolOutcome {
 }
 
 fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
-    // Platform shell, cwd pinned to the sandbox root, with a timeout:
-    // `/bin/sh -c <command>` on Unix, `cmd /C <command>` on Windows.
+    // Platform shell with a timeout: `/bin/sh -c <command>` on Unix, `cmd /C
+    // <command>` on Windows. The cwd-pin and OS-level confinement are applied by
+    // the shell-sandbox layer (Task 1), which fails closed when the configured
+    // mode can't be enforced on this host.
     #[cfg(unix)]
     let mut builder = {
         let mut c = Command::new("/bin/sh");
@@ -532,13 +654,17 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         c.arg("/C").arg(command);
         c
     };
-    let mut child = match builder
-        .current_dir(&sandbox.root)
+    builder
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    // Apply confinement. A sandboxed mode that can't be enforced here returns an
+    // error → refuse to run, never a silent unconfined fallback.
+    if let Err(e) = shell_sandbox::configure_command(&mut builder, &sandbox.root, sandbox.shell_mode)
     {
+        return ToolOutcome::Err(format!("run_shell refused: {e}"));
+    }
+    let mut child = match builder.spawn() {
         Ok(c) => c,
         Err(e) => return ToolOutcome::Err(format!("spawn failed: {e}")),
     };
@@ -715,18 +841,42 @@ mod tests {
 
     #[test]
     fn http_fetch_offered_only_with_net() {
-        assert!(specs(false).iter().all(|t| t.name != "http_fetch"));
-        assert!(specs(true).iter().any(|t| t.name == "http_fetch"));
+        use super::ShellSandbox;
+        assert!(specs(false, ShellSandbox::Sandboxed)
+            .iter()
+            .all(|t| t.name != "http_fetch"));
+        assert!(specs(true, ShellSandbox::Sandboxed)
+            .iter()
+            .any(|t| t.name == "http_fetch"));
         let dir = tempfile::tempdir().unwrap();
         let sb = sandbox(dir.path()); // allow_net = false
         assert!(validate(&call("http_fetch", json!({"url":"http://x"})), &sb).is_err());
     }
 
     #[test]
+    fn disabled_shell_mode_unregisters_run_shell() {
+        use super::ShellSandbox;
+        // Disabled → the tool is not advertised at all (Task 1).
+        assert!(specs(false, ShellSandbox::Disabled)
+            .iter()
+            .all(|t| t.name != "run_shell"));
+        // Sandboxed / unrestricted → it is advertised.
+        assert!(specs(false, ShellSandbox::Sandboxed)
+            .iter()
+            .any(|t| t.name == "run_shell"));
+        assert!(specs(false, ShellSandbox::Unrestricted)
+            .iter()
+            .any(|t| t.name == "run_shell"));
+    }
+
+    #[test]
     fn run_shell_runs_in_root_and_captures() {
+        use super::ShellSandbox;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
-        let sb = sandbox(dir.path());
+        // Unrestricted: the sandboxed kernel mode is not enforceable on every CI
+        // host (and fails closed there). This test exercises the cwd-pinned path.
+        let sb = sandbox(dir.path()).with_shell_mode(ShellSandbox::Unrestricted);
         // Platform-appropriate directory listing: `ls` on Unix, `dir /b` on Windows.
         #[cfg(unix)]
         let command = "ls";
@@ -736,5 +886,21 @@ mod tests {
         assert_eq!(a.risk(), Risk::Exec);
         let out = a.execute(&sb);
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
+    }
+
+    // The default (sandboxed) mode is not kernel-enforceable off Linux, so
+    // run_shell must refuse to run rather than execute unconfined. This is the
+    // fail-closed behavior exercised on the Windows dev box.
+    #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    #[test]
+    fn sandboxed_run_shell_fails_closed_off_linux() {
+        use super::ShellSandbox;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path()); // default = Sandboxed
+        assert_eq!(sb.shell_mode(), ShellSandbox::Sandboxed);
+        let a = validate(&call("run_shell", json!({"command":"echo hi"})), &sb).unwrap();
+        let out = a.execute(&sb);
+        assert!(out.is_err());
+        assert!(out.text().contains("refused") || out.text().contains("not enforceable"));
     }
 }
