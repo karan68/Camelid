@@ -2117,7 +2117,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -2170,6 +2170,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 status: "supported_exact_row_smoke_lanes",
                 notes: "exact Llama 3.2 1B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048/4096/8192-context packs; exact Llama 3.2 3B Instruct Q8_0 has supported_exact_row_smoke canonical Ubuntu main-lane API/WebUI evidence at source head e9f926ed1a65 plus checked bounded 512/1024/2048-context packs; exact Llama 3 8B Instruct Q8_0 has row-specific smoke support with checked bounded 512/1024/2048-context packs, including the published source/runtime-head 8B 1024/2048 PASS bundle at 8e26be0a73c0. Broader 50-token, compact chat-template-shapes, and retained-block lazy-Q8 hot-path evidence remain exact-row bounded pack/measurement evidence only, and broad/full support still needs separate proof.",
+            },
+            SupportItem {
+                id: "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
+                status: "supported_exact_row_smoke_lanes",
+                notes: "exact dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking DISABLED) have row-specific smoke support: qwen2 BPE pre-tokenizer + hardcoded ChatML renderer, per-head QK-norm + NEOX (split-half) RoPE, and token-AND-text-identical greedy parity vs llama.cpp at 1/5/50 tokens on macOS/Ubuntu and on Windows x86_64 CPU (both the cpu_reference scalar path and the x86_q8 AVX2 runtime-repack path, bit-identical). 1.7B additionally runs the GPU-resident decode+prefill path and a 15,373-token single-shot prefill lane on macOS, with opt-in thinking-mode leading-trace parity. Exact rows only; other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the validated envelope, and broad Qwen-family support are not implied.",
             },
         ],
         planned_model_families: vec![
@@ -2663,6 +2668,174 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 next_step: "repeat the current-head promotion smoke on contract-affecting changes; broader/full support still needs separate proof",
             },
             ModelCompatibilityTarget {
+                id: "qwen3_0_6b_instruct_q8_0",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_chatml_thinking_disabled_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the short-chat envelope, production throughput, and WebUI smoke on Windows remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated",
+                tensors_load: "validated",
+                generation_runs: "api_completion_and_chat_smoke",
+                parity_audited: "chatml_thinking_disabled_token_and_text_parity_1_5_50_pass_cpu_reference_and_x86_q8_avx2",
+                performance_measured: "not_promoted",
+                frontend_load_path_verified: "api_smoke_validated_webui_follow_up",
+                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                tested_context: "chatml_1_5_50_token_short_chat_smoke",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "windows_x86_64_chatml_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/qwen3-0.6b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23/README.md",
+                evidence: "exact row Qwen3-0.6B-Q8_0.gguf (explicit head_dim path: head_dim 128 != embedding/head_count 64, sourced from attention.key_length): token-AND-text-identical to llama.cpp at 1/5/50 (ChatML, thinking disabled). macOS bundle qa/evidence-bundles/qwen3-0.6b-q8-chatml-parity-20260614T032905Z-head-63bf015; Windows x86_64 CPU bundle qa/evidence-bundles/qwen3-0.6b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 records all_pass on both the cpu_reference scalar path and the x86_q8 AVX2 path vs llama.cpp 9632 (acd79d603).",
+                next_step: "add WebUI smoke and normalized context/perf evidence on Windows before any broader claim",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen3_1_7b_instruct_q8_0",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_chatml_thinking_disabled_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), full-trace thinking-mode token-parity, context beyond the 16,384 single-shot / 40,960 KV ceilings, production throughput, and WebUI smoke on Windows remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated",
+                tensors_load: "validated",
+                generation_runs: "api_completion_and_chat_smoke_plus_five_prompt_api_smoke",
+                parity_audited: "chatml_thinking_disabled_token_and_text_parity_1_5_50_pass_cpu_reference_x86_q8_avx2_and_macos_gpu_resident_15373_token_prefill",
+                performance_measured: "not_promoted",
+                frontend_load_path_verified: "api_smoke_validated_webui_follow_up",
+                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                tested_context: "chatml_1_5_50_token_short_chat_plus_macos_15373_token_single_shot_prefill",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "windows_x86_64_chatml_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/qwen3-1.7b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23/README.md",
+                evidence: "exact row Qwen3-1.7B-Q8_0.gguf: token-AND-text-identical to llama.cpp at 1/5/50 (ChatML, thinking disabled) on macOS/Ubuntu and Windows x86_64 CPU (cpu_reference + x86_q8 AVX2). macOS bundles qa/evidence-bundles/qwen3-1.7b-q8-chatml-parity-20260614T021844Z-head-f41e374 and qwen3-1.7b-q8-gpu-resident-bigctx-parity-20260614T171846Z-head-f97a896 (GPU-resident decode+prefill; 15,373-token single-shot prefill); thinking-mode leading-trace parity qwen3-1.7b-q8-thinking-enabled-parity-*. Windows bundle qa/evidence-bundles/qwen3-1.7b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass).",
+                next_step: "add WebUI smoke on Windows and re-prove the large-context lane on Windows before widening the platform claim",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen3_4b_instruct_q8_0",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_chatml_thinking_disabled_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, model-native/larger context beyond the short-chat envelope, production throughput, and WebUI smoke on Windows remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated",
+                tensors_load: "validated",
+                generation_runs: "api_completion_and_chat_smoke",
+                parity_audited: "chatml_thinking_disabled_token_and_text_parity_1_5_50_pass_confident_probes_cpu_reference_and_x86_q8_avx2",
+                performance_measured: "not_promoted",
+                frontend_load_path_verified: "api_smoke_validated_webui_follow_up",
+                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                tested_context: "chatml_1_5_50_token_short_chat_smoke_confident_probes",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "windows_x86_64_chatml_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/qwen3-4b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23/README.md",
+                evidence: "exact row Qwen3-4B-Q8_0.gguf (explicit head_dim path): token-AND-text-identical to llama.cpp at 1/5/50 on confident probes (capital-of-France, say-hello, 2+2). The 'Name a primary color.' probe is a documented macOS first-token near-tie; on the Windows 9632 comparator it also matched (both 'Red'). macOS bundle qa/evidence-bundles/qwen3-4b-q8-chatml-parity-20260614T054617Z-head-368ed9b; Windows bundle qa/evidence-bundles/qwen3-4b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass, cpu_reference + x86_q8 AVX2).",
+                next_step: "add WebUI smoke and normalized context/perf evidence on Windows before any broader claim",
+            },
+            ModelCompatibilityTarget {
+                id: "qwen3_8b_instruct_q8_0",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_chatml_thinking_disabled_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), thinking-mode token-parity, 8B large-context token-parity, context beyond the 16,384 single-shot / 40,960 KV ceilings, production throughput, and WebUI smoke on Windows remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated",
+                tensors_load: "validated",
+                generation_runs: "api_completion_and_chat_smoke",
+                parity_audited: "chatml_thinking_disabled_token_and_text_parity_1_5_50_pass_cpu_reference_x86_q8_avx2_and_macos_gpu_resident",
+                performance_measured: "not_promoted",
+                frontend_load_path_verified: "api_smoke_validated_webui_follow_up",
+                frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
+                tested_context: "chatml_1_5_50_token_short_chat_smoke",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "windows_x86_64_chatml_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/qwen3-8b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23/README.md",
+                evidence: "exact row Qwen3-8B-Q8_0.gguf (square head_dim, UNTIED embeddings / separate output.weight): token-AND-text-identical to llama.cpp at 1/5/50 (ChatML, thinking disabled). macOS bundles qa/evidence-bundles/qwen3-8b-q8-chatml-parity-20260614T072602Z-head-368ed9b and qwen3-8b-q8-gpu-resident-parity-20260614T213932Z-head-a0ee3d6 (GPU-resident decode+prefill); Windows bundle qa/evidence-bundles/qwen3-8b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 captured via the two-phase oracle flow (all_pass, cpu_reference + x86_q8 AVX2).",
+                next_step: "add WebUI smoke and large-context evidence on Windows before any broader claim",
+            },
+            ModelCompatibilityTarget {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
                 tool_capable: false,
                 family: "mixtral_moe",
@@ -3061,6 +3234,63 @@ mod gemma4_template_tests {
                 shape.id, shape.enable_thinking
             );
         }
+    }
+
+    #[test]
+    fn qwen3_chatml_prompt_with_tools_renders_tool_definitions_and_suppresses_thinking() {
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "You are an agent.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Read notes.txt".to_string(),
+            },
+        ];
+        let tools = vec![serde_json::json!({
+            "name": "read_file",
+            "description": "Read a file",
+            "parameters": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }
+        })];
+        let prompt = render_qwen3_chatml_prompt_with_tools(&messages, &tools);
+        // System turn merges caller system content + tool definitions.
+        assert!(prompt.starts_with("<|im_start|>system\nYou are an agent.\n\n"));
+        assert!(prompt.contains("You are a helpful assistant with access to the following tools:"));
+        assert!(prompt.contains("\"name\":\"read_file\""));
+        assert!(prompt.contains("<tool_call>"));
+        // User turn present.
+        assert!(prompt.contains("<|im_start|>user\nRead notes.txt<|im_end|>"));
+        // Thinking suppressed in assistant generation prompt.
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        // System role only appears once at the start.
+        assert_eq!(prompt.matches("<|im_start|>system").count(), 1);
+    }
+
+    #[test]
+    fn qwen3_chatml_prompt_with_tools_no_system_message() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let tools = vec![serde_json::json!({
+            "name": "search",
+            "description": "Search",
+            "parameters": { "type": "object", "properties": {} }
+        })];
+        let prompt = render_qwen3_chatml_prompt_with_tools(&messages, &tools);
+        // Tool block IS the system message when no caller system content.
+        assert!(prompt.starts_with(
+            "<|im_start|>system\nYou are a helpful assistant with access to the following tools:"
+        ));
+        assert!(prompt.contains("<|im_start|>user\nhello<|im_end|>"));
     }
 
     #[test]
@@ -3964,19 +4194,17 @@ async fn get_or_load_model(
 
     let target_id = if let Some(id) = model_id {
         id.to_string()
+    } else if let Some(active) = state.active_model_id.read().await.as_ref() {
+        active.clone()
+    } else if loaded_models.len() == 1 {
+        loaded_models.keys().next().unwrap().clone()
     } else {
-        if let Some(active) = state.active_model_id.read().await.as_ref() {
-            active.clone()
-        } else if loaded_models.len() == 1 {
-            loaded_models.keys().next().unwrap().clone()
-        } else {
-            return Err(api_error(
-                StatusCode::NOT_FOUND,
-                "model_not_loaded",
-                BackendError::ModelNotLoaded.to_string(),
-                None,
-            ));
-        }
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "model_not_loaded",
+            BackendError::ModelNotLoaded.to_string(),
+            None,
+        ));
     };
 
     if let Some(loaded) = loaded_models.get(&target_id) {
@@ -6859,8 +7087,15 @@ fn generate_token_ids(
     // so the served run and any later verify re-run fold an identical forward (a cache hit skips
     // the prompt forwards on one side only, which would desync the digest).
     let want_execution_trace = crate::inference::deterministic_mode_enabled();
+    // The GPU-resident CUDA decode engine reuses a cached prompt-prefix session by
+    // reseeding the GPU KV from the f16-rounded host history and resuming, which is not
+    // bit-identical to a fresh GPU prefill (different reduction order) and flips
+    // near-tie tokens. Bypass the cache whenever that engine drives decode so every
+    // request takes the clean prefill path; the CPU lane stays reduction-order-stable
+    // and keeps the cache.
+    let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
-    if !prepared.collect_dense_diagnostics && !want_execution_trace {
+    if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
         if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
             prepared.session = cached.session.clone();
             // The cached session's resident-path pin reflects the request
@@ -7111,7 +7346,12 @@ fn generate_token_ids(
             && generated.is_empty()
             && !prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
+            && !resident_cuda_active
         {
+            // Don't cache a GPU-prefilled session: it can only be replayed bit-exactly
+            // by a fresh GPU prefill, and the lookup above is skipped while the resident
+            // CUDA engine is active anyway. Keeping it out also avoids a CPU request
+            // (after a GPU-off toggle) reusing a GPU-built (f16-seeded) session.
             store_prompt_prefix_cache(&prepared, &step);
         }
         if generated.is_empty() && !reused_prompt_prefix {
@@ -8067,6 +8307,25 @@ fn render_chat_prompt_for_tokenization_with_tools(
         })
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
+        // Mistral Instruct templates (v0.3 GGUF) don't reference the `tools`
+        // Jinja variable — the generic Jinja render silently drops them. Use
+        // the dedicated renderer that produces [AVAILABLE_TOOLS] natively.
+        if is_mistral_instruct_template(template) {
+            return Ok(RenderedPrompt {
+                text: render_mistral_instruct_prompt_with_tools(messages, tokenizer, tools),
+                add_special: false,
+                parse_special: true,
+            });
+        }
+        // Qwen3's full Jinja template uses constructs minijinja can't evaluate;
+        // render tools via the dedicated ChatML+tools path instead.
+        if is_qwen3_chatml_template(template) {
+            return Ok(RenderedPrompt {
+                text: render_qwen3_chatml_prompt_with_tools(messages, &normalized),
+                add_special: false,
+                parse_special: true,
+            });
+        }
         return render_metadata_jinja_chat_template_prompt(
             messages,
             tokenizer,
@@ -8185,6 +8444,74 @@ fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -
             // deterministic answer for parity.
             prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
         }
+    }
+    prompt
+}
+
+/// Renders a Qwen3 ChatML prompt with tool definitions injected into the system
+/// message and thinking suppressed. The format matches Qwen3's expected tool-call
+/// protocol: tools as flat JSON objects in the system turn, model responds with
+/// `<tool_call>{"name":…,"arguments":{…}}</tool_call>`.
+fn render_qwen3_chatml_prompt_with_tools(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+) -> String {
+    let mut prompt = String::new();
+
+    // Build tool definitions block for the system message.
+    let mut tool_block =
+        String::from("You are a helpful assistant with access to the following tools:\n\n");
+    for tool in tools {
+        if let Ok(json) = serde_json::to_string(tool) {
+            tool_block.push_str(&json);
+            tool_block.push('\n');
+        }
+    }
+    tool_block.push_str(
+        "\nWhen you need to call a tool, put your tool call in the format:\n\
+         <tool_call>\n\
+         {\"name\": \"tool_name\", \"arguments\": {\"arg\": \"value\"}}\n\
+         </tool_call>",
+    );
+
+    // Emit system turn: merge any existing system content with tool definitions.
+    prompt.push_str("<|im_start|>system\n");
+    let mut has_system = false;
+    for message in messages {
+        if message.role.trim() == "system" {
+            if !message.content.is_empty() {
+                prompt.push_str(&message.content);
+                prompt.push_str("\n\n");
+            }
+            has_system = true;
+        }
+    }
+    if !has_system {
+        // No system message from caller — tool block IS the system message.
+    }
+    prompt.push_str(&tool_block);
+    prompt.push_str("<|im_end|>\n");
+
+    // Emit non-system messages.
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        if role == "system" {
+            continue;
+        }
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+
+    if append_generation_prompt {
+        // Suppress thinking for tool-calling: pre-fill empty <think></think> so
+        // the model proceeds directly to <tool_call> output without burning tokens
+        // on chain-of-thought reasoning.
+        prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
     }
     prompt
 }
@@ -8498,6 +8825,129 @@ fn render_mistral_instruct_prompt(messages: &[ChatMessage], tokenizer: &Tokenize
     }
 
     prompt
+}
+
+/// Mistral Instruct v0.3+ with native tool calling: injects `[AVAILABLE_TOOLS]`
+/// before the conversation and renders tool results as `[TOOL_RESULTS]` blocks.
+/// The GGUF-embedded Jinja template for this model does not reference the `tools`
+/// variable, so the generic Jinja path silently drops them. This renderer produces
+/// the format documented in Mistral's tokenizer v2 spec.
+fn render_mistral_instruct_prompt_with_tools(
+    messages: &[ChatMessage],
+    tokenizer: &Tokenizer,
+    tools: &[serde_json::Value],
+) -> String {
+    let bos = tokenizer.token_text(tokenizer.special.bos).unwrap_or("<s>");
+    let eos = tokenizer
+        .token_text(tokenizer.special.eos)
+        .unwrap_or("</s>");
+    let mut prompt = String::new();
+
+    // [AVAILABLE_TOOLS] block before the conversation.
+    prompt.push_str(bos);
+    prompt.push_str("[AVAILABLE_TOOLS] ");
+    prompt.push_str(&serde_json::to_string(tools).unwrap_or_else(|_| "[]".into()));
+    prompt.push_str("[/AVAILABLE_TOOLS]");
+
+    let mut system: Option<&str> = None;
+    let mut idx = 0;
+    let mut tool_call_counter: u32 = 0;
+
+    if let Some(first) = messages.first() {
+        if first.role.trim() == "system" {
+            system = Some(first.content.trim());
+            idx = 1;
+        }
+    }
+
+    while idx < messages.len() {
+        let message = &messages[idx];
+        let role = message.role.trim();
+        match role {
+            "user" => {
+                prompt.push_str("[INST] ");
+                // When [AVAILABLE_TOOLS] is active, discard the system message.
+                // Mistral v0.3 was fine-tuned on:
+                //   [AVAILABLE_TOOLS]...[/AVAILABLE_TOOLS][INST] query [/INST]
+                // Adding system text inside [INST] pushes the model off-distribution
+                // and causes it to generate prose instead of [TOOL_CALLS].
+                system.take();
+                prompt.push_str(message.content.trim());
+                prompt.push_str(" [/INST]");
+            }
+            "assistant" => {
+                // If the content looks like tool-call output from the agent loop
+                // (formatted as "name(args)"), wrap it in [TOOL_CALLS] so the model
+                // sees its own output format in multi-turn history. Otherwise emit
+                // as plain assistant text.
+                let content = message.content.trim();
+                if looks_like_agent_tool_call(content) {
+                    tool_call_counter += 1;
+                    let id = format!("call{:05}", tool_call_counter);
+                    let tc_json = agent_call_to_mistral_json(content, &id);
+                    prompt.push_str("[TOOL_CALLS] ");
+                    prompt.push_str(&tc_json);
+                    prompt.push_str(eos);
+                } else {
+                    prompt.push_str(content);
+                    prompt.push_str(eos);
+                }
+            }
+            "tool" => {
+                let id = format!("call{:05}", tool_call_counter);
+                prompt.push_str("[TOOL_RESULTS] ");
+                prompt.push_str(&format!(
+                    "{{\"content\": {}, \"call_id\": \"{}\"}}",
+                    serde_json::to_string(message.content.trim()).unwrap_or_else(|_| "\"\"".into()),
+                    id
+                ));
+                prompt.push_str("[/TOOL_RESULTS]");
+            }
+            _ => {
+                // Skip unknown roles (system already consumed above).
+            }
+        }
+        idx += 1;
+    }
+
+    prompt
+}
+
+/// Returns true if the content looks like the agent loop's tool-call rendering
+/// (e.g. `read_file({"path":"notes.txt"})`).
+fn looks_like_agent_tool_call(content: &str) -> bool {
+    let first_line = content.lines().next().unwrap_or("");
+    if let Some(paren) = first_line.find('(') {
+        let name = &first_line[..paren];
+        let rest = &first_line[paren..];
+        !name.is_empty()
+            && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && rest.ends_with(')')
+            && rest.contains('{')
+    } else {
+        false
+    }
+}
+
+/// Convert the agent loop's `name({"key":"val"})` format to Mistral's
+/// `[{"name":"...", "arguments":{...}, "id":"..."}]` JSON array.
+fn agent_call_to_mistral_json(content: &str, id: &str) -> String {
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(paren) = line.find('(') {
+            let name = &line[..paren];
+            let args_str = &line[paren + 1..line.len().saturating_sub(1)];
+            let args: serde_json::Value = serde_json::from_str(args_str)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            calls.push(serde_json::json!({
+                "name": name,
+                "arguments": args,
+                "id": id,
+            }));
+        }
+    }
+    serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into())
 }
 
 fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
@@ -8929,6 +9379,7 @@ mod tests {
             thread_count: 16,
             diagnostics_status: "standard diagnostics; RSS timings disabled by default".into(),
             fallback_path: "retained_q8_reference_path".into(),
+            cuda_resident_active: false,
             reasons: vec!["default-off Ubuntu x86_64 experiment selected".into()],
         };
 
@@ -9047,6 +9498,45 @@ mod tests {
             .evidence
             .contains("checked 512/1024/2048-context packs"));
         assert!(eight_b.evidence.contains("current-head 1024/2048 pass"));
+    }
+
+    #[test]
+    fn capabilities_report_qwen3_chatml_supported_rows() {
+        let response = capabilities_response();
+        for id in [
+            "qwen3_0_6b_instruct_q8_0",
+            "qwen3_1_7b_instruct_q8_0",
+            "qwen3_4b_instruct_q8_0",
+            "qwen3_8b_instruct_q8_0",
+        ] {
+            let target = response
+                .model_compatibility
+                .iter()
+                .find(|target| target.id == id)
+                .unwrap_or_else(|| panic!("{id} should be advertised in model_compatibility"));
+            assert_eq!(target.family, "qwen3", "{id} family");
+            assert_eq!(target.quantization, "Q8_0", "{id} quant");
+            assert_eq!(target.status, "supported_exact_row_smoke", "{id} status");
+            assert_eq!(
+                target.chat_template_renderer, "qwen3_chatml_thinking_disabled",
+                "{id} renderer"
+            );
+            // Parity proven on both the scalar and the AVX2 x86_q8 paths on Windows.
+            assert!(
+                target.parity_audited.contains("x86_q8_avx2"),
+                "{id} parity_audited should cite the x86_q8 AVX2 path"
+            );
+            // Each row cites its Windows x86_64 parity bundle.
+            assert!(
+                target.evidence.contains("windows-x86-chatml-parity"),
+                "{id} evidence should cite the Windows bundle"
+            );
+            // ChatML short-chat smoke only — no bounded context pack is promoted.
+            assert_eq!(
+                target.bounded_context_512_pack, "not_promoted",
+                "{id} ctx512"
+            );
+        }
     }
 
     #[test]
@@ -9254,6 +9744,14 @@ mod tests {
                 "llama32_3b_instruct_q8_0",
                 "llama3_8b_instruct_q8_0",
                 "mistral_7b_instruct_v0_3_q8_0",
+                // Dense Qwen3 Q8_0 ChatML rows (thinking disabled): exact-row
+                // token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on
+                // Windows x86_64 CPU (cpu_reference + x86_q8 AVX2, bit-identical).
+                // Short-chat smoke only; no bounded-context/perf/full support.
+                "qwen3_0_6b_instruct_q8_0",
+                "qwen3_1_7b_instruct_q8_0",
+                "qwen3_4b_instruct_q8_0",
+                "qwen3_8b_instruct_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
             ])
         );
@@ -9269,6 +9767,7 @@ mod tests {
                 "llama_bpe_decoder_exact_1b_3b_8b_q8_0",
                 "llama_spm_decoder",
                 "mistral_instruct_exact_7b_v0_3_q8_0",
+                "qwen3_chatml_exact_0_6b_1_7b_4b_8b_q8_0",
             ])
         );
 
@@ -10085,6 +10584,123 @@ mod tests {
             ),
             "<s>[INST] Complete cam [/INST] elid</s><s>[INST] Now say hi [/INST]"
         );
+    }
+
+    #[test]
+    fn mistral_instruct_with_tools_injects_available_tools() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = mistral_test_tokenizer();
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        })];
+
+        let messages = vec![ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "Read notes.txt".to_string(),
+        }];
+
+        let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
+
+        assert!(rendered.starts_with("<s>[AVAILABLE_TOOLS] "));
+        assert!(rendered.contains("[/AVAILABLE_TOOLS]"));
+        assert!(rendered.contains("[INST] Read notes.txt [/INST]"));
+        assert!(
+            rendered.contains("\"name\":\"read_file\"")
+                || rendered.contains("\"name\": \"read_file\"")
+        );
+    }
+
+    #[test]
+    fn mistral_instruct_with_tools_omits_system_message() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = mistral_test_tokenizer();
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "test", "description": "Test tool", "parameters": {}}
+        })];
+
+        let messages = vec![
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "You are helpful.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Do something".to_string(),
+            },
+        ];
+
+        let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
+
+        // System content is discarded when [AVAILABLE_TOOLS] is active
+        assert!(!rendered.contains("You are helpful."));
+        assert!(rendered.contains("[INST] Do something [/INST]"));
+        assert!(rendered.starts_with("<s>[AVAILABLE_TOOLS] "));
+    }
+
+    #[test]
+    fn mistral_instruct_with_tools_renders_tool_results() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
+        let tokenizer = mistral_test_tokenizer();
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "read_file", "description": "Read", "parameters": {}}
+        })];
+
+        let messages = vec![
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Read it".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "read_file({\"path\":\"notes.txt\"})".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "tool".to_string(),
+                content: "alpha\nbeta\ngamma".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "How many lines?".to_string(),
+            },
+        ];
+
+        let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
+
+        assert!(rendered.contains("[TOOL_CALLS] "));
+        assert!(
+            rendered.contains("\"name\":\"read_file\"")
+                || rendered.contains("\"name\": \"read_file\"")
+        );
+        assert!(rendered.contains("[TOOL_RESULTS] "));
+        assert!(rendered.contains("call_id"));
+        assert!(rendered.contains("[/TOOL_RESULTS]"));
+        assert!(rendered.contains("[INST] How many lines? [/INST]"));
     }
 
     #[test]
@@ -11517,6 +12133,61 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             likes: 920,
             quant: "Q8_0",
             license: "llama3",
+        },
+        CatalogItem {
+            catalog_id: "mistral_7b_instruct_v0_3_q8_0",
+            name: "Mistral 7B Instruct v0.3 Q8_0",
+            repo_id: "bartowski/Mistral-7B-Instruct-v0.3-GGUF",
+            filename: "Mistral-7B-Instruct-v0.3-Q8_0.gguf",
+            size_bytes: 7702565088,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "apache-2.0",
+        },
+        CatalogItem {
+            catalog_id: "qwen3_0_6b_instruct_q8_0",
+            name: "Qwen3 0.6B Q8_0",
+            repo_id: "Qwen/Qwen3-0.6B-GGUF",
+            filename: "Qwen3-0.6B-Q8_0.gguf",
+            size_bytes: 639446688,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "apache-2.0",
+        },
+        CatalogItem {
+            catalog_id: "qwen3_1_7b_instruct_q8_0",
+            name: "Qwen3 1.7B Q8_0",
+            repo_id: "Qwen/Qwen3-1.7B-GGUF",
+            filename: "Qwen3-1.7B-Q8_0.gguf",
+            size_bytes: 1834426016,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "apache-2.0",
+        },
+        CatalogItem {
+            catalog_id: "qwen3_4b_instruct_q8_0",
+            name: "Qwen3 4B Q8_0",
+            repo_id: "Qwen/Qwen3-4B-GGUF",
+            filename: "Qwen3-4B-Q8_0.gguf",
+            size_bytes: 4280404704,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "apache-2.0",
+        },
+        CatalogItem {
+            catalog_id: "qwen3_8b_instruct_q8_0",
+            name: "Qwen3 8B Q8_0",
+            repo_id: "Qwen/Qwen3-8B-GGUF",
+            filename: "Qwen3-8B-Q8_0.gguf",
+            size_bytes: 8709518112,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            license: "apache-2.0",
         },
         CatalogItem {
             catalog_id: "gemma4_e4b_it_q8_0",

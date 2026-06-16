@@ -25,50 +25,109 @@
 use std::path::Path;
 
 pub mod chat;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod reff16;
 mod refmath;
 pub mod refrng;
 
+/// GPU soft-embedding matmul (`emb_t @ probs`) for the self-conditioning
+/// signal — returns the `[c*hidden]` f32 buffer, or `None` to fall back to the
+/// CPU path. A no-op (always `None`) when the `cuda` feature is off.
+#[cfg(feature = "cuda")]
+fn sc_soft_gpu(
+    emb_t: &[u16],
+    probs_f16: &[u16],
+    c: usize,
+    hidden: usize,
+    n_vocab: usize,
+    embed_scale: f32,
+) -> Option<Vec<f32>> {
+    cuda::sc_soft_embedding_gpu(emb_t, probs_f16, c, hidden, n_vocab, embed_scale)
+}
+#[cfg(not(feature = "cuda"))]
+fn sc_soft_gpu(
+    _emb_t: &[u16],
+    _probs_f16: &[u16],
+    _c: usize,
+    _hidden: usize,
+    _n_vocab: usize,
+    _embed_scale: f32,
+) -> Option<Vec<f32>> {
+    None
+}
+
+/// GPU Q6_K lm_head over the canvas activations — returns `[c*n_vocab]` logits
+/// (row-major per position) or `None` to fall back to the CPU matvec. A no-op
+/// when the `cuda` feature is off. The Q6_K GEMV mirrors the CPU `q6_k_dot`
+/// reduction (exact i64 dot + fused per-block f32 term), so it is bit-close /
+/// bit-identical to the CPU path.
+#[cfg(feature = "cuda")]
+fn lm_head_gpu(wire: &DgWire, acts: &[DgActivation], c: usize, hidden: usize) -> Option<Vec<f32>> {
+    // Opt-in: the GPU Q6_K GEMV is bit-identical to the CPU lm_head but the
+    // current naive one-thread-per-output kernel is SLOWER than CPU in isolation
+    // (lm_head is only ~9s on CPU). Kept as the validated building block for the
+    // full-forward GPU path (where it avoids the per-stage round-trip); enable
+    // with CAMELID_DG_CUDA_LMHEAD=1. Needs a coalesced/warp kernel to win solo.
+    if std::env::var("CAMELID_DG_CUDA_LMHEAD").as_deref() != Ok("1") {
+        return None;
+    }
+    if wire.format != DgFormat::Q6K {
+        return None;
+    }
+    let bpr = hidden / 256;
+    let rb = wire.row_bytes();
+    let bytes = wire.mmap.bytes(wire.offset, wire.rows * rb).ok()?;
+    let mut scales = vec![0f32; c * bpr];
+    let mut quants = vec![0i8; c * bpr * 256];
+    for (pos, a) in acts.iter().enumerate() {
+        let blocks = a.q8_k.as_ref()?;
+        if blocks.len() != bpr {
+            return None;
+        }
+        for (b, blk) in blocks.iter().enumerate() {
+            scales[pos * bpr + b] = blk.d;
+            let off = (pos * bpr + b) * 256;
+            quants[off..off + 256].copy_from_slice(&blk.qs);
+        }
+    }
+    cuda::lm_head_q6k_gpu(bytes, wire.rows, bpr, &scales, &quants, c)
+}
+#[cfg(not(feature = "cuda"))]
+fn lm_head_gpu(
+    _wire: &DgWire,
+    _acts: &[DgActivation],
+    _c: usize,
+    _hidden: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
-// Expert-selection argsort that bit-exactly matches the reference's
-// `ggml_argsort_top_k` (libc++ `std::sort` over indices by DESC key, with the
-// strict no-tie-break comparator — UNSTABLE tie order). Implemented as a C++
-// shim (src/dg_argsort.cpp) so the tie order is the SAME libc++ std::sort as
-// the pinned reference build, rather than a fragile hand-port of clang's
-// introsort. Camelid's prior `sort_unstable_by(...).then(idx)` forced
-// lower-index-first ties, which swapped equal-probability experts' slots and
-// perturbed the MoE weighted-sum accumulation order.
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn dg_argsort_desc_f32(keys: *const f32, n: i32, out_idx: *mut i32);
-    fn dg_argsort_asc_f32(keys: *const f32, n: i32, out_idx: *mut i32);
-}
+// Expert-selection argsort matching the reference's `ggml_argsort_top_k`
+// comparator. The reference's CPU path is libc++ `std::sort` over expert indices
+// with the STRICT, no-tie-break comparator (`keys[a] > keys[b]` for DESC). That
+// sort is *unstable*: for an exact-equal key tie (a true probability tie) the
+// relative order is libc++-introsort-internal.
+//
+// This is a pure-Rust implementation (no C/C++ shim). Every NON-tie comparison
+// is identical to the reference because the comparator is the same strict
+// `>`/`<`; only exact f32 ties are resolved differently (we break them by lower
+// index, which is deterministic). An unspecified libc++ introsort tie-order
+// cannot be reproduced portably, and the lane's Apple-specific math bindings
+// (`__sincosf_stret`, vDSP) already place non-macOS targets out of bit-parity
+// with the pinned reference regardless. On Apple Silicon, exact-tie bit-parity
+// against the reference is therefore no longer guaranteed once the C++ shim is
+// removed; re-validate the encoder/decode parity gates on a Mac if that matters
+// (the shim is recoverable from git history). See DIFFUSIONGEMMA_RECON.md.
+//
+// Sorting by the bit-exact router LOGITS with `>` is comparison-identical to the
+// reference sorting softmax `selection_probs` (softmax is strictly monotonic:
+// logit[a] > logit[b] <=> prob[a] > prob[b], and equal logits <=> equal probs).
 
-/// Indices `[0..keys.len())` ordered by DESCENDING `keys`, matching the
-/// reference's libc++ `std::sort` (including its unstable tie order). Use the
-/// bit-exact router logits as the key (comparison-identical to softmax probs).
-#[cfg(target_os = "macos")]
-fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
-    let mut out = vec![0i32; keys.len()];
-    // SAFETY: out has keys.len() slots; the shim writes exactly that many.
-    unsafe { dg_argsort_desc_f32(keys.as_ptr(), keys.len() as i32, out.as_mut_ptr()) };
-    out
-}
-
-/// Indices ordered by ASCENDING `keys` via the same libc++ `std::sort` — for
-/// the EB sampler's MI-bound position ordering (reference sorts positions by
-/// entropy with `std::sort`, strict `<`, unstable tie order).
-#[cfg(target_os = "macos")]
-fn argsort_asc_libcpp(keys: &[f32]) -> Vec<i32> {
-    let mut out = vec![0i32; keys.len()];
-    unsafe { dg_argsort_asc_f32(keys.as_ptr(), keys.len() as i32, out.as_mut_ptr()) };
-    out
-}
-
-/// Non-macOS fallback (the lane is Apple-Silicon-only; this keeps other
-/// targets compiling): descending key with lower-index tie-break.
-#[cfg(not(target_os = "macos"))]
+/// Indices `[0..keys.len())` ordered by DESCENDING `keys` (strict `>`, lower
+/// index breaks exact ties). Use the bit-exact router logits as the key.
 fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
     let mut out: Vec<i32> = (0..keys.len() as i32).collect();
     out.sort_unstable_by(|&a, &b| {
@@ -80,7 +139,9 @@ fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
     out
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Indices ordered by ASCENDING `keys` (strict `<`, lower index breaks exact
+/// ties) — the EB sampler's MI-bound position ordering (reference sorts
+/// positions by entropy with `std::sort`, strict `<`).
 fn argsort_asc_libcpp(keys: &[f32]) -> Vec<i32> {
     let mut out: Vec<i32> = (0..keys.len() as i32).collect();
     out.sort_unstable_by(|&a, &b| {
@@ -253,6 +314,29 @@ impl DgWire {
         self.in_dim / self.format.values_per_block() * self.format.bytes_per_block()
     }
 
+    /// One weight row (raw wire bytes) dotted with one quantized activation,
+    /// dispatched by format. This IS the reference reduction order (the `_arm`
+    /// kernels, which dispatch to bit-identical AVX2 on x86_64).
+    #[inline]
+    fn dot_row(&self, row: &[u8], x: &DgActivation) -> f32 {
+        match self.format {
+            DgFormat::Q8_0 => refmath::q8_0_dot_arm(row, &x.q8_0),
+            DgFormat::Q5_0 => refmath::q5_0_dot_arm(row, &x.q8_0),
+            DgFormat::Q4K => refmath::q4_k_dot_arm(
+                row,
+                x.q8_k
+                    .as_ref()
+                    .expect("K-quant rows imply 256-aligned input"),
+            ),
+            DgFormat::Q6K => refmath::q6_k_dot_arm(
+                row,
+                x.q8_k
+                    .as_ref()
+                    .expect("K-quant rows imply 256-aligned input"),
+            ),
+        }
+    }
+
     /// y[r] = dequant(W[first_row + r]) · x for `n_rows` rows.
     fn matvec_rows(&self, first_row: usize, n_rows: usize, x: &DgActivation) -> Result<Vec<f32>> {
         if first_row + n_rows > self.rows {
@@ -266,49 +350,22 @@ impl DgWire {
         let bytes = self
             .mmap
             .bytes(self.offset + (first_row * rb) as u64, n_rows * rb)?;
-        let dot = |r: usize| -> f32 {
-            let row = &bytes[r * rb..(r + 1) * rb];
-            match self.format {
-                DgFormat::Q8_0 => refmath::q8_0_dot_arm(row, &x.q8_0),
-                DgFormat::Q5_0 => refmath::q5_0_dot_arm(row, &x.q8_0),
-                DgFormat::Q4K => refmath::q4_k_dot_arm(
-                    row,
-                    x.q8_k
-                        .as_ref()
-                        .expect("K-quant rows imply 256-aligned input"),
-                ),
-                DgFormat::Q6K => refmath::q6_k_dot_arm(
-                    row,
-                    x.q8_k
-                        .as_ref()
-                        .expect("K-quant rows imply 256-aligned input"),
-                ),
-            }
-        };
         let mut out = vec![0f32; n_rows];
-        // Row-chunk threading: every output element is one self-contained row
-        // dot, so splitting ROWS across threads cannot change any value (the
-        // reference's own mul_mat threads partition the same way). Small
-        // matvecs stay sequential — thread spawn would dominate.
-        let nth = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
-        if nth <= 1 || n_rows * self.in_dim < (1 << 21) {
+        // Row-parallel matvec: every output element is one self-contained row
+        // dot over the same input, so distributing ROWS across threads cannot
+        // change any value (no shared reduction; each y[r] is written once).
+        // The result is bit-identical to the serial path regardless of thread
+        // count — the reference's own mul_mat threads partition the same way.
+        // Uses the global rayon pool (no per-call OS-thread spawn); small
+        // matvecs stay serial because the fork/join would dominate.
+        if n_rows * self.in_dim < (1 << 18) {
             for (r, y) in out.iter_mut().enumerate() {
-                *y = dot(r);
+                *y = self.dot_row(&bytes[r * rb..(r + 1) * rb], x);
             }
         } else {
-            let chunk = n_rows.div_ceil(nth);
-            std::thread::scope(|s| {
-                for (ci, ys) in out.chunks_mut(chunk).enumerate() {
-                    let dot = &dot;
-                    s.spawn(move || {
-                        for (i, y) in ys.iter_mut().enumerate() {
-                            *y = dot(ci * chunk + i);
-                        }
-                    });
-                }
+            use rayon::prelude::*;
+            out.par_iter_mut().enumerate().for_each(|(r, y)| {
+                *y = self.dot_row(&bytes[r * rb..(r + 1) * rb], x);
             });
         }
         Ok(out)
@@ -818,8 +875,8 @@ impl DgEncoderRuntime {
                 let mut probs: Vec<f32> = logits.clone();
                 refmath::softmax_row(&mut probs);
                 // expert ORDER must match the reference's ggml_argsort_top_k =
-                // libc++ std::sort over DESC router logits (unstable tie order;
-                // see dg_argsort.cpp). Sorting by the bit-exact logits is
+                // libc++ std::sort over DESC router logits (strict `>`; see
+                // argsort_desc_experts). Sorting by the bit-exact logits is
                 // comparison-identical to sorting softmax probs.
                 let order = argsort_desc_experts(&logits);
                 let mut idx: Vec<usize> = order[..self.n_expert_used]
@@ -1089,41 +1146,56 @@ impl DgEncoderRuntime {
         let mut d_normed: Vec<f32> = Vec::new();
         let mut d_g: Vec<f32> = Vec::new();
         let mut d_sig: Vec<f32> = Vec::new();
+
+        // probs = softmax(scale(sc_logits, temp_inv)) per position, then the
+        // F16 src1 conversion (ggml quantizes src1 rows to the f16 vec_dot
+        // type). Gathered for all positions so the soft-embedding matmul can
+        // run as one batched GPU kernel.
+        let mut probs_f16_all = vec![0u16; c * n_vocab];
         for pos in 0..c {
-            // probs = soft_max(scale(sc_logits, temp_inv)) — f32, same
-            // kernel as every other softmax; then the F16 src1 conversion
-            // (ggml quantizes src1 rows to the f16 vec_dot_type)
             let mut probs: Vec<f32> = sc.logits[pos * n_vocab..(pos + 1) * n_vocab]
                 .iter()
                 .map(|&x| x * sc.temp_inv)
                 .collect();
             refmath::softmax_row(&mut probs);
-            let probs_f16: Vec<u16> = probs
-                .iter()
-                .map(|&x| crate::tensor::f32_to_f16_bits(x))
-                .collect();
+            for (v, &p) in probs.iter().enumerate() {
+                probs_f16_all[pos * n_vocab + v] = crate::tensor::f32_to_f16_bits(p);
+            }
+        }
 
-            // soft = (embT @ probs) * sqrt(n_embd) — one f16 dot per row
-            let mut soft = vec![0f32; hidden];
-            let nth = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(8);
-            let chunk = hidden.div_ceil(nth);
-            std::thread::scope(|s| {
-                for (ci, ys) in soft.chunks_mut(chunk).enumerate() {
-                    let probs_f16 = &probs_f16;
-                    s.spawn(move || {
-                        for (i, y) in ys.iter_mut().enumerate() {
-                            let e = ci * chunk + i;
-                            *y = reff16::vec_dot_f16(
-                                &emb_t[e * n_vocab..(e + 1) * n_vocab],
-                                probs_f16,
-                            ) * embed_scale;
+        // soft[pos] = (embT @ probs[pos]) * sqrt(n_embd). GPU when available
+        // (f32 reduction — NOT bit-identical to the CPU f16 emulation, but this
+        // matmul is ~87% of a multi-step denoise step); else the reference
+        // per-row f16 dot.
+        let soft_all = sc_soft_gpu(emb_t, &probs_f16_all, c, hidden, n_vocab, embed_scale);
+
+        for pos in 0..c {
+            let soft: Vec<f32> = match &soft_all {
+                Some(all) => all[pos * hidden..(pos + 1) * hidden].to_vec(),
+                None => {
+                    let probs_f16 = &probs_f16_all[pos * n_vocab..(pos + 1) * n_vocab];
+                    let mut soft = vec![0f32; hidden];
+                    let nth = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(8);
+                    let chunk = hidden.div_ceil(nth);
+                    std::thread::scope(|s| {
+                        for (ci, ys) in soft.chunks_mut(chunk).enumerate() {
+                            s.spawn(move || {
+                                for (i, y) in ys.iter_mut().enumerate() {
+                                    let e = ci * chunk + i;
+                                    *y = reff16::vec_dot_f16(
+                                        &emb_t[e * n_vocab..(e + 1) * n_vocab],
+                                        probs_f16,
+                                    ) * embed_scale;
+                                }
+                            });
                         }
                     });
+                    soft
                 }
-            });
+            };
 
             // SC gated MLP: pre_norm -> down( gelu(gate) * up )
             let normed = refmath::rms_norm(&soft, Some(&self.sc_pre_norm), eps);
@@ -1209,10 +1281,14 @@ impl DgEncoderRuntime {
         let embed_scale = (hidden as f32).sqrt();
 
         // self-conditioning signal per canvas position (graph order: the SC
-        // subgraph feeds the canvas embedding)
+        // subgraph feeds the canvas embedding). When use_sc == 0 (step 0) the
+        // signal is added as `sv * 0` below — i.e. discarded — so skip the
+        // ~1.9e11-MAC soft-embedding matmul entirely. Bit-identical: every
+        // embedding row is left unchanged either way (the reference's step-0
+        // graph likewise contributes nothing).
         let sigs = match sc {
-            Some(sc_in) => Some(self.sc_signal(sc_in, c)?),
-            None => None,
+            Some(sc_in) if sc_in.use_sc != 0.0 => Some(self.sc_signal(sc_in, c)?),
+            _ => None,
         };
 
         // embeddings: every row scaled by sqrt(n_embd); canvas rows add the
@@ -1246,6 +1322,8 @@ impl DgEncoderRuntime {
         let canvas_prompt_lo = p as i64 - win as i64 + 1;
 
         let mut traces = Vec::with_capacity(if want_trace { self.n_layer } else { 0 });
+        let dg_prof = std::env::var("CAMELID_DG_STAGE_TIMINGS").is_ok();
+        let (mut t_qkv, mut t_attn, mut t_ffn) = (0u128, 0u128, 0u128);
         for (l, lw) in self.layers.iter().enumerate() {
             let sliding = self.g.is_sliding_layer(l);
             let head_dim = self.g.head_dim_at(l) as usize;
@@ -1265,6 +1343,7 @@ impl DgEncoderRuntime {
             let mut qs: Vec<Vec<f32>> = Vec::with_capacity(n);
             let mut ks: Vec<Vec<f32>> = Vec::with_capacity(n);
             let mut vs: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let _t_qkv = std::time::Instant::now();
             for (pos, hp) in h.iter().enumerate() {
                 let xn = refmath::rms_norm(hp, Some(&lw.attn_norm), eps);
                 let xq = DgActivation::new(&xn);
@@ -1292,6 +1371,8 @@ impl DgEncoderRuntime {
                 vs.push(v);
             }
 
+            t_qkv += _t_qkv.elapsed().as_nanos();
+            let _t_attn = std::time::Instant::now();
             // region-aware mask (llm_graph_input_attn_diffusion::set_input):
             // prompt queries causal over the prompt only (SWA-clipped on
             // sliding layers); canvas queries bidirectional — global layers
@@ -1370,6 +1451,8 @@ impl DgEncoderRuntime {
                 }
             }
 
+            t_attn += _t_attn.elapsed().as_nanos();
+            let _t_ffn = std::time::Instant::now();
             // ---- dense shared-expert MLP + 128-expert MoE (identical math
             // to the encoder path; only the per-layer output scalar is
             // region-aware) ----
@@ -1413,9 +1496,9 @@ impl DgEncoderRuntime {
                 let mut probs: Vec<f32> = logits.clone();
                 refmath::softmax_row(&mut probs);
                 // expert ORDER must match the reference's ggml_argsort_top_k =
-                // libc++ std::sort over DESC router logits (unstable tie order;
-                // see dg_argsort.cpp) — NOT lower-index-first, which swapped
-                // equal-prob experts' slots and perturbed the weighted sum.
+                // libc++ std::sort over DESC router logits (strict `>`; see
+                // argsort_desc_experts). Exact ties break by lower index (the
+                // reference's introsort tie-order is not portably reproducible).
                 let order = argsort_desc_experts(&logits);
                 let idx: Vec<usize> = order[..self.n_expert_used]
                     .iter()
@@ -1493,6 +1576,7 @@ impl DgEncoderRuntime {
                 }
             }
 
+            t_ffn += _t_ffn.elapsed().as_nanos();
             if want_trace {
                 let mut k_flat = Vec::with_capacity(n * kv_dim);
                 let mut v_flat = Vec::with_capacity(n * kv_dim);
@@ -1525,27 +1609,59 @@ impl DgEncoderRuntime {
 
         // final norm on every row; lm_head (tied Q6_K token embedding) +
         // final-logit softcapping on the CANVAS rows only (the gate surface)
+        let _t_lm = std::time::Instant::now();
         let n_vocab = self.token_embd.rows;
         let mut result_norm_all = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
+        let rns: Vec<Vec<f32>> = h
+            .iter()
+            .map(|hp| refmath::rms_norm(hp, Some(&self.output_norm), eps))
+            .collect();
+        if want_trace {
+            for rn in &rns {
+                result_norm_all.extend_from_slice(rn);
+            }
+        }
+        // Canvas rows finish through the tied Q6_K lm_head. Quantize each canvas
+        // activation to Q8_K, then run one batched GPU GEMV (bit-close to the
+        // CPU q6_k_dot) when available, else the per-position CPU matvec.
+        let canvas_acts: Vec<DgActivation> =
+            rns[p..].iter().map(|rn| DgActivation::new(rn)).collect();
+        let gpu_logits = lm_head_gpu(&self.token_embd, &canvas_acts, c, hidden);
         let mut logits = Vec::with_capacity(c * n_vocab);
-        for (pos, hp) in h.iter().enumerate() {
-            let rn = refmath::rms_norm(hp, Some(&self.output_norm), eps);
-            if pos >= p {
-                let rq = DgActivation::new(&rn);
-                let mut row = self.token_embd.matvec_dense(&rq)?;
-                if let Some(cap) = self.final_logit_softcapping {
-                    // reference: scale(1/cap) -> tanh -> scale(cap); the
-                    // reciprocal is computed in f32 at graph build
-                    let inv_cap = 1.0f32 / cap;
-                    for v in row.iter_mut() {
-                        *v = refmath::libm_tanhf(*v * inv_cap) * cap;
-                    }
+        let softcap = |row: &mut [f32]| {
+            if let Some(cap) = self.final_logit_softcapping {
+                // reference: scale(1/cap) -> tanh -> scale(cap); the reciprocal
+                // is computed in f32 at graph build
+                let inv_cap = 1.0f32 / cap;
+                for v in row.iter_mut() {
+                    *v = refmath::libm_tanhf(*v * inv_cap) * cap;
                 }
-                logits.extend_from_slice(&row);
             }
-            if want_trace {
-                result_norm_all.extend_from_slice(&rn);
+        };
+        match gpu_logits {
+            Some(all) => {
+                for pos in 0..c {
+                    let mut row = all[pos * n_vocab..(pos + 1) * n_vocab].to_vec();
+                    softcap(&mut row);
+                    logits.extend_from_slice(&row);
+                }
             }
+            None => {
+                for rq in &canvas_acts {
+                    let mut row = self.token_embd.matvec_dense(rq)?;
+                    softcap(&mut row);
+                    logits.extend_from_slice(&row);
+                }
+            }
+        }
+        if dg_prof {
+            eprintln!(
+                "[dg-prof] qkv={}ms attn={}ms ffn+moe={}ms lm_head={}ms (n={n} c={c})",
+                t_qkv / 1_000_000,
+                t_attn / 1_000_000,
+                t_ffn / 1_000_000,
+                _t_lm.elapsed().as_millis(),
+            );
         }
 
         let trace = want_trace.then(|| DgEncoderTrace {
@@ -1920,6 +2036,22 @@ mod tests {
         // the same f16 produce the identical output
         let y = x + 1e-6;
         assert_eq!(dg_gelu(x).to_bits(), dg_gelu(y).to_bits());
+    }
+
+    #[test]
+    fn dg_argsort_orders_and_breaks_ties_by_index() {
+        // DESC: strictly decreasing key order; the comparator matches the
+        // reference's ggml_argsort_top_k (`keys[a] > keys[b]`).
+        let keys = [0.1f32, 0.9, 0.5, 0.3];
+        assert_eq!(argsort_desc_experts(&keys), vec![1, 2, 3, 0]);
+        // ASC: strictly increasing key order (EB MI-bound position ordering).
+        assert_eq!(argsort_asc_libcpp(&keys), vec![0, 3, 2, 1]);
+        // Exact ties resolve by lower index, deterministically, in both orders.
+        let tied = [0.5f32, 0.5, 0.2, 0.5];
+        assert_eq!(argsort_desc_experts(&tied), vec![0, 1, 3, 2]);
+        assert_eq!(argsort_asc_libcpp(&tied), vec![2, 0, 1, 3]);
+        // Pure-Rust path is deterministic: same input -> same order every call.
+        assert_eq!(argsort_desc_experts(&tied), argsort_desc_experts(&tied));
     }
 
     #[test]

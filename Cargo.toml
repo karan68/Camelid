@@ -2,7 +2,7 @@
 name = "camelid"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.89"
 description = "Camelid: a Rust-native local GGUF inference backend with evidence-gated model compatibility"
 license = "MIT"
 repository = "https://github.com/timtoole02/Camelid"
@@ -74,6 +74,14 @@ tempfile = "3"
 # timestamps) internally probe the legacy `feature = "cargo-clippy"` cfg; register it so
 # check-cfg does not error under -D warnings.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+# Phase 1 build flags (CPU perf mission). Fat LTO + a single codegen unit let the
+# optimizer inline and vectorize the hot Q8_0 matvec/dequant loops across module
+# boundaries. opt-level 3 is already the release default. No fast-math is enabled,
+# so f32 reduction order — and therefore token output — stays bit-identical.
+[profile.release]
+lto = "fat"
+codegen-units = 1
 
 [lib]
 name = "camelid"

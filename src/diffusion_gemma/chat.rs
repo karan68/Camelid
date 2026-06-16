@@ -178,7 +178,10 @@ impl DgChat {
             None => user_message.to_string(),
         };
         let parse_special = self.tokenizer.chat_prompt_parse_special();
-        Ok(self.tokenizer.encode(&prompt_text, true, parse_special)?.to_vec())
+        Ok(self
+            .tokenizer
+            .encode(&prompt_text, true, parse_special)?
+            .to_vec())
     }
 
     /// Detokenize a response (the trimmed multi-canvas tokens) back to text —

@@ -104,6 +104,11 @@ pub struct ExecutionPlan {
     pub thread_count: usize,
     pub diagnostics_status: String,
     pub fallback_path: String,
+    /// True when the GPU-resident CUDA decode engine drives decode for this process
+    /// (surfaced in `/api/capabilities` so a loaded row reports the live GPU path). The
+    /// `selected_backend`/`decode_path` above carry the `cuda_resident_q8_*` labels when
+    /// this is set; mirrors the Metal lane's `metal_available` capabilities signal.
+    pub cuda_resident_active: bool,
     pub reasons: Vec<String>,
 }
 
@@ -183,6 +188,13 @@ pub struct PlanPlatform {
     pub cpu_features: Vec<String>,
     /// A usable Metal compute device exists on this host (always false off macOS).
     pub metal_available: bool,
+    /// The CUDA resident decode engine will drive decode for this process (a usable
+    /// CUDA device is present, GPU acceleration is on, and neither deterministic mode
+    /// nor `CAMELID_CUDA_RESIDENT_DECODE=0` forces the CPU reference). When true, the
+    /// CPU Q8 rows4 repack is skipped: the GPU resident engine consumes plain RAM-
+    /// resident Q8_0 blocks, and the repack replaces them (the two are mutually
+    /// exclusive on weight storage, exactly as the Metal-resident plan handles).
+    pub cuda_resident_active: bool,
 }
 
 impl PlanPlatform {
@@ -193,6 +205,7 @@ impl PlanPlatform {
         let cpu_model = cpu_model();
         let platform_label = platform_label(&operating_system, &architecture, &cpu_model);
         let metal_available = crate::metal::detect_metal_device().available;
+        let cuda_resident_active = cuda_resident_decode_will_run();
         Self {
             operating_system,
             architecture,
@@ -200,8 +213,30 @@ impl PlanPlatform {
             cpu_model,
             cpu_features,
             metal_available,
+            cuda_resident_active,
         }
     }
+}
+
+/// Planning-time mirror of `inference::resident_decode_cuda_enabled`: true when the GPU
+/// resident decode engine will run, so the CPU Q8 rows4 repack must be skipped (the GPU
+/// needs un-repacked plain Q8_0 blocks). Deterministic mode and
+/// `CAMELID_CUDA_RESIDENT_DECODE=0` force it false (CPU reference), matching the runtime
+/// gate. On a host without a usable CUDA device (or a build without the `cuda` feature)
+/// `cuda::is_available()` is false, so the CPU repack path is unaffected.
+fn cuda_resident_decode_will_run() -> bool {
+    if env_flag_enabled("CAMELID_DETERMINISTIC") {
+        return false;
+    }
+    if let Ok(value) = env::var("CAMELID_CUDA_RESIDENT_DECODE") {
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ) {
+            return false;
+        }
+    }
+    crate::cuda::is_available() && crate::cuda::gpu_accel_enabled()
 }
 
 pub fn plan_for_model(
@@ -251,8 +286,13 @@ pub fn plan_for_model_with_platform(
     ) = if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
-        } else if platform.operating_system == "linux" && platform.architecture == "x86_64" {
-            select_linux_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+        } else if platform.architecture == "x86_64"
+            && (platform.operating_system == "linux" || platform.operating_system == "windows")
+        {
+            // The x86_64 Q8 runtime-repack + AVX2 packed-rows4 path is platform-agnostic
+            // Rust (no OS-specific kernels) and is parity-validated bit-identical to the
+            // scalar reference on Windows as well as Linux, so both share this plan.
+            select_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
         } else {
             reasons.push(
                     "no validated platform-specific Q8_0 plan for this OS/arch; failing closed to safe path"
@@ -291,6 +331,7 @@ pub fn plan_for_model_with_platform(
         thread_count,
         diagnostics_status,
         fallback_path: fallback_path.to_string(),
+        cuda_resident_active: platform.cuda_resident_active,
         reasons,
     };
     ExecutionPlanOutcome { plan, env_updates }
@@ -431,7 +472,7 @@ fn select_macos_q8_plan(
     )
 }
 
-fn select_linux_x86_q8_plan(
+fn select_x86_q8_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
@@ -447,6 +488,17 @@ fn select_linux_x86_q8_plan(
     if matches!(profile, ExecutionProfile::Safe) {
         reasons.push("safe profile selected; optimized x86 Q8 paths disabled".into());
         return safe_q8_plan();
+    }
+    if platform.cuda_resident_active {
+        // A CUDA device is driving decode: keep weights as plain RAM-resident Q8_0
+        // blocks (the GPU resident engine cannot consume the CPU rows4 repack — the two
+        // are mutually exclusive on weight storage). The CPU repack path only wins when
+        // the CPU actually runs decode (no GPU, GPU toggled off, or deterministic mode).
+        reasons.push(
+            "CUDA resident decode active; GPU-resident Q8_0 engine drives decode (weights stay plain RAM-resident Q8_0 blocks — the CPU rows4 repack is disabled while the GPU drives decode)"
+                .into(),
+        );
+        return cuda_resident_q8_plan();
     }
     if env_flag_disabled("CAMELID_X86_Q8_REPACK") || env_flag_disabled("CAMELID_X86_Q8_KERNEL") {
         reasons.push(
@@ -516,9 +568,23 @@ fn select_linux_x86_q8_plan(
         "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
         optional_x86_q8_gate("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL"),
     );
+    // Serial packed decode is the validated Linux default, but on Windows the parallel
+    // packed decode runs ~2x faster (TinyLlama 11 -> 19 tok/s, ffn_down 20 -> 10 ms) and
+    // stays bit-identical to the reference (each output row is an independent dot, so
+    // parallelizing across rows does not change any reduction order). Windows therefore
+    // defaults serial-decode OFF; an explicit env opt-in still forces it on.
+    let serial_packed_decode = if platform.operating_system == "windows" {
+        if env_flag_enabled("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE") {
+            Some("on")
+        } else {
+            Some("off")
+        }
+    } else {
+        optional_x86_q8_gate("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE")
+    };
     env_updates.insert(
         "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
-        optional_x86_q8_gate("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
+        serial_packed_decode,
     );
     env_updates.insert(
         "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
@@ -627,7 +693,7 @@ fn select_linux_x86_q8_plan(
                 .into(),
         );
     }
-    reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
+    reasons.push("validated x86_64 (Linux/Windows) Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
     reasons.push("attention, FFN, and output experiments enabled by default".into());
     if matches!(profile, ExecutionProfile::Experimental) {
@@ -658,6 +724,32 @@ fn safe_q8_plan() -> (
         "safe_cpu_prefill",
         "always_retained_reference_path",
         "safe_cpu_decode",
+        "retained_q8_reference_path",
+    )
+}
+
+/// Plan labels when the GPU-resident CUDA decode engine drives this process (the NVIDIA
+/// analog of `metal_resident_q8_runtime`). Weights stay plain RAM-resident Q8_0 blocks —
+/// the engine uploads them to VRAM once and decodes on-device; the CPU rows4 repack is
+/// disabled because the GPU consumes the plain blocks. The `retained_q8_reference_path`
+/// CPU plan remains the in-process fallback for any token/config the resident gates
+/// reject. Validated token-AND-text-identical to the CPU reference (transitively
+/// llama.cpp) on the dense Qwen3 Q8_0 ChatML rows; see the COMPATIBILITY.md Windows CUDA
+/// section and the `qwen3-*-windows-cuda-resident-parity-*` evidence bundles.
+fn cuda_resident_q8_plan() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    (
+        "cuda_resident_q8_runtime",
+        "cuda_resident_q8_0_wire",
+        "q8_0_cuda_resident_prefill",
+        "resident_single_shot_prefill",
+        "q8_0_cuda_resident_decode",
         "retained_q8_reference_path",
     )
 }
@@ -710,6 +802,20 @@ fn support_level(row: &str) -> String {
         "supported_exact_row_smoke_512_1024_2048".into()
     } else if normalized.contains("mistral_7b_instruct_v0_3") {
         "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
+    } else if normalized.contains("qwen3_0_6b_instruct")
+        || normalized.contains("qwen3_1_7b_instruct")
+        || normalized.contains("qwen3_4b_instruct")
+        || normalized.contains("qwen3_8b_instruct")
+    {
+        // Dense Qwen3 Q8_0 ChatML rows (thinking disabled), validated token+text
+        // identical to llama.cpp at 1/5/50 on the cpu_reference path and on the
+        // x86_64 runtime-repack/AVX2 Q8 path (parity re-validated on Windows).
+        // Scoped to the short-chat smoke envelope; MoE (A3B), base variants, other
+        // sizes/quants, longer context, and thinking-mode are NOT covered.
+        // (Replaces the broader `contains("qwen3")` branch from PR #283, whose
+        // label claimed 512/1024/2048 context packs and matched MoE/base/other
+        // sizes — neither validated for qwen3.)
+        "supported_exact_row_smoke_chatml".into()
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
         "bounded_runtime_only_unsupported".into()
     } else {
@@ -723,6 +829,7 @@ fn is_supported_exact_q8_row(row: &str) -> bool {
         "supported_current_gate"
             | "supported_exact_row_smoke_512_1024_2048_4096_8192"
             | "supported_exact_row_smoke_512_1024_2048"
+            | "supported_exact_row_smoke_chatml"
     )
 }
 
@@ -953,12 +1060,20 @@ mod tests {
             cpu_model: "fixture cpu".into(),
             cpu_features: features.iter().map(|feature| (*feature).into()).collect(),
             metal_available: false,
+            cuda_resident_active: false,
         }
     }
 
     fn metal_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
         PlanPlatform {
             metal_available: true,
+            ..platform(os, arch, features)
+        }
+    }
+
+    fn cuda_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
+        PlanPlatform {
+            cuda_resident_active: true,
             ..platform(os, arch, features)
         }
     }
@@ -1080,6 +1195,52 @@ mod tests {
             Some(&Some("off"))
         );
         env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        clear_profile_env();
+    }
+
+    #[test]
+    fn windows_cuda_resident_plan_selected_when_engine_active() {
+        let _guard = env_lock();
+        clear_profile_env();
+        // A supported Qwen3 Q8_0 row on a Windows x86_64 host where the CUDA resident
+        // decode engine is active: the plan surfaces the GPU-resident backend/decode
+        // labels and reports cuda_resident_active, while keeping the row's
+        // supported_exact_row_smoke_chatml support level (engine-agnostic).
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Qwen3-0.6B-Q8_0.gguf"),
+            &fixture("Qwen3 0.6B Instruct"),
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "cuda_resident_q8_runtime");
+        assert_eq!(outcome.plan.decode_path, "q8_0_cuda_resident_decode");
+        assert_eq!(outcome.plan.prefill_path, "q8_0_cuda_resident_prefill");
+        assert!(outcome.plan.cuda_resident_active);
+        assert_eq!(
+            outcome.plan.support_level, "supported_exact_row_smoke_chatml",
+            "GPU lane reuses the row-keyed support level (Phase 1 design)"
+        );
+        // The GPU consumes plain Q8_0 blocks: the x86 rows4 repack must NOT be enabled.
+        assert_ne!(
+            outcome.env_updates.get("CAMELID_X86_Q8_REPACK"),
+            Some(&Some("on"))
+        );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn windows_cuda_resident_inactive_keeps_cpu_repack_plan() {
+        let _guard = env_lock();
+        clear_profile_env();
+        // Same row/host but no active CUDA engine: the validated x86_64 CPU repack plan.
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Qwen3-0.6B-Q8_0.gguf"),
+            &fixture("Qwen3 0.6B Instruct"),
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "cpu_q8_runtime_repack");
+        assert!(!outcome.plan.cuda_resident_active);
         clear_profile_env();
     }
 
@@ -1981,5 +2142,39 @@ mod tests {
         );
         assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
         clear_profile_env();
+    }
+
+    #[test]
+    fn qwen3_rows_select_validated_x86_q8_plan() {
+        let _guard = env_lock();
+        for name in [
+            "Qwen3-0.6B-Instruct-Q8_0.gguf",
+            "Qwen3-1.7B-Instruct-Q8_0.gguf",
+            "Qwen3-4B-Instruct-Q8_0.gguf",
+            "Qwen3-8B-Instruct-Q8_0.gguf",
+        ] {
+            clear_profile_env();
+            let outcome = plan_for_model_with_platform(
+                &PathBuf::from(format!("/tmp/{name}")),
+                &fixture(name),
+                None,
+                platform("windows", "x86_64", &["avx2"]),
+            );
+            assert_eq!(
+                outcome.plan.support_level, "supported_exact_row_smoke_chatml",
+                "row {name} support_level"
+            );
+            // Supported Qwen3 Q8 rows engage the validated x86_64 runtime-repack/AVX2
+            // plan (not the scalar safe path), matching the other supported Q8 rows.
+            assert_eq!(
+                outcome.plan.selected_backend, "cpu_q8_runtime_repack",
+                "row {name} backend"
+            );
+            assert_eq!(
+                outcome.plan.selected_q8_path, "x86_experimental_q8_0_avx2_rust",
+                "row {name} q8 path"
+            );
+            clear_profile_env();
+        }
     }
 }

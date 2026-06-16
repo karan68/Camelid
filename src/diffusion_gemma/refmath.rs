@@ -21,6 +21,10 @@ use crate::tensor::f16_round;
 // The reference calls the system libm f32 functions directly; Rust's
 // f32::sin/cos/exp/tanh may lower differently (1-ulp scatter observed on
 // rope angles). Bind the exact symbols.
+// Only the macOS path constructs this (the __sincosf_stret return struct);
+// elsewhere libm_sincosf uses Rust's f32::sin/cos, so gate it to avoid a
+// dead-code warning on non-Apple targets.
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct SinCosF32 {
     sinval: f32,
@@ -394,12 +398,110 @@ fn bsums16(y: &crate::inference::Q8KBlock) -> [i32; 16] {
     out
 }
 
+/// Horizontal sum of the eight i32 lanes of an AVX2 vector.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_i32_8(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let lo = _mm256_castsi256_si128(v);
+    let hi = _mm256_extracti128_si256(v, 1);
+    let s = _mm_add_epi32(lo, hi);
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
+    _mm_cvtsi128_si32(s)
+}
+
 /// `ggml_vec_dot_q4_K_q8_K`, the M4's nrc=1 path (arch/arm/quants.c, the
 /// __ARM_NEON section): per superblock ONE sequential f32 accumulator —
 /// `sumf -= dmin·minsprod` then `sumf += d·(sumi1+sumi2)`, both fused by
 /// clang's default contraction; everything inside is exact integer math
 /// (per-32 bsum pairs × mins; per-64 nibble-group dots × 6-bit scales).
+///
+/// Dispatches to an AVX2 kernel on x86_64 when available. The AVX2 path is
+/// BIT-IDENTICAL to the scalar reference: it only vectorizes the exact i64
+/// integer dots (associative — any lane order yields the same integers) and
+/// reproduces the same sequential per-superblock f32 `mul_add` accumulation.
 pub(crate) fn q4_k_dot_arm(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 just confirmed present; the kernel is value-identical
+            // to q4_k_dot_scalar (see the bit-identity unit test).
+            return unsafe { q4_k_dot_avx2(weight_wire, input) };
+        }
+    }
+    q4_k_dot_scalar(weight_wire, input)
+}
+
+/// AVX2 Q4_K×Q8_K row dot — bit-identical to [`q4_k_dot_scalar`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q4_k_dot_avx2(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+    const WIRE: usize = 144;
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+    let low_mask = _mm256_set1_epi8(0x0f);
+    let ones16 = _mm256_set1_epi16(1);
+    let one_u8 = _mm256_set1_epi8(1);
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d = y.d * crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = y.d * crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let sc = &block[4..16];
+        let qs = &block[16..144];
+
+        // 6-bit scale/min unpack — identical to the scalar path.
+        let utmp0 = u32::from_le_bytes([sc[0], sc[1], sc[2], sc[3]]);
+        let utmp1 = u32::from_le_bytes([sc[4], sc[5], sc[6], sc[7]]);
+        let utmp2 = u32::from_le_bytes([sc[8], sc[9], sc[10], sc[11]]);
+        let mins8 = [
+            utmp1 & KMASK1,
+            ((utmp2 >> 4) & KMASK2) | (((utmp1 >> 6) & KMASK3) << 4),
+        ];
+        let scales_w = [
+            utmp0 & KMASK1,
+            (utmp2 & KMASK2) | (((utmp0 >> 6) & KMASK3) << 4),
+        ];
+        let scale_at = |g: usize| -> i64 { ((scales_w[g / 4] >> (8 * (g % 4))) & 0xff) as i64 };
+        let min_at = |g: usize| -> i64 { ((mins8[g / 4] >> (8 * (g % 4))) & 0xff) as i64 };
+
+        let q8 = y.qs.as_ptr();
+
+        // mins side: per-32 q8 sums × mins, exact i64 (matches bsum pairs × min).
+        let mut prod: i64 = 0;
+        for g in 0..8 {
+            let v = _mm256_loadu_si256(q8.add(32 * g) as *const __m256i);
+            let p = _mm256_maddubs_epi16(one_u8, v);
+            let s = _mm256_madd_epi16(p, ones16);
+            prod += hsum_i32_8(s) as i64 * min_at(g);
+        }
+        sumf = (-dmin).mul_add(prod as f32, sumf);
+
+        // main side: four 32-byte q4 chunks; low nibbles dot q8[64j..+32] with
+        // scale[2j], high nibbles dot q8[64j+32..+32] with scale[2j+1].
+        let mut sumi1: i64 = 0;
+        let mut sumi2: i64 = 0;
+        for j in 0..4 {
+            let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+            let low = _mm256_and_si256(q4, low_mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            let q8lo = _mm256_loadu_si256(q8.add(j * 64) as *const __m256i);
+            let q8hi = _mm256_loadu_si256(q8.add(j * 64 + 32) as *const __m256i);
+            let slo = _mm256_madd_epi16(_mm256_maddubs_epi16(low, q8lo), ones16);
+            let shi = _mm256_madd_epi16(_mm256_maddubs_epi16(high, q8hi), ones16);
+            sumi1 += hsum_i32_8(slo) as i64 * scale_at(2 * j);
+            sumi2 += hsum_i32_8(shi) as i64 * scale_at(2 * j + 1);
+        }
+        sumf = d.mul_add((sumi1 + sumi2) as f32, sumf);
+    }
+    sumf
+}
+
+/// Scalar reference Q4_K×Q8_K row dot (parity oracle for the AVX2 kernel).
+fn q4_k_dot_scalar(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
     const WIRE: usize = 144;
     let mut sumf = 0f32;
     for (i, y) in input.iter().enumerate() {
@@ -463,7 +565,117 @@ pub(crate) fn q4_k_dot_arm(weight_wire: &[u8], input: &[crate::inference::Q8KBlo
 /// 6-bit values dot UNSIGNED against q8 with the -32 offset folded out via
 /// `isum - 32·isum_mins` (bsums × int scales); the only float op per
 /// superblock is the fused `sum += d_all·y.d·(…)`.
+///
+/// Dispatches to an AVX2 kernel on x86_64 when available. BIT-IDENTICAL to the
+/// scalar reference (only the exact i64 integer rebuild/dots are vectorized;
+/// the per-superblock f32 `mul_add` accumulation is reproduced unchanged).
 pub(crate) fn q6_k_dot_arm(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 just confirmed present; value-identical to
+            // q6_k_dot_scalar (see the bit-identity unit test).
+            return unsafe { q6_k_dot_avx2(weight_wire, input) };
+        }
+    }
+    q6_k_dot_scalar(weight_wire, input)
+}
+
+/// Sum the eight i16 lanes of one 128-bit half of an AVX2 vector to i32.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn lane_sum_i16(p: std::arch::x86_64::__m256i, hi: bool) -> i32 {
+    use std::arch::x86_64::*;
+    let lane = if hi {
+        _mm256_extracti128_si256(p, 1)
+    } else {
+        _mm256_castsi256_si128(p)
+    };
+    let s = _mm_madd_epi16(lane, _mm_set1_epi16(1));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
+    _mm_cvtsi128_si32(s)
+}
+
+/// AVX2 Q6_K×Q8_K row dot — bit-identical to [`q6_k_dot_scalar`]. Vectorizes
+/// the 6-bit rebuild + grouped dots (exact i64); the mins side stays scalar.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6_k_dot_avx2(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+    const WIRE: usize = 210;
+    let m0f = _mm256_set1_epi8(0x0f);
+    let m03 = _mm256_set1_epi8(0x03);
+    let mut sum = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d_all = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+
+        // mins side: scalar (cheap; the simple per-16 sums autovectorize).
+        let bs = bsums16(y);
+        let mut isum_mins = 0i64;
+        for t in 0..16 {
+            isum_mins += bs[t] as i64 * (scales[t] as i8) as i64;
+        }
+
+        let mut isum = 0i64;
+        for half in 0..2 {
+            let qlh = ql.as_ptr().add(half * 64);
+            let qhh_v = _mm256_loadu_si256(qh.as_ptr().add(half * 32) as *const __m256i);
+            let q8 = y.qs.as_ptr().add(half * 128);
+            let sc = &scales[half * 8..(half + 1) * 8];
+
+            let qlh_lo = _mm256_loadu_si256(qlh as *const __m256i);
+            let qlh_hi = _mm256_loadu_si256(qlh.add(32) as *const __m256i);
+            // four interleaved 6-bit streams (ql low/high nibble × qh 2-bit field)
+            let b0 = _mm256_and_si256(qhh_v, m03);
+            let b2 = _mm256_and_si256(_mm256_srli_epi16(qhh_v, 2), m03);
+            let b4 = _mm256_and_si256(_mm256_srli_epi16(qhh_v, 4), m03);
+            let b6 = _mm256_and_si256(_mm256_srli_epi16(qhh_v, 6), m03);
+            let v0 = _mm256_or_si256(_mm256_and_si256(qlh_lo, m0f), _mm256_slli_epi16(b0, 4));
+            let v1 = _mm256_or_si256(_mm256_and_si256(qlh_hi, m0f), _mm256_slli_epi16(b2, 4));
+            let v2 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(qlh_lo, 4), m0f),
+                _mm256_slli_epi16(b4, 4),
+            );
+            let v3 = _mm256_or_si256(
+                _mm256_and_si256(_mm256_srli_epi16(qlh_hi, 4), m0f),
+                _mm256_slli_epi16(b6, 4),
+            );
+            let q8a = _mm256_loadu_si256(q8 as *const __m256i);
+            let q8b = _mm256_loadu_si256(q8.add(32) as *const __m256i);
+            let q8c = _mm256_loadu_si256(q8.add(64) as *const __m256i);
+            let q8d = _mm256_loadu_si256(q8.add(96) as *const __m256i);
+            // maddubs (unsigned 6-bit value × signed q8): low 128-bit lane holds
+            // l=0..15 (group l/16=0), high lane l=16..31 (group 1).
+            let pv0 = _mm256_maddubs_epi16(v0, q8a);
+            let pv1 = _mm256_maddubs_epi16(v1, q8b);
+            let pv2 = _mm256_maddubs_epi16(v2, q8c);
+            let pv3 = _mm256_maddubs_epi16(v3, q8d);
+            let group_sums: [i64; 8] = [
+                lane_sum_i16(pv0, false) as i64,
+                lane_sum_i16(pv0, true) as i64,
+                lane_sum_i16(pv1, false) as i64,
+                lane_sum_i16(pv1, true) as i64,
+                lane_sum_i16(pv2, false) as i64,
+                lane_sum_i16(pv2, true) as i64,
+                lane_sum_i16(pv3, false) as i64,
+                lane_sum_i16(pv3, true) as i64,
+            ];
+            for g in 0..8 {
+                isum += group_sums[g] * (sc[g] as i8) as i64;
+            }
+        }
+        sum = (d_all * y.d).mul_add((isum - 32 * isum_mins) as f32, sum);
+    }
+    sum
+}
+
+/// Scalar reference Q6_K×Q8_K row dot (parity oracle for the AVX2 kernel).
+fn q6_k_dot_scalar(weight_wire: &[u8], input: &[crate::inference::Q8KBlock]) -> f32 {
     const WIRE: usize = 210;
     let mut sum = 0f32;
     for (i, y) in input.iter().enumerate() {
@@ -580,6 +792,86 @@ pub(crate) fn q8_0_dot_arm(weight_wire: &[u8], input: &[crate::tensor::Q8_0Block
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4_k_avx2_bit_identical_to_scalar() {
+        use crate::inference::Q8KBlock;
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: avx2 not available");
+            return;
+        }
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const WIRE: usize = 144;
+        for nblk in [1usize, 2, 5, 11] {
+            let mut wire = vec![0u8; nblk * WIRE];
+            for b in wire.iter_mut() {
+                *b = (next() & 0xff) as u8;
+            }
+            let mut blocks = Vec::with_capacity(nblk);
+            for _ in 0..nblk {
+                let mut qs = [0i8; 256];
+                for q in qs.iter_mut() {
+                    *q = (next() & 0xff) as u8 as i8;
+                }
+                let d = (next() % 1000) as f32 / 333.0 + 0.001;
+                blocks.push(Q8KBlock { d, qs });
+            }
+            let s = q4_k_dot_scalar(&wire, &blocks);
+            let v = unsafe { q4_k_dot_avx2(&wire, &blocks) };
+            assert_eq!(
+                s.to_bits(),
+                v.to_bits(),
+                "q4_k avx2 != scalar at nblk={nblk}: scalar={s} avx2={v}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q6_k_avx2_bit_identical_to_scalar() {
+        use crate::inference::Q8KBlock;
+        if !is_x86_feature_detected!("avx2") {
+            eprintln!("skipping: avx2 not available");
+            return;
+        }
+        let mut state: u64 = 0x0fed_cba9_8765_4321;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const WIRE: usize = 210;
+        for nblk in [1usize, 2, 5, 11] {
+            let mut wire = vec![0u8; nblk * WIRE];
+            for b in wire.iter_mut() {
+                *b = (next() & 0xff) as u8;
+            }
+            let mut blocks = Vec::with_capacity(nblk);
+            for _ in 0..nblk {
+                let mut qs = [0i8; 256];
+                for q in qs.iter_mut() {
+                    *q = (next() & 0xff) as u8 as i8;
+                }
+                let d = (next() % 1000) as f32 / 333.0 + 0.001;
+                blocks.push(Q8KBlock { d, qs });
+            }
+            let s = q6_k_dot_scalar(&wire, &blocks);
+            let v = unsafe { q6_k_dot_avx2(&wire, &blocks) };
+            assert_eq!(
+                s.to_bits(),
+                v.to_bits(),
+                "q6_k avx2 != scalar at nblk={nblk}: scalar={s} avx2={v}"
+            );
+        }
+    }
 
     #[test]
     fn vec_dot_f32_tree_matches_naive_within_fp() {

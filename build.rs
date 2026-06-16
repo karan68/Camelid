@@ -8,8 +8,10 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(camelid_x86_amx_shim)");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" {
+        // Accelerate provides the refmath vDSP / __sincosf_stret system bindings
+        // (a framework binding, not compiled C/C++). The DiffusionGemma expert
+        // argsort is now pure Rust (see src/diffusion_gemma.rs) — no C++ shim.
         println!("cargo:rustc-link-lib=framework=Accelerate");
-        build_dg_argsort_shim();
     }
     if target_os == "windows" {
         // Export the Optimus / Enduro hints so a laptop's hybrid-graphics driver
@@ -88,36 +90,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=camelid_x86_amx_q8");
     println!("cargo:rustc-cfg=camelid_x86_amx_shim");
-}
-
-// DiffusionGemma expert-argsort shim: compile src/dg_argsort.cpp with the
-// system C++ toolchain (Apple clang libc++ — identical to the pinned reference
-// build) so camelid's MoE expert ordering matches the reference's libc++
-// std::sort tie behavior bit-for-bit. macOS only; the diffusion-gemma lane is
-// Apple-Silicon-only.
-fn build_dg_argsort_shim() {
-    println!("cargo:rerun-if-changed=src/dg_argsort.cpp");
-    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-    let obj = out_dir.join("dg_argsort.o");
-    let lib = out_dir.join("libdg_argsort.a");
-    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".to_string());
-    let status = Command::new(&cxx)
-        .args(["-std=c++17", "-O2", "-c", "src/dg_argsort.cpp", "-o"])
-        .arg(&obj)
-        .status()
-        .expect("failed to run c++ for dg_argsort shim");
-    assert!(status.success(), "c++ failed building dg_argsort shim");
-    let status = Command::new("ar")
-        .arg("crus")
-        .arg(&lib)
-        .arg(&obj)
-        .status()
-        .expect("failed to run ar for dg_argsort shim");
-    assert!(status.success(), "ar failed building dg_argsort shim");
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=dg_argsort");
-    // libc++ for the std::sort instantiation
-    println!("cargo:rustc-link-lib=c++");
 }
 
 // Embed git provenance so a running binary reports its own version/commit

@@ -40,8 +40,14 @@ fn dg_block1_logit_ladder() {
         return;
     };
     let refd = Path::new(&r);
-    let prompt: Vec<u32> = read_i32(Path::new(&i)).into_iter().map(|v| v as u32).collect();
-    eprintln!("loading runtime (lazy mmap); block-1 prefix P={}...", prompt.len());
+    let prompt: Vec<u32> = read_i32(Path::new(&i))
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
+    eprintln!(
+        "loading runtime (lazy mmap); block-1 prefix P={}...",
+        prompt.len()
+    );
     let rt = DgEncoderRuntime::load(Path::new(&g)).expect("load");
     let params = DgEbParams::default(); // seed 0, S=48 — exactly block 1
 

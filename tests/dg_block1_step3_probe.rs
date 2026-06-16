@@ -56,7 +56,10 @@ fn dg_block1_step3_probe() {
         return;
     };
     let refd = Path::new(&r);
-    let prompt: Vec<u32> = read_i32(Path::new(&i)).into_iter().map(|v| v as u32).collect();
+    let prompt: Vec<u32> = read_i32(Path::new(&i))
+        .into_iter()
+        .map(|v| v as u32)
+        .collect();
     let canvas: Vec<u32> = read_i32(&refd.join("canvas-in-step3.i32"))
         .into_iter()
         .map(|v| v as u32)
@@ -101,8 +104,14 @@ fn dg_block1_step3_probe() {
 
     let (d12, f12, m12) = diff(&r1, &r2);
     let (d1o, f1o, m1o) = diff(&r1, &oracle_step3);
-    eprintln!("run1 vs run2 (DETERMINISM): {d12}/{} differ, first {f12}, maxabs {m12:.3e}", r1.len());
-    eprintln!("run1 vs oracle step3:       {d1o}/{} differ, first {f1o}, maxabs {m1o:.3e}", r1.len());
+    eprintln!(
+        "run1 vs run2 (DETERMINISM): {d12}/{} differ, first {f12}, maxabs {m12:.3e}",
+        r1.len()
+    );
+    eprintln!(
+        "run1 vs oracle step3:       {d1o}/{} differ, first {f1o}, maxabs {m1o:.3e}",
+        r1.len()
+    );
 
     let verdict = if d12 != 0 {
         "NON-DETERMINISTIC forward (run1 != run2)"

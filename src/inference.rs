@@ -1097,6 +1097,141 @@ pub struct LlamaForwardTimings {
     pub memory: Option<LlamaForwardMemoryTimings>,
 }
 
+/// Process-global accumulator for the per-stage CPU decode profile, folded from the
+/// `LlamaForwardTimings` the timed forward path already collects, gated by
+/// `CAMELID_STAGE_TIMINGS=1`. Pure reporting: it only sums microsecond counters that
+/// are already recorded, so it adds no measurement overhead and never affects output.
+#[derive(Default, Clone)]
+struct StageTimingAccumulator {
+    tokens: u64,
+    embedding: u128,
+    attention_norm: u128,
+    attention_qkv: u128,
+    attention_rope: u128,
+    kv_cache_write: u128,
+    attention_context: u128,
+    attention_output: u128,
+    attention_residual: u128,
+    ffn_norm: u128,
+    ffn_gate: u128,
+    ffn_up: u128,
+    ffn_activation: u128,
+    ffn_down: u128,
+    ffn_residual: u128,
+    final_norm: u128,
+    logits: u128,
+    total: u128,
+}
+
+static STAGE_TIMINGS: std::sync::Mutex<Option<StageTimingAccumulator>> =
+    std::sync::Mutex::new(None);
+
+fn stage_timings_enabled() -> bool {
+    env_flag_enabled("CAMELID_STAGE_TIMINGS")
+}
+
+fn fold_stage_timings(timings: &LlamaForwardTimings) {
+    if !stage_timings_enabled() {
+        return;
+    }
+    let mut guard = STAGE_TIMINGS.lock().expect("stage timings mutex poisoned");
+    let acc = guard.get_or_insert_with(StageTimingAccumulator::default);
+    acc.tokens += 1;
+    acc.embedding += timings.embedding;
+    acc.final_norm += timings.final_norm;
+    acc.logits += timings.logits;
+    acc.total += timings.total;
+    for l in &timings.layers {
+        acc.attention_norm += l.attention_norm;
+        acc.attention_qkv += l.attention_q + l.attention_k + l.attention_v;
+        acc.attention_rope += l.attention_rope;
+        acc.kv_cache_write += l.kv_cache_write;
+        acc.attention_context += l.attention_context;
+        acc.attention_output += l.attention_output;
+        acc.attention_residual += l.attention_residual;
+        acc.ffn_norm += l.ffn_norm;
+        acc.ffn_gate += l.ffn_gate;
+        acc.ffn_up += l.ffn_up;
+        acc.ffn_activation += l.ffn_activation;
+        acc.ffn_down += l.ffn_down;
+        acc.ffn_residual += l.ffn_residual;
+    }
+}
+
+/// Reset the process-global stage-timing accumulator. Call before a measured run so
+/// warmup/prefill tokens do not pollute the decode profile.
+pub fn reset_stage_timings() {
+    *STAGE_TIMINGS.lock().expect("stage timings mutex poisoned") = None;
+}
+
+/// Print the per-stage CPU decode breakdown (largest sink first) accumulated since
+/// the last reset, to stderr. No-op when `CAMELID_STAGE_TIMINGS` is unset or no
+/// tokens were folded. Reporting only; never affects generation.
+pub fn dump_stage_timings() {
+    let Some(acc) = STAGE_TIMINGS
+        .lock()
+        .expect("stage timings mutex poisoned")
+        .take()
+    else {
+        return;
+    };
+    if acc.tokens == 0 {
+        return;
+    }
+    let stages: [(&str, u128); 16] = [
+        ("ffn_down", acc.ffn_down),
+        ("ffn_gate", acc.ffn_gate),
+        ("ffn_up", acc.ffn_up),
+        ("attention_qkv", acc.attention_qkv),
+        ("attention_output", acc.attention_output),
+        ("logits", acc.logits),
+        ("attention_context", acc.attention_context),
+        ("ffn_activation", acc.ffn_activation),
+        ("attention_rope", acc.attention_rope),
+        ("kv_cache_write", acc.kv_cache_write),
+        ("attention_norm", acc.attention_norm),
+        ("ffn_norm", acc.ffn_norm),
+        ("attention_residual", acc.attention_residual),
+        ("ffn_residual", acc.ffn_residual),
+        ("final_norm", acc.final_norm),
+        ("embedding", acc.embedding),
+    ];
+    let mut sorted = stages;
+    sorted.sort_by_key(|&(_, us)| std::cmp::Reverse(us));
+    let attributed: u128 = stages.iter().map(|(_, us)| *us).sum();
+    let tokens = acc.tokens as f64;
+    let per_tok_ms = |us: u128| (us as f64) / tokens / 1000.0;
+    let pct = |us: u128| {
+        if attributed == 0 {
+            0.0
+        } else {
+            (us as f64) / (attributed as f64) * 100.0
+        }
+    };
+    eprintln!(
+        "[stage-timings] tokens={} | total {:.2} ms/tok | attributed {:.2} ms/tok ({:.0}% of total)",
+        acc.tokens,
+        per_tok_ms(acc.total),
+        per_tok_ms(attributed),
+        if acc.total == 0 {
+            0.0
+        } else {
+            (attributed as f64) / (acc.total as f64) * 100.0
+        }
+    );
+    for (name, us) in sorted {
+        if us == 0 {
+            continue;
+        }
+        eprintln!(
+            "[stage-timings]   {:<18} {:>8.3} ms/tok  {:>5.1}%",
+            name,
+            per_tok_ms(us),
+            pct(us)
+        );
+    }
+}
+
 #[allow(dead_code)]
 fn q8_schedule_output_projection_route_kind(
     weight: BorrowedLinearWeight<'_>,
@@ -1957,10 +2092,6 @@ impl LlamaInferenceSession {
             Some(t) => t,
             None => return Ok(false),
         };
-        // The CUDA RoPE kernel implements adjacent-even-odd pairing only.
-        if tables.split_half_pairing {
-            return Ok(false);
-        }
         let embeddings = weights
             .token_embedding
             .embedding_lookup(token_ids, "token_embedding_resident_prefill_cuda")?;
@@ -1994,6 +2125,7 @@ impl LlamaInferenceSession {
                 kv_cap,
                 vocab,
                 rms_eps,
+                tables.split_half_pairing,
             ) {
                 Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
                 None => return Ok(false),
@@ -2241,7 +2373,7 @@ impl LlamaInferenceSession {
                 &self.config,
                 self.weights.rope_freqs.as_ref(),
             )? {
-                Some(t) if !t.split_half_pairing => {
+                Some(t) => {
                     cos_all.extend_from_slice(&t.cos);
                     sin_all.extend_from_slice(&t.sin);
                 }
@@ -2422,14 +2554,6 @@ impl LlamaInferenceSession {
                 return Ok(None);
             }
         };
-        // The CUDA RoPE kernel implements adjacent-even-odd pairing (Llama). Split-half
-        // (Qwen3) is not yet ported, so fall back rather than mis-rotate.
-        if tables.split_half_pairing {
-            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-                eprintln!("[resident-cuda] split_half_pairing (Qwen3) unsupported");
-            }
-            return Ok(None);
-        }
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
         let rope_dim = self
             .config
@@ -2487,6 +2611,7 @@ impl LlamaInferenceSession {
                 kv_cap,
                 vocab,
                 rms_eps,
+                tables.split_half_pairing,
             ) {
                 Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
                 None => {
@@ -3679,6 +3804,7 @@ impl LlamaInferenceSession {
             memory.record_end(capture_memory_sample(&self.kv_cache));
         }
         timings.memory = memory;
+        fold_stage_timings(&timings);
         let diagnostics = if collect_diagnostics {
             Some(LlamaForwardDiagnostics {
                 embedding: embedding_stats.expect("embedding diagnostics collected"),
@@ -9468,6 +9594,7 @@ fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// Fail the CUDA resident path closed for Qwen3-style per-head QK-norm.
 /// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate
 /// the GPU KV cache, and upload every layer's Q8_0 weights (repacked to SoA) plus
 /// the output stage. Returns `None` for any unsupported tensor (e.g. wire-page
@@ -9488,6 +9615,7 @@ fn build_resident_cuda_engine(
     kv_cap: usize,
     vocab: usize,
     rms_eps: f32,
+    split_half_pairing: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
         t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
@@ -9646,7 +9774,17 @@ fn build_resident_cuda_engine(
         return None;
     }
     let mut engine = crate::cuda_resident::CudaResidentDecode::new(
-        n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
+        n_layers,
+        n_heads,
+        n_kv,
+        head_dim,
+        hidden,
+        ffn_dim,
+        rope_dim,
+        cap,
+        vocab,
+        rms_eps,
+        split_half_pairing,
     )
     .ok()?;
     for (idx, l) in weights.layers[range].iter().enumerate() {
@@ -9675,6 +9813,8 @@ fn build_resident_cuda_engine(
                 down,
                 &l.attention_norm.data,
                 &l.ffn_norm.data,
+                l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 idx < n_resident_layers,
             )
             .ok()?;
@@ -9749,6 +9889,18 @@ fn resident_decode_cuda_enabled() -> bool {
 #[cfg(not(feature = "cuda"))]
 fn resident_decode_cuda_enabled() -> bool {
     false
+}
+
+/// Public predicate mirroring `resident_decode_cuda_enabled` for callers outside the
+/// decode hot path (the prompt-prefix cache in the API). When true, the GPU-resident
+/// CUDA engine drives this process's decode, and reusing a cached prompt-prefix session
+/// is NOT bit-identical to a fresh GPU prefill: a cache hit reseeds the GPU KV from the
+/// f16-rounded host history and resumes, a different reduction order than a clean GPU
+/// prefill, which flips borderline (near-tie) tokens. The CPU lane is reduction-order
+/// stable, so it keeps the cache; the GPU lane must bypass it — exactly as deterministic
+/// mode already bypasses the cache on the CPU lane.
+pub fn resident_decode_cuda_active() -> bool {
+    resident_decode_cuda_enabled()
 }
 
 /// Maximum sequence length the CUDA resident engine keeps on the GPU. The GPU KV

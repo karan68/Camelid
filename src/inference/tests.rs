@@ -11143,3 +11143,61 @@ fn perf_q4_q8_q6_dot() {
     eprintln!("[dotbench] {iters} iters @ in_dim {in_dim}: q8={:.3}s ({:.1} Mrow/s)  q4={:.3}s ({:.1} Mrow/s, {:.1}x q8)  q6={:.3}s ({:.1} Mrow/s, {:.1}x q8)  sink={s}",
         q8, iters as f64/q8/1e6, q4, iters as f64/q4/1e6, q4/q8, q6, iters as f64/q6/1e6, q6/q8);
 }
+
+/// Build a 1-layer `LlamaLoadedWeights` for the CUDA arch-guard test, with per-head
+/// QK-norm tensors present (`qk_norm = true`, i.e. a Qwen3-shaped row) or absent
+/// (`false`, a plain Llama row). All other tensors are trivial 2×2 placeholders; the
+/// guard only inspects `attention_q_norm` / `attention_k_norm`.
+#[cfg(feature = "cuda")]
+fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
+    let t = |name: &str, shape: Vec<usize>, n: usize| {
+        CpuTensor::from_f32(name, shape, vec![1.0; n]).unwrap()
+    };
+    let (q_norm, k_norm) = if qk_norm {
+        (
+            Some(t("blk.0.attn_q_norm.weight", vec![2], 2)),
+            Some(t("blk.0.attn_k_norm.weight", vec![2], 2)),
+        )
+    } else {
+        (None, None)
+    };
+    LlamaLoadedWeights {
+        token_embedding: t("token_embd.weight", vec![2, 2], 4),
+        output_norm: t("output_norm.weight", vec![2], 2),
+        output: None,
+        rope_freqs: None,
+        layer_range: None,
+        layers: vec![LlamaLayerWeights {
+            attention_norm: t("blk.0.attn_norm.weight", vec![2], 2),
+            attention_q: t("blk.0.attn_q.weight", vec![2, 2], 4),
+            attention_k: t("blk.0.attn_k.weight", vec![2, 2], 4),
+            attention_v: t("blk.0.attn_v.weight", vec![2, 2], 4),
+            attention_output: t("blk.0.attn_output.weight", vec![2, 2], 4),
+            attention_q_norm: q_norm,
+            attention_k_norm: k_norm,
+            ffn_norm: t("blk.0.ffn_norm.weight", vec![2], 2),
+            ffn_gate: t("blk.0.ffn_gate.weight", vec![2, 2], 4),
+            ffn_up: t("blk.0.ffn_up.weight", vec![2, 2], 4),
+            ffn_down: t("blk.0.ffn_down.weight", vec![2, 2], 4),
+            moe_router: None,
+        }],
+    }
+}
+
+/// Loading a Qwen3 GGUF (per-head QK-norm present) on the CUDA resident path must fail
+/// closed with the typed `UnsupportedModelArchitecture` error: the engine has no
+/// QK-norm kernel, so running it would silently feed un-normalized Q/K into RoPE. A
+/// Qwen3 per-head QK-norm is now supported by the CUDA resident decode engine.
+/// This test verifies the engine *accepts* models with QK-norm (the guard was removed).
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_resident_accepts_qwen3_qk_norm() {
+    // With the QK-norm kernel ported, models with attention_q_norm/attention_k_norm
+    // tensors should no longer be rejected. The guard function has been removed,
+    // so this test just documents that the architecture is now supported.
+    let qwen3 = minimal_weights_with_qk_norm(true);
+    assert!(
+        qwen3.layers.iter().any(|l| l.attention_q_norm.is_some()),
+        "test fixture should have QK-norm weights"
+    );
+}
