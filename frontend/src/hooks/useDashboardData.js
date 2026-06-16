@@ -429,6 +429,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
   // Opt-in parity receipts: sends the next message non-streaming with
   // camelid_receipt:true so the response carries a verifiable receipt.
   const [receiptMode, setReceiptMode] = useState(false)
+  // Opt-in thinking mode (experimental — NOT parity-locked): sends
+  // camelid_enable_thinking:true so the model emits its own <think>…</think>
+  // reasoning. Default OFF so chat stays on the parity-locked thinking-DISABLED
+  // rendering; only the leading reasoning trace is evidenced vs llama.cpp.
+  const [thinkingMode, setThinkingMode] = useState(false)
   const [stoppingGeneration, setStoppingGeneration] = useState(false)
   const [loadingModelId, setLoadingModelId] = useState('')
   const [pendingChat, setPendingChat] = useState(null)
@@ -886,6 +891,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */
           ...contractSamplingOverrides(dashboard?.capabilities?.api_features, requestModelId),
+          // Opt-in thinking mode (experimental — not parity-locked). Only sent
+          // when the user turns it on; silence keeps the thinking-DISABLED
+          // parity-locked rendering.
+          ...(thinkingMode ? { camelid_enable_thinking: true } : {}),
           // Receipts only attach to non-streaming responses; the JSON
           // fallback in readStreamingChatCompletion handles that shape.
           stream: !receiptMode,
@@ -1443,6 +1452,8 @@ export function useDashboardData({ showNotice, clearNotice }) {
     sending,
     receiptMode,
     setReceiptMode,
+    thinkingMode,
+    setThinkingMode,
     loadingModelId,
     registerForm,
     setRegisterForm,

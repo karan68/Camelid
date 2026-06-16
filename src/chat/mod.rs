@@ -66,6 +66,9 @@ pub struct ChatOptions {
     pub auto_approve: bool,
     pub allow_net: bool,
     pub shell_timeout: u64,
+    /// Opt-in thinking mode (`chat --enable-thinking`): the model emits its own
+    /// `<think>…</think>` reasoning. NOT parity-locked (leading-trace lane only).
+    pub enable_thinking: bool,
 }
 
 /// Entry point for the `Chat` subcommand. Returns a process exit code (0 = ok,
@@ -85,6 +88,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
         max_tokens: opts.max_tokens,
         seed: opts.seed,
         stream: !opts.no_stream,
+        enable_thinking: opts.enable_thinking,
     };
     let mut session = Session::new(client, opts.models_dir, settings, opts.system);
 

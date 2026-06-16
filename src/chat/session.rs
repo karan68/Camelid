@@ -26,6 +26,11 @@ pub struct Settings {
     pub max_tokens: u32,
     pub seed: Option<u64>,
     pub stream: bool,
+    /// Opt-in thinking mode: send `camelid_enable_thinking:true` so the model
+    /// emits its own `<think>…</think>` reasoning. NOT parity-locked (the
+    /// leading-trace lane only); off by default.
+    #[serde(default)]
+    pub enable_thinking: bool,
 }
 
 impl Settings {
@@ -35,13 +40,18 @@ impl Settings {
         let opt_u = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_else(|| "off".into());
         let opt_s = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "off".into());
         format!(
-            "temp {:.2} · top-p {} · top-k {} · max {} · seed {} · stream {}",
+            "temp {:.2} · top-p {} · top-k {} · max {} · seed {} · stream {}{}",
             self.temperature,
             opt_f(self.top_p),
             opt_u(self.top_k),
             self.max_tokens,
             opt_s(self.seed),
             if self.stream { "on" } else { "off" },
+            if self.enable_thinking {
+                " · thinking on (experimental)"
+            } else {
+                ""
+            },
         )
     }
 }
@@ -310,6 +320,11 @@ impl Session {
         if let Some(seed) = self.settings.seed {
             request["seed"] = json!(seed);
         }
+        if self.settings.enable_thinking {
+            // Opt-in, NOT parity-locked: leading-trace lane only. Silent by
+            // default so the parity-locked thinking-DISABLED rendering stands.
+            request["camelid_enable_thinking"] = json!(true);
+        }
         request
     }
 
@@ -369,8 +384,20 @@ impl Session {
                 };
                 Ok(format!("stream = {}", self.settings.stream))
             }
+            "thinking" | "enable_thinking" => {
+                // Opt-in, NOT parity-locked: the leading-trace lane only.
+                self.settings.enable_thinking = match value.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" | "yes" => true,
+                    "off" | "false" | "0" | "no" => false,
+                    _ => return Err("thinking must be on/off".into()),
+                };
+                Ok(format!(
+                    "thinking = {} (experimental — not parity-locked)",
+                    if self.settings.enable_thinking { "on" } else { "off" }
+                ))
+            }
             other => Err(format!(
-                "unknown setting '{other}' — try temperature, top_p, top_k, max_tokens, seed, stream"
+                "unknown setting '{other}' — try temperature, top_p, top_k, max_tokens, seed, stream, thinking"
             )),
         }
     }
@@ -453,6 +480,7 @@ mod tests {
                 max_tokens: 512,
                 seed: None,
                 stream: true,
+                enable_thinking: false,
             },
             system: None,
             history: Vec::new(),
@@ -493,6 +521,29 @@ mod tests {
         assert_eq!(req["seed"], 42);
         assert_eq!(req["messages"][0]["role"], "user");
         assert_eq!(req["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn thinking_flag_only_sent_when_opted_in() {
+        let mut s = session();
+        s.push_user("hi".into());
+        // Default OFF: the request stays silent so the server keeps the
+        // parity-locked thinking-DISABLED rendering.
+        assert!(s
+            .build_request(true)
+            .get("camelid_enable_thinking")
+            .is_none());
+        // /set thinking on flips it; the request then carries the opt-in flag.
+        let msg = s.set_param("thinking", "on").unwrap();
+        assert!(msg.contains("not parity-locked"));
+        assert!(s.settings.enable_thinking);
+        assert_eq!(s.build_request(true)["camelid_enable_thinking"], true);
+        // /set thinking off returns to silence.
+        s.set_param("thinking", "off").unwrap();
+        assert!(s
+            .build_request(true)
+            .get("camelid_enable_thinking")
+            .is_none());
     }
 
     #[test]

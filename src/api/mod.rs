@@ -93,6 +93,11 @@ pub struct AppState {
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
     planner_env: PlannerEnv,
     configured_threads: Option<usize>,
+    /// Server-wide default for opt-in thinking mode (`serve --enable-thinking`).
+    /// Applied only to chat requests that omit `camelid_enable_thinking`; an
+    /// explicit value in the request always wins. Off by default so the
+    /// parity-locked thinking-DISABLED rendering stays the default.
+    default_enable_thinking: bool,
 }
 
 impl Default for AppState {
@@ -108,6 +113,7 @@ impl Default for AppState {
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
+            default_enable_thinking: false,
         }
     }
 }
@@ -118,6 +124,15 @@ impl AppState {
             configured_threads,
             ..Self::default()
         }
+    }
+
+    /// Set the server-wide default for opt-in thinking mode
+    /// (`serve --enable-thinking`). An explicit `camelid_enable_thinking` in a
+    /// request always overrides this; the default only fills in when the request
+    /// is silent.
+    pub fn with_default_enable_thinking(mut self, default_enable_thinking: bool) -> Self {
+        self.default_enable_thinking = default_enable_thinking;
+        self
     }
 
     /// Register a loaded gemma4 runtime under a model id, exactly as the
@@ -1330,8 +1345,10 @@ pub async fn serve(
     configured_threads: Option<usize>,
     initial_model: Option<PathBuf>,
     open_ui: bool,
+    default_enable_thinking: bool,
 ) -> std::io::Result<()> {
-    let state = AppState::with_configured_threads(configured_threads);
+    let state = AppState::with_configured_threads(configured_threads)
+        .with_default_enable_thinking(default_enable_thinking);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
@@ -2979,6 +2996,71 @@ mod gemma4_template_tests {
             prompt,
             "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
         );
+    }
+
+    /// Byte-lock the Qwen3 ChatML renderer against
+    /// `qa/prompt-packs/qwen3-chatml-thinking-template-pack-v1.json` for every
+    /// shape in both modes. The whole point of the pack is the
+    /// `enable_thinking=true` rows: a bare `<|im_start|>assistant\n` generation
+    /// turn (no pre-filled `<think></think>` block) is the one strong, bit-exact
+    /// guarantee the opt-in thinking lane carries. The parity-locked exact-row
+    /// mode stays thinking-DISABLED; this test does not touch that claim.
+    #[test]
+    fn qwen3_chatml_thinking_template_pack_locks_renderer() {
+        #[derive(serde::Deserialize)]
+        struct Shape {
+            id: String,
+            enable_thinking: bool,
+            messages: Vec<PackMessage>,
+            rendered_prompt: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct PackMessage {
+            role: String,
+            content: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Pack {
+            pack_id: String,
+            support_scope: String,
+            shapes: Vec<Shape>,
+        }
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/qa/prompt-packs/qwen3-chatml-thinking-template-pack-v1.json"
+        );
+        let raw = std::fs::read_to_string(path).expect("read qwen3 thinking template pack");
+        let pack: Pack = serde_json::from_str(&raw).expect("parse qwen3 thinking template pack");
+
+        // The pack is the opt-in thinking lane; its scope must stay the
+        // honestly-bounded one (never the exact-row smoke scope).
+        assert_eq!(pack.pack_id, "qwen3-chatml-thinking-template-pack-v1");
+        assert_eq!(pack.support_scope, "thinking_opt_in_leading_trace_only");
+        assert!(!pack.shapes.is_empty(), "pack must carry shapes");
+        // At least one enable_thinking=true shape — the lane's whole reason to exist.
+        assert!(
+            pack.shapes.iter().any(|s| s.enable_thinking),
+            "pack must lock at least one enable_thinking=true shape"
+        );
+
+        for shape in &pack.shapes {
+            let messages: Vec<ChatMessage> = shape
+                .messages
+                .iter()
+                .map(|m| ChatMessage {
+                    unsupported_content_parts: Vec::new(),
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                })
+                .collect();
+            let rendered = render_qwen3_chatml_prompt(&messages, shape.enable_thinking);
+            assert_eq!(
+                rendered, shape.rendered_prompt,
+                "shape {} (enable_thinking={}) diverges from the locked reference rendering",
+                shape.id, shape.enable_thinking
+            );
+        }
     }
 
     #[test]
@@ -4779,7 +4861,11 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
-        camelid_enable_thinking: req.camelid_enable_thinking,
+        // An explicit request value always wins; the server-wide default
+        // (`serve --enable-thinking`) only fills in when the request is silent.
+        camelid_enable_thinking: req
+            .camelid_enable_thinking
+            .or(state.default_enable_thinking.then_some(true)),
         tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),

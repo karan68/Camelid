@@ -6,7 +6,7 @@ import { CamelidMark } from '../components/ui/CamelidMark'
 import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { IconSend, IconStop, IconMemory, IconReceipt, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
+import { IconSend, IconStop, IconMemory, IconReceipt, IconThinking, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
 import { MessageTurn } from '../components/chat/MessageTurn'
 import { ChatControls } from '../components/chat/ChatControls'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
@@ -60,6 +60,8 @@ export default function ChatWorkspace({
   sending,
   receiptMode = false,
   setReceiptMode = null,
+  thinkingMode = false,
+  setThinkingMode = null,
   stoppingGeneration = false,
   selectedModelRunnable,
   setTab,
@@ -409,6 +411,17 @@ export default function ChatWorkspace({
                 onClick={() => setReceiptMode(!receiptMode)}
               >
                 <IconReceipt size={16} /> {receiptMode ? 'Receipt on' : 'Receipt'}
+              </button>
+            )}
+            {!demoMode && setThinkingMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool ${thinkingMode ? 'is-on' : ''}`}
+                title="Thinking mode (experimental — not parity-locked). The model emits its own <think>…</think> reasoning. Only the leading reasoning trace is evidenced against llama.cpp; the parity-locked exact-row mode stays thinking-disabled."
+                aria-pressed={thinkingMode}
+                onClick={() => setThinkingMode(!thinkingMode)}
+              >
+                <IconThinking size={16} /> {thinkingMode ? 'Thinking on (experimental)' : 'Thinking'}
               </button>
             )}
             {!demoMode && (

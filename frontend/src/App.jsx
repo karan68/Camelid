@@ -63,6 +63,7 @@ function App() {
     dashboard, tab, setTab, selectedConversationId, setSelectedConversationId,
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
+    thinkingMode, setThinkingMode,
     loadingModelId, registerForm, setRegisterForm, externalForm, setExternalForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, latestAssistantMessage, pendingConversation,
@@ -271,6 +272,8 @@ function App() {
               sending={sending}
               receiptMode={receiptMode}
               setReceiptMode={setReceiptMode}
+              thinkingMode={thinkingMode}
+              setThinkingMode={setThinkingMode}
               stoppingGeneration={stoppingGeneration}
               selectedModelRunnable={selectedModelRunnable}
               setTab={navigateTab}

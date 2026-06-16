@@ -63,6 +63,7 @@ export const IconCheckCircle = (p) => <Svg {...p}><path d="M12 2a10 10 0 1 0 0 2
 export const IconError = (p) => <Svg {...p}><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z" /></Svg>
 export const IconBolt = (p) => <Svg {...p}><path d="M11 21 13 13H9l4-10h2l-2 6h4l-4 12h-2z" /></Svg>
 export const IconReceipt = (p) => <Svg {...p}><path d="M5 2v20l2-1.5L9 22l2-1.5L13 22l2-1.5L17 22l2-1.5V2l-2 1.5L15 2l-2 1.5L11 2 9 3.5 7 2 5 3.5V2zm3 5h8v2H8V7zm0 4h8v2H8v-2zm0 4h5v2H8v-2z" /></Svg>
+export const IconThinking = (p) => <Svg {...p} strokeIcon><path d="M9.5 18.5h5M10.5 21h3M12 3a6 6 0 0 0-3.6 10.8c.4.3.6.7.6 1.2v.5h6v-.5c0-.5.2-.9.6-1.2A6 6 0 0 0 12 3z" /></Svg>
 export const IconChart = (p) => <Svg {...p}><path d="M3 3h2v18H3V3zm16 8h2v10h-2V11zm-4-6h2v16h-2V5zM7 13h2v8H7v-8z" /></Svg>
 export const IconSettings = (p) => <Svg {...p}><path d="M19.14 12.94a7.5 7.5 0 0 0 .05-1.88l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7 7 0 0 0-1.62-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.6.22L2.32 8.84a.5.5 0 0 0 .12.64l2.03 1.58a7.5 7.5 0 0 0 0 1.88l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.22.39.31.6.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.54a.5.5 0 0 0 .5.42h3.84a.5.5 0 0 0 .5-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.09.47 0 .6-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z" /></Svg>
 export const IconPlay = (p) => <Svg {...p}><path d="M8 5v14l11-7z" /></Svg>

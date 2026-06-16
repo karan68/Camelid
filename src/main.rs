@@ -75,6 +75,7 @@ fn default_launch_command() -> Command {
         spec_draft_tokens: None,
         no_open: false,
         deterministic: false,
+        enable_thinking: false,
     }
 }
 
@@ -266,6 +267,14 @@ enum Command {
         /// order follows the llama.cpp reference Q8_0 layout (see DECISIONS.md §D9).
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
+        /// Default Qwen3/gemma4 thinking mode ON for chat requests that don't set
+        /// it themselves. Opt-in and NOT parity-locked: thinking mode is supported
+        /// only as a leading-trace lane (the first tokens match the llama.cpp
+        /// reference before a benign f32 near-tie); the parity-locked exact-row
+        /// mode remains thinking-DISABLED. A client that sends
+        /// `camelid_enable_thinking` explicitly always wins over this default.
+        #[arg(long, env = "CAMELID_ENABLE_THINKING", default_value_t = false)]
+        enable_thinking: bool,
     },
     /// Interactive terminal chat REPL over the local Camelid API.
     ///
@@ -327,6 +336,13 @@ enum Command {
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
+        /// Render Qwen3/gemma4 thinking mode: the model emits its own
+        /// `<think>…</think>` reasoning before answering. Opt-in and NOT
+        /// parity-locked — supported only as a leading-trace lane (see
+        /// `--enable-thinking` on `serve`). Default off keeps the parity-locked
+        /// thinking-DISABLED rendering.
+        #[arg(long, env = "CAMELID_ENABLE_THINKING", default_value_t = false)]
+        enable_thinking: bool,
     },
     /// Tool-capability promotion harness: decide whether a model drives a clean
     /// tool-call round-trip (PASS / FAIL / INCONCLUSIVE) and emit a receipt. A
@@ -762,6 +778,7 @@ async fn main() -> anyhow::Result<()> {
             spec_draft_tokens,
             no_open,
             deterministic,
+            enable_thinking,
         } => {
             configure_rayon_threads(threads)?;
             camelid::capability::HardwareProfile::detect().log();
@@ -790,7 +807,7 @@ async fn main() -> anyhow::Result<()> {
             let model = model.or_else(auto_select_model);
             // Open the browser only when run interactively and not opted out.
             let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
-            api::serve(addr, threads, model, open_ui).await?
+            api::serve(addr, threads, model, open_ui, enable_thinking).await?
         }
         Command::Chat {
             model,
@@ -810,6 +827,7 @@ async fn main() -> anyhow::Result<()> {
             auto_approve,
             allow_net,
             shell_timeout,
+            enable_thinking,
         } => {
             let code = chat::run_chat(chat::ChatOptions {
                 model,
@@ -829,6 +847,7 @@ async fn main() -> anyhow::Result<()> {
                 auto_approve,
                 allow_net,
                 shell_timeout,
+                enable_thinking,
             })?;
             if code != 0 {
                 std::process::exit(code);
@@ -892,7 +911,7 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                api::serve(addr, threads, Some(model), false).await?
+                api::serve(addr, threads, Some(model), false, false).await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
