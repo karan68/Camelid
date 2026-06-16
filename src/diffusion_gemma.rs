@@ -25,9 +25,37 @@
 use std::path::Path;
 
 pub mod chat;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod reff16;
 mod refmath;
 pub mod refrng;
+
+/// GPU soft-embedding matmul (`emb_t @ probs`) for the self-conditioning
+/// signal — returns the `[c*hidden]` f32 buffer, or `None` to fall back to the
+/// CPU path. A no-op (always `None`) when the `cuda` feature is off.
+#[cfg(feature = "cuda")]
+fn sc_soft_gpu(
+    emb_t: &[u16],
+    probs_f16: &[u16],
+    c: usize,
+    hidden: usize,
+    n_vocab: usize,
+    embed_scale: f32,
+) -> Option<Vec<f32>> {
+    cuda::sc_soft_embedding_gpu(emb_t, probs_f16, c, hidden, n_vocab, embed_scale)
+}
+#[cfg(not(feature = "cuda"))]
+fn sc_soft_gpu(
+    _emb_t: &[u16],
+    _probs_f16: &[u16],
+    _c: usize,
+    _hidden: usize,
+    _n_vocab: usize,
+    _embed_scale: f32,
+) -> Option<Vec<f32>> {
+    None
+}
 
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
@@ -1072,41 +1100,56 @@ impl DgEncoderRuntime {
         let mut d_normed: Vec<f32> = Vec::new();
         let mut d_g: Vec<f32> = Vec::new();
         let mut d_sig: Vec<f32> = Vec::new();
+
+        // probs = softmax(scale(sc_logits, temp_inv)) per position, then the
+        // F16 src1 conversion (ggml quantizes src1 rows to the f16 vec_dot
+        // type). Gathered for all positions so the soft-embedding matmul can
+        // run as one batched GPU kernel.
+        let mut probs_f16_all = vec![0u16; c * n_vocab];
         for pos in 0..c {
-            // probs = soft_max(scale(sc_logits, temp_inv)) — f32, same
-            // kernel as every other softmax; then the F16 src1 conversion
-            // (ggml quantizes src1 rows to the f16 vec_dot_type)
             let mut probs: Vec<f32> = sc.logits[pos * n_vocab..(pos + 1) * n_vocab]
                 .iter()
                 .map(|&x| x * sc.temp_inv)
                 .collect();
             refmath::softmax_row(&mut probs);
-            let probs_f16: Vec<u16> = probs
-                .iter()
-                .map(|&x| crate::tensor::f32_to_f16_bits(x))
-                .collect();
+            for (v, &p) in probs.iter().enumerate() {
+                probs_f16_all[pos * n_vocab + v] = crate::tensor::f32_to_f16_bits(p);
+            }
+        }
 
-            // soft = (embT @ probs) * sqrt(n_embd) — one f16 dot per row
-            let mut soft = vec![0f32; hidden];
-            let nth = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-                .min(8);
-            let chunk = hidden.div_ceil(nth);
-            std::thread::scope(|s| {
-                for (ci, ys) in soft.chunks_mut(chunk).enumerate() {
-                    let probs_f16 = &probs_f16;
-                    s.spawn(move || {
-                        for (i, y) in ys.iter_mut().enumerate() {
-                            let e = ci * chunk + i;
-                            *y = reff16::vec_dot_f16(
-                                &emb_t[e * n_vocab..(e + 1) * n_vocab],
-                                probs_f16,
-                            ) * embed_scale;
+        // soft[pos] = (embT @ probs[pos]) * sqrt(n_embd). GPU when available
+        // (f32 reduction — NOT bit-identical to the CPU f16 emulation, but this
+        // matmul is ~87% of a multi-step denoise step); else the reference
+        // per-row f16 dot.
+        let soft_all = sc_soft_gpu(emb_t, &probs_f16_all, c, hidden, n_vocab, embed_scale);
+
+        for pos in 0..c {
+            let soft: Vec<f32> = match &soft_all {
+                Some(all) => all[pos * hidden..(pos + 1) * hidden].to_vec(),
+                None => {
+                    let probs_f16 = &probs_f16_all[pos * n_vocab..(pos + 1) * n_vocab];
+                    let mut soft = vec![0f32; hidden];
+                    let nth = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1)
+                        .min(8);
+                    let chunk = hidden.div_ceil(nth);
+                    std::thread::scope(|s| {
+                        for (ci, ys) in soft.chunks_mut(chunk).enumerate() {
+                            s.spawn(move || {
+                                for (i, y) in ys.iter_mut().enumerate() {
+                                    let e = ci * chunk + i;
+                                    *y = reff16::vec_dot_f16(
+                                        &emb_t[e * n_vocab..(e + 1) * n_vocab],
+                                        probs_f16,
+                                    ) * embed_scale;
+                                }
+                            });
                         }
                     });
+                    soft
                 }
-            });
+            };
 
             // SC gated MLP: pre_norm -> down( gelu(gate) * up )
             let normed = refmath::rms_norm(&soft, Some(&self.sc_pre_norm), eps);
