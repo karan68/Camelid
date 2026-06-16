@@ -9773,6 +9773,25 @@ fn build_resident_cuda_engine(
         }
         return None;
     }
+    // Task 4 — explicit VRAM headroom policy. Project the actual device
+    // allocation (resident weights + streaming scratch + the sized KV cache) and
+    // run it past the headroom policy *before* allocating. If it would OOM or
+    // leave less than the minimum post-load headroom, refuse the resident load
+    // (fall back to CPU) with a named shortfall rather than allocating into an
+    // eventual mid-load OOM. By construction `cap` already reserves `headroom`, so
+    // a model that currently loads still passes; this is the explicit backstop.
+    if free_vram > 0 {
+        let projected_alloc =
+            resident_weights_bytes + scratch_reserve + (cap as u64) * kv_bytes_per_pos;
+        if let Err(short) = crate::cuda_vram::evaluate(
+            free_vram,
+            projected_alloc,
+            crate::cuda_vram::min_headroom_mib(),
+        ) {
+            eprintln!("[resident-cuda] refusing resident load: {short}; using CPU path");
+            return None;
+        }
+    }
     let mut engine = crate::cuda_resident::CudaResidentDecode::new(
         n_layers,
         n_heads,

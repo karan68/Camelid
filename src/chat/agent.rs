@@ -8,19 +8,21 @@
 //! clean redirected transcripts. The full-screen TUI agent (modal approvals in
 //! the redraw loop) is a documented follow-up. See `DECISIONS.md` D9.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use super::audit::{self, AuditEvent, AuditSink};
 use super::banner;
 use super::client::Client;
 use super::session::{Session, CANCEL};
-use super::tools::{self, Action, Sandbox, ToolCall, ToolOutcome, ToolSpec};
+use super::shell_sandbox::{self, ShellSandbox};
+use super::tools::{self, Action, ApprovalTier, Sandbox, ToolCall, ToolOutcome, ToolSpec};
 
 /// Configuration for one agent session.
 pub struct AgentConfig {
@@ -31,6 +33,11 @@ pub struct AgentConfig {
     pub shell_timeout: Duration,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Where audit events are delivered. Defaults to the no-op sink (audit
+    /// nothing) when unconfigured; see [`audit::sink_from_config`].
+    pub audit: Box<dyn AuditSink>,
+    /// `run_shell` confinement mode (Task 1). Defaults to sandboxed.
+    pub shell_sandbox: ShellSandbox,
 }
 
 /// What the model produced for one step.
@@ -93,20 +100,46 @@ pub enum LoopEnd {
     DriverError,
 }
 
-/// Per-session approval grants (the `a` choice). Lifted to the agent REPL so a
-/// grant persists across goals within one session.
-#[derive(Default)]
-pub struct Policy {
-    always: HashSet<String>,
+/// The session approval policy: per-tool tiers + the `a` ("always allow") grants
+/// that persist across goals within one session. This is the tier-aware
+/// [`tools::ApprovalPolicy`]; the alias keeps the agent-facing name stable.
+pub use super::tools::ApprovalPolicy as Policy;
+
+/// Production posture from the environment. Any non-empty, non-falsey value of
+/// `CAMELID_PRODUCTION` counts as production; an unparseable value is treated as
+/// production too (fail-safe: ambiguous ⇒ production).
+pub fn is_production() -> bool {
+    match std::env::var("CAMELID_PRODUCTION") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "no" || v == "off")
+        }
+        Err(std::env::VarError::NotPresent) => false,
+        // Non-UTF8 value: present but unreadable → treat as production (fail safe).
+        Err(std::env::VarError::NotUnicode(_)) => true,
+    }
 }
 
-impl Policy {
-    /// The tools auto-allowed for this session (for `/tools`).
-    pub fn granted(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.always.iter().cloned().collect();
-        v.sort();
-        v
+/// Build the effective [`Policy`] from the `--auto-approve` flag and the
+/// production posture. Auto-approve bypasses interactive confirmation, so it is
+/// **refused (fail closed) under production** — the caller must surface the
+/// returned error and not run. Outside production it is allowed but the caller
+/// is expected to emit a prominent warning. `run_shell` (exec risk) stays gated
+/// even with auto-approve on (see [`tools::ApprovalPolicy::tier_for`]).
+pub fn resolve_policy(auto_approve: bool, production: bool) -> Result<Policy, String> {
+    if auto_approve && production {
+        return Err(
+            "refusing --auto-approve: CAMELID_PRODUCTION is set. Auto-approval runs \
+             write/network tools without confirmation and must not be used in a production \
+             deployment. Unset CAMELID_PRODUCTION or drop --auto-approve."
+                .to_string(),
+        );
     }
+    let mut policy = Policy::default();
+    if auto_approve {
+        policy.set_auto_all(true);
+    }
+    Ok(policy)
 }
 
 /// Run the bounded loop for one goal. Returns how it ended. Never loops past
@@ -125,7 +158,7 @@ pub fn run_loop(
     policy: &mut Policy,
     history: &mut Vec<AgentMsg>,
 ) -> LoopEnd {
-    let tools = tools::specs(cfg.allow_net);
+    let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let mut call_counts: HashMap<String, usize> = HashMap::new();
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -185,16 +218,15 @@ pub fn run_loop(
                     };
                     reporter.tool_call(&action.call_line(sandbox));
 
-                    // Read-only, already-granted-this-session, or --auto-approve all
-                    // skip the prompt; everything else gates. Auto-approve relaxes
-                    // *prompting* only — the sandbox already validated the action.
-                    let auto = !action.risk().needs_approval()
-                        || policy.always.contains(action.tool_name())
-                        || cfg.auto_approve;
-                    let decision = if auto {
-                        Decision::Once
-                    } else {
-                        approver.approve(&action, sandbox)
+                    // Consult the approval policy for the effective tier — the one
+                    // chokepoint for "may this run?". Auto runs; Confirm prompts the
+                    // approver; Deny never runs. The sandbox already validated the
+                    // action regardless of tier (auto relaxes *prompting* only).
+                    let tier = policy.tier_for(&action);
+                    let decision = match tier {
+                        ApprovalTier::Auto => Decision::Once,
+                        ApprovalTier::Confirm => approver.approve(&action, sandbox),
+                        ApprovalTier::Deny => Decision::No,
                     };
 
                     let outcome = match decision {
@@ -202,12 +234,24 @@ pub fn run_loop(
                             reporter.notice("aborted by user");
                             return LoopEnd::Aborted;
                         }
-                        Decision::No => ToolOutcome::Err("the user denied this action".into()),
-                        Decision::AlwaysTool => {
-                            policy.always.insert(action.tool_name().to_string());
-                            action.execute(sandbox)
+                        Decision::No => {
+                            let msg = if tier == ApprovalTier::Deny {
+                                format!(
+                                    "blocked by approval policy: `{}` is set to the deny tier",
+                                    action.tool_name()
+                                )
+                            } else {
+                                "the user denied this action".to_string()
+                            };
+                            ToolOutcome::Err(msg)
                         }
-                        Decision::Once => action.execute(sandbox),
+                        Decision::AlwaysTool => {
+                            policy.grant(action.tool_name());
+                            execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
+                        }
+                        Decision::Once => {
+                            execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
+                        }
                     };
                     reporter.tool_result(action.tool_name(), &outcome);
                     history.push(AgentMsg::ToolResult {
@@ -231,6 +275,31 @@ pub fn run_loop(
         cfg.max_steps
     ));
     LoopEnd::StepCapped
+}
+
+/// Execute an approved action, bracketed by the `agent.tool_call` and
+/// `agent.tool_result` audit events. The argument *digest* (not the raw args) is
+/// shared by both events so a sink can correlate them without seeing secrets.
+fn execute_audited(
+    action: &Action,
+    sandbox: &Sandbox,
+    tier: ApprovalTier,
+    raw_args: &Value,
+    sink: &dyn AuditSink,
+) -> ToolOutcome {
+    let tool = action.tool_name();
+    let digest = audit::digest_args(raw_args);
+    sink.emit(&AuditEvent::call(tool, tier.label(), digest.clone()));
+    let start = Instant::now();
+    let outcome = action.execute(sandbox);
+    sink.emit(&AuditEvent::result(
+        tool,
+        tier.label(),
+        digest,
+        &outcome,
+        start.elapsed(),
+    ));
+    outcome
 }
 
 /// Build the system prompt: the tools, the sandbox, and the data-not-commands
@@ -493,7 +562,19 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         return Ok(2);
     }
 
-    let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?;
+    // Resolve the approval policy before any UI. `--auto-approve` is refused
+    // (fail closed) when CAMELID_PRODUCTION is set, so a production deployment
+    // can never silently run write/network tools without confirmation.
+    let mut policy = match resolve_policy(cfg.auto_approve, is_production()) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e}");
+            return Ok(2);
+        }
+    };
+
+    let sandbox =
+        Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?.with_shell_mode(cfg.shell_sandbox);
     println!(
         "{}\n",
         banner::splash(
@@ -509,21 +590,56 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
     if cfg.auto_approve {
         println!(
             "{}",
-            banner::dim("⚠ --auto-approve: write/exec/network run WITHOUT prompting (sandbox still enforced)")
+            banner::dim(
+                "⚠ --auto-approve: write/network tools run WITHOUT prompting (sandbox still \
+                 enforced; run_shell stays gated)"
+            )
         );
+    }
+    // Surface the *actual* run_shell confinement, never a faked one (Task 1).
+    match cfg.shell_sandbox {
+        ShellSandbox::Disabled => {
+            println!("{}", banner::dim("· run_shell: disabled (tool not offered)"));
+        }
+        ShellSandbox::Unrestricted => {
+            println!(
+                "{}",
+                banner::dim(
+                    "⚠ run_shell: UNRESTRICTED — commands run cwd-pinned + timed but otherwise \
+                     unconfined (no seccomp/uid-drop)"
+                )
+            );
+        }
+        ShellSandbox::Sandboxed => match shell_sandbox::describe_sandboxed(sandbox.root()) {
+            Ok(enforced) => {
+                println!(
+                    "{}",
+                    banner::dim(&format!("· run_shell: sandboxed — {}", enforced.summary()))
+                );
+            }
+            Err(e) => {
+                // Sandboxed but unenforceable here → run_shell will fail closed.
+                println!(
+                    "{}",
+                    banner::dim(&format!(
+                        "⚠ run_shell: sandboxed but NOT enforceable here — calls will be refused. {e}"
+                    ))
+                );
+            }
+        },
     }
     println!(
         "{}",
         banner::dim("describe a goal · /tools list tools · /steps budget · /exit quit")
     );
 
-    let tools = tools::specs(cfg.allow_net);
+    let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
     let mut reporter = InlineReporter;
     let mut approver = InlineApprover;
-    // Session-spanning approval grants (the `a` choice persists across goals).
-    let mut policy = Policy::default();
+    // `policy` (resolved above) carries the session-spanning grants (the `a`
+    // choice persists across goals) plus the auto-approve posture.
 
     loop {
         let prompt = format!("agent ({}) › ", session.active_label);
@@ -666,6 +782,8 @@ mod tests {
             shell_timeout: Duration::from_secs(5),
             max_tokens: 64,
             temperature: 0.0,
+            audit: Box::new(audit::NoopSink),
+            shell_sandbox: ShellSandbox::Sandboxed,
         }
     }
 
@@ -895,6 +1013,11 @@ mod tests {
         let mut approver = ScriptApprover(vec![], 0);
         let mut reporter = RecordReporter::default();
         let mut history = vec![AgentMsg::User("escape".into())];
+        // Auto-approve posture on the policy (the loop consults the policy now,
+        // not cfg.auto_approve): the write would skip the prompt, but the sandbox
+        // refuses the escape at validation, before approval is ever reached.
+        let mut policy = Policy::default();
+        policy.set_auto_all(true);
         run_loop(
             &mut driver,
             &mut approver,
@@ -902,10 +1025,164 @@ mod tests {
             &sb,
             &cfg(dir.path(), true),
             &AtomicBool::new(false),
-            &mut Policy::default(),
+            &mut policy,
             &mut history,
         );
         assert!(!dir.path().parent().unwrap().join("escape.txt").exists());
         assert!(reporter.results[0].contains("escapes") || reporter.results[0].contains("access"));
+    }
+
+    // --- Task 2: approval tiers + production fail-closed --------------------
+
+    #[test]
+    fn auto_approve_refused_under_production() {
+        // Fail closed: --auto-approve under CAMELID_PRODUCTION is rejected.
+        assert!(resolve_policy(true, true).is_err());
+        // Allowed off-production (the caller warns loudly).
+        assert!(resolve_policy(true, false).is_ok());
+        // No auto-approve → fine even in production.
+        assert!(resolve_policy(false, true).is_ok());
+    }
+
+    #[test]
+    fn auto_all_promotes_writes_but_never_run_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut policy = resolve_policy(true, false).unwrap(); // auto_all on
+        let write =
+            tools::validate(&tc("write_file", json!({"path":"a.txt","content":"x"})), &sb).unwrap();
+        let shell =
+            tools::validate(&tc("run_shell", json!({"command":"echo hi"})), &sb).unwrap();
+        // Write (Confirm) is promoted to Auto; run_shell (Exec) is NOT.
+        assert_eq!(policy.tier_for(&write), ApprovalTier::Auto);
+        assert_eq!(policy.tier_for(&shell), ApprovalTier::Confirm);
+        // The explicit override is the escape hatch that can auto-run exec.
+        policy.set_override("run_shell", ApprovalTier::Auto);
+        assert_eq!(policy.tier_for(&shell), ApprovalTier::Auto);
+    }
+
+    #[test]
+    fn deny_tier_blocks_without_prompting() {
+        // A tool pinned to the deny tier never runs and never prompts the
+        // approver; the model gets a clean policy-denial result.
+        struct NeverApprove;
+        impl Approver for NeverApprove {
+            fn approve(&mut self, _a: &Action, _s: &Sandbox) -> Decision {
+                panic!("deny tier must not consult the approver");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "important").unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("run_shell", json!({"command":"rm -f keep.txt"}))]),
+                ModelStep::Text("understood".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = NeverApprove;
+        let mut reporter = RecordReporter::default();
+        let mut policy = Policy::default();
+        policy.set_override("run_shell", ApprovalTier::Deny);
+        let mut history = vec![AgentMsg::User("delete keep.txt".into())];
+        run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &cfg(dir.path(), false),
+            &AtomicBool::new(false),
+            &mut policy,
+            &mut history,
+        );
+        assert!(dir.path().join("keep.txt").exists()); // never ran
+        assert!(reporter.results[0].contains("deny"));
+    }
+
+    #[test]
+    fn audit_sink_gets_one_call_and_one_result_per_executed_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "a\nb\n").unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let sink = audit::InMemorySink::default();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("read_file", json!({"path":"f.txt"}))]),
+                ModelStep::Text("two lines".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![], 0);
+        let mut reporter = RecordReporter::default();
+        let mut c = cfg(dir.path(), false);
+        c.audit = Box::new(sink.clone()); // clone shares the buffer
+        let mut history = vec![AgentMsg::User("count".into())];
+        run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &c,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        let events = sink.events();
+        assert_eq!(events.len(), 2, "one tool_call + one tool_result");
+        assert_eq!(events[0].event_name(), "agent.tool_call");
+        assert_eq!(events[1].event_name(), "agent.tool_result");
+        assert_eq!(events[0].tool, "read_file");
+        assert_eq!(events[0].tier, "auto"); // read_file is auto tier
+        // The args digest is a hash, not the raw path.
+        assert!(events[0].args_digest.starts_with("sha256:"));
+        assert!(!events[0].args_digest.contains("f.txt"));
+        // The result event carries outcome + duration; the call event does not.
+        assert!(events[0].outcome.is_none() && events[0].duration_ms.is_none());
+        assert!(events[1].outcome.is_some() && events[1].duration_ms.is_some());
+    }
+
+    #[test]
+    fn denied_tool_emits_no_audit_events() {
+        // A denied action never executes, so it is never bracketed by events.
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let sink = audit::InMemorySink::default();
+        let mut driver = MockDriver {
+            steps: vec![
+                ModelStep::Calls(vec![tc("write_file", json!({"path":"x.txt","content":"hi"}))]),
+                ModelStep::Text("won't".into()),
+            ],
+            idx: 0,
+        };
+        let mut approver = ScriptApprover(vec![Decision::No], 0);
+        let mut reporter = RecordReporter::default();
+        let mut c = cfg(dir.path(), false);
+        c.audit = Box::new(sink.clone());
+        let mut history = vec![AgentMsg::User("write".into())];
+        run_loop(
+            &mut driver,
+            &mut approver,
+            &mut reporter,
+            &sb,
+            &c,
+            &AtomicBool::new(false),
+            &mut Policy::default(),
+            &mut history,
+        );
+        assert!(sink.events().is_empty());
+    }
+
+    #[test]
+    fn session_grant_promotes_tool_to_auto() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let mut policy = Policy::default();
+        let write =
+            tools::validate(&tc("write_file", json!({"path":"a.txt","content":"x"})), &sb).unwrap();
+        assert_eq!(policy.tier_for(&write), ApprovalTier::Confirm);
+        policy.grant("write_file");
+        assert_eq!(policy.tier_for(&write), ApprovalTier::Auto);
+        assert_eq!(policy.granted(), vec!["write_file".to_string()]);
     }
 }

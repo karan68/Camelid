@@ -189,12 +189,31 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
         started.elapsed().as_secs_f64()
     );
 
+    // The eval is intrinsically auto-approve (it runs a controlled fixture with a
+    // non-interactive approver). That bypass must never happen in production, so
+    // mirror the agent's fail-closed rule: refuse under CAMELID_PRODUCTION.
+    if agent::is_production() {
+        return finish(
+            &cfg,
+            EvalOutcome::Fail,
+            &abs,
+            Some(&loaded),
+            "refused: agent-eval uses auto-approval and CAMELID_PRODUCTION is set; \
+             run the promotion harness on a non-production host",
+            &[],
+        );
+    }
+
     // --- fixture workspace --------------------------------------------------
     let work = std::env::temp_dir().join(format!("camelid-agent-eval-{}", std::process::id()));
     std::fs::create_dir_all(&work)?;
     std::fs::write(work.join("notes.txt"), FIXTURE)?;
-    let sandbox = Sandbox::new(&work, false, Duration::from_secs(20))?;
-    let tools = super::tools::specs(false);
+    // The eval runs a controlled read-only fixture; run_shell is unrestricted so
+    // the harness works on any host (including non-Linux CI) without the
+    // kernel-sandbox preconditions. The battery never invokes run_shell.
+    let sandbox = Sandbox::new(&work, false, Duration::from_secs(20))?
+        .with_shell_mode(super::shell_sandbox::ShellSandbox::Unrestricted);
+    let tools = super::tools::specs(false, sandbox.shell_mode());
     let family = family_for(&abs);
 
     // --- run the battery ----------------------------------------------------
@@ -224,8 +243,14 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             shell_timeout: Duration::from_secs(20),
             max_tokens: cfg.max_tokens,
             temperature: 0.0,
+            // The promotion harness audits nothing (controlled fixture, no sink).
+            audit: Box::new(super::audit::NoopSink),
+            shell_sandbox: super::shell_sandbox::ShellSandbox::Unrestricted,
         };
+        // Auto-approve posture (write/network auto; run_shell still gated, which
+        // the AutoApprove approver allows). Production was already refused above.
         let mut policy = agent::Policy::default();
+        policy.set_auto_all(true);
         let end = agent::run_loop(
             &mut driver,
             &mut approver,
