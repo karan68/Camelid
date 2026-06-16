@@ -2069,13 +2069,6 @@ impl LlamaInferenceSession {
         let hidden = dims.embedding_length;
         let ffn_dim = dims.feed_forward_length;
         let vocab = dims.vocab_size;
-        // Fail closed for Qwen3 per-head QK-norm: the CUDA engine has no QK-norm kernel,
-        // so decline the GPU prefill and let the CPU reference (which applies QK-norm)
-        // run it, rather than uploading weights and producing un-normed Q/K.
-        if let Err(unsupported) = cuda_resident_qk_norm_unsupported(&weights, 0..n_layers) {
-            log_cuda_resident_unsupported_once(&unsupported);
-            return Ok(false);
-        }
         let n = token_ids.len();
         let kv_cap = (self.config.context_length as usize)
             .min(self.kv_cache.plan.max_sequence_length)
@@ -2099,10 +2092,6 @@ impl LlamaInferenceSession {
             Some(t) => t,
             None => return Ok(false),
         };
-        // The CUDA RoPE kernel implements adjacent-even-odd pairing only.
-        if tables.split_half_pairing {
-            return Ok(false);
-        }
         let embeddings = weights
             .token_embedding
             .embedding_lookup(token_ids, "token_embedding_resident_prefill_cuda")?;
@@ -2136,6 +2125,7 @@ impl LlamaInferenceSession {
                 kv_cap,
                 vocab,
                 rms_eps,
+                tables.split_half_pairing,
             ) {
                 Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
                 None => return Ok(false),
@@ -2383,7 +2373,7 @@ impl LlamaInferenceSession {
                 &self.config,
                 self.weights.rope_freqs.as_ref(),
             )? {
-                Some(t) if !t.split_half_pairing => {
+                Some(t) => {
                     cos_all.extend_from_slice(&t.cos);
                     sin_all.extend_from_slice(&t.sin);
                 }
@@ -2524,14 +2514,6 @@ impl LlamaInferenceSession {
         let range = weights.layer_range.clone().unwrap_or(0..dims.block_count);
         let n_layers = range.len();
         let vocab = dims.vocab_size;
-        // Fail closed for Qwen3 per-head QK-norm: the CUDA engine has no QK-norm kernel,
-        // so decline the GPU decode and let the CPU reference (which applies QK-norm) run
-        // it, rather than producing un-normed Q/K. Matches the documented "Ok(None) for any
-        // unsupported config" contract of this function.
-        if let Err(unsupported) = cuda_resident_qk_norm_unsupported(&weights, range.clone()) {
-            log_cuda_resident_unsupported_once(&unsupported);
-            return Ok(None);
-        }
         // The GPU KV cache is allocated once at `kv_cap` positions. Sizing it to a
         // model's full trained context (e.g. Llama 3.2's 131072) would allocate
         // many GB of VRAM up front; on a card without the room the driver
@@ -2572,14 +2554,6 @@ impl LlamaInferenceSession {
                 return Ok(None);
             }
         };
-        // The CUDA RoPE kernel implements adjacent-even-odd pairing (Llama). Split-half
-        // (Qwen3) is not yet ported, so fall back rather than mis-rotate.
-        if tables.split_half_pairing {
-            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
-                eprintln!("[resident-cuda] split_half_pairing (Qwen3) unsupported");
-            }
-            return Ok(None);
-        }
         let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
         let rope_dim = self
             .config
@@ -2637,6 +2611,7 @@ impl LlamaInferenceSession {
                 kv_cap,
                 vocab,
                 rms_eps,
+                tables.split_half_pairing,
             ) {
                 Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
                 None => {
@@ -9620,53 +9595,6 @@ fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
 }
 
 /// Fail the CUDA resident path closed for Qwen3-style per-head QK-norm.
-///
-/// The CUDA resident decode engine (`cuda_resident.rs`) has no per-head
-/// RMSNorm-on-Q/K kernel: its per-layer sequence is RMSNorm → quantize → Q/K/V GEMV
-/// → RoPE, with nothing between projection and RoPE. A model that carries
-/// `attention_q_norm` / `attention_k_norm` (Qwen3) requires Q and K to be
-/// per-head-RMSNorm'd *before* RoPE (see the CPU path in this file and the Metal
-/// path in `metal.rs`). Running such a model through this engine would feed
-/// un-normalized Q/K into RoPE and diverge from the reference *without* failing —
-/// so detect it and return a typed [`BackendError::UnsupportedModelArchitecture`]
-/// rather than emit ungated output. The resident seams treat this as "unsupported
-/// config" and fall back to the CPU reference (which implements QK-norm), exactly
-/// like every other unsupported-on-CUDA case. Delete this guard only once a CUDA
-/// QK-norm kernel exists *and* is parity-validated against the CPU reference.
-#[cfg(feature = "cuda")]
-fn cuda_resident_qk_norm_unsupported(
-    weights: &LlamaLoadedWeights,
-    range: std::ops::Range<usize>,
-) -> Result<()> {
-    let end = range.end.min(weights.layers.len());
-    let start = range.start.min(end);
-    if weights.layers[start..end]
-        .iter()
-        .any(|l| l.attention_q_norm.is_some() || l.attention_k_norm.is_some())
-    {
-        return Err(BackendError::UnsupportedModelArchitecture(
-            "qwen3 per-head QK-norm has no CUDA resident-decode kernel; the GPU path \
-             would feed un-normalized Q/K into RoPE and silently diverge from the \
-             reference. Run the CPU reference path (CAMELID_CUDA_RESIDENT_DECODE=0 or \
-             --deterministic) until the CUDA QK-norm kernel lands."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Log the resident-CUDA arch refusal exactly once per process so the CPU fallback is
-/// observable (a silent fallback would hide that the GPU path does not support the
-/// loaded architecture). Pure observability; never affects output.
-#[cfg(feature = "cuda")]
-fn log_cuda_resident_unsupported_once(err: &BackendError) {
-    use std::sync::Once;
-    static ONCE: Once = Once::new();
-    ONCE.call_once(|| {
-        eprintln!("[cuda] resident decode declined: {err} — falling back to CPU reference");
-    });
-}
-
 /// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate
 /// the GPU KV cache, and upload every layer's Q8_0 weights (repacked to SoA) plus
 /// the output stage. Returns `None` for any unsupported tensor (e.g. wire-page
@@ -9687,6 +9615,7 @@ fn build_resident_cuda_engine(
     kv_cap: usize,
     vocab: usize,
     rms_eps: f32,
+    split_half_pairing: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
         t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
@@ -9846,6 +9775,7 @@ fn build_resident_cuda_engine(
     }
     let mut engine = crate::cuda_resident::CudaResidentDecode::new(
         n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
+        split_half_pairing,
     )
     .ok()?;
     for (idx, l) in weights.layers[range].iter().enumerate() {
@@ -9874,6 +9804,8 @@ fn build_resident_cuda_engine(
                 down,
                 &l.attention_norm.data,
                 &l.ffn_norm.data,
+                l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 idx < n_resident_layers,
             )
             .ok()?;
