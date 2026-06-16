@@ -3,7 +3,7 @@
 Exact row: `Qwen3 0.6B Instruct Q8_0` (`Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf`)
 SHA256: `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`
 Platform: Windows x86_64 (MSVC). GPU: NVIDIA GeForce RTX 3060 Laptop GPU (6 GB VRAM, compute 8.6), driver 576.83, CUDA 12.9 (nvcc V12.9.86).
-Source/runtime head: `8a84519d`.
+Source/runtime head: `5ca1ede3`.
 
 ## Result
 
@@ -20,11 +20,11 @@ On-disk Windows CPU comparator (same as the Windows x86 Qwen3 CPU bundles). The 
 
 ## GPU / driver / CUDA
 
-NVIDIA GeForce RTX 3060 Laptop GPU, compute 8.6, 6144 MiB VRAM (~5122 MiB free at engine build), driver 576.83, CUDA 12.9 (nvcc V12.9.86). RTX 3060 LAPTOP GPU with 6 GB VRAM — NOT the 12 GB desktop RTX 3060. The 8B row (8.7 GB Q8_0) does not fit GPU-resident on 6 GB and is deferred to a 12 GB host; it is NOT validated here. Results are specific to this GPU/driver/CUDA combination (f32 reduction order is GPU-specific).
+NVIDIA GeForce RTX 3060 Laptop GPU, compute 8.6, 6144 MiB VRAM (~5122 MiB free at engine build), driver 576.83, CUDA 12.9 (nvcc V12.9.86). RTX 3060 LAPTOP GPU with 6 GB VRAM — NOT the 12 GB desktop RTX 3060. The 8B row (8.7 GB Q8_0) does not fit fully in 6 GB, so it runs via the automatic VRAM+host-RAM offload split (some layers resident in VRAM, the rest streamed from system RAM each token; compute stays on the GPU and the math is identical). The 0.6B/1.7B/4B rows are fully VRAM-resident. Results are specific to this GPU/driver/CUDA combination (f32 reduction order is GPU-specific).
 
 ## Claim boundary
 
-Supported exact-row smoke for this exact Qwen3 Q8_0 GGUF on Windows x86_64 (MSVC) with the GPU-resident CUDA decode engine on the recorded RTX 3060 Laptop (6 GB) / driver 576.83 / CUDA 12.9. ChatML chat, thinking DISABLED, short-chat envelope. GPU-resident decode AND single-shot GPU prefill token+text identical to the camelid cpu_reference (transitively llama.cpp) at the listed token counts on the listed prompts. NOT claimed: the 8B row (does not fit 6 GB), other Qwen3 sizes/variants/quants, base variants, Qwen3-MoE (A3B), model-native/long context beyond the recorded resident KV cap, thinking-mode, other GPUs/drivers/CUDA versions (results are GPU/driver/CUDA-version specific), or production throughput.
+Supported exact-row smoke for this exact Qwen3 Q8_0 GGUF on Windows x86_64 (MSVC) with the GPU CUDA decode engine on the recorded RTX 3060 Laptop (6 GB) / driver 576.83 / CUDA 12.9 (fully VRAM-resident). ChatML chat, thinking DISABLED, short-chat envelope. GPU decode AND single-shot GPU prefill token+text identical to the camelid cpu_reference (transitively llama.cpp) at the listed token counts on the listed prompts. NOT claimed: other Qwen3 sizes beyond the validated 0.6B/1.7B/4B/8B rows, other variants/quants, base variants, Qwen3-MoE (A3B), model-native/long context beyond the recorded resident KV cap, thinking-mode, other GPUs/drivers/CUDA versions (results are GPU/driver/CUDA-version specific), or production throughput.
 
 ## Artifacts
 
