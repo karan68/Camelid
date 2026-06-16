@@ -5,6 +5,7 @@ pub mod cluster;
 pub mod cuda;
 #[cfg(feature = "cuda")]
 pub mod cuda_resident;
+pub mod diffusion_gemma;
 pub mod distributed;
 pub mod error;
 pub mod execution_plan;

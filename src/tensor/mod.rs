@@ -29,6 +29,8 @@ use crate::{
     BackendError, Result,
 };
 
+pub mod wire_dequant;
+
 #[cfg(target_os = "macos")]
 pub(crate) fn disable_file_cache_best_effort(file: &File) {
     use std::{os::fd::AsRawFd, os::raw::c_int};
@@ -3512,7 +3514,6 @@ fn decode_q8_0_blocks(
 /// Kept for cache-precision experiments (the gemma4 KV cache is f32; parity
 /// oracles pin the comparator to the plain-f32 path instead — see
 /// `gemma4_runtime`).
-#[allow(dead_code)]
 pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -3552,6 +3553,12 @@ pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
         half += 1; // mantissa carry propagates into the exponent correctly
     }
     sign | half as u16
+}
+
+/// Round an f32 through f16 storage precision (f32 → f16 bits → f32) — the
+/// effective value of an `ggml_half`-stored scale.
+pub(crate) fn f16_round(value: f32) -> f32 {
+    f16_bits_to_f32(f32_to_f16_bits(value))
 }
 
 pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {

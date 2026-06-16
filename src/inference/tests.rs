@@ -10997,6 +10997,83 @@ fn q6_k_wire_dot_consistent_with_dequant() {
     );
 }
 
+/// Q4_K: the wire-row dot must agree with an f64 dot of the tensor-layer
+/// dequant (`Q4KBlock::dequantize`, an independent implementation of the same
+/// format) against the dequantized Q8_K activations. The integer kernel and
+/// the dequant dot compute the same sum in different float orders, so the
+/// tolerance covers f32-vs-f64 accumulation only. (DiffusionGemma lane.)
+#[test]
+fn q4_k_wire_dot_consistent_with_tensor_dequant() {
+    let blocks = 3usize;
+    let mut wire = vec![0u8; blocks * super::Q4_K_WIRE_BYTES_PER_BLOCK];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 131 + 17) % 256) as u8;
+    }
+    // sane f16 scales: d at +0, dmin at +2 of each superblock
+    for blk in wire.chunks_exact_mut(super::Q4_K_WIRE_BYTES_PER_BLOCK) {
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(0.0173).to_le_bytes());
+        blk[2..4].copy_from_slice(&super::f32_to_f16_bits(0.0049).to_le_bytes());
+    }
+
+    let activation: Vec<f32> = (0..blocks * 256)
+        .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+        .collect();
+    let xq = super::quantize_q8_k_blocks(&activation);
+
+    let dot = super::q4_k_wire_row_dot(&wire, &xq);
+
+    let decoded = crate::tensor::decode_q4_k_blocks(&wire).expect("decode q4_k blocks");
+    let mut reference = 0f64;
+    let mut vals = [0f32; 256];
+    for (bi, block) in decoded.iter().enumerate() {
+        block.dequantize(&mut vals);
+        let y = &xq[bi];
+        for (l, &w) in vals.iter().enumerate() {
+            reference += w as f64 * (y.d as f64 * y.qs[l] as f64);
+        }
+    }
+    assert!(
+        (dot as f64 - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+        "q4_k dot {dot} vs tensor dequant reference {reference}"
+    );
+}
+
+/// Q5_0: the wire-row dot must agree with an f64 dot of the tensor-layer
+/// dequant (`Q5_0Block`) against the dequantized Q8_0 activations.
+/// (DiffusionGemma lane.)
+#[test]
+fn q5_0_wire_dot_consistent_with_tensor_dequant() {
+    let blocks = 5usize;
+    let mut wire = vec![0u8; blocks * super::Q5_0_WIRE_BYTES_PER_BLOCK];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 89 + 41) % 256) as u8;
+    }
+    for blk in wire.chunks_exact_mut(super::Q5_0_WIRE_BYTES_PER_BLOCK) {
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(0.031).to_le_bytes());
+    }
+
+    let activation: Vec<f32> = (0..blocks * 32)
+        .map(|i| ((i as f32) * 0.83).cos() * 2.0)
+        .collect();
+    let xq = super::quantize_q8_0_blocks(&activation);
+
+    let dot = super::q5_0_wire_row_dot(&wire, &xq);
+
+    let decoded = crate::tensor::decode_q5_0_blocks(&wire).expect("decode q5_0 blocks");
+    let mut reference = 0f64;
+    for (bi, block) in decoded.iter().enumerate() {
+        let scale = block.scale_f32();
+        let y = &xq[bi];
+        for (l, &q) in block.unpack_values().iter().enumerate() {
+            reference += (scale * q as f32) as f64 * (y.scale as f64 * y.quants[l] as f64);
+        }
+    }
+    assert!(
+        (dot as f64 - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+        "q5_0 dot {dot} vs tensor dequant reference {reference}"
+    );
+}
+
 /// The Q8_K quantizer must mirror the reference exactly: iscale uses the
 /// SIGNED max (not amax), magic-number nearest-even rounding, clamp to 127.
 #[test]

@@ -440,6 +440,26 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
     },
+    /// Chat with a DiffusionGemma model: render the chat template, run the
+    /// bit-exact multi-canvas block-autoregressive denoise loop, detokenize.
+    /// CPU-only and slow (each denoise step is a full bidirectional forward);
+    /// experimental — see the DiffusionGemma lane recon.
+    DiffusionGemmaChat {
+        path: PathBuf,
+        #[arg(long, default_value = "Hello")]
+        prompt: String,
+        /// Max blocks (each block denoises one canvas_length window, then
+        /// commits to the prefix). The answer stops earlier on an end token,
+        /// a repetition loop, or the ubatch budget.
+        #[arg(long, default_value_t = 4)]
+        max_blocks: i32,
+        /// Entropy-Bound sampler seed (reference default 0).
+        #[arg(long, default_value_t = 0)]
+        seed: u32,
+        /// Max ubatch (the whole [prefix | canvas] must fit in one ubatch).
+        #[arg(long, default_value_t = 1100)]
+        max_ubatch: i32,
+    },
     /// Serve the TAIL layers of a Gemma 4 model as a distributed worker
     /// (layer sharding over TCP; pair with gemma4-master on the other Mac).
     Gemma4Worker {
@@ -1053,6 +1073,47 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .into());
             }
+        }
+        Command::DiffusionGemmaChat {
+            path,
+            prompt,
+            max_blocks,
+            seed,
+            max_ubatch,
+        } => {
+            use camelid::diffusion_gemma::chat::DgChat;
+            use camelid::diffusion_gemma::DgEbParams;
+            eprintln!("[dg] loading {} (CPU, lazy mmap)...", path.display());
+            let t0 = std::time::Instant::now();
+            let chat = DgChat::load(&path)?;
+            eprintln!(
+                "[dg] loaded in {:.1}s; canvas_length={}; denoising (CPU — minutes per step)...",
+                t0.elapsed().as_secs_f32(),
+                chat.canvas_length()
+            );
+            let params = DgEbParams {
+                seed,
+                ..DgEbParams::default()
+            };
+            let t1 = std::time::Instant::now();
+            let (text, stop, ids) = chat.generate(
+                &prompt,
+                &params,
+                max_blocks,
+                max_ubatch,
+                |b, prefix_len, steps, cut| {
+                    eprintln!(
+                        "[dg] block {b}: prefix={prefix_len} steps={steps} cut={cut} ({:.0}s)",
+                        t1.elapsed().as_secs_f32()
+                    );
+                },
+            )?;
+            eprintln!(
+                "[dg] done in {:.1}s (stop: {stop}, {} tokens)",
+                t1.elapsed().as_secs_f32(),
+                ids.len()
+            );
+            println!("{text}");
         }
         Command::Gemma4Worker {
             path,

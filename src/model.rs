@@ -80,18 +80,20 @@ impl LlamaModelConfig {
             // Entropy-Bound diffusion sampler), and it is multimodal (image/video
             // inputs). Camelid is a decoder-only autoregressive engine (causal
             // attention, KV cache, greedy next-token decode) and cannot run the
-            // diffusion decode loop; there is also no autoregressive reference
-            // runtime to prove token parity against. Fail closed with the exact
-            // blocker rather than mis-binding the shared gemma4 tensors.
+            // diffusion decode loop through THIS runtime. DiffusionGemma is instead
+            // supported through its own dedicated lane (`DgEncoderRuntime`, the
+            // `diffusion-gemma-chat` subcommand), which is bit-exact-validated
+            // against the pinned reference. Redirect rather than mis-bind the
+            // shared gemma4 tensors onto the autoregressive path.
             Some(other) if other.to_ascii_lowercase().contains("diffusion") => {
                 return Err(BackendError::UnsupportedModelArchitecture(format!(
-                    "{other} (DiffusionGemma): blocked — DiffusionGemma is a discrete \
-                     block-diffusion encoder-decoder (bidirectional attention over a \
-                     denoising token canvas, multi-canvas iterative sampling, \
-                     cross-attention, Entropy-Bound diffusion sampler) and is \
-                     multimodal; Camelid's autoregressive decoder-only engine cannot \
-                     run the diffusion decode loop, and there is no autoregressive \
-                     reference comparator to prove parity against. Fails closed by design"
+                    "{other} (DiffusionGemma): not an autoregressive model — it is a \
+                     discrete block-diffusion encoder-decoder (bidirectional attention \
+                     over a denoising token canvas, multi-canvas iterative sampling, \
+                     Entropy-Bound diffusion sampler). The autoregressive engine cannot \
+                     run the diffusion decode loop; use the dedicated DiffusionGemma lane \
+                     instead: `camelid diffusion-gemma-chat <model.gguf>` (bit-exact \
+                     CPU-pure runtime, experimental)"
                 )))
             }
             Some(other) => return Err(BackendError::UnsupportedModelArchitecture(other.into())),
@@ -267,9 +269,14 @@ pub struct Gemma4Metadata {
 }
 
 impl Gemma4Metadata {
-    /// Returns `Some` only for the `gemma4` architecture; `None` otherwise.
+    /// Returns `Some` only for the `gemma4` and `diffusion-gemma`
+    /// architectures; `None` otherwise. `diffusion-gemma` shares the Gemma 4
+    /// backbone and key suffixes (different prefix). Parsing here is
+    /// metadata-layer only: the AR runtime still fails closed on any
+    /// diffusion architecture in `LlamaModelConfig::from_gguf`; only the
+    /// experimental DiffusionGemma lane consumes this struct for that arch.
     pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Option<Self> {
-        if architecture != "gemma4" {
+        if architecture != "gemma4" && architecture != "diffusion-gemma" {
             return None;
         }
         let key = |suffix: &str| architecture_key(architecture, suffix);

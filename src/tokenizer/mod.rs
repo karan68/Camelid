@@ -754,7 +754,13 @@ impl Tokenizer {
 
         let mut unresolved = String::new();
         for symbol in symbols {
-            if symbol.contains("▁▁") {
+            // The multi-space (▁▁) deferral belongs to the score-merge path
+            // only. Rank-based BPE (merges present, e.g. the gemma4 family)
+            // merges multi-space runs into single vocab tokens — llama.cpp's
+            // GEMMA4 BPE emits e.g. ▁▁ / ▁▁▁ tokens, proven by the
+            // DiffusionGemma tokenizer-parity gate (tests/dg_tokenizer_parity.rs),
+            // and deferring them here diverges from the reference.
+            if self.bpe_ranks.is_empty() && symbol.contains("▁▁") {
                 unresolved.push_str(&symbol);
                 continue;
             }
