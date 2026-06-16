@@ -1,0 +1,10 @@
+# Phase 1 build flags for the CPU perf mission. x86-64-v3 lets LLVM autovectorize
+# the hot Q8_0 matvec/dequant loops with AVX2/FMA/BMI2 while staying portable to any
+# Haswell+/Zen+ CPU (no AVX-512 → no SIGILL on hosts that lack it). Measured A/B:
+# target-cpu=native (which adds AVX-512 on this Tiger Lake host) gave NO speedup over
+# x86-64-v3 for this workload — AVX-512 downclocking cancels the wider lanes — and both
+# produce bit-identical token output, so v3 is the strictly-better portable choice.
+# IEEE f32 reduction order is preserved (no fast-math), so output stays bit-identical
+# to the scalar baseline — verified by the parity gate.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

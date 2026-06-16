@@ -3149,16 +3149,63 @@ fn log_acceleration_state() {
     );
 }
 
+// Best-effort physical (not logical) core count on Windows. Compute-bound SIMD
+// matvec does not benefit from SMT siblings — oversubscribing logical cores adds
+// scheduler contention and measurably regresses decode (16 logical threads run
+// slower than 8 physical on this i7-11800H). Returns None if the query fails, in
+// which case we fall back to Rayon's default (logical-core) sizing.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn windows_physical_core_count() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformation, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
+    };
+    // RelationProcessorCore == 0 (LOGICAL_PROCESSOR_RELATIONSHIP); one such record
+    // per physical core.
+    const RELATION_PROCESSOR_CORE: i32 = 0;
+    unsafe {
+        let mut len: u32 = 0;
+        // First call sizes the buffer (expected to fail with ERROR_INSUFFICIENT_BUFFER).
+        GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len);
+        if len == 0 {
+            return None;
+        }
+        let count = len as usize / std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
+        if count == 0 {
+            return None;
+        }
+        let mut buf: Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> = Vec::with_capacity(count);
+        if GetLogicalProcessorInformation(buf.as_mut_ptr(), &mut len) == 0 {
+            return None;
+        }
+        buf.set_len(count);
+        let physical = buf
+            .iter()
+            .filter(|info| info.Relationship == RELATION_PROCESSOR_CORE)
+            .count();
+        (physical > 0).then_some(physical)
+    }
+}
+
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
+    if let Some(t) = threads {
+        anyhow::ensure!(t > 0, "--threads must be greater than zero");
+    }
+    // When the caller did not pin a thread count, default the Windows pool to the
+    // physical core count (SMT siblings hurt compute-bound decode). Other targets
+    // keep their existing defaults.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let resolved = threads.or_else(windows_physical_core_count);
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let resolved = threads;
+
     #[cfg(target_os = "macos")]
     let should_configure = true;
     #[cfg(not(target_os = "macos"))]
-    let should_configure = threads.is_some();
+    let should_configure = resolved.is_some();
 
     if should_configure {
         let mut builder = ThreadPoolBuilder::new();
-        if let Some(t) = threads {
-            anyhow::ensure!(t > 0, "--threads must be greater than zero");
+        if let Some(t) = resolved {
             builder = builder.num_threads(t);
         }
         #[cfg(target_os = "macos")]

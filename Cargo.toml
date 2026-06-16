@@ -75,6 +75,14 @@ tempfile = "3"
 # check-cfg does not error under -D warnings.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
+# Phase 1 build flags (CPU perf mission). Fat LTO + a single codegen unit let the
+# optimizer inline and vectorize the hot Q8_0 matvec/dequant loops across module
+# boundaries. opt-level 3 is already the release default. No fast-math is enabled,
+# so f32 reduction order — and therefore token output — stays bit-identical.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [lib]
 name = "camelid"
 path = "src/lib.rs"
