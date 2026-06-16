@@ -56,7 +56,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-0.6B-Q8_0.gguf',
     size_bytes: 639446688,
     quant: 'Q8_0',
-    blurb: 'Smallest Qwen3 row — ChatML with thinking disabled, token+text parity at 1/5/50 tokens.',
+    blurb: 'Smallest Qwen3 row — ChatML with thinking disabled, token+text parity at 1/5/50 tokens. Runs on the Windows CUDA GPU-resident path (parity vs the CPU/llama.cpp reference).',
   },
   {
     catalog_id: 'qwen3_1_7b_instruct_q8_0',
@@ -65,7 +65,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-1.7B-Q8_0.gguf',
     size_bytes: 1834426016,
     quant: 'Q8_0',
-    blurb: 'Qwen3 ChatML row (thinking disabled) — token+text parity at 1/5/50 plus GPU-resident decode/prefill to a 15k-token context.',
+    blurb: 'Qwen3 ChatML row (thinking disabled) — token+text parity at 1/5/50 plus GPU-resident decode/prefill to a 15k-token context (macOS), and Windows CUDA GPU-resident parity vs the CPU/llama.cpp reference.',
   },
   {
     catalog_id: 'qwen3_4b_instruct_q8_0',
@@ -74,7 +74,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-4B-Q8_0.gguf',
     size_bytes: 4280404704,
     quant: 'Q8_0',
-    blurb: 'Qwen3 ChatML row (thinking disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim path).',
+    blurb: 'Qwen3 ChatML row (thinking disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim path). Runs on the Windows CUDA GPU-resident path (parity vs the CPU/llama.cpp reference).',
   },
   {
     catalog_id: 'qwen3_8b_instruct_q8_0',
@@ -83,7 +83,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-8B-Q8_0.gguf',
     size_bytes: 8709518112,
     quant: 'Q8_0',
-    blurb: 'Largest Qwen3 row — ChatML (thinking disabled) token+text parity at 1/5/50 plus the GPU-resident decode/prefill path.',
+    blurb: 'Largest Qwen3 row — ChatML (thinking disabled) token+text parity at 1/5/50 plus the GPU-resident decode/prefill path. On Windows CUDA it runs via VRAM+host-RAM layer offload (parity vs the CPU/llama.cpp reference).',
   },
   {
     catalog_id: 'gemma4_e4b_it_q8_0',
