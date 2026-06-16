@@ -57,6 +57,47 @@ fn sc_soft_gpu(
     None
 }
 
+/// GPU Q6_K lm_head over the canvas activations — returns `[c*n_vocab]` logits
+/// (row-major per position) or `None` to fall back to the CPU matvec. A no-op
+/// when the `cuda` feature is off. The Q6_K GEMV mirrors the CPU `q6_k_dot`
+/// reduction (exact i64 dot + fused per-block f32 term), so it is bit-close /
+/// bit-identical to the CPU path.
+#[cfg(feature = "cuda")]
+fn lm_head_gpu(wire: &DgWire, acts: &[DgActivation], c: usize, hidden: usize) -> Option<Vec<f32>> {
+    // Opt-in: the GPU Q6_K GEMV is bit-identical to the CPU lm_head but the
+    // current naive one-thread-per-output kernel is SLOWER than CPU in isolation
+    // (lm_head is only ~9s on CPU). Kept as the validated building block for the
+    // full-forward GPU path (where it avoids the per-stage round-trip); enable
+    // with CAMELID_DG_CUDA_LMHEAD=1. Needs a coalesced/warp kernel to win solo.
+    if std::env::var("CAMELID_DG_CUDA_LMHEAD").as_deref() != Ok("1") {
+        return None;
+    }
+    if wire.format != DgFormat::Q6K {
+        return None;
+    }
+    let bpr = hidden / 256;
+    let rb = wire.row_bytes();
+    let bytes = wire.mmap.bytes(wire.offset, wire.rows * rb).ok()?;
+    let mut scales = vec![0f32; c * bpr];
+    let mut quants = vec![0i8; c * bpr * 256];
+    for (pos, a) in acts.iter().enumerate() {
+        let blocks = a.q8_k.as_ref()?;
+        if blocks.len() != bpr {
+            return None;
+        }
+        for (b, blk) in blocks.iter().enumerate() {
+            scales[pos * bpr + b] = blk.d;
+            let off = (pos * bpr + b) * 256;
+            quants[off..off + 256].copy_from_slice(&blk.qs);
+        }
+    }
+    cuda::lm_head_q6k_gpu(bytes, wire.rows, bpr, &scales, &quants, c)
+}
+#[cfg(not(feature = "cuda"))]
+fn lm_head_gpu(_wire: &DgWire, _acts: &[DgActivation], _c: usize, _hidden: usize) -> Option<Vec<f32>> {
+    None
+}
+
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
 // Expert-selection argsort matching the reference's `ggml_argsort_top_k`
@@ -1566,24 +1607,46 @@ impl DgEncoderRuntime {
         let _t_lm = std::time::Instant::now();
         let n_vocab = self.token_embd.rows;
         let mut result_norm_all = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
-        let mut logits = Vec::with_capacity(c * n_vocab);
-        for (pos, hp) in h.iter().enumerate() {
-            let rn = refmath::rms_norm(hp, Some(&self.output_norm), eps);
-            if pos >= p {
-                let rq = DgActivation::new(&rn);
-                let mut row = self.token_embd.matvec_dense(&rq)?;
-                if let Some(cap) = self.final_logit_softcapping {
-                    // reference: scale(1/cap) -> tanh -> scale(cap); the
-                    // reciprocal is computed in f32 at graph build
-                    let inv_cap = 1.0f32 / cap;
-                    for v in row.iter_mut() {
-                        *v = refmath::libm_tanhf(*v * inv_cap) * cap;
-                    }
-                }
-                logits.extend_from_slice(&row);
+        let rns: Vec<Vec<f32>> = h
+            .iter()
+            .map(|hp| refmath::rms_norm(hp, Some(&self.output_norm), eps))
+            .collect();
+        if want_trace {
+            for rn in &rns {
+                result_norm_all.extend_from_slice(rn);
             }
-            if want_trace {
-                result_norm_all.extend_from_slice(&rn);
+        }
+        // Canvas rows finish through the tied Q6_K lm_head. Quantize each canvas
+        // activation to Q8_K, then run one batched GPU GEMV (bit-close to the
+        // CPU q6_k_dot) when available, else the per-position CPU matvec.
+        let canvas_acts: Vec<DgActivation> =
+            rns[p..].iter().map(|rn| DgActivation::new(rn)).collect();
+        let gpu_logits = lm_head_gpu(&self.token_embd, &canvas_acts, c, hidden);
+        let mut logits = Vec::with_capacity(c * n_vocab);
+        let softcap = |row: &mut [f32]| {
+            if let Some(cap) = self.final_logit_softcapping {
+                // reference: scale(1/cap) -> tanh -> scale(cap); the reciprocal
+                // is computed in f32 at graph build
+                let inv_cap = 1.0f32 / cap;
+                for v in row.iter_mut() {
+                    *v = refmath::libm_tanhf(*v * inv_cap) * cap;
+                }
+            }
+        };
+        match gpu_logits {
+            Some(all) => {
+                for pos in 0..c {
+                    let mut row = all[pos * n_vocab..(pos + 1) * n_vocab].to_vec();
+                    softcap(&mut row);
+                    logits.extend_from_slice(&row);
+                }
+            }
+            None => {
+                for rq in &canvas_acts {
+                    let mut row = self.token_embd.matvec_dense(rq)?;
+                    softcap(&mut row);
+                    logits.extend_from_slice(&row);
+                }
             }
         }
         if dg_prof {
