@@ -375,7 +375,12 @@ extern "C" __global__ void q8_0_block_linear_row(
 
     fn init_backend() -> Result<CudaBackend, String> {
         let ordinal = super::selected_device_ordinal();
-        let ctx = CudaContext::new(ordinal)
+        // cudarc panics (rather than returning Err) when the CUDA driver
+        // library cannot be loaded — e.g. on a CI runner or any host with no
+        // NVIDIA driver. Catch that so `--all-features` builds fall back to the
+        // CPU path instead of aborting the process.
+        let ctx = std::panic::catch_unwind(|| CudaContext::new(ordinal))
+            .map_err(|_| "CUDA driver library not available".to_string())?
             .map_err(|e| format!("CudaContext::new({ordinal}) failed: {e}"))?;
         // After CudaContext::new (which runs cuInit) the driver can report the
         // device count.
@@ -427,7 +432,11 @@ extern "C" __global__ void q8_0_block_linear_row(
     /// `None` on any machine without a usable CUDA device.
     pub fn probe_capability() -> Option<super::CudaCapability> {
         let ordinal = super::selected_device_ordinal();
-        let ctx = CudaContext::new(ordinal).ok()?;
+        // See init_backend: a missing CUDA driver library makes cudarc panic
+        // rather than return Err, so guard the first call against it.
+        let ctx = std::panic::catch_unwind(|| CudaContext::new(ordinal))
+            .ok()?
+            .ok()?;
         let device_count = result::device::get_count().unwrap_or(0).max(0) as usize;
         let device_name = ctx
             .name()
