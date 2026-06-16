@@ -1567,8 +1567,8 @@ impl CudaResidentDecode {
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
         let projections = [q, kk, v, o, gate, up, down];
         let (attn_norm, ffn_norm) = (up_f(attn_norm)?, up_f(ffn_norm)?);
-        let q_norm_gpu = q_norm.map(|w| up_f(w)).transpose()?;
-        let k_norm_gpu = k_norm.map(|w| up_f(w)).transpose()?;
+        let q_norm_gpu = q_norm.map(up_f).transpose()?;
+        let k_norm_gpu = k_norm.map(up_f).transpose()?;
 
         if resident {
             // Resident: each projection uploaded once to its own VRAM slice; no
