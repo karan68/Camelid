@@ -183,6 +183,13 @@ pub struct PlanPlatform {
     pub cpu_features: Vec<String>,
     /// A usable Metal compute device exists on this host (always false off macOS).
     pub metal_available: bool,
+    /// The CUDA resident decode engine will drive decode for this process (a usable
+    /// CUDA device is present, GPU acceleration is on, and neither deterministic mode
+    /// nor `CAMELID_CUDA_RESIDENT_DECODE=0` forces the CPU reference). When true, the
+    /// CPU Q8 rows4 repack is skipped: the GPU resident engine consumes plain RAM-
+    /// resident Q8_0 blocks, and the repack replaces them (the two are mutually
+    /// exclusive on weight storage, exactly as the Metal-resident plan handles).
+    pub cuda_resident_active: bool,
 }
 
 impl PlanPlatform {
@@ -193,6 +200,7 @@ impl PlanPlatform {
         let cpu_model = cpu_model();
         let platform_label = platform_label(&operating_system, &architecture, &cpu_model);
         let metal_available = crate::metal::detect_metal_device().available;
+        let cuda_resident_active = cuda_resident_decode_will_run();
         Self {
             operating_system,
             architecture,
@@ -200,8 +208,30 @@ impl PlanPlatform {
             cpu_model,
             cpu_features,
             metal_available,
+            cuda_resident_active,
         }
     }
+}
+
+/// Planning-time mirror of `inference::resident_decode_cuda_enabled`: true when the GPU
+/// resident decode engine will run, so the CPU Q8 rows4 repack must be skipped (the GPU
+/// needs un-repacked plain Q8_0 blocks). Deterministic mode and
+/// `CAMELID_CUDA_RESIDENT_DECODE=0` force it false (CPU reference), matching the runtime
+/// gate. On a host without a usable CUDA device (or a build without the `cuda` feature)
+/// `cuda::is_available()` is false, so the CPU repack path is unaffected.
+fn cuda_resident_decode_will_run() -> bool {
+    if env_flag_enabled("CAMELID_DETERMINISTIC") {
+        return false;
+    }
+    if let Ok(value) = env::var("CAMELID_CUDA_RESIDENT_DECODE") {
+        if matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ) {
+            return false;
+        }
+    }
+    crate::cuda::is_available() && crate::cuda::gpu_accel_enabled()
 }
 
 pub fn plan_for_model(
@@ -451,6 +481,17 @@ fn select_x86_q8_plan(
 ) {
     if matches!(profile, ExecutionProfile::Safe) {
         reasons.push("safe profile selected; optimized x86 Q8 paths disabled".into());
+        return safe_q8_plan();
+    }
+    if platform.cuda_resident_active {
+        // A CUDA device is driving decode: keep weights as plain RAM-resident Q8_0
+        // blocks (the GPU resident engine cannot consume the CPU rows4 repack — the two
+        // are mutually exclusive on weight storage). The CPU repack path only wins when
+        // the CPU actually runs decode (no GPU, GPU toggled off, or deterministic mode).
+        reasons.push(
+            "CUDA resident decode active; keeping plain Q8_0 blocks for the GPU (CPU rows4 repack disabled while the GPU drives decode)"
+                .into(),
+        );
         return safe_q8_plan();
     }
     if env_flag_disabled("CAMELID_X86_Q8_REPACK") || env_flag_disabled("CAMELID_X86_Q8_KERNEL") {
@@ -972,6 +1013,7 @@ mod tests {
             cpu_model: "fixture cpu".into(),
             cpu_features: features.iter().map(|feature| (*feature).into()).collect(),
             metal_available: false,
+            cuda_resident_active: false,
         }
     }
 
