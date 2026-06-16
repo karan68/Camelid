@@ -1103,7 +1103,10 @@ async fn main() -> anyhow::Result<()> {
                 max_steps: max_steps.map(|m| m.max(1)).unwrap_or(defaults.max_steps),
                 ..defaults
             };
-            eprintln!("[dg] max_steps={} max_blocks={}", params.max_steps, max_blocks);
+            eprintln!(
+                "[dg] max_steps={} max_blocks={}",
+                params.max_steps, max_blocks
+            );
             let t1 = std::time::Instant::now();
             let (text, stop, ids) = chat.generate(
                 &prompt,
