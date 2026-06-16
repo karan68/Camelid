@@ -347,6 +347,8 @@ fn family_for(gguf: &std::path::Path) -> String {
         .to_lowercase();
     if name.contains("qwen") {
         "qwen".into()
+    } else if name.contains("mistral") {
+        "mistral".into()
     } else {
         "llama".into()
     }
