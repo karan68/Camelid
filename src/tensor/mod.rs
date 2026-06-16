@@ -4,7 +4,6 @@ use std::{
     env,
     fs::File,
     io::{Read, Seek, SeekFrom},
-    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -26,6 +25,7 @@ use serde::Serialize;
 
 use crate::{
     gguf::{GgufFile, GgufTensorDescriptor, GgufTensorType},
+    platform_fs::read_exact_at,
     BackendError, Result,
 };
 
@@ -754,11 +754,10 @@ impl Q8_0FileBacking {
             // cache-miss range bookkeeping for every streamed weight chunk.
             q8_file_cache_apply_capacity(0);
             let file = self.file()?;
-            file.read_exact_at(out, offset)
-                .map_err(|source| BackendError::Io {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            read_exact_at(&file, out, offset).map_err(|source| BackendError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
             record_q8_0_file_read(out.len());
             if cache_decoded_q8_0_scales {
                 if let Some(scales) = &mut cached_scales {
@@ -803,11 +802,12 @@ impl Q8_0FileBacking {
                 )
             })?;
             let out_end = range.out_start + range.len;
-            file.read_exact_at(&mut out[range.out_start..out_end], range_offset)
-                .map_err(|source| BackendError::Io {
+            read_exact_at(&file, &mut out[range.out_start..out_end], range_offset).map_err(
+                |source| BackendError::Io {
                     path: self.path.clone(),
                     source,
-                })?;
+                },
+            )?;
             record_q8_0_file_read(range.len);
         }
         let mut scale_status = Q8FileReadScaleStatus::NoScales;
@@ -1723,6 +1723,42 @@ impl CpuTensor {
         }
 
         Self::from_f32(name, self.shape.dims.clone(), out)
+    }
+
+    /// Per-head RMSNorm (Qwen3 QK-norm). Treats each row of this `[rows, cols]`
+    /// tensor as `head_count` contiguous heads of `head_dim = cols / head_count`
+    /// and RMS-normalizes each head independently with the shared `[head_dim]`
+    /// weight. This is what Qwen3 applies to the Q and K projections after
+    /// reshape-to-heads and before RoPE.
+    ///
+    /// Because the data is row-major, the head slices of a `[rows, cols]` tensor
+    /// are exactly the rows of a `[rows*head_count, head_dim]` tensor, so this
+    /// reuses [`Self::rms_norm`] verbatim — same numeric path as every other RMS
+    /// norm in the engine.
+    pub fn per_head_rms_norm(
+        &self,
+        weight: &Self,
+        head_count: usize,
+        eps: f32,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        require_rank(self, 2, "per_head_rms_norm input")?;
+        let rows = self.dim(0)?;
+        let cols = self.dim(1)?;
+        if head_count == 0 || !cols.is_multiple_of(head_count) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "per_head_rms_norm width {cols} is not divisible by head count {head_count}"
+            )));
+        }
+        let head_dim = cols / head_count;
+        let name = name.into();
+        let per_head = Self::from_f32(
+            name.clone(),
+            vec![rows * head_count, head_dim],
+            self.data.clone(),
+        )?;
+        let normed = per_head.rms_norm(weight, eps, name.clone())?;
+        Self::from_f32(name, vec![rows, cols], normed.data)
     }
 
     pub fn softmax_last_dim(&self, name: impl Into<String>) -> Result<Self> {
@@ -4547,10 +4583,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-disabled-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-disabled-{}", std::process::id()));
 
         let start = q8_0_file_read_stats();
         q8_file_cache_insert(path.clone(), 10, b"abcdefgh");
@@ -4572,8 +4606,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-disabled-scale-read-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-disabled-scale-read-{}",
             std::process::id()
         ));
         let scale_bits = 0x3800_u16;
@@ -5083,8 +5117,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-zero-clear-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-zero-clear-{}",
             std::process::id()
         ));
         q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
@@ -5107,10 +5141,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::remove_var("CAMELID_Q8_0_FILE_CACHE_BYTES");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-scoped-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-scoped-{}", std::process::id()));
 
         let (hit, scoped_stats) = with_q8_file_cache_capacity_override(Some(8), || {
             q8_file_cache_insert(path.clone(), 10, b"abcdefgh");
@@ -5149,14 +5181,10 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "8");
-        let first_path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-first-{}",
-            std::process::id()
-        ));
-        let second_path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-second-{}",
-            std::process::id()
-        ));
+        let first_path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-first-{}", std::process::id()));
+        let second_path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-second-{}", std::process::id()));
         q8_file_cache_insert(first_path.clone(), 10, b"abcdefgh");
         let mut out = [0_u8; 8];
         let start = q8_0_file_read_stats();
@@ -5187,10 +5215,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-subrange-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-subrange-{}", std::process::id()));
         q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
 
         let start = q8_0_file_read_stats();
@@ -5209,10 +5235,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-adjacent-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-adjacent-{}", std::process::id()));
         q8_file_cache_insert(path.clone(), 100, b"abcdefgh");
         q8_file_cache_insert(path.clone(), 108, b"ijklmnop");
 
@@ -5236,12 +5260,10 @@ mod tests {
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-stats-{}",
-            std::process::id()
-        ));
-        let other_path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-stats-other-{}",
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-stats-{}", std::process::id()));
+        let other_path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-stats-other-{}",
             std::process::id()
         ));
 
@@ -5277,8 +5299,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-trim-window-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-trim-window-{}",
             std::process::id()
         ));
         q8_file_cache_insert(path.clone(), 100, b"abcdefgh");
@@ -5305,10 +5327,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "12");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-overlap-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-overlap-{}", std::process::id()));
         q8_file_cache_insert(path.clone(), 100, b"abcdefgh");
         q8_file_cache_insert(path.clone(), 104, b"WXYZmnop");
 
@@ -5330,10 +5350,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-covered-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-covered-{}", std::process::id()));
         q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
         q8_file_cache_insert(path.clone(), 104, b"efgh");
 
@@ -5355,8 +5373,8 @@ mod tests {
         let _env_guard = env_lock();
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "16");
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-covered-conflict-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-covered-conflict-{}",
             std::process::id()
         ));
         q8_file_cache_insert(path.clone(), 100, b"abcdefghijklmnop");
@@ -5381,8 +5399,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-partial-file-read-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-partial-file-read-{}",
             std::process::id()
         ));
         std::fs::write(&path, b"abcdefghijklmnopqrstuvwxyz").unwrap();
@@ -5435,10 +5453,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "128");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-scales-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-cache-scales-{}", std::process::id()));
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&0x3c00_u16.to_le_bytes());
         bytes.extend(std::iter::repeat_n(0_u8, Q8_0_BLOCK_BYTES - 2));
@@ -5490,8 +5506,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "256");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-partial-scales-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-partial-scales-{}",
             std::process::id()
         ));
         let mut bytes = Vec::new();
@@ -5576,8 +5592,8 @@ mod tests {
             (Q8_0_BLOCK_BYTES * 3).to_string(),
         );
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-scale-trim-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-scale-trim-{}",
             std::process::id()
         ));
         let mut bytes = Vec::new();
@@ -5645,8 +5661,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "128");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-cache-scale-upgrade-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-cache-scale-upgrade-{}",
             std::process::id()
         ));
         let mut bytes = Vec::new();
@@ -5711,10 +5727,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "0");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-backing-bounds-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("camelid-q8-backing-bounds-{}", std::process::id()));
         std::fs::write(&path, (0_u8..64).collect::<Vec<_>>()).unwrap();
         let backing = Q8_0FileBacking::new(path.clone(), 8, 1);
 
@@ -5753,8 +5767,8 @@ mod tests {
         let _q8_guard = crate::test_support::q8_file_state_lock();
         std::env::set_var("CAMELID_Q8_0_FILE_CACHE_BYTES", "32");
         let _ = q8_0_file_read_stats();
-        let path = std::path::PathBuf::from(format!(
-            "/tmp/camelid-q8-zero-block-bounds-{}",
+        let path = std::env::temp_dir().join(format!(
+            "camelid-q8-zero-block-bounds-{}",
             std::process::id()
         ));
         let backing = Q8_0FileBacking::new(path.clone(), 128, 0);

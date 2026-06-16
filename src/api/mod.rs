@@ -47,6 +47,7 @@ use crate::{
         self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
         RECEIPT_SCHEMA_V1,
     },
+    telemetry,
     tensor::{parse_byte_count_env, CpuTensor, Q8_0Block, TensorStore},
     tokenizer::Tokenizer,
     BackendError,
@@ -305,6 +306,9 @@ pub struct ModelCompatibilityTarget {
     pub family: &'static str,
     pub quantization: &'static str,
     pub status: &'static str,
+    /// Verified (via the agent-eval harness) to drive a clean tool-call
+    /// round-trip. Promoted only with a PASS receipt; default false.
+    pub tool_capable: bool,
     pub support_scope: &'static str,
     pub full_support_status: &'static str,
     pub full_support_blockers: &'static str,
@@ -402,6 +406,11 @@ pub struct ChatCompletionRequest {
     /// channels are stripped from chat output either way. Default: false (the
     /// reference's `enable_thinking:false` rendering).
     pub camelid_enable_thinking: Option<bool>,
+    /// OpenAI-style tool/function definitions. When present, they are rendered
+    /// into the prompt through the loaded model's own chat template (Hybrid agent
+    /// mode); the model's tool-call output is parsed by the client. Models whose
+    /// template does not render tools simply ignore them.
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -832,6 +841,15 @@ pub struct GenerationSessionRequest {
     pub camelid_prompt_token_ids: Option<Vec<u32>>,
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
+    /// Opt-in Qwen3/gemma4 thinking mode: when true the chat renderer emits the
+    /// template's thinking generation prompt (the model produces its own
+    /// `<think>…</think>` block) instead of the deterministic thinking-disabled
+    /// shape. `None`/false preserves the parity-locked thinking-disabled default.
+    pub camelid_enable_thinking: Option<bool>,
+    /// Tool/function definitions, rendered into the prompt via the model's chat
+    /// template (agent mode). `None` renders identically to before.
+    #[serde(default)]
+    pub tools: Option<Vec<serde_json::Value>>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
@@ -1118,6 +1136,9 @@ struct PreparedGeneration {
     timings: GenerationTimings,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     speculative: Option<PreparedSpeculative>,
+    /// Captured request identity for the live telemetry stream; taken by the
+    /// generation path that actually runs (streaming or blocking).
+    telemetry: Option<telemetry::RequestStart>,
 }
 
 /// Server-level speculative decoding mode (`CAMELID_SPEC_DECODE`).
@@ -1133,6 +1154,18 @@ fn spec_decode_mode_from_env() -> Option<SpecDecodeMode> {
         Ok(value) if value.eq_ignore_ascii_case("draft") => Some(SpecDecodeMode::DraftModel),
         _ => None,
     }
+}
+
+/// Run speculative decode on the GPU (CAMELID_SPEC_GPU=1): keep the target's
+/// resident decode engine active during speculation and verify drafts via the
+/// batched GPU `verify_batch` instead of the CPU chunk verify. Opt-in while this
+/// lands; lossless either way (the target verify is authoritative), so the flag
+/// only changes where the work runs.
+fn spec_gpu_enabled() -> bool {
+    matches!(
+        env::var("CAMELID_SPEC_GPU").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
 }
 
 fn spec_draft_tokens_from_env(default: usize) -> usize {
@@ -1166,6 +1199,8 @@ struct GeneratedText {
     completion_tokens: usize,
     finish_reason: &'static str,
     timings: GenerationTimings,
+    /// Execution-trace rollup `(digest, fold_count)` from a deterministic run, else `None`.
+    execution_trace: Option<(String, u64)>,
 }
 
 struct GeneratedTokens {
@@ -1179,6 +1214,9 @@ struct GeneratedTokens {
     dense_diagnostic_generated_index: Option<usize>,
     finish_reason: &'static str,
     timings: GenerationTimings,
+    /// Execution-trace rollup `(digest, fold_count)` captured during a deterministic run, or
+    /// `None` when the trace was not armed (any non-deterministic generation).
+    execution_trace: Option<(String, u64)>,
 }
 
 fn collect_dense_diagnostics_for_generated_index(
@@ -1226,6 +1264,8 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/health", get(health))
         .route("/api/capabilities", get(capabilities))
+        .route("/api/runtime/gpu", get(gpu_runtime).post(set_gpu_runtime))
+        .route("/api/telemetry/stream", get(telemetry_stream))
         .route("/execution-plan", get(execution_plan))
         .route("/api/execution-plan", get(execution_plan))
         .route("/api/models/load", post(load_model))
@@ -1276,6 +1316,10 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/v1/messages", post(unsupported_messages))
         .route("/v1/rerank", post(unsupported_reranking))
         .route("/v1/reranking", post(unsupported_reranking))
+        // Anything not matched above is served from the embedded web UI (the
+        // chat surface and its static assets), with a client-side-route
+        // fallback to the app shell. API routes are matched first.
+        .fallback(crate::web_ui::handler)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -1285,17 +1329,137 @@ pub async fn serve(
     addr: SocketAddr,
     configured_threads: Option<usize>,
     initial_model: Option<PathBuf>,
+    open_ui: bool,
 ) -> std::io::Result<()> {
     let state = AppState::with_configured_threads(configured_threads);
     if let Some(model_path) = initial_model {
         if let Err(err) = load_model_from_path(&state, model_path, None).await {
             tracing::error!(error=%err, "failed to load startup model");
+            eprintln!("\n  Could not load that model: {err}");
+            eprintln!("  Camelid serves specific validated Q8_0 rows. To get one:");
+            eprintln!("      camelid pull            # list supported models");
+            eprintln!("      camelid pull <id>       # download one into ./models\n");
             return Err(std::io::Error::other(err.to_string()));
         }
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "camelid server listening");
-    axum::serve(listener, router_with_state(state)).await
+    let url = format!("http://{addr}");
+
+    // Warm the generation path BEFORE telling the user we're ready. The GPU resident
+    // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
+    // lazily on the first generation — a one-time cost of several seconds. If it lands
+    // on the user's first prompt the model looks "dog slow" (it's really the cold
+    // build, on the GPU the whole time). So: start serving in the background, fire one
+    // tiny self-request through the exact same code path to build the engine, BLOCK on
+    // it, and only then print "ready". After this the first real request is warm
+    // (~0.5s) instead of ~10s. The warm-up is best-effort — any failure just falls back
+    // to the old lazy build and is not fatal.
+    let warm_model_id = state.active_model_id.read().await.clone();
+    let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
+    if let Some(model_id) = warm_model_id {
+        eprintln!("\n  🐪 Warming up the GPU (building the resident engine, one-time)…");
+        warmup_generation_blocking(addr, model_id).await;
+    }
+    print_ready_banner(&url);
+    if open_ui {
+        crate::web_ui::open_in_browser(&url);
+    }
+    server.await.map_err(std::io::Error::other)?
+}
+
+/// One-shot self-request to build/warm the generation engine, awaited so startup
+/// blocks until the GPU resident engine is built (kernels compiled, weights uploaded,
+/// first prefill run). Runs the blocking `std::net` round-trip on the blocking pool so
+/// the spawned server task can answer it concurrently. Best-effort: any failure (or
+/// the 180s safety timeout) just returns, leaving the old lazy-build behaviour.
+async fn warmup_generation_blocking(addr: SocketAddr, model_id: String) {
+    let _ = tokio::task::spawn_blocking(move || warmup_request(addr, &model_id)).await;
+}
+
+/// Send the warm-up chat request and read the full response (blocking). Returns once
+/// the forward has completed so the resident engine is built before the caller
+/// proceeds. Errors are swallowed by the caller — this only shaves the cold start.
+fn warmup_request(addr: SocketAddr, model_id: &str) {
+    use std::io::{Read, Write};
+    // Give the just-spawned listener a moment to start accepting; retry briefly.
+    let mut stream = None;
+    for _ in 0..40 {
+        match std::net::TcpStream::connect(addr) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let Some(mut stream) = stream else {
+        return;
+    };
+    // Don't let a stuck forward hang startup forever.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(180)));
+    let body = serde_json::json!({
+        "model": model_id,
+        "messages": [{ "role": "user", "content": "hi" }],
+        "max_tokens": 1,
+        "temperature": 0,
+        "stream": false,
+    })
+    .to_string();
+    let request = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body,
+    );
+    if stream.write_all(request.as_bytes()).is_ok() {
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink);
+        tracing::info!("generation warm-up complete");
+    }
+}
+
+/// Print a clear, human-facing pointer to the web UI once the server is up.
+/// `tracing` output is for operators; this banner is for the person who just
+/// ran `camelid serve` and wants to know where to click.
+fn print_ready_banner(url: &str) {
+    eprintln!("\n  🐪 Camelid is ready");
+    eprintln!("  Open the chat UI:  {url}");
+    eprintln!("  OpenAI-style API:  {url}/v1/chat/completions\n");
+}
+
+/// Live inference telemetry stream (SSE). Subscribers receive only events
+/// emitted by real inference work (see `crate::telemetry`); an idle server
+/// sends nothing beyond the initial hello and keep-alive comments.
+async fn telemetry_stream() -> Response {
+    let mut rx = telemetry::hub().subscribe();
+    let events = async_stream::stream! {
+        let hello = serde_json::json!({
+            "event": "hello",
+            "schema": telemetry::TELEMETRY_SCHEMA,
+            "engine": "camelid",
+        });
+        yield Ok::<Event, Infallible>(Event::default().event("telemetry").data(hello.to_string()));
+        loop {
+            match rx.recv().await {
+                Ok(envelope) => match serde_json::to_string(&envelope) {
+                    Ok(json) => yield Ok(Event::default().event("telemetry").data(json)),
+                    Err(_) => continue,
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    let notice = serde_json::json!({ "event": "lagged", "skipped": skipped });
+                    yield Ok(Event::default().event("telemetry").data(notice.to_string()));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(events)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(10))
+                .text("ping"),
+        )
+        .into_response()
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -1700,6 +1864,8 @@ async fn llama_server_completion(
         camelid_prompt_token_ids,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_enable_thinking: None,
+        tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -1848,6 +2014,55 @@ fn loaded_model_generation_ready(model: &LoadedModel) -> bool {
         && guard_cpu_weight_materialization_budget(binding).is_ok()
 }
 
+/// Runtime GPU (CUDA) state for the UI toggle. `available` is whether a usable
+/// CUDA device is present (the UI shows the toggle only when true); `enabled` is
+/// the current switch position. On non-CUDA builds/hosts `available` is false.
+#[derive(Serialize)]
+struct GpuRuntimeState {
+    available: bool,
+    enabled: bool,
+    device: Option<String>,
+    backend: &'static str,
+    /// Number of Q8_0 matmuls run on the GPU so far this process (0 if the GPU
+    /// path has never executed). Lets the UI/tests confirm the toggle is live.
+    run_count: u64,
+}
+
+#[derive(Deserialize)]
+struct GpuRuntimeRequest {
+    enabled: bool,
+}
+
+fn current_gpu_runtime() -> GpuRuntimeState {
+    GpuRuntimeState {
+        available: crate::cuda::is_available(),
+        // Report the MASTER GPU-acceleration switch (resident decode), which is what
+        // actually runs the model on the GPU — not the legacy hybrid-matmul flag, which
+        // defaults off and made the UI read "GPU off" while the GPU did all the work.
+        enabled: crate::cuda::gpu_accel_enabled(),
+        device: crate::cuda::device_name(),
+        backend: "cuda",
+        run_count: crate::cuda::cuda_q8_run_count(),
+    }
+}
+
+/// GET `/api/runtime/gpu` — current GPU-acceleration availability + on/off state.
+async fn gpu_runtime() -> Json<GpuRuntimeState> {
+    Json(current_gpu_runtime())
+}
+
+/// POST `/api/runtime/gpu` `{ "enabled": bool }` — flip GPU acceleration at
+/// runtime (no restart). A no-op effect when no CUDA device is present, since
+/// the inference dispatch falls back to the CPU reference either way.
+async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeState> {
+    // Flip the master GPU-acceleration switch (the resident decode engine) AND the
+    // legacy hybrid Q8 matmul switch together, so "GPU acceleration" is one coherent
+    // control: on => resident decode runs on the GPU; off => pure CPU reference.
+    crate::cuda::set_gpu_accel_enabled(req.enabled);
+    crate::cuda::set_runtime_enabled(req.enabled);
+    Json(current_gpu_runtime())
+}
+
 async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
     let active_id_lock = state.active_model_id.read().await;
     let execution_plans = state.execution_plans.read().await;
@@ -1970,6 +2185,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         model_compatibility: vec![
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q8_0",
                 status: "supported_current_gate",
@@ -2011,6 +2227,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama32_1b_instruct_q8_0",
+                tool_capable: false,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2052,6 +2269,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama32_3b_instruct_q8_0",
+                tool_capable: true,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2093,6 +2311,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama3_8b_instruct_q8_0",
+                tool_capable: false,
                 family: "llama_bpe_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2134,6 +2353,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_e4b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_ple_matformer_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2175,6 +2395,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_e2b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_ple_matformer_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2216,6 +2437,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_12b_it_q8_0",
+                tool_capable: false,
                 family: "gemma4_dense_decoder",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2257,6 +2479,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma4_26b_a4b_it_q4_0",
+                tool_capable: false,
                 family: "gemma4_a4b_moe_decoder",
                 quantization: "Q4_0",
                 status: "supported_exact_row_smoke",
@@ -2298,6 +2521,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_0_q5_0",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q4_0/Q5_0",
                 status: "planned_phase_10",
@@ -2339,6 +2563,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "llama_spm_q4_k_q5_k",
+                tool_capable: false,
                 family: "llama_spm_decoder",
                 quantization: "Q4_K_M/Q5_K_M",
                 status: "planned_phase_10",
@@ -2380,6 +2605,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "mistral_7b_instruct_v0_3_q8_0",
+                tool_capable: false,
                 family: "mistral",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",
@@ -2421,6 +2647,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "mixtral_8x7b_instruct_v0_1_q8_0",
+                tool_capable: false,
                 family: "mixtral_moe",
                 quantization: "Q8_0",
                 status: "active_validation_partial_runtime",
@@ -2462,6 +2689,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "qwen25_7b_instruct_q8_0",
+                tool_capable: false,
                 family: "qwen_decoder",
                 quantization: "Q8_0",
                 status: "planned_exact_row_candidate",
@@ -2503,6 +2731,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "gemma2_9b_it_q8_0",
+                tool_capable: false,
                 family: "gemma2_decoder",
                 quantization: "Q8_0",
                 status: "planned_exact_row_candidate",
@@ -2690,6 +2919,66 @@ mod gemma4_template_tests {
         // must never appear.
         assert!(!prompt.contains("<start_of_turn>"));
         assert!(!prompt.contains("<end_of_turn>"));
+    }
+
+    #[test]
+    fn qwen3_chatml_prompt_renders_thinking_disabled_generation_prompt() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "What is the capital of France?".to_string(),
+        }];
+        let prompt = render_qwen3_chatml_prompt(&messages, false);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n"
+        );
+    }
+
+    #[test]
+    fn qwen3_chatml_prompt_renders_thinking_enabled_generation_prompt() {
+        let messages = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "What is the capital of France?".to_string(),
+        }];
+        let prompt = render_qwen3_chatml_prompt(&messages, true);
+        // Thinking enabled: bare assistant turn, no pre-filled <think></think>
+        // block — the model emits its own reasoning (the template default branch).
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
+             <|im_start|>assistant\n"
+        );
+    }
+
+    #[test]
+    fn qwen3_chatml_template_detected_and_no_generation_prompt_after_assistant_turn() {
+        assert!(is_qwen3_chatml_template(
+            "{%- if ... %}<|im_start|>...<|im_end|>..."
+        ));
+        assert!(!is_qwen3_chatml_template(
+            "<|start_header_id|>...<|eot_id|>"
+        ));
+        // A trailing assistant turn must NOT get an extra generation prompt.
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "hi".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "assistant".to_string(),
+                content: "hello".to_string(),
+            },
+        ];
+        let prompt = render_qwen3_chatml_prompt(&messages, false);
+        assert_eq!(
+            prompt,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nhello<|im_end|>\n"
+        );
     }
 
     #[test]
@@ -3097,28 +3386,45 @@ async fn gemma4_chat_nonstreaming(
     let prompt = gemma4_chat_prompt(&messages, req.camelid_enable_thinking.unwrap_or(false));
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let t_generate = std::time::Instant::now();
+    // Lifecycle telemetry only on this lane: the gemma4 runtime does not
+    // (yet) report prompt token counts or per-layer events, so those fields
+    // stay at their "not reported" zero values rather than being estimated.
+    let telemetry_guard =
+        telemetry::RequestGuard::begin(gemma4_telemetry_start(&id, max_tokens as u32, false));
     let result =
         tokio::task::spawn_blocking(move || runtime.generate_greedy(&prompt, max_tokens)).await;
     let generate_ms = t_generate.elapsed().as_secs_f64() * 1e3;
     let (text, ids) = match result {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
+            telemetry_guard.finish(gemma4_telemetry_error(e.to_string()));
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "generation_error",
                 e.to_string(),
                 None,
-            )
+            );
         }
         Err(e) => {
+            let message = format!("gemma4 generation task panicked: {e}");
+            telemetry_guard.finish(gemma4_telemetry_error(message.clone()));
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "generation_error",
-                format!("gemma4 generation task panicked: {e}"),
+                message,
                 None,
-            )
+            );
         }
     };
+    telemetry_guard.finish(telemetry::RequestFinish {
+        status: "ok",
+        finish_reason: Some("stop".to_string()),
+        completion_tokens: ids.len(),
+        ttft_ms: None,
+        decode_tps: None,
+        prefill_tps: None,
+        error: None,
+    });
     let body = serde_json::json!({
         "id": "chatcmpl-gemma4",
         "object": "chat.completion",
@@ -3147,6 +3453,40 @@ async fn gemma4_chat_nonstreaming(
     (StatusCode::OK, Json(body)).into_response()
 }
 
+/// Telemetry request identity for the gemma4 serve lane. Prompt token count
+/// and context length are not reported by this runtime, so they are recorded
+/// as 0 ("not reported") instead of being estimated.
+fn gemma4_telemetry_start(
+    model_id: &str,
+    max_tokens: u32,
+    stream: bool,
+) -> telemetry::RequestStart {
+    telemetry::RequestStart {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        model_id: model_id.to_string(),
+        backend: "gemma4-runtime".to_string(),
+        quantization: String::new(),
+        architecture: "gemma4".to_string(),
+        prompt_tokens: 0,
+        max_tokens,
+        context_length: 0,
+        temperature: 0.0,
+        stream,
+    }
+}
+
+fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
+    telemetry::RequestFinish {
+        status: "error",
+        finish_reason: None,
+        completion_tokens: 0,
+        ttft_ms: None,
+        decode_tps: None,
+        prefill_tps: None,
+        error: Some(message),
+    }
+}
+
 /// Streaming Gemma 4 chat (SSE). Mirrors the OpenAI `chat.completion.chunk`
 /// shape: a role chunk, one content delta per generated token, a final
 /// finish_reason chunk, then `[DONE]`. Generation runs on a blocking thread and
@@ -3173,6 +3513,14 @@ async fn gemma4_chat_streaming(
     });
 
     let events = async_stream::stream! {
+        // Lifecycle telemetry; a dropped stream (client disconnect) closes
+        // the run via the guard's Drop.
+        let mut telemetry_guard = Some(telemetry::RequestGuard::begin(gemma4_telemetry_start(
+            &id,
+            max_tokens as u32,
+            true,
+        )));
+        let mut telemetry_tokens = 0usize;
         // Role chunk.
         let role = serde_json::json!({
             "id": "chatcmpl-gemma4",
@@ -3188,6 +3536,15 @@ async fn gemma4_chat_streaming(
         while let Some(item) = rx.recv().await {
             match item {
                 Ok(delta) => {
+                    // One delta per really-decoded token on this lane (the
+                    // runtime invokes the callback per generated token), so
+                    // this pulse maps 1:1 to real decode work.
+                    telemetry_tokens += 1;
+                    telemetry::emit(telemetry::Event::TokenDecoded {
+                        token_id: None,
+                        context_position: None,
+                        layers_total: None,
+                    });
                     // Suppress thinking-channel spans; an empty visible delta
                     // emits nothing.
                     let visible = channel_filter.filter(&delta);
@@ -3204,6 +3561,9 @@ async fn gemma4_chat_streaming(
                     yield Ok(Event::default().data(chunk.to_string()));
                 }
                 Err(e) => {
+                    if let Some(guard) = telemetry_guard.take() {
+                        guard.finish(gemma4_telemetry_error(e.clone()));
+                    }
                     let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
                     yield Ok(Event::default().data(err.to_string()));
                     errored = true;
@@ -3213,6 +3573,17 @@ async fn gemma4_chat_streaming(
         }
 
         if !errored {
+            if let Some(guard) = telemetry_guard.take() {
+                guard.finish(telemetry::RequestFinish {
+                    status: "ok",
+                    finish_reason: Some("stop".to_string()),
+                    completion_tokens: telemetry_tokens,
+                    ttft_ms: None,
+                    decode_tps: None,
+                    prefill_tps: None,
+                    error: None,
+                });
+            }
             let done = serde_json::json!({
                 "id": "chatcmpl-gemma4",
                 "object": "chat.completion.chunk",
@@ -4085,6 +4456,9 @@ async fn llama_server_apply_template(
         &messages,
         &tokenizer,
         Some(&model.id),
+        // Template-preview endpoint: render the deterministic thinking-disabled
+        // shape (the generation path honors camelid_enable_thinking per request).
+        false,
     ) {
         Ok(rendered) => rendered,
         Err(err) => {
@@ -4256,6 +4630,8 @@ async fn completions(
         camelid_prompt_token_ids: req.camelid_prompt_token_ids,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_enable_thinking: None,
+        tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
     };
@@ -4293,6 +4669,7 @@ async fn completions(
                 completion_tokens,
                 finish_reason,
                 timings,
+                execution_trace: _,
             } = generated;
             (
                 StatusCode::OK,
@@ -4402,6 +4779,8 @@ async fn chat_completions(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: req.camelid_dense_diagnostics,
         camelid_dense_diagnostic_generated_index: req.camelid_dense_diagnostic_generated_index,
+        camelid_enable_thinking: req.camelid_enable_thinking,
+        tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
@@ -4582,6 +4961,20 @@ async fn build_server_receipt(
         let models = state.loaded_models.read().await;
         models.get(model_id)?.lane.clone()
     };
+    // Attach the execution-trace rollup only for reproducible (deterministic, greedy) runs that
+    // actually captured one. Non-reproducible or non-deterministic runs leave it absent, so the
+    // receipt serializes and digests exactly as before.
+    let execution_trace = generated
+        .execution_trace
+        .as_ref()
+        .filter(|_| stamp.reproducible)
+        .map(|(digest, fold_count)| {
+            receipt::ExecutionTraceBlock::rollup_v1(
+                digest.clone(),
+                *fold_count,
+                generated.generated_token_ids.len(),
+            )
+        });
     let mut receipt = ParityReceipt {
         schema: RECEIPT_SCHEMA_V1.to_string(),
         receipt_id: String::new(),
@@ -4612,12 +5005,18 @@ async fn build_server_receipt(
             finish_reason: generated.finish_reason.to_string(),
         },
         parity: ParityBlock::not_compared(),
+        execution_trace,
         signature: None,
     };
     if let Err(err) = receipt.seal() {
         tracing::warn!(error = %err, "failed to seal camelid_receipt; omitting receipt");
         return None;
     }
+    telemetry::emit(telemetry::Event::ReceiptWritten {
+        receipt_id: receipt.receipt_id.clone(),
+        reproducible: receipt.reproducible,
+        gguf_sha256: Some(receipt.lane.gguf_sha256.clone()),
+    });
     Some(receipt)
 }
 
@@ -4625,6 +5024,9 @@ async fn build_server_receipt(
 pub struct ReceiptReplay {
     pub lane: LaneIdentity,
     pub result: ReceiptResult,
+    /// Execution-trace rollup digest re-derived by this replay, when the replay ran on the
+    /// deterministic lane (else `None`). Verification compares it against the receipt's block.
+    pub execution_trace_digest: Option<String>,
 }
 
 /// Replay a receipt's request through the exact non-streaming generation path
@@ -4681,6 +5083,8 @@ pub async fn replay_receipt_request(
         camelid_prompt_token_ids: None,
         camelid_dense_diagnostics: None,
         camelid_dense_diagnostic_generated_index: None,
+        camelid_enable_thinking: None,
+        tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
     };
@@ -4694,6 +5098,7 @@ pub async fn replay_receipt_request(
     };
     Ok(ReceiptReplay {
         lane: loaded.lane,
+        execution_trace_digest: generated.execution_trace.map(|(digest, _)| digest),
         result: ReceiptResult {
             prompt_token_ids: generated.prompt_token_ids,
             generated_token_ids: generated.generated_token_ids,
@@ -4983,6 +5388,7 @@ async fn prepare_generation(
     req: GenerationSessionRequest,
 ) -> std::result::Result<PreparedGeneration, Response> {
     let requested_max_tokens = req.max_tokens;
+    let request_tools = req.tools.clone();
     validate_unsupported_generation_fields(&req).map_err(|response| *response)?;
     validate_choice_and_logprob_fields(&req).map_err(|response| *response)?;
     let sampling = sampling_config_from_request(&req).map_err(|response| *response)?;
@@ -5072,11 +5478,17 @@ async fn prepare_generation(
             token_ids
         }
         PromptInput::Chat(messages) => {
-            let rendered_prompt = render_chat_prompt_for_tokenization_for_model_result(
-                &messages,
-                &tokenizer,
-                Some(&model.id),
-            )
+            let rendered_prompt = match request_tools.as_deref() {
+                Some(tools) if !tools.is_empty() => {
+                    render_chat_prompt_for_tokenization_with_tools(&messages, &tokenizer, tools)
+                }
+                _ => render_chat_prompt_for_tokenization_for_model_result(
+                    &messages,
+                    &tokenizer,
+                    Some(&model.id),
+                    req.camelid_enable_thinking.unwrap_or(false),
+                ),
+            }
             .map_err(|err| {
                 api_error(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -5212,6 +5624,15 @@ async fn prepare_generation(
             Some("model"),
         )
     })?;
+    // Pin the GPU resident-decode engine cache to the model identity (not the
+    // per-load weights Arc pointer), so every request for this model reuses the
+    // uploaded weights instead of rebuilding the engine each time.
+    {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        model.id.hash(&mut hasher);
+        session.set_resident_cache_key(hasher.finish());
+    }
     timings.session_create = session_create_started.elapsed().as_millis();
 
     let collect_dense_diagnostics = req.camelid_dense_diagnostics.unwrap_or(false)
@@ -5244,9 +5665,30 @@ async fn prepare_generation(
             accepted_drafts: 0,
         }),
     };
-    // Speculation needs CPU-authoritative KV state for rollback, so the
-    // session stays off the GPU-resident prefill/decode paths.
-    session.set_resident_paths_disabled(speculative.is_some());
+    // CPU speculation needs CPU-authoritative KV for the chunk-verify rollback, so
+    // the target stays off the resident paths. GPU speculation (CAMELID_SPEC_GPU)
+    // keeps the target resident and verifies drafts via the batched GPU verify.
+    session.set_resident_paths_disabled(speculative.is_some() && !spec_gpu_enabled());
+
+    let telemetry_backend = {
+        let plans = state.execution_plans.read().await;
+        plans
+            .get(&model.id)
+            .map(|plan| plan.selected_backend.clone())
+            .unwrap_or_else(|| "llama".to_string())
+    };
+    let telemetry_start = telemetry::RequestStart {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        model_id: model.id.clone(),
+        backend: telemetry_backend,
+        quantization: model.lane.quantization.clone(),
+        architecture: model.lane.architecture.clone(),
+        prompt_tokens: token_ids.len(),
+        max_tokens,
+        context_length,
+        temperature: f64::from(req.temperature.unwrap_or(0.0)),
+        stream: req.stream.unwrap_or(false),
+    };
 
     Ok(PreparedGeneration {
         model_id: model.id,
@@ -5266,6 +5708,7 @@ async fn prepare_generation(
         timings,
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
         speculative,
+        telemetry: Some(telemetry_start),
     })
 }
 
@@ -5859,6 +6302,13 @@ fn gpu_sampled_generation_step(
     next_token_id: u32,
     forward_us: u128,
 ) -> crate::Result<LlamaGenerationStep> {
+    // This step's token was really sampled (on the GPU); the engine-level
+    // sampler hook never runs for it, so the decode pulse is emitted here.
+    telemetry::emit(telemetry::Event::TokenDecoded {
+        token_id: Some(next_token_id),
+        context_position: None,
+        layers_total: None,
+    });
     Ok(LlamaGenerationStep {
         prompt_token_count: 1,
         prefill_token_count: 0,
@@ -5919,6 +6369,34 @@ async fn generate_stream_step_blocking(
                     ))
                 })?;
                 return Ok(TimedGenerationStep { session, step });
+            }
+        }
+        // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
+        // instead of copying the full logits row to the host and sorting it on the
+        // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
+        if !collect_dense_diagnostics {
+            if let LlamaSampler::Sampling(cfg) = &sampler {
+                if let Some((id, forward_us)) = session
+                    .generate_next_token_sampled_resident(input[0], cfg)
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?
+                {
+                    let step = gpu_sampled_generation_step(id, forward_us).map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?;
+                    return Ok(TimedGenerationStep { session, step });
+                }
             }
         }
         let step = session
@@ -6041,11 +6519,28 @@ fn generation_timeout_duration() -> std::result::Result<Duration, Box<Response>>
 }
 
 fn generate_decoded_tokens(
-    prepared: PreparedGeneration,
+    mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
+    // Lifecycle telemetry for the blocking (non-streaming) path. If the
+    // generation errors out, the guard's Drop closes the run on the stream.
+    let telemetry_guard = prepared
+        .telemetry
+        .take()
+        .map(telemetry::RequestGuard::begin);
     let tokenizer = prepared.tokenizer.clone();
     let stop_sequences = prepared.stop_sequences.clone();
     let generated = generate_token_ids(prepared)?;
+    if let Some(guard) = telemetry_guard {
+        guard.finish(telemetry::RequestFinish {
+            status: "ok",
+            finish_reason: Some(generated.finish_reason.to_string()),
+            completion_tokens: generated.token_ids.len(),
+            ttft_ms: None,
+            decode_tps: None,
+            prefill_tps: None,
+            error: None,
+        });
+    }
     let mut text = tokenizer
         .decode(&generated.token_ids, true)
         .map_err(|err| {
@@ -6099,6 +6594,7 @@ fn generate_decoded_tokens(
         dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
         finish_reason: generated.finish_reason,
         timings: generated.timings,
+        execution_trace: generated.execution_trace,
     })
 }
 
@@ -6272,14 +6768,20 @@ fn generate_token_ids(
     let mut sample = 0;
     let mut reused_prompt_prefix = false;
 
-    if !prepared.collect_dense_diagnostics {
+    // The execution-trace rollup is captured only on the deterministic CPU lane (the only lane
+    // where it is reduction-order-stable). When it will be armed, bypass the prompt-prefix cache
+    // so the served run and any later verify re-run fold an identical forward (a cache hit skips
+    // the prompt forwards on one side only, which would desync the digest).
+    let want_execution_trace = crate::inference::deterministic_mode_enabled();
+
+    if !prepared.collect_dense_diagnostics && !want_execution_trace {
         if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
             prepared.session = cached.session.clone();
             // The cached session's resident-path pin reflects the request
             // that stored it; re-pin for this request's mode.
             prepared
                 .session
-                .set_resident_paths_disabled(prepared.speculative.is_some());
+                .set_resident_paths_disabled(prepared.speculative.is_some() && !spec_gpu_enabled());
             input.clear();
             let first_step = sample_cached_prompt_prefix(&cached, &history)?;
             let cached_next_token = first_step.next_token_id;
@@ -6303,6 +6805,10 @@ fn generate_token_ids(
             }
         }
     }
+
+    // Arm the rollup now that the session is settled (past any prompt-cache swap). Fails closed
+    // unless deterministic mode is active, so non-deterministic generations never trace.
+    let tracing_armed = want_execution_trace && prepared.session.enable_execution_trace();
 
     for _ in generated.len() as u32..prepared.max_tokens {
         if finish_reason != "length" {
@@ -6362,38 +6868,67 @@ fn generate_token_ids(
             // single-token step below; a one-token verify chunk would only
             // add chunk-path overhead over the tuned decode step.
             if !drafts.is_empty() {
-                let base_position = prepared.session.kv_position();
-                let mut batch = Vec::with_capacity(1 + drafts.len());
-                batch.push(input[0]);
-                batch.extend_from_slice(&drafts);
-                let (predictions, round_timings) = prepared
-                    .session
-                    .forward_greedy_verify_chunk(&batch)
-                    .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_verify_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
-                let accepted = accepted_draft_prefix(&drafts, &predictions);
-                prepared
-                    .session
-                    .rollback_to_position(base_position + 1 + accepted)
-                    .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "speculative_rollback_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
-                spec.rounds += 1;
-                spec.drafted += drafts.len() as u64;
-                spec.accepted_drafts += accepted as u64;
-                forward_timings.add_assign(&round_timings);
-                for &token in &predictions[..=accepted] {
+                // GPU speculative decode (CAMELID_SPEC_GPU=1): verify all drafts in one
+                // batched forward on the target's resident engine, which manages the KV
+                // itself (accept the longest matching prefix, advance position). Falls
+                // back to the CPU chunk verify when the engine isn't resident-ready.
+                // Lossless either way — the emitted tokens are the target's own greedy
+                // argmax given the accepted prefix.
+                let gpu_accepted = if spec_gpu_enabled() {
+                    prepared
+                        .session
+                        .verify_drafts_gpu(input[0], &drafts)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "speculative_verify_failed",
+                                err.to_string(),
+                                None,
+                            ))
+                        })?
+                } else {
+                    None
+                };
+                let emitted: Vec<u32> = if let Some(acc) = gpu_accepted {
+                    spec.rounds += 1;
+                    spec.drafted += drafts.len() as u64;
+                    spec.accepted_drafts += (acc.len() as u64).saturating_sub(1);
+                    acc
+                } else {
+                    let base_position = prepared.session.kv_position();
+                    let mut batch = Vec::with_capacity(1 + drafts.len());
+                    batch.push(input[0]);
+                    batch.extend_from_slice(&drafts);
+                    let (predictions, round_timings) = prepared
+                        .session
+                        .forward_greedy_verify_chunk(&batch)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "speculative_verify_failed",
+                                err.to_string(),
+                                None,
+                            ))
+                        })?;
+                    let accepted = accepted_draft_prefix(&drafts, &predictions);
+                    prepared
+                        .session
+                        .rollback_to_position(base_position + 1 + accepted)
+                        .map_err(|err| {
+                            Box::new(api_error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "speculative_rollback_failed",
+                                err.to_string(),
+                                None,
+                            ))
+                        })?;
+                    spec.rounds += 1;
+                    spec.drafted += drafts.len() as u64;
+                    spec.accepted_drafts += accepted as u64;
+                    forward_timings.add_assign(&round_timings);
+                    predictions[..=accepted].to_vec()
+                };
+                for &token in &emitted {
                     generated.push(token);
                     history.push(token);
                     if prepared.tokenizer.special.eog.contains(&token) {
@@ -6423,25 +6958,38 @@ fn generate_token_ids(
                 continue;
             }
         }
-        // Greedy single-token continuations with no per-step logit consumers ride the
-        // resident GPU-sampling fast lane; everything else takes the general step.
+        // Single-token continuations with no per-step logit consumers ride the
+        // resident GPU fast lane: greedy via GPU argmax, temperature-only sampling
+        // via GPU Gumbel-max. Everything else takes the general step.
         let fast_step = if input.len() == 1
-            && matches!(sampler, LlamaSampler::Greedy)
             && !collect_dense_for_step
             && !collect_step_top_logits
             && !top_logits.is_empty()
         {
-            prepared
-                .session
-                .generate_next_token_greedy_resident(input[0])
-                .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "generation_step_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?
+            match &sampler {
+                LlamaSampler::Greedy => prepared
+                    .session
+                    .generate_next_token_greedy_resident(input[0])
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?,
+                LlamaSampler::Sampling(cfg) => prepared
+                    .session
+                    .generate_next_token_sampled_resident(input[0], cfg)
+                    .map_err(|err| {
+                        Box::new(api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "generation_step_failed",
+                            err.to_string(),
+                            None,
+                        ))
+                    })?,
+            }
         } else {
             None
         };
@@ -6578,6 +7126,16 @@ fn generate_token_ids(
         prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
     }
 
+    // Finalize the rollup before any field is moved out of `prepared`.
+    let execution_trace = if tracing_armed {
+        let fold_count = prepared.session.execution_trace_fold_count();
+        prepared
+            .session
+            .take_execution_trace_digest()
+            .zip(fold_count)
+    } else {
+        None
+    };
     Ok(GeneratedTokens {
         prompt_token_ids: prepared.token_ids,
         token_ids: generated,
@@ -6589,6 +7147,7 @@ fn generate_token_ids(
         dense_diagnostic_generated_index,
         finish_reason,
         timings: prepared.timings,
+        execution_trace,
     })
 }
 
@@ -6919,6 +7478,10 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
     };
     let events = async_stream::stream! {
         let stream_started = Instant::now();
+        // Lifecycle telemetry for the streaming path. Dropping the stream
+        // (client disconnect, error return) closes the run via the guard's
+        // Drop, so the observatory never shows a stale "running" state.
+        let telemetry_guard = prepared.telemetry.take().map(telemetry::RequestGuard::begin);
         let mut stream_event_timings = StreamEventTimings {
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
@@ -7175,6 +7738,25 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         if collect_q8_schedule {
             prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
         }
+        if let Some(guard) = telemetry_guard {
+            let ttft_ms = first_content_ms.map(|ms| ms as u64);
+            let decode_tps = match (first_content_ms, generated.len()) {
+                (Some(first_ms), count) if count > 1 => {
+                    let decode_ms = generation_started.elapsed().as_millis().saturating_sub(first_ms);
+                    (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
+                }
+                _ => None,
+            };
+            guard.finish(telemetry::RequestFinish {
+                status: "ok",
+                finish_reason: Some(finish_reason.to_string()),
+                completion_tokens: generated.len(),
+                ttft_ms,
+                decode_tps,
+                prefill_tps: None,
+                error: None,
+            });
+        }
         stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
         let camelid_diagnostics = stream_timing_diagnostics
             .then(|| stream_timing_diagnostics_json(&prepared.timings, first_content_ms, stream_event_timings));
@@ -7342,16 +7924,19 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     model_id: Option<&str>,
+    enable_thinking: bool,
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
     let exact_llama32_metadata_jinja_row =
         model_id.and_then(llama32_metadata_jinja_exact_row_label);
     if let Some(template) = tokenizer.chat_template.as_deref() {
         if metadata_chat_template_enabled() {
-            return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
+            return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template, None);
         }
         if let Some(row_label) = exact_llama32_metadata_jinja_row {
             if is_llama3_instruct_template(template) {
-                return render_metadata_jinja_chat_template_prompt(messages, tokenizer, template);
+                return render_metadata_jinja_chat_template_prompt(
+                    messages, tokenizer, template, None,
+                );
             }
             return Err(exact_llama32_metadata_jinja_chat_template_error(
                 &format!(
@@ -7366,7 +7951,46 @@ fn render_chat_prompt_for_tokenization_for_model_result(
     }
 
     Ok(render_chat_prompt_for_tokenization_fallback(
-        messages, tokenizer,
+        messages,
+        tokenizer,
+        enable_thinking,
+    ))
+}
+
+/// Agent mode: render the chat prompt with tool definitions threaded into the
+/// model's own chat template. Used only when a request carries `tools`; when the
+/// model has no chat template, tools cannot be rendered and we fall back.
+fn render_chat_prompt_for_tokenization_with_tools(
+    messages: &[ChatMessage],
+    tokenizer: &Tokenizer,
+    tools: &[serde_json::Value],
+) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
+    // Normalize OpenAI-style `{ "type":"function", "function":{…} }` tools to the
+    // flat function objects (`{ "name", "description", "parameters" }`) the chat
+    // templates (Llama 3.x etc.) actually render — matching llama.cpp / vLLM. This
+    // keeps the wire format OpenAI-standard while the prompt the model sees aligns
+    // with the `{"name":…, "parameters":…}` response format the template requests
+    // (the nested envelope otherwise leaks into the prompt and small models echo
+    // the schema). See `TOOLCALL_DIAG.md`.
+    let normalized: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|tool| {
+            tool.get("function")
+                .cloned()
+                .unwrap_or_else(|| tool.clone())
+        })
+        .collect();
+    if let Some(template) = tokenizer.chat_template.as_deref() {
+        return render_metadata_jinja_chat_template_prompt(
+            messages,
+            tokenizer,
+            template,
+            Some(&normalized),
+        );
+    }
+    // Agent/tools rendering is the deterministic thinking-disabled path.
+    Ok(render_chat_prompt_for_tokenization_fallback(
+        messages, tokenizer, false,
     ))
 }
 
@@ -7376,13 +8000,16 @@ fn render_chat_prompt_for_tokenization_for_model(
     tokenizer: &Tokenizer,
     model_id: Option<&str>,
 ) -> RenderedPrompt {
-    render_chat_prompt_for_tokenization_for_model_result(messages, tokenizer, model_id)
-        .unwrap_or_else(|_| render_chat_prompt_for_tokenization_fallback(messages, tokenizer))
+    render_chat_prompt_for_tokenization_for_model_result(messages, tokenizer, model_id, false)
+        .unwrap_or_else(|_| {
+            render_chat_prompt_for_tokenization_fallback(messages, tokenizer, false)
+        })
 }
 
 fn render_chat_prompt_for_tokenization_fallback(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
+    enable_thinking: bool,
 ) -> RenderedPrompt {
     if let Some(template) = tokenizer.chat_template.as_deref() {
         // The marker strings themselves (<|user|>, <|assistant|>, <|system|>)
@@ -7418,6 +8045,16 @@ fn render_chat_prompt_for_tokenization_fallback(
                 parse_special: true,
             };
         }
+        if is_qwen3_chatml_template(template) {
+            return RenderedPrompt {
+                text: render_qwen3_chatml_prompt(messages, enable_thinking),
+                // Qwen3 has add_bos_token=false; the ChatML template fully
+                // specifies the prompt. Parse specials so <|im_start|>/<|im_end|>
+                // become control token ids (151644/151645), not literal text.
+                add_special: false,
+                parse_special: true,
+            };
+        }
     }
 
     RenderedPrompt {
@@ -7425,6 +8062,45 @@ fn render_chat_prompt_for_tokenization_fallback(
         add_special: true,
         parse_special: tokenizer.chat_prompt_parse_special(),
     }
+}
+
+/// Render a Qwen3 ChatML prompt. Mirrors the GGUF jinja template for the standard
+/// cases (optional leading system turn, then user/assistant turns), then appends
+/// the generation prompt for the requested thinking mode:
+/// - `enable_thinking = false` (the deterministic, parity-locked default):
+///   `<|im_start|>assistant\n<think>\n\n</think>\n\n` (the template's
+///   `enable_thinking is false` branch — a direct answer, no reasoning).
+/// - `enable_thinking = true`: `<|im_start|>assistant\n` (the template's default
+///   branch — the model emits its own `<think>…</think>` reasoning block first).
+///
+/// Verified token-identical to the reference for single-turn user prompts.
+fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
+    let mut prompt = String::new();
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        // If the caller already supplied a trailing assistant turn, don't append
+        // another generation prompt.
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        if enable_thinking {
+            // Thinking enabled: the bare assistant turn matches the GGUF template's
+            // default branch; the model generates its own <think>…</think> block.
+            prompt.push_str("<|im_start|>assistant\n");
+        } else {
+            // Thinking disabled: the empty <think></think> block matches the GGUF
+            // template's `enable_thinking is false` branch, giving a direct,
+            // deterministic answer for parity.
+            prompt.push_str("<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        }
+    }
+    prompt
 }
 
 #[cfg(test)]
@@ -7448,6 +8124,14 @@ fn is_mistral_instruct_template(template: &str) -> bool {
     template.contains("[INST]")
         && template.contains("[/INST]")
         && (template.contains("bos_token") || template.contains("</s>"))
+}
+
+/// Qwen3 (and Qwen2) ChatML template detector: `<|im_start|>` / `<|im_end|>`
+/// turn markers. camelid's minijinja cannot render the full Qwen3 jinja template
+/// (it uses constructs that evaluate to undefined), so the dense ChatML path is
+/// rendered by [`render_qwen3_chatml_prompt`] instead.
+fn is_qwen3_chatml_template(template: &str) -> bool {
+    template.contains("<|im_start|>") && template.contains("<|im_end|>")
 }
 
 fn exact_llama32_metadata_jinja_chat_template_error(message: &str) -> MiniJinjaError {
@@ -7506,8 +8190,9 @@ fn render_metadata_jinja_chat_template_prompt(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     template: &str,
+    tools: Option<&[serde_json::Value]>,
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
-    let rendered = render_jinja_chat_template(messages, tokenizer, template)?;
+    let rendered = render_jinja_chat_template(messages, tokenizer, template, tools)?;
     Ok(RenderedPrompt {
         add_special: !rendered_prompt_starts_with_token_text(
             &rendered,
@@ -7523,6 +8208,7 @@ fn render_jinja_chat_template(
     messages: &[ChatMessage],
     tokenizer: &Tokenizer,
     template: &str,
+    tools: Option<&[serde_json::Value]>,
 ) -> std::result::Result<String, MiniJinjaError> {
     let template_messages = messages
         .iter()
@@ -7547,6 +8233,11 @@ fn render_jinja_chat_template(
         eom_token => eom_token,
         unk_token => unk_token,
         add_generation_prompt => true,
+        // Agent mode: the model's own template renders these. When `tools` is
+        // None both resolve to none, so the template takes its no-tools path and
+        // the render is byte-identical to before.
+        tools => tools,
+        custom_tools => tools,
     })
 }
 
@@ -7786,6 +8477,16 @@ fn api_error(
     message: String,
     param: Option<&'static str>,
 ) -> Response {
+    // Surface failures that happen while a generation is live on the
+    // telemetry stream. Errors raised outside an active generation
+    // (request validation, model management) are not inference errors and
+    // stay off the stream.
+    if telemetry::hub().request_active() {
+        telemetry::emit(telemetry::Event::InferenceError {
+            code: code.to_string(),
+            message: message.clone(),
+        });
+    }
     let error_type = match status {
         StatusCode::NOT_IMPLEMENTED => "not_implemented",
         StatusCode::SERVICE_UNAVAILABLE => "runtime_unavailable",
@@ -7887,8 +8588,8 @@ mod tests {
         model::LlamaModelConfig,
         tensor::CpuTensor,
         tokenizer::{
-            BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer, TokenizerConfig,
-            TokenizerModel,
+            BpePreTokenizer, BpeRegistry, SpecialTokens, Token, TokenKind, Tokenizer,
+            TokenizerConfig, TokenizerModel,
         },
     };
 
@@ -9042,6 +9743,7 @@ mod tests {
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![
                 Token {
                     id: 0,
@@ -9100,6 +9802,7 @@ mod tests {
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
         let tokenizer = Tokenizer {
             model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: Vec::new(),
             token_to_id: HashMap::new(),
             byte_token_to_id: HashMap::new(),
@@ -9479,6 +10182,40 @@ mod tests {
         );
     }
 
+    /// TOOLCALL_DIAG: prints how the Llama 3 template renders OpenAI-nested vs
+    /// flat function tools, so the rendered prompt is inspectable (run with
+    /// `--nocapture`). Asserts the flat form puts `"name"`/`"parameters"` at the
+    /// tool's top level (matching the response format the template requests).
+    #[test]
+    fn tool_render_nested_vs_flat_diagnostic() {
+        let tokenizer = llama3_tokenizer_with_template(LLAMA3_METADATA_FULL_TEMPLATE);
+        let user = [ChatMessage {
+            unsupported_content_parts: Vec::new(),
+            role: "user".to_string(),
+            content: "read notes.txt".to_string(),
+        }];
+        let nested = serde_json::json!([{
+            "type":"function",
+            "function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}
+        }]);
+        let flat = serde_json::json!([{
+            "name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+        }]);
+        let n = nested.as_array().unwrap();
+        let f = flat.as_array().unwrap();
+        let r_nested =
+            render_jinja_chat_template(&user, &tokenizer, LLAMA3_METADATA_FULL_TEMPLATE, Some(n))
+                .unwrap();
+        let r_flat =
+            render_jinja_chat_template(&user, &tokenizer, LLAMA3_METADATA_FULL_TEMPLATE, Some(f))
+                .unwrap();
+        println!("\n===== NESTED (OpenAI) tools =====\n{r_nested}\n===== FLAT (function) tools =====\n{r_flat}\n=====");
+        assert!(r_nested.contains("\"type\": \"function\""));
+        assert!(!r_flat.contains("\"type\": \"function\""));
+        assert!(r_flat.contains("\"name\": \"read_file\""));
+        assert!(r_flat.contains("\"parameters\""));
+    }
+
     #[test]
     fn exact_llama32_1b_row_uses_metadata_jinja_renderer_without_env_opt_in_system_user() {
         let _guard = crate::test_support::env_lock();
@@ -9837,8 +10574,8 @@ mod tests {
         let template = "{{ raise_exception('unsupported chat-template branch') }}";
         let tokenizer = llama3_tokenizer_with_template(template);
 
-        let err =
-            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+        let err = render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template, None)
+            .unwrap_err();
         assert!(err.to_string().contains("unsupported chat-template branch"));
 
         let rendered = render_chat_prompt_for_tokenization(
@@ -9868,6 +10605,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -9890,6 +10628,7 @@ mod tests {
             }],
             &tokenizer,
             Some("llama32_3b_instruct_q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -9917,6 +10656,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -9942,6 +10682,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-3B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -9968,6 +10709,7 @@ mod tests {
             }],
             &tokenizer,
             Some("llama32_1b_instruct_q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -9994,6 +10736,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Meta-Llama-3.2-3B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10013,8 +10756,8 @@ mod tests {
         let template = "{{ unsupported_template_variable }}";
         let tokenizer = llama3_tokenizer_with_template(template);
 
-        let err =
-            render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template).unwrap_err();
+        let err = render_metadata_jinja_chat_template_prompt(&[], &tokenizer, template, None)
+            .unwrap_err();
 
         assert_eq!(err.kind(), MiniJinjaErrorKind::UndefinedError);
         std::env::remove_var(METADATA_CHAT_TEMPLATE_ENV);
@@ -10036,6 +10779,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Llama-3.2-1B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10058,6 +10802,7 @@ mod tests {
             }],
             &tokenizer,
             Some("Meta-Llama-3.2-3B-Instruct-Q8_0"),
+            false,
         )
         .unwrap_err();
 
@@ -10073,6 +10818,7 @@ mod tests {
     fn mistral_test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![
                 Token {
                     id: 0,
@@ -10223,6 +10969,7 @@ mod tests {
     fn llama3_tokenizer_with_template(template: &str) -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::Gpt2Bpe,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: vec![Token {
                 id: 0,
                 text: "<|begin_of_text|>".to_string(),
@@ -10266,6 +11013,8 @@ mod tests {
                 attention_k: desc("blk.0.attn_k.weight"),
                 attention_v: desc("blk.0.attn_v.weight"),
                 attention_output: desc("blk.0.attn_output.weight"),
+                attention_q_norm: None,
+                attention_k_norm: None,
                 ffn_norm: desc("blk.0.ffn_norm.weight"),
                 ffn: LlamaFfnTensors::Dense {
                     gate: desc("blk.0.ffn_gate.weight"),
@@ -10320,6 +11069,7 @@ mod tests {
             timings: GenerationTimings::default(),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             speculative: None,
+            telemetry: None,
         }
     }
 
@@ -10377,6 +11127,7 @@ mod tests {
     fn test_tokenizer() -> Tokenizer {
         Tokenizer {
             model: TokenizerModel::LlamaSpm,
+            bpe_pre_tokenizer: BpePreTokenizer::default(),
             tokens: Vec::new(),
             token_to_id: HashMap::new(),
             byte_token_to_id: HashMap::new(),
@@ -10543,6 +11294,8 @@ mod tests {
             rms_norm_epsilon: 1e-6,
             vocab_size: Some(3),
             file_type: Some(0),
+            rope_neox_pairing: false,
+            attention_key_length: None,
             moe: None,
             gemma4: None,
         }
@@ -10579,6 +11332,8 @@ mod tests {
                 ffn_gate: select_rows("blk.0.ffn_gate.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_up: select_rows("blk.0.ffn_up.weight", ffn, hidden, &[0, 1, 2, 3, 0, 1]),
                 ffn_down: select_rows("blk.0.ffn_down.weight", hidden, ffn, &[0, 1, 2, 3]),
+                attention_q_norm: None,
+                attention_k_norm: None,
                 moe_router: None,
             }],
             layer_range: None,
@@ -10629,14 +11384,14 @@ pub struct CatalogItem {
     pub license: &'static str,
 }
 
-fn curated_catalog() -> Vec<CatalogItem> {
+pub fn curated_catalog() -> Vec<CatalogItem> {
     vec![
         CatalogItem {
             catalog_id: "llama32_1b_instruct_q8_0",
             name: "Llama 3.2 1B Instruct Q8_0",
             repo_id: "unsloth/Llama-3.2-1B-Instruct-GGUF",
             filename: "Llama-3.2-1B-Instruct-Q8_0.gguf",
-            size_bytes: 1346203104,
+            size_bytes: 1321082528,
             downloads: 142000,
             likes: 540,
             quant: "Q8_0",
@@ -10647,7 +11402,7 @@ fn curated_catalog() -> Vec<CatalogItem> {
             name: "Llama 3.2 3B Instruct Q8_0",
             repo_id: "unsloth/Llama-3.2-3B-Instruct-GGUF",
             filename: "Llama-3.2-3B-Instruct-Q8_0.gguf",
-            size_bytes: 3422709216,
+            size_bytes: 3421898816,
             downloads: 98000,
             likes: 420,
             quant: "Q8_0",
@@ -10658,7 +11413,9 @@ fn curated_catalog() -> Vec<CatalogItem> {
             name: "TinyLlama 1.1B Chat Q8_0",
             repo_id: "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
             filename: "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
-            size_bytes: 1169007424,
+            // Verified against the HuggingFace resolve Content-Length (2026-06-14);
+            // must match exactly or `pull`'s skip-if-complete/resume check refires.
+            size_bytes: 1170781568,
             downloads: 512000,
             likes: 1240,
             quant: "Q8_0",
@@ -10669,7 +11426,7 @@ fn curated_catalog() -> Vec<CatalogItem> {
             name: "Llama 3 8B Instruct Q8_0",
             repo_id: "MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF",
             filename: "Meta-Llama-3-8B-Instruct.Q8_0.gguf",
-            size_bytes: 8540846592,
+            size_bytes: 8541283552,
             downloads: 320000,
             likes: 920,
             quant: "Q8_0",

@@ -73,6 +73,8 @@ export const IconWindows = (p) => <Svg {...p}><path d="M3 5.5 10.5 4.4v7.1H3V5.5
 export const IconLinux = (p) => <Svg {...p}><path d="M12 2c-2.2 0-3.5 1.9-3.5 4.2 0 1.4.4 2.2.4 3.3 0 .9-.7 1.6-1.6 3-1 1.6-2 3-2 4.7 0 1.4.9 2.1 2 2.4.4.9 1.2 1.9 2.4 2 .9.1 1.6-.3 2.3-.3s1.4.4 2.3.3c1.2-.1 2-1.1 2.4-2 1.1-.3 2-1 2-2.4 0-1.7-1-3.1-2-4.7-.9-1.4-1.6-2.1-1.6-3 0-1.1.4-1.9.4-3.3C15.5 3.9 14.2 2 12 2zm-1.5 4.1c.5 0 .9.5.9 1.1s-.4 1.1-.9 1.1-.9-.5-.9-1.1.4-1.1.9-1.1zm3 0c.5 0 .9.5.9 1.1s-.4 1.1-.9 1.1-.9-.5-.9-1.1.4-1.1.9-1.1zM12 9.4c.9 0 2 .6 2 1.2 0 .4-.6.7-1.1 1-.4.2-.7.5-.9.5s-.5-.3-.9-.5c-.5-.3-1.1-.6-1.1-1 0-.6 1.1-1.2 2-1.2z" /></Svg>
 export const IconRaspberryPi = (p) => <Svg {...p} strokeIcon><rect x="3" y="6" width="18" height="12" rx="1.5" /><path d="M6 6V4M9 6V4M12 6V4M15 6V4M18 6V4" /><rect x="6.5" y="9.5" width="4" height="4" rx="0.5" /><path d="M14 10h4M14 12.5h4M14 15h4" /></Svg>
 export const IconNetwork = (p) => <Svg {...p} strokeIcon><circle cx="12" cy="5" r="2.4" /><circle cx="5" cy="18" r="2.4" /><circle cx="19" cy="18" r="2.4" /><path d="M10.6 6.9 6.4 16M13.4 6.9 17.6 16M7.4 18h9.2" /></Svg>
+/* observatory: an orbit ring around a core */
+export const IconObservatory = (p) => <Svg {...p} strokeIcon><circle cx="12" cy="12" r="2.6" /><ellipse cx="12" cy="12" rx="9.5" ry="3.8" transform="rotate(-24 12 12)" /><circle cx="18.6" cy="8.3" r="1" fill="currentColor" stroke="none" /></Svg>
 /* canvas controls */
 export const IconZoomIn = (p) => <Svg {...p} strokeIcon><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5M11 8v6M8 11h6" /></Svg>
 export const IconZoomOut = (p) => <Svg {...p} strokeIcon><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5M8 11h6" /></Svg>

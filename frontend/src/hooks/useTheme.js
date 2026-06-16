@@ -2,12 +2,14 @@ import { useCallback, useEffect, useState } from 'react'
 
 const STORAGE_KEY = 'camelid-theme'
 const VALID = new Set(['system', 'light', 'dark'])
-const ORDER = ['system', 'light', 'dark']
+const ORDER = ['dark', 'light', 'system']
 
+/* Dark is the design's canonical palette, so it is the default preference;
+   'system' and 'light' remain one toggle away. */
 function readPreference() {
-  if (typeof window === 'undefined') return 'system'
+  if (typeof window === 'undefined') return 'dark'
   const saved = window.localStorage.getItem(STORAGE_KEY)
-  return saved && VALID.has(saved) ? saved : 'system'
+  return saved && VALID.has(saved) ? saved : 'dark'
 }
 
 function systemPrefersDark() {

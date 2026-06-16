@@ -22,8 +22,8 @@ use camelid::{
     gguf::{read_metadata, GgufTensorType},
     ghost::{GhostFile, GhostPrefetcher},
     inference::{
-        LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, LlamaSampler,
-        Q8ResidencyReport, SamplingConfig,
+        LlamaForwardTimings, LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights,
+        LlamaSampler, Q8ResidencyReport, SamplingConfig,
     },
     metal::detect_metal_device,
     model::{LlamaModelConfig, LlamaTensorBinding},
@@ -34,12 +34,183 @@ use clap::{Parser, Subcommand};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 
+mod chat;
+
+// Prefer the git describe stamped in by build.rs (e.g. "v0.1.1" or
+// "v0.1.1-3-gabcdef-dirty"); fall back to the crate version for builds without
+// a git checkout.
+const VERSION: &str = match option_env!("CAMELID_GIT_DESCRIBE") {
+    Some(describe) => describe,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Parser)]
-#[command(name = "camelid", about = "Rust-native local GGUF inference backend")]
+#[command(
+    name = "camelid",
+    version = VERSION,
+    about = "Rust-native local GGUF inference backend"
+)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
+
+/// The action taken when the binary is launched with no subcommand (e.g. a
+/// double-click of `camelid.exe`): start the local server and open the chat UI,
+/// with the GPU resident-decode path armed automatically. This is what makes the
+/// shipped Windows build a single open-and-use app — no terminal, flags, or
+/// toggles required.
+fn default_launch_command() -> Command {
+    Command::Serve {
+        addr: "127.0.0.1:8181".parse().expect("valid default serve addr"),
+        model: std::env::var_os("CAMELID_MODEL").map(PathBuf::from),
+        threads: None,
+        parallel_linear_min_outputs: None,
+        apple_accelerate_min_elements: None,
+        metal_linear: false,
+        metal_q8: false,
+        log_acceleration: true,
+        spec_decode: None,
+        spec_draft_model: None,
+        spec_draft_tokens: None,
+        no_open: false,
+        deterministic: false,
+    }
+}
+
+/// Find a GGUF to load when `serve` is started without an explicit `--model`,
+/// so the open-and-use launch lands directly in a usable chat. Looks next to the
+/// executable (the shipped layout: `camelid.exe` beside a `models/` folder) and
+/// in the working directory; returns the first `*.gguf` found.
+fn auto_select_model() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.join("models"));
+            dirs.push(parent.to_path_buf());
+        }
+    }
+    dirs.push(PathBuf::from("models"));
+    dirs.push(PathBuf::from("."));
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut ggufs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+                })
+                .collect();
+            ggufs.sort();
+            if let Some(first) = ggufs.into_iter().next() {
+                return Some(first);
+            }
+        }
+    }
+    None
+}
+
+/// Windows + CUDA: make the NVIDIA runtime DLLs (NVRTC etc.) loadable without the
+/// user having to add the CUDA `bin` directory to PATH. Locates the installed
+/// toolkit (via `CUDA_PATH*` or the standard install root) and prepends its `bin`
+/// to the process PATH before any GPU code runs, so the shipped app finds the GPU
+/// on its own. No-op if the toolkit is absent (the engine then falls back to CPU).
+#[cfg(all(windows, feature = "cuda"))]
+fn ensure_cuda_runtime_on_path() {
+    use std::path::{Path, PathBuf};
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if key == "CUDA_PATH" || key.starts_with("CUDA_PATH_V") {
+            let bin = Path::new(&value).join("bin");
+            if bin.is_dir() {
+                candidates.push(bin);
+            }
+        }
+    }
+    let root = Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+    if let Ok(entries) = std::fs::read_dir(root) {
+        let mut versions: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        versions.sort();
+        for version in versions.into_iter().rev() {
+            let bin = version.join("bin");
+            if bin.is_dir() {
+                candidates.push(bin);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let current_lower = current.to_string_lossy().to_lowercase();
+    let mut prefix = std::ffi::OsString::new();
+    for bin in &candidates {
+        if !current_lower.contains(&bin.to_string_lossy().to_lowercase()) {
+            prefix.push(bin);
+            prefix.push(";");
+        }
+    }
+    if prefix.is_empty() {
+        return;
+    }
+    prefix.push(current);
+    std::env::set_var("PATH", prefix);
+}
+
+#[cfg(not(all(windows, feature = "cuda")))]
+fn ensure_cuda_runtime_on_path() {}
+
+// Optimus / Enduro hint variables, exported from the exe via build.rs. A laptop's
+// hybrid-graphics driver reads these at process start and routes the process to
+// the discrete NVIDIA / AMD GPU rather than the integrated Intel one. Without this
+// Windows assigns the process to the iGPU by default, so Task Manager shows the
+// Intel GPU "busy" even though CUDA compute runs (and can only run) on the NVIDIA
+// card — the source of the "it's on Intel" confusion.
+#[cfg(windows)]
+#[no_mangle]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(windows)]
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
+/// Tell Windows to run this executable on the high-performance (discrete NVIDIA)
+/// GPU — the same setting as Settings → System → Display → Graphics → set the app
+/// to "High performance". Writing it (HKCU, no admin needed) makes Windows and
+/// Task Manager attribute the app to the NVIDIA GPU instead of the integrated
+/// Intel one. Idempotent and best-effort; failures are ignored.
+#[cfg(windows)]
+fn pin_to_high_performance_gpu() {
+    use std::os::windows::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.to_string_lossy().to_string();
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\DirectX\UserGpuPreferences",
+            "/v",
+            &exe,
+            "/t",
+            "REG_SZ",
+            "/d",
+            "GpuPreference=2;",
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn pin_to_high_performance_gpu() {}
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -84,6 +255,101 @@ enum Command {
         /// ngram, 5 for draft).
         #[arg(long, env = "CAMELID_SPEC_DRAFT_TOKENS")]
         spec_draft_tokens: Option<usize>,
+        /// Do not open the web UI in a browser on startup. By default, when run
+        /// interactively, `serve` opens the chat surface automatically.
+        #[arg(long, env = "CAMELID_NO_OPEN", default_value_t = false)]
+        no_open: bool,
+        /// Opt into deterministic inference: pin the forward pass to the order-stable
+        /// CPU path (the whole Metal/GPU fast stack is forced off) so the supported
+        /// TinyLlama 1.1B Q8_0 lane is bit-exact and reduction-order-stable across runs.
+        /// Slower than the default GPU path; the default path is unchanged. Reduction
+        /// order follows the llama.cpp reference Q8_0 layout (see DECISIONS.md §D9).
+        #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
+        deterministic: bool,
+    },
+    /// Interactive terminal chat REPL over the local Camelid API.
+    ///
+    /// Attaches to (or spawns) a `camelid serve`, opens a supported-model picker,
+    /// and streams `/v1/chat/completions` live. Switch models in-session with
+    /// `/models`.
+    Chat {
+        /// Load this GGUF at startup (same semantics as `serve --model`). Omit to
+        /// open the supported-model picker.
+        #[arg(long, env = "CAMELID_MODEL")]
+        model: Option<PathBuf>,
+        /// Server to attach to, or spawn on if nothing is listening there.
+        #[arg(long, default_value = "127.0.0.1:8181", env = "CAMELID_ADDR")]
+        addr: SocketAddr,
+        /// Initial system prompt.
+        #[arg(long)]
+        system: Option<String>,
+        /// Maximum tokens to generate per turn.
+        #[arg(long, default_value_t = 512)]
+        max_tokens: u32,
+        /// Sampling temperature (0 = greedy/deterministic).
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// Nucleus sampling top-p (omit to leave unset).
+        #[arg(long)]
+        top_p: Option<f32>,
+        /// Top-k sampling (omit to leave unset).
+        #[arg(long)]
+        top_k: Option<u32>,
+        /// Sampling seed (omit for the engine default).
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Print the full response after completion instead of streaming.
+        #[arg(long, default_value_t = false)]
+        no_stream: bool,
+        /// Force the inline line REPL instead of the full-screen TUI.
+        #[arg(long, default_value_t = false)]
+        plain: bool,
+        /// Directory holding downloaded GGUFs (picker availability + pull target).
+        #[arg(long, env = "CAMELID_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+        /// Enter agent mode: a sandboxed tool-calling loop (requires a
+        /// tool-capable supported model and `--model`).
+        #[arg(long, default_value_t = false)]
+        agent: bool,
+        /// Sandbox root for agent file/shell tools (default: current directory).
+        #[arg(long)]
+        workdir: Option<PathBuf>,
+        /// Max agent steps (tool-call rounds) per goal.
+        #[arg(long, default_value_t = 25)]
+        max_steps: usize,
+        /// Agent: run write/exec/network tools WITHOUT prompting (sandbox still
+        /// enforced). Prints a warning; not recommended.
+        #[arg(long, default_value_t = false)]
+        auto_approve: bool,
+        /// Agent: offer the network tool (`http_fetch`). Off by default.
+        #[arg(long, default_value_t = false)]
+        allow_net: bool,
+        /// Agent: shell-command timeout in seconds.
+        #[arg(long, default_value_t = 30)]
+        shell_timeout: u64,
+    },
+    /// Tool-capability promotion harness: decide whether a model drives a clean
+    /// tool-call round-trip (PASS / FAIL / INCONCLUSIVE) and emit a receipt. A
+    /// contended box that can't load in time yields INCONCLUSIVE, never FAIL.
+    AgentEval {
+        /// GGUF to evaluate.
+        #[arg(long)]
+        model: PathBuf,
+        /// Server to attach to / spawn on.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load before reporting INCONCLUSIVE.
+        #[arg(long, default_value_t = 90)]
+        load_timeout: u64,
+        /// Max agent steps per case.
+        #[arg(long, default_value_t = 6)]
+        max_steps: usize,
+        /// Max tokens per model turn.
+        #[arg(long, default_value_t = 256)]
+        max_tokens: u32,
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-eval")]
+        receipt_dir: PathBuf,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -107,6 +373,7 @@ enum Command {
         threads: Option<usize>,
     },
     /// Benchmark raw TCP latency and bandwidth between Coordinator and Worker.
+    #[command(hide = true)]
     BenchNetwork {
         /// Mode to run: coordinator or worker
         #[arg(long, default_value = "coordinator")]
@@ -126,6 +393,37 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Layer offloading — Phase 1: print the planned VRAM/host layer split for a
+    /// model (no weights loaded, no compute). `--budget-mb` forces a small VRAM
+    /// budget to demonstrate partial offload; `--arch <name>` plans a known
+    /// architecture without its GGUF file.
+    PlanOffload {
+        /// GGUF model to plan (reads real per-layer tensor sizes).
+        model: Option<PathBuf>,
+        /// Known architecture to plan without a file (e.g. "llama-8b").
+        #[arg(long)]
+        arch: Option<String>,
+        /// Override detected free VRAM (MiB) to force a split.
+        #[arg(long)]
+        budget_mb: Option<u64>,
+        /// KV-cache context length to reserve (default 4096).
+        #[arg(long)]
+        context: Option<u64>,
+        /// Safety margin in MiB (default 256).
+        #[arg(long)]
+        safety_mb: Option<u64>,
+    },
+    /// Download a supported model (a known-good Q8_0 GGUF) into ./models.
+    ///
+    /// Run with no argument to list the catalog. Accepts a catalog id or a
+    /// fragment of the name, e.g. `camelid pull llama32_3b`.
+    Pull {
+        /// Catalog id or name fragment to download. Omit to list all models.
+        model: Option<String>,
+        /// Directory to download into (default: ./models).
+        #[arg(long, env = "CAMELID_MODELS_DIR")]
+        models_dir: Option<PathBuf>,
+    },
     /// Generate text with a Gemma 4 model (correctness-first runtime).
     Gemma4Generate {
         path: PathBuf,
@@ -188,6 +486,7 @@ enum Command {
         max_tokens: usize,
     },
     /// Dump focused tensor descriptor, raw block, and f32 dequantization diagnostics.
+    #[command(hide = true)]
     TensorDump {
         path: PathBuf,
         /// Tensor name to dump. Repeat to override the TinyLlama parity default set.
@@ -207,6 +506,7 @@ enum Command {
         layers: Vec<usize>,
     },
     /// Run a deterministic release-mode microbenchmark for dense matmul/FFN hot loops.
+    #[command(hide = true)]
     BenchDenseHotloops {
         /// LLaMA hidden width for the synthetic single-row input.
         #[arg(long, default_value_t = 2048)]
@@ -225,6 +525,7 @@ enum Command {
         threads: Option<usize>,
     },
     /// Load one GGUF Q8_0 tensor as retained blocks and benchmark bounded row dequantization/dot rows.
+    #[command(hide = true)]
     BenchQ8Blocks {
         /// GGUF model path.
         path: PathBuf,
@@ -313,6 +614,7 @@ enum Command {
     /// from a prompt, and emits one JSON metrics object per measured iteration
     /// (load/prefill/TTFT/decode timings, decode tok/s, peak RSS). For runtime
     /// comparison harnesses.
+    #[command(hide = true)]
     BenchGenerate {
         /// GGUF model path.
         model: PathBuf,
@@ -340,6 +642,12 @@ enum Command {
         /// Accepted for compatibility; JSON is always emitted to stdout.
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Opt into deterministic inference: pin generation to the order-stable CPU
+        /// forward pass (Metal/GPU fast stack forced off) so the supported TinyLlama
+        /// 1.1B Q8_0 lane is bit-exact across runs, thread counts, and processes.
+        /// Slower than the default GPU path; the default path is unchanged.
+        #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
+        deterministic: bool,
     },
     /// EXPERIMENTAL ghost (layer-streaming) mode: execute a model one transformer block at
     /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
@@ -406,6 +714,7 @@ enum Command {
     /// Recompute and stamp `receipt_id` on a receipt body. Emitters (e.g. the
     /// chat-parity harness) delegate sealing here so canonical serialization
     /// and digesting live in exactly one implementation.
+    #[command(hide = true)]
     SealReceipt {
         /// Receipt JSON to seal (the existing receipt_id value is ignored).
         #[arg(long, value_name = "PATH")]
@@ -422,9 +731,23 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    apply_default_fast_stack();
+    // Make the GPU runtime discoverable before anything probes for a device, so
+    // the shipped app needs no PATH setup (no-op off Windows / without CUDA).
+    ensure_cuda_runtime_on_path();
+    pin_to_high_performance_gpu();
 
-    match Cli::parse().command {
+    // No subcommand (a bare double-click of the exe) launches the open-and-use app.
+    let command = Cli::parse().command.unwrap_or_else(default_launch_command);
+    // Deterministic mode opts out of the GPU fast stack entirely; otherwise the CLI
+    // defaults to the measured-fastest Metal configuration. Branch before any env is set
+    // so the deterministic path never even arms the GPU defaults.
+    if command_requests_deterministic(&command) {
+        apply_deterministic_mode();
+    } else {
+        apply_default_fast_stack();
+    }
+
+    match command {
         Command::Serve {
             addr,
             model,
@@ -437,16 +760,24 @@ async fn main() -> anyhow::Result<()> {
             spec_decode,
             spec_draft_model,
             spec_draft_tokens,
+            no_open,
+            deterministic,
         } => {
             configure_rayon_threads(threads)?;
+            camelid::capability::HardwareProfile::detect().log();
+            // In deterministic mode the engine fails every Metal gate closed (see
+            // `apply_deterministic_mode`); don't also arm the Metal tuning env or the
+            // GPU fast-load nocopy default, which would only be contradictory no-ops.
             apply_runtime_tuning_env(
                 parallel_linear_min_outputs,
                 apple_accelerate_min_elements,
-                metal_linear,
-                metal_q8,
+                metal_linear && !deterministic,
+                metal_q8 && !deterministic,
             );
             apply_spec_decode_env(spec_decode, spec_draft_model, spec_draft_tokens);
-            apply_serve_nocopy_default();
+            if !deterministic {
+                apply_serve_nocopy_default();
+            }
             if log_acceleration {
                 log_acceleration_state();
             }
@@ -454,7 +785,72 @@ async fn main() -> anyhow::Result<()> {
             unsafe {
                 pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
             }
-            api::serve(addr, threads, model).await?
+            // Open-and-use launch: if no model was named, load the first GGUF we
+            // can find (beside the exe or in ./models) so the UI lands in a chat.
+            let model = model.or_else(auto_select_model);
+            // Open the browser only when run interactively and not opted out.
+            let open_ui = !no_open && std::io::IsTerminal::is_terminal(&std::io::stdout());
+            api::serve(addr, threads, model, open_ui).await?
+        }
+        Command::Chat {
+            model,
+            addr,
+            system,
+            max_tokens,
+            temperature,
+            top_p,
+            top_k,
+            seed,
+            no_stream,
+            plain,
+            models_dir,
+            agent,
+            workdir,
+            max_steps,
+            auto_approve,
+            allow_net,
+            shell_timeout,
+        } => {
+            let code = chat::run_chat(chat::ChatOptions {
+                model,
+                addr,
+                system,
+                max_tokens,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                no_stream,
+                plain,
+                models_dir: models_dir.unwrap_or_else(|| PathBuf::from("models")),
+                agent,
+                workdir,
+                max_steps,
+                auto_approve,
+                allow_net,
+                shell_timeout,
+            })?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Command::AgentEval {
+            model,
+            addr,
+            load_timeout,
+            max_steps,
+            max_tokens,
+            receipt_dir,
+        } => {
+            let code = chat::run_agent_eval(chat::AgentEvalOptions {
+                model,
+                addr,
+                load_timeout,
+                max_steps,
+                max_tokens,
+                receipt_dir,
+            })?;
+            std::process::exit(code);
         }
         Command::ServeDistributed {
             role,
@@ -496,7 +892,7 @@ async fn main() -> anyhow::Result<()> {
                 unsafe {
                     pthread_set_qos_class_self_np(0x09, 0); // QOS_CLASS_BACKGROUND (forces network I/O onto E-cores)
                 }
-                api::serve(addr, threads, Some(model)).await?
+                api::serve(addr, threads, Some(model), false).await?
             } else if role == "worker" {
                 let gguf = camelid::gguf::read_metadata(&model)?;
                 let config = camelid::model::LlamaModelConfig::from_gguf(&gguf)?;
@@ -553,6 +949,73 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::PlanOffload {
+            model,
+            arch,
+            budget_mb,
+            context,
+            safety_mb,
+        } => {
+            let profile = camelid::capability::HardwareProfile::detect();
+            profile.log();
+            let free_vram = match budget_mb {
+                Some(mb) => {
+                    println!("[offload] forced VRAM budget: {mb} MiB");
+                    mb * 1024 * 1024
+                }
+                None => {
+                    anyhow::ensure!(
+                        profile.cuda_available,
+                        "no CUDA device — offloading is a no-op; the CPU backend already \
+                         holds all weights in system RAM"
+                    );
+                    profile.cuda_vram_free_bytes
+                }
+            };
+            let context = context.unwrap_or(4096);
+            let safety_mb = safety_mb.unwrap_or(256);
+            let (config, plan) = if let Some(path) = model {
+                let gguf = read_metadata(&path)?;
+                let config = LlamaModelConfig::from_gguf(&gguf)?;
+                let plan = camelid::offload::OffloadPlan::from_gguf(
+                    &gguf, &config, free_vram, context, safety_mb,
+                );
+                (config, plan)
+            } else if let Some(arch) = arch {
+                let config = known_arch_config(&arch)?;
+                let plan = camelid::offload::OffloadPlan::from_dims(
+                    &config, free_vram, context, safety_mb,
+                );
+                (config, plan)
+            } else {
+                anyhow::bail!("provide a model path or --arch <name>");
+            };
+            let head_dim = config
+                .attention_key_length
+                .unwrap_or(config.embedding_length / config.attention_head_count.max(1));
+            println!(
+                "model: layers={} hidden={} ffn={} heads={} kv_heads={} head_dim={} vocab={:?} | KV reserved at context={}",
+                config.block_count,
+                config.embedding_length,
+                config.feed_forward_length,
+                config.attention_head_count,
+                config.attention_head_count_kv,
+                head_dim,
+                config.vocab_size,
+                context,
+            );
+            println!("{}", plan.describe());
+            let map: String = plan
+                .layer_resident
+                .iter()
+                .map(|&r| if r { 'V' } else { 'H' })
+                .collect();
+            println!("[offload] layer map (V=VRAM, H=host): {map}");
+        }
+        Command::Pull { model, models_dir } => {
+            let dir = models_dir.unwrap_or_else(|| PathBuf::from("models"));
+            camelid::catalog::run_pull(model.as_deref(), &dir)?;
         }
         Command::Gemma4Generate {
             path,
@@ -797,6 +1260,10 @@ async fn main() -> anyhow::Result<()> {
             warmup,
             threads,
             json: _,
+            // `apply_deterministic_mode` already set CAMELID_DETERMINISTIC + forced the
+            // Metal stack off before this match, so generation rides the CPU path; the
+            // engine reads the env directly.
+            deterministic: _,
         } => {
             run_bench_generate(
                 model,
@@ -1215,6 +1682,13 @@ struct BenchGenerateRecord {
     decode_ms: f64,
     tokens_per_second: f64,
     peak_memory_bytes: u64,
+    /// GPU layer-offload split for this run (Phase 4 honest labeling). `None` on the
+    /// CPU path; `source == "none"` means fully resident on the GPU. A non-zero
+    /// `layers_offloaded` means a tok/s number here is a capacity-mode result, not a
+    /// fully-resident one — the field carries the split + measured PCIe so it can't be
+    /// read as native.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offload: Option<camelid::offload::OffloadRunStatus>,
     output_text: String,
     output_token_ids: Vec<u32>,
 }
@@ -1260,13 +1734,67 @@ fn generate_run(
     // Decode the remaining tokens (pure decode throughput).
     // CAMELID_DECODE_TIME=1: split per-token wall into forward / sample / other.
     let time_decode = std::env::var_os("CAMELID_DECODE_TIME").is_some();
+    // Phase 0 instrumentation: per-stage decode time sinks (CPU path). Aggregates the
+    // already-collected per-layer timings across all decode steps. GPU resident decode
+    // runs as one fused call so these stay ~0 there; meaningful on the CPU forward.
+    let stage_timings = std::env::var_os("CAMELID_STAGE_TIMINGS").is_some();
+    let mut stage_us: std::collections::BTreeMap<&'static str, u128> =
+        std::collections::BTreeMap::new();
     let (mut fwd_us, mut sample_us, mut steps, mut wall_us) = (0u128, 0u128, 0u64, 0u128);
     let (mut emb_us, mut layers_us) = (0u128, 0u128);
     let greedy = matches!(sampler, LlamaSampler::Greedy)
         && std::env::var_os("CAMELID_NO_GPU_SAMPLE").is_none();
+    // CAMELID_SPEC_NGRAM=<max_draft>: greedy GPU speculative decoding (lossless).
+    let spec_draft = std::env::var("CAMELID_SPEC_NGRAM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    // Adaptive drafting: an EMA of how many drafts get accepted per round tunes the
+    // n-gram length. Start conservative (precise 4-gram, which rarely drafts on
+    // non-repetitive text so it isn't slowed) and only loosen to an aggressive
+    // 2-gram once repetition is proven by a high acceptance rate.
+    let mut spec_ema = 0.5f32;
     let decode_start = Instant::now();
     while !finished && generated.len() < max_tokens {
         let step_started = Instant::now();
+        // Greedy speculative decoding: one batched verify can emit several tokens.
+        // Falls through to the single-token path when no draft / engine not ready.
+        if greedy {
+            if let Some(nd) = spec_draft {
+                let ngram = if spec_ema >= 2.0 {
+                    2
+                } else if spec_ema >= 0.9 {
+                    3
+                } else {
+                    4
+                };
+                if let Some(toks) =
+                    session.generate_next_tokens_speculative(input[0], &history, nd, ngram)?
+                {
+                    // accepted drafts = tokens emitted minus the always-present bonus.
+                    let accepted = toks.len().saturating_sub(1) as f32;
+                    spec_ema = 0.7 * spec_ema + 0.3 * accepted;
+                    if time_decode {
+                        wall_us += step_started.elapsed().as_micros();
+                        steps += 1;
+                    }
+                    for t in toks {
+                        if generated.len() >= max_tokens {
+                            break;
+                        }
+                        generated.push(t);
+                        history.push(t);
+                        if tokenizer.special.eog.contains(&t) {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    input.clear();
+                    input.push(*generated.last().expect("at least one token"));
+                    continue;
+                }
+            }
+        }
         // Greedy decode rides the resident fast lane (GPU argmax + embedding gather,
         // next graph pre-released); anything else takes the general sampling path.
         let next = if greedy {
@@ -1294,25 +1822,52 @@ fn generate_run(
                         layers_us += step.timings.layers_total;
                         steps += 1;
                     }
+                    if stage_timings {
+                        accumulate_stage_timings(&mut stage_us, &step.timings);
+                    }
                     step.next_token_id
                 }
             }
         } else {
-            let step = session.generate_next_token_with_history_diagnostics(
-                &input,
-                sampler.clone(),
-                &history,
-                false,
-            )?;
-            if time_decode {
-                wall_us += step_started.elapsed().as_micros();
-                fwd_us += step.timings.total;
-                sample_us += step.sample;
-                emb_us += step.timings.embedding;
-                layers_us += step.timings.layers_total;
-                steps += 1;
+            // Temperature-only sampling rides the GPU Gumbel-max fast lane (no host
+            // logits copy, no CPU sort); top-k / top-p / penalties fall through to
+            // the CPU sampler.
+            let gpu_sampled = match &sampler {
+                LlamaSampler::Sampling(cfg) => {
+                    session.generate_next_token_sampled_resident(input[0], cfg)?
+                }
+                LlamaSampler::Greedy => None,
+            };
+            match gpu_sampled {
+                Some((id, forward_us)) => {
+                    if time_decode {
+                        wall_us += step_started.elapsed().as_micros();
+                        fwd_us += forward_us;
+                        steps += 1;
+                    }
+                    id
+                }
+                None => {
+                    let step = session.generate_next_token_with_history_diagnostics(
+                        &input,
+                        sampler.clone(),
+                        &history,
+                        false,
+                    )?;
+                    if time_decode {
+                        wall_us += step_started.elapsed().as_micros();
+                        fwd_us += step.timings.total;
+                        sample_us += step.sample;
+                        emb_us += step.timings.embedding;
+                        layers_us += step.timings.layers_total;
+                        steps += 1;
+                    }
+                    if stage_timings {
+                        accumulate_stage_timings(&mut stage_us, &step.timings);
+                    }
+                    step.next_token_id
+                }
             }
-            step.next_token_id
         };
         generated.push(next);
         history.push(next);
@@ -1321,6 +1876,20 @@ fn generate_run(
         input.push(next);
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    if stage_timings && !stage_us.is_empty() {
+        let total: u128 = stage_us.values().sum();
+        let mut ranked: Vec<(&&str, &u128)> = stage_us.iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(a.1));
+        eprintln!("[stage-timings] per-decode-step CPU breakdown (sum of all layers), total {:.2} ms/token over {} steps:", total as f64 / generated.len().max(1) as f64 / 1000.0, generated.len());
+        for (name, us) in ranked {
+            eprintln!(
+                "  {:>18}  {:6.2}%  {:8.3} ms/token",
+                name,
+                *us as f64 / total as f64 * 100.0,
+                *us as f64 / generated.len().max(1) as f64 / 1000.0,
+            );
+        }
+    }
     if time_decode && steps > 0 {
         eprintln!(
             "[decode-time] per token: step wall {:.2}ms | forward {:.2}ms (embed {:.3} layers {:.2}) | sample {:.2}ms | in-step other {:.2}ms | loop other {:.2}ms",
@@ -1342,6 +1911,75 @@ fn generate_run(
     })
 }
 
+/// Phase 0 instrumentation: fold one forward step's per-stage timings into a
+/// running per-stage accumulator, so a decode run can report where CPU time goes.
+fn accumulate_stage_timings(
+    acc: &mut std::collections::BTreeMap<&'static str, u128>,
+    t: &LlamaForwardTimings,
+) {
+    *acc.entry("embedding").or_default() += t.embedding;
+    *acc.entry("final_norm").or_default() += t.final_norm;
+    *acc.entry("logits(output_proj)").or_default() += t.logits;
+    for l in &t.layers {
+        *acc.entry("attn_norm").or_default() += l.attention_norm;
+        *acc.entry("attn_q_proj").or_default() += l.attention_q;
+        *acc.entry("attn_k_proj").or_default() += l.attention_k;
+        *acc.entry("attn_v_proj").or_default() += l.attention_v;
+        *acc.entry("attn_rope").or_default() += l.attention_rope;
+        *acc.entry("kv_write").or_default() += l.kv_cache_write;
+        *acc.entry("attn_context").or_default() += l.attention_context;
+        *acc.entry("attn_out_proj").or_default() += l.attention_output;
+        *acc.entry("attn_residual").or_default() += l.attention_residual;
+        *acc.entry("ffn_norm").or_default() += l.ffn_norm;
+        *acc.entry("ffn_gate").or_default() += l.ffn_gate;
+        *acc.entry("ffn_up").or_default() += l.ffn_up;
+        *acc.entry("ffn_activation").or_default() += l.ffn_activation;
+        *acc.entry("ffn_down").or_default() += l.ffn_down;
+        *acc.entry("ffn_residual").or_default() += l.ffn_residual;
+    }
+}
+
+/// A LlamaModelConfig for a known architecture, so `plan-offload --arch` can size
+/// a model whose GGUF isn't on disk. Only the fields the offload planner reads
+/// (dims, vocab, quant) are meaningful; the rest take neutral defaults.
+fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
+    // (block_count, hidden, ffn, heads, kv_heads, vocab, context)
+    let (
+        block_count,
+        embedding_length,
+        feed_forward_length,
+        heads,
+        kv_heads,
+        vocab,
+        context_length,
+    ) = match arch.to_lowercase().as_str() {
+        "llama-8b" | "llama3-8b" | "llama3.1-8b" | "8b" => (32, 4096, 14336, 32, 8, 128256, 131072),
+        other => anyhow::bail!("unknown --arch {other:?}; known: llama-8b"),
+    };
+    Ok(LlamaModelConfig {
+        context_length,
+        embedding_length,
+        block_count,
+        feed_forward_length,
+        attention_head_count: heads,
+        attention_head_count_kv: kv_heads,
+        rope_dimension_count: None,
+        rope_freq_base: None,
+        rope_scaling_type: None,
+        rope_scaling_factor: None,
+        rope_scaling_original_context_length: None,
+        rope_scaling_low_freq_factor: None,
+        rope_scaling_high_freq_factor: None,
+        rms_norm_epsilon: 1e-5,
+        vocab_size: Some(vocab),
+        file_type: Some(7), // Q8_0
+        attention_key_length: None,
+        rope_neox_pairing: false,
+        moe: None,
+        gemma4: None,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_bench_generate(
     model: PathBuf,
@@ -1356,6 +1994,7 @@ fn run_bench_generate(
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
     anyhow::ensure!(iterations >= 1, "--iterations must be at least 1");
     configure_rayon_threads(threads)?;
+    camelid::capability::HardwareProfile::detect().log();
 
     let prompt_text = match (&prompt_file, &prompt) {
         (Some(path), _) => std::fs::read_to_string(path)?,
@@ -1434,6 +2073,7 @@ fn run_bench_generate(
             decode_ms: run.decode_ms,
             tokens_per_second,
             peak_memory_bytes: peak_rss_bytes(),
+            offload: camelid::offload::offload_run_status(),
             output_text,
             output_token_ids: run.generated,
         };
@@ -1494,6 +2134,56 @@ fn apply_default_fast_stack() {
             std::env::set_var(key, "1");
         }
     }
+}
+
+/// True when the parsed subcommand opted into deterministic inference (`--deterministic`).
+/// Only `serve` and `bench-generate` expose the flag today (the supported single-node
+/// generate/serve path); every other subcommand keeps the default fast stack.
+fn command_requests_deterministic(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Serve {
+            deterministic: true,
+            ..
+        } | Command::BenchGenerate {
+            deterministic: true,
+            ..
+        }
+    )
+}
+
+/// Pin the process to the opt-in deterministic CPU forward pass. Sets
+/// `CAMELID_DETERMINISTIC=1` — which the engine reads (`inference::deterministic_mode_enabled`)
+/// to fail every Metal/GPU dispatch gate closed to its order-stable CPU equivalent — then
+/// forces the whole Metal fast stack off and disables GPU sampling so greedy decode also
+/// stays on the CPU path. The result is bit-exact, reduction-order-stable logits for the
+/// supported TinyLlama 1.1B Q8_0 lane. Only the CLI entry calls this; library defaults and
+/// the default (GPU) fast path are byte-for-byte unchanged. The pinned reduction order
+/// mirrors the llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated
+/// against (see DECISIONS.md §D9 and `qa/determinism/determinism-baseline-*.md`).
+fn apply_deterministic_mode() {
+    std::env::set_var("CAMELID_DETERMINISTIC", "1");
+    for key in [
+        "CAMELID_METAL_RESIDENT_DECODE",
+        "CAMELID_METAL_F32Y",
+        "CAMELID_METAL_WIRE",
+        "CAMELID_METAL_WIRE_NSG8",
+        "CAMELID_METAL_ATTN2",
+        "CAMELID_METAL_RESIDENT_PREFILL",
+        "CAMELID_METAL_MM",
+        "CAMELID_METAL_LINEAR",
+        "CAMELID_METAL_Q8",
+        "CAMELID_METAL_Q8_RETAINED",
+        "CAMELID_HYBRID_Q8_RETAINED",
+        "CAMELID_METAL_NOCOPY",
+    ] {
+        std::env::set_var(key, "0");
+    }
+    std::env::set_var("CAMELID_NO_GPU_SAMPLE", "1");
+    eprintln!(
+        "[deterministic] pinned to the order-stable CPU forward pass (Metal/GPU stack off). \
+         Reduction order follows the llama.cpp reference block-wise Q8_0 layout; see DECISIONS.md \u{a7}D9."
+    );
 }
 
 /// Default the single-node `serve` path to fast-load (CAMELID_METAL_NOCOPY): Q8_0
@@ -1595,7 +2285,9 @@ fn phys_footprint_bytes() -> u64 {
     peak_rss_bytes()
 }
 
-/// Peak resident set size of this process. macOS reports bytes; Linux kilobytes.
+/// Peak resident set size of this process in bytes. macOS `getrusage` reports
+/// bytes; other Unix reports kilobytes (scaled here).
+#[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
@@ -1611,6 +2303,25 @@ fn peak_rss_bytes() -> u64 {
     {
         max * 1024
     }
+}
+
+/// Peak resident set size of this process in bytes. Windows exposes the peak
+/// working set directly via `GetProcessMemoryInfo`.
+#[cfg(windows)]
+fn peak_rss_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: GetCurrentProcess returns a valid pseudo-handle; `counters` is
+    // sized via its `cb` field per the API contract.
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if ok == 0 {
+        return 0;
+    }
+    counters.PeakWorkingSetSize as u64
 }
 
 fn connect_with_retry(addr: SocketAddr) -> TcpStream {
@@ -2485,6 +3196,17 @@ fn log_acceleration_state() {
         metal_device = metal.device_name.as_deref().unwrap_or("none"),
         metal_note = metal.note.as_deref().unwrap_or(""),
         "camelid acceleration state"
+    );
+    // Probe CUDA at startup so the selected GPU (index, name, compute capability,
+    // VRAM) is logged at launch via cuda::init_backend, and surface availability
+    // here. A present CUDA device is always the discrete NVIDIA GPU — the Intel
+    // iGPU is not CUDA-capable and is never enumerated.
+    let cuda = camelid::cuda::detect_cuda_device();
+    tracing::info!(
+        cuda_available = cuda.available,
+        cuda_device = cuda.device_name.as_deref().unwrap_or("none"),
+        cuda_reason = cuda.reason.as_deref().unwrap_or(""),
+        "camelid cuda state"
     );
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react'
 import SidebarRail from './components/layout/SidebarRail'
 import TopBar from './components/TopBar'
 import { BackendBanner } from './components/layout/BackendBanner'
@@ -9,18 +9,27 @@ import { useDashboardData } from './hooks/useDashboardData'
 import { useBackendLauncher } from './hooks/useBackendLauncher'
 import { useNotice } from './hooks/useNotice'
 import { useTheme } from './hooks/useTheme'
+import { ensureInferenceTelemetryConnected } from './hooks/useInferenceTelemetry'
 import ChatWorkspace from './views/ChatWorkspace'
-import AnalyticsView from './views/AnalyticsView'
-import HistoryView from './views/HistoryView'
-import MemoryView from './views/MemoryView'
-import ModelsView from './views/ModelsView'
-import ApiView from './views/ApiView'
-import SystemView from './views/SystemView'
-import SettingsView from './views/SettingsView'
-import ClusterView from './views/ClusterView'
+import { CommandPalette } from './components/CommandPalette'
+import { ShortcutsOverlay } from './components/ShortcutsOverlay'
+
+/* Route-level code splitting (Phase 7): chat is the default surface and stays
+   eager; every other view loads on first visit. */
+const AnalyticsView = lazy(() => import('./views/AnalyticsView'))
+const HistoryView = lazy(() => import('./views/HistoryView'))
+const MemoryView = lazy(() => import('./views/MemoryView'))
+const ModelsView = lazy(() => import('./views/ModelsView'))
+const ApiView = lazy(() => import('./views/ApiView'))
+const SystemView = lazy(() => import('./views/SystemView'))
+const SettingsView = lazy(() => import('./views/SettingsView'))
+const ClusterView = lazy(() => import('./views/ClusterView'))
+const CompatibilityView = lazy(() => import('./views/CompatibilityView'))
+const TelemetryView = lazy(() => import('./views/TelemetryView'))
+const InferenceObservatoryView = lazy(() => import('./views/InferenceObservatoryView'))
 
 const DEMO_UI = import.meta.env?.VITE_CAMELID_DEMO_UI === 'true'
-const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster'])
+const HASH_TABS = new Set(['chat', 'library', 'api', 'analytics', 'history', 'memory', 'system', 'settings', 'cluster', 'observatory', 'compatibility', 'telemetry'])
 
 function App() {
   const { notice, noticeTone, showNotice, clearNotice } = useNotice()
@@ -36,6 +45,9 @@ function App() {
     () => typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches,
   )
   const [pendingDeleteConversationId, setPendingDeleteConversationId] = useState(null)
+  const [ledgerFocusRow, setLedgerFocusRow] = useState(null)
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  const [shortcutsOpen, setShortcutsOpen] = useState(false)
   const [deleteBusy, setDeleteBusy] = useState(false)
 
   useEffect(() => {
@@ -54,8 +66,8 @@ function App() {
     loadingModelId, registerForm, setRegisterForm, externalForm, setExternalForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, latestAssistantMessage, pendingConversation,
-    createConversation, showNewChatLanding, sendMessage, stopGeneration, saveToMemory,
-    createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation,
+    createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
+    createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
     installModel, installCatalogModel, cancelModelDownload, activateModel, unloadCurrentModel,
     registerModel, connectExternalModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
@@ -78,6 +90,44 @@ function App() {
   }, [])
 
   const closeMobileNav = () => setMobileNavOpen(false)
+
+  /* Observatory stream listens from app start (Phase 6.1 DEFECT 1): runs made
+     before the view's first mount must not be invisible. */
+  useEffect(() => {
+    if (apiBase) ensureInferenceTelemetryConnected(apiBase)
+  }, [apiBase])
+
+  /* Evidence Chips anywhere in the app deep-link to their ledger row through
+     this event — no prop drilling through every chip call site. */
+  useEffect(() => {
+    const onOpenLedger = (event) => {
+      setLedgerFocusRow(event.detail?.rowId || null)
+      setTab('compatibility')
+      if (typeof window !== 'undefined') window.history.replaceState(null, '', '#compatibility')
+    }
+    window.addEventListener('camelid:open-ledger', onOpenLedger)
+    return () => window.removeEventListener('camelid:open-ledger', onOpenLedger)
+  }, [setTab])
+
+  /* Global keys: Cmd/Ctrl+K command palette; "?" shortcut map outside inputs. */
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        setShortcutsOpen(false)
+        setPaletteOpen((value) => !value)
+        return
+      }
+      const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable
+      if (event.key === '?' && !typing && !event.metaKey && !event.ctrlKey) {
+        event.preventDefault()
+        setPaletteOpen(false)
+        setShortcutsOpen((value) => !value)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   const navigateTab = (next) => {
     setTab(next)
@@ -199,7 +249,8 @@ function App() {
           <BackendBanner backend={backend} onOpenSettings={() => navigateTab('settings')} />
         )}
 
-        <div className={`camelid-view ${(tab === 'chat' || tab === 'cluster') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+        <div className={`camelid-view ${(tab === 'chat' || tab === 'cluster' || tab === 'observatory') ? 'camelid-view--chat' : 'camelid-view--page'}`}>
+          <Suspense fallback={<div className="view-loading" role="status" aria-label="Loading view">Loading view…</div>}>
           {tab === 'chat' && (
             <ChatWorkspace
               selectedConversation={selectedConversation}
@@ -215,6 +266,7 @@ function App() {
               setComposer={setComposer}
               saveToMemory={saveToMemory}
               sendMessage={sendMessage}
+              resendFromMessage={resendFromMessage}
               stopGeneration={stopGeneration}
               sending={sending}
               receiptMode={receiptMode}
@@ -275,10 +327,22 @@ function App() {
               installModel={installModel}
               installCatalogModel={installCatalogModel}
               cancelModelDownload={cancelModelDownload}
+              apiBase={apiBase}
+              setTab={navigateTab}
             />
           )}
 
           {tab === 'api' && <ApiView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
+
+          {tab === 'telemetry' && <TelemetryView />}
+
+          {tab === 'compatibility' && (
+            <CompatibilityView
+              capabilities={dashboard?.capabilities}
+              focusRowId={ledgerFocusRow}
+              onFocusConsumed={() => setLedgerFocusRow(null)}
+            />
+          )}
 
           {tab === 'system' && <SystemView runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
 
@@ -292,14 +356,33 @@ function App() {
               themePreference={preference}
               setThemePreference={setPreference}
               onOpenCluster={() => navigateTab('cluster')}
+              conversationCount={conversations.length}
+              deleteAllConversations={deleteAllConversations}
+              selectedModel={selectedModel}
+              capabilities={dashboard?.capabilities}
             />
           )}
 
           {tab === 'cluster' && <ClusterView showNotice={showNotice} />}
+
+          {tab === 'observatory' && <InferenceObservatoryView apiBase={apiBase} runtime={runtime} selectedModel={selectedModel} capabilities={dashboard?.capabilities} />}
+          </Suspense>
         </div>
       </main>
 
-      <ConfirmDialog
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        setTab={navigateTab}
+        showNewChatLanding={startNewChat}
+        cyclePreference={cyclePreference}
+        models={models}
+        capabilities={dashboard?.capabilities?.model_compatibility || []}
+        setSelectedModelId={setSelectedModelId}
+      />
+      <ShortcutsOverlay open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
+            <ConfirmDialog
         open={Boolean(pendingDeleteConversation)}
         title={pendingDeleteTitle}
         detail={pendingDeleteDetail}

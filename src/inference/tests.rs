@@ -812,6 +812,8 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
             ffn_up: CpuTensor::from_f32("blk.0.ffn_up.weight", vec![2, 2], vec![1.0; 4]).unwrap(),
             ffn_down: CpuTensor::from_f32("blk.0.ffn_down.weight", vec![2, 2], vec![1.0; 4])
                 .unwrap(),
+            attention_q_norm: None,
+            attention_k_norm: None,
             moe_router: None,
         }],
     }
@@ -1085,6 +1087,8 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         rms_norm_epsilon: 1.0e-5,
         vocab_size: Some(2),
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -1113,6 +1117,8 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
             attention_k: dense_matrix("blk.0.attn_k.weight"),
             attention_v: dense_matrix("blk.0.attn_v.weight"),
             attention_output: dense_matrix("blk.0.attn_output.weight"),
+            attention_q_norm: None,
+            attention_k_norm: None,
             ffn_norm: dense_vector("blk.0.ffn_norm.weight"),
             ffn_gate: dense_matrix("blk.0.ffn_gate.weight"),
             ffn_up: dense_matrix("blk.0.ffn_up.weight"),
@@ -1834,6 +1840,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
             metal: false,
+            cuda: false,
             metal_retained: false,
             hybrid_retained: false,
             hybrid_gpu_rows: None,
@@ -2742,6 +2749,7 @@ fn q8_attention_consumer_plan(
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
             metal: false,
+            cuda: false,
             metal_retained: false,
             hybrid_retained: false,
             hybrid_gpu_rows: None,
@@ -3756,6 +3764,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
             metal: false,
+            cuda: false,
             metal_retained: false,
             hybrid_retained: false,
             hybrid_gpu_rows: None,
@@ -3806,6 +3815,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
             metal: false,
+            cuda: false,
             metal_retained: false,
             hybrid_retained: false,
             hybrid_gpu_rows: None,
@@ -3860,6 +3870,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
             metal: false,
+            cuda: false,
             metal_retained: false,
             hybrid_retained: false,
             hybrid_gpu_rows: None,
@@ -7415,6 +7426,8 @@ fn applies_rope_to_each_attention_head() {
         rms_norm_epsilon: 1e-6,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7452,6 +7465,8 @@ fn apply_rope_uses_configured_frequency_base() {
         rms_norm_epsilon: 1e-5,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7499,6 +7514,8 @@ fn apply_rope_uses_llama3_frequency_scaling_metadata() {
         rms_norm_epsilon: 1e-5,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7550,6 +7567,8 @@ fn apply_rope_uses_gguf_rope_frequency_factors() {
         rms_norm_epsilon: 1e-5,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7608,6 +7627,8 @@ fn rope_diagnostics_reconstruct_reported_rotation() {
         rms_norm_epsilon: 1e-6,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7671,6 +7692,8 @@ fn split_half_rope_pairing_is_available_for_diagnostics() {
         rms_norm_epsilon: 1e-6,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7746,6 +7769,8 @@ fn inverse_rope_direction_is_available_for_diagnostics() {
         rms_norm_epsilon: 1e-6,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -7820,6 +7845,8 @@ fn one_based_rope_position_mode_is_available_for_diagnostics() {
         rms_norm_epsilon: 1e-6,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9342,6 +9369,8 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
         rms_norm_epsilon: 0.0,
         vocab_size: Some(3),
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9416,6 +9445,8 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
                 vec![1.0, 0.0, 0.0, 1.0],
             )
             .unwrap(),
+            attention_q_norm: None,
+            attention_k_norm: None,
             moe_router: None,
         }],
         layer_range: None,
@@ -9603,6 +9634,8 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
         rms_norm_epsilon: 1.0e-5,
         vocab_size: Some(4),
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9670,6 +9703,8 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
                 vec![0.7, -0.2, 0.4, 0.3],
             )
             .unwrap(),
+            attention_q_norm: None,
+            attention_k_norm: None,
             moe_router: None,
         }],
         layer_range: None,
@@ -9795,6 +9830,8 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         rms_norm_epsilon: 1.0e-5,
         vocab_size: Some(4),
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -9840,6 +9877,8 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
             vec![1.0, 0.0, 0.0, 1.0],
         )
         .unwrap(),
+        attention_q_norm: None,
+        attention_k_norm: None,
         moe_router: None,
     };
     let hidden = CpuTensor::from_f32("hidden", vec![2, 2], vec![0.1, 0.2, 0.3, 0.4]).unwrap();
@@ -9890,6 +9929,8 @@ fn batch_attention_rejects_reads_beyond_allocated_kv_cache() {
         rms_norm_epsilon: 1.0e-5,
         vocab_size: Some(4),
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -10030,6 +10071,8 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
         rms_norm_epsilon: 1.0e-5,
         vocab_size: Some(4),
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };
@@ -10097,6 +10140,8 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
                 vec![0.7, -0.2, 0.4, 0.3],
             )
             .unwrap(),
+            attention_q_norm: None,
+            attention_k_norm: None,
             moe_router: None,
         }],
         layer_range: None,
@@ -10785,6 +10830,8 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
         rms_norm_epsilon: 1e-6,
         vocab_size: None,
         file_type: None,
+        rope_neox_pairing: false,
+        attention_key_length: None,
         moe: None,
         gemma4: None,
     };

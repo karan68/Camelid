@@ -12,10 +12,12 @@ use std::sync::OnceLock;
 
 use rayon::prelude::*;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
+use crate::telemetry;
 
 mod diagnostic_config;
 pub(crate) mod gemma4;
@@ -180,6 +182,13 @@ pub struct LlamaLayerWeights {
     pub attention_k: CpuTensor,
     pub attention_v: CpuTensor,
     pub attention_output: CpuTensor,
+    /// Per-head RMSNorm weight (`[head_dim]`, F32) applied to the Q projection
+    /// after reshape-to-heads and before RoPE. `Some` only for Qwen3-style rows
+    /// (QK-norm); `None` for plain Llama-family rows.
+    pub attention_q_norm: Option<CpuTensor>,
+    /// Per-head RMSNorm weight for the K projection; bound in lockstep with
+    /// [`Self::attention_q_norm`].
+    pub attention_k_norm: Option<CpuTensor>,
     pub ffn_norm: CpuTensor,
     pub ffn_gate: CpuTensor,
     pub ffn_up: CpuTensor,
@@ -474,12 +483,38 @@ impl LlamaLoadedWeights {
                         Some(store.load_cpu_f32(&router.name)?),
                     ),
                 };
+                // DEBUG ONLY: CAMELID_DEBUG_DISABLE_QK_NORM=1 skips loading the
+                // QK-norm weights so a Qwen3 forward runs as if it had none — used
+                // to bisect whether QK-norm is the source of a parity gap. Never
+                // set in production.
+                let debug_disable_qk_norm =
+                    std::env::var_os("CAMELID_DEBUG_DISABLE_QK_NORM").is_some();
+                let attention_q_norm = if debug_disable_qk_norm {
+                    None
+                } else {
+                    layer
+                        .attention_q_norm
+                        .as_ref()
+                        .map(|desc| store.load_cpu_f32(&desc.name))
+                        .transpose()?
+                };
+                let attention_k_norm = if debug_disable_qk_norm {
+                    None
+                } else {
+                    layer
+                        .attention_k_norm
+                        .as_ref()
+                        .map(|desc| store.load_cpu_f32(&desc.name))
+                        .transpose()?
+                };
                 layers.push(LlamaLayerWeights {
                     attention_norm: store.load_cpu_f32(&layer.attention_norm.name)?,
                     attention_q: load_linear(&layer.attention_q.name)?,
                     attention_k: load_linear(&layer.attention_k.name)?,
                     attention_v: load_linear(&layer.attention_v.name)?,
                     attention_output: load_linear(&layer.attention_output.name)?,
+                    attention_q_norm,
+                    attention_k_norm,
                     ffn_norm: store.load_cpu_f32(&layer.ffn_norm.name)?,
                     ffn_gate,
                     ffn_up,
@@ -501,6 +536,10 @@ impl LlamaLoadedWeights {
                         vec![0],
                         vec![],
                     )?,
+                    // Unowned pipeline layers carry empty placeholders; QK-norm is
+                    // applied by the owning node, so leave these None here.
+                    attention_q_norm: None,
+                    attention_k_norm: None,
                     ffn_norm: CpuTensor::from_f32(&layer.ffn_norm.name, vec![0], vec![])?,
                     ffn_gate: CpuTensor::from_f32(
                         match &layer.ffn {
@@ -604,7 +643,7 @@ impl LlamaLoadedWeights {
             require_matrix_shape(
                 &layer.attention_q,
                 dims.embedding_length,
-                dims.embedding_length,
+                dims.q_width,
                 &format!("layer {idx} attention q"),
             )?;
             require_matrix_shape(
@@ -621,7 +660,7 @@ impl LlamaLoadedWeights {
             )?;
             require_matrix_shape(
                 &layer.attention_output,
-                dims.embedding_length,
+                dims.q_width,
                 dims.embedding_length,
                 &format!("layer {idx} attention output"),
             )?;
@@ -1383,13 +1422,57 @@ pub struct LlamaInferenceSession {
     /// Lazily-built GPU resident-decode session (a transient on-GPU cache; rebuilt on demand
     /// and not part of the session's logical identity, so it is skipped by Clone/PartialEq/Debug).
     resident_decode: Option<metal::ResidentDecodeState>,
+    /// CUDA analog of `resident_decode` (the GPU-resident decode engine on
+    /// NVIDIA hardware). Same transient-cache role; skipped by Clone/PartialEq/Debug.
     /// When set, the session never takes the GPU-resident prefill/decode paths, keeping the
     /// CPU KV buffers authoritative. Speculative decoding requires this: KV rollback after a
     /// rejected draft only exists for CPU state.
     resident_paths_disabled: bool,
+    /// When set, the deterministic forward pass folds each layer's output hidden state and the
+    /// final logits into a streaming SHA-256 rollup (an execution-trace digest). Transient
+    /// proof-carrying state, not part of the session's logical identity — skipped by
+    /// Clone/PartialEq/Debug like `resident_decode`. Only enabled in deterministic mode
+    /// (`enable_execution_trace`); the default path never allocates it.
+    execution_trace: Option<ExecutionTraceHasher>,
+    /// Stable identity for the process-global GPU resident-decode engine cache. The
+    /// engine is keyed so the same model reuses its uploaded weights across requests;
+    /// without this the key would be the `weights` Arc pointer, which is not stable
+    /// across separately-loaded `Arc<LlamaLoadedWeights>` for the same model (e.g. a
+    /// prompt-prefix-cache-restored session vs a freshly loaded one). When two such
+    /// Arcs alternate, the single-slot engine cache thrashes — a multi-second 3.4 GB
+    /// re-upload on every request. The API sets this from the model id; when unset
+    /// (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
+    /// copied by Clone/take_for_step so restored sessions keep the same key.
+    resident_cache_key: Option<u64>,
+    /// True for a speculative draft-model session: routes its GPU resident engine to
+    /// the dedicated drafter cache so draft + target models stay resident at once.
+    is_drafter: bool,
 }
 
 impl LlamaInferenceSession {
+    /// Set the stable resident-engine cache key (see field docs). The API derives it
+    /// from the model id so every session for one model shares an engine.
+    pub fn set_resident_cache_key(&mut self, key: u64) {
+        self.resident_cache_key = Some(key);
+    }
+
+    /// Mark this session as the speculative draft model so its GPU resident engine
+    /// lives in the dedicated drafter cache (coexisting with the target's engine).
+    pub fn set_is_drafter(&mut self, is_drafter: bool) {
+        self.is_drafter = is_drafter;
+    }
+
+    /// The resident-engine cache this session's GPU decode uses: the drafter cache
+    /// for a draft-model session, the main cache otherwise.
+    #[cfg(feature = "cuda")]
+    fn resident_cache(&self) -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+        if self.is_drafter {
+            resident_cuda_drafter_cache()
+        } else {
+            resident_cuda_cache()
+        }
+    }
+
     /// Move the session out for a blocking generation step, leaving a hollow placeholder
     /// behind (same identity, empty KV, no resident state). Unlike `clone`, this PRESERVES
     /// the resident GPU session — the on-GPU KV cache and encode-ahead pipeline — which is
@@ -1412,6 +1495,9 @@ impl LlamaInferenceSession {
             ),
             resident_decode: self.resident_decode.take(),
             resident_paths_disabled: self.resident_paths_disabled,
+            execution_trace: self.execution_trace.take(),
+            resident_cache_key: self.resident_cache_key,
+            is_drafter: self.is_drafter,
         }
     }
 
@@ -1434,6 +1520,9 @@ impl Clone for LlamaInferenceSession {
             kv_cache: self.kv_cache.clone(),
             resident_decode: None,
             resident_paths_disabled: self.resident_paths_disabled,
+            execution_trace: None,
+            resident_cache_key: self.resident_cache_key,
+            is_drafter: self.is_drafter,
         }
     }
 }
@@ -1470,6 +1559,9 @@ impl LlamaInferenceSession {
             kv_cache: LlamaKvCache::new(plan)?,
             resident_decode: None,
             resident_paths_disabled: false,
+            execution_trace: None,
+            resident_cache_key: None,
+            is_drafter: false,
         })
     }
 
@@ -1493,6 +1585,39 @@ impl LlamaInferenceSession {
         self.resident_paths_disabled = disabled;
     }
 
+    /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
+    /// hidden state and the final logits into a streaming SHA-256 (see [`ExecutionTraceHasher`]).
+    /// Fails closed unless deterministic mode is active — the rollup is only meaningful on the
+    /// order-stable CPU lane (RECEIPTS.md rule 2), and arming it would otherwise advertise a
+    /// digest over a non-reproducible run. Returns whether the trace was armed.
+    pub fn enable_execution_trace(&mut self) -> bool {
+        if deterministic_mode_enabled() {
+            self.execution_trace
+                .get_or_insert_with(ExecutionTraceHasher::new);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the execution-trace rollup is currently armed.
+    pub fn execution_trace_armed(&self) -> bool {
+        self.execution_trace.is_some()
+    }
+
+    /// Checkpoints folded so far by the armed rollup (layers + logits across all tokens), if any.
+    pub fn execution_trace_fold_count(&self) -> Option<u64> {
+        self.execution_trace.as_ref().map(|h| h.fold_count())
+    }
+
+    /// Finalize and take the execution-trace rollup digest (lowercase-hex SHA-256), if armed.
+    /// Consumes the accumulated hasher; a subsequent generation must re-arm.
+    pub fn take_execution_trace_digest(&mut self) -> Option<String> {
+        self.execution_trace
+            .take()
+            .map(ExecutionTraceHasher::finalize_hex)
+    }
+
     /// Roll the sequence back to `position`, discarding newer KV entries.
     /// Requires CPU-authoritative KV state — the GPU-resident cache has no
     /// rollback, so any resident session is dropped and reseeds from CPU on
@@ -1507,6 +1632,28 @@ impl LlamaInferenceSession {
         }
         self.resident_decode = None;
         self.kv_cache.rollback_to_position(position)
+    }
+
+    /// Roll back a GPU-resident drafter session to `position`. Unlike
+    /// [`rollback_to_position`], this does NOT require CPU-authoritative KV: it
+    /// resets the resident CUDA engine's `filled` to `position` so the next decode
+    /// trusts the (still-valid) GPU KV up to `position` instead of reseeding from the
+    /// CPU history. The GPU KV is position-major, so entries past `position` are
+    /// overwritten on the next append. For a CPU drafter (no resident engine in the
+    /// cache) this is just the plain kv_cache rollback.
+    pub fn rollback_resident_to_position(&mut self, position: usize) -> Result<()> {
+        self.kv_cache.rollback_to_position(position)?;
+        #[cfg(feature = "cuda")]
+        {
+            if let Ok(mut guard) = self.resident_cache().lock() {
+                if let Some(slot) = guard.as_mut() {
+                    if slot.engine.filled() > position {
+                        slot.engine.set_filled(position);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether the GPU-resident decode forward may run for this model+config: flag on, dense
@@ -1528,12 +1675,15 @@ impl LlamaInferenceSession {
         if self.resident_paths_disabled {
             bail!("resident paths disabled for this session (CPU-authoritative KV required)");
         }
-        if !resident_decode_metal_enabled() {
-            bail!("CAMELID_METAL_RESIDENT_DECODE not enabled");
+        if !resident_decode_metal_enabled() && !resident_decode_cuda_enabled() {
+            bail!("neither CAMELID_METAL_RESIDENT_DECODE nor CAMELID_CUDA_RESIDENT_DECODE enabled");
         }
         if self.config.moe.is_some() {
             bail!("moe config");
         }
+        // QK-norm (Qwen3) is applied in the resident path (decode:
+        // encode_attention_block, prefill: prefill_tokens) via the per-head
+        // RMSNorm kernel, so it no longer disqualifies the resident path.
         if diagnostic_gqa_head_mapping()? != GqaHeadMapping::Grouped
             || diagnostic_attention_score_scale()? != AttentionScoreScale::HeadDim
             || diagnostic_ffn_gate_up_order()? != FfnGateUpOrder::GateUp
@@ -1631,6 +1781,13 @@ impl LlamaInferenceSession {
         if self.resident_paths_disabled {
             return Ok(false);
         }
+        // CUDA: run the whole prompt on the GPU resident engine (default on when a
+        // device is present), eliminating the CPU prefill / TTFT. The Metal seam
+        // below is unchanged.
+        #[cfg(feature = "cuda")]
+        if resident_decode_cuda_enabled() {
+            return self.try_resident_prefill_cuda(token_ids);
+        }
         if std::env::var("CAMELID_METAL_RESIDENT_PREFILL")
             .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
             .unwrap_or(true)
@@ -1703,6 +1860,8 @@ impl LlamaInferenceSession {
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
                 ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -1735,6 +1894,184 @@ impl LlamaInferenceSession {
         self.kv_cache.position = n;
         self.resident_decode = Some(session);
         Ok(true)
+    }
+
+    /// CUDA GPU prefill: run the whole prompt through the resident engine on the
+    /// NVIDIA device (one forward per token, KV built incrementally, a single sync
+    /// at the end), then leave the global engine ready at `position = n` so the
+    /// last prompt token decodes straight into the first generated token. Replaces
+    /// the CPU prefill — the main time-to-first-token cost. Returns `false` to fall
+    /// back to the CPU prefill for any unsupported config.
+    #[cfg(feature = "cuda")]
+    fn try_resident_prefill_cuda(&mut self, token_ids: &[u32]) -> Result<bool> {
+        // Explicit escape hatch: `CAMELID_CUDA_RESIDENT_PREFILL=0` keeps prefill on
+        // the CPU while still allowing GPU-resident decode (debugging / isolation).
+        if std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL")
+            .map(|v| {
+                let v = v.to_string_lossy();
+                let v = v.trim();
+                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false)
+        {
+            return Ok(false);
+        }
+        if self.resident_paths_disabled
+            || token_ids.len() < 2
+            || token_ids.len() > 16384
+            || self.kv_cache.position != 0
+            || self.weights.layer_range.is_some()
+            || !self.resident_decode_eligible(false)?
+        {
+            return Ok(false);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_layers = dims.block_count;
+        let n_heads = self.config.attention_head_count as usize;
+        let n_kv = dims.attention_head_count_kv;
+        let head_dim = dims.head_dim;
+        let hidden = dims.embedding_length;
+        let ffn_dim = dims.feed_forward_length;
+        let vocab = dims.vocab_size;
+        let n = token_ids.len();
+        let kv_cap = (self.config.context_length as usize)
+            .min(self.kv_cache.plan.max_sequence_length)
+            .min(resident_cuda_max_context());
+        if n >= kv_cap {
+            return Ok(false);
+        }
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let rope_dim = self
+            .config
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let tables = match rope::resident_prefill_rope_tables(
+            n,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(t) => t,
+            None => return Ok(false),
+        };
+        // The CUDA RoPE kernel implements adjacent-even-odd pairing only.
+        if tables.split_half_pairing {
+            return Ok(false);
+        }
+        let embeddings = weights
+            .token_embedding
+            .embedding_lookup(token_ids, "token_embedding_resident_prefill_cuda")?;
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        let started = std::time::Instant::now();
+
+        // Prefer the stable model-identity key (set by the API) so the resident engine
+        // is reused across requests; fall back to the weights Arc pointer when unset.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
+        let cache = self.resident_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let need_build = guard
+            .as_ref()
+            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+        if need_build {
+            match build_resident_cuda_engine(
+                &weights,
+                0..n_layers,
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn_dim,
+                rope_dim,
+                kv_cap,
+                vocab,
+                rms_eps,
+            ) {
+                Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
+                None => return Ok(false),
+            }
+        }
+        let slot = guard.as_mut().expect("resident CUDA engine built above");
+        // The engine's VRAM-sized capacity is authoritative; a prompt longer than it
+        // fits prefills on the CPU instead of overrunning the resident KV.
+        if n > slot.engine.max_pos() {
+            return Ok(false);
+        }
+        if slot
+            .engine
+            .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+            .is_err()
+        {
+            // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
+            // decode path rebuilds/reseeds rather than trusting it.
+            slot.engine.set_filled(0);
+            return Ok(false);
+        }
+        slot.engine.set_filled(n);
+        // The GPU prefill only fills the GPU KV cache. Copy it back so the CPU-side
+        // KV cache is authoritative too: otherwise any later forward that takes the
+        // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
+        // an all-zero history and generation degenerates. The copy is a few MB of
+        // device->host transfer — negligible next to the prefill compute it follows,
+        // and it keeps both backends in lockstep.
+        if let Err(e) =
+            self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
+        {
+            if trace {
+                eprintln!("[resident-cuda] KV readback to host failed ({e}); using CPU prefill");
+            }
+            slot.engine.set_filled(0);
+            return Ok(false);
+        }
+        drop(guard);
+        self.kv_cache.position = n;
+        if trace {
+            eprintln!(
+                "[resident-cuda] GPU prefill {n} tokens in {} ms",
+                started.elapsed().as_millis()
+            );
+        }
+        Ok(true)
+    }
+
+    /// Mirror the GPU-resident prefill KV into the CPU KV cache so both backends hold
+    /// the same history. Reads each layer's K/V back from the device (in
+    /// `[head][position][head_dim]` order) and writes it at the CPU cache's
+    /// position-major offsets. Called only right after a successful GPU prefill.
+    #[cfg(feature = "cuda")]
+    fn copy_resident_cuda_kv_to_host(
+        &mut self,
+        engine: &crate::cuda_resident::CudaResidentDecode,
+        n_layers: usize,
+        n: usize,
+        n_kv: usize,
+        head_dim: usize,
+    ) -> Result<()> {
+        self.kv_cache.ensure_position_capacity(n)?;
+        for layer in 0..n_layers {
+            let (k, v) = engine
+                .read_kv_layer(layer, n)
+                .map_err(BackendError::RuntimeShapeMismatch)?;
+            for p in 0..n {
+                for h in 0..n_kv {
+                    let src = (h * n + p) * head_dim;
+                    let dst = self.kv_cache.offset(layer, p, h);
+                    self.kv_cache.keys[dst..dst + head_dim]
+                        .copy_from_slice(&k[src..src + head_dim]);
+                    self.kv_cache.values[dst..dst + head_dim]
+                        .copy_from_slice(&v[src..src + head_dim]);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run the whole token forward on the GPU resident-decode session. Returns Some(hidden) on
@@ -1783,7 +2120,525 @@ impl LlamaInferenceSession {
         }
     }
 
+    /// Temperature-sampling analog of the greedy resident fast lane: when the
+    /// sampler is plain temperature (no top-k / top-p / penalties / logit-bias),
+    /// draw the next token on the GPU via Gumbel-max — no 128K-logit host copy and
+    /// no CPU sort, which the profiler showed cost ~7 ms/token (more than the whole
+    /// forward). Returns `Ok(None)` when the config isn't GPU-eligible or CUDA
+    /// resident decode is off, so the caller uses the CPU logits path unchanged.
+    pub fn generate_next_token_sampled_resident(
+        &mut self,
+        token_id: u32,
+        config: &SamplingConfig,
+    ) -> Result<Option<(u32, u128)>> {
+        if !resident_decode_cuda_enabled()
+            || config.temperature <= 0.0
+            || config.top_k.is_some()
+            || config.top_p.is_some_and(|p| p < 1.0)
+            || config.presence_penalty != 0.0
+            || config.frequency_penalty != 0.0
+            || !config.logit_bias.is_empty()
+        {
+            return Ok(None);
+        }
+        if !self.kv_cache.can_append() {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV cache is full at context length {}",
+                self.kv_cache.plan.max_sequence_length
+            )));
+        }
+        let started = Instant::now();
+        let embedding = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&[token_id], "token_embedding")?;
+        let inv_temp = 1.0 / config.temperature;
+        // Per-token seed so the Gumbel draw differs each step (the CPU sampler's
+        // fixed seed=0 draw is replaced; temperature sampling is random regardless).
+        let base = config.seed.unwrap_or(0);
+        let seed = base ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(self.kv_cache.position as u64 + 1);
+        match self.try_resident_decode_forward_cuda(
+            &embedding,
+            true,
+            None,
+            Some((inv_temp, seed)),
+        )? {
+            Some(ResidentForward::Sampled(id)) => {
+                self.kv_cache.position += 1;
+                Ok(Some((id, started.elapsed().as_micros())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// One round of greedy speculative decoding on the GPU. An n-gram drafter
+    /// proposes up to `max_draft` tokens from `history`; the model verifies them in
+    /// ONE batched forward (`verify_batch`), and the longest correct prefix plus
+    /// one bonus token are accepted. Output is exactly what greedy decode would
+    /// have produced (the model's argmax verifies every token) — lossless — but a
+    /// single memory-bound forward can emit several tokens. Returns the accepted
+    /// tokens (1..=max_draft+1) and advances the KV position, or `Ok(None)` when no
+    /// draft is available or the GPU engine isn't ready (caller does a normal step).
+    #[cfg(feature = "cuda")]
+    pub fn generate_next_tokens_speculative(
+        &mut self,
+        last_token: u32,
+        history: &[u32],
+        max_draft: usize,
+        ngram: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
+            return Ok(None);
+        }
+        let max_draft = max_draft.min(crate::cuda_resident::MAX_VERIFY_K - 1);
+        // The caller adapts `ngram`: a longer match is higher precision (fewer wasted
+        // verifies on non-repetitive text), a shorter one catches more repeats.
+        let drafts = draft_ngram(history, max_draft, ngram);
+        self.verify_drafts_gpu(last_token, &drafts)
+    }
+
+    /// Verify a batch of draft tokens against the target's resident GPU engine in one
+    /// pass and return the accepted prefix (longest run the model confirms, plus the
+    /// bonus token at the first mismatch). Draft-source-agnostic: works for n-gram or
+    /// model-drafted tokens. Returns `Ok(None)` (caller takes a normal single step)
+    /// unless the engine already holds this model with KV materialized exactly to the
+    /// current position. Lossless: `accepted` is exactly what greedy decode would emit.
+    #[cfg(feature = "cuda")]
+    pub fn verify_drafts_gpu(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled || drafts.is_empty() {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        let k = drafts.len() + 1;
+        if k > crate::cuda_resident::MAX_VERIFY_K
+            || position + k > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(None);
+        }
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // Inputs: [last_token, drafts...] at positions [position, position+k).
+        let mut inputs = Vec::with_capacity(k);
+        inputs.push(last_token);
+        inputs.extend_from_slice(drafts);
+        let embeddings = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&inputs, "token_embedding_spec_verify")?;
+        let mut cos_all = Vec::with_capacity(k * head_dim);
+        let mut sin_all = Vec::with_capacity(k * head_dim);
+        for i in 0..k {
+            match rope::resident_decode_rope_tables(
+                position + i,
+                head_dim,
+                &self.config,
+                self.weights.rope_freqs.as_ref(),
+            )? {
+                Some(t) if !t.split_half_pairing => {
+                    cos_all.extend_from_slice(&t.cos);
+                    sin_all.extend_from_slice(&t.sin);
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Same key the build/decode wrappers use (stable model identity when set,
+        // else the weights Arc pointer) — otherwise the readiness check never matches.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        let cache = self.resident_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only run when the engine already holds this model with the KV materialized
+        // exactly up to `position` (mid-decode). Otherwise let the caller take a normal
+        // step, which builds/seeds the engine.
+        let ready = guard.as_ref().is_some_and(|slot| {
+            slot.key == key && slot.engine.weights_ready() && slot.engine.filled() == position
+        });
+        if !ready {
+            return Ok(None);
+        }
+        let slot = guard.as_mut().expect("ready checked above");
+        let predicted =
+            match slot
+                .engine
+                .verify_batch(&embeddings.data, &cos_all, &sin_all, position, k, scale)
+            {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+
+        // Accept the longest prefix of drafts that the model confirms, plus the
+        // bonus token at the first mismatch (predicted[0] is always taken).
+        let mut accepted = vec![predicted[0]];
+        let mut j = 0usize;
+        while j < drafts.len() && drafts[j] == predicted[j] {
+            accepted.push(predicted[j + 1]);
+            j += 1;
+        }
+        let new_position = position + accepted.len();
+        slot.engine.set_filled(new_position);
+        drop(guard);
+        self.kv_cache.position = new_position;
+        Ok(Some(accepted))
+    }
+
+    /// Non-CUDA build: the GPU resident speculative-verify path is unavailable,
+    /// so return `Ok(None)` and let the caller fall back to the CPU chunk verify.
+    /// Lossless either way (the target verify is authoritative).
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_variables)]
+    pub fn verify_drafts_gpu(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_variables)]
+    pub fn generate_next_tokens_speculative(
+        &mut self,
+        last_token: u32,
+        history: &[u32],
+        max_draft: usize,
+        ngram: usize,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Dispatch the resident-decode fast lane to the active GPU backend: CUDA when
+    /// `CAMELID_CUDA_RESIDENT_DECODE` is enabled (and the feature is built), otherwise the
+    /// Metal seam. Either backend returns `Ok(None)` to fall back to the CPU layer loop.
     fn try_resident_decode_forward(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample_token: Option<u32>,
+    ) -> Result<Option<ResidentForward>> {
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            use std::sync::Once;
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[resident-dispatch] cuda_enabled={} metal_enabled={}",
+                    resident_decode_cuda_enabled(),
+                    resident_decode_metal_enabled(),
+                );
+            });
+        }
+        if resident_decode_cuda_enabled() {
+            return self.try_resident_decode_forward_cuda(
+                embedding,
+                compute_logits,
+                gpu_sample_token,
+                None,
+            );
+        }
+        self.try_resident_decode_forward_metal(embedding, compute_logits, gpu_sample_token)
+    }
+
+    /// CUDA GPU-resident decode: full forward on the NVIDIA device with weights + KV cache
+    /// resident and exactly one host sync per token. Token-identical to the CPU reference
+    /// (validated per-kernel + full-forward in `cuda_resident::tests`). Returns `Ok(None)`
+    /// for any unsupported config so the caller falls back to the CPU path.
+    #[cfg(feature = "cuda")]
+    fn try_resident_decode_forward_cuda(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample_token: Option<u32>,
+        sample: Option<(f32, u64)>,
+    ) -> Result<Option<ResidentForward>> {
+        if !self.resident_decode_eligible(compute_logits)? {
+            return Ok(None);
+        }
+        // The CUDA engine runs the whole forward on the GPU and produces logits;
+        // it serves both greedy decode (GPU argmax -> sampled token) and sampling
+        // (returns the full logits row for the CPU temperature/top-p/top-k
+        // sampler). Only the hidden-state-threading variant (compute_logits =
+        // false) stays on the CPU path.
+        if !compute_logits {
+            return Ok(None);
+        }
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let n_heads = self.config.attention_head_count as usize;
+        let n_kv = dims.attention_head_count_kv;
+        let head_dim = dims.head_dim;
+        let hidden = dims.embedding_length;
+        let ffn_dim = dims.feed_forward_length;
+        let range = weights.layer_range.clone().unwrap_or(0..dims.block_count);
+        let n_layers = range.len();
+        let vocab = dims.vocab_size;
+        // The GPU KV cache is allocated once at `kv_cap` positions. Sizing it to a
+        // model's full trained context (e.g. Llama 3.2's 131072) would allocate
+        // many GB of VRAM up front; on a card without the room the driver
+        // oversubscribes into shared host memory and every attention read crosses
+        // PCIe, collapsing throughput. Cap it to a practical chat context that fits
+        // comfortably; beyond it the per-token guard below falls back to the CPU.
+        let kv_cap = (self.config.context_length as usize)
+            .min(self.kv_cache.plan.max_sequence_length)
+            .min(resident_cuda_max_context());
+        let position = self.kv_cache.position;
+        if position >= kv_cap
+            || embedding.data.len() != hidden
+            || weights.layers.len() != dims.block_count
+            || range.end > weights.layers.len()
+        {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!(
+                    "[resident-cuda] dim guard: pos={position} kv_cap={kv_cap} emb={} hidden={hidden} layers={} blocks={}",
+                    embedding.data.len(),
+                    weights.layers.len(),
+                    dims.block_count
+                );
+            }
+            return Ok(None);
+        }
+        let rms_eps = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
+        let tables = match rope::resident_decode_rope_tables(
+            position,
+            head_dim,
+            &self.config,
+            weights.rope_freqs.as_ref(),
+        )? {
+            Some(t) => t,
+            None => {
+                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    eprintln!("[resident-cuda] rope tables None");
+                }
+                return Ok(None);
+            }
+        };
+        // The CUDA RoPE kernel implements adjacent-even-odd pairing (Llama). Split-half
+        // (Qwen3) is not yet ported, so fall back rather than mis-rotate.
+        if tables.split_half_pairing {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[resident-cuda] split_half_pairing (Qwen3) unsupported");
+            }
+            return Ok(None);
+        }
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+        let rope_dim = self
+            .config
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        // The resident engine (compiled kernels + uploaded weights + GPU KV cache)
+        // lives in a process-global cache, not the session: the API server clones a
+        // fresh session per request and Clone cannot duplicate GPU buffers, so a
+        // per-session engine rebuilt (recompiled kernels + re-uploaded ~GBs of
+        // weights) on every request. Keyed by the model's weight identity, the
+        // global engine is built once and reused across every request and chat
+        // turn; the lock is held only for this one token's forward. Steady-state
+        // decode was already fast (~54 tok/s); this removes the ~0.5s cold rebuild
+        // that made short replies feel slow.
+        // Prefer the stable model-identity key (set by the API) so the resident engine
+        // is reused across requests; fall back to the weights Arc pointer when unset.
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&weights) as *const () as usize);
+        let cache = self.resident_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let need_build = guard
+            .as_ref()
+            .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
+        if trace && need_build {
+            match guard.as_ref() {
+                None => eprintln!("[resident-cuda] need_build: cache EMPTY (key={key:#x})"),
+                Some(slot) => eprintln!(
+                    "[resident-cuda] need_build: cached_key={:#x} req_key={key:#x} key_match={} ready={}",
+                    slot.key,
+                    slot.key == key,
+                    slot.engine.weights_ready()
+                ),
+            }
+        }
+        let build_started = std::time::Instant::now();
+        if need_build {
+            match build_resident_cuda_engine(
+                &weights,
+                range.clone(),
+                n_layers,
+                n_heads,
+                n_kv,
+                head_dim,
+                hidden,
+                ffn_dim,
+                rope_dim,
+                kv_cap,
+                vocab,
+                rms_eps,
+            ) {
+                Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
+                None => {
+                    if trace {
+                        eprintln!("[resident-cuda] engine build failed (unsupported weights?)");
+                    }
+                    return Ok(None);
+                }
+            }
+            if trace {
+                eprintln!(
+                    "[resident-cuda] built engine (weights uploaded) in {} ms",
+                    build_started.elapsed().as_millis()
+                );
+            }
+        }
+
+        let slot = guard.as_mut().expect("resident CUDA engine built above");
+
+        // The engine's VRAM-sized capacity is authoritative: a position at or beyond
+        // it (this token would write KV slot `position`) decodes on the CPU instead of
+        // overrunning the resident KV cache. This is the cap guard, since the engine
+        // may have been built with fewer positions than the request asked for.
+        if position >= slot.engine.max_pos() {
+            if trace {
+                eprintln!(
+                    "[resident-cuda] position {position} >= resident cap {}; CPU fallback",
+                    slot.engine.max_pos()
+                );
+            }
+            return Ok(None);
+        }
+
+        // (Re)seed the GPU KV cache from the CPU history [0, position) when
+        // starting or resuming a sequence at a position the engine has not
+        // materialized (a fresh build, or a new turn after CPU prefill). During
+        // steady decode `filled == position`, so this is skipped.
+        let need_seed = slot.engine.filled() != position;
+        let seed_started = std::time::Instant::now();
+        if need_seed {
+            if position > 0 {
+                let kv_dim = n_kv * head_dim;
+                for layer in 0..n_layers {
+                    let mut ck = vec![0.0f32; kv_dim * position];
+                    let mut cv = vec![0.0f32; kv_dim * position];
+                    for p in 0..position {
+                        for h in 0..n_kv {
+                            let src = self.kv_cache.offset(range.start + layer, p, h);
+                            let dst = (h * position + p) * head_dim;
+                            ck[dst..dst + head_dim]
+                                .copy_from_slice(&self.kv_cache.keys[src..src + head_dim]);
+                            cv[dst..dst + head_dim]
+                                .copy_from_slice(&self.kv_cache.values[src..src + head_dim]);
+                        }
+                    }
+                    if slot.engine.seed_layer(layer, &ck, &cv, position).is_err() {
+                        return Ok(None);
+                    }
+                }
+            }
+            slot.engine.set_filled(position);
+            if trace {
+                eprintln!(
+                    "[resident-cuda] seeded KV at position {position} in {} ms",
+                    seed_started.elapsed().as_millis()
+                );
+            }
+        }
+
+        // Three GPU tails, all keeping the whole layer stack on the device:
+        // `sample` (temperature sampling) draws the token on the GPU via Gumbel-max;
+        // `gpu_sample_token` set means greedy (GPU argmax); otherwise the full logits
+        // row goes back for the CPU sampler (top-k / top-p / penalties).
+        let forward = if let Some((inv_temp, seed)) = sample {
+            match slot.engine.forward_token_sample(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+                inv_temp,
+                seed,
+            ) {
+                Ok(id) => ResidentForward::Sampled(id),
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token_sample err at {position}: {e}");
+                    }
+                    return Ok(None);
+                }
+            }
+        } else if gpu_sample_token.is_some() {
+            match slot.engine.forward_token(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+                true,
+            ) {
+                Ok(Some(id)) => ResidentForward::Sampled(id),
+                Ok(None) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token None at {position} (fallback)");
+                    }
+                    return Ok(None);
+                }
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token err at {position}: {e}");
+                    }
+                    return Ok(None);
+                }
+            }
+        } else {
+            match slot.engine.forward_token_logits(
+                &embedding.data,
+                &tables.cos,
+                &tables.sin,
+                position,
+                scale,
+            ) {
+                Ok(logits) => ResidentForward::Logits(CpuTensor::from_f32(
+                    "resident_logits",
+                    vec![1, vocab],
+                    logits,
+                )?),
+                Err(e) => {
+                    if trace {
+                        eprintln!("[resident-cuda] forward_token_logits err at {position}: {e}");
+                    }
+                    return Ok(None);
+                }
+            }
+        };
+        slot.engine.set_filled(position + 1);
+        Ok(Some(forward))
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_variables)]
+    fn try_resident_decode_forward_cuda(
+        &mut self,
+        embedding: &CpuTensor,
+        compute_logits: bool,
+        gpu_sample_token: Option<u32>,
+        sample: Option<(f32, u64)>,
+    ) -> Result<Option<ResidentForward>> {
+        Ok(None)
+    }
+
+    fn try_resident_decode_forward_metal(
         &mut self,
         embedding: &CpuTensor,
         compute_logits: bool,
@@ -1881,6 +2736,8 @@ impl LlamaInferenceSession {
             .map(|l| metal::ResidentLayerWeights {
                 attn_norm: &l.attention_norm.data,
                 ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 q_weight_blocks: resident_weight_bytes(&l.attention_q),
                 k_weight_blocks: resident_weight_bytes(&l.attention_k),
                 v_weight_blocks: resident_weight_bytes(&l.attention_v),
@@ -2492,6 +3349,11 @@ impl LlamaInferenceSession {
             if next_hidden.len() != hidden.data.len() {
                 next_hidden.resize(hidden.data.len(), 0.0);
             }
+            telemetry::emit(telemetry::Event::LayerStarted {
+                layer: layer_idx,
+                layers_total: self.weights.layers.len(),
+            });
+            let layer_telemetry_started = Instant::now();
             let mut layer_timings = LlamaLayerTimings {
                 layer_index: layer_idx,
                 ..LlamaLayerTimings::default()
@@ -2572,6 +3434,11 @@ impl LlamaInferenceSession {
             hidden.q8_0_packed_rows4_4x8 = None;
             hidden.q8_0_runtime_storage = None;
             hidden.q8_0_file_backing = None;
+            telemetry::emit(telemetry::Event::LayerCompleted {
+                layer: layer_idx,
+                layers_total: self.weights.layers.len(),
+                duration_us: layer_telemetry_started.elapsed().as_micros() as u64,
+            });
             trace_forward_memory(&format!("prefill_layer_major_layer_{layer_idx}_done"));
         }
         timings.layers_total = layers_started.elapsed().as_micros();
@@ -2602,6 +3469,13 @@ impl LlamaInferenceSession {
                 self.kv_cache.plan.max_sequence_length
             )));
         }
+
+        // Take the execution-trace rollup out for the duration of this forward so the per-layer
+        // fold is a plain local (no borrow conflict with the `self.weights.layers` loop). It is
+        // restored on the success path; an error path drops it (the generation failed anyway).
+        // Only ever Some in deterministic mode (see `enable_execution_trace`); on the default
+        // path this is None and adds nothing.
+        let mut execution_trace = self.execution_trace.take();
 
         let runtime_plan = ResolvedRuntimePlan::from_env()?;
         let total_started = Instant::now();
@@ -2681,6 +3555,10 @@ impl LlamaInferenceSession {
                     }
                 }
                 trace_forward_memory(&format!("layer_{layer_idx}_start"));
+                telemetry::emit(telemetry::Event::LayerStarted {
+                    layer: layer_idx,
+                    layers_total: self.weights.layers.len(),
+                });
                 let timed = forward_layer_timed(
                     &hidden,
                     layer,
@@ -2695,6 +3573,14 @@ impl LlamaInferenceSession {
                     &mut self.kv_cache,
                 )?;
                 hidden = timed.output;
+                if let Some(trace) = execution_trace.as_mut() {
+                    trace.fold_layer_hidden(layer_idx, &hidden.data);
+                }
+                telemetry::emit(telemetry::Event::LayerCompleted {
+                    layer: layer_idx,
+                    layers_total: self.weights.layers.len(),
+                    duration_us: timed.timings.total as u64,
+                });
                 trace_forward_memory(&format!("layer_{layer_idx}_done"));
                 if let (Some(memory), Some(layer_memory)) = (&mut memory, &timed.timings.memory) {
                     memory.record_layer(layer_memory.clone());
@@ -2777,6 +3663,13 @@ impl LlamaInferenceSession {
                     None,
                 )
             };
+        // Fold the final logits and restore the rollup onto the session for the next token.
+        if compute_logits {
+            if let Some(trace) = execution_trace.as_mut() {
+                trace.fold_logits(&logits.data);
+            }
+        }
+        self.execution_trace = execution_trace;
         self.kv_cache.position += 1;
         if !collect_diagnostics {
             metal::end_inference_session();
@@ -2855,6 +3748,17 @@ impl LlamaInferenceSession {
         let mut first_token_timings = LlamaForwardTimings::default();
         let prefill_count = token_ids.len().saturating_sub(1);
         let prefill_chunk_tokens = prefill_chunk_token_count(prefill_count);
+        let telemetry_layers_total = self.weights.layers.len();
+        if prefill_count > 0 {
+            telemetry::emit(telemetry::Event::PrefillStarted {
+                prefill_tokens: prefill_count,
+                // The lane resolves just below (GPU-resident first, then
+                // layer-major / chunked / single-token); the progress and
+                // layer events that follow come from the lane that ran.
+                path: "auto",
+                layers_total: telemetry_layers_total,
+            });
+        }
         let resident_prefill_started = Instant::now();
         if prefill_count > 1 && self.try_resident_prefill(&token_ids[..prefill_count])? {
             // Whole prompt prefilled on the GPU in one command buffer; the last prompt
@@ -2863,6 +3767,10 @@ impl LlamaInferenceSession {
             let resident_prefill_us = resident_prefill_started.elapsed().as_micros();
             timings.total += resident_prefill_us;
             prefill_timings.total += resident_prefill_us;
+            telemetry::emit(telemetry::Event::PrefillProgress {
+                tokens_done: prefill_count,
+                tokens_total: prefill_count,
+            });
         } else if prefill_count > 0
             && prefill_chunk_tokens > 1
             && prefill_layer_major_enabled(&self.weights)
@@ -2874,18 +3782,33 @@ impl LlamaInferenceSession {
             timings.add_assign(&layer_major_timings);
             prefill_timings.add_assign(&layer_major_timings);
         } else if prefill_count > 0 && prefill_chunk_tokens > 1 {
+            let mut telemetry_tokens_done = 0usize;
             for chunk in token_ids[..prefill_count].chunks(prefill_chunk_tokens) {
                 let chunk_timings = self.forward_prefill_chunk_timed_fast(chunk)?;
                 timings.add_assign(&chunk_timings);
                 prefill_timings.add_assign(&chunk_timings);
+                telemetry_tokens_done += chunk.len();
+                telemetry::emit(telemetry::Event::PrefillProgress {
+                    tokens_done: telemetry_tokens_done,
+                    tokens_total: prefill_count,
+                });
             }
         } else {
-            for token_id in &token_ids[..prefill_count] {
+            for (telemetry_done, token_id) in token_ids[..prefill_count].iter().enumerate() {
                 add_q8_schedule_counter(&Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS, 1);
                 let timed = self.forward_single_token_timed_internal(*token_id, false, false)?;
                 timings.add_assign(&timed.timings);
                 prefill_timings.add_assign(&timed.timings);
+                telemetry::emit(telemetry::Event::PrefillProgress {
+                    tokens_done: telemetry_done + 1,
+                    tokens_total: prefill_count,
+                });
             }
+        }
+        if prefill_count > 0 {
+            telemetry::emit(telemetry::Event::DecodeStarted {
+                context_position: self.kv_cache.position,
+            });
         }
 
         let last_token_id = *token_ids.last().expect("non-empty token_ids checked above");
@@ -2904,6 +3827,35 @@ impl LlamaInferenceSession {
         let sample_started = Instant::now();
         let next_token_id = sampler.sample_with_history(&logits, token_history)?;
         let sample = sample_started.elapsed().as_micros();
+        if telemetry::active() {
+            // Candidate probabilities are computed from the real logits of
+            // this step, and only while a telemetry subscriber is connected.
+            telemetry::emit(telemetry::Event::SamplerStep {
+                chosen_token_id: next_token_id,
+                mode: match &sampler {
+                    LlamaSampler::Greedy => "greedy",
+                    LlamaSampler::Sampling(_) => "sampling",
+                },
+                candidates: telemetry::top_k_candidates(&logits.data, 8),
+            });
+        }
+        telemetry::emit(telemetry::Event::TokenDecoded {
+            token_id: Some(next_token_id),
+            context_position: Some(self.kv_cache.position),
+            layers_total: Some(telemetry_layers_total),
+        });
+        telemetry::emit(telemetry::Event::KvCacheUpdated {
+            position: self.kv_cache.position,
+            capacity: self.kv_cache.plan.max_sequence_length,
+            approx_bytes: Some(
+                (self.kv_cache.position
+                    * self.kv_cache.plan.layer_count
+                    * self.kv_cache.plan.kv_head_count
+                    * self.kv_cache.plan.head_dim
+                    * 2
+                    * std::mem::size_of::<f32>()) as u64,
+            ),
+        });
         Ok(LlamaGenerationStep {
             prompt_token_count: token_ids.len(),
             prefill_token_count: token_ids.len().saturating_sub(1),
@@ -3044,6 +3996,103 @@ fn env_flag_enabled(key: &str) -> bool {
         env::var(key).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") | Ok("on") | Ok("ON")
     )
+}
+
+/// Opt-in deterministic inference mode (`CAMELID_DETERMINISTIC=1`, set by the CLI
+/// `--deterministic` flag). When on, the engine is pinned to the order-stable CPU
+/// forward pass: every Metal/GPU dispatch gate fails closed to its CPU equivalent,
+/// regardless of any `CAMELID_METAL_*` override. This makes the supported TinyLlama
+/// 1.1B Q8_0 forward pass bit-exact and reduction-order-stable across runs, thread
+/// counts, and processes (the CPU reduction order is already fixed — each output owns
+/// its full serial K-dimension reduction; see `qa/determinism/determinism-baseline-*.md` and
+/// DECISIONS.md §D9). The library default is OFF, so the default (GPU fast) path and
+/// every embedder are byte-for-byte unchanged. The pinned reduction order mirrors the
+/// llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated against.
+pub fn deterministic_mode_enabled() -> bool {
+    env_flag_enabled("CAMELID_DETERMINISTIC")
+}
+
+/// Schema tag for the execution-trace rollup digest carried in a parity receipt.
+pub const EXECUTION_TRACE_SCHEMA_V1: &str = "camelid.execution-trace/v1";
+/// Algorithm tag: a single streaming SHA-256 over the whole deterministic forward pass.
+pub const EXECUTION_TRACE_ALGORITHM_ROLLUP_V1: &str = "sha256-rollup-v1";
+
+/// Streaming SHA-256 rollup over a deterministic forward pass. It folds, in forward order
+/// across every generated token, each transformer layer's output hidden state and the final
+/// logits vector into one digest. The fold is domain-separated (a kind byte + index + length
+/// prefix per checkpoint) so the byte stream is unambiguous, and uses little-endian f32 bytes
+/// so it is reproducible on a given host.
+///
+/// This is a single *rollup*: a mismatch proves the run differs but does not localize which
+/// token or layer. It is only meaningful on the order-stable CPU lane (deterministic mode):
+/// the underlying values are reduction-order-stable there (see [`deterministic_mode_enabled`]
+/// and DECISIONS.md §D9), and byte-for-byte reproducibility requires greedy decoding
+/// (RECEIPTS.md rule 2). The digest is ISA-specific (i8mm vs scalar round differently), so it
+/// is re-derivable on the same deterministic lane/host, not portable across ISAs.
+#[derive(Clone)]
+pub struct ExecutionTraceHasher {
+    hasher: Sha256,
+    fold_count: u64,
+}
+
+impl ExecutionTraceHasher {
+    /// Kind byte for a per-layer output hidden-state checkpoint.
+    const KIND_LAYER_HIDDEN: u8 = 0;
+    /// Kind byte for a final logits checkpoint.
+    const KIND_LOGITS: u8 = 1;
+
+    pub fn new() -> Self {
+        Self {
+            hasher: Sha256::new(),
+            fold_count: 0,
+        }
+    }
+
+    /// Fold one f32 checkpoint, domain-separated by `kind` + `index` + length so adjacent
+    /// checkpoints can never alias. Bytes are little-endian (host-reproducible).
+    fn fold(&mut self, kind: u8, index: u64, data: &[f32]) {
+        self.hasher.update([kind]);
+        self.hasher.update(index.to_le_bytes());
+        self.hasher.update((data.len() as u64).to_le_bytes());
+        let mut buf = Vec::with_capacity(data.len() * 4);
+        for &value in data {
+            buf.extend_from_slice(&value.to_le_bytes());
+        }
+        self.hasher.update(&buf);
+        self.fold_count += 1;
+    }
+
+    /// Fold a transformer layer's output hidden state.
+    pub fn fold_layer_hidden(&mut self, layer_index: usize, hidden: &[f32]) {
+        self.fold(Self::KIND_LAYER_HIDDEN, layer_index as u64, hidden);
+    }
+
+    /// Fold a final logits vector.
+    pub fn fold_logits(&mut self, logits: &[f32]) {
+        self.fold(Self::KIND_LOGITS, 0, logits);
+    }
+
+    /// Number of checkpoints folded so far (layers + logits across all tokens).
+    pub fn fold_count(&self) -> u64 {
+        self.fold_count
+    }
+
+    /// Finalize to a lowercase-hex SHA-256 digest.
+    pub fn finalize_hex(self) -> String {
+        let digest = self.hasher.finalize();
+        let mut out = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap());
+        }
+        out
+    }
+}
+
+impl Default for ExecutionTraceHasher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn prefill_chunk_token_count(prefill_count: usize) -> usize {
@@ -4210,6 +5259,26 @@ fn forward_layer_timed(
 
     let started = Instant::now();
     metal::synchronize_active_session();
+    // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projections (reshaped to
+    // heads) and BEFORE RoPE. No-op for plain Llama-family rows (norm is None).
+    let q = match &layer.attention_q_norm {
+        Some(weight) => q.per_head_rms_norm(
+            weight,
+            config.attention_head_count as usize,
+            rms_norm_epsilon,
+            format!("layer_{layer_idx}_attention_q_norm"),
+        )?,
+        None => q,
+    };
+    let k = match &layer.attention_k_norm {
+        Some(weight) => k.per_head_rms_norm(
+            weight,
+            config.attention_head_count_kv as usize,
+            rms_norm_epsilon,
+            format!("layer_{layer_idx}_attention_k_norm"),
+        )?,
+        None => k,
+    };
     let q_before_rope = q;
     let k_before_rope = k;
     let q = apply_rope(
@@ -4716,6 +5785,26 @@ fn forward_prefill_layer_chunk_timed(
     trace_chunk_memory("attention_k_done");
 
     let started = Instant::now();
+    // Qwen3 QK-norm: per-head RMSNorm on Q/K after the projections and BEFORE
+    // RoPE (batched prefill path). No-op for plain Llama-family rows.
+    let q = match &layer.attention_q_norm {
+        Some(weight) => q.per_head_rms_norm(
+            weight,
+            config.attention_head_count as usize,
+            params.rms_norm_epsilon,
+            format!("layer_{layer_idx}_prefill_attention_q_norm"),
+        )?,
+        None => q,
+    };
+    let k = match &layer.attention_k_norm {
+        Some(weight) => k.per_head_rms_norm(
+            weight,
+            config.attention_head_count_kv as usize,
+            params.rms_norm_epsilon,
+            format!("layer_{layer_idx}_prefill_attention_k_norm"),
+        )?,
+        None => k,
+    };
     let q = apply_rope_batch(
         &q,
         params.base_position,
@@ -8313,23 +9402,387 @@ fn q8_0_file_reader_block_dot_enabled() -> bool {
 
 #[allow(dead_code)]
 fn q8_0_metal_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8")
+    // Deterministic mode fails closed to the CPU Q8_0 kernels (see `deterministic_mode_enabled`).
+    !deterministic_mode_enabled() && q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8")
 }
 
 /// Gate for the GPU-resident decode forward (whole token on the Metal GPU, KV cache resident
-/// across tokens). Default off; opt in with `CAMELID_METAL_RESIDENT_DECODE`.
+/// across tokens). Default off; opt in with `CAMELID_METAL_RESIDENT_DECODE`. Deterministic
+/// mode forces this off so the forward stays on the order-stable CPU path.
 fn resident_decode_metal_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+    !deterministic_mode_enabled()
+        && q8_0_env_flag_enabled_default_off("CAMELID_METAL_RESIDENT_DECODE")
+}
+
+/// Process-global resident CUDA engine, keyed by the model's weight identity.
+/// The engine holds compiled kernels, the uploaded weights, and the GPU KV
+/// cache; it is built once and reused across every request and chat turn (the
+/// API server clones a fresh session per request, so this can't live in the
+/// session). The mutex is held only for a single token's forward.
+#[cfg(feature = "cuda")]
+struct ResidentCudaSlot {
+    key: usize,
+    engine: crate::cuda_resident::CudaResidentDecode,
+}
+
+#[cfg(feature = "cuda")]
+fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Second resident-engine cache, dedicated to the speculative draft model. Draft
+/// and target are different models (different weight identities), so giving them
+/// separate single-slot caches lets BOTH stay GPU-resident at once — sharing one
+/// slot would thrash (rebuild + 3.4 GB re-upload) every time control passed between
+/// drafter and target. Routed by `LlamaInferenceSession::is_drafter`.
+#[cfg(feature = "cuda")]
+fn resident_cuda_drafter_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
+/// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
+/// Cheap (no model), and it hits whenever the model repeats a phrase already in
+/// the context (code, lists, quoted text) — exactly where greedy decode is
+/// predictable. Empty when there's no match.
+#[cfg(feature = "cuda")]
+fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
+    if max_draft == 0 || ngram == 0 || history.len() <= ngram {
+        return Vec::new();
+    }
+    let suffix = &history[history.len() - ngram..];
+    let limit = history.len() - ngram;
+    for start in (0..limit).rev() {
+        if &history[start..start + ngram] == suffix {
+            let follow = &history[start + ngram..];
+            let take = follow.len().min(max_draft);
+            if take > 0 {
+                return follow[..take].to_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate
+/// the GPU KV cache, and upload every layer's Q8_0 weights (repacked to SoA) plus
+/// the output stage. Returns `None` for any unsupported tensor (e.g. wire-page
+/// mmap weights that aren't RAM-resident blocks), so the caller falls back.
+/// Shared by the decode and prefill seams so weight upload lives in one place.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn build_resident_cuda_engine(
+    weights: &LlamaLoadedWeights,
+    range: std::ops::Range<usize>,
+    n_layers: usize,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn_dim: usize,
+    rope_dim: usize,
+    kv_cap: usize,
+    vocab: usize,
+    rms_eps: f32,
+) -> Option<crate::cuda_resident::CudaResidentDecode> {
+    fn raw(t: &CpuTensor) -> Option<&[u8]> {
+        t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
+    }
+    // VRAM-driven resident-context sizing (portability, not hardcoded to any card):
+    //   resident weights are uploaded once and live for the engine's lifetime; the
+    //   GPU KV cache is allocated once at `cap` positions, costing
+    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 4(f32) each. Size the
+    //   cap so weights + KV + a scratch/headroom reserve fit in *detected free* VRAM:
+    //     cap = min(requested, (free_vram − weights − headroom) / kv_bytes_per_pos)
+    //   On a 6 GB card this stays conservative; on a 24 GB card it grows automatically
+    //   to a long context. If even the floor (256) cannot fit, return None so the
+    //   caller runs the model on the CPU path rather than oversubscribing VRAM.
+    const MIN_RESIDENT_CONTEXT: usize = 256;
+    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 4) as u64;
+    let weights_bytes: u64 = weights.layers[range.clone()]
+        .iter()
+        .flat_map(|l| {
+            [
+                &l.attention_q,
+                &l.attention_k,
+                &l.attention_v,
+                &l.attention_output,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
+            ]
+        })
+        .filter_map(|t| raw(t).map(|b| b.len() as u64))
+        .sum::<u64>()
+        + raw(weights.output_projection())
+            .map(|b| b.len() as u64)
+            .unwrap_or(0);
+    // Scratch reserve: logits row (vocab·f32) + per-stage activation buffers + a flat
+    // safety margin for driver/context overhead and fragmentation. The flat margin is
+    // env-overridable (CAMELID_CUDA_RESIDENT_HEADROOM_MB) so a second engine can be
+    // packed onto a small card — e.g. drafter + target for speculative decode, where
+    // the default 512 MiB per engine would not leave room for both.
+    let headroom_mb = std::env::var("CAMELID_CUDA_RESIDENT_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(512);
+    let headroom = (vocab as u64 * 4) + (headroom_mb * 1024 * 1024);
+    let free_vram = crate::cuda::probe_capability()
+        .map(|c| c.vram_free_bytes)
+        .unwrap_or(0);
+
+    // Per-layer resident weight bytes (raw Q8_0 layout, same unit as `weights_bytes`),
+    // for the offload split decision. Index i is layer `range.start + i`.
+    let per_layer_bytes: Vec<u64> = weights.layers[range.clone()]
+        .iter()
+        .map(|l| {
+            [
+                &l.attention_q,
+                &l.attention_k,
+                &l.attention_v,
+                &l.attention_output,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
+            ]
+            .iter()
+            .filter_map(|t| raw(t).map(|b| b.len() as u64))
+            .sum()
+        })
+        .collect();
+    let per_layer_max = per_layer_bytes.iter().copied().max().unwrap_or(0);
+    // Streaming scratch buffers reserved when offloading (matches
+    // enable_offload_scratch's CAMELID_OFFLOAD_BUFFERS, default 2).
+    let n_buffers = std::env::var("CAMELID_OFFLOAD_BUFFERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(2) as u64;
+    let min_kv = kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
+
+    // Layer-offload split. CAMELID_OFFLOAD_FORCE_LAYERS=N forces the last N layers to
+    // host RAM (test/override hook, fires even on a model that fits). Otherwise the
+    // split is AUTOMATIC: when all weights + a minimum KV cache + headroom cannot fit
+    // in free VRAM, offload the fewest TRAILING layers needed so the rest fit. Each
+    // offloaded layer streams its weights to a GPU scratch buffer every forward — a
+    // capacity tradeoff, token-identical to the all-resident path.
+    let force_offload = std::env::var("CAMELID_OFFLOAD_FORCE_LAYERS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(n_layers);
+    let (offload_count, offload_source) = if force_offload > 0 {
+        (force_offload, "forced")
+    } else if free_vram > 0 && weights_bytes + headroom + min_kv > free_vram {
+        // Reserve KV(min) + headroom + scratch; offload trailing layers until the
+        // resident weights fit the remainder.
+        let scratch = per_layer_max * n_buffers;
+        let budget = free_vram
+            .saturating_sub(headroom)
+            .saturating_sub(min_kv)
+            .saturating_sub(scratch);
+        let mut resident_w = weights_bytes;
+        let mut k = 0usize;
+        let mut i = per_layer_bytes.len();
+        while resident_w > budget && i > 0 {
+            i -= 1;
+            resident_w -= per_layer_bytes[i];
+            k += 1;
+        }
+        (k, "auto")
+    } else {
+        (0, "none")
+    };
+    let n_resident_layers = n_layers - offload_count;
+
+    // VRAM left for the KV cache after the RESIDENT weights and (if offloading) the
+    // streaming scratch — so freed weight VRAM grows the resident context.
+    let offloaded_bytes: u64 = per_layer_bytes[n_resident_layers..].iter().sum();
+    let resident_weights_bytes = weights_bytes.saturating_sub(offloaded_bytes);
+    let scratch_reserve = if offload_count > 0 {
+        per_layer_max * n_buffers
+    } else {
+        0
+    };
+    let cap = if free_vram > 0 && kv_bytes_per_pos > 0 {
+        let budget = free_vram
+            .saturating_sub(resident_weights_bytes)
+            .saturating_sub(headroom)
+            .saturating_sub(scratch_reserve);
+        let vram_positions = (budget / kv_bytes_per_pos) as usize;
+        let chosen = kv_cap.min(vram_positions);
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cuda] VRAM sizing: free {} MiB, weights {} MiB (resident {} MiB; {}/{} layers offloaded; scratch {} MiB), headroom {} MiB, kv {} B/pos -> fits {} pos, requested {} -> cap {}",
+                free_vram / (1024 * 1024),
+                weights_bytes / (1024 * 1024),
+                resident_weights_bytes / (1024 * 1024),
+                offload_count,
+                n_layers,
+                scratch_reserve / (1024 * 1024),
+                headroom / (1024 * 1024),
+                kv_bytes_per_pos,
+                vram_positions,
+                kv_cap,
+                chosen,
+            );
+        }
+        chosen
+    } else {
+        // Could not probe free VRAM: trust the requested cap (the engine's own
+        // allocation will fail and fall back if it genuinely does not fit).
+        kv_cap
+    };
+    if cap < MIN_RESIDENT_CONTEXT {
+        if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+            eprintln!(
+                "[resident-cuda] VRAM too small for resident decode even with {offload_count}/{n_layers} layers offloaded (cap {cap} < {MIN_RESIDENT_CONTEXT}); using CPU path"
+            );
+        }
+        return None;
+    }
+    let mut engine = crate::cuda_resident::CudaResidentDecode::new(
+        n_layers, n_heads, n_kv, head_dim, hidden, ffn_dim, rope_dim, cap, vocab, rms_eps,
+    )
+    .ok()?;
+    for (idx, l) in weights.layers[range].iter().enumerate() {
+        let (q, k, v, o, gate, up, down) = match (
+            raw(&l.attention_q),
+            raw(&l.attention_k),
+            raw(&l.attention_v),
+            raw(&l.attention_output),
+            raw(&l.ffn_gate),
+            raw(&l.ffn_up),
+            raw(&l.ffn_down),
+        ) {
+            (Some(q), Some(k), Some(v), Some(o), Some(g), Some(u), Some(d)) => {
+                (q, k, v, o, g, u, d)
+            }
+            _ => return None,
+        };
+        engine
+            .set_layer_located(
+                q,
+                k,
+                v,
+                o,
+                gate,
+                up,
+                down,
+                &l.attention_norm.data,
+                &l.ffn_norm.data,
+                idx < n_resident_layers,
+            )
+            .ok()?;
+    }
+    // Honest run labeling (Phase 4): record the offload split and print a one-line
+    // load banner so a capacity-mode (offloaded) run never reads like a native one.
+    let status = if offload_count > 0 {
+        engine.enable_offload_scratch().ok()?;
+        // Probe the copy-stream peak once so the banner/record carries a real PCIe
+        // number (a one-time ~0.5 s build cost; this run is already paying for offload).
+        let (streamed_bytes, pcie_gbps) = match engine.probe_offload_pcie(50) {
+            Some((bytes, gibs)) => (bytes as u64, Some(gibs * 1.073_741_824)),
+            None => (0, None),
+        };
+        if std::env::var_os("CAMELID_OFFLOAD_PCIE_PROBE").is_some() {
+            if let Some(g) = pcie_gbps {
+                eprintln!(
+                    "[offload] PCIe probe: {} MiB/transfer, copy-stream peak {:.2} GB/s over 50 back-to-back transfers (no compute)",
+                    streamed_bytes / (1024 * 1024),
+                    g,
+                );
+            }
+        }
+        crate::offload::OffloadRunStatus {
+            total_layers: n_layers,
+            layers_resident: n_resident_layers,
+            layers_offloaded: offload_count,
+            per_layer_bytes: streamed_bytes,
+            free_vram_bytes: free_vram,
+            pcie_gbps,
+            source: offload_source,
+        }
+    } else {
+        crate::offload::OffloadRunStatus::resident(n_layers, free_vram)
+    };
+    eprintln!("{}", status.describe());
+    crate::offload::set_offload_run_status(Some(status));
+    engine
+        .set_output(&weights.output_norm.data, raw(weights.output_projection())?)
+        .ok()?;
+    Some(engine)
+}
+
+/// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On
+/// automatically whenever a usable CUDA device is present — the end-user app
+/// "just works" fast on the GPU with no flag or toggle. Deterministic mode
+/// (opt-in) forces the CPU reference; `CAMELID_CUDA_RESIDENT_DECODE=0` is an
+/// explicit escape hatch for debugging. Falls back to CPU per token for any
+/// model/config the resident engine does not support.
+#[cfg(feature = "cuda")]
+fn resident_decode_cuda_enabled() -> bool {
+    if deterministic_mode_enabled() {
+        return false;
+    }
+    // Explicit off switch only: `CAMELID_CUDA_RESIDENT_DECODE=0/false/off`.
+    if let Some(value) = std::env::var_os("CAMELID_CUDA_RESIDENT_DECODE") {
+        let value = value.to_string_lossy();
+        let value = value.trim();
+        let off = value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no");
+        if off {
+            return false;
+        }
+    }
+    // The user-facing "GPU acceleration" switch (default on when a device is present;
+    // flippable from the UI). gpu_accel_enabled() already requires a usable device.
+    crate::cuda::gpu_accel_enabled()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn resident_decode_cuda_enabled() -> bool {
+    false
+}
+
+/// Maximum sequence length the CUDA resident engine keeps on the GPU. The GPU KV
+/// cache is allocated once at this many positions, so it directly sets the engine's
+/// VRAM footprint (≈ n_layers·n_kv·head_dim·2·4 bytes per position) on top of the
+/// resident weights. On a 6 GB laptop card a 3B Q8_0 model's weights already take
+/// ~3.4 GB, so an 8192-position KV (~1.8 GB for 3B) leaves almost no headroom — any
+/// other GPU app then pushes the engine past VRAM, it can no longer stay resident,
+/// and it is rebuilt (a multi-second 3.4 GB re-upload) on every request. A 4096 cap
+/// halves the KV footprint and keeps the engine resident with room to spare; beyond
+/// it the per-token guard falls back to the CPU. Override with
+/// Optional hard ceiling on the resident KV context the wrappers *request*. The
+/// real limit is VRAM-driven inside `build_resident_cuda_engine` (which sizes the
+/// cap to detected free VRAM and reports it), so by default this imposes no extra
+/// cap — a big card gets a long resident context automatically. Set
+/// `CAMELID_CUDA_RESIDENT_MAX_CONTEXT` to force a lower ceiling (e.g. to leave more
+/// VRAM for other apps).
+#[cfg(feature = "cuda")]
+fn resident_cuda_max_context() -> usize {
+    std::env::var("CAMELID_CUDA_RESIDENT_MAX_CONTEXT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 256)
+        .unwrap_or(usize::MAX)
 }
 
 #[allow(dead_code)]
 fn q8_0_metal_retained_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED")
+    !deterministic_mode_enabled() && q8_0_env_flag_enabled_default_off("CAMELID_METAL_Q8_RETAINED")
 }
 
 #[allow(dead_code)]
 fn q8_0_hybrid_retained_enabled() -> bool {
-    q8_0_env_flag_enabled_default_off("CAMELID_HYBRID_Q8_RETAINED")
+    !deterministic_mode_enabled() && q8_0_env_flag_enabled_default_off("CAMELID_HYBRID_Q8_RETAINED")
 }
 
 fn q8_0_metal_trace_enabled() -> bool {
@@ -14751,7 +16204,7 @@ fn horizontal_sum_i32x4(acc: std::arch::aarch64::int32x4_t) -> i32 {
     unsafe { std::arch::aarch64::vaddvq_s32(acc) }
 }
 
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;
@@ -14787,7 +16240,7 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     half
 }
 
-fn f16_bits_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     let sign = (u32::from(bits & 0x8000)) << 16;
     let exp = (bits & 0x7c00) >> 10;
     let frac = u32::from(bits & 0x03ff);
@@ -14903,7 +16356,11 @@ fn try_accumulate_descriptor_linear_row_metal(
 ) -> bool {
     #[cfg(target_os = "macos")]
     {
-        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1") {
+        // Cheap existing check first so the default path (Metal linear off) short-circuits
+        // before the deterministic-mode env read — zero added work when the flag is unused.
+        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1")
+            || deterministic_mode_enabled()
+        {
             return false;
         }
         if weight.q8_0_blocks.is_some() || weight.q8_0_file_backing.is_some() {
@@ -15582,6 +17039,24 @@ fn accumulate_transposed_linear_row_q8_0_block_dot_quantized_with_flags(
         let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
         if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
             metal::try_q8_0_block_linear_row(
+                input_scales,
+                input_quants,
+                weight_bytes,
+                output.len(),
+                blocks_per_row,
+                output,
+            )
+        }) {
+            return;
+        }
+    }
+    if q8_flags.cuda {
+        // Opt-in CUDA Q8 hybrid decode over the retained block layout. The
+        // kernel mirrors q8_0_dot_rows' term order; on any error it returns
+        // false and the CPU reference below runs unchanged.
+        let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
+        if with_q8_0_block_scales_and_quants(quantized_input, |input_scales, input_quants| {
+            crate::cuda::try_q8_0_block_linear_row(
                 input_scales,
                 input_quants,
                 weight_bytes,
@@ -16954,7 +18429,11 @@ fn try_accumulate_transposed_linear_row_metal(
 ) -> bool {
     #[cfg(target_os = "macos")]
     {
-        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1") {
+        // Cheap existing check first so the default path (Metal linear off) short-circuits
+        // before the deterministic-mode env read — zero added work when the flag is unused.
+        if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1")
+            || deterministic_mode_enabled()
+        {
             return false;
         }
         if weight.q8_0_blocks.is_some() || weight.q8_0_file_backing.is_some() {

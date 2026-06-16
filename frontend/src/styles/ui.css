@@ -1,11 +1,38 @@
 /* ==========================================================================
    UI primitives — Button, IconButton, Chip, Card, StatusDot, ThemeToggle,
-   Tooltip, Modal, ConfirmDialog, Notice, Field, EmptyState, Avatar/Sparkle.
+   Tooltip, Modal, ConfirmDialog, Notice, Field, EmptyState, Avatar/CamelidMark.
    All classes are prefixed (cx- and camelid- namespaces) to avoid collisions.
    ========================================================================== */
 
-/* ---- Sparkle / Avatar ---- */
-.camelid-sparkle-icon { display: block; }
+/* ---- Camelid mark / Avatar ---- */
+.camelid-mark { display: block; }
+.camelid-mark__ear { transform-box: fill-box; transform-origin: 50% 100%; transition: transform 130ms var(--ease-standard); }
+.camelid-mark[data-state='awaiting'] { animation: camelidMarkBreathe 2.2s var(--ease-standard) infinite; }
+@keyframes camelidMarkBreathe {
+  0%, 100% { transform: scale(1); opacity: 0.7; }
+  50% { transform: scale(1.07); opacity: 1; }
+}
+/* streaming: a happy head-bob groove (continuous) layered with ear flicks
+   advanced by real token batches (data-step flips per rAF-coalesced flush) —
+   the groove says "having a good time", the ear rhythm IS the real cadence */
+.camelid-mark[data-state='streaming'] {
+  animation: camelidMarkGroove 0.9s var(--ease-standard) infinite;
+  transform-origin: 45% 85%;
+}
+@keyframes camelidMarkGroove {
+  0%, 100% { transform: rotate(-6deg) translateY(0.4px); }
+  25% { transform: rotate(0deg) translateY(-0.9px); }
+  50% { transform: rotate(6deg) translateY(0.3px); }
+  75% { transform: rotate(0deg) translateY(-0.9px); }
+}
+.camelid-mark[data-state='streaming'][data-step='0'] .camelid-mark__ear--l { transform: rotate(-14deg); }
+.camelid-mark[data-state='streaming'][data-step='0'] .camelid-mark__ear--r { transform: rotate(4deg); }
+.camelid-mark[data-state='streaming'][data-step='1'] .camelid-mark__ear--r { transform: rotate(14deg); }
+.camelid-mark[data-state='streaming'][data-step='1'] .camelid-mark__ear--l { transform: rotate(-4deg); }
+.camelid-mark[data-state='settle'] .camelid-mark__ear { transform: none; transition-duration: 320ms; }
+@media (prefers-reduced-motion: reduce) {
+  .camelid-mark, .camelid-mark__ear { animation: none !important; transition: none !important; transform: none !important; }
+}
 .camelid-avatar {
   display: inline-grid;
   place-items: center;
@@ -265,6 +292,17 @@
 .cx-field__hint { font-size: var(--text-xs); color: var(--color-text-faint); }
 
 /* ---- EmptyState ---- */
+/* Inline (left-aligned, bordered) empty/error card used inside dense views. */
+.cx-empty--inline {
+  align-items: flex-start;
+  text-align: left;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-subtle);
+  margin: 0 0 var(--space-4);
+}
+
 .cx-empty {
   display: flex;
   flex-direction: column;

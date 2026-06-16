@@ -22,6 +22,7 @@ Read these first:
 - [`PARITY.md`](docs/benchmarks/PARITY.md) — exact-row parity proof map and audit trail
 - [`RECEIPTS.md`](RECEIPTS.md) — verifiable single-request parity receipts; a receipt never changes the support ledger
 - [`docs/CONFORMANCE.md`](docs/CONFORMANCE.md) — cross-runtime conformance: determinism, agreement, tokenizer parity, provability; methodology and current findings
+- [`docs/TELEMETRY.md`](docs/TELEMETRY.md) — live inference telemetry stream (`/api/telemetry/stream`): event schema, truthfulness contract, lane coverage; drives the UI's Inference Observatory
 - [`ROADMAP.md`](ROADMAP.md) — phase-level plan of record
 
 ## Contributor and project policy
@@ -60,4 +61,4 @@ These documents are working notes, not support ledgers. When a note and a public
 ## Historical archives
 
 - [`ROADMAP_ARCHIVE.md`](docs/archive/ROADMAP_ARCHIVE.md) — completed-phase history
-- [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md) — detailed historical status log
+- [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md) — detailed historical status log

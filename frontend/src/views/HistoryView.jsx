@@ -1,5 +1,6 @@
 import { clampText, formatCompactNumber, formatHistoryDate, formatPreview } from '../lib/formatters'
 import { Button } from '../components/ui/Button'
+import { downloadConversation } from '../lib/conversationExport'
 import { EmptyState } from '../components/ui/EmptyState'
 import { IconHistory, IconChat, IconTrash } from '../components/ui/icons'
 
@@ -77,6 +78,22 @@ export default function HistoryView({ filteredConversations, setSelectedConversa
                       onClick={() => { setSelectedConversationId(conversation.id); setTab('chat') }}
                     >
                       Open
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title="Export as Markdown (local download; never includes file paths)"
+                      onClick={() => downloadConversation(conversation, 'markdown')}
+                    >
+                      MD
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title="Export as JSON (local download; never includes file paths)"
+                      onClick={() => downloadConversation(conversation, 'json')}
+                    >
+                      JSON
                     </Button>
                     <Button
                       variant="ghost"

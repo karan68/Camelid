@@ -4,9 +4,11 @@ import { Button } from '../components/ui/Button'
 import { Chip } from '../components/ui/Chip'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Field } from '../components/ui/Field'
-import { Sparkle } from '../components/ui/Avatar'
+import { CamelidMark } from '../components/ui/CamelidMark'
 import { IconPlay, IconStop, IconCopy, IconCheck, IconServer, IconMonitor, IconSun, IconMoon, IconNetwork, IconChevronRight } from '../components/ui/icons'
 import { copyText } from '../lib/markdown'
+import { getConfiguredMaxTokens, setConfiguredMaxTokens } from '../lib/responseLimits'
+import { ResponseLengthControl } from '../components/settings/ResponseLengthControl'
 
 const THEME_OPTS = [
   { value: 'system', label: 'System', Icon: IconMonitor },
@@ -23,17 +25,56 @@ export default function SettingsView({
   themePreference = 'system',
   setThemePreference = () => {},
   onOpenCluster = () => {},
+  conversationCount = 0,
+  deleteAllConversations = null,
+  selectedModel = null,
+  capabilities = null,
 }) {
+  const [confirmWipe, setConfirmWipe] = useState(false)
   const online = runtime?.status === 'online'
   const { status, command, setCommand, resolvedCommand, starting, start, stop } = backend
   const [copied, setCopied] = useState(false)
   const [apiBaseDraft, setApiBaseDraft] = useState(apiBase || 'http://127.0.0.1:8181')
   const [showAdvanced, setShowAdvanced] = useState(Boolean(command))
   const [showLogs, setShowLogs] = useState(false)
-  const [maxTokens, setMaxTokens] = useState(() => (typeof window !== 'undefined' && window.localStorage.getItem('camelid.maxTokens')) || '8192')
+  const [maxTokens, setMaxTokens] = useState(() => getConfiguredMaxTokens(selectedModel?.id))
+  const [gpu, setGpu] = useState(null)
+  const [gpuBusy, setGpuBusy] = useState(false)
   const copyResetRef = useRef(null)
 
   useEffect(() => () => { if (copyResetRef.current) window.clearTimeout(copyResetRef.current) }, [])
+
+  // GPU (CUDA) acceleration availability + on/off state. Only present on a
+  // CUDA-capable build/host; the card stays hidden everywhere else.
+  useEffect(() => {
+    if (!online) { setGpu(null); return }
+    let cancelled = false
+    const base = (apiBase || '').replace(/\/$/, '')
+    fetch(`${base}/api/runtime/gpu`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled) setGpu(d) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [online, apiBase])
+
+  const toggleGpu = async (enabled) => {
+    const base = (apiBase || '').replace(/\/$/, '')
+    setGpuBusy(true)
+    try {
+      const r = await fetch(`${base}/api/runtime/gpu`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      const d = await r.json()
+      setGpu(d)
+      showNotice?.(`GPU acceleration ${d.enabled ? 'enabled' : 'disabled'}${d.device ? ` (${d.device})` : ''}.`, 'success')
+    } catch {
+      showNotice?.('Could not change GPU acceleration.', 'error')
+    } finally {
+      setGpuBusy(false)
+    }
+  }
 
   const handleCopy = async () => {
     await copyText(resolvedCommand || 'camelid serve')
@@ -51,8 +92,9 @@ export default function SettingsView({
 
   const handleMaxTokens = (value) => {
     setMaxTokens(value)
-    if (typeof window !== 'undefined') window.localStorage.setItem('camelid.maxTokens', value)
-    showNotice?.(`Max response length set to ${Number(value).toLocaleString()} tokens.`, 'success')
+    setConfiguredMaxTokens(selectedModel?.id || '', value)
+    // keep the legacy global key as the fallback for other models
+    if (typeof window !== 'undefined') window.localStorage.setItem('camelid.maxTokens', String(value))
   }
 
   const statusTone = online ? 'ready' : status.running ? 'warn' : 'offline'
@@ -144,6 +186,29 @@ export default function SettingsView({
         </CardBody>
       </Card>
 
+      {gpu?.available && (
+        <Card>
+          <CardHeader icon={<IconServer size={20} />} eyebrow="Hardware" title="GPU acceleration" actions={
+            <span className="settings-status"><StatusDot tone={gpu.enabled ? 'ready' : 'offline'} pulse={gpu.enabled} /> <strong>{gpu.enabled ? 'On' : 'Off'}</strong></span>
+          } />
+          <CardBody>
+            <p className="settings-help">
+              Run the Q8_0 decode on {gpu.device || 'the CUDA GPU'} instead of the CPU. The CPU path stays the correctness reference and the output is token-identical either way. Small models (e.g. TinyLlama) speed up noticeably; larger models may not, because this path uploads weights to the GPU per step.
+            </p>
+            <div className="settings-actions">
+              <Button
+                variant={gpu.enabled ? 'tonal' : 'primary'}
+                onClick={() => toggleGpu(!gpu.enabled)}
+                loading={gpuBusy}
+                disabled={gpuBusy}
+              >
+                {gpu.enabled ? 'Disable GPU acceleration' : 'Enable GPU acceleration'}
+              </Button>
+            </div>
+          </CardBody>
+        </Card>
+      )}
+
       <Card interactive className="settings-cluster-card" onClick={onOpenCluster} role="button" tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter') onOpenCluster() }}>
         <CardHeader
@@ -159,14 +224,41 @@ export default function SettingsView({
         <CardHeader eyebrow="Chat" title="Response length" />
         <CardBody>
           <p className="settings-help">How many tokens Camelid can generate per reply. Larger means more complete answers and full programs (less truncation), but slower. Supported rows are validated to ~2K context; larger values still run model-native.</p>
+          <ResponseLengthControl
+            value={Number(maxTokens)}
+            onChange={(next) => handleMaxTokens(next)}
+            model={selectedModel}
+            capabilities={capabilities}
+          />
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader eyebrow="Chat" title="Local data" />
+        <CardBody>
+          <p className="settings-help">Conversations live only in this browser&apos;s storage. Deleting them does not touch models, memories, or anything on disk.</p>
           <div className="settings-select-row">
-            <select value={maxTokens} onChange={(e) => handleMaxTokens(e.target.value)} aria-label="Max response length">
-              <option value="1024">1,024 tokens — short</option>
-              <option value="2048">2,048 tokens</option>
-              <option value="4096">4,096 tokens</option>
-              <option value="8192">8,192 tokens — default</option>
-              <option value="16384">16,384 tokens — very long</option>
-            </select>
+            {deleteAllConversations && (confirmWipe ? (
+              <>
+                <button
+                  type="button"
+                  className="primary-button settings-danger"
+                  onClick={async () => { await deleteAllConversations(); setConfirmWipe(false) }}
+                >
+                  Confirm — delete {conversationCount} conversation{conversationCount === 1 ? '' : 's'}
+                </button>
+                <button type="button" className="ghost-button" onClick={() => setConfirmWipe(false)}>Cancel</button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className="ghost-button settings-danger-ghost"
+                disabled={conversationCount === 0}
+                onClick={() => setConfirmWipe(true)}
+              >
+                {conversationCount === 0 ? 'No conversations stored' : `Delete all ${conversationCount} conversations…`}
+              </button>
+            ))}
           </div>
         </CardBody>
       </Card>
@@ -192,7 +284,7 @@ export default function SettingsView({
 
       <Card tone="muted">
         <div className="settings-about">
-          <Sparkle size={28} />
+          <CamelidMark size={28} />
           <div>
             <strong>Camelid</strong>
             <p>Local, proof-carrying LLM inference. The UI talks to the backend over the OpenAI-compatible HTTP API.</p>

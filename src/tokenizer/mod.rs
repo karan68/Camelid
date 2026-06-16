@@ -21,6 +21,31 @@ impl TokenizerModel {
     }
 }
 
+/// GPT-2/BPE pre-tokenizer dialect (`tokenizer.ggml.pre`). The byte-level BPE
+/// merge step is identical across these; the pre-tokenization regex that splits
+/// raw text into pieces differs in exactly one branch — digit grouping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BpePreTokenizer {
+    /// llama.cpp `llama-bpe` (Llama 3 / GPT-4 tiktoken): digits group in runs of
+    /// up to three (`\p{N}{1,3}`).
+    #[default]
+    Llama3,
+    /// llama.cpp `qwen2` (Qwen2/Qwen3): each digit is its own piece (`\p{N}`).
+    /// Byte-for-byte identical to `llama-bpe` in every other branch — verified
+    /// against `llama-vocab.cpp` LLAMA_VOCAB_PRE_TYPE_LLAMA3 vs _QWEN2.
+    Qwen2,
+}
+
+impl BpePreTokenizer {
+    /// Maximum number of consecutive digits the pre-tokenizer keeps in one piece.
+    fn digit_group_max(self) -> usize {
+        match self {
+            Self::Llama3 => 3,
+            Self::Qwen2 => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Undefined,
@@ -170,6 +195,9 @@ pub struct TokenizerConfig {
 #[derive(Debug, Clone)]
 pub struct Tokenizer {
     pub model: TokenizerModel,
+    /// GPT-2/BPE pre-tokenizer dialect. Only consulted on the [`TokenizerModel::Gpt2Bpe`]
+    /// path; defaults to [`BpePreTokenizer::Llama3`] and is ignored for SPM.
+    pub bpe_pre_tokenizer: BpePreTokenizer,
     pub tokens: Vec<Token>,
     pub token_to_id: HashMap<String, TokenId>,
     pub byte_token_to_id: HashMap<u8, TokenId>,
@@ -198,14 +226,23 @@ impl Tokenizer {
                 )))
             }
         };
-        if model == TokenizerModel::Gpt2Bpe {
+        let bpe_pre_tokenizer = if model == TokenizerModel::Gpt2Bpe {
             let pre_tokenizer = file.metadata_string("tokenizer.ggml.pre");
-            if pre_tokenizer != Some("llama-bpe") {
-                return Err(BackendError::UnsupportedTokenizer(format!(
-                    "unsupported GPT-2/BPE pre-tokenizer {pre_tokenizer:?}; currently supported: llama-bpe"
-                )));
+            match pre_tokenizer {
+                Some("llama-bpe") => BpePreTokenizer::Llama3,
+                // Qwen2/Qwen3 differ from llama-bpe only in digit grouping
+                // (single digit vs runs of three); the byte-BPE merge step is
+                // identical. Verified against llama.cpp llama-vocab.cpp.
+                Some("qwen2") => BpePreTokenizer::Qwen2,
+                other => {
+                    return Err(BackendError::UnsupportedTokenizer(format!(
+                        "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2"
+                    )))
+                }
             }
-        }
+        } else {
+            BpePreTokenizer::default()
+        };
 
         let token_texts = file.metadata_array_strings("tokenizer.ggml.tokens")?;
         if token_texts.is_empty() {
@@ -304,6 +341,7 @@ impl Tokenizer {
 
         Ok(Self {
             model,
+            bpe_pre_tokenizer,
             tokens,
             token_to_id,
             byte_token_to_id,
@@ -462,7 +500,10 @@ impl Tokenizer {
                 text.len()
             };
 
-            for segment in bpe_pretokenize(&text[byte_start..byte_end]) {
+            for segment in bpe_pretokenize_with(
+                &text[byte_start..byte_end],
+                self.bpe_pre_tokenizer.digit_group_max(),
+            ) {
                 self.encode_bpe_segment(segment, &mut out)?;
             }
             byte_start = byte_end;
@@ -622,9 +663,16 @@ impl Tokenizer {
             return None;
         }
 
+        // Match both CONTROL and USER_DEFINED ("added") tokens, mirroring
+        // llama.cpp's special-token partition. Qwen3 marks <think>/</think>
+        // (and many <|...|> markers) as USER_DEFINED (type 4) rather than CONTROL
+        // (type 3); without matching USER_DEFINED, a rendered ChatML template's
+        // literal "</think>" tokenizes as text instead of the single special
+        // token, and chat generation diverges from the reference.
         self.tokens
             .iter()
-            .filter(|token| token.kind == TokenKind::Control)
+            .filter(|token| matches!(token.kind, TokenKind::Control | TokenKind::UserDefined))
+            .filter(|token| !token.text.is_empty())
             .filter(|token| text[byte_start..].starts_with(&token.text))
             .max_by_key(|token| token.text.len())
             .map(|token| (token.text.as_str(), token.text.len()))
@@ -842,24 +890,31 @@ impl Tokenizer {
     }
 }
 
+#[cfg(test)]
 fn bpe_pretokenize(text: &str) -> Vec<&str> {
-    // Llama 3 GGUFs use llama.cpp's "llama-bpe" pre-tokenizer, which mirrors
-    // the tiktoken regex below without pulling in a regex dependency:
+    // Test-only convenience wrapper: the default llama-bpe digit grouping.
+    bpe_pretokenize_with(text, 3)
+}
+
+fn bpe_pretokenize_with(text: &str, digit_group_max: usize) -> Vec<&str> {
+    // GPT-2/BPE pre-tokenizer, mirroring llama.cpp's tiktoken-style regex without
+    // pulling in a regex dependency:
     //   (?i:'s|'t|'re|'ve|'m|'ll|'d)
     //   | [^\r\n\p{L}\p{N}]?\p{L}+
-    //   | \p{N}{1,3}
+    //   | \p{N}{1,N}              (N = digit_group_max: 3 for llama-bpe, 1 for qwen2)
     //   |  ?[^\s\p{L}\p{N}]+[\r\n]*
     //   | \s*[\r\n]+
     //   | \s+(?!\S)
     //   | \s+
     // Keep the branch order identical: the whitespace branches intentionally
     // leave one prefix byte/char behind when that enables the next token to be
-    // an optional-prefix letters or punctuation segment.
+    // an optional-prefix letters or punctuation segment. The ONLY dialect
+    // difference (llama-bpe vs qwen2) is the digit-run cap.
     let mut segments = Vec::new();
     let mut byte_start = 0;
 
     while byte_start < text.len() {
-        let byte_end = next_llama_bpe_segment_end(text, byte_start);
+        let byte_end = next_llama_bpe_segment_end(text, byte_start, digit_group_max);
         segments.push(&text[byte_start..byte_end]);
         byte_start = byte_end;
     }
@@ -867,7 +922,7 @@ fn bpe_pretokenize(text: &str) -> Vec<&str> {
     segments
 }
 
-fn next_llama_bpe_segment_end(text: &str, byte_start: usize) -> usize {
+fn next_llama_bpe_segment_end(text: &str, byte_start: usize, digit_group_max: usize) -> usize {
     if let Some(end) = consume_contraction(text, byte_start) {
         return end;
     }
@@ -877,7 +932,7 @@ fn next_llama_bpe_segment_end(text: &str, byte_start: usize) -> usize {
 
     let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
     if is_number(ch) {
-        return consume_digits(text, byte_start, 3);
+        return consume_digits(text, byte_start, digit_group_max);
     }
     if let Some(end) = consume_optional_space_punctuation(text, byte_start) {
         return end;
@@ -1101,7 +1156,7 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bpe_pretokenize, BpeRegistry};
+    use super::{bpe_pretokenize, bpe_pretokenize_with, BpeRegistry};
 
     #[test]
     fn bpe_registry_uses_ranked_heap_priority_for_merges() {
@@ -1178,6 +1233,44 @@ mod tests {
 
         for (input, expected) in cases {
             assert_eq!(bpe_pretokenize(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn qwen2_pretokenizer_splits_digits_singly_but_matches_llama3_otherwise() {
+        // The ONLY difference between the qwen2 (digit cap 1) and llama-bpe
+        // (digit cap 3) pre-tokenizers is digit grouping: qwen2 emits each digit
+        // as its own piece (`\p{N}`), llama-bpe groups runs of up to three
+        // (`\p{N}{1,3}`). Verified against llama.cpp llama-vocab.cpp
+        // LLAMA_VOCAB_PRE_TYPE_QWEN2 vs LLAMA_VOCAB_PRE_TYPE_LLAMA3.
+        const QWEN2: usize = 1;
+        const LLAMA3: usize = 3;
+
+        // Digits split one-at-a-time under qwen2 …
+        assert_eq!(
+            bpe_pretokenize_with("1234", QWEN2),
+            vec!["1", "2", "3", "4"]
+        );
+        assert_eq!(
+            bpe_pretokenize_with("abc12345def", QWEN2),
+            vec!["abc", "1", "2", "3", "4", "5", "def"]
+        );
+        // … while the rest of the grammar is byte-for-byte identical to llama-bpe.
+        for input in [
+            "hello world",
+            "it's",
+            "WE'LL",
+            "  hello",
+            "foo...bar",
+            "café déjà",
+            "line\r\n  next",
+            "hello🙂world",
+        ] {
+            assert_eq!(
+                bpe_pretokenize_with(input, QWEN2),
+                bpe_pretokenize_with(input, LLAMA3),
+                "non-digit input {input:?} must tokenize identically under both dialects"
+            );
         }
     }
 }

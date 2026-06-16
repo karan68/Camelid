@@ -18,6 +18,7 @@
 //! body (sorted keys, no insignificant whitespace, `receipt_id` excluded), so
 //! a receipt can be cited by fingerprint and trivially checked for tampering.
 
+pub mod distributed;
 pub mod verify;
 
 use std::collections::BTreeMap;
@@ -76,6 +77,13 @@ pub struct ParityReceipt {
     pub reproducible: bool,
     pub result: ReceiptResult,
     pub parity: ParityBlock,
+    /// Optional execution-trace rollup digest over the deterministic forward pass
+    /// (`camelid.execution-trace/v1`). Present only for deterministic, reproducible runs
+    /// that opted into tracing; absent otherwise, so non-traced receipts serialize and
+    /// digest exactly as before. Verification re-derives the rollup from an independent
+    /// in-process re-run and checks it matches (see `verify`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_trace: Option<ExecutionTraceBlock>,
     /// Deferred signing seam: an optional detached signature over
     /// `receipt_id`. Absent in v1; present-but-optional so adding it later is
     /// not a schema-breaking change. Key management is intentionally not
@@ -294,6 +302,71 @@ impl ParityBlock {
     }
 }
 
+/// Execution-trace rollup carried in a receipt: a single streaming SHA-256 over the whole
+/// deterministic forward pass (every layer's output hidden state + the final logits, folded
+/// across every generated token). A mismatch on re-derivation proves the run differs but does
+/// not localize which token or layer (single rollup, by design).
+///
+/// The digest is reduction-order-stable on the deterministic CPU lane but ISA-specific (the
+/// Q8_0 dot kernel rounds differently across ISAs), so `lane` and `host_isa` pin the lane the
+/// digest is re-derivable on — it is portable to the same lane/host, not across ISAs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionTraceBlock {
+    /// Always `camelid.execution-trace/v1`.
+    pub schema: String,
+    /// Fold algorithm, e.g. `sha256-rollup-v1`.
+    pub algorithm: String,
+    /// The execution lane the digest commits to (e.g. `deterministic-cpu`).
+    pub lane: String,
+    /// ISA marker the digest is re-derivable on (e.g. `aarch64-i8mm`, `aarch64-dotprod`).
+    pub host_isa: String,
+    /// Lowercase-hex SHA-256 rollup digest.
+    pub digest: String,
+    /// Number of checkpoints folded (layers + logits across all generated tokens).
+    pub fold_count: u64,
+    /// Number of generated tokens the rollup covers.
+    pub generated_token_count: usize,
+}
+
+impl ExecutionTraceBlock {
+    /// Build a v1 rollup block from a finalized digest captured on the deterministic CPU lane.
+    pub fn rollup_v1(digest: String, fold_count: u64, generated_token_count: usize) -> Self {
+        Self {
+            schema: crate::inference::EXECUTION_TRACE_SCHEMA_V1.to_string(),
+            algorithm: crate::inference::EXECUTION_TRACE_ALGORITHM_ROLLUP_V1.to_string(),
+            lane: "deterministic-cpu".to_string(),
+            host_isa: host_isa_marker(),
+            digest,
+            fold_count,
+            generated_token_count,
+        }
+    }
+}
+
+/// A coarse ISA marker that captures the only axis that changes the deterministic Q8_0 dot
+/// rounding on a given build: presence of the i8mm packed-rows kernel on aarch64. Used to pin
+/// the lane an execution-trace digest is re-derivable on.
+pub fn host_isa_marker() -> String {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("i8mm") {
+            "aarch64-i8mm".to_string()
+        } else if std::arch::is_aarch64_feature_detected!("dotprod") {
+            "aarch64-dotprod".to_string()
+        } else {
+            "aarch64-scalar".to_string()
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64".to_string()
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        std::env::consts::ARCH.to_string()
+    }
+}
+
 /// Reserved for the deferred signing decision: a detached signature over
 /// `receipt_id`. Not produced by v1 emitters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -492,6 +565,7 @@ mod tests {
                 generated_text_match: Some(true),
                 first_divergent_token_index: Some(NO_DIVERGENCE),
             },
+            execution_trace: None,
             signature: None,
         }
     }
@@ -503,6 +577,42 @@ mod tests {
         let json = serde_json::to_string(&receipt).expect("serialize");
         let back: ParityReceipt = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(receipt, back);
+    }
+
+    #[test]
+    fn execution_trace_absent_keeps_receipt_byte_identical() {
+        // A non-traced receipt must omit the key entirely, so existing receipts and their
+        // digests are unchanged by adding the field.
+        let mut receipt = sample_receipt();
+        assert!(receipt.execution_trace.is_none());
+        receipt.seal().expect("seal");
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        assert!(
+            !json.contains("execution_trace"),
+            "absent execution trace must not serialize a key"
+        );
+    }
+
+    #[test]
+    fn execution_trace_present_round_trips_and_enters_the_digest() {
+        let mut without = sample_receipt();
+        without.seal().expect("seal");
+
+        let mut with = sample_receipt();
+        with.execution_trace = Some(ExecutionTraceBlock::rollup_v1("a".repeat(64), 1024, 16));
+        with.seal().expect("seal");
+
+        // The trace is part of the canonical body, so it changes receipt_id.
+        assert_ne!(
+            without.receipt_id, with.receipt_id,
+            "an execution trace must enter the receipt digest"
+        );
+        // And it survives a serialize/deserialize round trip.
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(json.contains("camelid.execution-trace/v1"));
+        let back: ParityReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(with, back);
+        assert!(back.verify_self_digest().is_ok());
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # Camelid Status
 
-Last updated: 2026-06-01
+Last updated: 2026-06-14
 
-`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](STATUS_ARCHIVE_2026-04.md).
+`STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md).
 
 Use this file to answer three practical questions: what is supported now, what changed recently, and what still blocks the next support move?
 
@@ -22,8 +22,9 @@ Executive summary: Camelid has API + frontend exact-row validation for the Llama
 | Llama 3 8B Instruct Q8_0 | Verified bounded support is now public: compact parity, broader 50-token parity, API/WebUI, checked 512/1024/2048-context packs, compact template-shapes, memory evidence, structured Q8 read counters, and hot-path measurements are public. | 512/1024/2048 bounded packs are green for this exact row where row-specific PASS artifacts are cited, with 1024/2048 tied to source/runtime head `8e26be0a73c0`. | Hard boundary: no model-native/larger context beyond checked packs, broad 8B/Llama support, arbitrary templates, production throughput, portability, or neighboring-row/context promotion without row-specific evidence. |
 | Mistral-7B-Instruct-v0.3.Q8_0.gguf | Supported exact-row smoke (promoted post-v0.1.0 at head d7b1699): exact-row load, tokenizer/template, 1-token generation, broader 50-token parity, checked 512/1024/2048/4096/8192 context packs, GPU-vs-CPU greedy parity, and the support-promotion API/WebUI smoke bundle `qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json`. | 512, 1024, 2048, 4096, and 8192 bounded packs are green for this exact row only. | Mistral-family support, neighboring variants, arbitrary templates beyond the row-scoped renderer and shapes, model-native/larger context beyond the checked packs, or production throughput. |
 | Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf | Active validation / partial backend runtime only: bounded one-token MoE evidence exists, but Gate 9A 50-token evidence diverges and the longer-continuation backend HTTP hang remains unresolved. | One-token backend runtime only; no API/WebUI/RSS/frontend readiness or context bucket is promoted. | Hard blocker: fix later-generation divergence and continuation hang before any Mixtral support/readiness claim. |
+| Qwen3-1.7B-Q8_0.gguf | First Qwen-family exact row: the dense `qwen3` engine path (qwen2 BPE pre-tokenizer, per-head QK-norm, NEOX RoPE for the unpermuted GGUF, hardcoded ChatML renderer, USER_DEFINED special-token parsing) is token-AND-text-identical to the pinned llama.cpp reference at 1/5/50 tokens for three fixed ChatML thinking-disabled prompts; `/v1/completions`, `/v1/chat/completions`, and five-prompt API smoke all pass; server RSS ~212 MiB after generation. Also validated on the **GPU-resident decode + single-shot prefill** path (per-head QK-norm applied in-kernel), token-AND-text-identical to cpu_reference and to llama.cpp. | **Large-context validated:** token-AND-text-identical to pinned llama.cpp at a 15,373-token single-shot prefill context (ceilings: 16,384 single-shot prefill / 40,960 KV). Bundles `qa/evidence-bundles/qwen3-1.7b-q8-chatml-parity-20260614T021844Z-head-f41e374/`, `qa/evidence-bundles/qwen3-1.7b-q8-gpu-resident-bigctx-parity-20260614T171846Z-head-f97a896/`. **Thinking mode** available opt-in (`camelid_enable_thinking:true`): leading-trace parity vs llama.cpp (envelope 26–205 tokens) before the documented f32 frontier, bundle `qa/evidence-bundles/qwen3-1.7b-q8-thinking-enabled-parity-*/`. | Other Qwen3 sizes (0.6B/4B/8B/14B/32B), base variants, other quants, Qwen3-MoE (A3B), context above the 16,384 single-shot / 40,960 KV ceilings, full-trace thinking-mode token-parity (only the leading-trace envelope is claimed; thinking-disabled is the parity-locked mode), a resident-prefill throughput/perf claim, or broad Qwen-family support. |
 
-This is the repo story in one sentence: Camelid preserves one trusted small-model gate and three bounded Llama exact-row lanes, plus the promoted Mistral v0.3 exact-row smoke lane, while keeping Mixtral, Qwen, and Gemma fail-closed for every unproven support, context, quantization, and runtime path.
+This is the repo story in one sentence: Camelid preserves one trusted small-model gate and three bounded Llama exact-row lanes, plus the promoted Mistral v0.3 and Qwen3-1.7B (ChatML, thinking-disabled) exact-row smoke lanes, while keeping Mixtral, Qwen2.5, larger/other Qwen3 rows, and Gemma fail-closed for every unproven support, context, quantization, and runtime path.
 
 Active work now splits into two explicit tracks:
 
@@ -107,6 +108,24 @@ Boundaries that remain in force:
 - No broader model-family or neighboring-row support claim from this work alone.
 
 Primary public evidence anchors for this lane are summarized in [`docs/performance/ubuntu-x86-q8.md`](docs/performance/ubuntu-x86-q8.md).
+
+## Windows x86 platform bring-up
+
+Windows `x86_64-pc-windows-msvc` (MSVC toolchain) is now a tracked CPU platform alongside macOS and Ubuntu. This is a narrow, exact-row bring-up; it does not promote any model lane (support is exact-row and does not spread by platform any more than by size or quantization).
+
+What is proven on Windows now:
+
+- The repo-health gate is green on MSVC: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-targets --all-features`, and `cargo doc --no-deps --all-features`. CI runs them on a `windows-latest` job.
+- The **TinyLlama 1.1B Chat Q8_0** baseline gate reproduces the cross-platform evidence exactly: output-projection layout `output_projection_layout_ok=true` with `gguf_dimensions=[2048,32000]` and `storage_row_stride_bytes=2176` (byte-for-byte identical), the `hello` smoke first token `29907`/"C" plus the same 50-token stream, and the supported-lane parity audit vs llama.cpp (prompt tokens, generated text, and generated token IDs match; `first_divergent_token_index=-1`).
+- The port is implementation-only behind `#[cfg(...)]` guards (Windows positioned `seek_read` for the Q8_0 file-backed reads; `memmap2` for the GGUF wire mapping); macOS/Ubuntu paths are unchanged, and the token-major `output.weight` interpretation is identical.
+
+Boundaries that remain in force:
+
+- TinyLlama is the only exact row with a full Windows parity gate today; Llama 3.2 1B/3B run and agree with the GPU lane on Windows CPU, but their direct Windows-vs-llama.cpp parity bundles are follow-up.
+- No Windows performance, throughput, or packaging claim.
+- **Windows CUDA is experimental and not a supported lane.** An opt-in NVRTC backend (`--features cuda`, RTX 3060) now runs the whole TinyLlama decode forward on the GPU: a GPU-resident decode engine (weights uploaded once and cached across requests, not per call), single-shot GPU prefill, on-device greedy/temperature sampling, and a lossless n-gram speculative-decode path. Each of these is token-identical to the CPU/llama.cpp reference for TinyLlama by direct parity (prompt tokens, generated text, and the 50-token stream all match; `first_divergent_token_index=-1`), including when dense per-token diagnostics force the decode onto the CPU path — the GPU prefill mirrors its KV cache back to host so the CPU and GPU histories stay in lockstep. Per-kernel GPU tests are bit-identical to the CPU dot, and the resident `prefill`/`verify_batch`/full-forward paths have GPU device tests (`cargo test --features cuda -- --ignored`). It still carries no multi-model artifact-backed parity-bundle discipline (TinyLlama on one RTX 3060 is the only CUDA evidence) and makes no throughput claim. The CPU path stays the default and the correctness reference; do not claim the CUDA lane as supported until it carries the same committed multi-row evidence the CPU lanes do.
+
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support for the release-contract wording.
 
 ## Durable evidence anchors
 
@@ -437,12 +456,12 @@ Mistral 7B Instruct v0.3 Q8_0 remains an active exact-row validation lane, not a
 
 `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf` is active validation / partial backend runtime only. Bounded one-token backend MoE evidence exists, but Gate 9A later-generation evidence diverges and the continuation bundle records a backend HTTP hang. No Mixtral API/WebUI/frontend readiness, neighboring-row, long-context, arbitrary-template, production-throughput, portability, or broader/full support claim is active.
 
-Qwen and Gemma remain planned exact-row candidates.
+Qwen3-1.7B Q8_0 is now a supported exact-row smoke lane for ChatML chat with thinking disabled (token-and-text-identical greedy parity vs the pinned llama.cpp reference at 1/5/50 tokens; bundle `qa/evidence-bundles/qwen3-1.7b-q8-chatml-parity-20260614T021844Z-head-f41e374/`). Qwen2.5, other/larger Qwen3 rows, and Gemma remain planned exact-row candidates.
 
 ## Validation note
 
 This file is intentionally a snapshot, not a diary. When a change materially affects support or its blockers:
 
 - add the current evidence summary here
-- keep the detailed run log and older slices in `STATUS_ARCHIVE_2026-04.md` or later archives
+- keep the detailed run log and older slices in `docs/archive/STATUS_ARCHIVE_2026-04.md` or later archives
 - update `COMPATIBILITY.md`, `ROADMAP.md`, and user-visible readiness copy in the same change window when support language changes

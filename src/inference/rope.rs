@@ -54,6 +54,22 @@ impl RopePositionMode {
     }
 }
 
+/// RoPE pairing for a specific model: the `CAMELID_ROPE_PAIRING` env override
+/// wins (for diagnostics); otherwise the model's config decides. Qwen3 sets
+/// `rope_neox_pairing = true` (split-half / NEOX) because its GGUF weights are
+/// not permuted; LLaMA-family rows keep adjacent even/odd because llama.cpp
+/// permutes their weights at conversion.
+pub(super) fn rope_pairing_for_config(config: &LlamaModelConfig) -> Result<RopePairing> {
+    if env::var_os("CAMELID_ROPE_PAIRING").is_some() {
+        return diagnostic_rope_pairing();
+    }
+    Ok(if config.rope_neox_pairing {
+        RopePairing::SplitHalf
+    } else {
+        RopePairing::AdjacentEvenOdd
+    })
+}
+
 pub fn diagnostic_rope_pairing() -> Result<RopePairing> {
     match env::var("CAMELID_ROPE_PAIRING") {
         Ok(value) if value == "split_half" => Ok(RopePairing::SplitHalf),
@@ -149,7 +165,7 @@ pub(super) fn apply_rope(
             head_dim,
             rope_dim,
             freq_base,
-            pairing: diagnostic_rope_pairing()?,
+            pairing: rope_pairing_for_config(config)?,
             direction: diagnostic_rope_direction()?,
             position_mode: diagnostic_rope_position_mode()?,
             scaling,
@@ -208,7 +224,7 @@ pub(super) fn apply_rope_batch(
         head_dim,
         rope_dim,
         freq_base,
-        pairing: diagnostic_rope_pairing()?,
+        pairing: rope_pairing_for_config(config)?,
         direction: diagnostic_rope_direction()?,
         position_mode: diagnostic_rope_position_mode()?,
         scaling,
@@ -472,7 +488,7 @@ pub(super) fn resident_decode_rope_tables(
     if diagnostic_rope_direction()? != RopeDirection::Forward {
         return Ok(None);
     }
-    let pairing = diagnostic_rope_pairing()?;
+    let pairing = rope_pairing_for_config(config)?;
     let position_mode = diagnostic_rope_position_mode()?;
     let scaling = rope_scaling_from_config(config)?;
     let rope_freqs = rope_freqs
@@ -528,7 +544,7 @@ pub(super) fn resident_prefill_rope_tables(
     // them, then sweep positions with only sin_cos in the inner loop.
     let rope_dim = config.rope_dimension_count.unwrap_or(head_dim as u32) as usize;
     let freq_base = config.rope_freq_base.unwrap_or(10_000.0);
-    let pairing = diagnostic_rope_pairing()?;
+    let pairing = rope_pairing_for_config(config)?;
     let scaling = rope_scaling_from_config(config)?;
     let validated_freqs = rope_freqs
         .map(|freqs| validate_rope_frequency_tensor(freqs, rope_dim))

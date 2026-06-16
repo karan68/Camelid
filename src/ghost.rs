@@ -17,8 +17,9 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+use crate::platform_fs::read_exact_at;
 
 use serde::{Deserialize, Serialize};
 
@@ -290,9 +291,7 @@ impl GhostFile {
         let group = self.group(id)?;
         let (start, len) = group.span();
         buf.resize(len as usize, 0);
-        self.file
-            .read_exact_at(buf, start)
-            .map_err(|e| io_err(Path::new("<cghost>"), e))?;
+        read_exact_at(&self.file, buf, start).map_err(|e| io_err(Path::new("<cghost>"), e))?;
         Ok((group, start))
     }
 
@@ -335,6 +334,12 @@ impl GhostFile {
                 attention_k: take("attn_k")?,
                 attention_v: take("attn_v")?,
                 attention_output: take("attn_output")?,
+                // The ghost (.cghost layer-streaming) format predates QK-norm and
+                // carries no attn_q_norm/attn_k_norm roles, so ghost mode does not
+                // support Qwen3-style models. Left None here; a Qwen3 ghost run is
+                // not a supported configuration.
+                attention_q_norm: None,
+                attention_k_norm: None,
                 ffn_norm: take("ffn_norm")?,
                 ffn_gate: take("ffn_gate")?,
                 ffn_up: take("ffn_up")?,

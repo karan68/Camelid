@@ -23,6 +23,21 @@ pub struct LlamaModelConfig {
     pub rms_norm_epsilon: f32,
     pub vocab_size: Option<u32>,
     pub file_type: Option<u32>,
+    /// Explicit per-head dimension from `<arch>.attention.key_length`, when the
+    /// GGUF sets it. Qwen3 sizes where `head_dim != embedding_length/head_count`
+    /// (0.6B/4B/32B) rely on this; `None` falls back to `embedding/head_count`
+    /// (llama/mistral, and the Qwen3 sizes where they happen to be equal). The
+    /// Llama dense path reads this in [`DenseLlamaDims`]; gemma4 keeps its own
+    /// per-layer head-dim handling in [`Gemma4Metadata`].
+    pub attention_key_length: Option<u32>,
+    /// RoPE uses NEOX "split-half" pairing (dim `d` rotated with `d + rope_dim/2`)
+    /// rather than the default "adjacent even/odd" pairing. llama.cpp permutes the
+    /// Q/K projection weights for LLaMA-family conversions so that the adjacent
+    /// pairing reproduces rotate-half; Qwen GGUFs are NOT permuted, so they must
+    /// be roped with split-half to match the reference. `true` for qwen3 (verified
+    /// against llama.cpp); `false` for llama/mistral/etc. The env override
+    /// `CAMELID_ROPE_PAIRING` still takes precedence for diagnostics.
+    pub rope_neox_pairing: bool,
     pub moe: Option<MixtralMoeMetadata>,
     /// Gemma 4 (`general.architecture = "gemma4"`) specific metadata. `None` for
     /// every other architecture. Holds the per-layer-type attention dims, dual
@@ -65,18 +80,20 @@ impl LlamaModelConfig {
             // Entropy-Bound diffusion sampler), and it is multimodal (image/video
             // inputs). Camelid is a decoder-only autoregressive engine (causal
             // attention, KV cache, greedy next-token decode) and cannot run the
-            // diffusion decode loop; there is also no autoregressive reference
-            // runtime to prove token parity against. Fail closed with the exact
-            // blocker rather than mis-binding the shared gemma4 tensors.
+            // diffusion decode loop through THIS runtime. DiffusionGemma is instead
+            // supported through its own dedicated lane (`DgEncoderRuntime`, the
+            // `diffusion-gemma-chat` subcommand), which is bit-exact-validated
+            // against the pinned reference. Redirect rather than mis-bind the
+            // shared gemma4 tensors onto the autoregressive path.
             Some(other) if other.to_ascii_lowercase().contains("diffusion") => {
                 return Err(BackendError::UnsupportedModelArchitecture(format!(
-                    "{other} (DiffusionGemma): blocked — DiffusionGemma is a discrete \
-                     block-diffusion encoder-decoder (bidirectional attention over a \
-                     denoising token canvas, multi-canvas iterative sampling, \
-                     cross-attention, Entropy-Bound diffusion sampler) and is \
-                     multimodal; Camelid's autoregressive decoder-only engine cannot \
-                     run the diffusion decode loop, and there is no autoregressive \
-                     reference comparator to prove parity against. Fails closed by design"
+                    "{other} (DiffusionGemma): not an autoregressive model — it is a \
+                     discrete block-diffusion encoder-decoder (bidirectional attention \
+                     over a denoising token canvas, multi-canvas iterative sampling, \
+                     Entropy-Bound diffusion sampler). The autoregressive engine cannot \
+                     run the diffusion decode loop; use the dedicated DiffusionGemma lane \
+                     instead: `camelid diffusion-gemma-chat <model.gguf>` (bit-exact \
+                     CPU-pure runtime, experimental)"
                 )))
             }
             Some(other) => return Err(BackendError::UnsupportedModelArchitecture(other.into())),
@@ -154,6 +171,20 @@ impl LlamaModelConfig {
                     )
                 }),
             file_type: gguf.metadata_u32("general.file_type"),
+            // Explicit head_dim for the dense path (gemma4 has its own per-layer
+            // head-dim handling, so don't surface it here for that arch).
+            attention_key_length: if gemma4.is_some() {
+                None
+            } else {
+                gguf.metadata_u32(&architecture_key(architecture, "attention.key_length"))
+            },
+            // Qwen3 GGUFs are not weight-permuted (unlike LLaMA conversions), so
+            // their RoPE must use NEOX split-half pairing to match llama.cpp.
+            // Verified token-identical against the pinned reference for
+            // Qwen3-1.7B Q8_0. Other unpermuted archs (qwen2/gemma3/phi3/…) very
+            // likely need this too but are out of scope and unverified, so we
+            // only flip it for the proven row here.
+            rope_neox_pairing: architecture == "qwen3",
             moe,
             gemma4,
         })
@@ -567,6 +598,16 @@ pub struct LlamaLayerTensors {
     pub attention_k: GgufTensorDescriptor,
     pub attention_v: GgufTensorDescriptor,
     pub attention_output: GgufTensorDescriptor,
+    /// Per-head RMSNorm applied to the Q projection *after* reshape-to-heads and
+    /// *before* RoPE. `Some` only for architectures that use QK-norm (Qwen3);
+    /// `None` for plain Llama-family rows (llama/mistral/qwen2/…). When `Some`
+    /// the descriptor shape is `[head_dim]`. See [`LlamaTensorBinding::bind`] for
+    /// the per-architecture presence invariant.
+    pub attention_q_norm: Option<GgufTensorDescriptor>,
+    /// Per-head RMSNorm applied to the K projection, mirroring
+    /// [`Self::attention_q_norm`]. Bound in lockstep with it (both `Some` or both
+    /// `None`).
+    pub attention_k_norm: Option<GgufTensorDescriptor>,
     pub ffn_norm: GgufTensorDescriptor,
     pub ffn: LlamaFfnTensors,
 }
@@ -621,9 +662,76 @@ impl LlamaTensorBinding {
         };
         let rope_freqs = find_tensor(gguf, "rope_freqs.weight").cloned();
 
+        // Per-architecture QK-norm classification. Qwen3 applies a per-head
+        // RMSNorm to Q and K after the projections and before RoPE
+        // (`attn_q_norm`/`attn_k_norm`, shape `[head_dim]`); the plain
+        // Llama-family rows do not. We classify every architecture that reaches
+        // this dense binder so a model can never be silently mis-bound in either
+        // direction (carrying QK-norm weights that the forward path would drop,
+        // or fabricating them where none exist).
+        let architecture = gguf.architecture().unwrap_or_default();
+        let expects_qk_norm = architecture == "qwen3";
+        let forbids_qk_norm = matches!(architecture, "llama" | "mistral" | "qwen2");
+
+        // Qwen3 sets the per-head dim explicitly via `attention.key_length` /
+        // `attention.value_length` and it is NOT guaranteed to equal
+        // `embedding_length / head_count` (0.6B/4B/32B differ). The dense path
+        // carries the explicit head_dim through `LlamaModelConfig.attention_key_length`
+        // / `DenseLlamaDims`. The engine assumes a single head_dim for K and V, so
+        // require key_length == value_length and fail closed otherwise.
+        if expects_qk_norm {
+            let key_length =
+                gguf.metadata_u32(&architecture_key(architecture, "attention.key_length"));
+            let value_length =
+                gguf.metadata_u32(&architecture_key(architecture, "attention.value_length"));
+            if let (Some(k), Some(v)) = (key_length, value_length) {
+                if k != v {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "qwen3 attention.key_length={k} != value_length={v}; the engine assumes a \
+                         single per-head dimension for K and V, so this row fails closed"
+                    )));
+                }
+            }
+        }
+
         let mut layers = Vec::with_capacity(config.block_count as usize);
         for layer_idx in 0..config.block_count {
+            let q_norm_name = format!("blk.{layer_idx}.attn_q_norm.weight");
+            let k_norm_name = format!("blk.{layer_idx}.attn_k_norm.weight");
+            let (attention_q_norm, attention_k_norm) = if expects_qk_norm {
+                // Required for Qwen3: both must be present, or fail closed.
+                let q = find_tensor(gguf, &q_norm_name).cloned();
+                let k = find_tensor(gguf, &k_norm_name).cloned();
+                if q.is_none() || k.is_none() {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "qwen3 layer {layer_idx} is missing QK-norm tensors \
+                         (attn_q_norm present: {}, attn_k_norm present: {}); Qwen3 applies \
+                         per-head RMSNorm to Q and K and cannot be run correctly without them",
+                        q.is_some(),
+                        k.is_some()
+                    )));
+                }
+                (q, k)
+            } else {
+                // Forbidden for the plain Llama-family rows: if a GGUF unexpectedly
+                // carries QK-norm tensors under one of these architectures, the
+                // forward path would silently drop them — fail closed instead.
+                if forbids_qk_norm
+                    && (find_tensor(gguf, &q_norm_name).is_some()
+                        || find_tensor(gguf, &k_norm_name).is_some())
+                {
+                    return Err(BackendError::UnsupportedModelArchitecture(format!(
+                        "architecture {architecture:?} unexpectedly carries QK-norm tensors at \
+                         layer {layer_idx} (attn_q_norm/attn_k_norm); the Llama-family forward \
+                         path does not apply them, so Camelid fails closed rather than running \
+                         a model whose weights it would silently ignore"
+                    )));
+                }
+                (None, None)
+            };
             layers.push(LlamaLayerTensors {
+                attention_q_norm,
+                attention_k_norm,
                 attention_norm: required_tensor(
                     gguf,
                     &format!("blk.{layer_idx}.attn_norm.weight"),
@@ -771,6 +879,30 @@ impl LlamaTensorBinding {
                 dims.embedding_length,
                 &format!("layer {idx} attention output"),
             )?;
+            // QK-norm (Qwen3) — per-head RMSNorm weights over the head dim. Only
+            // populated for architectures that use them; validate shape `[head_dim]`
+            // and require they appear together.
+            match (&layer.attention_q_norm, &layer.attention_k_norm) {
+                (Some(q_norm), Some(k_norm)) => {
+                    require_descriptor_shape(
+                        q_norm,
+                        &[head_dim],
+                        &format!("layer {idx} attention q_norm"),
+                    )?;
+                    require_descriptor_shape(
+                        k_norm,
+                        &[head_dim],
+                        &format!("layer {idx} attention k_norm"),
+                    )?;
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(BackendError::InvalidModelMetadata(format!(
+                        "layer {idx} has exactly one of attn_q_norm/attn_k_norm bound; QK-norm \
+                         weights must be present as a pair"
+                    )));
+                }
+            }
             require_descriptor_shape(
                 &layer.ffn_norm,
                 &[dims.embedding_length],
@@ -1149,6 +1281,10 @@ pub(crate) struct DenseLlamaDims {
     pub feed_forward_length: usize,
     pub attention_head_count_kv: usize,
     pub head_dim: usize,
+    /// Query projection width = `attention_head_count * head_dim`. Equals
+    /// `embedding_length` only when `head_dim == embedding_length/head_count`;
+    /// Qwen3 0.6B/4B/32B set an explicit larger head_dim so `q_width > embedding`.
+    pub q_width: usize,
     pub kv_width: usize,
     pub vocab_size: usize,
 }
@@ -1187,13 +1323,20 @@ impl DenseLlamaDims {
             ));
         }
 
-        let head_dim = embedding_length / attention_head_count;
+        // Prefer the GGUF's explicit per-head dim (`attention.key_length`) when
+        // present — Qwen3 0.6B/4B/32B set head_dim != embedding/head_count. Fall
+        // back to embedding/head_count for rows that don't carry it.
+        let head_dim = match config.attention_key_length {
+            Some(key_length) if key_length > 0 => key_length as usize,
+            _ => embedding_length / attention_head_count,
+        };
         Ok(Self {
             embedding_length,
             block_count: config.block_count as usize,
             feed_forward_length: config.feed_forward_length as usize,
             attention_head_count_kv,
             head_dim,
+            q_width: attention_head_count * head_dim,
             kv_width: attention_head_count_kv * head_dim,
             vocab_size,
         })

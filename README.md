@@ -8,6 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
 ![Platform: Apple Silicon · CPU](https://img.shields.io/badge/platform-Apple%20Silicon%20·%20CPU-lightgrey.svg)
+![Verified gate: TinyLlama 1.1B Q8_0](https://img.shields.io/badge/verified%20gate-TinyLlama%201.1B%20Q8__0-success.svg)
 
 </div>
 
@@ -16,6 +17,78 @@ Camelid loads GGUF models directly, serves them over a local OpenAI-style API, a
 ![Camelid WebUI chat surface](docs/assets/camelid-readme-chat-surface-dark.png)
 
 <div align="center"><sub>The local web frontend — a dark, collapsed-rail chat surface that unlocks chat only for model rows the compatibility contract recognizes.</sub></div>
+
+---
+
+## Why Camelid is different
+
+Most local runtimes optimize for breadth — "point it at any GGUF." Camelid optimizes for **trust**, and treats the boundary as the feature:
+
+- **Every claim is backed by a re-runnable receipt.** Support is per *exact* model row — a specific GGUF at a specific quant — and an optimized path ships only after it matches a reference token-for-token. No "same family, probably fine."
+- **It fails closed, on purpose.** Point it at an unsupported model and you get a typed error, not a silent wrong answer. The honest boundary *is* the product.
+- **One Rust binary, no Python.** Tokenizer, GGUF loader, CPU kernels, and the Metal GPU path all live in this repo and ship as a single static binary — `serve` even embeds the web UI.
+- **Numbers come with logs or they don't ship.** Every published benchmark links to a committed bundle with raw logs, exact commands, and versions. No raw log, no claim.
+
+---
+
+## Get started in two commands
+
+Grab the binary for your platform from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) (the chat UI is built in), then:
+
+```bash
+./camelid pull llama32_3b      # download a supported model into ./models
+./camelid serve --model models/Llama-3.2-3B-Instruct-Q8_0.gguf
+```
+
+`serve` opens the chat UI in your browser automatically. **No Python, no Node, no Docker, no separate server** — one static binary that serves the OpenAI-style API and the web UI on the same port. Full details in [Install](#install) and [Quickstart](#quickstart).
+
+Want a single command that proves the whole path end to end? `scripts/smoke.sh` pulls TinyLlama, serves it, does one real chat round-trip, and asserts on the reply — no mocks. See [Quickstart](#quickstart).
+
+<!-- TODO(tim): record and embed demo — a terminal cast of this exact supported path (serve → load TinyLlama → first token 29907/"C" → 50-token completion). Exact asciinema + svg-term commands are in assets/DEMO_RECORDING.md; replace this comment with ![…](assets/camelid-demo.svg) once rendered. -->
+<sub>📽️ A terminal cast of this exact path is on the way — see [`assets/DEMO_RECORDING.md`](assets/DEMO_RECORDING.md) for the recording recipe.</sub>
+
+### Run in the terminal
+
+Prefer the keyboard? `camelid chat` is a full-screen terminal app — Markdown-rendered replies that stream in live, a scrollable chat pane, a settings sidebar with a context gauge, a `/` command palette, and instant switching between models already loaded in the server. It attaches to a running `camelid serve` or spawns one for you. (Over a pipe, SSH without a TTY, or with `--plain`, it falls back to a scrollback-friendly line REPL.)
+
+```bash
+./camelid pull tinyllama        # the baseline supported row (or any pull alias)
+./camelid chat                  # full-screen TUI; opens the model browser, or:
+./camelid chat --model models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+```
+
+Type **`/`** to open the command palette and browse everything (filter as you type, **↑↓** to pick, **Tab**/**Enter** to run). Highlights: **`/models`** browses loaded + downloadable models, **`/switch`** flips instantly between models already loaded in the server (no reload), **`/set <temperature|top_p|top_k|max_tokens|seed|stream> <value>`** tunes sampling live, **`/system`** sets a prompt, **`/save`/`/load`** persist a session, **`/copy`** yanks the last reply to the clipboard, **`/theme`** restyles, **`/retry`** regenerates. **Tab** toggles the sidebar, **PgUp/PgDn** and the wheel scroll, **Ctrl-C** stops a stream, **Ctrl-D** quits (**F1** for the full key/command list). The model browser is built from the live support ledger (`/api/capabilities`) — it lists only **supported** rows and shows which are already downloaded. Pointing `--model` at a GGUF whose architecture Camelid doesn't support is refused with the same typed error the rest of the engine uses — the terminal is not a backdoor around the support contract. Gemma 4 12B/26B remain **two-Mac distributed only** and are not single-node chat rows.
+
+### Agent mode (preview)
+
+`camelid chat --agent --model <gguf>` runs a **sandboxed tool-calling loop**: the model reads/writes/searches files, runs shell commands, and (opt-in) fetches URLs, observing each result and iterating toward your goal — every write/exec/network action behind an **approval prompt** (`y` once · `a` this tool for the session · `n` deny · `q` abort). File tools are confined to a canonical workspace root (`--workdir`, default the current directory); path escapes (`..`, outside-absolute, escaping symlinks) are refused in code, not just discouraged. Tool results are treated as **untrusted data** — an instruction hidden in a file or web page can never make the agent escalate or run a prohibited action. The network tool is **off unless `--allow-net`**; `--auto-approve` exists for power users but warns loudly and still enforces the sandbox.
+
+**Requires a tool-capable supported row.** Agent mode is gated to models the ledger marks `tool_capable`, promoted only with a real tool-call round-trip as evidence — the same bar as the support gate. The engine renders tool definitions through each model's own chat template (canonical flat-function form, matching llama.cpp/vLLM — see [`TOOLCALL_DIAG.md`](TOOLCALL_DIAG.md)) and the loop parses the tool-call output back out; that plumbing ships and is tested.
+
+Promotion is decided by the **`camelid agent-eval --model <gguf>`** harness, which runs a fixed tool-use battery against a fixture and reports one of three outcomes with a receipt artifact: **`PASS`** (clean round-trip — eligible for promotion), **`FAIL`** (loaded but the model can't produce usable tool calls), or **`INCONCLUSIVE`** (didn't load in budget — a contended box, *not* a capability failure; re-run on a quiet host). A row's `tool_capable` flag is flipped true **only** after a `PASS` receipt — never a lucky run.
+
+**`Llama 3.2 3B Instruct Q8_0` is the first promoted row** — it earned a `PASS` receipt ([`qa/agent-eval/`](qa/agent-eval/)): with the corrected render it emits well-formed tool calls, reads the fixture, and answers correctly. So `camelid chat --agent --model models/Llama-3.2-3B-Instruct-Q8_0.gguf` runs the live loop. (The 1B is too weak — it `FAIL`s the harness with malformed args even with the correct render — so it stays gated, as does any row without a PASS receipt.) The capability moves only on harness evidence, never a claim.
+
+---
+
+## Which model should I try first?
+
+Every row below is a **supported exact row** with committed evidence; the caveat column is the real support envelope from [`STATUS.md`](STATUS.md), not marketing. The three rows in `camelid pull` are the frictionless path — pick one and you're chatting in two commands (or run `scripts/smoke.sh` for the zero-decision path).
+
+| If you want… | Try this row | One command | First-run reality (from STATUS.md) |
+|---|---|---|---|
+| **The fastest "does it work" check** | TinyLlama 1.1B Chat Q8_0 | `camelid pull tinyllama` | The baseline gate — ~1.2 GB, single-node, runs anywhere. This is exactly what `scripts/smoke.sh` exercises. |
+| **A solid single-node default** | Llama 3.2 3B Instruct Q8_0 | `camelid pull llama32_3b` | Exact-row smoke + API/WebUI, single-node Apple Silicon or CPU. Verified context is **bounded to 512/1024/2048** — longer contexts aren't a support claim yet. |
+| **A small Gemma 4** | Gemma 4 E4B-It Q8_0 | `camelid pull gemma4_e4b` | Greedy parity on **both** CPU and the Metal GPU-resident runtime, **bounded context 512→8192**. Multimodal input fails closed by design. |
+
+**Also supported — bring the official Q8_0 GGUF and point `serve` at it** (these exact rows aren't in `camelid pull` yet):
+
+- **Most capable on a 16 GB Mac — Mistral 7B Instruct v0.3 Q8_0.** Exact-row smoke with **bounded context 512→8192** and GPU-vs-CPU greedy parity; the 7B parity receipt re-verifies on a 16 GB host.
+- **Kick the tires on Qwen — Qwen3 1.7B Q8_0** (`Qwen/Qwen3-1.7B-GGUF`). **ChatML** with token-and-text parity at 1/5/50 tokens plus API smoke (thinking-disabled is the parity-locked mode). Runs on the **GPU-resident decode + single-shot prefill** path (per-head QK-norm applied in-kernel), validated token-and-text-identical to llama.cpp at a **15,373-token single-shot prefill context** (ceilings: 16,384 single-shot prefill / 40,960 KV). **Thinking mode** is available opt-in (`camelid_enable_thinking:true`): the model emits its own `<think>…</think>` reasoning, token-identical to llama.cpp for the leading trace (26–205-token envelope) before the documented f32 frontier.
+
+> **Not a single-node first demo:** **Gemma 4 12B-It** (and the 26B-A4B MoE) is supported **only** through the **two-Mac distributed serve lane** — single-node on a 16 GB host is memory-bound and **unsupported**. Treat it as a deliberate two-machine setup ([`docs/gemma4-two-mac-cluster.md`](docs/gemma4-two-mac-cluster.md)), not a casual demo.
+
+Anything not in [Supported models](#supported-models) fails closed with a typed error — that's the contract, not a limitation to work around.
 
 ---
 
@@ -45,12 +118,16 @@ Support is **per exact model row** (a specific GGUF at a specific quantization),
 | Llama 3.2 3B Instruct | Q8_0 | single-node | Exact-row smoke + API/WebUI + bounded context |
 | Llama 3 8B Instruct | Q8_0 | single-node | Exact-row + bounded context 512→2048 |
 | Mistral 7B Instruct v0.3 | Q8_0 | single-node | Exact-row smoke + bounded context 512→8192 + GPU/CPU parity |
+| **Qwen3 1.7B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens + API smoke; GPU-resident decode+prefill validated to a 15,373-token context (vs llama.cpp); thinking mode opt-in (leading-trace parity) |
+| **Qwen3 0.6B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (explicit head_dim path) |
+| **Qwen3 4B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim); one probe is a documented first-token near-tie |
+| **Qwen3 8B** | Q8_0 | single-node | Exact-row ChatML (thinking-disabled) — token+text parity at 1/5/50 tokens (untied embeddings); also on the GPU-resident decode+prefill path (same support bar vs llama.cpp), resident prefill engages at large context |
 | **Gemma 4 E2B-It** | Q8_0 | single-node (CPU + Metal) | Greedy parity + bounded context **512→8192** |
 | **Gemma 4 E4B-It** | Q8_0 | single-node (CPU + Metal) | Greedy parity + bounded context **512→8192** |
 | **Gemma 4 12B-It** | Q8_0 | two-Mac distributed | Distributed parity + serve/WebUI smoke |
 | **Gemma 4 26B-A4B-It QAT** | Q4_0 (128-expert MoE) | two-Mac distributed | Distributed parity + serve/WebUI smoke |
 
-> **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
+> **Fails closed (by design):** Mixtral-8x7B v0.1 (validation-in-progress, one-token runtime only); other Qwen3 sizes (14B/32B), base variants, Qwen3-MoE (A3B), and full-trace Qwen3 thinking-mode token-parity (thinking is available opt-in with leading-trace parity); Gemma 4 26B-A4B **Q8_0** (26.9 GB) and 31B (over the 2×16 GB envelope); Gemma 4 MTP/drafter rows; **DiffusionGemma 26B-A4B** (recognized, but a discrete block-diffusion encoder-decoder — not runnable on an autoregressive engine; see [recon](docs/recon/DIFFUSIONGEMMA_26B_A4B_RECON.md)); multimodal input; and all other quantizations in v0.1.
 
 ### Experimental lanes (not supported)
 
@@ -72,7 +149,7 @@ Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md
 | OpenAI-style API | ✅ Working | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus capability/health routes. |
 | Streaming chat | ✅ Working | SSE streaming on the chat endpoint. |
 | Apple Silicon Metal path | ✅ Working | GPU-resident prefill and decode, auto-selected when a Metal device is present; CPU fallback otherwise. |
-| Web frontend | ✅ Working | Local React/Vite chat surface; unlocks chat only for recognized model rows. |
+| Web frontend | ✅ Working | Local React/Vite chat surface, embedded in the binary and served at the same address; unlocks chat only for recognized model rows. |
 | Parity receipts | ✅ Working | Opt-in sealed record of one request; `camelid verify-receipt` re-checks it against llama.cpp (incl. 7B on a 16 GB host). |
 | Two-Mac distributed serve | ✅ Working | Layer sharding over TCP for rows too large for one 16 GB host (Gemma 4 12B, 26B-A4B). |
 | Other quantizations | ⛔ Not supported | Fail closed in v0.1. |
@@ -101,23 +178,61 @@ Both rows serve over HTTP through the same lane — set `CAMELID_GEMMA4_SERVE=1`
 
 ---
 
-## Quickstart
+## Install
 
-Build:
+Download a prebuilt binary from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) — the web UI is baked in, so there's nothing else to install:
 
 ```bash
-cargo build --release
+# macOS (Apple Silicon)
+curl -L https://github.com/timtoole02/Camelid/releases/latest/download/camelid-macos-arm64.tar.gz | tar -xz
+cd camelid-macos-arm64
+xattr -d com.apple.quarantine ./camelid 2>/dev/null || true   # allow the unsigned binary to run
+
+# Linux (x86_64): camelid-linux-x86_64.tar.gz
 ```
 
-Serve a local GGUF model (Q8_0):
+Then jump to [Quickstart](#quickstart) — `./camelid pull` to get a model, `./camelid serve --model …` to chat.
+
+## Quickstart
+
+Already have a binary from [Install](#install)? Skip to "Get a model" below. To build from source instead — the web UI is compiled into the binary, so build the frontend first and it gets embedded (one binary, no separate Node process at runtime):
+
+```bash
+(cd frontend && npm ci && npm run build)   # bundles the web UI
+cargo build --release                       # embeds it into the binary
+```
+
+### Build from source on Windows (x86_64, MSVC)
+
+Windows `x86_64-pc-windows-msvc` is a tracked CPU platform (see [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support). There is no prebuilt Windows binary yet, so build from source. Prerequisites: the **MSVC** toolchain (Visual Studio Build Tools with the C++ workload — *not* MinGW), Rust via `rustup` with the `x86_64-pc-windows-msvc` host, and Node.js for the embedded web UI. Then, in PowerShell:
+
+```powershell
+cd frontend; npm ci; npm run build; cd ..   # bundles the web UI
+cargo build --release                       # embeds it into the binary
+.\target\release\camelid.exe pull tinyllama # the baseline supported row
+.\target\release\camelid.exe serve --model models\tinyllama-1.1b-chat-v1.0.Q8_0.gguf
+```
+
+The server behaves exactly as on the other platforms (listens on `127.0.0.1:8181`, same OpenAI-style API + web UI). The TinyLlama 1.1B Chat Q8_0 baseline gate is verified on Windows with the same parity evidence as macOS/Ubuntu.
+
+> **Experimental GPU (NVIDIA/CUDA).** `cargo build --release --features cuda` adds an opt-in CUDA backend (enable at runtime with `CAMELID_CUDA_Q8=1`) that runs the Q8_0 decode matmul on the GPU. It is token-identical to the CPU reference on the tested rows but is **decode-only and not a supported lane** — the CPU path is the default and the correctness reference. Building the feature needs the [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) (12.x; CUDA libraries are loaded at runtime); running it needs an NVIDIA GPU + driver.
+
+Get a model. Camelid validates specific **Q8_0** rows (most GGUFs on the web are other quantizations and fail closed), so `pull` fetches a known-good one into `./models`:
+
+```bash
+./target/release/camelid pull              # list the supported models
+./target/release/camelid pull llama32_3b   # download Llama 3.2 3B Instruct Q8_0
+```
+
+Serve it (`pull` prints the exact command to run; the model is in `./models`):
 
 ```bash
 ./target/release/camelid serve \
-  --model /path/to/Llama-3.2-3B-Instruct-Q8_0.gguf \
+  --model models/Llama-3.2-3B-Instruct-Q8_0.gguf \
   --threads 4
 ```
 
-The server listens on `127.0.0.1:8181` by default. List the loaded model (its `id` comes from the GGUF metadata):
+The server listens on `127.0.0.1:8181` and **opens the chat UI in your browser automatically** (pass `--no-open` to disable). The same address serves the OpenAI-style API. List the loaded model (its `id` comes from the GGUF metadata):
 
 ```bash
 curl -s http://127.0.0.1:8181/v1/models
@@ -136,7 +251,7 @@ curl -s http://127.0.0.1:8181/v1/chat/completions \
   }'
 ```
 
-Run the local web frontend:
+The web frontend is served by the binary itself at the same address — no extra step. For hot-reloading frontend development, run the Vite dev server separately (it proxies to a running `camelid serve`):
 
 ```bash
 cd frontend && npm ci && npm run dev
@@ -173,6 +288,18 @@ To measure *any* local runtime — not only Camelid — by determinism, cross-ru
 
 ---
 
+## Under the hood
+
+For the reader who wants the engineering, not the pitch — a few of the genuinely interesting artifacts:
+
+- **The token-major `output.weight` guardrail.** TinyLlama had perfect tokenizer parity but *wrong first-token logits* until the final vocab projection was read as token-major rows. The fix, the rationale, and the regression guard are pinned in [`DECISIONS.md` D0007](docs/architecture/DECISIONS.md).
+- **Reproduce any supported row's parity yourself.** Each row's greedy parity is re-runnable with a committed harness against pinned llama.cpp — methodology and per-row reproduction steps in [`CORRECTNESS_v0.1.md`](docs/release/CORRECTNESS_v0.1.md).
+- **One four-row story across every surface.** README, `STATUS.md`, `/api/capabilities`, and the UI are held to the same ledger by the readiness-gate inventory in [`VALIDATION_MATRIX.md`](docs/VALIDATION_MATRIX.md) — drift on any surface is treated as a bug.
+- **Sealed, portable parity receipts.** Any greedy request can emit a SHA-256-anchored receipt that re-verifies against llama.cpp on a different machine (incl. a 7B receipt on a 16 GB Mac) — [`RECEIPTS.md`](RECEIPTS.md).
+- **Engine internals.** The from-scratch tokenizer, GGUF loader, CPU kernels, and Metal-resident pipeline are mapped in [`ARCHITECTURE.md`](docs/architecture/ARCHITECTURE.md).
+
+---
+
 ## Documentation
 
 | Doc | What's in it |
@@ -206,3 +333,13 @@ Camelid's tokenizer, reference compatibility layouts, and validation benchmarks 
 
 [ci-badge]: https://github.com/timtoole02/Camelid/actions/workflows/ci.yml/badge.svg
 [ci-workflow]: https://github.com/timtoole02/Camelid/actions/workflows/ci.yml
+
+## Star History
+
+<a href="https://www.star-history.com/?repos=timtoole02%2FCamelid&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=timtoole02/Camelid&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=timtoole02/Camelid&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=timtoole02/Camelid&type=date&legend=top-left" />
+ </picture>
+</a>

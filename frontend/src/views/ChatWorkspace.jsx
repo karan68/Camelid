@@ -1,10 +1,14 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
-import { Sparkle } from '../components/ui/Avatar'
+import { getConfiguredMaxTokens, modelContextLength, validateSendBudget } from '../lib/responseLimits'
+import { CamelidMark } from '../components/ui/CamelidMark'
+import { Avatar } from '../components/ui/Avatar'
 import { StatusDot } from '../components/ui/StatusDot'
+import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { IconSend, IconStop, IconMemory, IconReceipt, IconBolt, IconChart, IconChat, IconEdit } from '../components/ui/icons'
 import { MessageTurn } from '../components/chat/MessageTurn'
+import { ChatControls } from '../components/chat/ChatControls'
 import { PREPARING_STREAMING_LABEL, StreamingLoader } from '../components/chat/render/StreamingIndicator'
 
 const isBootstrapMessage = (message) =>
@@ -51,6 +55,7 @@ export default function ChatWorkspace({
   setComposer,
   saveToMemory,
   sendMessage,
+  resendFromMessage = null,
   stopGeneration,
   sending,
   receiptMode = false,
@@ -62,6 +67,9 @@ export default function ChatWorkspace({
   demoMode = false,
 }) {
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
+  const [showControls, setShowControls] = useState(false)
+  const [showAllMessages, setShowAllMessages] = useState(false)
+  const [userScrolledAway, setUserScrolledAway] = useState(false)
   const chatBottomRef = useRef(null)
   const composerRef = useRef(null)
   const autoFollowGenerationRef = useRef(true)
@@ -255,11 +263,14 @@ export default function ChatWorkspace({
   useEffect(() => {
     if (!generationActive) return undefined
     autoFollowGenerationRef.current = true
+    setUserScrolledAway(false)
     const updateAutoFollow = () => {
       const el = document.querySelector('.cxchat__scroll')
       if (!el) return
       const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
-      autoFollowGenerationRef.current = distanceFromBottom < 260
+      const follow = distanceFromBottom < 260
+      if (follow !== autoFollowGenerationRef.current) setUserScrolledAway(!follow)
+      autoFollowGenerationRef.current = follow
     }
     const el = document.querySelector('.cxchat__scroll')
     el?.addEventListener('scroll', updateAutoFollow, { passive: true })
@@ -321,10 +332,33 @@ export default function ChatWorkspace({
     return `${model.name} · Not loaded`
   }
 
+  /* Send-time budget check (Phase 9): mirrors the backend's real rule —
+     prompt_tokens + max_tokens must fit the context or the request gets a
+     typed context_length_exceeded error (verified: the backend rejects, it
+     does not clamp). Prompt size is a client estimate, labeled as such. */
+  const estimatedPromptTokens = useMemo(() => {
+    const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
+    const text = `${history} ${composer}`
+    const pieces = text.match(/[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]/gu) || []
+    return Math.max(1, Math.round(Math.max(pieces.length, text.length / 4)))
+  }, [visibleMessages, composer])
+  const sendBudget = validateSendBudget({
+    promptTokens: estimatedPromptTokens,
+    maxTokens: getConfiguredMaxTokens(selectedModelId),
+    contextLength: modelContextLength(selectedModel),
+  })
+
   const detailCopy = selectedModelRunnable ? selectionSummaryCopy : (supportBlocked || selectedModelIssue ? selectedCompatibilityCopy : readinessFinePrint)
 
   const renderComposer = () => (
     <div className={`cxcomposer is-${readinessState}`}>
+      {showControls && (
+        <ChatControls
+          capabilities={capabilities}
+          modelId={selectedModelId}
+          onClose={() => setShowControls(false)}
+        />
+      )}
       <div className="cxcomposer__box">
         <textarea
           ref={composerRef}
@@ -382,6 +416,17 @@ export default function ChatWorkspace({
                 <IconMemory size={16} /> {secondaryActionLabel}
               </button>
             )}
+            {!demoMode && (
+              <button
+                type="button"
+                className={`cxcomposer__tool ${showControls ? 'is-on' : ''}`}
+                aria-expanded={showControls}
+                onClick={() => setShowControls((value) => !value)}
+                title="System prompt and contract-gated sampling controls"
+              >
+                <IconBolt size={16} /> Controls
+              </button>
+            )}
           </div>
           <div className="cxcomposer__actions">
             {generationActive && (
@@ -396,7 +441,7 @@ export default function ChatWorkspace({
               data-send-ready={canSubmit ? 'true' : 'false'}
               title={!canSubmit ? sendDisabledReason : 'Send message to Camelid'}
               onClick={sendMessage}
-              disabled={!canSubmit}
+              disabled={!canSubmit || sendBudget.level === 'error'}
             >
               <IconSend size={20} />
             </button>
@@ -404,7 +449,12 @@ export default function ChatWorkspace({
         </div>
       </div>
 
-      <div className={`cxcomposer__status is-${statusTone}`} title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
+      {sendBudget.level === 'error' && (
+        <p className="cxcomposer__budget-error" role="alert">
+          <span aria-hidden="true">✕</span> {sendBudget.message}
+        </p>
+      )}
+      <div className={`cxcomposer__status is-${statusTone}`} role="status" aria-live="polite" title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
         <StatusDot tone={statusTone} pulse={selectedModelRunnable} />
         <strong className="cxcomposer__status-label">{runtimeStatusLabel}</strong>
         <span className="cxcomposer__status-sep" aria-hidden="true">·</span>
@@ -412,7 +462,14 @@ export default function ChatWorkspace({
         {selectedModel && (
           <>
             <span className="cxcomposer__status-sep" aria-hidden="true">·</span>
-            <span className="cxcomposer__status-row">{supportStatusLabel}</span>
+            <EvidenceChip
+              status={selectedChatGate.hint?.target?.status || ''}
+              state={selectedChatGate.contractSupported ? 'supported' : selectedChatGate.hint?.target?.status ? null : 'unsupported'}
+              label={supportStatusLabel}
+              source={{ rowId: selectedChatGate.hint?.target?.id, note: selectedChatGate.copy }}
+              size="sm"
+              className="cxcomposer__status-row"
+            />
           </>
         )}
       </div>
@@ -422,13 +479,13 @@ export default function ChatWorkspace({
   )
 
   return (
-    <section className={`cxchat is-${readinessState} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
+    <section className={`cxchat is-${readinessState} ${userScrolledAway ? 'is-user-scrolled' : ''} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
       <div className="cxchat__scroll">
         <div className="cxchat__column">
           {isFreshThread ? (
             <div className="cxchat__empty">
               <div className="cxchat-hero">
-                <Sparkle size={52} className="cxchat-hero__sparkle" />
+                <CamelidMark size={52} className="cxchat-hero__mark" />
                 <h2 className="cxchat-hero__title">{productHeroTitle}</h2>
                 <p className="cxchat-hero__summary">{productHeroSummary}</p>
               </div>
@@ -452,10 +509,21 @@ export default function ChatWorkspace({
                   ))}
                 </div>
               )}
-              {visibleMessages.map((message, index) => {
-                const priorUserPrompt = message.role === 'assistant'
-                  ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')?.content
+              {/* Long-thread windowing (Phase 7): render the latest 60 turns;
+                  earlier turns mount on demand. Keeps streaming smooth without
+                  a virtualization dependency. */}
+              {!showAllMessages && visibleMessages.length > 60 && (
+                <button type="button" className="cxchat__show-earlier" onClick={() => setShowAllMessages(true)}>
+                  Show {visibleMessages.length - 60} earlier messages
+                </button>
+              )}
+              {(showAllMessages ? visibleMessages : visibleMessages.slice(-60)).map((message) => {
+                const index = visibleMessages.indexOf(message)
+                const priorUserMessage = message.role === 'assistant'
+                  ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')
                   : null
+                const priorUserPrompt = priorUserMessage?.content || null
+                const canResend = Boolean(resendFromMessage) && !generationActive && selectedModelRunnable
                 return (
                   <MessageTurn
                     key={message.id}
@@ -463,16 +531,28 @@ export default function ChatWorkspace({
                     generationElapsedSeconds={generationElapsedSeconds}
                     priorUserPrompt={priorUserPrompt}
                     onReusePrompt={setComposer}
+                    onRegenerate={canResend && priorUserMessage ? () => resendFromMessage(priorUserMessage.id) : null}
+                    onEditResend={canResend && message.role === 'user' ? (messageId, content) => resendFromMessage(messageId, content) : null}
                   />
                 )
               })}
+              {generationActive && (
+                <button
+                  type="button"
+                  className="cxchat__jump-latest"
+                  data-autofollow-affordance
+                  onClick={() => { autoFollowGenerationRef.current = true; setUserScrolledAway(false); chatBottomRef.current?.scrollIntoView({ block: 'end' }) }}
+                >
+                  ↓ jump to latest
+                </button>
+              )}
               {awaitingAssistant && (
                 <>
                   {pendingUserPrompt && (
                     <article className="cxturn cxturn--user"><div className="cxturn__user-chip"><p>{pendingUserPrompt}</p></div></article>
                   )}
                   <article className="cxturn cxturn--assistant is-streaming" aria-busy="true" data-streaming-state="active">
-                    <div className="cxturn__avatar"><Sparkle size={30} /></div>
+                    <div className="cxturn__avatar"><Avatar size={30} state="awaiting" /></div>
                     <div className="cxturn__body"><StreamingLoader elapsedSeconds={generationElapsedSeconds} label={PREPARING_STREAMING_LABEL} /></div>
                   </article>
                 </>

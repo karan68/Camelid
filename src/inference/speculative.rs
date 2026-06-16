@@ -124,9 +124,14 @@ pub struct ModelDrafter {
 
 impl ModelDrafter {
     pub fn new(mut session: LlamaInferenceSession) -> Self {
-        // The draft session lives on the CPU path: rollback requires
-        // CPU-authoritative KV state.
-        session.set_resident_paths_disabled(true);
+        // Route the draft session's GPU resident engine to the dedicated drafter
+        // cache so it coexists with the target's engine. Resident decode stays
+        // enabled (the draft model runs fast on the GPU); rollback of rejected
+        // drafts uses `rollback_resident_to_position`, which resets the engine's
+        // `filled` so the GPU KV (still valid up to the accepted prefix) is trusted
+        // rather than reseeded. If the draft engine doesn't fit in VRAM it falls
+        // back to the CPU path per token automatically.
+        session.set_is_drafter(true);
         Self {
             session,
             committed: 0,
@@ -146,7 +151,8 @@ impl ModelDrafter {
             .zip(self.speculative_fed.iter())
             .take_while(|(token, fed)| token == fed)
             .count();
-        self.session.rollback_to_position(self.committed + reuse)?;
+        self.session
+            .rollback_resident_to_position(self.committed + reuse)?;
         self.committed += reuse;
         self.speculative_fed.clear();
         let pending = &history[self.committed..];

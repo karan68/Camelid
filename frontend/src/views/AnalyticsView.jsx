@@ -1,4 +1,5 @@
-import { capabilityStatusTone, displayCapabilityCopy, displayCapabilityId, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, guardedCapabilityCopy, isGuardedCapabilityStatus } from '../lib/capabilities'
+import { displayCapabilityCopy, displayCapabilityId, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, guardedCapabilityCopy, isGuardedCapabilityStatus } from '../lib/capabilities'
+import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { formatCompactNumber, formatDate, formatRate } from '../lib/formatters'
 import { isRunnableModel } from '../lib/modelState'
 import { EmptyState } from '../components/ui/EmptyState'
@@ -227,13 +228,13 @@ export default function AnalyticsView({ conversations, models, runtime, capabili
               <strong>Guarded compatibility rows</strong>
               <p className="cxv-sub">{summarizeGuardedTargets(compatibilityTargets)}</p>
               {guardedTargets.slice(0, 4).map((target) => (
-                <p className="cxv-sub" key={target.id}><b className={capabilityStatusTone(target.status)}>{target.id}</b>: {formatCapabilityStatus(target.status)} — {displayCapabilityCopy(target.next_step || 'Guarded until evidence lands.')}</p>
+                <p className="cxv-sub" key={target.id}><EvidenceChip status={target.status} source={{ rowId: target.id }} size="sm" /> <b>{target.id}</b> — {displayCapabilityCopy(target.next_step || 'Guarded until evidence lands.')}</p>
               ))}
             </div>
             <div className="cxv-card cxv-card--flat">
               <strong>Unsupported / partial API rows</strong>
               {guardedFeatures.length ? guardedFeatures.slice(0, 4).map((feature) => (
-                <p className="cxv-sub" key={feature.id}><b className={capabilityStatusTone(feature.status)}>{displayCapabilityId(feature.id)}</b>: {formatCapabilityStatus(feature.status)} — {displayCapabilityCopy(guardedCapabilityCopy(feature, 'Analytics-driven shortcuts and UI controls'))}</p>
+                <p className="cxv-sub" key={feature.id}><EvidenceChip status={feature.status} source={{ rowId: feature.id }} size="sm" /> <b>{displayCapabilityId(feature.id)}</b> — {displayCapabilityCopy(guardedCapabilityCopy(feature, 'Analytics-driven shortcuts and UI controls'))}</p>
               )) : <p className="cxv-sub">No unsupported or partial API rows advertised.</p>}
             </div>
           </div>

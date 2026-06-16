@@ -1,22 +1,25 @@
 import { useMemo } from 'react'
-import { Sparkle } from '../ui/Avatar'
+import { CamelidMark } from '../ui/CamelidMark'
 import { StatusDot } from '../ui/StatusDot'
 import { ThemeToggle } from '../ui/ThemeToggle'
 import { Tooltip } from '../ui/Tooltip'
 import { ConversationListItem } from './ConversationListItem'
 import {
-  IconAnalytics, IconApi, IconChat, IconHistory, IconMemory, IconModels,
-  IconNetwork, IconNewChat, IconSearch, IconSettings, IconSidebar, IconSystem,
+  IconAnalytics, IconApi, IconChart, IconChat, IconHistory, IconMemory, IconModels,
+  IconNetwork, IconNewChat, IconObservatory, IconReceipt, IconSearch, IconSettings, IconSidebar, IconSystem,
 } from '../ui/icons'
 
 const NAV = [
   { tab: 'library', label: 'Models', Icon: IconModels },
   { tab: 'history', label: 'Chat history', Icon: IconHistory },
   { tab: 'analytics', label: 'Analytics', Icon: IconAnalytics },
+  { tab: 'telemetry', label: 'Telemetry', Icon: IconChart },
   { tab: 'memory', label: 'Memory', Icon: IconMemory },
   { tab: 'system', label: 'System', Icon: IconSystem },
   { tab: 'api', label: 'API', Icon: IconApi },
+  { tab: 'compatibility', label: 'Compatibility', Icon: IconReceipt },
   { tab: 'cluster', label: 'Cluster', Icon: IconNetwork },
+  { tab: 'observatory', label: 'Inference Observatory', Icon: IconObservatory },
   { tab: 'settings', label: 'Settings', Icon: IconSettings },
 ]
 
@@ -102,7 +105,7 @@ export function SidebarRail({
     <aside className="rail" id="camelid-sidebar" aria-label="Navigation sidebar">
       <div className="rail__header">
         <button type="button" className="rail__brand" onClick={showNewChatLanding} aria-label="Camelid home">
-          <Sparkle size={24} />
+          <CamelidMark size={24} />
           <span className="rail__brand-name">Camelid</span>
         </button>
         <button type="button" className="rail__icon-btn" aria-label="Collapse sidebar" onClick={onToggleCollapsed}>

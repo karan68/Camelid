@@ -1,6 +1,6 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react'
 import { NodeCard, NODE_W, NODE_H } from './NodeCard'
-import { Sparkle } from '../ui/Avatar'
+import { CamelidMark } from '../ui/CamelidMark'
 import { Button } from '../ui/Button'
 import { CONNECTION_TYPE_BY, statusTone } from '../../lib/clusterModel'
 import { IconFit, IconZoomIn, IconZoomOut, IconGrid, IconNetwork, IconPlus } from '../ui/icons'
@@ -188,7 +188,7 @@ export const TopologyCanvas = forwardRef(function TopologyCanvas({
         <div className="cluster-empty">
           <div className="cluster-empty__art" aria-hidden="true">
             <span className="cluster-empty__node"><IconNetwork size={30} /></span>
-            <span className="cluster-empty__node cluster-empty__node--sm"><Sparkle size={22} /></span>
+            <span className="cluster-empty__node cluster-empty__node--sm"><CamelidMark size={22} /></span>
             <span className="cluster-empty__node cluster-empty__node--sm cluster-empty__node--alt" />
           </div>
           <h3>No cluster nodes yet.</h3>

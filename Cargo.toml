@@ -1,6 +1,6 @@
 [package]
 name = "camelid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.87"
 description = "Camelid: a Rust-native local GGUF inference backend with evidence-gated model compatibility"
@@ -19,8 +19,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 minijinja = { version = "2", features = ["json"] }
+rust-embed = { version = "8", features = ["mime-guess"] }
 libc = "0.2"
 rayon = "1"
+ratatui = "0.29"
+rustyline = "14"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
@@ -30,6 +33,37 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 metal = "0.31"
+
+[target.'cfg(windows)'.dependencies]
+# Read-only file mapping for the GGUF wire path. The Unix path uses raw libc
+# mmap; Windows uses memmap2 (CreateFileMapping/MapViewOfFile under the hood).
+memmap2 = "0.9"
+# GetSystemInfo (page size) and GetProcessMemoryInfo (peak working set).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+# Optional CUDA backend (additive, gated behind `--features cuda`). The CPU path
+# stays the default and the correctness reference; CUDA must reproduce the same
+# parity evidence. Not built on macOS (Metal is the GPU lane there). Driver API
+# + runtime NVRTC kernel compilation; CUDA libraries are loaded dynamically at
+# runtime, so no build-time CUDA linking is required.
+[target.'cfg(all(not(target_os = "macos")))'.dependencies]
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-12090",
+    "fallback-dynamic-loading",
+], optional = true }
+
+[features]
+# Off by default: the CPU reference path is the default build and the parity
+# reference. Enable with `cargo build --features cuda` on a CUDA host.
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
