@@ -8,9 +8,8 @@
 //! produced tokens are identical. The kernels are validated against small CPU
 //! references in this file before being assembled into the per-token forward.
 //!
-//! The whole module is behind `#[cfg(feature = "cuda")]`; nothing here compiles
-//! into the default build.
-#![cfg(feature = "cuda")]
+//! The whole module is behind `#[cfg(feature = "cuda")]` (applied to the `mod`
+//! declaration in `lib.rs`); nothing here compiles into the default build.
 
 use std::sync::Arc;
 

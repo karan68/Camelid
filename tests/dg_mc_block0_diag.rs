@@ -92,7 +92,10 @@ fn dg_mc_block0_step0_ladder() {
         (Ok(scp), Ok(tinv)) => {
             let sc_logits = read_f32(Path::new(&scp));
             let temp_inv: f32 = tinv.parse().expect("temp_inv");
-            eprintln!("SC-ACTIVE diag: sc_len={} temp_inv={temp_inv}", sc_logits.len());
+            eprintln!(
+                "SC-ACTIVE diag: sc_len={} temp_inv={temp_inv}",
+                sc_logits.len()
+            );
             let sc = camelid::diffusion_gemma::DgScInput {
                 logits: &sc_logits,
                 temp_inv,
@@ -273,10 +276,16 @@ fn dg_mc_block0_step0_ladder() {
                 );
                 note("result_output(canvas)".into(), false, &mut first_divergent);
             } else {
-                eprintln!("  result_output(canvas): BIT-EXACT ({} logits)", logits.len());
+                eprintln!(
+                    "  result_output(canvas): BIT-EXACT ({} logits)",
+                    logits.len()
+                );
             }
         } else {
-            eprintln!("  result_output: ref too small ({} floats), skipped", ro.len());
+            eprintln!(
+                "  result_output: ref too small ({} floats), skipped",
+                ro.len()
+            );
         }
     }
 

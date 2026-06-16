@@ -87,8 +87,8 @@ impl LlamaModelConfig {
             // shared gemma4 tensors onto the autoregressive path.
             Some(other) if other.to_ascii_lowercase().contains("diffusion") => {
                 return Err(BackendError::UnsupportedModelArchitecture(format!(
-                    "{other} (DiffusionGemma): not an autoregressive model — it is a \
-                     discrete block-diffusion encoder-decoder (bidirectional attention \
+                    "{other} (DiffusionGemma): blocked — not an autoregressive model. \
+                     It is a discrete block-diffusion encoder-decoder (bidirectional attention \
                      over a denoising token canvas, multi-canvas iterative sampling, \
                      Entropy-Bound diffusion sampler). The autoregressive engine cannot \
                      run the diffusion decode loop; use the dedicated DiffusionGemma lane \

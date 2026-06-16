@@ -21,6 +21,10 @@ use crate::tensor::f16_round;
 // The reference calls the system libm f32 functions directly; Rust's
 // f32::sin/cos/exp/tanh may lower differently (1-ulp scatter observed on
 // rope angles). Bind the exact symbols.
+// Only the macOS path constructs this (the __sincosf_stret return struct);
+// elsewhere libm_sincosf uses Rust's f32::sin/cos, so gate it to avoid a
+// dead-code warning on non-Apple targets.
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct SinCosF32 {
     sinval: f32,

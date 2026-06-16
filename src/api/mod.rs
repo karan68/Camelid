@@ -3882,19 +3882,17 @@ async fn get_or_load_model(
 
     let target_id = if let Some(id) = model_id {
         id.to_string()
+    } else if let Some(active) = state.active_model_id.read().await.as_ref() {
+        active.clone()
+    } else if loaded_models.len() == 1 {
+        loaded_models.keys().next().unwrap().clone()
     } else {
-        if let Some(active) = state.active_model_id.read().await.as_ref() {
-            active.clone()
-        } else if loaded_models.len() == 1 {
-            loaded_models.keys().next().unwrap().clone()
-        } else {
-            return Err(api_error(
-                StatusCode::NOT_FOUND,
-                "model_not_loaded",
-                BackendError::ModelNotLoaded.to_string(),
-                None,
-            ));
-        }
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "model_not_loaded",
+            BackendError::ModelNotLoaded.to_string(),
+            None,
+        ));
     };
 
     if let Some(loaded) = loaded_models.get(&target_id) {
@@ -8495,8 +8493,7 @@ fn render_mistral_instruct_prompt_with_tools(
                 prompt.push_str("[TOOL_RESULTS] ");
                 prompt.push_str(&format!(
                     "{{\"content\": {}, \"call_id\": \"{}\"}}",
-                    serde_json::to_string(message.content.trim())
-                        .unwrap_or_else(|_| "\"\"".into()),
+                    serde_json::to_string(message.content.trim()).unwrap_or_else(|_| "\"\"".into()),
                     id
                 ));
                 prompt.push_str("[/TOOL_RESULTS]");
@@ -8536,8 +8533,8 @@ fn agent_call_to_mistral_json(content: &str, id: &str) -> String {
         if let Some(paren) = line.find('(') {
             let name = &line[..paren];
             let args_str = &line[paren + 1..line.len().saturating_sub(1)];
-            let args: serde_json::Value =
-                serde_json::from_str(args_str).unwrap_or(serde_json::Value::Object(Default::default()));
+            let args: serde_json::Value = serde_json::from_str(args_str)
+                .unwrap_or(serde_json::Value::Object(Default::default()));
             calls.push(serde_json::json!({
                 "name": name,
                 "arguments": args,
@@ -10167,7 +10164,10 @@ mod tests {
         assert!(rendered.starts_with("<s>[AVAILABLE_TOOLS] "));
         assert!(rendered.contains("[/AVAILABLE_TOOLS]"));
         assert!(rendered.contains("[INST] Read notes.txt [/INST]"));
-        assert!(rendered.contains("\"name\":\"read_file\"") || rendered.contains("\"name\": \"read_file\""));
+        assert!(
+            rendered.contains("\"name\":\"read_file\"")
+                || rendered.contains("\"name\": \"read_file\"")
+        );
     }
 
     #[test]
@@ -10239,7 +10239,10 @@ mod tests {
         let rendered = render_mistral_instruct_prompt_with_tools(&messages, &tokenizer, &tools);
 
         assert!(rendered.contains("[TOOL_CALLS] "));
-        assert!(rendered.contains("\"name\":\"read_file\"") || rendered.contains("\"name\": \"read_file\""));
+        assert!(
+            rendered.contains("\"name\":\"read_file\"")
+                || rendered.contains("\"name\": \"read_file\"")
+        );
         assert!(rendered.contains("[TOOL_RESULTS] "));
         assert!(rendered.contains("call_id"));
         assert!(rendered.contains("[/TOOL_RESULTS]"));

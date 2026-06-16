@@ -80,18 +80,22 @@ fn dg_chat_wrapper_matches_pinned_llamacpp() {
             ours[first], reference[first], ours, reference
         );
     }
-    eprintln!("render+tokenize parity: PASS ({} prompt tokens)", ours.len());
+    eprintln!(
+        "render+tokenize parity: PASS ({} prompt tokens)",
+        ours.len()
+    );
 
     // (2) detokenize parity.
     let resp_ids = read_i32(&resp_ids_p);
     let ours_text = chat.decode_response(&resp_ids).expect("decode_response");
-    let reference_text = std::fs::read_to_string(&resp_txt_p)
-        .unwrap_or_else(|e| panic!("read {resp_txt_p}: {e}"));
+    let reference_text =
+        std::fs::read_to_string(&resp_txt_p).unwrap_or_else(|e| panic!("read {resp_txt_p}: {e}"));
     // The reference text file may carry a single trailing newline from the
     // dumper's `printf("%s\n", ...)`; compare on the exact detok payload.
     let reference_text = reference_text.strip_suffix('\n').unwrap_or(&reference_text);
     assert_eq!(
-        ours_text, reference_text,
+        ours_text,
+        reference_text,
         "detokenize parity FAILED:\nours len={} reference len={}",
         ours_text.len(),
         reference_text.len()
