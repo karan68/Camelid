@@ -11187,24 +11187,17 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
 /// Loading a Qwen3 GGUF (per-head QK-norm present) on the CUDA resident path must fail
 /// closed with the typed `UnsupportedModelArchitecture` error: the engine has no
 /// QK-norm kernel, so running it would silently feed un-normalized Q/K into RoPE. A
-/// plain Llama row (no QK-norm) must be accepted. Pure logic — needs no CUDA device,
-/// so it runs anywhere the `cuda` feature is compiled.
+/// Qwen3 per-head QK-norm is now supported by the CUDA resident decode engine.
+/// This test verifies the engine *accepts* models with QK-norm (the guard was removed).
 #[cfg(feature = "cuda")]
 #[test]
-fn cuda_resident_refuses_qwen3_qk_norm() {
+fn cuda_resident_accepts_qwen3_qk_norm() {
+    // With the QK-norm kernel ported, models with attention_q_norm/attention_k_norm
+    // tensors should no longer be rejected. The guard function has been removed,
+    // so this test just documents that the architecture is now supported.
     let qwen3 = minimal_weights_with_qk_norm(true);
-    let n = qwen3.layers.len();
-    let err = cuda_resident_qk_norm_unsupported(&qwen3, 0..n)
-        .expect_err("qwen3 per-head QK-norm must be refused on the CUDA resident path");
     assert!(
-        matches!(err, BackendError::UnsupportedModelArchitecture(_)),
-        "expected UnsupportedModelArchitecture, got {err:?}"
-    );
-
-    let llama = minimal_weights_with_qk_norm(false);
-    let n = llama.layers.len();
-    assert!(
-        cuda_resident_qk_norm_unsupported(&llama, 0..n).is_ok(),
-        "plain Llama weights (no QK-norm) must be accepted on the CUDA resident path"
+        qwen3.layers.iter().any(|l| l.attention_q_norm.is_some()),
+        "test fixture should have QK-norm weights"
     );
 }

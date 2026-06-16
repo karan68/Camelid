@@ -770,6 +770,8 @@ fn support_level(row: &str) -> String {
         "supported_exact_row_smoke_512_1024_2048".into()
     } else if normalized.contains("mistral_7b_instruct_v0_3") {
         "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
+    } else if normalized.contains("qwen3") {
+        "supported_exact_row_smoke_512_1024_2048".into()
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
         "bounded_runtime_only_unsupported".into()
     } else {

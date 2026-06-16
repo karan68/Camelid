@@ -207,7 +207,7 @@ fn full_forward_token_matches_cpu() {
 
     // Build the GPU engine.
     let mut engine = CudaResidentDecode::new(
-        n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps,
+        n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps, false,
     )
     .unwrap();
     for l in &layers {
@@ -362,7 +362,7 @@ fn prefill_then_decode_matches_sequential() {
     }
     let build_engine = |layers: &[LayerF], final_norm: &[f32], output_w: &[u8]| {
         let mut engine = CudaResidentDecode::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps, false,
         )
         .unwrap();
         for l in layers {
@@ -640,7 +640,7 @@ fn verify_batch_matches_sequential() {
     let output_w = quantize_blocks(&rand(&mut rng, vocab * hidden), hidden);
     let build = || {
         let mut e = CudaResidentDecode::new(
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps,
+            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps, false,
         )
         .unwrap();
         for l in &layers {
@@ -962,4 +962,162 @@ fn attention_decode_matches_cpu() {
     k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
     k.ctx.synchronize().unwrap();
     assert!(close(&got, &expected, 1e-4), "attention diverged");
+}
+
+// ---- QK-norm per-head parity ----
+
+fn cpu_rms_norm_per_head(input: &[f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0f32; n_heads * head_dim];
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        let slice = &input[base..base + head_dim];
+        let sum: f32 = slice.iter().map(|v| v * v).sum::<f32>();
+        let scale = 1.0 / (sum / head_dim as f32 + eps).sqrt();
+        for i in 0..head_dim {
+            out[base + i] = slice[i] * scale * weight[i];
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore] // requires CUDA device
+fn rms_norm_per_head_parity() {
+    let k = CudaResidentKernels::new().unwrap();
+    let n_heads = 4usize;
+    let head_dim = 64usize;
+    let eps = 1e-6f32;
+    let total = n_heads * head_dim;
+
+    let input: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.01 - 1.28).sin()).collect();
+    let weight: Vec<f32> = (0..head_dim).map(|i| 1.0 + (i as f32) * 0.001).collect();
+
+    let expected = cpu_rms_norm_per_head(&input, &weight, n_heads, head_dim, eps);
+
+    let mut d_buf = k.stream.clone_htod(&input).unwrap();
+    let d_weight = k.stream.clone_htod(&weight).unwrap();
+
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (head_dim as u32) * 4,
+    };
+    let (hd_i, uw) = (head_dim as i32, 1i32);
+    let mut b = k.stream.launch_builder(&k.rms_norm_per_head);
+    b.arg(&mut d_buf).arg(&d_weight).arg(&hd_i).arg(&eps).arg(&uw);
+    unsafe { b.launch(cfg).unwrap() };
+
+    let mut got = vec![0f32; total];
+    k.stream.memcpy_dtoh(&d_buf, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 1e-5), "rms_norm_per_head diverged\ngot: {:?}\nexp: {:?}", &got[..8], &expected[..8]);
+}
+
+// ---- Split-half RoPE parity ----
+
+fn cpu_rope_split_half(vec: &mut [f32], cos: &[f32], sin: &[f32], n_heads: usize, head_dim: usize, rope_dim: usize) {
+    let pairs = rope_dim / 2;
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for p in 0..pairs {
+            let d0 = p;
+            let d1 = p + pairs;
+            let x0 = vec[base + d0];
+            let x1 = vec[base + d1];
+            let c = cos[p];
+            let s = sin[p];
+            vec[base + d0] = x0 * c - x1 * s;
+            vec[base + d1] = x0 * s + x1 * c;
+        }
+    }
+}
+
+#[test]
+#[ignore] // requires CUDA device
+fn rope_split_half_parity() {
+    let k = CudaResidentKernels::new().unwrap();
+    let n_heads = 4usize;
+    let head_dim = 64usize;
+    let rope_dim = 64usize;
+    let pairs = rope_dim / 2;
+    let total = n_heads * head_dim;
+
+    let input: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.1).sin()).collect();
+    let cos: Vec<f32> = (0..pairs).map(|p| ((p as f32) * 0.05).cos()).collect();
+    let sin: Vec<f32> = (0..pairs).map(|p| ((p as f32) * 0.05).sin()).collect();
+
+    let mut expected = input.clone();
+    cpu_rope_split_half(&mut expected, &cos, &sin, n_heads, head_dim, rope_dim);
+
+    let mut d_vec = k.stream.clone_htod(&input).unwrap();
+    let d_cos = k.stream.clone_htod(&cos).unwrap();
+    let d_sin = k.stream.clone_htod(&sin).unwrap();
+
+    let grid_total = (n_heads * pairs) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_total.div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nh, hd, rd, pairing) = (n_heads as i32, head_dim as i32, rope_dim as i32, 1i32);
+    let mut b = k.stream.launch_builder(&k.rope);
+    b.arg(&mut d_vec).arg(&d_cos).arg(&d_sin).arg(&nh).arg(&hd).arg(&rd).arg(&pairing);
+    unsafe { b.launch(cfg).unwrap() };
+
+    let mut got = vec![0f32; total];
+    k.stream.memcpy_dtoh(&d_vec, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 1e-6), "rope_split_half diverged\ngot: {:?}\nexp: {:?}", &got[..8], &expected[..8]);
+}
+
+// ---- Adjacent-even-odd RoPE still works (regression check) ----
+
+#[test]
+#[ignore] // requires CUDA device
+fn rope_adjacent_parity() {
+    let k = CudaResidentKernels::new().unwrap();
+    let n_heads = 4usize;
+    let head_dim = 64usize;
+    let rope_dim = 64usize;
+    let pairs = rope_dim / 2;
+    let total = n_heads * head_dim;
+
+    let input: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.1).cos()).collect();
+    let cos: Vec<f32> = (0..pairs).map(|p| ((p as f32) * 0.03).cos()).collect();
+    let sin: Vec<f32> = (0..pairs).map(|p| ((p as f32) * 0.03).sin()).collect();
+
+    let mut expected = input.clone();
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        for p in 0..pairs {
+            let d0 = 2 * p;
+            let d1 = d0 + 1;
+            let x0 = expected[base + d0];
+            let x1 = expected[base + d1];
+            let c = cos[p];
+            let s = sin[p];
+            expected[base + d0] = x0 * c - x1 * s;
+            expected[base + d1] = x0 * s + x1 * c;
+        }
+    }
+
+    let mut d_vec = k.stream.clone_htod(&input).unwrap();
+    let d_cos = k.stream.clone_htod(&cos).unwrap();
+    let d_sin = k.stream.clone_htod(&sin).unwrap();
+
+    let grid_total = (n_heads * pairs) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_total.div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nh, hd, rd, pairing) = (n_heads as i32, head_dim as i32, rope_dim as i32, 0i32);
+    let mut b = k.stream.launch_builder(&k.rope);
+    b.arg(&mut d_vec).arg(&d_cos).arg(&d_sin).arg(&nh).arg(&hd).arg(&rd).arg(&pairing);
+    unsafe { b.launch(cfg).unwrap() };
+
+    let mut got = vec![0f32; total];
+    k.stream.memcpy_dtoh(&d_vec, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 1e-6), "rope_adjacent diverged\ngot: {:?}\nexp: {:?}", &got[..8], &expected[..8]);
 }

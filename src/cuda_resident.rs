@@ -114,6 +114,37 @@ extern "C" __global__ void rms_norm_f32(
     for (int i = tid; i < n; i += blockDim.x) out[i] = xs[i] * scale * weight[i];
 }
 
+// ---- Per-head RMSNorm (Qwen3 QK-norm): one block per head, serial sum ------
+// Applies RMSNorm in-place to each head's head_dim slice. Weight is [head_dim]
+// and shared across all heads. The sum-of-squares uses the same serial-in-shared-
+// memory strategy as rms_norm_f32 to match CPU ordering (thread 0 sums, all apply).
+// In-place safe: reads to shared memory before writing back.
+extern "C" __global__ void rms_norm_per_head_f32(
+    float* __restrict__ buf,
+    const float* __restrict__ weight,
+    int head_dim, float eps, int use_weight
+) {
+    extern __shared__ float xs[];
+    __shared__ float s_scale;
+    int head = blockIdx.x;
+    int tid = threadIdx.x;
+    int base = head * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) xs[i] = buf[base + i];
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < head_dim; i++) sum += xs[i] * xs[i];
+        s_scale = 1.0f / sqrtf(sum / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float v = xs[i] * scale;
+        if (use_weight != 0) v *= weight[i];
+        buf[base + i] = v;
+    }
+}
+
 // ---- Quantize f32 row to Q8_0 blocks (matches quantize_q8_0_block) ---------
 // One thread per 32-value block. scale is f16-rounded; quants use the unrounded
 // inverse and round-half-to-even, clamped to [-128, 127].
@@ -267,10 +298,11 @@ extern "C" __global__ void q8_gemm_batched(
     }
 }
 
-// ---- RoPE: adjacent-even-odd, forward. cos/sin are per-pair (rope_dim/2). ---
+// ---- RoPE: supports adjacent-even-odd (pairing=0) and split-half/NEOX (pairing=1).
+// cos/sin are per-pair (rope_dim/2). ---
 extern "C" __global__ void rope_rotate(
     float* __restrict__ vec, const float* __restrict__ cos_t, const float* __restrict__ sin_t,
-    int n_heads, int head_dim, int rope_dim
+    int n_heads, int head_dim, int rope_dim, int pairing
 ) {
     int pairs = rope_dim >> 1;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -279,7 +311,12 @@ extern "C" __global__ void rope_rotate(
     int pair = idx % pairs;
     float c = cos_t[pair], s = sin_t[pair];
     float* h = vec + (long)head * head_dim;
-    int d0 = 2 * pair, d1 = d0 + 1;
+    int d0, d1;
+    if (pairing == 0) {
+        d0 = 2 * pair; d1 = d0 + 1;
+    } else {
+        d0 = pair; d1 = pair + pairs;
+    }
     float x0 = h[d0], x1 = h[d1];
     h[d0] = x0 * c - x1 * s;
     h[d1] = x0 * s + x1 * c;
@@ -483,7 +520,7 @@ extern "C" __global__ void rms_norm_batched(
 // RoPE for K tokens; cos/sin are per-token tables [token][rope_dim/2].
 extern "C" __global__ void rope_batched(
     float* __restrict__ vec, const float* __restrict__ cos_t, const float* __restrict__ sin_t,
-    int n_heads, int head_dim, int rope_dim, int per_token_dim, int half, int k_tokens
+    int n_heads, int head_dim, int rope_dim, int per_token_dim, int half, int k_tokens, int pairing
 ) {
     int pairs = rope_dim >> 1;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -495,7 +532,12 @@ extern "C" __global__ void rope_batched(
     int pair = rem % pairs;
     float c = cos_t[(long)t * half + pair], s = sin_t[(long)t * half + pair];
     float* h = vec + (long)t * per_token_dim + (long)head * head_dim;
-    int d0 = 2 * pair, d1 = d0 + 1;
+    int d0, d1;
+    if (pairing == 0) {
+        d0 = 2 * pair; d1 = d0 + 1;
+    } else {
+        d0 = pair; d1 = pair + pairs;
+    }
     float x0 = h[d0], x1 = h[d1];
     h[d0] = x0 * c - x1 * s;
     h[d1] = x0 * s + x1 * c;
@@ -614,6 +656,7 @@ pub struct CudaResidentKernels {
     pub(crate) ctx: Arc<CudaContext>,
     pub(crate) stream: Arc<CudaStream>,
     pub(crate) rms_norm: CudaFunction,
+    pub(crate) rms_norm_per_head: CudaFunction,
     pub(crate) quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
     pub(crate) rope: CudaFunction,
@@ -653,6 +696,7 @@ impl CudaResidentKernels {
         };
         Ok(Self {
             rms_norm: f("rms_norm_f32")?,
+            rms_norm_per_head: f("rms_norm_per_head_f32")?,
             quantize: f("quantize_q8_0")?,
             gemv: f("q8_gemv")?,
             rope: f("rope_rotate")?,
@@ -844,6 +888,7 @@ fn launch_rope_batched(
     rope_dim: usize,
     per_token_dim: usize,
     k: usize,
+    pairing: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     let half = rope_dim / 2;
     let total = (k * n_heads * half) as u32;
@@ -869,7 +914,8 @@ fn launch_rope_batched(
         .arg(&rd)
         .arg(&ptd)
         .arg(&hf)
-        .arg(&ki);
+        .arg(&ki)
+        .arg(&pairing);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -991,6 +1037,7 @@ fn launch_rope(
     n_heads: usize,
     head_dim: usize,
     rope_dim: usize,
+    pairing: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     let total = (n_heads * (rope_dim / 2)) as u32;
     let cfg = LaunchConfig {
@@ -1000,7 +1047,29 @@ fn launch_rope(
     };
     let (nh, hd, rd) = (n_heads as i32, head_dim as i32, rope_dim as i32);
     let mut b = s.launch_builder(f);
-    b.arg(vec).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&rd);
+    b.arg(vec).arg(cos).arg(sin).arg(&nh).arg(&hd).arg(&rd).arg(&pairing);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_rms_norm_per_head(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    buf: &mut CudaSlice<f32>,
+    weight: &CudaSlice<f32>,
+    head_count: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (head_count as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: (head_dim as u32) * 4,
+    };
+    let (hd, uw) = (head_dim as i32, 1i32);
+    let mut b = s.launch_builder(f);
+    b.arg(buf).arg(weight).arg(&hd).arg(&eps).arg(&uw);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -1256,6 +1325,8 @@ struct ResidentLayer {
     down: CudaSlice<u8>,
     attn_norm: CudaSlice<f32>,
     ffn_norm: CudaSlice<f32>,
+    q_norm: Option<CudaSlice<f32>>,
+    k_norm: Option<CudaSlice<f32>>,
     offloaded: Option<OffloadedLayer>,
 }
 
@@ -1285,6 +1356,7 @@ pub struct CudaResidentDecode {
     eps: f32,
     q_width: usize,
     kv_width: usize,
+    split_half_pairing: bool,
     layers: Vec<ResidentLayer>,
     final_norm: CudaSlice<f32>,
     output_weight: CudaSlice<u8>,
@@ -1382,6 +1454,7 @@ impl CudaResidentDecode {
         max_pos: usize,
         vocab: usize,
         eps: f32,
+        split_half_pairing: bool,
     ) -> Result<Self, String> {
         let k = CudaResidentKernels::new()?;
         let s = &k.stream;
@@ -1410,6 +1483,7 @@ impl CudaResidentDecode {
             eps,
             q_width,
             kv_width,
+            split_half_pairing,
             layers: Vec::with_capacity(n_layers),
             final_norm: alloc_f(hidden)?,
             output_weight: s.alloc_zeros::<u8>(1).map_err(|e| format!("alloc: {e}"))?,
@@ -1457,7 +1531,7 @@ impl CudaResidentDecode {
         ffn_norm: &[f32],
     ) -> Result<(), String> {
         // Default: every layer resident in VRAM (unchanged behavior).
-        self.set_layer_located(q, kk, v, o, gate, up, down, attn_norm, ffn_norm, true)
+        self.set_layer_located(q, kk, v, o, gate, up, down, attn_norm, ffn_norm, None, None, true)
     }
 
     /// As `set_layer`, but `resident` chooses where the projection weights live:
@@ -1476,6 +1550,8 @@ impl CudaResidentDecode {
         down: &[u8],
         attn_norm: &[f32],
         ffn_norm: &[f32],
+        q_norm: Option<&[f32]>,
+        k_norm: Option<&[f32]>,
         resident: bool,
     ) -> Result<(), String> {
         let ctx = &self.k.ctx;
@@ -1483,6 +1559,8 @@ impl CudaResidentDecode {
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
         let projections = [q, kk, v, o, gate, up, down];
         let (attn_norm, ffn_norm) = (up_f(attn_norm)?, up_f(ffn_norm)?);
+        let q_norm_gpu = q_norm.map(|w| up_f(w)).transpose()?;
+        let k_norm_gpu = k_norm.map(|w| up_f(w)).transpose()?;
 
         if resident {
             // Resident: each projection uploaded once to its own VRAM slice; no
@@ -1501,6 +1579,8 @@ impl CudaResidentDecode {
                 down: vram(projections[6])?,
                 attn_norm,
                 ffn_norm,
+                q_norm: q_norm_gpu,
+                k_norm: k_norm_gpu,
                 offloaded: None,
             });
             return Ok(());
@@ -1534,6 +1614,8 @@ impl CudaResidentDecode {
             down: ph()?,
             attn_norm,
             ffn_norm,
+            q_norm: q_norm_gpu,
+            k_norm: k_norm_gpu,
             offloaded: Some(OffloadedLayer { host: pinned, off }),
         });
         Ok(())
@@ -1937,7 +2019,21 @@ impl CudaResidentDecode {
                 &mut self.d_v,
             )
             .map_err(map)?;
+            // Qwen3 QK-norm: per-head RMSNorm on Q and K after projection, before RoPE
+            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm) {
+                launch_rms_norm_per_head(
+                    &s, &self.k.rms_norm_per_head,
+                    &mut self.d_q, qn,
+                    self.n_heads, self.head_dim, self.eps,
+                ).map_err(map)?;
+                launch_rms_norm_per_head(
+                    &s, &self.k.rms_norm_per_head,
+                    &mut self.d_k, kn,
+                    self.n_kv_heads, self.head_dim, self.eps,
+                ).map_err(map)?;
+            }
             // RoPE on Q and K
+            let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
             launch_rope(
                 &s,
                 &self.k.rope,
@@ -1947,6 +2043,7 @@ impl CudaResidentDecode {
                 self.n_heads,
                 self.head_dim,
                 self.rope_dim,
+                pairing,
             )
             .map_err(map)?;
             launch_rope(
@@ -1958,6 +2055,7 @@ impl CudaResidentDecode {
                 self.n_kv_heads,
                 self.head_dim,
                 self.rope_dim,
+                pairing,
             )
             .map_err(map)?;
             // KV write
@@ -2513,6 +2611,20 @@ impl CudaResidentDecode {
                 &mut sc.vv,
             )
             .map_err(map)?;
+            // Qwen3 QK-norm (batched): per-head RMSNorm on Q and K
+            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm) {
+                launch_rms_norm_per_head(
+                    &s, &self.k.rms_norm_per_head,
+                    &mut sc.vq, qn,
+                    k * n_heads, head_dim, eps,
+                ).map_err(map)?;
+                launch_rms_norm_per_head(
+                    &s, &self.k.rms_norm_per_head,
+                    &mut sc.vk, kn,
+                    k * n_kv, head_dim, eps,
+                ).map_err(map)?;
+            }
+            let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
             launch_rope_batched(
                 &s,
                 &self.k.rope_batched,
@@ -2524,6 +2636,7 @@ impl CudaResidentDecode {
                 rope_dim,
                 q_width,
                 k,
+                pairing,
             )
             .map_err(map)?;
             launch_rope_batched(
@@ -2537,6 +2650,7 @@ impl CudaResidentDecode {
                 rope_dim,
                 kv_width,
                 k,
+                pairing,
             )
             .map_err(map)?;
             launch_kv_scatter_batched(
