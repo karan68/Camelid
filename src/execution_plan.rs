@@ -770,6 +770,17 @@ fn support_level(row: &str) -> String {
         "supported_exact_row_smoke_512_1024_2048".into()
     } else if normalized.contains("mistral_7b_instruct_v0_3") {
         "supported_exact_row_smoke_512_1024_2048_4096_8192".into()
+    } else if normalized.contains("qwen3_0_6b_instruct")
+        || normalized.contains("qwen3_1_7b_instruct")
+        || normalized.contains("qwen3_4b_instruct")
+        || normalized.contains("qwen3_8b_instruct")
+    {
+        // Dense Qwen3 Q8_0 ChatML rows (thinking disabled), validated token+text
+        // identical to llama.cpp at 1/5/50 on the cpu_reference path and on the
+        // x86_64 runtime-repack/AVX2 Q8 path (parity re-validated on Windows).
+        // Scoped to the short-chat smoke envelope; MoE (A3B), base variants, other
+        // sizes/quants, longer context, and thinking-mode are NOT covered.
+        "supported_exact_row_smoke_chatml".into()
     } else if normalized.contains("mixtral_8x7b_instruct_v0_1") {
         "bounded_runtime_only_unsupported".into()
     } else {
@@ -783,6 +794,7 @@ fn is_supported_exact_q8_row(row: &str) -> bool {
         "supported_current_gate"
             | "supported_exact_row_smoke_512_1024_2048_4096_8192"
             | "supported_exact_row_smoke_512_1024_2048"
+            | "supported_exact_row_smoke_chatml"
     )
 }
 
@@ -2042,5 +2054,39 @@ mod tests {
         );
         assert_eq!(outcome.plan.selected_q8_path, "mac_validated_q8_0_repack");
         clear_profile_env();
+    }
+
+    #[test]
+    fn qwen3_rows_select_validated_x86_q8_plan() {
+        let _guard = env_lock();
+        for name in [
+            "Qwen3-0.6B-Instruct-Q8_0.gguf",
+            "Qwen3-1.7B-Instruct-Q8_0.gguf",
+            "Qwen3-4B-Instruct-Q8_0.gguf",
+            "Qwen3-8B-Instruct-Q8_0.gguf",
+        ] {
+            clear_profile_env();
+            let outcome = plan_for_model_with_platform(
+                &PathBuf::from(format!("/tmp/{name}")),
+                &fixture(name),
+                None,
+                platform("windows", "x86_64", &["avx2"]),
+            );
+            assert_eq!(
+                outcome.plan.support_level, "supported_exact_row_smoke_chatml",
+                "row {name} support_level"
+            );
+            // Supported Qwen3 Q8 rows engage the validated x86_64 runtime-repack/AVX2
+            // plan (not the scalar safe path), matching the other supported Q8 rows.
+            assert_eq!(
+                outcome.plan.selected_backend, "cpu_q8_runtime_repack",
+                "row {name} backend"
+            );
+            assert_eq!(
+                outcome.plan.selected_q8_path, "x86_experimental_q8_0_avx2_rust",
+                "row {name} q8 path"
+            );
+            clear_profile_env();
+        }
     }
 }
