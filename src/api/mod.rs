@@ -2100,7 +2100,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and the 0.6B/1.7B/4B rows additionally on Windows CUDA GPU-resident decode+single-shot prefill (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; token+text identical to cpu_reference/llama.cpp at 1/5/50; 8B does not fit 6 GB VRAM); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -7001,8 +7001,15 @@ fn generate_token_ids(
     // so the served run and any later verify re-run fold an identical forward (a cache hit skips
     // the prompt forwards on one side only, which would desync the digest).
     let want_execution_trace = crate::inference::deterministic_mode_enabled();
+    // The GPU-resident CUDA decode engine reuses a cached prompt-prefix session by
+    // reseeding the GPU KV from the f16-rounded host history and resuming, which is not
+    // bit-identical to a fresh GPU prefill (different reduction order) and flips
+    // near-tie tokens. Bypass the cache whenever that engine drives decode so every
+    // request takes the clean prefill path; the CPU lane stays reduction-order-stable
+    // and keeps the cache.
+    let resident_cuda_active = crate::inference::resident_decode_cuda_active();
 
-    if !prepared.collect_dense_diagnostics && !want_execution_trace {
+    if !prepared.collect_dense_diagnostics && !want_execution_trace && !resident_cuda_active {
         if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
             prepared.session = cached.session.clone();
             // The cached session's resident-path pin reflects the request
@@ -7253,7 +7260,12 @@ fn generate_token_ids(
             && generated.is_empty()
             && !prepared.collect_dense_diagnostics
             && step.diagnostics.is_none()
+            && !resident_cuda_active
         {
+            // Don't cache a GPU-prefilled session: it can only be replayed bit-exactly
+            // by a fresh GPU prefill, and the lookup above is skipped while the resident
+            // CUDA engine is active anyway. Keeping it out also avoids a CPU request
+            // (after a GPU-off toggle) reusing a GPU-built (f16-seeded) session.
             store_prompt_prefix_cache(&prepared, &step);
         }
         if generated.is_empty() && !reused_prompt_prefix {
@@ -9281,6 +9293,7 @@ mod tests {
             thread_count: 16,
             diagnostics_status: "standard diagnostics; RSS timings disabled by default".into(),
             fallback_path: "retained_q8_reference_path".into(),
+            cuda_resident_active: false,
             reasons: vec!["default-off Ubuntu x86_64 experiment selected".into()],
         };
 

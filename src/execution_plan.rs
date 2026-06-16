@@ -104,6 +104,11 @@ pub struct ExecutionPlan {
     pub thread_count: usize,
     pub diagnostics_status: String,
     pub fallback_path: String,
+    /// True when the GPU-resident CUDA decode engine drives decode for this process
+    /// (surfaced in `/api/capabilities` so a loaded row reports the live GPU path). The
+    /// `selected_backend`/`decode_path` above carry the `cuda_resident_q8_*` labels when
+    /// this is set; mirrors the Metal lane's `metal_available` capabilities signal.
+    pub cuda_resident_active: bool,
     pub reasons: Vec<String>,
 }
 
@@ -326,6 +331,7 @@ pub fn plan_for_model_with_platform(
         thread_count,
         diagnostics_status,
         fallback_path: fallback_path.to_string(),
+        cuda_resident_active: platform.cuda_resident_active,
         reasons,
     };
     ExecutionPlanOutcome { plan, env_updates }
@@ -489,10 +495,10 @@ fn select_x86_q8_plan(
         // are mutually exclusive on weight storage). The CPU repack path only wins when
         // the CPU actually runs decode (no GPU, GPU toggled off, or deterministic mode).
         reasons.push(
-            "CUDA resident decode active; keeping plain Q8_0 blocks for the GPU (CPU rows4 repack disabled while the GPU drives decode)"
+            "CUDA resident decode active; GPU-resident Q8_0 engine drives decode (weights stay plain RAM-resident Q8_0 blocks — the CPU rows4 repack is disabled while the GPU drives decode)"
                 .into(),
         );
-        return safe_q8_plan();
+        return cuda_resident_q8_plan();
     }
     if env_flag_disabled("CAMELID_X86_Q8_REPACK") || env_flag_disabled("CAMELID_X86_Q8_KERNEL") {
         reasons.push(
@@ -718,6 +724,32 @@ fn safe_q8_plan() -> (
         "safe_cpu_prefill",
         "always_retained_reference_path",
         "safe_cpu_decode",
+        "retained_q8_reference_path",
+    )
+}
+
+/// Plan labels when the GPU-resident CUDA decode engine drives this process (the NVIDIA
+/// analog of `metal_resident_q8_runtime`). Weights stay plain RAM-resident Q8_0 blocks —
+/// the engine uploads them to VRAM once and decodes on-device; the CPU rows4 repack is
+/// disabled because the GPU consumes the plain blocks. The `retained_q8_reference_path`
+/// CPU plan remains the in-process fallback for any token/config the resident gates
+/// reject. Validated token-AND-text-identical to the CPU reference (transitively
+/// llama.cpp) on the dense Qwen3 Q8_0 ChatML rows; see the COMPATIBILITY.md Windows CUDA
+/// section and the `qwen3-*-windows-cuda-resident-parity-*` evidence bundles.
+fn cuda_resident_q8_plan() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    (
+        "cuda_resident_q8_runtime",
+        "cuda_resident_q8_0_wire",
+        "q8_0_cuda_resident_prefill",
+        "resident_single_shot_prefill",
+        "q8_0_cuda_resident_decode",
         "retained_q8_reference_path",
     )
 }
@@ -1039,6 +1071,13 @@ mod tests {
         }
     }
 
+    fn cuda_platform(os: &str, arch: &str, features: &[&str]) -> PlanPlatform {
+        PlanPlatform {
+            cuda_resident_active: true,
+            ..platform(os, arch, features)
+        }
+    }
+
     fn fixture(name: &str) -> GgufFile {
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -1156,6 +1195,52 @@ mod tests {
             Some(&Some("off"))
         );
         env::remove_var("CAMELID_METAL_RESIDENT_DECODE");
+        clear_profile_env();
+    }
+
+    #[test]
+    fn windows_cuda_resident_plan_selected_when_engine_active() {
+        let _guard = env_lock();
+        clear_profile_env();
+        // A supported Qwen3 Q8_0 row on a Windows x86_64 host where the CUDA resident
+        // decode engine is active: the plan surfaces the GPU-resident backend/decode
+        // labels and reports cuda_resident_active, while keeping the row's
+        // supported_exact_row_smoke_chatml support level (engine-agnostic).
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Qwen3-0.6B-Q8_0.gguf"),
+            &fixture("Qwen3 0.6B Instruct"),
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "cuda_resident_q8_runtime");
+        assert_eq!(outcome.plan.decode_path, "q8_0_cuda_resident_decode");
+        assert_eq!(outcome.plan.prefill_path, "q8_0_cuda_resident_prefill");
+        assert!(outcome.plan.cuda_resident_active);
+        assert_eq!(
+            outcome.plan.support_level, "supported_exact_row_smoke_chatml",
+            "GPU lane reuses the row-keyed support level (Phase 1 design)"
+        );
+        // The GPU consumes plain Q8_0 blocks: the x86 rows4 repack must NOT be enabled.
+        assert_ne!(
+            outcome.env_updates.get("CAMELID_X86_Q8_REPACK"),
+            Some(&Some("on"))
+        );
+        clear_profile_env();
+    }
+
+    #[test]
+    fn windows_cuda_resident_inactive_keeps_cpu_repack_plan() {
+        let _guard = env_lock();
+        clear_profile_env();
+        // Same row/host but no active CUDA engine: the validated x86_64 CPU repack plan.
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/tmp/Qwen3-0.6B-Q8_0.gguf"),
+            &fixture("Qwen3 0.6B Instruct"),
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(outcome.plan.selected_backend, "cpu_q8_runtime_repack");
+        assert!(!outcome.plan.cuda_resident_active);
         clear_profile_env();
     }
 

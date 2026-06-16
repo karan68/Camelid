@@ -9891,6 +9891,18 @@ fn resident_decode_cuda_enabled() -> bool {
     false
 }
 
+/// Public predicate mirroring `resident_decode_cuda_enabled` for callers outside the
+/// decode hot path (the prompt-prefix cache in the API). When true, the GPU-resident
+/// CUDA engine drives this process's decode, and reusing a cached prompt-prefix session
+/// is NOT bit-identical to a fresh GPU prefill: a cache hit reseeds the GPU KV from the
+/// f16-rounded host history and resumes, a different reduction order than a clean GPU
+/// prefill, which flips borderline (near-tie) tokens. The CPU lane is reduction-order
+/// stable, so it keeps the cache; the GPU lane must bypass it — exactly as deterministic
+/// mode already bypasses the cache on the CPU lane.
+pub fn resident_decode_cuda_active() -> bool {
+    resident_decode_cuda_enabled()
+}
+
 /// Maximum sequence length the CUDA resident engine keeps on the GPU. The GPU KV
 /// cache is allocated once at this many positions, so it directly sets the engine's
 /// VRAM footprint (≈ n_layers·n_kv·head_dim·2·4 bytes per position) on top of the
