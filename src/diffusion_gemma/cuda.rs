@@ -180,7 +180,9 @@ fn build_engine() -> Result<Engine, String> {
         ..Default::default()
     };
     let ptx = compile_ptx_with_opts(KERNEL, opts).map_err(|e| format!("nvrtc: {e}"))?;
-    let m = ctx.load_module(ptx).map_err(|e| format!("load_module: {e}"))?;
+    let m = ctx
+        .load_module(ptx)
+        .map_err(|e| format!("load_module: {e}"))?;
     let sc_func = m
         .load_function("sc_soft_embedding")
         .map_err(|e| format!("load sc_soft_embedding: {e}"))?;

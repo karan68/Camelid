@@ -94,7 +94,12 @@ fn lm_head_gpu(wire: &DgWire, acts: &[DgActivation], c: usize, hidden: usize) ->
     cuda::lm_head_q6k_gpu(bytes, wire.rows, bpr, &scales, &quants, c)
 }
 #[cfg(not(feature = "cuda"))]
-fn lm_head_gpu(_wire: &DgWire, _acts: &[DgActivation], _c: usize, _hidden: usize) -> Option<Vec<f32>> {
+fn lm_head_gpu(
+    _wire: &DgWire,
+    _acts: &[DgActivation],
+    _c: usize,
+    _hidden: usize,
+) -> Option<Vec<f32>> {
     None
 }
 
