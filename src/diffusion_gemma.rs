@@ -31,44 +31,29 @@ pub mod refrng;
 
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
-// Expert-selection argsort that bit-exactly matches the reference's
-// `ggml_argsort_top_k` (libc++ `std::sort` over indices by DESC key, with the
-// strict no-tie-break comparator — UNSTABLE tie order). Implemented as a C++
-// shim (src/dg_argsort.cpp) so the tie order is the SAME libc++ std::sort as
-// the pinned reference build, rather than a fragile hand-port of clang's
-// introsort. Camelid's prior `sort_unstable_by(...).then(idx)` forced
-// lower-index-first ties, which swapped equal-probability experts' slots and
-// perturbed the MoE weighted-sum accumulation order.
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn dg_argsort_desc_f32(keys: *const f32, n: i32, out_idx: *mut i32);
-    fn dg_argsort_asc_f32(keys: *const f32, n: i32, out_idx: *mut i32);
-}
+// Expert-selection argsort matching the reference's `ggml_argsort_top_k`
+// comparator. The reference's CPU path is libc++ `std::sort` over expert indices
+// with the STRICT, no-tie-break comparator (`keys[a] > keys[b]` for DESC). That
+// sort is *unstable*: for an exact-equal key tie (a true probability tie) the
+// relative order is libc++-introsort-internal.
+//
+// This is a pure-Rust implementation (no C/C++ shim). Every NON-tie comparison
+// is identical to the reference because the comparator is the same strict
+// `>`/`<`; only exact f32 ties are resolved differently (we break them by lower
+// index, which is deterministic). An unspecified libc++ introsort tie-order
+// cannot be reproduced portably, and the lane's Apple-specific math bindings
+// (`__sincosf_stret`, vDSP) already place non-macOS targets out of bit-parity
+// with the pinned reference regardless. On Apple Silicon, exact-tie bit-parity
+// against the reference is therefore no longer guaranteed once the C++ shim is
+// removed; re-validate the encoder/decode parity gates on a Mac if that matters
+// (the shim is recoverable from git history). See DIFFUSIONGEMMA_RECON.md.
+//
+// Sorting by the bit-exact router LOGITS with `>` is comparison-identical to the
+// reference sorting softmax `selection_probs` (softmax is strictly monotonic:
+// logit[a] > logit[b] <=> prob[a] > prob[b], and equal logits <=> equal probs).
 
-/// Indices `[0..keys.len())` ordered by DESCENDING `keys`, matching the
-/// reference's libc++ `std::sort` (including its unstable tie order). Use the
-/// bit-exact router logits as the key (comparison-identical to softmax probs).
-#[cfg(target_os = "macos")]
-fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
-    let mut out = vec![0i32; keys.len()];
-    // SAFETY: out has keys.len() slots; the shim writes exactly that many.
-    unsafe { dg_argsort_desc_f32(keys.as_ptr(), keys.len() as i32, out.as_mut_ptr()) };
-    out
-}
-
-/// Indices ordered by ASCENDING `keys` via the same libc++ `std::sort` — for
-/// the EB sampler's MI-bound position ordering (reference sorts positions by
-/// entropy with `std::sort`, strict `<`, unstable tie order).
-#[cfg(target_os = "macos")]
-fn argsort_asc_libcpp(keys: &[f32]) -> Vec<i32> {
-    let mut out = vec![0i32; keys.len()];
-    unsafe { dg_argsort_asc_f32(keys.as_ptr(), keys.len() as i32, out.as_mut_ptr()) };
-    out
-}
-
-/// Non-macOS fallback (the lane is Apple-Silicon-only; this keeps other
-/// targets compiling): descending key with lower-index tie-break.
-#[cfg(not(target_os = "macos"))]
+/// Indices `[0..keys.len())` ordered by DESCENDING `keys` (strict `>`, lower
+/// index breaks exact ties). Use the bit-exact router logits as the key.
 fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
     let mut out: Vec<i32> = (0..keys.len() as i32).collect();
     out.sort_unstable_by(|&a, &b| {
@@ -80,7 +65,9 @@ fn argsort_desc_experts(keys: &[f32]) -> Vec<i32> {
     out
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Indices ordered by ASCENDING `keys` (strict `<`, lower index breaks exact
+/// ties) — the EB sampler's MI-bound position ordering (reference sorts
+/// positions by entropy with `std::sort`, strict `<`).
 fn argsort_asc_libcpp(keys: &[f32]) -> Vec<i32> {
     let mut out: Vec<i32> = (0..keys.len() as i32).collect();
     out.sort_unstable_by(|&a, &b| {
@@ -253,6 +240,29 @@ impl DgWire {
         self.in_dim / self.format.values_per_block() * self.format.bytes_per_block()
     }
 
+    /// One weight row (raw wire bytes) dotted with one quantized activation,
+    /// dispatched by format. This IS the reference reduction order (the `_arm`
+    /// kernels, which dispatch to bit-identical AVX2 on x86_64).
+    #[inline]
+    fn dot_row(&self, row: &[u8], x: &DgActivation) -> f32 {
+        match self.format {
+            DgFormat::Q8_0 => refmath::q8_0_dot_arm(row, &x.q8_0),
+            DgFormat::Q5_0 => refmath::q5_0_dot_arm(row, &x.q8_0),
+            DgFormat::Q4K => refmath::q4_k_dot_arm(
+                row,
+                x.q8_k
+                    .as_ref()
+                    .expect("K-quant rows imply 256-aligned input"),
+            ),
+            DgFormat::Q6K => refmath::q6_k_dot_arm(
+                row,
+                x.q8_k
+                    .as_ref()
+                    .expect("K-quant rows imply 256-aligned input"),
+            ),
+        }
+    }
+
     /// y[r] = dequant(W[first_row + r]) · x for `n_rows` rows.
     fn matvec_rows(&self, first_row: usize, n_rows: usize, x: &DgActivation) -> Result<Vec<f32>> {
         if first_row + n_rows > self.rows {
@@ -266,49 +276,22 @@ impl DgWire {
         let bytes = self
             .mmap
             .bytes(self.offset + (first_row * rb) as u64, n_rows * rb)?;
-        let dot = |r: usize| -> f32 {
-            let row = &bytes[r * rb..(r + 1) * rb];
-            match self.format {
-                DgFormat::Q8_0 => refmath::q8_0_dot_arm(row, &x.q8_0),
-                DgFormat::Q5_0 => refmath::q5_0_dot_arm(row, &x.q8_0),
-                DgFormat::Q4K => refmath::q4_k_dot_arm(
-                    row,
-                    x.q8_k
-                        .as_ref()
-                        .expect("K-quant rows imply 256-aligned input"),
-                ),
-                DgFormat::Q6K => refmath::q6_k_dot_arm(
-                    row,
-                    x.q8_k
-                        .as_ref()
-                        .expect("K-quant rows imply 256-aligned input"),
-                ),
-            }
-        };
         let mut out = vec![0f32; n_rows];
-        // Row-chunk threading: every output element is one self-contained row
-        // dot, so splitting ROWS across threads cannot change any value (the
-        // reference's own mul_mat threads partition the same way). Small
-        // matvecs stay sequential — thread spawn would dominate.
-        let nth = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(8);
-        if nth <= 1 || n_rows * self.in_dim < (1 << 21) {
+        // Row-parallel matvec: every output element is one self-contained row
+        // dot over the same input, so distributing ROWS across threads cannot
+        // change any value (no shared reduction; each y[r] is written once).
+        // The result is bit-identical to the serial path regardless of thread
+        // count — the reference's own mul_mat threads partition the same way.
+        // Uses the global rayon pool (no per-call OS-thread spawn); small
+        // matvecs stay serial because the fork/join would dominate.
+        if n_rows * self.in_dim < (1 << 18) {
             for (r, y) in out.iter_mut().enumerate() {
-                *y = dot(r);
+                *y = self.dot_row(&bytes[r * rb..(r + 1) * rb], x);
             }
         } else {
-            let chunk = n_rows.div_ceil(nth);
-            std::thread::scope(|s| {
-                for (ci, ys) in out.chunks_mut(chunk).enumerate() {
-                    let dot = &dot;
-                    s.spawn(move || {
-                        for (i, y) in ys.iter_mut().enumerate() {
-                            *y = dot(ci * chunk + i);
-                        }
-                    });
-                }
+            use rayon::prelude::*;
+            out.par_iter_mut().enumerate().for_each(|(r, y)| {
+                *y = self.dot_row(&bytes[r * rb..(r + 1) * rb], x);
             });
         }
         Ok(out)
@@ -818,8 +801,8 @@ impl DgEncoderRuntime {
                 let mut probs: Vec<f32> = logits.clone();
                 refmath::softmax_row(&mut probs);
                 // expert ORDER must match the reference's ggml_argsort_top_k =
-                // libc++ std::sort over DESC router logits (unstable tie order;
-                // see dg_argsort.cpp). Sorting by the bit-exact logits is
+                // libc++ std::sort over DESC router logits (strict `>`; see
+                // argsort_desc_experts). Sorting by the bit-exact logits is
                 // comparison-identical to sorting softmax probs.
                 let order = argsort_desc_experts(&logits);
                 let mut idx: Vec<usize> = order[..self.n_expert_used]
@@ -1209,10 +1192,14 @@ impl DgEncoderRuntime {
         let embed_scale = (hidden as f32).sqrt();
 
         // self-conditioning signal per canvas position (graph order: the SC
-        // subgraph feeds the canvas embedding)
+        // subgraph feeds the canvas embedding). When use_sc == 0 (step 0) the
+        // signal is added as `sv * 0` below — i.e. discarded — so skip the
+        // ~1.9e11-MAC soft-embedding matmul entirely. Bit-identical: every
+        // embedding row is left unchanged either way (the reference's step-0
+        // graph likewise contributes nothing).
         let sigs = match sc {
-            Some(sc_in) => Some(self.sc_signal(sc_in, c)?),
-            None => None,
+            Some(sc_in) if sc_in.use_sc != 0.0 => Some(self.sc_signal(sc_in, c)?),
+            _ => None,
         };
 
         // embeddings: every row scaled by sqrt(n_embd); canvas rows add the
@@ -1246,6 +1233,8 @@ impl DgEncoderRuntime {
         let canvas_prompt_lo = p as i64 - win as i64 + 1;
 
         let mut traces = Vec::with_capacity(if want_trace { self.n_layer } else { 0 });
+        let dg_prof = std::env::var("CAMELID_DG_STAGE_TIMINGS").is_ok();
+        let (mut t_qkv, mut t_attn, mut t_ffn) = (0u128, 0u128, 0u128);
         for (l, lw) in self.layers.iter().enumerate() {
             let sliding = self.g.is_sliding_layer(l);
             let head_dim = self.g.head_dim_at(l) as usize;
@@ -1265,6 +1254,7 @@ impl DgEncoderRuntime {
             let mut qs: Vec<Vec<f32>> = Vec::with_capacity(n);
             let mut ks: Vec<Vec<f32>> = Vec::with_capacity(n);
             let mut vs: Vec<Vec<f32>> = Vec::with_capacity(n);
+            let _t_qkv = std::time::Instant::now();
             for (pos, hp) in h.iter().enumerate() {
                 let xn = refmath::rms_norm(hp, Some(&lw.attn_norm), eps);
                 let xq = DgActivation::new(&xn);
@@ -1292,6 +1282,8 @@ impl DgEncoderRuntime {
                 vs.push(v);
             }
 
+            t_qkv += _t_qkv.elapsed().as_nanos();
+            let _t_attn = std::time::Instant::now();
             // region-aware mask (llm_graph_input_attn_diffusion::set_input):
             // prompt queries causal over the prompt only (SWA-clipped on
             // sliding layers); canvas queries bidirectional — global layers
@@ -1370,6 +1362,8 @@ impl DgEncoderRuntime {
                 }
             }
 
+            t_attn += _t_attn.elapsed().as_nanos();
+            let _t_ffn = std::time::Instant::now();
             // ---- dense shared-expert MLP + 128-expert MoE (identical math
             // to the encoder path; only the per-layer output scalar is
             // region-aware) ----
@@ -1413,9 +1407,9 @@ impl DgEncoderRuntime {
                 let mut probs: Vec<f32> = logits.clone();
                 refmath::softmax_row(&mut probs);
                 // expert ORDER must match the reference's ggml_argsort_top_k =
-                // libc++ std::sort over DESC router logits (unstable tie order;
-                // see dg_argsort.cpp) — NOT lower-index-first, which swapped
-                // equal-prob experts' slots and perturbed the weighted sum.
+                // libc++ std::sort over DESC router logits (strict `>`; see
+                // argsort_desc_experts). Exact ties break by lower index (the
+                // reference's introsort tie-order is not portably reproducible).
                 let order = argsort_desc_experts(&logits);
                 let idx: Vec<usize> = order[..self.n_expert_used]
                     .iter()
@@ -1493,6 +1487,7 @@ impl DgEncoderRuntime {
                 }
             }
 
+            t_ffn += _t_ffn.elapsed().as_nanos();
             if want_trace {
                 let mut k_flat = Vec::with_capacity(n * kv_dim);
                 let mut v_flat = Vec::with_capacity(n * kv_dim);
@@ -1525,6 +1520,7 @@ impl DgEncoderRuntime {
 
         // final norm on every row; lm_head (tied Q6_K token embedding) +
         // final-logit softcapping on the CANVAS rows only (the gate surface)
+        let _t_lm = std::time::Instant::now();
         let n_vocab = self.token_embd.rows;
         let mut result_norm_all = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
         let mut logits = Vec::with_capacity(c * n_vocab);
@@ -1546,6 +1542,15 @@ impl DgEncoderRuntime {
             if want_trace {
                 result_norm_all.extend_from_slice(&rn);
             }
+        }
+        if dg_prof {
+            eprintln!(
+                "[dg-prof] qkv={}ms attn={}ms ffn+moe={}ms lm_head={}ms (n={n} c={c})",
+                t_qkv / 1_000_000,
+                t_attn / 1_000_000,
+                t_ffn / 1_000_000,
+                _t_lm.elapsed().as_millis(),
+            );
         }
 
         let trace = want_trace.then(|| DgEncoderTrace {
@@ -1920,6 +1925,22 @@ mod tests {
         // the same f16 produce the identical output
         let y = x + 1e-6;
         assert_eq!(dg_gelu(x).to_bits(), dg_gelu(y).to_bits());
+    }
+
+    #[test]
+    fn dg_argsort_orders_and_breaks_ties_by_index() {
+        // DESC: strictly decreasing key order; the comparator matches the
+        // reference's ggml_argsort_top_k (`keys[a] > keys[b]`).
+        let keys = [0.1f32, 0.9, 0.5, 0.3];
+        assert_eq!(argsort_desc_experts(&keys), vec![1, 2, 3, 0]);
+        // ASC: strictly increasing key order (EB MI-bound position ordering).
+        assert_eq!(argsort_asc_libcpp(&keys), vec![0, 3, 2, 1]);
+        // Exact ties resolve by lower index, deterministically, in both orders.
+        let tied = [0.5f32, 0.5, 0.2, 0.5];
+        assert_eq!(argsort_desc_experts(&tied), vec![0, 1, 3, 2]);
+        assert_eq!(argsort_asc_libcpp(&tied), vec![2, 0, 1, 3]);
+        // Pure-Rust path is deterministic: same input -> same order every call.
+        assert_eq!(argsort_desc_experts(&tied), argsort_desc_experts(&tied));
     }
 
     #[test]

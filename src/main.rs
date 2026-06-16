@@ -459,6 +459,11 @@ enum Command {
         /// Max ubatch (the whole [prefix | canvas] must fit in one ubatch).
         #[arg(long, default_value_t = 1100)]
         max_ubatch: i32,
+        /// Override the EB sampler's max denoise steps per block (reference
+        /// default 48, with adaptive early stop). Lower it (e.g. 1-2) for a
+        /// fast correctness signal — each step is a full bidirectional forward.
+        #[arg(long)]
+        max_steps: Option<i32>,
     },
     /// Serve the TAIL layers of a Gemma 4 model as a distributed worker
     /// (layer sharding over TCP; pair with gemma4-master on the other Mac).
@@ -1080,6 +1085,7 @@ async fn main() -> anyhow::Result<()> {
             max_blocks,
             seed,
             max_ubatch,
+            max_steps,
         } => {
             use camelid::diffusion_gemma::chat::DgChat;
             use camelid::diffusion_gemma::DgEbParams;
@@ -1091,10 +1097,13 @@ async fn main() -> anyhow::Result<()> {
                 t0.elapsed().as_secs_f32(),
                 chat.canvas_length()
             );
+            let defaults = DgEbParams::default();
             let params = DgEbParams {
                 seed,
-                ..DgEbParams::default()
+                max_steps: max_steps.map(|m| m.max(1)).unwrap_or(defaults.max_steps),
+                ..defaults
             };
+            eprintln!("[dg] max_steps={} max_blocks={}", params.max_steps, max_blocks);
             let t1 = std::time::Instant::now();
             let (text, stop, ids) = chat.generate(
                 &prompt,
