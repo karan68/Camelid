@@ -1097,6 +1097,141 @@ pub struct LlamaForwardTimings {
     pub memory: Option<LlamaForwardMemoryTimings>,
 }
 
+/// Process-global accumulator for the per-stage CPU decode profile, folded from the
+/// `LlamaForwardTimings` the timed forward path already collects, gated by
+/// `CAMELID_STAGE_TIMINGS=1`. Pure reporting: it only sums microsecond counters that
+/// are already recorded, so it adds no measurement overhead and never affects output.
+#[derive(Default, Clone)]
+struct StageTimingAccumulator {
+    tokens: u64,
+    embedding: u128,
+    attention_norm: u128,
+    attention_qkv: u128,
+    attention_rope: u128,
+    kv_cache_write: u128,
+    attention_context: u128,
+    attention_output: u128,
+    attention_residual: u128,
+    ffn_norm: u128,
+    ffn_gate: u128,
+    ffn_up: u128,
+    ffn_activation: u128,
+    ffn_down: u128,
+    ffn_residual: u128,
+    final_norm: u128,
+    logits: u128,
+    total: u128,
+}
+
+static STAGE_TIMINGS: std::sync::Mutex<Option<StageTimingAccumulator>> =
+    std::sync::Mutex::new(None);
+
+fn stage_timings_enabled() -> bool {
+    env_flag_enabled("CAMELID_STAGE_TIMINGS")
+}
+
+fn fold_stage_timings(timings: &LlamaForwardTimings) {
+    if !stage_timings_enabled() {
+        return;
+    }
+    let mut guard = STAGE_TIMINGS.lock().expect("stage timings mutex poisoned");
+    let acc = guard.get_or_insert_with(StageTimingAccumulator::default);
+    acc.tokens += 1;
+    acc.embedding += timings.embedding;
+    acc.final_norm += timings.final_norm;
+    acc.logits += timings.logits;
+    acc.total += timings.total;
+    for l in &timings.layers {
+        acc.attention_norm += l.attention_norm;
+        acc.attention_qkv += l.attention_q + l.attention_k + l.attention_v;
+        acc.attention_rope += l.attention_rope;
+        acc.kv_cache_write += l.kv_cache_write;
+        acc.attention_context += l.attention_context;
+        acc.attention_output += l.attention_output;
+        acc.attention_residual += l.attention_residual;
+        acc.ffn_norm += l.ffn_norm;
+        acc.ffn_gate += l.ffn_gate;
+        acc.ffn_up += l.ffn_up;
+        acc.ffn_activation += l.ffn_activation;
+        acc.ffn_down += l.ffn_down;
+        acc.ffn_residual += l.ffn_residual;
+    }
+}
+
+/// Reset the process-global stage-timing accumulator. Call before a measured run so
+/// warmup/prefill tokens do not pollute the decode profile.
+pub fn reset_stage_timings() {
+    *STAGE_TIMINGS.lock().expect("stage timings mutex poisoned") = None;
+}
+
+/// Print the per-stage CPU decode breakdown (largest sink first) accumulated since
+/// the last reset, to stderr. No-op when `CAMELID_STAGE_TIMINGS` is unset or no
+/// tokens were folded. Reporting only; never affects generation.
+pub fn dump_stage_timings() {
+    let Some(acc) = STAGE_TIMINGS
+        .lock()
+        .expect("stage timings mutex poisoned")
+        .take()
+    else {
+        return;
+    };
+    if acc.tokens == 0 {
+        return;
+    }
+    let stages: [(&str, u128); 16] = [
+        ("ffn_down", acc.ffn_down),
+        ("ffn_gate", acc.ffn_gate),
+        ("ffn_up", acc.ffn_up),
+        ("attention_qkv", acc.attention_qkv),
+        ("attention_output", acc.attention_output),
+        ("logits", acc.logits),
+        ("attention_context", acc.attention_context),
+        ("ffn_activation", acc.ffn_activation),
+        ("attention_rope", acc.attention_rope),
+        ("kv_cache_write", acc.kv_cache_write),
+        ("attention_norm", acc.attention_norm),
+        ("ffn_norm", acc.ffn_norm),
+        ("attention_residual", acc.attention_residual),
+        ("ffn_residual", acc.ffn_residual),
+        ("final_norm", acc.final_norm),
+        ("embedding", acc.embedding),
+    ];
+    let mut sorted = stages;
+    sorted.sort_by_key(|&(_, us)| std::cmp::Reverse(us));
+    let attributed: u128 = stages.iter().map(|(_, us)| *us).sum();
+    let tokens = acc.tokens as f64;
+    let per_tok_ms = |us: u128| (us as f64) / tokens / 1000.0;
+    let pct = |us: u128| {
+        if attributed == 0 {
+            0.0
+        } else {
+            (us as f64) / (attributed as f64) * 100.0
+        }
+    };
+    eprintln!(
+        "[stage-timings] tokens={} | total {:.2} ms/tok | attributed {:.2} ms/tok ({:.0}% of total)",
+        acc.tokens,
+        per_tok_ms(acc.total),
+        per_tok_ms(attributed),
+        if acc.total == 0 {
+            0.0
+        } else {
+            (attributed as f64) / (acc.total as f64) * 100.0
+        }
+    );
+    for (name, us) in sorted {
+        if us == 0 {
+            continue;
+        }
+        eprintln!(
+            "[stage-timings]   {:<18} {:>8.3} ms/tok  {:>5.1}%",
+            name,
+            per_tok_ms(us),
+            pct(us)
+        );
+    }
+}
+
 #[allow(dead_code)]
 fn q8_schedule_output_projection_route_kind(
     weight: BorrowedLinearWeight<'_>,
@@ -1934,6 +2069,13 @@ impl LlamaInferenceSession {
         let hidden = dims.embedding_length;
         let ffn_dim = dims.feed_forward_length;
         let vocab = dims.vocab_size;
+        // Fail closed for Qwen3 per-head QK-norm: the CUDA engine has no QK-norm kernel,
+        // so decline the GPU prefill and let the CPU reference (which applies QK-norm)
+        // run it, rather than uploading weights and producing un-normed Q/K.
+        if let Err(unsupported) = cuda_resident_qk_norm_unsupported(&weights, 0..n_layers) {
+            log_cuda_resident_unsupported_once(&unsupported);
+            return Ok(false);
+        }
         let n = token_ids.len();
         let kv_cap = (self.config.context_length as usize)
             .min(self.kv_cache.plan.max_sequence_length)
@@ -2369,6 +2511,14 @@ impl LlamaInferenceSession {
         let range = weights.layer_range.clone().unwrap_or(0..dims.block_count);
         let n_layers = range.len();
         let vocab = dims.vocab_size;
+        // Fail closed for Qwen3 per-head QK-norm: the CUDA engine has no QK-norm kernel,
+        // so decline the GPU decode and let the CPU reference (which applies QK-norm) run
+        // it, rather than producing un-normed Q/K. Matches the documented "Ok(None) for any
+        // unsupported config" contract of this function.
+        if let Err(unsupported) = cuda_resident_qk_norm_unsupported(&weights, range.clone()) {
+            log_cuda_resident_unsupported_once(&unsupported);
+            return Ok(None);
+        }
         // The GPU KV cache is allocated once at `kv_cap` positions. Sizing it to a
         // model's full trained context (e.g. Llama 3.2's 131072) would allocate
         // many GB of VRAM up front; on a card without the room the driver
@@ -3666,6 +3816,7 @@ impl LlamaInferenceSession {
             memory.record_end(capture_memory_sample(&self.kv_cache));
         }
         timings.memory = memory;
+        fold_stage_timings(&timings);
         let diagnostics = if collect_diagnostics {
             Some(LlamaForwardDiagnostics {
                 embedding: embedding_stats.expect("embedding diagnostics collected"),
@@ -9453,6 +9604,54 @@ fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
         }
     }
     Vec::new()
+}
+
+/// Fail the CUDA resident path closed for Qwen3-style per-head QK-norm.
+///
+/// The CUDA resident decode engine (`cuda_resident.rs`) has no per-head
+/// RMSNorm-on-Q/K kernel: its per-layer sequence is RMSNorm → quantize → Q/K/V GEMV
+/// → RoPE, with nothing between projection and RoPE. A model that carries
+/// `attention_q_norm` / `attention_k_norm` (Qwen3) requires Q and K to be
+/// per-head-RMSNorm'd *before* RoPE (see the CPU path in this file and the Metal
+/// path in `metal.rs`). Running such a model through this engine would feed
+/// un-normalized Q/K into RoPE and diverge from the reference *without* failing —
+/// so detect it and return a typed [`BackendError::UnsupportedModelArchitecture`]
+/// rather than emit ungated output. The resident seams treat this as "unsupported
+/// config" and fall back to the CPU reference (which implements QK-norm), exactly
+/// like every other unsupported-on-CUDA case. Delete this guard only once a CUDA
+/// QK-norm kernel exists *and* is parity-validated against the CPU reference.
+#[cfg(feature = "cuda")]
+fn cuda_resident_qk_norm_unsupported(
+    weights: &LlamaLoadedWeights,
+    range: std::ops::Range<usize>,
+) -> Result<()> {
+    let end = range.end.min(weights.layers.len());
+    let start = range.start.min(end);
+    if weights.layers[start..end]
+        .iter()
+        .any(|l| l.attention_q_norm.is_some() || l.attention_k_norm.is_some())
+    {
+        return Err(BackendError::UnsupportedModelArchitecture(
+            "qwen3 per-head QK-norm has no CUDA resident-decode kernel; the GPU path \
+             would feed un-normalized Q/K into RoPE and silently diverge from the \
+             reference. Run the CPU reference path (CAMELID_CUDA_RESIDENT_DECODE=0 or \
+             --deterministic) until the CUDA QK-norm kernel lands."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Log the resident-CUDA arch refusal exactly once per process so the CPU fallback is
+/// observable (a silent fallback would hide that the GPU path does not support the
+/// loaded architecture). Pure observability; never affects output.
+#[cfg(feature = "cuda")]
+fn log_cuda_resident_unsupported_once(err: &BackendError) {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        eprintln!("[cuda] resident decode declined: {err} — falling back to CPU reference");
+    });
 }
 
 /// Build a resident CUDA engine for `weights[range]`: compile kernels, allocate

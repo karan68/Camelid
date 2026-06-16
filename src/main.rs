@@ -1944,6 +1944,11 @@ fn run_bench_generate(
     // Load the model once; this cost is measured separately from generation.
     let load_start = Instant::now();
     let gguf = read_metadata(&model)?;
+    // Apply the model's execution plan (as serve/chat do) BEFORE loading weights so the
+    // CPU Q8 runtime repack + packed-rows4 fast path is selected at load time. Without
+    // this, bench-generate measures the unplanned safe (scalar) path.
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
     let config = LlamaModelConfig::from_gguf(&gguf)?;
     let binding = LlamaTensorBinding::bind(&gguf, &config)?;
     let store = TensorStore::open(&model, &gguf);
@@ -1980,6 +1985,8 @@ fn run_bench_generate(
         )?;
     }
 
+    // Drop any warmup/prefill contributions so the dump reflects only measured decode.
+    camelid::inference::reset_stage_timings();
     let stdout = std::io::stdout();
     for iteration in 0..iterations {
         let run = generate_run(
@@ -2032,6 +2039,8 @@ fn run_bench_generate(
             record.peak_memory_bytes as f64 / 1.073_741_824e9,
         );
     }
+    // Per-stage CPU decode profile (no-op unless CAMELID_STAGE_TIMINGS=1).
+    camelid::inference::dump_stage_timings();
     Ok(())
 }
 

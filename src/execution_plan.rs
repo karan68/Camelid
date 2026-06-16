@@ -251,8 +251,13 @@ pub fn plan_for_model_with_platform(
     ) = if quant_type == "Q8_0" && is_supported_exact_q8_row(&row) {
         if platform.operating_system == "macos" && platform.architecture == "aarch64" {
             select_macos_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
-        } else if platform.operating_system == "linux" && platform.architecture == "x86_64" {
-            select_linux_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
+        } else if platform.architecture == "x86_64"
+            && (platform.operating_system == "linux" || platform.operating_system == "windows")
+        {
+            // The x86_64 Q8 runtime-repack + AVX2 packed-rows4 path is platform-agnostic
+            // Rust (no OS-specific kernels) and is parity-validated bit-identical to the
+            // scalar reference on Windows as well as Linux, so both share this plan.
+            select_x86_q8_plan(&profile, &platform, &mut env_updates, &mut reasons)
         } else {
             reasons.push(
                     "no validated platform-specific Q8_0 plan for this OS/arch; failing closed to safe path"
@@ -431,7 +436,7 @@ fn select_macos_q8_plan(
     )
 }
 
-fn select_linux_x86_q8_plan(
+fn select_x86_q8_plan(
     profile: &ExecutionProfile,
     platform: &PlanPlatform,
     env_updates: &mut BTreeMap<&'static str, Option<&'static str>>,
@@ -516,9 +521,23 @@ fn select_linux_x86_q8_plan(
         "CAMELID_X86_Q8_OUTPUT_AMX_PREFILL",
         optional_x86_q8_gate("CAMELID_X86_Q8_OUTPUT_AMX_PREFILL"),
     );
+    // Serial packed decode is the validated Linux default, but on Windows the parallel
+    // packed decode runs ~2x faster (TinyLlama 11 -> 19 tok/s, ffn_down 20 -> 10 ms) and
+    // stays bit-identical to the reference (each output row is an independent dot, so
+    // parallelizing across rows does not change any reduction order). Windows therefore
+    // defaults serial-decode OFF; an explicit env opt-in still forces it on.
+    let serial_packed_decode = if platform.operating_system == "windows" {
+        if env_flag_enabled("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE") {
+            Some("on")
+        } else {
+            Some("off")
+        }
+    } else {
+        optional_x86_q8_gate("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE")
+    };
     env_updates.insert(
         "CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE",
-        optional_x86_q8_gate("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE"),
+        serial_packed_decode,
     );
     env_updates.insert(
         "CAMELID_X86_Q8_PARALLEL_INPUT_QUANTIZE",
@@ -627,7 +646,7 @@ fn select_linux_x86_q8_plan(
                 .into(),
         );
     }
-    reasons.push("validated Ubuntu/Linux x86_64 Rust Q8 runtime repack enabled".into());
+    reasons.push("validated x86_64 (Linux/Windows) Rust Q8 runtime repack enabled".into());
     reasons.push("validated Rust AVX2 Q8 packed rows4 kernel selected".into());
     reasons.push("attention, FFN, and output experiments enabled by default".into());
     if matches!(profile, ExecutionProfile::Experimental) {
