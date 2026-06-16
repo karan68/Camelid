@@ -76,10 +76,30 @@ pub fn eog_token_set(gguf: &GgufFile, tok: &Tokenizer) -> HashSet<i32> {
 }
 
 fn render_chat_prompt(tok: &Tokenizer, template: &str, user: &str) -> Result<String> {
-    let bos = tok.token_text(tok.special.bos).unwrap_or("");
     let eos = tok.token_text(tok.special.eos).unwrap_or("");
     let eot = tok.token_text(tok.special.eot).unwrap_or("");
     let mut env = Environment::new();
+    // These chat templates use Python-style dict methods (e.g.
+    // `message.get('reasoning')` to read optional keys) that minijinja does not
+    // implement natively but llama.cpp's minja — the reference renderer — does.
+    // Bridge the methods the templates rely on so render matches the reference.
+    env.set_unknown_method_callback(|_state, value, method, args| {
+        use minijinja::value::Value;
+        use minijinja::{Error, ErrorKind};
+        match method {
+            // dict.get(key[, default]) -> value, or default/Undefined if absent.
+            "get" => {
+                let key = args.first().cloned().unwrap_or(Value::UNDEFINED);
+                let default = args.get(1).cloned().unwrap_or(Value::UNDEFINED);
+                Ok(value
+                    .get_item(&key)
+                    .ok()
+                    .filter(|v| !v.is_undefined())
+                    .unwrap_or(default))
+            }
+            _ => Err(Error::from(ErrorKind::UnknownMethod)),
+        }
+    });
     env.add_template_owned("chat", template.to_string())
         .map_err(|e| BackendError::InvalidModelMetadata(format!("chat template parse: {e}")))?;
     let compiled = env
@@ -93,9 +113,15 @@ fn render_chat_prompt(tok: &Tokenizer, template: &str, user: &str) -> Result<Str
         .render(context! {
             messages => messages,
             add_generation_prompt => true,
-            bos_token => bos,
+            // The reference (llama.cpp) renders the template's `{{ bos_token }}`
+            // as EMPTY and relies on tokenize(add_special=true) for the single
+            // BOS, and applies the chat template with enable_thinking=true by
+            // default — which emits the leading <|turn>system\n<|think|> block
+            // and suppresses the trailing generation-prompt thought block.
+            bos_token => "",
             eos_token => eos,
             eot_token => eot,
+            enable_thinking => true,
         })
         .map_err(|e| BackendError::InvalidModelMetadata(format!("chat template render: {e}")))
 }
@@ -141,6 +167,27 @@ impl DgChat {
         self.canvas_length
     }
 
+    /// Render the chat template for `user_message` and tokenize it into the
+    /// prompt token ids that seed the multi-canvas loop — exactly the reference
+    /// chat path (`apply_template(add_generation_prompt=true)` then
+    /// `common_tokenize(add_special=true, parse_special=true)`). Exposed so the
+    /// Phase 6 gate can check render+tokenize parity in isolation.
+    pub fn render_prompt(&self, user_message: &str) -> Result<Vec<u32>> {
+        let prompt_text = match &self.template {
+            Some(t) => render_chat_prompt(&self.tokenizer, t, user_message)?,
+            None => user_message.to_string(),
+        };
+        let parse_special = self.tokenizer.chat_prompt_parse_special();
+        Ok(self.tokenizer.encode(&prompt_text, true, parse_special)?.to_vec())
+    }
+
+    /// Detokenize a response (the trimmed multi-canvas tokens) back to text —
+    /// the reference's `common_detokenize(response, special=false)`.
+    pub fn decode_response(&self, ids: &[i32]) -> Result<String> {
+        let resp_ids: Vec<u32> = ids.iter().map(|&t| t as u32).collect();
+        self.tokenizer.decode(&resp_ids, false)
+    }
+
     /// One chat turn: render the template, tokenize, run the multi-canvas
     /// loop, detokenize. `on_block` observes each committed block. Returns
     /// the response text, the stop reason, and the response token ids.
@@ -152,13 +199,7 @@ impl DgChat {
         max_ubatch: i32,
         mut on_block: impl FnMut(usize, usize, usize, usize),
     ) -> Result<(String, String, Vec<i32>)> {
-        let prompt_text = match &self.template {
-            Some(t) => render_chat_prompt(&self.tokenizer, t, user_message)?,
-            None => user_message.to_string(),
-        };
-        let parse_special = self.tokenizer.chat_prompt_parse_special();
-        let ids = self.tokenizer.encode(&prompt_text, true, parse_special)?;
-        let prompt: Vec<u32> = ids.to_vec();
+        let prompt = self.render_prompt(user_message)?;
         let (_blocks, response, stop) = self.runtime.mc_generate(
             &prompt,
             params,
@@ -167,8 +208,7 @@ impl DgChat {
             &self.eog,
             |b, prefix, records, _canvas, cut| on_block(b, prefix.len(), records.len(), cut),
         )?;
-        let resp_ids: Vec<u32> = response.iter().map(|&t| t as u32).collect();
-        let text = self.tokenizer.decode(&resp_ids, false)?;
+        let text = self.decode_response(&response)?;
         Ok((text, stop, response))
     }
 }
