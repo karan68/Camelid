@@ -624,7 +624,9 @@ mod tests {
             "absent lane must not appear in the canonical body: {body}"
         );
         assert!(!receipt.is_runnable());
-        receipt.verify_self_digest().expect("legacy digest verifies");
+        receipt
+            .verify_self_digest()
+            .expect("legacy digest verifies");
     }
 
     #[test]

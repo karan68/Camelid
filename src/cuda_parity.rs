@@ -182,7 +182,11 @@ pub fn tokens_from_diag(v: &Value) -> Option<Vec<u32>> {
         "cuda_tokens",
     ] {
         if let Some(arr) = v.get(key).and_then(Value::as_array) {
-            return Some(arr.iter().filter_map(|x| x.as_u64().map(|n| n as u32)).collect());
+            return Some(
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as u32))
+                    .collect(),
+            );
         }
     }
     None

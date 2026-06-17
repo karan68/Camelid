@@ -1006,7 +1006,9 @@ async fn main() -> anyhow::Result<()> {
                         report.prompt_token_count, report.logit_min, report.logit_max
                     );
                     eprintln!("  greedy: {:?}", report.generated_text);
-                    eprintln!("  (runnable receipt below — attests deterministic execution, not parity)");
+                    eprintln!(
+                        "  (runnable receipt below — attests deterministic execution, not parity)"
+                    );
                     // The runnable receipt (lane=runnable, never copper) to stdout.
                     println!("{}", serde_json::to_string_pretty(&report.receipt)?);
                 }

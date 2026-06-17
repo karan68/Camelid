@@ -3,9 +3,9 @@ pub mod capability;
 pub mod catalog;
 pub mod cluster;
 pub mod cuda;
+pub mod cuda_parity;
 #[cfg(feature = "cuda")]
 pub mod cuda_resident;
-pub mod cuda_parity;
 pub mod cuda_vram;
 pub mod diffusion_gemma;
 pub mod distributed;

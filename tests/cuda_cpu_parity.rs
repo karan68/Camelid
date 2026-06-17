@@ -30,12 +30,13 @@ fn read_tokens(path: &str) -> Vec<u32> {
 #[test]
 #[ignore = "needs CPU and CUDA token streams over the frozen fixtures; run on a CUDA host"]
 fn cpu_cuda_greedy_parity() {
-    let cpu_path =
-        std::env::var("CAMELID_PARITY_CPU_JSON").unwrap_or_else(|_| "qa/parity_cpu_diag.json".into());
+    let cpu_path = std::env::var("CAMELID_PARITY_CPU_JSON")
+        .unwrap_or_else(|_| "qa/parity_cpu_diag.json".into());
     let cuda_path = std::env::var("CAMELID_PARITY_CUDA_JSON")
         .unwrap_or_else(|_| "qa/parity_cuda_diag.json".into());
     let model = std::env::var("CAMELID_PARITY_MODEL").unwrap_or_else(|_| "validated-model".into());
-    let fixture = std::env::var("CAMELID_PARITY_FIXTURE").unwrap_or_else(|_| "frozen-fixture".into());
+    let fixture =
+        std::env::var("CAMELID_PARITY_FIXTURE").unwrap_or_else(|_| "frozen-fixture".into());
 
     let cpu = read_tokens(&cpu_path);
     let cuda = read_tokens(&cuda_path);

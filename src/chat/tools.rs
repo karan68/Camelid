@@ -660,7 +660,8 @@ fn run_shell(sandbox: &Sandbox, command: &str) -> ToolOutcome {
         .stderr(Stdio::piped());
     // Apply confinement. A sandboxed mode that can't be enforced here returns an
     // error → refuse to run, never a silent unconfined fallback.
-    if let Err(e) = shell_sandbox::configure_command(&mut builder, &sandbox.root, sandbox.shell_mode)
+    if let Err(e) =
+        shell_sandbox::configure_command(&mut builder, &sandbox.root, sandbox.shell_mode)
     {
         return ToolOutcome::Err(format!("run_shell refused: {e}"));
     }
@@ -891,7 +892,10 @@ mod tests {
     // The default (sandboxed) mode is not kernel-enforceable off Linux, so
     // run_shell must refuse to run rather than execute unconfined. This is the
     // fail-closed behavior exercised on the Windows dev box.
-    #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     #[test]
     fn sandboxed_run_shell_fails_closed_off_linux() {
         use super::ShellSandbox;

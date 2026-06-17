@@ -71,9 +71,7 @@ fn produces_logits_and_greedy_tokens_end_to_end() {
 #[test]
 fn forward_is_bit_exact_deterministic() {
     let Some((model, tok)) = load() else { return };
-    let prompt = tok
-        .encode("Hello, world!", true, false)
-        .expect("encode");
+    let prompt = tok.encode("Hello, world!", true, false).expect("encode");
 
     // Same input, two runs -> bit-identical logits.
     let a = model.forward_logits(&prompt).expect("run a");

@@ -152,5 +152,8 @@ fn dequant_matches_ggml_reference() {
         }
     }
 
-    assert!(!any_fail, "dequant parity failed; see per-format lines above");
+    assert!(
+        !any_fail,
+        "dequant parity failed; see per-format lines above"
+    );
 }
