@@ -325,7 +325,7 @@ mod linux {
                     if libc::chroot(root_c.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
                     }
-                    if libc::chdir(b"/\0".as_ptr().cast()) != 0 {
+                    if libc::chdir(c"/".as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
                     }
                 } else {
@@ -511,6 +511,6 @@ mod tests {
         if let Some(code) = status.code() {
             assert_eq!(code, 0, "raw socket creation was NOT blocked by seccomp");
         }
-        let _ = (&mut std::io::stdout()).flush();
+        let _ = std::io::stdout().flush();
     }
 }
