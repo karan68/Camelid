@@ -283,20 +283,31 @@ mod tests {
         assert!(!d.contains("hunter2"));
         assert!(!d.contains("secret.txt"));
         // Deterministic for equal args.
-        assert_eq!(d, digest_args(&json!({"path": "secret.txt", "token": "hunter2"})));
+        assert_eq!(
+            d,
+            digest_args(&json!({"path": "secret.txt", "token": "hunter2"}))
+        );
     }
 
     #[test]
     fn noop_sink_emits_nothing_observable() {
         let s = NoopSink;
-        s.emit(&AuditEvent::call("read_file", "auto", digest_args(&json!({}))));
+        s.emit(&AuditEvent::call(
+            "read_file",
+            "auto",
+            digest_args(&json!({})),
+        ));
         // No panic, no state — the point is it never errors.
     }
 
     #[test]
     fn in_memory_sink_records_payload_shape() {
         let s = InMemorySink::default();
-        s.emit(&AuditEvent::call("run_shell", "confirm", "sha256:abc".into()));
+        s.emit(&AuditEvent::call(
+            "run_shell",
+            "confirm",
+            "sha256:abc".into(),
+        ));
         let evs = s.events();
         assert_eq!(evs.len(), 1);
         let p = evs[0].to_json();

@@ -12456,9 +12456,7 @@ async fn local_models() -> Json<LocalModelsResponse> {
                                 }
                             }
                         }
-                        Err(err) => {
-                            c.admission_reason = Some(format!("GGUF parse failed: {err}"))
-                        }
+                        Err(err) => c.admission_reason = Some(format!("GGUF parse failed: {err}")),
                     }
                     local_meta_cache()
                         .lock()
@@ -12560,8 +12558,7 @@ async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
         );
     }
     let path_str = path.to_string_lossy().to_string();
-    let result =
-        tokio::task::spawn_blocking(move || crate::runnable::smoke_admit(&path_str)).await;
+    let result = tokio::task::spawn_blocking(move || crate::runnable::smoke_admit(&path_str)).await;
     match result {
         Ok(Ok(report)) => {
             let out = runnable_smoke_receipt_path(&filename);

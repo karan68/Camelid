@@ -129,9 +129,7 @@ pub fn configure_command(
     mode: ShellSandbox,
 ) -> Result<EnforcedShell, String> {
     match mode {
-        ShellSandbox::Disabled => {
-            Err("run_shell is disabled (shell_sandbox=disabled)".to_string())
-        }
+        ShellSandbox::Disabled => Err("run_shell is disabled (shell_sandbox=disabled)".to_string()),
         ShellSandbox::Unrestricted => {
             builder.current_dir(root);
             Ok(EnforcedShell::unrestricted())
@@ -153,7 +151,10 @@ pub fn describe_sandboxed(root: &Path) -> Result<EnforcedShell, String> {
 // Linux enforcement (x86_64 / aarch64). Built-and-gated; validated by Linux CI.
 // ===========================================================================
 
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod linux {
     use super::EnforcedShell;
     use std::ffi::CString;
@@ -177,7 +178,7 @@ mod linux {
     const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
     const BPF_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
     const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
-    // Offsets into `struct seccomp_data`.
+                                 // Offsets into `struct seccomp_data`.
     const SD_NR: u32 = 0;
     const SD_ARCH: u32 = 4;
 
@@ -187,7 +188,12 @@ mod linux {
     const AUDIT_ARCH: u32 = 0xC000_00B7; // AUDIT_ARCH_AARCH64
 
     fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
-        libc::sock_filter { code, jt: 0, jf: 0, k }
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
     }
     fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
         libc::sock_filter { code, jt, jf, k }
@@ -389,12 +395,18 @@ mod linux {
 
 /// Sandboxed configuration dispatch. Linux (supported arch) wires the real
 /// enforcement; everywhere else fails closed.
-#[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn configure_sandboxed(builder: &mut Command, root: &Path) -> Result<EnforcedShell, String> {
     linux::configure(builder, root)
 }
 
-#[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
 fn configure_sandboxed(_builder: &mut Command, _root: &Path) -> Result<EnforcedShell, String> {
     // Fail closed: no kernel mechanism to enforce the sandbox here. Refuse rather
     // than silently running unconfined.
@@ -414,8 +426,14 @@ mod tests {
 
     #[test]
     fn mode_parses_and_round_trips() {
-        assert_eq!("sandboxed".parse::<ShellSandbox>().unwrap(), ShellSandbox::Sandboxed);
-        assert_eq!("Disabled".parse::<ShellSandbox>().unwrap(), ShellSandbox::Disabled);
+        assert_eq!(
+            "sandboxed".parse::<ShellSandbox>().unwrap(),
+            ShellSandbox::Sandboxed
+        );
+        assert_eq!(
+            "Disabled".parse::<ShellSandbox>().unwrap(),
+            ShellSandbox::Disabled
+        );
         assert_eq!(
             "unrestricted".parse::<ShellSandbox>().unwrap(),
             ShellSandbox::Unrestricted
@@ -442,7 +460,10 @@ mod tests {
     // On a non-Linux (or unsupported-arch) host, sandboxed mode must FAIL CLOSED —
     // it must not silently run unconfined. This is the behavior exercised on the
     // Windows dev box.
-    #[cfg(not(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+    #[cfg(not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
     #[test]
     fn sandboxed_fails_closed_off_linux() {
         let mut c = Command::new("true");
@@ -455,7 +476,10 @@ mod tests {
     // sandbox. We fork, install the filter via the same pre_exec path by running
     // a tiny shell command, and assert it cannot create a socket. Validated by
     // Linux CI (not run on the Windows dev box).
-    #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn socket_is_blocked_under_seccomp() {
         use std::io::Write;

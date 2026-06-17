@@ -44,7 +44,12 @@ fn ref_f32(bits: &[String]) -> Vec<f32> {
 
 #[test]
 fn llama_matches_hf_transformers_greedy() {
-    run_parity("tinyllama.json", "tinyllama-parity.json", "llama", "llama_spm");
+    run_parity(
+        "tinyllama.json",
+        "tinyllama-parity.json",
+        "llama",
+        "llama_spm",
+    );
 }
 
 #[test]
@@ -63,9 +68,7 @@ fn phi3_matches_hf_transformers_greedy() {
 }
 
 fn run_parity(fixture_file: &str, artifact_file: &str, arch: &str, tokenizer_kind: &str) {
-    let fx_path = repo()
-        .join("tests/fixtures/hf_parity")
-        .join(fixture_file);
+    let fx_path = repo().join("tests/fixtures/hf_parity").join(fixture_file);
     if !fx_path.exists() {
         eprintln!("SKIP: HF parity fixtures absent ({})", fx_path.display());
         return;
@@ -126,12 +129,13 @@ fn run_parity(fixture_file: &str, artifact_file: &str, arch: &str, tokenizer_kin
         }));
     }
 
-    eprintln!(
-        "  ALL greedy match = {all_match}   max logit_abs_diff = {max_logit_abs_diff:.3e}"
-    );
+    eprintln!("  ALL greedy match = {all_match}   max logit_abs_diff = {max_logit_abs_diff:.3e}");
 
     // Parity artifact (lane=runnable), traceable to the exact GGUF bytes.
-    assert_eq!(model.architecture, arch, "fixture/model architecture mismatch");
+    assert_eq!(
+        model.architecture, arch,
+        "fixture/model architecture mismatch"
+    );
     let artifact = json!({
         "lane": "runnable",
         "architecture": model.architecture,

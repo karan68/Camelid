@@ -263,7 +263,11 @@ pub fn measure_contention(
         });
     }
 
-    Ok(summarize_contention(primary_bytes, second_bytes, &run_results))
+    Ok(summarize_contention(
+        primary_bytes,
+        second_bytes,
+        &run_results,
+    ))
 }
 
 /// Pure aggregation of contention runs (separated so it is testable without CUDA).

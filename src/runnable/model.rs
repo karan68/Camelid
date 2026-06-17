@@ -268,7 +268,10 @@ impl RunnableModel {
             };
             // phi3 fuses gate+up into ffn_up [2*ffn] (gate first); split it.
             let (gate, up) = if find_tensor(&gguf, &p("ffn_gate")).is_ok() {
-                (load_raw(&mut f, &p("ffn_gate"))?, load_raw(&mut f, &p("ffn_up"))?)
+                (
+                    load_raw(&mut f, &p("ffn_gate"))?,
+                    load_raw(&mut f, &p("ffn_up"))?,
+                )
             } else {
                 let gu = load_raw(&mut f, &p("ffn_up"))?;
                 (gu.split_rows(0, ffn), gu.split_rows(ffn, ffn))
@@ -304,7 +307,13 @@ impl RunnableModel {
             let local = 10_000.0_f32;
             let pattern = 6usize;
             (0..n_layers)
-                .map(|i| if (i + 1) % pattern == 0 { global } else { local })
+                .map(|i| {
+                    if (i + 1) % pattern == 0 {
+                        global
+                    } else {
+                        local
+                    }
+                })
                 .collect()
         } else {
             vec![rope_base; n_layers]
@@ -345,7 +354,9 @@ impl RunnableModel {
     /// Pure f32, deterministic, no KV cache — recomputed each call.
     pub fn forward_logits(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         if tokens.is_empty() {
-            return Err(BackendError::InvalidTensorData("empty token sequence".into()));
+            return Err(BackendError::InvalidTensorData(
+                "empty token sequence".into(),
+            ));
         }
         let seq = tokens.len();
         let dm = self.d_model;
@@ -723,7 +734,10 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len() as f32;
     let ss: f32 = x.iter().map(|v| v * v).sum();
     let inv = 1.0 / (ss / n + eps).sqrt();
-    x.iter().zip(weight.iter()).map(|(v, w)| v * inv * w).collect()
+    x.iter()
+        .zip(weight.iter())
+        .map(|(v, w)| v * inv * w)
+        .collect()
 }
 
 /// gelu with the tanh approximation (`gelu_pytorch_tanh`), gemma's FFN activation.

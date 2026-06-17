@@ -62,10 +62,7 @@ fn dump_and_admit(filename: &str, expect_tokenizer: TokenizerFamily) {
 fn tinyllama_q8_parses_dumps_and_admits() {
     // Known-validated TinyLlama 1.1B Q8_0 — the spec's Gate 1 reference model.
     // SPM tokenizer (tokenizer.ggml.model = "llama").
-    dump_and_admit(
-        "tinyllama-1.1b-chat-v1.0.Q8_0.gguf",
-        TokenizerFamily::Spm,
-    );
+    dump_and_admit("tinyllama-1.1b-chat-v1.0.Q8_0.gguf", TokenizerFamily::Spm);
 }
 
 #[test]
@@ -106,7 +103,10 @@ fn diffusiongemma_real_file_is_refused() {
     eprintln!("contains an uncovered quant: {has_uncovered_quant}");
 
     let reject = admit(&file).expect_err("out-of-set model must be refused");
-    eprintln!("REFUSED: axis={:?} value={} :: {reject}", reject.axis, reject.offending_value);
+    eprintln!(
+        "REFUSED: axis={:?} value={} :: {reject}",
+        reject.axis, reject.offending_value
+    );
     assert_eq!(reject.axis, AdmissionAxis::Architecture);
     assert_eq!(reject.offending_value, arch.unwrap());
 }

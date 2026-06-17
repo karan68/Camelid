@@ -573,8 +573,8 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         }
     };
 
-    let sandbox =
-        Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?.with_shell_mode(cfg.shell_sandbox);
+    let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?
+        .with_shell_mode(cfg.shell_sandbox);
     println!(
         "{}\n",
         banner::splash(
@@ -599,7 +599,10 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
     // Surface the *actual* run_shell confinement, never a faked one (Task 1).
     match cfg.shell_sandbox {
         ShellSandbox::Disabled => {
-            println!("{}", banner::dim("· run_shell: disabled (tool not offered)"));
+            println!(
+                "{}",
+                banner::dim("· run_shell: disabled (tool not offered)")
+            );
         }
         ShellSandbox::Unrestricted => {
             println!(
@@ -1049,10 +1052,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
         let mut policy = resolve_policy(true, false).unwrap(); // auto_all on
-        let write =
-            tools::validate(&tc("write_file", json!({"path":"a.txt","content":"x"})), &sb).unwrap();
-        let shell =
-            tools::validate(&tc("run_shell", json!({"command":"echo hi"})), &sb).unwrap();
+        let write = tools::validate(
+            &tc("write_file", json!({"path":"a.txt","content":"x"})),
+            &sb,
+        )
+        .unwrap();
+        let shell = tools::validate(&tc("run_shell", json!({"command":"echo hi"})), &sb).unwrap();
         // Write (Confirm) is promoted to Auto; run_shell (Exec) is NOT.
         assert_eq!(policy.tier_for(&write), ApprovalTier::Auto);
         assert_eq!(policy.tier_for(&shell), ApprovalTier::Confirm);
@@ -1134,7 +1139,7 @@ mod tests {
         assert_eq!(events[1].event_name(), "agent.tool_result");
         assert_eq!(events[0].tool, "read_file");
         assert_eq!(events[0].tier, "auto"); // read_file is auto tier
-        // The args digest is a hash, not the raw path.
+                                            // The args digest is a hash, not the raw path.
         assert!(events[0].args_digest.starts_with("sha256:"));
         assert!(!events[0].args_digest.contains("f.txt"));
         // The result event carries outcome + duration; the call event does not.
@@ -1150,7 +1155,10 @@ mod tests {
         let sink = audit::InMemorySink::default();
         let mut driver = MockDriver {
             steps: vec![
-                ModelStep::Calls(vec![tc("write_file", json!({"path":"x.txt","content":"hi"}))]),
+                ModelStep::Calls(vec![tc(
+                    "write_file",
+                    json!({"path":"x.txt","content":"hi"}),
+                )]),
                 ModelStep::Text("won't".into()),
             ],
             idx: 0,
@@ -1178,8 +1186,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
         let mut policy = Policy::default();
-        let write =
-            tools::validate(&tc("write_file", json!({"path":"a.txt","content":"x"})), &sb).unwrap();
+        let write = tools::validate(
+            &tc("write_file", json!({"path":"a.txt","content":"x"})),
+            &sb,
+        )
+        .unwrap();
         assert_eq!(policy.tier_for(&write), ApprovalTier::Confirm);
         policy.grant("write_file");
         assert_eq!(policy.tier_for(&write), ApprovalTier::Auto);
