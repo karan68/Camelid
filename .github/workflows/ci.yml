@@ -30,6 +30,9 @@ jobs:
       - name: Check public evidence claims
         run: node scripts/check-public-evidence-claims.mjs
 
+      - name: Check CUDA batched-prefill parity gate wiring
+        run: node scripts/check-cuda-prefill-parity-gate.mjs
+
       - name: Check README screenshot contract
         run: node scripts/test-readme-screenshot.mjs
 
