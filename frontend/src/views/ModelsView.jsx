@@ -9,6 +9,8 @@ import { ModelInspector } from '../components/models/ModelInspector'
 import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
+import { LocalLaneSections } from '../components/models/LocalLaneSections'
+import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
 import { IconModels } from '../components/ui/icons'
 
 const FILTERS = [
@@ -335,6 +337,7 @@ export default function ModelsView({
   const [catalogError, setCatalogError] = useState('')
   const [catalogAvailable, setCatalogAvailable] = useState(false)
   const [refreshingRuntime, setRefreshingRuntime] = useState(false)
+  const [localRefreshKey, setLocalRefreshKey] = useState(0)
 
   const catalogApiBase = (runtime?.api_base || '').replace(/\/$/, '')
   const runtimeOnline = runtime?.status === 'online'
@@ -346,10 +349,7 @@ export default function ModelsView({
   const compatibilityRows = capabilities?.model_compatibility || []
   const trackedCompatibilityRows = getTrackedCompatibilityTargets(capabilities)
   const supportedCompatibilityRows = compatibilityRows.filter((target) => isSupportedCapabilityStatus(target.status))
-  const plannedCompatibilityRows = compatibilityRows.filter((target) => !isSupportedCapabilityStatus(target.status))
   const supportedCompatibilitySummary = supportedCompatibilityRows.map((target) => target.id).join(' · ') || (currentCompatibilityTarget ? currentCompatibilityTarget.id : '')
-  const exactQuantEvidenceSummary = compatibilityRows.map((target) => `${target.id}: ${target.quantization} (${formatCapabilityStatus(target.status)})`).join(' · ') || 'No exact rows advertised'
-  const guardedCompatibilitySummary = plannedCompatibilityRows.map((target) => `${target.id}: ${formatCapabilityStatus(target.status)}`).join(' · ') || 'No guarded rows advertised'
   const supportedRowCount = supportedCompatibilityRows.length
   const trackedRowCount = trackedCompatibilityRows.length
 
@@ -560,6 +560,17 @@ export default function ModelsView({
           </div>
       </div>
 
+      <LocalLaneSections
+        apiBase={catalogApiBase || apiBase}
+        capabilities={capabilities}
+        refreshKey={localRefreshKey}
+      />
+      <CatalogLaneBrowse
+        apiBase={catalogApiBase || apiBase}
+        capabilities={capabilities}
+        onAcquired={() => setLocalRefreshKey((k) => k + 1)}
+      />
+
       <div className="cxv-card cxv-panel">
         <div className="models-toolbar-top">
           <label className="models-search-field">
@@ -604,23 +615,6 @@ export default function ModelsView({
             <span>Hosted APIs</span>
             <strong>{hostedRoutingAvailable ? 'Routing advertised' : 'Routing planned'}</strong>
             <small>Provider links stay disabled until /api/capabilities exposes hosted-provider routing and the frontend has matching evidence.</small>
-          </div>
-        </div>
-        <div className="models-compatibility-strip" aria-label="Camelid compatibility support contract">
-          <div>
-            <span>Current supported gate</span>
-            <strong>{capabilities?.support_contract ? supportContractCurrentGate : 'No /api/capabilities contract'}</strong>
-            <small>{supportedCompatibilitySummary ? `Supported rows: ${supportedCompatibilitySummary}. Runtime loaded_now=true and generation_ready=true are still required.` : 'The UI will not infer support beyond loaded/model readiness.'}</small>
-          </div>
-          <div>
-            <span>Exact-row quants</span>
-            <strong>{exactQuantEvidenceSummary}</strong>
-            <small>Quant evidence is row-scoped; filenames and saved paths do not promote support.</small>
-          </div>
-          <div>
-            <span>Guarded rows</span>
-            <strong>{guardedCompatibilitySummary}</strong>
-            <small>{plannedCompatibilityRows.length ? `${plannedCompatibilityRows.length} compatibility row${plannedCompatibilityRows.length === 1 ? '' : 's'} remain planned or guarded; backend typed errors are expected until COMPATIBILITY.md records evidence.` : 'No planned compatibility rows advertised.'}</small>
           </div>
         </div>
         <div className="models-summary-strip" aria-label="Model summary">
@@ -726,9 +720,9 @@ export default function ModelsView({
                   <span>{formatModelMeta(LLAMA32_3B_ACCEPTANCE_TARGET)}</span>
                 </div>
                 <EvidenceChip
-                  status="supported_exact_row_smoke"
+                  status={findCompatibilityHint(capabilities, LLAMA32_3B_ACCEPTANCE_TARGET)?.target?.status || ''}
                   label="Exact-row smoke · runtime required"
-                  source={{ rowId: 'llama32_3b_instruct_q8_0', detail: 'Supported for the exact 3B Instruct Q8_0 artifact only; chat still requires the loaded runtime to match.' }}
+                  source={{ rowId: 'llama32_3b_instruct_q8_0', detail: 'Status derives from the live /api/capabilities row for this exact 3B Instruct Q8_0 artifact; chat still requires the loaded runtime to match.' }}
                 />
               </div>
 

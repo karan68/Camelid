@@ -49,6 +49,22 @@ fn is_oracle_qualified(arch: &str, tok: TokenizerFamily, quant: &str) -> bool {
     )
 }
 
+/// Public (architecture, quant) view of the oracle-qualified set — the tokenizer
+/// family is implied by the architecture for every anchored combo. Used by the API
+/// to classify local models and catalog entries without running a model.
+pub fn oracle_qualified(architecture: &str, quant: &str) -> bool {
+    matches!(
+        (architecture, quant),
+        ("llama", "Q8_0") | ("qwen3", "Q8_0") | ("gemma3", "Q8_0") | ("phi3", "Q8_0")
+    )
+}
+
+/// The headline quant of a GGUF: the most common quantized (non-F32) tensor type,
+/// e.g. `Q8_0`. Public so the API can label local models without loading them.
+pub fn headline_quant_of(gguf: &GgufFile) -> String {
+    headline_quant(gguf)
+}
+
 /// Result of a passing smoke-admission.
 pub struct SmokeReport {
     pub architecture: String,

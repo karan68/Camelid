@@ -17,4 +17,4 @@ pub mod smoke;
 pub use admit::{admit, AdmissionAxis, AdmissionOk, AdmissionReject, TokenizerFamily};
 pub use dequant::dequantize;
 pub use model::RunnableModel;
-pub use smoke::{smoke_admit, SmokeReport};
+pub use smoke::{headline_quant_of, oracle_qualified, smoke_admit, SmokeReport};

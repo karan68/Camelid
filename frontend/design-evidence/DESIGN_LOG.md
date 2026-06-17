@@ -955,3 +955,28 @@ They must never be conflated, and the receipts/UI keep them apart.
 Oracle qualification answers "is this architecture's math right?" (vs HF, once).
 Smoke-admission answers "does this specific file run cleanly?" (per file, never a
 correctness claim). The runnable receipt a smoke emits attests the latter only.
+
+## Models tab — lane-distinction UI (Gate 4, 2026-06-17)
+
+The Models tab renders four DERIVED local sections (Supported / Compatible / Run
+smoke-admission / Not yet runnable). Membership is computed from `/api/models/local`
+lane facts + the `/api/capabilities` support contract — never a hand-authored array.
+
+**Use/load is lane-scoped, on purpose.** Only **Supported** rows get a "Use for chat"
+button. It calls `POST /api/models/load { id, path }` — the parity-locked supported chat
+backend — and the row that matches `/api/models/current` shows "● Loaded" with a neutral
+(never copper) active accent. Copper stays exclusively in the EvidenceChip.
+
+**Compatible (runnable) rows deliberately have no chat button.** The runnable lane is the
+generic f32 engine and exposes no HTTP serve/generate route (only `runnable-smoke` + the
+CLI). Loading a runnable-only model through `/api/models/load` would run it on the
+*supported* backend and visually imply parity it doesn't have — so we don't. Those rows
+keep their runnable receipt (amber, `parity: not_compared`) plus an explicit "CLI only —
+no HTTP serve yet" note. The missing endpoint is logged as BACKEND_ASKS #4, not faked.
+
+**Model copy says what the model is GOOD AT, never where it runs.** Catalog blurbs and the
+local `describeModel()` line were scrubbed of all hardware/parity/serve-flag jargon
+("16 GB Mac", "greedy parity", "GPU-resident", "CAMELID_GEMMA4_SERVE", "memory-infeasible").
+They now state strengths by family ("Strong at reasoning, coding…", "multilingual chat,
+reasoning, coding, and math"). System/lane facts live in the chip + meta line, not the
+description.

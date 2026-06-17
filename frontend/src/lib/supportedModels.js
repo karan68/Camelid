@@ -10,7 +10,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Llama-3.2-3B-Instruct-Q8_0.gguf',
     size_bytes: 3422709216,
     quant: 'Q8_0',
-    blurb: 'Reference exact-row model — the best quality/speed balance on Apple Silicon.',
+    blurb: 'Good at everyday chat, summarizing, and writing — a solid all-rounder.',
     recommended: true,
   },
   {
@@ -20,7 +20,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Llama-3.2-1B-Instruct-Q8_0.gguf',
     size_bytes: 1346203104,
     quant: 'Q8_0',
-    blurb: 'Smallest supported chat model — fastest to download and load.',
+    blurb: 'A small, fast model for quick chat and simple tasks.',
   },
   {
     catalog_id: 'tinyllama_1_1b_chat_q8_0',
@@ -29,7 +29,7 @@ export const SUPPORTED_MODELS = [
     filename: 'tinyllama-1.1b-chat-v1.0.Q8_0.gguf',
     size_bytes: 1169007424,
     quant: 'Q8_0',
-    blurb: 'Tiny SPM-tokenizer chat model — handy for quick smoke checks.',
+    blurb: 'A tiny chat model for basic conversation and quick experiments.',
   },
   {
     catalog_id: 'llama3_8b_instruct_q8_0',
@@ -38,7 +38,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Meta-Llama-3-8B-Instruct.Q8_0.gguf',
     size_bytes: 8540846592,
     quant: 'Q8_0',
-    blurb: 'Largest Llama supported row — highest quality, needs the most memory.',
+    blurb: 'Higher-quality chat, reasoning, and longer-form writing.',
   },
   {
     catalog_id: 'mistral_7b_instruct_v0_3_q8_0',
@@ -47,7 +47,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Mistral-7B-Instruct-v0.3-Q8_0.gguf',
     size_bytes: 7702565088,
     quant: 'Q8_0',
-    blurb: 'Most capable on a 16 GB Mac — exact-row smoke with bounded context 512→8192 and GPU/CPU greedy parity.',
+    blurb: 'Strong at reasoning, coding, and following detailed instructions.',
   },
   {
     catalog_id: 'qwen3_0_6b_instruct_q8_0',
@@ -56,7 +56,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-0.6B-Q8_0.gguf',
     size_bytes: 639446688,
     quant: 'Q8_0',
-    blurb: 'Smallest Qwen3 row — ChatML with thinking disabled, token+text parity at 1/5/50 tokens. Runs on the Windows CUDA GPU-resident path (parity vs the CPU/llama.cpp reference).',
+    blurb: 'A compact multilingual model for quick chat and light reasoning.',
   },
   {
     catalog_id: 'qwen3_1_7b_instruct_q8_0',
@@ -65,7 +65,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-1.7B-Q8_0.gguf',
     size_bytes: 1834426016,
     quant: 'Q8_0',
-    blurb: 'Qwen3 ChatML row (thinking disabled) — token+text parity at 1/5/50 plus GPU-resident decode/prefill to a 15k-token context (macOS), and Windows CUDA GPU-resident parity vs the CPU/llama.cpp reference.',
+    blurb: 'Multilingual chat with good reasoning and coding for its size.',
   },
   {
     catalog_id: 'qwen3_4b_instruct_q8_0',
@@ -74,7 +74,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-4B-Q8_0.gguf',
     size_bytes: 4280404704,
     quant: 'Q8_0',
-    blurb: 'Qwen3 ChatML row (thinking disabled) — token+text parity at 1/5/50 on confident prompts (explicit head_dim path). Runs on the Windows CUDA GPU-resident path (parity vs the CPU/llama.cpp reference).',
+    blurb: 'Strong multilingual reasoning, math, and coding, with optional step-by-step thinking.',
   },
   {
     catalog_id: 'qwen3_8b_instruct_q8_0',
@@ -83,7 +83,7 @@ export const SUPPORTED_MODELS = [
     filename: 'Qwen3-8B-Q8_0.gguf',
     size_bytes: 8709518112,
     quant: 'Q8_0',
-    blurb: 'Largest Qwen3 row — ChatML (thinking disabled) token+text parity at 1/5/50 plus the GPU-resident decode/prefill path. On Windows CUDA it runs via VRAM+host-RAM layer offload (parity vs the CPU/llama.cpp reference).',
+    blurb: 'Top-tier Qwen3 quality — strong reasoning, math, coding, and multilingual chat.',
   },
   {
     catalog_id: 'gemma4_e4b_it_q8_0',
@@ -92,7 +92,7 @@ export const SUPPORTED_MODELS = [
     filename: 'gemma-4-E4B-it-Q8_0.gguf',
     size_bytes: 8192951456,
     quant: 'Q8_0',
-    blurb: 'Gemma 4 (E-series matformer) — from-scratch gemma4 engine, greedy-identical to the reference. Serve with CAMELID_GEMMA4_SERVE=1.',
+    blurb: 'Google’s Gemma — capable multilingual chat and reasoning.',
   },
   {
     catalog_id: 'gemma4_e2b_it_q8_0',
@@ -101,7 +101,7 @@ export const SUPPORTED_MODELS = [
     filename: 'gemma-4-E2B-it-Q8_0.gguf',
     size_bytes: 5048350848,
     quant: 'Q8_0',
-    blurb: 'Gemma 4 E2B (E-series matformer) — greedy parity with the reference on the committed basic_v1 prompt pack. Text-token generation only; serve with CAMELID_GEMMA4_SERVE=1.',
+    blurb: 'A compact Gemma model for multilingual chat.',
   },
   {
     catalog_id: 'gemma4_12b_it_q8_0',
@@ -110,7 +110,7 @@ export const SUPPORTED_MODELS = [
     filename: 'gemma-4-12b-it-Q8_0.gguf',
     size_bytes: 12669646240,
     quant: 'Q8_0',
-    blurb: 'Gemma 4 12B served as two-Mac distributed layer sharding (master shard local, tail on a worker over TCP). Requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT and a live gemma4-worker; memory-infeasible on a single 16GB host.',
+    blurb: 'A larger Gemma for higher-quality multilingual chat and reasoning.',
   },
   {
     catalog_id: 'gemma4_26b_a4b_it_q4_0',
@@ -119,6 +119,6 @@ export const SUPPORTED_MODELS = [
     filename: 'gemma-4-26B_q4_0-it.gguf',
     size_bytes: 14439361440,
     quant: 'Q4_0',
-    blurb: 'Gemma 4 26B A4B (128-expert MoE, QAT Q4_0 + Q6_K head) served as two-Mac distributed layer sharding. Requires CAMELID_GEMMA4_SERVE=1 plus CAMELID_GEMMA4_WORKER/CAMELID_GEMMA4_SPLIT and a live gemma4-worker; the 13.4GB row is memory-infeasible on a single 16GB host.',
+    blurb: 'A large mixture-of-experts Gemma — strongest reasoning and quality.',
   },
 ]
