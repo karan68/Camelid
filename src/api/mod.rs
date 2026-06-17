@@ -1318,6 +1318,9 @@ pub fn router_with_state(state: AppState) -> Router {
             "/api/generation/sessions",
             get(generation_sessions).post(create_generation_session),
         )
+        .route("/api/models/local", get(local_models))
+        .route("/api/models/runnable-receipt", get(runnable_receipt))
+        .route("/api/models/runnable-smoke", post(run_runnable_smoke))
         .route("/api/models/catalog", get(get_catalog))
         .route("/api/models/catalog/install", post(install_catalog_model))
         .route("/api/models/catalog/downloads", get(get_catalog_downloads))
@@ -12086,7 +12089,21 @@ pub struct CatalogItem {
     pub downloads: u64,
     pub likes: u64,
     pub quant: &'static str,
+    /// `general.architecture` the GGUF will report (authoritative — curated, not
+    /// inferred from the filename). Drives the catalog's predicted lane.
+    pub architecture: &'static str,
     pub license: &'static str,
+}
+
+/// A catalog item plus its predicted runnable lane, so the Models tab can show which
+/// lane each entry would land in without downloading it. `oracle_qualified` means the
+/// `(architecture, quant)` combo is anchored → it would be Compatible after download
+/// (unless it also matches a supported contract row, which the frontend resolves).
+#[derive(Debug, serde::Serialize)]
+pub struct CatalogItemView {
+    #[serde(flatten)]
+    pub item: CatalogItem,
+    pub oracle_qualified: bool,
 }
 
 pub fn curated_catalog() -> Vec<CatalogItem> {
@@ -12100,6 +12117,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 142000,
             likes: 540,
             quant: "Q8_0",
+            architecture: "llama",
             license: "llama3.2",
         },
         CatalogItem {
@@ -12111,6 +12129,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 98000,
             likes: 420,
             quant: "Q8_0",
+            architecture: "llama",
             license: "llama3.2",
         },
         CatalogItem {
@@ -12124,6 +12143,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 512000,
             likes: 1240,
             quant: "Q8_0",
+            architecture: "llama",
             license: "other",
         },
         CatalogItem {
@@ -12135,6 +12155,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 320000,
             likes: 920,
             quant: "Q8_0",
+            architecture: "llama",
             license: "llama3",
         },
         CatalogItem {
@@ -12146,6 +12167,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "llama",
             license: "apache-2.0",
         },
         CatalogItem {
@@ -12157,6 +12179,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
             license: "apache-2.0",
         },
         CatalogItem {
@@ -12168,6 +12191,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
             license: "apache-2.0",
         },
         CatalogItem {
@@ -12179,6 +12203,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
             license: "apache-2.0",
         },
         CatalogItem {
@@ -12190,6 +12215,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "qwen3",
             license: "apache-2.0",
         },
         CatalogItem {
@@ -12201,6 +12227,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "gemma4",
             license: "gemma",
         },
         CatalogItem {
@@ -12212,6 +12239,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "gemma4",
             license: "gemma",
         },
         CatalogItem {
@@ -12223,6 +12251,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q8_0",
+            architecture: "gemma4",
             license: "gemma",
         },
         CatalogItem {
@@ -12234,20 +12263,341 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             downloads: 0,
             likes: 0,
             quant: "Q4_0",
+            architecture: "gemma4",
             license: "gemma",
+        },
+        CatalogItem {
+            catalog_id: "gemma3_1b_it_q8_0",
+            name: "Gemma 3 1B-It Q8_0",
+            repo_id: "ggml-org/gemma-3-1b-it-GGUF",
+            filename: "gemma-3-1b-it-Q8_0.gguf",
+            size_bytes: 1069306368,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "gemma3",
+            license: "gemma",
+        },
+        CatalogItem {
+            catalog_id: "phi3_mini_4k_instruct_q8_0",
+            name: "Phi-3-mini-4k-instruct Q8_0",
+            repo_id: "bartowski/Phi-3-mini-4k-instruct-GGUF",
+            filename: "Phi-3-mini-4k-instruct-Q8_0.gguf",
+            size_bytes: 4061222688,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "phi3",
+            license: "mit",
         },
     ]
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct CatalogResponse {
-    pub items: Vec<CatalogItem>,
+    pub items: Vec<CatalogItemView>,
     pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct CatalogQuery {
     pub query: Option<String>,
+}
+
+/// One local on-disk GGUF with the facts the Models tab needs to bucket it by lane.
+/// Cheap to compute: header-only metadata + admission, no model load or generation,
+/// no whole-file hashing. The frontend derives "supported" by matching against the
+/// `/api/capabilities` contract; the runnable-lane facts come from here.
+#[derive(Debug, serde::Serialize)]
+pub struct LocalModelEntry {
+    pub filename: String,
+    pub size_bytes: u64,
+    pub architecture: Option<String>,
+    /// Headline (dominant non-F32) quant, e.g. `Q8_0`.
+    pub quantization: Option<String>,
+    /// `llama_spm` / `gpt2_bpe`, from the runnable tokenizer family.
+    pub tokenizer_kind: Option<String>,
+    /// Passes the runnable covered-set admission gate.
+    pub admitted: bool,
+    /// Machine-readable refusal reason when `admitted` is false.
+    pub admission_reason: Option<String>,
+    /// The (architecture, quant) combo is oracle-qualified, so smoke-admission is
+    /// allowed. A model that is admitted but NOT oracle_qualified is "combo not yet
+    /// anchored" — never presented as compatible.
+    pub oracle_qualified: bool,
+    /// A cached runnable smoke receipt already exists for this file (it passed
+    /// smoke-admission before) — i.e. it belongs in the Compatible section.
+    pub runnable_receipt_present: bool,
+    /// The GGUF ships a chat template — i.e. it is an instruction-tuned chat model
+    /// (vs a base text-completion model). A model capability, not a system fact.
+    pub chat_capable: bool,
+    /// Trained context window (tokens) from the GGUF — a model capability.
+    pub context_length: Option<u32>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct LocalModelsResponse {
+    /// Repo-relative models directory the scan covered.
+    pub models_dir: String,
+    pub models: Vec<LocalModelEntry>,
+}
+
+/// Cached metadata-derived facts for one local model, keyed by (mtime, size) so a
+/// re-download invalidates it. Parsing a GGUF's tensor index is slow for big models
+/// (the 16 GB MoE alone is seconds), and this endpoint is polled — so we re-parse
+/// only files that are new or changed.
+#[derive(Clone)]
+struct CachedLocalMeta {
+    mtime_secs: u64,
+    size_bytes: u64,
+    architecture: Option<String>,
+    quantization: Option<String>,
+    tokenizer_kind: Option<String>,
+    admitted: bool,
+    admission_reason: Option<String>,
+    oracle_qualified: bool,
+    chat_capable: bool,
+    context_length: Option<u32>,
+}
+
+fn local_meta_cache() -> &'static std::sync::Mutex<HashMap<String, CachedLocalMeta>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, CachedLocalMeta>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn runnable_smoke_receipt_path(filename: &str) -> PathBuf {
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    PathBuf::from("qa")
+        .join("runnable")
+        .join("smoke")
+        .join(format!("{stem}.json"))
+}
+
+/// `GET /api/models/local` — enumerate `models/*.gguf` with per-model lane facts.
+/// Membership is derived downstream from these facts; nothing here is hand-authored.
+async fn local_models() -> Json<LocalModelsResponse> {
+    let dir = PathBuf::from("models");
+    let mut models = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "gguf").unwrap_or(false))
+            .collect();
+        paths.sort();
+        for path in paths {
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let fs_meta = std::fs::metadata(&path).ok();
+            let size_bytes = fs_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime_secs = fs_meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            // Reuse cached metadata facts when the file is unchanged; only the cheap
+            // receipt-present check (which a smoke run can flip) is always live.
+            let cached = {
+                let cache = local_meta_cache().lock().unwrap();
+                cache.get(&filename).cloned()
+            };
+            let meta = match cached {
+                Some(c) if c.mtime_secs == mtime_secs && c.size_bytes == size_bytes => c,
+                _ => {
+                    let mut c = CachedLocalMeta {
+                        mtime_secs,
+                        size_bytes,
+                        architecture: None,
+                        quantization: None,
+                        tokenizer_kind: None,
+                        admitted: false,
+                        admission_reason: None,
+                        oracle_qualified: false,
+                        chat_capable: false,
+                        context_length: None,
+                    };
+                    match read_metadata(&path) {
+                        Ok(gguf) => {
+                            let quant = crate::runnable::headline_quant_of(&gguf);
+                            c.quantization = Some(quant.clone());
+                            // Model capabilities (system-independent): a chat template
+                            // means instruction-tuned chat; context_length is the
+                            // trained window.
+                            c.chat_capable =
+                                gguf.metadata_string("tokenizer.chat_template").is_some();
+                            c.context_length = gguf
+                                .architecture()
+                                .and_then(|a| gguf.metadata_u32(&format!("{a}.context_length")));
+                            match crate::runnable::admit(&gguf) {
+                                Ok(ok) => {
+                                    c.admitted = true;
+                                    c.tokenizer_kind = Some(
+                                        match ok.tokenizer {
+                                            crate::runnable::TokenizerFamily::Spm => "llama_spm",
+                                            crate::runnable::TokenizerFamily::Bpe => "gpt2_bpe",
+                                        }
+                                        .to_string(),
+                                    );
+                                    c.oracle_qualified =
+                                        crate::runnable::oracle_qualified(&ok.architecture, &quant);
+                                    c.architecture = Some(ok.architecture);
+                                }
+                                Err(reject) => {
+                                    c.architecture = gguf.architecture().map(|s| s.to_string());
+                                    c.admission_reason = Some(reject.message);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            c.admission_reason = Some(format!("GGUF parse failed: {err}"))
+                        }
+                    }
+                    local_meta_cache()
+                        .lock()
+                        .unwrap()
+                        .insert(filename.clone(), c.clone());
+                    c
+                }
+            };
+
+            models.push(LocalModelEntry {
+                runnable_receipt_present: runnable_smoke_receipt_path(&filename).exists(),
+                filename,
+                size_bytes,
+                architecture: meta.architecture,
+                quantization: meta.quantization,
+                tokenizer_kind: meta.tokenizer_kind,
+                admitted: meta.admitted,
+                admission_reason: meta.admission_reason,
+                oracle_qualified: meta.oracle_qualified,
+                chat_capable: meta.chat_capable,
+                context_length: meta.context_length,
+            });
+        }
+    }
+    Json(LocalModelsResponse {
+        models_dir: "models".to_string(),
+        models,
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunnableReceiptQuery {
+    filename: String,
+}
+
+/// `GET /api/models/runnable-receipt?filename=<gguf>` — return the cached runnable
+/// smoke receipt for a model (lane=runnable; attests deterministic execution, not
+/// parity). 404 when the model has not been smoke-admitted yet.
+async fn runnable_receipt(
+    axum::extract::Query(q): axum::extract::Query<RunnableReceiptQuery>,
+) -> Response {
+    let path = runnable_smoke_receipt_path(&q.filename);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(mut value) => {
+                // Normalize to the bare receipt: older cached artifacts wrap it as
+                // `{ "receipt": {...} }`; the endpoint always returns the receipt.
+                if let Some(inner) = value.get_mut("receipt").map(std::mem::take) {
+                    value = inner;
+                }
+                (StatusCode::OK, Json(value)).into_response()
+            }
+            Err(err) => api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "runnable_receipt_unreadable",
+                format!("cached receipt is not valid JSON: {err}"),
+                None,
+            ),
+        },
+        Err(_) => api_error(
+            StatusCode::NOT_FOUND,
+            "runnable_receipt_not_found",
+            format!("no runnable smoke receipt for {}", q.filename),
+            None,
+        ),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RunnableSmokeRequest {
+    filename: String,
+}
+
+/// `POST /api/models/runnable-smoke {filename}` — run smoke-admission on a local
+/// model (admit -> load -> forward sanity -> coherence), cache + return the runnable
+/// receipt on pass. User-initiated; the model joins the Compatible section after.
+/// CPU-heavy (~minute) so it runs on a blocking thread.
+async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
+    let filename = req.filename;
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_filename",
+            "filename must be a bare GGUF name resolved under models/".to_string(),
+            None,
+        );
+    }
+    let path = PathBuf::from("models").join(&filename);
+    if !path.exists() {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "model_not_found",
+            format!("{filename} is not present in models/"),
+            None,
+        );
+    }
+    let path_str = path.to_string_lossy().to_string();
+    let result =
+        tokio::task::spawn_blocking(move || crate::runnable::smoke_admit(&path_str)).await;
+    match result {
+        Ok(Ok(report)) => {
+            let out = runnable_smoke_receipt_path(&filename);
+            if let Some(parent) = out.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string_pretty(&report.receipt) {
+                let _ = std::fs::write(&out, json);
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "passed": true,
+                    "architecture": report.architecture,
+                    "quant": report.quant,
+                    "logit_min": report.logit_min,
+                    "logit_max": report.logit_max,
+                    "generated_text": report.generated_text,
+                    "receipt": report.receipt,
+                })),
+            )
+                .into_response()
+        }
+        Ok(Err(err)) => api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "smoke_admission_failed",
+            err.to_string(),
+            None,
+        ),
+        Err(_) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "smoke_task_failed",
+            "smoke-admission task panicked".to_string(),
+            None,
+        ),
+    }
 }
 
 async fn get_catalog(
@@ -12267,8 +12617,15 @@ async fn get_catalog(
     } else {
         items
     };
+    let items = filtered
+        .into_iter()
+        .map(|item| CatalogItemView {
+            oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
+            item,
+        })
+        .collect();
     Json(CatalogResponse {
-        items: filtered,
+        items,
         next_cursor: None,
     })
 }

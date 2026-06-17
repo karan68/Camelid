@@ -75,3 +75,24 @@ Once present, the control renders: projected = process_rss_bytes +
 (value − kv_cached_tokens) × kv_bytes_per_token vs available_bytes, labeled
 "estimated", with red above available RAM and amber above 85% — formula shown in the
 readout's popover.
+
+## 4. Runnable-lane HTTP serve/generate endpoint (Models tab Gate 4, 2026-06-17)
+
+**Surface waiting on it:** Models tab → "Compatible" lane rows (smoke-admitted, runnable
+f32 lane). These models have a runnable receipt proving deterministic execution, but the
+UI offers NO in-app "Use for chat" for them — only the Supported lane gets a load button
+(it loads into the parity chat backend via `POST /api/models/load`). The runnable lane is
+a separate generic-f32 engine with only `POST /api/models/runnable-smoke` (one-shot smoke)
+and the `camelid runnable-smoke` CLI. There is no interactive serve/generate route, so the
+frontend cannot — and will not fake — a chat session against the runnable lane.
+
+**Ask (one of):**
+1. `POST /api/models/runnable-generate` → `{ filename, prompt, max_tokens, ... }` returning
+   `{ tokens, text }` from the runnable engine (stateless or KV-cached), OR
+2. let `POST /api/models/load` accept `{ lane: "runnable" }` so a runnable-only model can be
+   loaded into a runnable serving context and reuse `/v1/completions` with an explicit
+   `execution_lane: "runnable"` echoed on every response (so the chat UI can label it amber,
+   never copper, and keep the parity-locked Send-gate off for it).
+
+Until then the Compatible rows stay receipt-only with an explicit "CLI only — no HTTP serve
+yet" note; membership and evidence remain fully derived, nothing is invented.
