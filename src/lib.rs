@@ -22,6 +22,7 @@ pub mod model_source;
 pub mod offload;
 pub mod platform_fs;
 pub mod receipt;
+pub mod runnable;
 pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;

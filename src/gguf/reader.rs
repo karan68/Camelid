@@ -32,7 +32,7 @@ pub enum GgufMetadataValue {
     F64(f64),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GgufTensorType {
     F32,
     F16,

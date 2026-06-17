@@ -572,8 +572,13 @@ impl Tokenizer {
         if text.is_empty() {
             return normalized;
         }
+        // Always prepend the dummy `▁` when add_space_prefix is set, including when
+        // the text already begins with whitespace. This matches HF's SentencePiece
+        // (Metaspace) tokenizer, which prepends unconditionally — verified bit-exact
+        // against HF `tokenizers` for llama SPM (tests/runnable_tokenizer.rs). A prior
+        // `!text.starts_with(char::is_whitespace)` guard suppressed the prefix on
+        // leading-whitespace input and diverged from HF on those cases (RA-5).
         if self.config.add_space_prefix
-            && !text.starts_with(char::is_whitespace)
             && !(parse_special && self.longest_control_token_at(text, 0).is_some())
         {
             normalized.push(SPM_SPACE);

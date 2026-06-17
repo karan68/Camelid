@@ -382,6 +382,20 @@ for (const [path, css] of statusSheets) {
   assert.doesNotMatch(css, /var\(--color-verified\)/, `${path} must not spend the copper supported color on non-claim surfaces`)
 }
 
+/* ---- Runnable lane (Phase 7): unfakeable + unconfusable, never copper ---- */
+const parityReceiptSource = read('../src/components/chat/render/ParityReceipt.jsx')
+assert.match(evidenceStatusSource, /value === 'runnable' \|\| value\.startsWith\('runnable_'\)\) return 'runnable'/, 'runnable status must classify to its own state, never into copper supported')
+assert.match(evidenceStatusSource, /EVIDENCE_STATES = \[\s*'supported',\s*'runnable'/, 'runnable must be a first-class evidence state, distinct from supported')
+const runnableChipRule = evidenceCss.match(/\.ev-chip--runnable\s*\{[^}]*\}/s)
+assert.ok(runnableChipRule, 'evidence.css must define the runnable chip state')
+assert.doesNotMatch(runnableChipRule[0], /var\(--color-verified\)/, 'the runnable chip must never spend the reserved copper token')
+assert.match(runnableChipRule[0], /var\(--color-evidence\)/, 'the runnable chip must use the amber evidence token (the 🟡 legend state)')
+assert.match(parityReceiptSource, /execution_lane === 'runnable'/, 'the receipt card must detect the runnable lane from the receipt schema')
+assert.match(parityReceiptSource, /Runnable lane/, 'a runnable receipt must be labelled distinctly from a supported parity receipt')
+const runnableCardRule = chatCss.match(/\.parity-receipt-lane-badge\s*\{[^}]*\}/s)
+assert.ok(runnableCardRule, 'chat.css must style the runnable lane badge')
+assert.doesNotMatch(runnableCardRule[0], /var\(--color-verified\)/, 'the runnable lane badge must never be copper')
+
 /* ---- Tokens, fonts, themes (Phase 1 contract) ---- */
 assert.doesNotMatch(tokensCss, /@import url\(['"]?https?:/, 'tokens.css must not import from a CDN — the app renders fully offline')
 assert.match(tokensCss, /:root \{\s*\n\s*color-scheme: dark;/, 'dark is the canonical :root palette (dark-first)')

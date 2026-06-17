@@ -25,6 +25,10 @@ export function ParityReceiptCard({ receipt }) {
   if (!receipt?.receipt_id) return null
   const lane = receipt.lane || {}
   const parity = receipt.parity || {}
+  // The generic runnable lane attests deterministic, HF-anchored execution — NOT a
+  // supported parity contract. It must be unmistakable from a supported receipt and
+  // is never copper.
+  const isRunnable = receipt.execution_lane === 'runnable'
   const shortHash = String(lane.gguf_sha256 || '').slice(0, 12)
   const shortId = String(receipt.receipt_id || '').slice(0, 12)
   const downloadName = `camelid-parity-receipt-${shortId}.json`
@@ -54,9 +58,17 @@ export function ParityReceiptCard({ receipt }) {
   }
 
   return (
-    <div className="parity-receipt-card" aria-label="Parity receipt for this request">
+    <div
+      className={`parity-receipt-card${isRunnable ? ' is-runnable' : ''}`}
+      aria-label={`${isRunnable ? 'Runnable-lane' : 'Parity'} receipt for this request`}
+    >
       <div className="parity-receipt-header">
-        <span className="parity-receipt-title">Parity receipt</span>
+        <span className="parity-receipt-title">{isRunnable ? 'Runnable receipt' : 'Parity receipt'}</span>
+        {isRunnable && (
+          <span className="parity-receipt-lane-badge" title="Generic runnable lane — not a supported parity contract">
+            Runnable lane
+          </span>
+        )}
         <span className={`parity-receipt-badge is-${receipt.reproducible ? 'reproducible' : 'sampled'}`}>
           {receipt.reproducible ? 'Reproducible (greedy)' : 'Not reproducible (sampled)'}
         </span>
@@ -88,7 +100,9 @@ export function ParityReceiptCard({ receipt }) {
         </button>
       </div>
       <p className="parity-receipt-note">
-        Records this one request on this exact GGUF. Not a support claim; the release ledger is unchanged.
+        {isRunnable
+          ? 'Runnable lane: this one request executed deterministically on this exact GGUF and is anchored to the HF reference. That is cross-checked execution, not a supported parity contract — never copper; the release ledger is unchanged.'
+          : 'Records this one request on this exact GGUF. Not a support claim; the release ledger is unchanged.'}
       </p>
     </div>
   )

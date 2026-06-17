@@ -13,3 +13,7 @@ frontend/dist/
 qa/evidence-bundles/four-row-20260503T024119Z/
 qa/evidence-bundles/four-row-20260503T024327Z/
 qa/evidence-bundles/four-row-perf-portability-20260503T025639Z/
+
+# Large regenerable HF parity fixtures (rebuild via scripts/gen-hf-parity-fixtures.py;
+# the passing evidence is committed under qa/runnable/*-parity.json)
+tests/fixtures/hf_parity/

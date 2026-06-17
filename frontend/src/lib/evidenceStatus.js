@@ -5,6 +5,10 @@
    States (the design's vocabulary, one icon + one color family each):
    - supported          copper. Reserved for contract `supported`/`supported_*`
                         rows only — the receipt-stamp state.
+   - runnable           amber (🟡). The generic runnable lane: a model that executes
+                        deterministically and is anchored to the HF reference, but is
+                        NOT a supported parity contract. Distinct from supported (never
+                        copper) and from unsupported.
    - evidence           desaturated amber. Bounded/row-scoped evidence facts:
                         validated, measured, pass, partial, guarded lanes.
    - acceptance-target  cool slate. A named target the ledger tracks.
@@ -19,6 +23,7 @@ import { formatCapabilityStatus } from './capabilities.js'
 
 export const EVIDENCE_STATES = [
   'supported',
+  'runnable',
   'evidence',
   'acceptance-target',
   'groundwork',
@@ -36,6 +41,9 @@ export function classifyEvidenceState(status = '') {
   const value = String(status).toLowerCase().trim()
   if (!value) return 'neutral'
   if (value === 'supported' || value.startsWith('supported_')) return 'supported'
+  // Runnable is anchored/deterministic but never a supported contract — it must
+  // classify to its own amber state, never into the copper supported state.
+  if (value === 'runnable' || value.startsWith('runnable_')) return 'runnable'
   if (value === 'acceptance_target' || value === 'acceptance-target' || value.startsWith('acceptance_target')) return 'acceptance-target'
   if (value === 'groundwork' || value.startsWith('groundwork')) return 'groundwork'
   if (PLANNED_VALUES.has(value)) return 'planned'
@@ -48,6 +56,7 @@ export function classifyEvidenceState(status = '') {
 /* Short human framing per state — claim scope, in product voice. */
 export const EVIDENCE_STATE_COPY = {
   supported: 'Supported for this exact row only. Resemblance is not evidence.',
+  runnable: 'Runnable lane: this model executes deterministically and is anchored to the HF reference. That is cross-checked execution, not a supported parity contract — never copper.',
   evidence: 'Row-scoped evidence exists for the bounded lane named here — not a broader support claim.',
   'acceptance-target': 'A tracked acceptance target. Listing it is not a support claim.',
   groundwork: 'Groundwork only: plumbing exists, nothing is promoted by it.',
@@ -59,6 +68,7 @@ export const EVIDENCE_STATE_COPY = {
 
 export const EVIDENCE_STATE_LABELS = {
   supported: 'Supported',
+  runnable: 'Runnable',
   evidence: 'Evidence',
   'acceptance-target': 'Target',
   groundwork: 'Groundwork',

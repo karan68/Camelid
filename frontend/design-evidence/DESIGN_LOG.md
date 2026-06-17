@@ -868,3 +868,90 @@ story should state parity is *gated by a ready harness with an explicit
 bit-exact tolerance*, not that the run has been performed. The dev box has no GPU
 build path exercised here; the existing `qa/parity_*_diag.json` files are
 camelid-vs-llama.cpp and are not a CPU-vs-CUDA substitute.
+
+## Phase 7 (runnable lane) — Receipt lane distinction: runnable vs supported (2026-06-16)
+
+Part of the runnable-lane build (`RUNNABLE_LANE_SPEC.md`). The runnable lane runs any
+covered GGUF deterministically as a generic f32 graph and is externally anchored to HF
+transformers (it is the promotion oracle for the supported lane). Its receipts must be
+**unmistakable** from a supported, llama.cpp-parity-verified receipt — and must never
+earn copper.
+
+### Schema (backend)
+
+- New `ExecutionLane { Runnable, Supported }` enum and an additive
+  `ParityReceipt.execution_lane: Option<ExecutionLane>` (`src/receipt/mod.rs`).
+- Additive on purpose, following the `execution_trace`/`signature` precedent:
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`. **Absent = supported**
+  (the legacy default), so every receipt written before this field digests and verifies
+  byte-for-byte unchanged (`absent_execution_lane_is_omitted_and_keeps_digest_stable`).
+- `Some(Runnable)` is part of the canonical body, so it is bound into `receipt_id` and
+  cannot be stripped to pass a runnable run off as supported without changing the id
+  (`runnable_lane_serializes_and_is_digest_bound`). The supported serving path
+  (`src/api/mod.rs`) leaves the lane absent.
+
+### UI (frontend)
+
+- New first-class evidence state **`runnable`** (`src/lib/evidenceStatus.js`): amber
+  (the 🟡 legend state), classified from `runnable`/`runnable_*`, with its own label and
+  claim copy. It can never fall through to the copper `supported` state.
+- `.ev-chip--runnable` (`src/styles/evidence.css`) uses the amber `--color-evidence`
+  tokens — the copper `--color-verified` token is never spent on it.
+- `ParityReceiptCard` (`src/components/chat/render/ParityReceipt.jsx`) reads
+  `receipt.execution_lane`; a runnable receipt gets a distinct "Runnable lane" badge,
+  a "Runnable receipt" title, and runnable-specific copy ("cross-checked execution, not
+  a supported parity contract — never copper"). Badge styled amber in `chat.css`.
+
+### Status doctrine
+
+Copper stays reserved exclusively for `supported`/`supported_*`. Runnable is amber,
+distinct from both supported (copper) and unsupported (slate). A runnable receipt
+attests *deterministic, oracle-anchored execution*, not cross-validated support.
+
+### Gate results
+
+- Backend: `cargo test --lib receipt::` — 29/29 (3 new: digest-stable-when-absent,
+  digest-bound-when-runnable, runnable≠supported digests).
+- Frontend: `node scripts/ui-regression-smoke.mjs` passes, with new assertions that
+  runnable classifies to its own state (never copper), the runnable chip uses amber not
+  `--color-verified`, and the receipt card detects + labels the runnable lane.
+
+## Runnable lane — Smoke-admission vs. oracle qualification (2026-06-16)
+
+Two distinct, deliberately-separate notions of "this model is OK" in the runnable lane.
+They must never be conflated, and the receipts/UI keep them apart.
+
+### Oracle qualification (Phase 5, per architecture)
+
+- A **one-time, per-(architecture, quant, tokenizer) gate**. Proves the runnable f32
+  graph is *numerically equivalent to HF transformers* — greedy token sequences match
+  exactly on frozen fixtures, logit max-abs-diff ~1e-4 (`tests/runnable_parity.rs`,
+  artifacts `qa/runnable/<arch>-parity.json`).
+- This is what *earns* an architecture the right to be trusted. Currently qualified:
+  llama, qwen3, gemma3 (Q8_0). phi3 is implemented + coherence-validated; its HF
+  bit-parity is pending a larger-RAM machine (Phi-3-mini is 3.8B → ~15 GB f32).
+- It is the promotion oracle for the supported lane.
+
+### Smoke-admission (new capability, per model file)
+
+- A **per-GGUF** check: "does THIS file admit, load, and execute cleanly here." It does
+  NOT prove correctness — it attests *deterministic execution*. (`src/runnable/smoke.rs`)
+- Guardrail: smoke-admission runs **only on combos that are already oracle-qualified**.
+  A GGUF on any other combo is refused with `combo not yet anchored` — so a green smoke
+  can never be mistaken for "this architecture is correct" (that claim belongs to the
+  oracle, not the smoke).
+- Checks, in order: (1) covered-set admission gate; (2) load — all tensors present,
+  shapes consistent, dequant succeeds on every tensor; (3) greedy forward on a fixed
+  tiny prompt with finite logits and a sane range; (4) coherence — greedy-decode ~24
+  tokens, fail if degenerate (a short-period repetition loop or too-few distinct
+  tokens). The smoke prompt is rendered through the GGUF's own chat template so
+  instruction-tuned models get a fair coherence test.
+- A pass emits a **runnable receipt** (`execution_lane = Runnable`, never copper) whose
+  `parity` block is `not_compared` — honest that no reference was consulted. It is, by
+  construction, unmistakable from a supported parity receipt (Phase 7).
+
+### The distinction in one line
+
+Oracle qualification answers "is this architecture's math right?" (vs HF, once).
+Smoke-admission answers "does this specific file run cleanly?" (per file, never a
+correctness claim). The runnable receipt a smoke emits attests the latter only.
