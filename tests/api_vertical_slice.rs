@@ -2363,9 +2363,12 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    // `add_space_prefix=true` unconditionally prepends a space, so the already
+    // space-led " hello!" tokenizes with a leading double-space (id 6 twice).
     assert_eq!(
         body["tokens"].as_array().unwrap(),
         &[
+            serde_json::json!(6),
             serde_json::json!(6),
             serde_json::json!(4),
             serde_json::json!(5)
@@ -2390,6 +2393,7 @@ async fn llama_server_tokenize_detokenize_aliases_use_loaded_tokenizer() {
     assert_eq!(
         body["tokens"].as_array().unwrap(),
         &[
+            serde_json::json!({"id":6,"piece":" "}),
             serde_json::json!({"id":6,"piece":" "}),
             serde_json::json!({"id":4,"piece":"hello"}),
             serde_json::json!({"id":5,"piece":"!"})
