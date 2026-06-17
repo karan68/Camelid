@@ -797,7 +797,10 @@ fn launch_gemv(
 ) -> Result<(), cudarc::driver::DriverError> {
     // 8 warps/block, one warp per output row. Shared holds the staged input
     // vector (quants `bpr*32` + scales `bpr*4`) shared by all warps, then each
-    // warp's per-block float terms for the in-order lane-0 reduction.
+    // warp's per-block float terms for the in-order lane-0 reduction. (A block-size
+    // sweep — 64/128/256/512 — left decode tok/s flat within noise: the batch-1 GEMV
+    // is memory-latency-bound and the decode CUDA graph already cuts launch overhead,
+    // so occupancy is not the limiter. Kept at the profiled default.)
     let block = 256u32;
     let warps_per_block = block / 32;
     let bpr_u = blocks_per_row as u32;
@@ -1780,6 +1783,15 @@ impl CudaResidentDecode {
         self.filled = filled;
     }
 
+    /// True when any layer's weights live in host RAM and stream to a GPU scratch buffer
+    /// each forward (the capacity split for models too big to fit fully resident, e.g.
+    /// 8B on a 6 GiB card). Only `forward_pass` implements that streaming; the batched
+    /// layer stack reads VRAM slices directly, so batched prefill must defer to the
+    /// serial path when this is true.
+    pub fn is_offloaded(&self) -> bool {
+        self.offload.is_some() || self.layers.iter().any(|l| l.offloaded.is_some())
+    }
+
     /// Resident KV capacity (positions) this engine was built for. Sized from free
     /// VRAM at build time, so it is the authoritative cap the decode/prefill seams
     /// guard against (a position at or beyond it falls back to the CPU path).
@@ -2508,57 +2520,16 @@ impl CudaResidentDecode {
             return Err(format!("verify_batch: k={k} out of 1..={MAX_VERIFY_K}"));
         }
         let map = |e: cudarc::driver::DriverError| format!("cuda verify: {e}");
-        let (hidden, q_width, kv_width, ffn_dim, vocab) = (
-            self.hidden,
-            self.q_width,
-            self.kv_width,
-            self.ffn_dim,
-            self.vocab,
-        );
-        let (head_dim, n_heads, n_kv, rope_dim, max_pos, eps) = (
-            self.head_dim,
-            self.n_heads,
-            self.n_kv_heads,
-            self.rope_dim,
-            self.max_pos,
-            self.eps,
-        );
-        let half = rope_dim / 2;
-        let (hb, qb, fb) = (hidden / 32, q_width / 32, ffn_dim / 32);
+        // The per-layer batched stack lives in `run_batched_layer_stack` (shared with
+        // batched prefill); here we only need the dims for input staging and the final
+        // logits projection.
+        let (hidden, vocab, eps) = (self.hidden, self.vocab, self.eps);
+        let half = self.rope_dim / 2;
+        let hb = hidden / 32;
         if embeddings.len() < k * hidden || cos_all.len() < k * half || sin_all.len() < k * half {
             return Err("verify_batch: input slices too short".into());
         }
-        if self.verify_scratch.is_none() {
-            let st = &self.k.stream;
-            let mk = MAX_VERIFY_K;
-            let max_in = hidden.max(q_width).max(ffn_dim);
-            let af = |n: usize| {
-                st.alloc_zeros::<f32>(n)
-                    .map_err(|e| format!("verify alloc: {e}"))
-            };
-            self.verify_scratch = Some(VerifyScratch {
-                vh: af(mk * hidden)?,
-                vn: af(mk * hidden)?,
-                viq: st
-                    .alloc_zeros::<i8>(mk * max_in)
-                    .map_err(|e| format!("verify alloc: {e}"))?,
-                vis: af(mk * (max_in / 32))?,
-                vq: af(mk * q_width)?,
-                vk: af(mk * kv_width)?,
-                vv: af(mk * kv_width)?,
-                vattn: af(mk * q_width)?,
-                vproj: af(mk * hidden)?,
-                vgate: af(mk * ffn_dim)?,
-                vup: af(mk * ffn_dim)?,
-                vact: af(mk * ffn_dim)?,
-                vlogits: af(mk * vocab)?,
-                vsamp: st
-                    .alloc_zeros::<u32>(mk)
-                    .map_err(|e| format!("verify alloc: {e}"))?,
-                vcos: af(mk * half)?,
-                vsin: af(mk * half)?,
-            });
-        }
+        self.ensure_verify_scratch()?;
         let s = self.k.stream.clone();
         let mut sc = self.verify_scratch.take().expect("allocated above");
 
@@ -2572,6 +2543,141 @@ impl CudaResidentDecode {
         s.memcpy_htod(&sin_all[..k * half], &mut sc.vsin.slice_mut(0..k * half))
             .map_err(map)?;
 
+        self.run_batched_layer_stack(&mut sc, &s, base_position, k, scale)?;
+        launch_rms_norm_batched(
+            &s,
+            &self.k.rms_norm_batched,
+            &sc.vh,
+            &self.final_norm,
+            &mut sc.vn,
+            hidden,
+            eps,
+            k,
+        )
+        .map_err(map)?;
+        launch_quantize(
+            &s,
+            &self.k.quantize,
+            &sc.vn,
+            &mut sc.viq,
+            &mut sc.vis,
+            k * hb,
+        )
+        .map_err(map)?;
+        launch_gemm_batched(
+            &s,
+            &self.k.gemm_batched,
+            &sc.vis,
+            &sc.viq,
+            &self.output_weight,
+            vocab,
+            hb,
+            k,
+            &mut sc.vlogits,
+        )
+        .map_err(map)?;
+        launch_argmax_batched(
+            &s,
+            &self.k.argmax_batched,
+            &sc.vlogits,
+            vocab,
+            k,
+            &mut sc.vsamp,
+        )
+        .map_err(map)?;
+        let mut out = vec![0u32; MAX_VERIFY_K];
+        s.memcpy_dtoh(&sc.vsamp, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        out.truncate(k);
+        self.verify_scratch = Some(sc);
+        Ok(out)
+    }
+
+    /// Allocate the K-batched scratch (`verify_scratch`) if not already present.
+    /// Sized to `MAX_VERIFY_K * dim` and shared by `verify_batch` and `prefill_batched`.
+    /// Idempotent — a no-op once the buffers exist.
+    fn ensure_verify_scratch(&mut self) -> Result<(), String> {
+        if self.verify_scratch.is_some() {
+            return Ok(());
+        }
+        let (hidden, q_width, kv_width, ffn_dim, vocab) = (
+            self.hidden,
+            self.q_width,
+            self.kv_width,
+            self.ffn_dim,
+            self.vocab,
+        );
+        let half = self.rope_dim / 2;
+        let st = &self.k.stream;
+        let mk = MAX_VERIFY_K;
+        let max_in = hidden.max(q_width).max(ffn_dim);
+        let af = |n: usize| {
+            st.alloc_zeros::<f32>(n)
+                .map_err(|e| format!("verify alloc: {e}"))
+        };
+        self.verify_scratch = Some(VerifyScratch {
+            vh: af(mk * hidden)?,
+            vn: af(mk * hidden)?,
+            viq: st
+                .alloc_zeros::<i8>(mk * max_in)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            vis: af(mk * (max_in / 32))?,
+            vq: af(mk * q_width)?,
+            vk: af(mk * kv_width)?,
+            vv: af(mk * kv_width)?,
+            vattn: af(mk * q_width)?,
+            vproj: af(mk * hidden)?,
+            vgate: af(mk * ffn_dim)?,
+            vup: af(mk * ffn_dim)?,
+            vact: af(mk * ffn_dim)?,
+            vlogits: af(mk * vocab)?,
+            vsamp: st
+                .alloc_zeros::<u32>(mk)
+                .map_err(|e| format!("verify alloc: {e}"))?,
+            vcos: af(mk * half)?,
+            vsin: af(mk * half)?,
+        });
+        Ok(())
+    }
+
+    /// Run the batched layer stack for `k` tokens (`1..=MAX_VERIFY_K`) at consecutive
+    /// positions `[base_position, base_position+k)`. Reads the staged per-token input
+    /// from `sc.vh` / `sc.vcos` / `sc.vsin`, writes each token's K/V into the cache,
+    /// and leaves the post-final-layer hidden state in `sc.vh`. The caller stages the
+    /// inputs and (for `verify_batch`) projects logits afterward.
+    ///
+    /// This is the single source of truth for the batched forward, shared by
+    /// `verify_batch` (speculative decode) and `prefill_batched`. It is bit-identical
+    /// to the serial `forward_pass` per token: `q8_gemm_batched` reproduces the same
+    /// per-block integer dot and block-ordered fp32 sum as the decode `q8_gemv`, and
+    /// the batched norm/RoPE/scatter/attention kernels match their serial counterparts.
+    /// All K/V of the current chunk are scattered before attention reads them, so a
+    /// token attends to every earlier position (prior chunks + earlier tokens in this
+    /// chunk) exactly as sequential decoding would.
+    fn run_batched_layer_stack(
+        &mut self,
+        sc: &mut VerifyScratch,
+        s: &Arc<CudaStream>,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Result<(), String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda batched layers: {e}");
+        // Own the Arc locally so each per-launch `&s` is `&Arc<CudaStream>` (what the
+        // launch helpers take), not `&&Arc` — the launch calls below are copied verbatim
+        // from the original inline loop. Arc::clone is a cheap refcount bump.
+        let s = s.clone();
+        let (hidden, q_width, kv_width, ffn_dim) =
+            (self.hidden, self.q_width, self.kv_width, self.ffn_dim);
+        let (head_dim, n_heads, n_kv, rope_dim, max_pos, eps) = (
+            self.head_dim,
+            self.n_heads,
+            self.n_kv_heads,
+            self.rope_dim,
+            self.max_pos,
+            self.eps,
+        );
+        let (hb, qb, fb) = (hidden / 32, q_width / 32, ffn_dim / 32);
         for li in 0..self.n_layers {
             let layer = &self.layers[li];
             launch_rms_norm_batched(
@@ -2826,53 +2932,74 @@ impl CudaResidentDecode {
             launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
                 .map_err(map)?;
         }
-        launch_rms_norm_batched(
-            &s,
-            &self.k.rms_norm_batched,
-            &sc.vh,
-            &self.final_norm,
-            &mut sc.vn,
-            hidden,
-            eps,
-            k,
-        )
-        .map_err(map)?;
-        launch_quantize(
-            &s,
-            &self.k.quantize,
-            &sc.vn,
-            &mut sc.viq,
-            &mut sc.vis,
-            k * hb,
-        )
-        .map_err(map)?;
-        launch_gemm_batched(
-            &s,
-            &self.k.gemm_batched,
-            &sc.vis,
-            &sc.viq,
-            &self.output_weight,
-            vocab,
-            hb,
-            k,
-            &mut sc.vlogits,
-        )
-        .map_err(map)?;
-        launch_argmax_batched(
-            &s,
-            &self.k.argmax_batched,
-            &sc.vlogits,
-            vocab,
-            k,
-            &mut sc.vsamp,
-        )
-        .map_err(map)?;
-        let mut out = vec![0u32; MAX_VERIFY_K];
-        s.memcpy_dtoh(&sc.vsamp, &mut out).map_err(map)?;
-        self.k.ctx.synchronize().map_err(map)?;
-        out.truncate(k);
+        Ok(())
+    }
+
+    /// Batched GPU prefill: ingest `n` prompt tokens at positions `[0, n)` through the
+    /// batched layer stack in chunks of `MAX_VERIFY_K`, reading each weight once per
+    /// chunk instead of once per prompt token. The serial `prefill` re-streams every
+    /// weight from VRAM once per token (a memory-bound, device-under-filling GEMV per
+    /// token); batching turns each weight read into a GEMM amortized over the chunk's
+    /// tokens. Writes the KV cache identically to the serial path (same per-block dot
+    /// and block-ordered sum), so decode after prefill stays token-identical. Skips the
+    /// output projection entirely — prefill needs no logits — saving the large vocab
+    /// GEMM the serial path also skips per token.
+    pub fn prefill_batched(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        n: usize,
+        scale: f32,
+    ) -> Result<(), String> {
+        // The batched layer stack reads each layer's VRAM weight slice directly and has
+        // no offload-streaming path (unlike forward_pass), so for an offloaded model
+        // (e.g. 8B on a 6 GiB card) it would read placeholder bytes. Fall back to the
+        // serial prefill, which streams offloaded weights correctly. Batching is a
+        // resident-only fast path.
+        if self.is_offloaded() {
+            return self.prefill(embeddings, cos_all, sin_all, n, scale);
+        }
+        let map = |e: cudarc::driver::DriverError| format!("cuda prefill: {e}");
+        let hidden = self.hidden;
+        let half = self.rope_dim / 2;
+        if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
+            return Err("prefill_batched: input slices too short".into());
+        }
+        self.ensure_verify_scratch()?;
+        let s = self.k.stream.clone();
+        let mut sc = self.verify_scratch.take().expect("allocated above");
+        let mut base = 0usize;
+        while base < n {
+            let kk = (n - base).min(MAX_VERIFY_K);
+            // Stage this chunk's embeddings + RoPE tables into the shared scratch at
+            // offset 0; the layer stack reads [0, kk) and scatters K/V at [base, base+kk).
+            s.memcpy_htod(
+                &embeddings[base * hidden..(base + kk) * hidden],
+                &mut sc.vh.slice_mut(0..kk * hidden),
+            )
+            .map_err(map)?;
+            s.memcpy_htod(
+                &cos_all[base * half..(base + kk) * half],
+                &mut sc.vcos.slice_mut(0..kk * half),
+            )
+            .map_err(map)?;
+            s.memcpy_htod(
+                &sin_all[base * half..(base + kk) * half],
+                &mut sc.vsin.slice_mut(0..kk * half),
+            )
+            .map_err(map)?;
+            // Same stream → the next chunk's stage waits for this chunk's reads; no
+            // explicit per-chunk sync needed (matches the serial prefill's one-sync-at-end).
+            self.run_batched_layer_stack(&mut sc, &s, base, kk, scale)?;
+            base += kk;
+        }
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|e| format!("cuda prefill sync: {e}"))?;
         self.verify_scratch = Some(sc);
-        Ok(out)
+        Ok(())
     }
 }
 

@@ -2137,11 +2137,26 @@ impl LlamaInferenceSession {
         if n > slot.engine.max_pos() {
             return Ok(false);
         }
-        if slot
-            .engine
-            .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
-            .is_err()
-        {
+        // Default to the batched prefill (each weight read once per MAX_VERIFY_K-token
+        // chunk instead of once per token). `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0`
+        // forces the serial per-token loop — an A/B switch for parity bisection. Both
+        // write bit-identical KV (the batched stack reuses the same per-block dot and
+        // block-ordered sum), so decode after either is token-identical.
+        let serial_prefill = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED")
+            .map(|v| {
+                let v = v.to_string_lossy();
+                let v = v.trim();
+                v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+            })
+            .unwrap_or(false);
+        let prefill_result = if serial_prefill {
+            slot.engine
+                .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+        } else {
+            slot.engine
+                .prefill_batched(&embeddings.data, &tables.cos, &tables.sin, n, scale)
+        };
+        if prefill_result.is_err() {
             // A partial prefill leaves the GPU KV inconsistent; mark unfilled so the
             // decode path rebuilds/reseeds rather than trusting it.
             slot.engine.set_filled(0);

@@ -470,6 +470,38 @@ fn prefill_then_decode_matches_sequential() {
         "prefill logits diverged from sequential logits at position {}",
         n - 1
     );
+
+    // Batched prefill must build the SAME KV (hence the same next-token logits) as the
+    // serial prefill — it is the identical math run in MAX_VERIFY_K-token chunks. With
+    // n-1 = 9 tokens it exercises full chunks, a short final chunk, and cross-chunk
+    // causal attention.
+    let mut preb = build_engine(&layers, &final_norm, &output_w);
+    preb.prefill_batched(
+        &flat_emb,
+        &cos_all[..(n - 1) * half],
+        &sin_all[..(n - 1) * half],
+        n - 1,
+        scale,
+    )
+    .unwrap();
+    let preb_logits = preb
+        .forward_token_logits(
+            &embeddings[n - 1],
+            &cos_all[(n - 1) * half..n * half],
+            &sin_all[(n - 1) * half..n * half],
+            n - 1,
+            scale,
+        )
+        .unwrap();
+    assert_eq!(
+        argmax(&preb_logits),
+        argmax(&seq_logits),
+        "batched prefill+decode produced a different token than sequential forwards"
+    );
+    assert!(
+        close(&preb_logits, &pre_logits, 1e-4),
+        "batched prefill logits diverged from serial prefill logits"
+    );
 }
 
 // Deterministic LCG so the tests need no rand dependency.
@@ -789,6 +821,10 @@ fn rope_matches_cpu() {
     let dcos = k.stream.clone_htod(&cos_t).unwrap();
     let dsin = k.stream.clone_htod(&sin_t).unwrap();
     let (nh, hd, rd) = (n_heads as i32, head_dim as i32, rope_dim as i32);
+    // pairing=0 → adjacent-even-odd, matching the CPU reference above. (rope_rotate
+    // gained this 7th param in e08cffae; this direct-launch test must pass it too —
+    // the production `launch_rope` wrapper always does.)
+    let pairing = 0i32;
     let total = (n_heads * pairs) as u32;
     let cfg = LaunchConfig {
         grid_dim: (total.div_ceil(128), 1, 1),
@@ -801,7 +837,8 @@ fn rope_matches_cpu() {
         .arg(&dsin)
         .arg(&nh)
         .arg(&hd)
-        .arg(&rd);
+        .arg(&rd)
+        .arg(&pairing);
     unsafe { b.launch(cfg).unwrap() };
     let mut got = vec![0f32; n_heads * head_dim];
     k.stream.memcpy_dtoh(&dvec, &mut got).unwrap();
