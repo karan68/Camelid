@@ -77,6 +77,15 @@ pub struct ParityReceipt {
     pub reproducible: bool,
     pub result: ReceiptResult,
     pub parity: ParityBlock,
+    /// Which Camelid lane produced this receipt. Absent = `supported` (the legacy
+    /// default — every receipt written before this field existed is a supported-lane
+    /// receipt), so existing receipts digest and verify byte-for-byte unchanged.
+    /// `Some(Runnable)` explicitly marks a generic runnable-lane receipt: it attests
+    /// deterministic execution (oracle-anchored), NOT a supported parity contract, and
+    /// must never render as copper. The marker is part of the canonical body, so it is
+    /// bound into `receipt_id` and cannot be stripped without changing the id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_lane: Option<ExecutionLane>,
     /// Optional execution-trace rollup digest over the deterministic forward pass
     /// (`camelid.execution-trace/v1`). Present only for deterministic, reproducible runs
     /// that opted into tracing; absent otherwise, so non-traced receipts serialize and
@@ -90,6 +99,37 @@ pub struct ParityReceipt {
     /// implemented in this pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<SignatureBlock>,
+}
+
+/// The Camelid lane that produced a receipt.
+///
+/// - `Supported` — a hand-optimized native path, parity-verified against the
+///   llama.cpp reference; copper-eligible in the release ledger.
+/// - `Runnable` — the generic breadth-first f32 path. It attests that this exact
+///   request ran deterministically and produced this digest (oracle-anchored against
+///   HF transformers per architecture); it is **never** a supported parity contract
+///   and must render visibly distinct from a supported receipt, never copper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionLane {
+    Runnable,
+    Supported,
+}
+
+impl ParityReceipt {
+    /// True when this receipt was produced by the generic runnable lane (and so
+    /// must never be presented as a supported parity contract / copper).
+    pub fn is_runnable(&self) -> bool {
+        self.execution_lane == Some(ExecutionLane::Runnable)
+    }
+
+    /// Mark this receipt as a runnable-lane receipt. Call before [`seal`] so the
+    /// marker is bound into `receipt_id`.
+    ///
+    /// [`seal`]: ParityReceipt::seal
+    pub fn set_runnable_lane(&mut self) {
+        self.execution_lane = Some(ExecutionLane::Runnable);
+    }
 }
 
 /// Identity of the exact model lane the receipt is about. A receipt is only
@@ -565,9 +605,61 @@ mod tests {
                 generated_text_match: Some(true),
                 first_divergent_token_index: Some(NO_DIVERGENCE),
             },
+            execution_lane: None,
             execution_trace: None,
             signature: None,
         }
+    }
+
+    #[test]
+    fn absent_execution_lane_is_omitted_and_keeps_digest_stable() {
+        // A supported/legacy receipt (execution_lane = None) must serialize WITHOUT
+        // the field, so receipts written before this field existed digest and verify
+        // byte-for-byte unchanged.
+        let mut receipt = sample_receipt();
+        receipt.seal().expect("seal");
+        let body = receipt.canonical_body().expect("body");
+        assert!(
+            !body.contains("execution_lane"),
+            "absent lane must not appear in the canonical body: {body}"
+        );
+        assert!(!receipt.is_runnable());
+        receipt.verify_self_digest().expect("legacy digest verifies");
+    }
+
+    #[test]
+    fn runnable_lane_serializes_and_is_digest_bound() {
+        let mut receipt = sample_receipt();
+        receipt.set_runnable_lane();
+        receipt.seal().expect("seal");
+        assert!(receipt.is_runnable());
+
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        assert!(json.contains("\"execution_lane\":\"runnable\""));
+
+        // Round-trips and the runnable marker is bound into the id.
+        let back: ParityReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, receipt);
+        back.verify_self_digest().expect("runnable digest verifies");
+
+        // Stripping the marker changes the id (cannot be passed off as supported).
+        let mut stripped = receipt.clone();
+        stripped.execution_lane = None;
+        assert_ne!(
+            stripped.compute_receipt_id().unwrap(),
+            receipt.receipt_id,
+            "removing the runnable marker must change the receipt id"
+        );
+    }
+
+    #[test]
+    fn runnable_and_supported_digests_differ() {
+        let mut supported = sample_receipt();
+        supported.seal().expect("seal");
+        let mut runnable = sample_receipt();
+        runnable.set_runnable_lane();
+        runnable.seal().expect("seal");
+        assert_ne!(supported.receipt_id, runnable.receipt_id);
     }
 
     #[test]

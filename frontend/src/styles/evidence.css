@@ -63,6 +63,14 @@
   background: var(--color-verified-soft);
 }
 .ev-chip--supported.ev-chip--interactive:hover { border-color: var(--color-verified); }
+/* Runnable lane — amber, deliberately NOT copper. Anchored/deterministic execution,
+   not a supported parity contract. A solid border (vs evidence) reads as "runs",
+   while the copper supported token is never spent here. */
+.ev-chip--runnable {
+  color: var(--color-evidence);
+  border-color: var(--color-evidence);
+  background: var(--color-evidence-soft);
+}
 .ev-chip--evidence {
   color: var(--color-evidence);
   border-color: var(--color-evidence-border);

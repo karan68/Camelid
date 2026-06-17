@@ -3467,7 +3467,7 @@ fn decode_bf16_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
         .collect())
 }
 
-fn decode_q8_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q8_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     let blocks = decode_q8_0_blocks(name, bytes, expected_elements)?;
     let mut out = Vec::with_capacity(expected_elements);
     for block in blocks {
@@ -4398,7 +4398,7 @@ pub fn decode_iq4_nl_blocks(bytes: &[u8]) -> Result<Vec<IQ4NLBlock>> {
 }
 
 // Flat dequantization to f32 helpers
-fn decode_q4_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q4_0_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     let blocks = decode_q4_0_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
@@ -4476,7 +4476,7 @@ fn decode_q3_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
     Ok(out)
 }
 
-fn decode_q4_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q4_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     let blocks = decode_q4_k_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
@@ -4488,7 +4488,7 @@ fn decode_q4_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
     Ok(out)
 }
 
-fn decode_q5_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q5_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     let blocks = decode_q5_k_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);
@@ -4500,7 +4500,7 @@ fn decode_q5_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Res
     Ok(out)
 }
 
-fn decode_q6_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_q6_k_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
     let blocks = decode_q6_k_blocks(bytes)
         .map_err(|e| BackendError::InvalidTensorData(format!("{name}: {e}")))?;
     let mut out = Vec::with_capacity(expected_elements);

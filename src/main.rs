@@ -419,6 +419,11 @@ enum Command {
     },
     /// Inspect GGUF metadata and tensor descriptors.
     Inspect { path: PathBuf },
+    /// Runnable-lane smoke-admission for a single GGUF: admit -> load -> greedy
+    /// forward sanity -> coherence, on oracle-qualified combos only. Prints a
+    /// RUNNABLE receipt (lane=runnable, never copper; attests deterministic
+    /// execution, NOT parity) to stdout on pass; exits non-zero on refusal/failure.
+    RunnableSmoke { path: PathBuf },
     /// Layer offloading — Phase 1: print the planned VRAM/host layer split for a
     /// model (no weights loaded, no compute). `--budget-mb` forces a small VRAM
     /// budget to demonstrate partial offload; `--arch <name>` plans a known
@@ -987,6 +992,29 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::RunnableSmoke { path } => {
+            let path_str = path.to_string_lossy();
+            match camelid::runnable::smoke_admit(&path_str) {
+                Ok(report) => {
+                    eprintln!(
+                        "smoke-admission PASSED: {}/{}/{:?}",
+                        report.architecture, report.quant, report.tokenizer
+                    );
+                    eprintln!(
+                        "  prompt_tokens={} logits=[{:.1}, {:.1}]",
+                        report.prompt_token_count, report.logit_min, report.logit_max
+                    );
+                    eprintln!("  greedy: {:?}", report.generated_text);
+                    eprintln!("  (runnable receipt below — attests deterministic execution, not parity)");
+                    // The runnable receipt (lane=runnable, never copper) to stdout.
+                    println!("{}", serde_json::to_string_pretty(&report.receipt)?);
+                }
+                Err(err) => {
+                    eprintln!("smoke-admission REFUSED/FAILED: {err}");
+                    std::process::exit(1);
+                }
+            }
         }
         Command::PlanOffload {
             model,

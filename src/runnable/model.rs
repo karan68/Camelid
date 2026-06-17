@@ -1,0 +1,781 @@
+//! Parametric pre-norm decoder, f32 only — the runnable lane's generic graph.
+//!
+//! One configurable transformer (parameterized from GGUF KV via [`LlamaModelConfig`]):
+//! embeddings → N pre-norm blocks (RMSNorm → GQA attention with RoPE → RMSNorm →
+//! SwiGLU FFN) → final RMSNorm → logits. No Metal/CUDA, no fused quantized kernels —
+//! weights are dequantized to f32 ([`super::dequant`]) and run through naive f32 math.
+//! Speed is the supported lane's job; this path's job is to be obviously correct and
+//! deterministic so it can serve as the promotion oracle.
+//!
+//! Memory: weights stay resident in their compact **quantized** form; each layer's
+//! matrices are dequantized to f32 once per forward pass and dropped, and the
+//! embedding/output projections are done row-by-row. Peak ≈ raw weights + one layer
+//! of f32, rather than the whole model as f32 — deliberate, so a small model fits a
+//! tight RAM budget without thrashing (`RUNNABLE_LANE_SPEC.md` working-env guard).
+//!
+//! Phase 4 brings this up on **llama** (adjacent-pair RoPE, RMSNorm, SwiGLU, GQA).
+//! Architecture-specific switches (qwen3 QK-norm / split-half RoPE, gemma norms +
+//! soft-capping, phi3 fused QKV) land in Phase 6.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+
+use crate::error::{BackendError, Result};
+use crate::gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType};
+use crate::model::LlamaModelConfig;
+
+use super::admit;
+
+/// A 2-D weight kept in its quantized wire form. ggml layout: `ne = [in, out]`,
+/// row-major with out feature `r` occupying one contiguous row of `in` values.
+struct RawMat {
+    bytes: Vec<u8>,
+    tt: GgufTensorType,
+    in_features: usize,
+    out_features: usize,
+}
+
+/// A dequantized 2-D weight (f32), produced transiently from a [`RawMat`].
+struct Mat {
+    data: Vec<f32>,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl Mat {
+    /// y[r] = Σ_i data[r*in + i] * x[i].
+    fn matvec(&self, x: &[f32]) -> Vec<f32> {
+        debug_assert_eq!(x.len(), self.in_features);
+        let mut y = vec![0.0f32; self.out_features];
+        for (r, yr) in y.iter_mut().enumerate() {
+            let row = &self.data[r * self.in_features..(r + 1) * self.in_features];
+            *yr = dot(row, x);
+        }
+        y
+    }
+}
+
+impl RawMat {
+    fn row_bytes(&self) -> usize {
+        self.bytes.len() / self.out_features
+    }
+
+    /// Dequantize the entire matrix to f32 (used per layer, dropped after the layer).
+    fn dequant_all(&self, name: &str) -> Result<Mat> {
+        let data = super::dequant::dequantize(
+            self.tt,
+            &self.bytes,
+            self.in_features * self.out_features,
+            name,
+        )?;
+        Ok(Mat {
+            data,
+            in_features: self.in_features,
+            out_features: self.out_features,
+        })
+    }
+
+    /// Dequantize a single row `r` (length `in_features`) — for embedding lookup and
+    /// the output projection, which touch the huge vocab matrix one row at a time.
+    fn dequant_row(&self, r: usize, name: &str) -> Result<Vec<f32>> {
+        let rb = self.row_bytes();
+        let slice = &self.bytes[r * rb..(r + 1) * rb];
+        super::dequant::dequantize(self.tt, slice, self.in_features, name)
+    }
+
+    /// Carve out a contiguous block of `len` out-features starting at `start` into a
+    /// new RawMat. Used to split phi3's fused `attn_qkv` and fused `gate_up` into the
+    /// separate projections the generic block expects. Valid because rows are
+    /// out-feature-major and each row is a whole number of quant blocks.
+    fn split_rows(&self, start: usize, len: usize) -> RawMat {
+        let rb = self.row_bytes();
+        RawMat {
+            bytes: self.bytes[start * rb..(start + len) * rb].to_vec(),
+            tt: self.tt,
+            in_features: self.in_features,
+            out_features: len,
+        }
+    }
+}
+
+struct Layer {
+    attn_norm: Vec<f32>,
+    ffn_norm: Vec<f32>,
+    wq: RawMat,
+    wk: RawMat,
+    wv: RawMat,
+    wo: RawMat,
+    gate: RawMat,
+    up: RawMat,
+    down: RawMat,
+    /// Per-head QK-norm weights (qwen3, gemma3): RMSNorm over each head's `head_dim`
+    /// vector, applied to Q/K after projection and before RoPE. `None` for llama-family.
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
+    /// gemma 4-norm structure: an extra RMSNorm applied to the attention output and to
+    /// the FFN output BEFORE each residual add. `None` for the llama 2-norm structure.
+    post_attn_norm: Option<Vec<f32>>,
+    post_ffn_norm: Option<Vec<f32>>,
+}
+
+/// Per-layer K/V cache for incremental decode. Each `k`/`v` grows by `kv_dim` per
+/// position. Lets `generate` compute only the new position each step instead of
+/// recomputing the whole sequence — O(seq) matmuls total instead of O(seq²).
+struct KvCache {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+}
+
+impl KvCache {
+    fn new(n_layers: usize) -> Self {
+        Self {
+            k: vec![Vec::new(); n_layers],
+            v: vec![Vec::new(); n_layers],
+        }
+    }
+}
+
+/// A loaded runnable model: parametric config + quantized weights, ready for greedy
+/// decode. Weights are dequantized to f32 on demand during the forward pass.
+pub struct RunnableModel {
+    pub architecture: String,
+    pub d_model: usize,
+    pub n_layers: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    pub rope_base: f32,
+    pub eps: f32,
+    pub vocab: usize,
+    rope_neox: bool,
+    /// Per-layer RoPE base. Uniform for most models; gemma3 alternates a local base
+    /// (10000) on sliding-window layers and a global base (1e6) every Nth layer.
+    layer_rope_base: Vec<f32>,
+    /// gemma scales token embeddings by `sqrt(d_model)`. `None` for non-gemma.
+    embed_scale: Option<f32>,
+    /// gemma FFN uses GeGLU (gelu-tanh) instead of llama's SwiGLU (silu).
+    ffn_gelu: bool,
+    /// gemma2 logit soft-caps; gemma3 has neither. `cap * tanh(x / cap)`.
+    final_logit_softcap: Option<f32>,
+    attn_logit_softcap: Option<f32>,
+    token_embd: RawMat, // [in=d_model, out=vocab]; row = token embedding
+    output: RawMat,     // logits projection; tied models reuse token_embd
+    output_norm: Vec<f32>,
+    layers: Vec<Layer>,
+}
+
+impl RunnableModel {
+    /// Admit, parse config, and read every weight into resident quantized form.
+    pub fn load(path: &str) -> Result<Self> {
+        let gguf = read_metadata(path)?;
+        admit::admit(&gguf).map_err(BackendError::from)?;
+        let cfg = LlamaModelConfig::from_gguf(&gguf)?;
+        let arch = gguf
+            .architecture()
+            .ok_or_else(|| BackendError::InvalidModelMetadata("missing architecture".into()))?
+            .to_string();
+
+        let d_model = cfg.embedding_length as usize;
+        let n_heads = cfg.attention_head_count as usize;
+        let n_kv_heads = cfg.attention_head_count_kv as usize;
+        let head_dim = cfg
+            .attention_key_length
+            .map(|v| v as usize)
+            .unwrap_or(d_model / n_heads);
+        let rope_dim = cfg
+            .rope_dimension_count
+            .map(|v| v as usize)
+            .unwrap_or(head_dim);
+        let rope_base = cfg.rope_freq_base.unwrap_or(10_000.0);
+        let n_layers = cfg.block_count as usize;
+
+        if let Some(kind) = cfg.rope_scaling_type.as_deref() {
+            if !kind.is_empty() && kind != "none" {
+                // Phase 4 brings up plain llama (TinyLlama: no scaling). linear/yarn/
+                // llama3 scaling is a named Phase 6 follow-up, not silently ignored.
+                return Err(BackendError::UnsupportedGguf(format!(
+                    "runnable lane: rope scaling {kind:?} not yet implemented (Phase 6)"
+                )));
+            }
+        }
+
+        let mut f = File::open(path).map_err(|e| BackendError::Io {
+            path: path.into(),
+            source: e,
+        })?;
+
+        let load_raw = |f: &mut File, name: &str| -> Result<RawMat> {
+            let d = find_tensor(&gguf, name)?;
+            let (inf, outf) = mat_dims(d, name)?;
+            Ok(RawMat {
+                bytes: read_tensor_bytes(f, d, name)?,
+                tt: d.tensor_type,
+                in_features: inf,
+                out_features: outf,
+            })
+        };
+        let load_vec = |f: &mut File, name: &str| -> Result<Vec<f32>> {
+            let d = find_tensor(&gguf, name)?;
+            let n: usize = d.dimensions.iter().product::<u64>() as usize;
+            super::dequant::dequantize(d.tensor_type, &read_tensor_bytes(f, d, name)?, n, name)
+        };
+        let load_vec_opt = |f: &mut File, name: &str| -> Result<Option<Vec<f32>>> {
+            if find_tensor(&gguf, name).is_ok() {
+                Ok(Some(load_vec(f, name)?))
+            } else {
+                Ok(None)
+            }
+        };
+
+        let token_embd = load_raw(&mut f, "token_embd.weight")?;
+        let vocab = token_embd.out_features;
+        let output = if find_tensor(&gguf, "output.weight").is_ok() {
+            load_raw(&mut f, "output.weight")?
+        } else {
+            // Tied embeddings (e.g. Llama-3.2): reuse token_embd as the logits matrix.
+            RawMat {
+                bytes: token_embd.bytes.clone(),
+                tt: token_embd.tt,
+                in_features: token_embd.in_features,
+                out_features: token_embd.out_features,
+            }
+        };
+        let output_norm = load_vec(&mut f, "output_norm.weight")?;
+
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let ffn = cfg.feed_forward_length as usize;
+
+        let mut layers = Vec::with_capacity(n_layers);
+        for l in 0..n_layers {
+            let p = |t: &str| format!("blk.{l}.{t}.weight");
+
+            // phi3 fuses Q/K/V into a single attn_qkv; split it by out-feature rows.
+            let (wq, wk, wv) = if find_tensor(&gguf, &p("attn_q")).is_ok() {
+                (
+                    load_raw(&mut f, &p("attn_q"))?,
+                    load_raw(&mut f, &p("attn_k"))?,
+                    load_raw(&mut f, &p("attn_v"))?,
+                )
+            } else {
+                let qkv = load_raw(&mut f, &p("attn_qkv"))?;
+                (
+                    qkv.split_rows(0, q_dim),
+                    qkv.split_rows(q_dim, kv_dim),
+                    qkv.split_rows(q_dim + kv_dim, kv_dim),
+                )
+            };
+            // phi3 fuses gate+up into ffn_up [2*ffn] (gate first); split it.
+            let (gate, up) = if find_tensor(&gguf, &p("ffn_gate")).is_ok() {
+                (load_raw(&mut f, &p("ffn_gate"))?, load_raw(&mut f, &p("ffn_up"))?)
+            } else {
+                let gu = load_raw(&mut f, &p("ffn_up"))?;
+                (gu.split_rows(0, ffn), gu.split_rows(ffn, ffn))
+            };
+
+            layers.push(Layer {
+                attn_norm: load_vec(&mut f, &p("attn_norm"))?,
+                ffn_norm: load_vec(&mut f, &p("ffn_norm"))?,
+                wq,
+                wk,
+                wv,
+                wo: load_raw(&mut f, &p("attn_output"))?,
+                gate,
+                up,
+                down: load_raw(&mut f, &p("ffn_down"))?,
+                q_norm: load_vec_opt(&mut f, &p("attn_q_norm"))?,
+                k_norm: load_vec_opt(&mut f, &p("attn_k_norm"))?,
+                post_attn_norm: load_vec_opt(&mut f, &p("post_attention_norm"))?,
+                post_ffn_norm: load_vec_opt(&mut f, &p("post_ffw_norm"))?,
+            });
+        }
+
+        let is_gemma = arch.starts_with("gemma");
+        // RoPE pairing: NEOX (split-half) for qwen3/gemma/phi3 (unpermuted weights);
+        // adjacent even/odd for llama-family (llama.cpp permutes those weights).
+        let rope_neox = cfg.rope_neox_pairing || is_gemma || arch == "phi3";
+        // gemma3 dual RoPE: every Nth layer (sliding_window_pattern, default 6) is a
+        // GLOBAL-attention layer using the GGUF freq_base (1e6); the rest are local
+        // sliding-window layers using the gemma3 default local base (10000). The
+        // sliding window itself is a no-op for prompts shorter than the window.
+        let layer_rope_base = if arch == "gemma3" {
+            let global = rope_base;
+            let local = 10_000.0_f32;
+            let pattern = 6usize;
+            (0..n_layers)
+                .map(|i| if (i + 1) % pattern == 0 { global } else { local })
+                .collect()
+        } else {
+            vec![rope_base; n_layers]
+        };
+
+        let final_logit_softcap = gguf.metadata_f32(&format!("{arch}.final_logit_softcapping"));
+        let attn_logit_softcap = gguf.metadata_f32(&format!("{arch}.attn_logit_softcapping"));
+
+        Ok(Self {
+            architecture: arch,
+            d_model,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rope_dim,
+            rope_base,
+            eps: cfg.rms_norm_epsilon,
+            vocab,
+            rope_neox,
+            n_layers,
+            layer_rope_base,
+            embed_scale: if is_gemma {
+                Some((d_model as f32).sqrt())
+            } else {
+                None
+            },
+            ffn_gelu: is_gemma,
+            final_logit_softcap,
+            attn_logit_softcap,
+            token_embd,
+            output,
+            output_norm,
+            layers,
+        })
+    }
+
+    /// Forward the whole token sequence; return logits for the **last** position.
+    /// Pure f32, deterministic, no KV cache — recomputed each call.
+    pub fn forward_logits(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty token sequence".into()));
+        }
+        let seq = tokens.len();
+        let dm = self.d_model;
+
+        // Embedding lookup (one dequantized row per token).
+        let mut hidden = vec![0.0f32; seq * dm];
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let t = tok as usize;
+            if t >= self.vocab {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "token id {t} >= vocab {}",
+                    self.vocab
+                )));
+            }
+            let mut row = self.token_embd.dequant_row(t, "token_embd")?;
+            // gemma scales embeddings by sqrt(d_model).
+            if let Some(scale) = self.embed_scale {
+                for v in row.iter_mut() {
+                    *v *= scale;
+                }
+            }
+            hidden[pos * dm..(pos + 1) * dm].copy_from_slice(&row);
+        }
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            self.attention_block(layer, li, &mut hidden, seq)?;
+            self.ffn_block(layer, li, &mut hidden, seq)?;
+        }
+
+        // Final norm on the last position, then logits (one dequantized row per vocab).
+        let last = &hidden[(seq - 1) * dm..seq * dm];
+        let normed = rms_norm(last, &self.output_norm, self.eps);
+        let mut logits = vec![0.0f32; self.vocab];
+        for (t, lt) in logits.iter_mut().enumerate() {
+            let row = self.output.dequant_row(t, "output")?;
+            *lt = dot(&row, &normed);
+        }
+        // gemma2 final logit soft-cap (gemma3: None).
+        if let Some(cap) = self.final_logit_softcap {
+            for l in logits.iter_mut() {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
+        Ok(logits)
+    }
+
+    /// Greedy-decode up to `max_new` tokens. Uses an incremental KV cache: the prompt
+    /// is prefilled position-by-position, then each new token computes only its own
+    /// position and attends over the cache. Produces results bit-identical to the
+    /// stateless [`forward_logits`] path (the attention sum order is unchanged), but
+    /// O(seq) matmuls instead of O(seq²).
+    ///
+    /// [`forward_logits`]: RunnableModel::forward_logits
+    pub fn generate(&self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        let mut cache = KvCache::new(self.n_layers);
+        let mut last = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            last = self.forward_step(tok, pos, &mut cache)?;
+        }
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        let mut next = argmax(&last);
+        for i in 0..max_new {
+            out.push(next);
+            if i + 1 < max_new {
+                let logits = self.forward_step(next, pos, &mut cache)?;
+                pos += 1;
+                next = argmax(&logits);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Incremental forward of a single token at absolute `pos`, appending its K/V to
+    /// `cache` and attending over all cached positions. Returns next-token logits.
+    fn forward_step(&self, token: u32, pos: usize, cache: &mut KvCache) -> Result<Vec<f32>> {
+        let hd = self.head_dim;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = self.n_heads / self.n_kv_heads;
+        let q_dim = self.n_heads * hd;
+        let kv_dim = self.n_kv_heads * hd;
+
+        let t = token as usize;
+        if t >= self.vocab {
+            return Err(BackendError::InvalidTensorData(format!(
+                "token id {t} >= vocab {}",
+                self.vocab
+            )));
+        }
+        let mut hidden = self.token_embd.dequant_row(t, "token_embd")?;
+        if let Some(s) = self.embed_scale {
+            for v in hidden.iter_mut() {
+                *v *= s;
+            }
+        }
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            // --- attention (single query position over cached K/V) ---
+            let xn = rms_norm(&hidden, &layer.attn_norm, self.eps);
+            let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
+            let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
+            let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
+            let wo = layer.wo.dequant_all(&name(li, "attn_output"))?;
+            let mut qp = wq.matvec(&xn);
+            let mut kp = wk.matvec(&xn);
+            let vp = wv.matvec(&xn);
+            if let Some(qn) = &layer.q_norm {
+                norm_heads(&mut qp, self.n_heads, hd, qn, self.eps);
+            }
+            if let Some(kn) = &layer.k_norm {
+                norm_heads(&mut kp, self.n_kv_heads, hd, kn, self.eps);
+            }
+            let rb = self.layer_rope_base[li];
+            self.apply_rope(&mut qp, self.n_heads, pos, rb);
+            self.apply_rope(&mut kp, self.n_kv_heads, pos, rb);
+            cache.k[li].extend_from_slice(&kp);
+            cache.v[li].extend_from_slice(&vp);
+            let ck = &cache.k[li];
+            let cv = &cache.v[li];
+            let n_pos = pos + 1;
+
+            let mut attn_out = vec![0.0f32; q_dim];
+            for h in 0..self.n_heads {
+                let kvh = h / group;
+                let qh = &qp[h * hd..(h + 1) * hd];
+                let mut scores = vec![0.0f32; n_pos];
+                let mut mx = f32::NEG_INFINITY;
+                for (j, sj) in scores.iter_mut().enumerate() {
+                    let kh = &ck[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                    let mut s = dot(qh, kh) * scale;
+                    if let Some(cap) = self.attn_logit_softcap {
+                        s = cap * (s / cap).tanh();
+                    }
+                    *sj = s;
+                    if s > mx {
+                        mx = s;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - mx).exp();
+                    sum += *s;
+                }
+                let oh = &mut attn_out[h * hd..(h + 1) * hd];
+                for (j, s) in scores.iter().enumerate() {
+                    let w = *s / sum;
+                    let vh = &cv[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                    for d in 0..hd {
+                        oh[d] += w * vh[d];
+                    }
+                }
+            }
+            let mut proj = wo.matvec(&attn_out);
+            if let Some(pn) = &layer.post_attn_norm {
+                proj = rms_norm(&proj, pn, self.eps);
+            }
+            for (h, p) in hidden.iter_mut().zip(proj.iter()) {
+                *h += *p;
+            }
+
+            // --- FFN ---
+            let xn2 = rms_norm(&hidden, &layer.ffn_norm, self.eps);
+            let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
+            let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
+            let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
+            let g = gate.matvec(&xn2);
+            let u = up.matvec(&xn2);
+            let mut act = vec![0.0f32; g.len()];
+            for i in 0..g.len() {
+                let gated = if self.ffn_gelu {
+                    gelu_tanh(g[i])
+                } else {
+                    g[i] / (1.0 + (-g[i]).exp())
+                };
+                act[i] = gated * u[i];
+            }
+            let mut d = down.matvec(&act);
+            if let Some(pn) = &layer.post_ffn_norm {
+                d = rms_norm(&d, pn, self.eps);
+            }
+            for (h, dv) in hidden.iter_mut().zip(d.iter()) {
+                *h += *dv;
+            }
+        }
+
+        let normed = rms_norm(&hidden, &self.output_norm, self.eps);
+        let mut logits = vec![0.0f32; self.vocab];
+        for (tk, lt) in logits.iter_mut().enumerate() {
+            let row = self.output.dequant_row(tk, "output")?;
+            *lt = dot(&row, &normed);
+        }
+        if let Some(cap) = self.final_logit_softcap {
+            for l in logits.iter_mut() {
+                *l = cap * (*l / cap).tanh();
+            }
+        }
+        Ok(logits)
+    }
+
+    fn attention_block(
+        &self,
+        layer: &Layer,
+        li: usize,
+        hidden: &mut [f32],
+        seq: usize,
+    ) -> Result<()> {
+        let dm = self.d_model;
+        let hd = self.head_dim;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let group = self.n_heads / self.n_kv_heads;
+        let q_dim = self.n_heads * hd;
+        let kv_dim = self.n_kv_heads * hd;
+
+        // Dequantize this layer's projection weights once (dropped at block end).
+        let wq = layer.wq.dequant_all(&name(li, "attn_q"))?;
+        let wk = layer.wk.dequant_all(&name(li, "attn_k"))?;
+        let wv = layer.wv.dequant_all(&name(li, "attn_v"))?;
+        let wo = layer.wo.dequant_all(&name(li, "attn_output"))?;
+
+        let mut q = vec![0.0f32; seq * q_dim];
+        let mut k = vec![0.0f32; seq * kv_dim];
+        let mut v = vec![0.0f32; seq * kv_dim];
+        for pos in 0..seq {
+            let x = &hidden[pos * dm..(pos + 1) * dm];
+            let xn = rms_norm(x, &layer.attn_norm, self.eps);
+            let mut qp = wq.matvec(&xn);
+            let mut kp = wk.matvec(&xn);
+            let vp = wv.matvec(&xn);
+            // QK-norm (qwen3, gemma3): per-head RMSNorm before RoPE.
+            if let Some(qn) = &layer.q_norm {
+                norm_heads(&mut qp, self.n_heads, hd, qn, self.eps);
+            }
+            if let Some(kn) = &layer.k_norm {
+                norm_heads(&mut kp, self.n_kv_heads, hd, kn, self.eps);
+            }
+            let rope_base = self.layer_rope_base[li];
+            self.apply_rope(&mut qp, self.n_heads, pos, rope_base);
+            self.apply_rope(&mut kp, self.n_kv_heads, pos, rope_base);
+            q[pos * q_dim..(pos + 1) * q_dim].copy_from_slice(&qp);
+            k[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&kp);
+            v[pos * kv_dim..(pos + 1) * kv_dim].copy_from_slice(&vp);
+        }
+
+        for pos in 0..seq {
+            let mut attn_out = vec![0.0f32; q_dim];
+            for h in 0..self.n_heads {
+                let kvh = h / group;
+                let qh = &q[pos * q_dim + h * hd..pos * q_dim + (h + 1) * hd];
+                let mut scores = vec![0.0f32; pos + 1];
+                let mut max = f32::NEG_INFINITY;
+                for (j, sj) in scores.iter_mut().enumerate() {
+                    let kh = &k[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                    let mut s = dot(qh, kh) * scale;
+                    // gemma2 attention logit soft-cap (gemma3: None).
+                    if let Some(cap) = self.attn_logit_softcap {
+                        s = cap * (s / cap).tanh();
+                    }
+                    *sj = s;
+                    if *sj > max {
+                        max = *sj;
+                    }
+                }
+                let mut sum = 0.0f32;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                let oh = &mut attn_out[h * hd..(h + 1) * hd];
+                for (j, s) in scores.iter().enumerate() {
+                    let w = *s / sum;
+                    let vh = &v[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                    for d in 0..hd {
+                        oh[d] += w * vh[d];
+                    }
+                }
+            }
+            let mut proj = wo.matvec(&attn_out);
+            // gemma: post-attention RMSNorm before the residual add.
+            if let Some(pn) = &layer.post_attn_norm {
+                proj = rms_norm(&proj, pn, self.eps);
+            }
+            let dst = &mut hidden[pos * dm..(pos + 1) * dm];
+            for (h, p) in dst.iter_mut().zip(proj.iter()) {
+                *h += *p;
+            }
+        }
+        Ok(())
+    }
+
+    fn ffn_block(&self, layer: &Layer, li: usize, hidden: &mut [f32], seq: usize) -> Result<()> {
+        let dm = self.d_model;
+        let gate = layer.gate.dequant_all(&name(li, "ffn_gate"))?;
+        let up = layer.up.dequant_all(&name(li, "ffn_up"))?;
+        let down = layer.down.dequant_all(&name(li, "ffn_down"))?;
+        for pos in 0..seq {
+            let x = &hidden[pos * dm..(pos + 1) * dm];
+            let xn = rms_norm(x, &layer.ffn_norm, self.eps);
+            let g = gate.matvec(&xn);
+            let u = up.matvec(&xn);
+            // Gated FFN: gemma uses GeGLU (gelu-tanh), llama uses SwiGLU (silu).
+            let mut act = vec![0.0f32; g.len()];
+            for i in 0..g.len() {
+                let gated = if self.ffn_gelu {
+                    gelu_tanh(g[i])
+                } else {
+                    g[i] / (1.0 + (-g[i]).exp())
+                };
+                act[i] = gated * u[i];
+            }
+            let mut d = down.matvec(&act);
+            // gemma: post-FFN RMSNorm before the residual add.
+            if let Some(pn) = &layer.post_ffn_norm {
+                d = rms_norm(&d, pn, self.eps);
+            }
+            let dst = &mut hidden[pos * dm..(pos + 1) * dm];
+            for (hv, dv) in dst.iter_mut().zip(d.iter()) {
+                *hv += *dv;
+            }
+        }
+        Ok(())
+    }
+
+    /// RoPE in place over `n_heads` heads of `head_dim`, rotating the first
+    /// `rope_dim` dims at absolute position `pos`. Adjacent even/odd pairing for
+    /// llama (`rope_neox=false`); split-half (NEOX) for `rope_neox=true`.
+    fn apply_rope(&self, vec: &mut [f32], n_heads: usize, pos: usize, rope_base: f32) {
+        let hd = self.head_dim;
+        let half = self.rope_dim / 2;
+        for h in 0..n_heads {
+            let base = h * hd;
+            for i in 0..half {
+                let freq = 1.0 / rope_base.powf(2.0 * i as f32 / self.rope_dim as f32);
+                let angle = pos as f32 * freq;
+                let (sin, cos) = angle.sin_cos();
+                let (a, b) = if self.rope_neox {
+                    (base + i, base + i + half)
+                } else {
+                    (base + 2 * i, base + 2 * i + 1)
+                };
+                let x0 = vec[a];
+                let x1 = vec[b];
+                vec[a] = x0 * cos - x1 * sin;
+                vec[b] = x0 * sin + x1 * cos;
+            }
+        }
+    }
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// Per-head RMSNorm in place: normalize each of `n_heads` contiguous `head_dim`
+/// slices with the shared `weight` (length `head_dim`). Used for QK-norm (qwen3,
+/// gemma3).
+fn norm_heads(vec: &mut [f32], n_heads: usize, head_dim: usize, weight: &[f32], eps: f32) {
+    for h in 0..n_heads {
+        let slice = &mut vec[h * head_dim..(h + 1) * head_dim];
+        let ss: f32 = slice.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+        for (x, w) in slice.iter_mut().zip(weight.iter()) {
+            *x = *x * inv * *w;
+        }
+    }
+}
+
+/// RMSNorm: `x * rsqrt(mean(x^2) + eps) * weight`. The GGUF weight is applied
+/// directly for every architecture — gemma's `(1 + weight)` convention is already
+/// baked into the GGUF (llama.cpp's gemma conversion adds 1 at convert time, so the
+/// weights read as ~5 not ~0), so no special-casing is needed here.
+fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
+    let n = x.len() as f32;
+    let ss: f32 = x.iter().map(|v| v * v).sum();
+    let inv = 1.0 / (ss / n + eps).sqrt();
+    x.iter().zip(weight.iter()).map(|(v, w)| v * inv * w).collect()
+}
+
+/// gelu with the tanh approximation (`gelu_pytorch_tanh`), gemma's FFN activation.
+fn gelu_tanh(x: f32) -> f32 {
+    const C: f32 = 0.797_884_6; // sqrt(2/pi)
+    0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+}
+
+fn argmax(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+fn name(layer: usize, tensor: &str) -> String {
+    format!("blk.{layer}.{tensor}")
+}
+
+fn find_tensor<'a>(gguf: &'a GgufFile, name: &str) -> Result<&'a GgufTensorDescriptor> {
+    gguf.tensors
+        .iter()
+        .find(|t| t.name == name)
+        .ok_or_else(|| BackendError::TensorNotFound(name.to_string()))
+}
+
+/// ggml `ne = [in_features, out_features]` for a 2-D weight.
+fn mat_dims(d: &GgufTensorDescriptor, name: &str) -> Result<(usize, usize)> {
+    if d.dimensions.len() != 2 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "tensor {name} expected 2 dims, got {:?}",
+            d.dimensions
+        )));
+    }
+    Ok((d.dimensions[0] as usize, d.dimensions[1] as usize))
+}
+
+fn read_tensor_bytes(f: &mut File, d: &GgufTensorDescriptor, name: &str) -> Result<Vec<u8>> {
+    let mut bytes = vec![0u8; d.n_bytes as usize];
+    f.seek(SeekFrom::Start(d.absolute_offset))
+        .map_err(|e| BackendError::Io {
+            path: name.into(),
+            source: e,
+        })?;
+    f.read_exact(&mut bytes).map_err(|e| BackendError::Io {
+        path: name.into(),
+        source: e,
+    })?;
+    Ok(bytes)
+}

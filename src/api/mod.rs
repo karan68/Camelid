@@ -5319,6 +5319,9 @@ async fn build_server_receipt(
             finish_reason: generated.finish_reason.to_string(),
         },
         parity: ParityBlock::not_compared(),
+        // This is the supported-lane serving path; leave the lane absent (= supported,
+        // the legacy default) so existing receipts keep their exact digests.
+        execution_lane: None,
         execution_trace,
         signature: None,
     };
