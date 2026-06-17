@@ -46,6 +46,11 @@ pub enum ShellSandbox {
     Unrestricted,
 }
 
+// Kept as an explicit impl (not `#[derive(Default)]` + `#[default]`) so the secure
+// default is stated in code next to its rationale and cannot be silently flipped by a
+// future variant reorder — `Sandboxed` is the 2nd variant, so a plain derive would
+// default to `Disabled`.
+#[allow(clippy::derivable_impls)]
 impl Default for ShellSandbox {
     fn default() -> Self {
         // Secure by default: confinement on, fail closed where unenforceable.
