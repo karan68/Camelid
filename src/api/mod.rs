@@ -12099,11 +12099,76 @@ pub struct CatalogItem {
 /// lane each entry would land in without downloading it. `oracle_qualified` means the
 /// `(architecture, quant)` combo is anchored → it would be Compatible after download
 /// (unless it also matches a supported contract row, which the frontend resolves).
+///
+/// Owns its strings so it can carry both **curated** rows (authoritative metadata,
+/// `arch_detected: true`) and **experimental** live Hugging Face results
+/// (`arch_detected: false`, where `architecture`/`quant` are filename guesses). The
+/// JSON field names are unchanged from the previous flattened `CatalogItem` shape;
+/// `group`/`arch_detected` are additive. Experimental rows always report
+/// `oracle_qualified: false` — a filename guess can never anchor a lane, so the
+/// frontend resolves them to "not yet in a lane" regardless of name coincidence.
 #[derive(Debug, serde::Serialize)]
 pub struct CatalogItemView {
-    #[serde(flatten)]
-    pub item: CatalogItem,
+    pub catalog_id: String,
+    pub name: String,
+    pub repo_id: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub downloads: u64,
+    pub likes: u64,
+    pub quant: String,
+    pub architecture: String,
+    pub license: String,
     pub oracle_qualified: bool,
+    /// `"curated"` (pinned, known-good, authoritative metadata) or `"experimental"`
+    /// (live from Hugging Face; metadata is advisory and must never read as support).
+    pub group: &'static str,
+    /// Whether `architecture` is authoritative (curated) vs a filename guess (live).
+    pub arch_detected: bool,
+}
+
+impl CatalogItemView {
+    /// Build a view for a curated row: authoritative architecture, lane predicted
+    /// from the real `(architecture, quant)` via `runnable::oracle_qualified`.
+    fn from_curated(item: &CatalogItem) -> Self {
+        CatalogItemView {
+            catalog_id: item.catalog_id.to_string(),
+            name: item.name.to_string(),
+            repo_id: item.repo_id.to_string(),
+            filename: item.filename.to_string(),
+            size_bytes: item.size_bytes,
+            downloads: item.downloads,
+            likes: item.likes,
+            quant: item.quant.to_string(),
+            architecture: item.architecture.to_string(),
+            license: item.license.to_string(),
+            oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
+            group: "curated",
+            arch_detected: true,
+        }
+    }
+
+    /// Build a view for a live Hugging Face result. Architecture/quant are filename
+    /// guesses (`arch_detected: false`); `oracle_qualified` is forced `false` so the
+    /// experimental row is never predicted Compatible/Supported on a guess alone.
+    fn from_hf(file: crate::hf_browse::HfGgufFile) -> Self {
+        let catalog_id = format!("hf::{}::{}", file.repo_id, file.filename);
+        CatalogItemView {
+            catalog_id,
+            name: file.filename.clone(),
+            repo_id: file.repo_id,
+            filename: file.filename,
+            size_bytes: file.size_bytes,
+            downloads: file.downloads,
+            likes: file.likes,
+            quant: file.quant,
+            architecture: file.architecture,
+            license: String::new(),
+            oracle_qualified: false,
+            group: "experimental",
+            arch_detected: false,
+        }
+    }
 }
 
 pub fn curated_catalog() -> Vec<CatalogItem> {
@@ -12302,6 +12367,9 @@ pub struct CatalogResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct CatalogQuery {
     pub query: Option<String>,
+    /// Opaque Hugging Face pagination cursor for the experimental group (from a
+    /// prior response's `next_cursor`). Ignored when `query` is absent/trivial.
+    pub cursor: Option<String>,
 }
 
 /// One local on-disk GGUF with the facts the Models tab needs to bucket it by lane.
@@ -12597,34 +12665,65 @@ async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
     }
 }
 
+/// Number of Hugging Face repos a single experimental search inspects (each repo's
+/// tree is one extra network round-trip, so this also bounds search latency).
+const HF_SEARCH_LIMIT: usize = 15;
+
+/// The Models-tab catalog: a **curated** group (pinned, known-good rows, always
+/// first) followed, when the user is searching, by an **experimental** group of
+/// live Hugging Face results. Experimental rows are advisory-only — `oracle_qualified`
+/// is forced false and the frontend marks them unverified — so live browse can never
+/// widen what Camelid claims. A non-trivial `query` (≥2 chars) triggers the HF search;
+/// a network failure degrades silently to curated-only.
 async fn get_catalog(
     axum::extract::Query(q): axum::extract::Query<CatalogQuery>,
 ) -> Json<CatalogResponse> {
-    let items = curated_catalog();
-    let filtered = if let Some(query_str) = q.query {
-        let qs = query_str.to_lowercase();
-        items
-            .into_iter()
-            .filter(|item| {
+    let query = q.query.unwrap_or_default();
+    let trimmed = query.trim();
+
+    // Curated group: filter by query exactly as before, always emitted first.
+    let curated: Vec<CatalogItemView> = curated_catalog()
+        .iter()
+        .filter(|item| {
+            trimmed.is_empty() || {
+                let qs = trimmed.to_lowercase();
                 item.name.to_lowercase().contains(&qs)
                     || item.repo_id.to_lowercase().contains(&qs)
                     || item.filename.to_lowercase().contains(&qs)
-            })
-            .collect()
-    } else {
-        items
-    };
-    let items = filtered
-        .into_iter()
-        .map(|item| CatalogItemView {
-            oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
-            item,
+            }
         })
+        .map(CatalogItemView::from_curated)
         .collect();
-    Json(CatalogResponse {
-        items,
-        next_cursor: None,
-    })
+
+    let mut items = curated;
+    let mut next_cursor = None;
+
+    // Experimental group: live Hugging Face results, only when actively searching.
+    if trimmed.len() >= 2 {
+        match crate::hf_browse::search_gguf(trimmed, HF_SEARCH_LIMIT, q.cursor.as_deref()).await {
+            Ok(page) => {
+                next_cursor = page.next_cursor;
+                // A file already pinned in the curated group is shown there (vetted),
+                // not duplicated as a raw experimental row.
+                let curated_files: std::collections::HashSet<(String, String)> = curated_catalog()
+                    .iter()
+                    .map(|c| (c.repo_id.to_string(), c.filename.to_string()))
+                    .collect();
+                items.extend(
+                    page.files
+                        .into_iter()
+                        .filter(|f| {
+                            !curated_files.contains(&(f.repo_id.clone(), f.filename.clone()))
+                        })
+                        .map(CatalogItemView::from_hf),
+                );
+            }
+            // Offline / Hub error: keep curated-only rather than failing the page.
+            Err(err) => eprintln!("hugging face browse unavailable: {err}"),
+        }
+    }
+
+    Json(CatalogResponse { items, next_cursor })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
