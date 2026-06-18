@@ -561,7 +561,7 @@ export function getTrackedCompatibilityTargets(capabilities, ids = TRACKED_FULL_
 }
 
 function getModelCapabilityFields(model, catalogItem) {
-  return [
+  const fields = [
     model?.id,
     model?.runtime_model_name,
     model?.name,
@@ -571,7 +571,32 @@ function getModelCapabilityFields(model, catalogItem) {
     catalogItem?.name,
     catalogItem?.repo_id,
     catalogItem?.filename,
-  ].filter(Boolean).map((value) => String(value))
+  ]
+  // Exact compatibility row ids concatenate the model name with its quant
+  // (e.g. "qwen3_4b_instruct_q8_0"). A model loaded outside the catalog — e.g. via
+  // `--model` at startup — exposes its GGUF name ("Qwen3 4B Instruct") and its quant
+  // ("Q8_0", carried in the filename/path) as SEPARATE fields, so neither matches the
+  // row id alone: chat then falls back to a non-exact family match and stays gated for
+  // every such model. Append name+quant combinations so the exact-row identity match
+  // resolves for any model regardless of how it was loaded. Use the RAW quant token
+  // (e.g. "Q8_0") rather than the capability-normalized key ("Q80", underscore
+  // stripped) so the combined string reproduces the row id exactly under
+  // normalizeExactRowIdentity. Additive only — never removes an existing candidate.
+  const quantPattern = /\b(q\d(?:_k_[ms]|_\d)?|iq\d[a-z0-9_]*|bf16|f16|f32)\b/i
+  const rawQuant =
+    [model?.quant, catalogItem?.quant]
+      .map((value) => (typeof value === 'string' ? value.match(quantPattern)?.[1] : null))
+      .find(Boolean)
+    || [model?.model_path, model?.path, model?.hf_filename, catalogItem?.filename]
+      .filter(Boolean)
+      .join(' ')
+      .match(quantPattern)?.[1]
+  if (rawQuant) {
+    for (const name of [model?.runtime_model_name, model?.name, model?.id, catalogItem?.name]) {
+      if (name) fields.push(`${name} ${rawQuant}`)
+    }
+  }
+  return fields.filter(Boolean).map((value) => String(value))
 }
 
 function getModelCapabilitySubject(model, catalogItem) {
