@@ -1560,6 +1560,138 @@ fn find_tensor<'a>(gguf: &'a GgufFile, name: &str) -> Option<&'a GgufTensorDescr
     gguf.tensors.iter().find(|tensor| tensor.name == name)
 }
 
+/// A descriptor for a contiguous slice of `parent`'s **output rows** (`dimensions[1]`),
+/// e.g. the Q slice of a fused `attn_qkv` weight. Quantized weights store each output
+/// row as an integer number of blocks along the input dim, so a row range maps to an
+/// exact byte range — no re-encoding, just a sub-offset into the same file bytes.
+fn sub_row_descriptor(
+    parent: &GgufTensorDescriptor,
+    name: String,
+    row_start: u64,
+    row_count: u64,
+) -> Result<GgufTensorDescriptor> {
+    if parent.dimensions.len() != 2 {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "cannot slice non-2D tensor {} (dims {:?})",
+            parent.name, parent.dimensions
+        )));
+    }
+    let in_dim = parent.dimensions[0];
+    let total_rows = parent.dimensions[1];
+    let (block, type_size) = parent.tensor_type.layout().ok_or_else(|| {
+        BackendError::UnsupportedTensorType(format!(
+            "tensor {} type {:?} has no known block layout; cannot slice a fused tensor",
+            parent.name, parent.tensor_type
+        ))
+    })?;
+    if block == 0 || !in_dim.is_multiple_of(block) {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "tensor {} input dim {in_dim} is not a multiple of block size {block}; cannot slice",
+            parent.name
+        )));
+    }
+    if row_start + row_count > total_rows {
+        return Err(BackendError::InvalidModelMetadata(format!(
+            "slice [{row_start}..{}] of {} exceeds its {total_rows} rows",
+            row_start + row_count,
+            parent.name
+        )));
+    }
+    let row_bytes = (in_dim / block) * type_size;
+    let byte_start = row_start * row_bytes;
+    let n_bytes = row_count * row_bytes;
+    Ok(GgufTensorDescriptor {
+        name,
+        dimensions: vec![in_dim, row_count],
+        tensor_type: parent.tensor_type,
+        relative_offset: parent.relative_offset + byte_start,
+        absolute_offset: parent.absolute_offset + byte_start,
+        n_bytes,
+    })
+}
+
+/// Expand a dense decoder's **fused** projections into the split tensors the binder
+/// and forward path expect. Some conversions (notably `phi3`) ship a single
+/// `attn_qkv` (Q‖K‖V stacked by output row) and a single `ffn_up` carrying the
+/// gate‖up halves, instead of separate `attn_q/attn_k/attn_v` and `ffn_gate/ffn_up`.
+///
+/// Rather than special-case the engine, we synthesize name-addressable
+/// `GgufTensorDescriptor`s that point at the exact byte sub-ranges of the fused
+/// tensors (legal because quantized output rows are block-aligned), then append them
+/// to `gguf.tensors`. Everything downstream (`bind`, `TensorStore`, the forward
+/// path) resolves tensors by name from this list, so the split rows flow through the
+/// **unchanged** code path — a model with genuinely-separate tensors is byte-for-byte
+/// unaffected (this is a no-op unless a fused tensor is present and a split one is
+/// absent). It makes no parity claim; it only lets the fused layout be attempted.
+pub fn expand_fused_dense_tensors(gguf: &mut GgufFile, config: &LlamaModelConfig) -> Result<()> {
+    // MoE rows carry their own (already-split) expert tensors; leave them alone.
+    if config.moe.is_some() {
+        return Ok(());
+    }
+    let head_count = config.attention_head_count.max(1);
+    let head_dim = config
+        .attention_key_length
+        .unwrap_or(config.embedding_length / head_count);
+    let q_rows = u64::from(head_dim) * u64::from(config.attention_head_count);
+    let kv_rows = u64::from(head_dim) * u64::from(config.attention_head_count_kv);
+    let ffn = u64::from(config.feed_forward_length);
+
+    let mut additions: Vec<GgufTensorDescriptor> = Vec::new();
+    let mut renames: Vec<(usize, String)> = Vec::new();
+
+    for layer in 0..config.block_count {
+        // Fused attention QKV → attn_q / attn_k / attn_v (no rename: distinct names).
+        let q_name = format!("blk.{layer}.attn_q.weight");
+        if find_tensor(gguf, &q_name).is_none() {
+            if let Some(qkv) = find_tensor(gguf, &format!("blk.{layer}.attn_qkv.weight")) {
+                if qkv.dimensions.len() == 2 && qkv.dimensions[1] == q_rows + 2 * kv_rows {
+                    let qkv = qkv.clone();
+                    additions.push(sub_row_descriptor(&qkv, q_name, 0, q_rows)?);
+                    additions.push(sub_row_descriptor(
+                        &qkv,
+                        format!("blk.{layer}.attn_k.weight"),
+                        q_rows,
+                        kv_rows,
+                    )?);
+                    additions.push(sub_row_descriptor(
+                        &qkv,
+                        format!("blk.{layer}.attn_v.weight"),
+                        q_rows + kv_rows,
+                        kv_rows,
+                    )?);
+                }
+            }
+        }
+
+        // Fused gate+up → ffn_gate (first half) + ffn_up (second half). The fused
+        // tensor reuses the `ffn_up` name, so rename it before re-adding a half-sized
+        // `ffn_up` virtual to avoid an ambiguous duplicate name.
+        let gate_name = format!("blk.{layer}.ffn_gate.weight");
+        let up_name = format!("blk.{layer}.ffn_up.weight");
+        if find_tensor(gguf, &gate_name).is_none() {
+            if let Some((idx, up)) = gguf
+                .tensors
+                .iter()
+                .enumerate()
+                .find(|(_, t)| t.name == up_name)
+            {
+                if up.dimensions.len() == 2 && up.dimensions[1] == 2 * ffn {
+                    let up = up.clone();
+                    renames.push((idx, format!("blk.{layer}.ffn_up_fused.weight")));
+                    additions.push(sub_row_descriptor(&up, gate_name, 0, ffn)?);
+                    additions.push(sub_row_descriptor(&up, up_name, ffn, ffn)?);
+                }
+            }
+        }
+    }
+
+    for (idx, new_name) in renames {
+        gguf.tensors[idx].name = new_name;
+    }
+    gguf.tensors.extend(additions);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_output_projection_storage_layout;
@@ -1591,6 +1723,30 @@ mod tests {
                 "{arch} must not be implemented"
             );
         }
+    }
+
+    #[test]
+    fn sub_row_descriptor_slices_q8_0_by_output_row() {
+        // in=64 → Q8_0 row = (64/32)*34 = 68 bytes; out=6 rows.
+        let parent = GgufTensorDescriptor {
+            name: "blk.0.attn_qkv.weight".into(),
+            dimensions: vec![64, 6],
+            tensor_type: GgufTensorType::Q8_0,
+            relative_offset: 0,
+            absolute_offset: 1000,
+            n_bytes: 6 * 68,
+        };
+        let q = super::sub_row_descriptor(&parent, "q".into(), 0, 2).unwrap();
+        assert_eq!(q.dimensions, vec![64, 2]);
+        assert_eq!(q.absolute_offset, 1000);
+        assert_eq!(q.n_bytes, 2 * 68);
+        let k = super::sub_row_descriptor(&parent, "k".into(), 2, 4).unwrap();
+        assert_eq!(k.absolute_offset, 1000 + 2 * 68);
+        assert_eq!(k.n_bytes, 4 * 68);
+        // The slices tile the parent exactly (no gap, no overlap).
+        assert_eq!(q.n_bytes + k.n_bytes, parent.n_bytes);
+        // Out-of-range fails closed rather than reading past the tensor.
+        assert!(super::sub_row_descriptor(&parent, "x".into(), 4, 4).is_err());
     }
 
     #[test]

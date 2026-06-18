@@ -3231,6 +3231,32 @@ mod gemma4_template_tests {
     }
 
     #[test]
+    fn phi3_prompt_renders_end_marked_turns_and_generation_prompt() {
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "Be concise.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Capital of France?".to_string(),
+            },
+        ];
+        assert_eq!(
+            render_phi3_prompt(&messages),
+            "<|system|>\nBe concise.<|end|>\n<|user|>\nCapital of France?<|end|>\n<|assistant|>\n"
+        );
+        // Phi-3's <|end|>-separated template must be detected before TinyLlama's.
+        let phi3_tmpl = "<|user|>\n{{content}}<|end|>\n<|assistant|>\n";
+        assert!(is_phi3_template(phi3_tmpl));
+        assert!(!is_phi3_template(
+            "<|user|>\n{{content}}</s>\n<|assistant|>\n"
+        ));
+    }
+
+    #[test]
     fn qwen3_chatml_prompt_renders_thinking_enabled_generation_prompt() {
         let messages = [ChatMessage {
             unsupported_content_parts: Vec::new(),
@@ -4052,7 +4078,7 @@ async fn load_model_from_path_with_activation(
             }
         }
     }
-    let gguf = read_metadata(&path)?;
+    let mut gguf = read_metadata(&path)?;
     let outcome = plan_for_model(&path, &gguf, state.configured_threads);
     state.planner_env.apply(&outcome.env_updates);
     log_selected_execution_plan(&outcome.plan);
@@ -4061,6 +4087,14 @@ async fn load_model_from_path_with_activation(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
     let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+    // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
+    // the split tensors the binder + forward path expect (no-op for already-split rows),
+    // so the fused layout becomes attemptable without touching the parity-gated path.
+    if let Ok(config) = &llama_config_result {
+        if let Err(err) = crate::model::expand_fused_dense_tensors(&mut gguf, config) {
+            eprintln!("[camelid] fused-tensor expansion skipped: {err}");
+        }
+    }
     // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
     // WHY it fails closed (architecture not implemented, missing/invalid metadata,
     // DiffusionGemma redirect, …) instead of silently sitting non-generative.
@@ -5239,6 +5273,14 @@ async fn chat_completions(
                 }
                 _ => None,
             };
+            // Experimental models have no parity contract, so trim the leading/trailing
+            // whitespace some of them emit around the answer for a clean chat bubble.
+            // Supported rows are left byte-identical (their generated text is contractual).
+            let content = if lane.is_some() {
+                generated.text.trim().to_string()
+            } else {
+                generated.text
+            };
             (
                 StatusCode::OK,
                 Json(ChatCompletionResponse {
@@ -5250,7 +5292,7 @@ async fn chat_completions(
                         index: 0,
                         message: ChatCompletionMessage {
                             role: "assistant",
-                            content: generated.text,
+                            content,
                         },
                         finish_reason: generated.finish_reason,
                     }],
@@ -8487,6 +8529,20 @@ fn render_chat_prompt_for_tokenization_fallback(
         // as EOS when tokenizing the rendered template — so chat prompts
         // parse specials (chat_prompt_parse_special), with dummy-prefix
         // handling after control tokens preserved by encode_piece.
+        // Checked BEFORE tinyllama: Phi-3 reuses the same <|user|>/<|assistant|>
+        // marker spellings but separates turns with <|end|> (not </s>) and stops on
+        // <|end|>. Routing it through the tinyllama renderer used the wrong separator
+        // and stop token, so generation rambled.
+        if is_phi3_template(template) {
+            return RenderedPrompt {
+                text: render_phi3_prompt(messages),
+                // Phi-3 sets add_bos_token=true; the tokenizer prepends <s>.
+                add_special: true,
+                // Parse specials so <|user|>/<|assistant|>/<|end|> become the control
+                // token ids — in particular <|end|> as the end-of-turn stop token.
+                parse_special: true,
+            };
+        }
         if is_tinyllama_marker_template(template) {
             return RenderedPrompt {
                 text: render_tinyllama_marker_prompt(messages, tokenizer),
@@ -8669,6 +8725,17 @@ fn is_mistral_instruct_template(template: &str) -> bool {
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
 fn is_qwen3_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>") && template.contains("<|im_end|>")
+}
+
+/// Phi-3 chat template detector: `<|user|>`/`<|assistant|>` turns separated by the
+/// `<|end|>` turn marker. Phi-3 shares the `<|user|>`/`<|assistant|>`/`<|system|>`
+/// spellings with TinyLlama's marker template (which separates turns with `</s>`),
+/// so the `<|end|>` marker is the distinguishing signal and this MUST be checked
+/// before [`is_tinyllama_marker_template`].
+fn is_phi3_template(template: &str) -> bool {
+    template.contains("<|assistant|>")
+        && template.contains("<|end|>")
+        && template.contains("<|user|>")
 }
 
 fn exact_llama32_metadata_jinja_chat_template_error(message: &str) -> MiniJinjaError {
@@ -9072,6 +9139,27 @@ fn agent_call_to_mistral_json(content: &str, id: &str) -> String {
         }
     }
     serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into())
+}
+
+/// Render the Phi-3 chat template: each turn as `<|{role}|>\n{content}<|end|>\n`,
+/// then the `<|assistant|>\n` generation prompt. Mirrors the GGUF jinja template;
+/// `<|end|>` is the end-of-turn marker (and stop token under `parse_special`).
+fn render_phi3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = match message.role.trim() {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        prompt.push_str("<|");
+        prompt.push_str(role);
+        prompt.push_str("|>\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|end|>\n");
+    }
+    prompt.push_str("<|assistant|>\n");
+    prompt
 }
 
 fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {

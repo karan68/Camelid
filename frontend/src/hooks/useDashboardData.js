@@ -892,7 +892,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
         body: JSON.stringify({
           model: requestModelId,
           messages: requestMessages,
-          temperature: 0,
+          // Supported rows stay greedy (temperature 0) — their behavior is parity-
+          // locked. Experimental rows have no parity contract and small models loop
+          // badly under greedy decoding, so they sample for usable output.
+          temperature: selectedModelExperimental ? 0.7 : 0,
+          ...(selectedModelExperimental ? { top_p: 0.9 } : {}),
           max_tokens: localChatMaxTokens(history, requestModelId),
           /* Empty today: a sampling override is sent only when /api/capabilities
              advertises a supported row for that exact parameter. */
