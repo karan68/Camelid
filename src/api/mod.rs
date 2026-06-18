@@ -901,6 +901,13 @@ pub struct ChatCompletionResponse {
     /// Present only when the request opted in via `camelid_receipt: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camelid_receipt: Option<ParityReceipt>,
+    /// Serve-lane disclosure. Present and `"experimental"` only when the active
+    /// model is an implemented decoder that is NOT a supported exact row — the
+    /// output is unverified and carries no parity claim. Omitted for supported rows
+    /// (whose support is asserted by `/api/capabilities`, never by this field) and
+    /// is NEVER a parity receipt: the live token stream is not evidence of support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -5122,6 +5129,17 @@ async fn chat_completions(
                 }
                 None => None,
             };
+            // Disclose the serve lane: "experimental" only when the active model is
+            // an implemented decoder that is NOT a supported exact row. Never set
+            // for supported rows; never a parity claim.
+            let lane = match state.loaded_models.read().await.get(&model_id) {
+                Some(model)
+                    if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented =>
+                {
+                    Some("experimental")
+                }
+                _ => None,
+            };
             (
                 StatusCode::OK,
                 Json(ChatCompletionResponse {
@@ -5155,6 +5173,7 @@ async fn chat_completions(
                         timings_ms: generated.timings,
                     },
                     camelid_receipt,
+                    lane,
                 }),
             )
                 .into_response()
@@ -9546,6 +9565,38 @@ mod tests {
     }
 
     #[test]
+    fn classify_model_lane_separates_supported_experimental_and_unsupported() {
+        // Exact supported curated artifact → Supported.
+        assert_eq!(
+            classify_model_lane(Some("llama"), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        // Implemented architecture but NOT a supported exact artifact (different
+        // quant/filename) → experimental, never falsely supported.
+        assert_eq!(
+            classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q4_K_M.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
+        assert_eq!(
+            classify_model_lane(Some("mistral"), "some-random-mistral-finetune-Q8_0.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
+        // Architecture not in the implemented set → Unsupported (fails closed at load).
+        assert_eq!(
+            classify_model_lane(Some("falcon"), "falcon-7b-Q8_0.gguf"),
+            ModelLaneClass::Unsupported,
+        );
+        assert_eq!(
+            classify_model_lane(None, "headerless.gguf"),
+            ModelLaneClass::Unsupported,
+        );
+    }
+
+    #[test]
     fn capabilities_report_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
         assert!(response.support_contract.current_gate.contains(
@@ -12401,6 +12452,12 @@ pub struct LocalModelEntry {
     pub chat_capable: bool,
     /// Trained context window (tokens) from the GGUF — a model capability.
     pub context_length: Option<u32>,
+    /// Server-computed lane class from real header metadata (architecture) + the
+    /// exact-artifact supported-row check. `experimental_implemented` means the
+    /// architecture is implemented but this is NOT a supported row — attemptable,
+    /// unverified, no parity claim. Corroborates the frontend contract gate; it
+    /// never promotes a row.
+    pub lane_class: ModelLaneClass,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -12534,6 +12591,7 @@ async fn local_models() -> Json<LocalModelsResponse> {
                 }
             };
 
+            let lane_class = classify_model_lane(meta.architecture.as_deref(), &filename);
             models.push(LocalModelEntry {
                 runnable_receipt_present: runnable_smoke_receipt_path(&filename).exists(),
                 filename,
@@ -12546,6 +12604,7 @@ async fn local_models() -> Json<LocalModelsResponse> {
                 oracle_qualified: meta.oracle_qualified,
                 chat_capable: meta.chat_capable,
                 context_length: meta.context_length,
+                lane_class,
             });
         }
     }
@@ -12668,6 +12727,75 @@ async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
 /// Number of Hugging Face repos a single experimental search inspects (each repo's
 /// tree is one extra network round-trip, so this also bounds search latency).
 const HF_SEARCH_LIMIT: usize = 15;
+
+/// Lane classification for a downloaded/loaded model, driven only by real GGUF
+/// metadata (`general.architecture`) and the exact-artifact supported-row check —
+/// never a filename guess of the architecture. Drives experimental UI copy only; it
+/// never promotes a row or widens what `LlamaModelConfig::from_gguf` accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelLaneClass {
+    /// Exact supported row (asserted by `/api/capabilities`) — the full supported lane.
+    Supported,
+    /// Architecture is implemented but this is NOT a supported row: attemptable,
+    /// unverified, no parity claim.
+    ExperimentalImplemented,
+    /// Architecture is not in the implemented set — fails closed at load.
+    Unsupported,
+}
+
+/// The `id`s of `/api/capabilities` compatibility rows whose status is `supported*`.
+/// Memoized — these are static contract literals. Reads the SAME rows the contract
+/// publishes, so this introduces no second ledger.
+fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'static str> {
+    static IDS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        capabilities_response_with_plan(None)
+            .model_compatibility
+            .into_iter()
+            .filter(|row| row.status == "supported" || row.status.starts_with("supported_"))
+            .map(|row| row.id)
+            .collect()
+    })
+}
+
+/// True when `filename` is the exact GGUF artifact of a curated row whose
+/// `catalog_id` is a `supported_*` compatibility row. The ledger is exact-artifact
+/// gated, so an exact-filename match is the honest server-side "is this a supported
+/// row?" test. Deliberately conservative: a supported model loaded under a
+/// non-curated filename classifies as experimental, never falsely as supported.
+fn filename_is_supported_exact_row(filename: &str) -> bool {
+    let supported = supported_compatibility_row_ids();
+    curated_catalog()
+        .iter()
+        .any(|c| c.filename == filename && supported.contains(c.catalog_id))
+}
+
+/// Classify a model from real header metadata. `architecture` is the parsed
+/// `general.architecture` (NOT a filename guess); `filename` identifies the exact
+/// artifact for the supported-row check.
+fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneClass {
+    match architecture {
+        Some(arch) if crate::model::is_implemented_architecture(arch) => {
+            if filename_is_supported_exact_row(filename) {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            }
+        }
+        _ => ModelLaneClass::Unsupported,
+    }
+}
+
+/// Classify a loaded model from its real GGUF metadata + exact artifact path.
+fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
+    let filename = model
+        .path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default();
+    classify_model_lane(model.gguf.architecture(), filename)
+}
 
 /// The Models-tab catalog: a **curated** group (pinned, known-good rows, always
 /// first) followed, when the user is searching, by an **experimental** group of

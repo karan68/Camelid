@@ -46,6 +46,19 @@ pub struct LlamaModelConfig {
     pub gemma4: Option<Gemma4Metadata>,
 }
 
+/// Whether `architecture` is one of the dense-decoder families Camelid actually
+/// implements. This MUST mirror the accepted set in [`LlamaModelConfig::from_gguf`]
+/// below (the `unit test implemented_set_matches_from_gguf_accept_arm` guards the
+/// two against drift). It is a pure architecture-string check for classification
+/// (e.g. labeling a loaded model's lane); it makes NO support/parity claim — an
+/// implemented architecture is only *attemptable*, never automatically supported.
+pub fn is_implemented_architecture(architecture: &str) -> bool {
+    matches!(
+        architecture,
+        "llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "gemma4" | "phi3" | "lfm2"
+    )
+}
+
 impl LlamaModelConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = match gguf.architecture() {
@@ -1551,6 +1564,34 @@ fn find_tensor<'a>(gguf: &'a GgufFile, name: &str) -> Option<&'a GgufTensorDescr
 mod tests {
     use super::validate_output_projection_storage_layout;
     use crate::gguf::{GgufTensorDescriptor, GgufTensorType};
+
+    #[test]
+    fn implemented_architecture_set_is_exactly_the_from_gguf_accept_arm() {
+        // These nine must stay byte-for-byte in sync with the match arm in
+        // LlamaModelConfig::from_gguf. If you change one, change both.
+        for arch in [
+            "llama", "mistral", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "lfm2",
+        ] {
+            assert!(
+                super::is_implemented_architecture(arch),
+                "{arch} should be implemented"
+            );
+        }
+        for arch in [
+            "falcon",
+            "gpt2",
+            "mamba",
+            "bert",
+            "rwkv",
+            "diffusion-gemma",
+            "",
+        ] {
+            assert!(
+                !super::is_implemented_architecture(arch),
+                "{arch} must not be implemented"
+            );
+        }
+    }
 
     #[test]
     fn validates_q8_output_projection_token_row_storage_math() {

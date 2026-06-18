@@ -64,10 +64,16 @@ export default function ChatWorkspace({
   setThinkingMode = null,
   stoppingGeneration = false,
   selectedModelRunnable,
+  selectedModelExperimental = false,
   setTab,
   showNewChatLanding = null,
   demoMode = false,
 }) {
+  // Chat is allowed on the supported lane (full gate) OR the weaker experimental
+  // lane (implemented-but-unsupported). The supported-specific copy below stays
+  // keyed on `selectedModelRunnable`; the experimental lane gets its own banner and
+  // never borrows the supported badge.
+  const canChat = selectedModelRunnable || selectedModelExperimental
   const [generationElapsedSeconds, setGenerationElapsedSeconds] = useState(0)
   const [showControls, setShowControls] = useState(false)
   const [showAllMessages, setShowAllMessages] = useState(false)
@@ -209,8 +215,8 @@ export default function ChatWorkspace({
             ? 'Drafting stays unlocked. Camelid will unlock send as soon as this selected row is loaded, generation-ready, and supported.'
             : 'Pick a local model first, then Camelid will keep the runtime and support boundary visible here.'
 
-  const canSubmit = Boolean(composer.trim()) && selectedModelRunnable && !generationActive
-  const sendDisabledReason = selectedModelRunnable
+  const canSubmit = Boolean(composer.trim()) && canChat && !generationActive
+  const sendDisabledReason = canChat
     ? ''
     : generationActive
       ? 'Wait for the current reply to finish or stop it before sending again.'
@@ -221,7 +227,7 @@ export default function ChatWorkspace({
           : selectedModel
             ? 'Send unlocks when Camelid marks this model ready and supported.'
             : 'Choose a model before sending.'
-  const promptHintCopy = selectedModelRunnable
+  const promptHintCopy = canChat
     ? 'Enter sends · Shift+Enter for a new line'
     : apiUnavailable
       ? 'Draft now · send unlocks after the API reconnects'
@@ -234,7 +240,7 @@ export default function ChatWorkspace({
 
   const composerDraftUnlocked = Boolean(selectedModel || apiUnavailable)
   const composerDisabled = !composerDraftUnlocked
-  const composerPlaceholder = selectedModelRunnable
+  const composerPlaceholder = canChat
     ? 'Message Camelid…'
     : apiUnavailable
       ? 'Draft a prompt while the Camelid API comes back'
@@ -495,6 +501,16 @@ export default function ChatWorkspace({
     <section className={`cxchat is-${readinessState} ${userScrolledAway ? 'is-user-scrolled' : ''} ${isFreshThread ? 'cxchat--empty' : ''}`} data-view="chat">
       <div className="cxchat__scroll">
         <div className="cxchat__column">
+          {selectedModelExperimental && !selectedModelRunnable && (
+            <div className="cxchat__experimental-banner" role="note">
+              <EvidenceChip state="unsupported" asText>Experimental</EvidenceChip>
+              <span>
+                Output is <strong>unverified and has no parity guarantee</strong>. This model's
+                architecture is implemented, but it is not a supported row — every reply below is
+                marked experimental.
+              </span>
+            </div>
+          )}
           {isFreshThread ? (
             <div className="cxchat__empty">
               <div className="cxchat-hero">
@@ -536,7 +552,7 @@ export default function ChatWorkspace({
                   ? [...visibleMessages.slice(0, index)].reverse().find((item) => item.role === 'user')
                   : null
                 const priorUserPrompt = priorUserMessage?.content || null
-                const canResend = Boolean(resendFromMessage) && !generationActive && selectedModelRunnable
+                const canResend = Boolean(resendFromMessage) && !generationActive && canChat
                 return (
                   <MessageTurn
                     key={message.id}

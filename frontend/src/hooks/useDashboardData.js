@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { compatibilityHintCopy, compatibilityHintLabel, findCompatibilityHint, isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
+import { isCompatibilitySupportedForModel, quantLabelFromGgufFileType } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { resolveLoadedModelDisplayName } from '../lib/loadedModelDisplay'
 import { readStreamingChatCompletion } from '../lib/chatCompletionStream'
@@ -692,9 +692,10 @@ export function useDashboardData({ showNotice, clearNotice }) {
 
   const selectedModel = useMemo(() => models.find((model) => model.id === selectedModelId) || models[0], [models, selectedModelId])
   const selectedModelChatGate = getChatGateState(dashboard?.capabilities, selectedModel, runtime)
-  const selectedModelRuntimeReady = selectedModelChatGate.runtimeReady
-  const selectedModelCapabilitySupported = selectedModelChatGate.contractSupported
   const selectedModelRunnable = selectedModelChatGate.chatUnlocked
+  // Experimental lane: loaded + generation-ready implemented model that is NOT a
+  // supported row. Enables a weaker chat affordance; never the supported badge.
+  const selectedModelExperimental = selectedModelChatGate.experimentalUnlocked
   const pendingConversation = pendingChat?.conversationId
     && (selectedConversation?.id === pendingChat.conversationId || selectedConversationId === pendingChat.conversationId)
     ? pendingChat
@@ -784,13 +785,11 @@ export function useDashboardData({ showNotice, clearNotice }) {
     const { overrideContent = null, truncateFromMessageId = null } = options
     const draftContent = overrideContent ?? composer
     if (!draftContent.trim()) return
-    if (!selectedModelRunnable) {
-      if (selectedModelRuntimeReady && !selectedModelCapabilitySupported) {
-        const hint = findCompatibilityHint(dashboard?.capabilities, selectedModel)
-        showNotice(`${compatibilityHintLabel(hint, 'No matching COMPATIBILITY.md row')}: ${compatibilityHintCopy(hint)} Chat is blocked until /api/capabilities marks this exact model/quant as supported.`, 'error')
-      } else {
-        showNotice('Camelid is not generation-ready for the selected model yet.', 'error')
-      }
+    // Supported rows chat through the full gate. Implemented-but-unsupported rows
+    // chat through the weaker EXPERIMENTAL lane (every turn marked unverified). Only
+    // a model that is not generation-ready at all is fully blocked.
+    if (!selectedModelRunnable && !selectedModelExperimental) {
+      showNotice('Camelid is not generation-ready for the selected model yet.', 'error')
       return
     }
 
@@ -837,6 +836,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
       )))
 
       const requestStartedAt = performance.now()
+      // Fresh per-token decode trace for this generation (auditable backing for
+      // the live tok/s readout; read out after the stream completes).
+      if (typeof window !== 'undefined') window.__tpsTrace = []
       const lifecycleId = beginRequest({ kind: 'chat', endpoint: '/v1/chat/completions', modelId: getRuntimeRequestModelId(selectedModel, runtime, selectedModelId) })
       chatLifecycleId = lifecycleId
       let firstContentEmitted = false
@@ -850,6 +852,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const supportRowAtSend = sendGate.hint?.target
         ? { id: sendGate.hint.target.id, status: sendGate.hint.target.status, supported: sendGate.contractSupported }
         : null
+      // Mark this turn experimental when it ran on the weaker (implemented-but-not-
+      // supported) lane, so the footer can flag it as unverified with no parity claim.
+      const experimentalLaneAtSend = sendGate.chatMode === 'experimental'
       const assistantMessageBase = {
         id: assistantId,
         role: 'assistant',
@@ -857,6 +862,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
         model_id: selectedModelId,
         model_name: selectedModel?.name || selectedModelId,
         support_row: supportRowAtSend,
+        experimental_lane: experimentalLaneAtSend,
         created_at: nowIso(),
         tokens_in_per_sec: null,
         tokens_out_per_sec: null,
@@ -939,16 +945,26 @@ export function useDashboardData({ showNotice, clearNotice }) {
       if (response.ok && !response.headers.get('content-type')?.includes('application/json')) {
         markAssistantStreamState({ streaming_phase: 'generating' }, { immediate: true })
       }
-      const streamed = await readStreamingChatCompletion(response, (_delta, fullContent) => {
+      const streamed = await readStreamingChatCompletion(response, (_delta, fullContent, metrics) => {
         const liveElapsedMs = performance.now() - requestStartedAt
-        const liveCompletionTokens = estimateTokenCount(fullContent)
+        /* Live decode rate uses the REAL token count (one SSE content delta =
+           one generated token in Camelid) over the decode window, not a
+           word-piece estimate — so the on-screen tok/s is auditable and is
+           backed token-for-token by window.__tpsTrace below. */
+        const realTokens = Number(metrics?.completionTokens) || 0
+        const decodeMs = Number(metrics?.elapsedMs) || liveElapsedMs
+        const liveTps = tokensPerSecond(realTokens, decodeMs)
+        if (typeof window !== 'undefined' && realTokens > 0) {
+          if (!Array.isArray(window.__tpsTrace)) window.__tpsTrace = []
+          window.__tpsTrace.push({ i: realTokens, t_ms: Math.round(decodeMs * 10) / 10, tps: liveTps != null ? Math.round(liveTps * 100) / 100 : null, delta: _delta })
+        }
         if (!firstContentEmitted && fullContent) {
           firstContentEmitted = true
           emitFirstContent(lifecycleId, liveElapsedMs)
         }
         if (performance.now() - lastProgressAt > 100) {
           lastProgressAt = performance.now()
-          emitProgress(lifecycleId, { tokens: liveCompletionTokens, tokensPerSec: tokensPerSecond(liveCompletionTokens, liveElapsedMs) })
+          emitProgress(lifecycleId, { tokens: realTokens, tokensPerSec: liveTps })
         }
         markAssistantStreamState({
           /* paced display (lag-bounded ≤150ms, drains on end; metrics use the
@@ -956,7 +972,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
           content: paceStep(pacer, fullContent, performance.now()) || '…',
           streaming_phase: 'streaming',
           tokens_in_per_sec: null,
-          tokens_out_per_sec: tokensPerSecond(liveCompletionTokens, liveElapsedMs),
+          tokens_out_per_sec: liveTps,
         })
       }, {
         estimateTokenCount,
@@ -1466,6 +1482,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
     selectedConversation,
     selectedModel,
     selectedModelRunnable,
+    selectedModelExperimental,
     filteredConversations,
     filteredMemories,
     latestAssistantMessage,
