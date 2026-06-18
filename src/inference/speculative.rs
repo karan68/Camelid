@@ -24,9 +24,15 @@
 use crate::inference::{LlamaInferenceSession, LlamaSampler};
 use crate::Result;
 
-/// Default drafted tokens per round for the n-gram drafter. Drafts are nearly
-/// free here, so a longer window is cheap; misses cost one wasted verify row.
-pub const DEFAULT_NGRAM_DRAFT_TOKENS: usize = 8;
+/// Default drafted tokens per round for the n-gram drafter. The n-gram lookup
+/// itself is nearly free, but each extra draft widens the batched verify GEMM, so
+/// over-drafting wastes work on partial-acceptance text (code, prose) without
+/// helping. Measured on a 3B Q8_0 GPU resident decode (RTX 3060): a draft count of
+/// 5 (verify batch k=6) sits at the sweet spot — within ~1% of the maximum
+/// repetitive-text speedup (~2.55x) while giving the best result on moderately
+/// repetitive code (~1.20x), where 7 drafts regress to ~1.09x. Bounded by
+/// `cuda_resident::MAX_VERIFY_K - 1`.
+pub const DEFAULT_NGRAM_DRAFT_TOKENS: usize = 5;
 
 /// Default drafted tokens per round for the draft-model drafter. Each draft
 /// token costs a sequential forward through the draft model, so the window
