@@ -1291,6 +1291,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/execution-plan", get(execution_plan))
         .route("/api/execution-plan", get(execution_plan))
         .route("/api/models/load", post(load_model))
+        .route("/api/models/inspect", post(inspect_model))
         .route("/api/models/unload", post(unload_model))
         .route("/api/models/current", get(current_model))
         .route("/api/models/metadata", get(model_metadata))
@@ -3040,9 +3041,12 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
     match load_model_from_path(&state, req.path, req.id).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
+        // Fail closed with the exact typed reason and a stable, switchable code.
+        // The message already carries the offending architecture/quant and any
+        // dedicated-lane redirect (e.g. `camelid diffusion-gemma-chat`).
         Err(err) => api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_model",
+            backend_error_code(&err),
             err.to_string(),
             Some("path"),
         ),
@@ -3055,6 +3059,96 @@ async fn load_model_from_path(
     id: Option<String>,
 ) -> Result<LoadedModel, BackendError> {
     load_model_from_path_with_activation(state, path, id, true).await
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectModelRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectBlocker {
+    /// Stable, frontend-switchable code (same vocabulary as `error.code`).
+    code: &'static str,
+    /// Exact typed reason, including the offending architecture and any dedicated-
+    /// lane redirect (e.g. `camelid diffusion-gemma-chat`).
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectModelResponse {
+    architecture: Option<String>,
+    quant: Option<String>,
+    /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
+    lane_class: ModelLaneClass,
+    /// The exact typed blocker the load would hit — predicted WITHOUT binding
+    /// tensors or loading weights. `None` when the architecture is implemented
+    /// (it would load and run, supported or experimental).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<InspectBlocker>,
+}
+
+/// `POST /api/models/inspect` — header-only prediction of a GGUF's lane and the
+/// exact reason it would fail closed, WITHOUT loading weights, so the UI can warn
+/// before a multi-GB load attempt. Reads only the GGUF metadata header.
+async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
+    let path = req.path.clone();
+    let parsed = tokio::task::spawn_blocking(move || read_metadata(&path)).await;
+    let gguf = match parsed {
+        Ok(Ok(gguf)) => gguf,
+        Ok(Err(err)) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            );
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "inspect_task_failed",
+                "metadata inspection task panicked".to_string(),
+                None,
+            );
+        }
+    };
+
+    let architecture = gguf.architecture().map(ToOwned::to_owned);
+    let filename = req
+        .path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let quant = Some(crate::runnable::headline_quant_of(&gguf)).filter(|q| !q.is_empty());
+
+    // Parse the config header (no tensor bind, no weight load). Ok ⇒ it would load;
+    // Err ⇒ it would fail closed with this exact typed reason.
+    let (lane_class, blocker) = match LlamaModelConfig::from_gguf(&gguf) {
+        Ok(_) => (
+            classify_model_lane(architecture.as_deref(), &filename),
+            None,
+        ),
+        Err(err) => (
+            ModelLaneClass::Unsupported,
+            Some(InspectBlocker {
+                code: backend_error_code(&err),
+                message: err.to_string(),
+            }),
+        ),
+    };
+
+    (
+        StatusCode::OK,
+        Json(InspectModelResponse {
+            architecture,
+            quant,
+            lane_class,
+            blocker,
+        }),
+    )
+        .into_response()
 }
 
 /// The Gemma 4 serve path is gated behind `CAMELID_GEMMA4_SERVE` (1/true/yes).
@@ -3967,13 +4061,18 @@ async fn load_model_from_path_with_activation(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
     let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
+    // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
+    // WHY it fails closed (architecture not implemented, missing/invalid metadata,
+    // DiffusionGemma redirect, …) instead of silently sitting non-generative.
     let unsupported_runtime = match &llama_config_result {
-        Err(BackendError::UnsupportedModelArchitecture(message)) => {
-            Some(UnsupportedRuntimeSummary {
-                code: "unsupported_model_architecture",
-                message: message.clone(),
-            })
-        }
+        Err(
+            err @ (BackendError::UnsupportedModelArchitecture(_)
+            | BackendError::InvalidModelMetadata(_)
+            | BackendError::UnsupportedGguf(_)),
+        ) => Some(UnsupportedRuntimeSummary {
+            code: backend_error_code(err),
+            message: err.to_string(),
+        }),
         _ => None,
     };
     let llama_config = llama_config_result.ok();
@@ -9597,6 +9696,31 @@ mod tests {
     }
 
     #[test]
+    fn backend_error_code_is_stable_and_switchable() {
+        use crate::BackendError;
+        assert_eq!(
+            backend_error_code(&BackendError::UnsupportedModelArchitecture("falcon".into())),
+            "unsupported_model_architecture",
+        );
+        assert_eq!(
+            backend_error_code(&BackendError::InvalidModelMetadata("x".into())),
+            "invalid_model_metadata",
+        );
+        assert_eq!(
+            backend_error_code(&BackendError::UnsupportedTokenizer("x".into())),
+            "unsupported_tokenizer",
+        );
+        assert_eq!(
+            backend_error_code(&BackendError::UnsupportedGguf("x".into())),
+            "unsupported_gguf",
+        );
+        // The offending architecture rides in the message, not the code.
+        assert!(BackendError::UnsupportedModelArchitecture("falcon".into())
+            .to_string()
+            .contains("falcon"));
+    }
+
+    #[test]
     fn capabilities_report_exact_8b_1024_2048_after_current_head_alignment() {
         let response = capabilities_response();
         assert!(response.support_contract.current_gate.contains(
@@ -12795,6 +12919,25 @@ fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
         .and_then(|f| f.to_str())
         .unwrap_or_default();
     classify_model_lane(model.gguf.architecture(), filename)
+}
+
+/// Stable, frontend-switchable `error.code` for a typed backend failure. The
+/// human message (which already carries the offending architecture/quant and any
+/// dedicated-lane redirect, e.g. `camelid diffusion-gemma-chat`) travels separately
+/// in `error.message`.
+fn backend_error_code(err: &BackendError) -> &'static str {
+    match err {
+        BackendError::UnsupportedModelArchitecture(_) => "unsupported_model_architecture",
+        BackendError::InvalidModelMetadata(_) => "invalid_model_metadata",
+        BackendError::UnsupportedGguf(_) => "unsupported_gguf",
+        BackendError::InvalidGguf(_) => "invalid_gguf",
+        BackendError::UnsupportedTokenizer(_) => "unsupported_tokenizer",
+        BackendError::InvalidTokenizerMetadata(_) => "invalid_tokenizer_metadata",
+        BackendError::UnsupportedTensorType(_) => "unsupported_tensor_type",
+        BackendError::InvalidTensorData(_) => "invalid_tensor_data",
+        BackendError::Io { .. } => "model_io_error",
+        _ => "invalid_model",
+    }
 }
 
 /// The Models-tab catalog: a **curated** group (pinned, known-good rows, always

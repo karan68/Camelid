@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { ParityReceiptCard } from '../chat/render/ParityReceipt'
+import { UnsupportedBlocker } from './UnsupportedBlocker'
 
 /* Local models on disk, grouped into derived lane sections. Membership is computed
    from /api/models/local lane facts + the /api/capabilities contract — never a
@@ -174,6 +175,9 @@ export function LocalLaneSections({ apiBase = '', capabilities, refreshKey = 0 }
   const [busy, setBusy] = useState({})
   const [activeFilename, setActiveFilename] = useState('')
   const [usingFilename, setUsingFilename] = useState('')
+  // Typed fail-closed blocker from a pre-load inspect ({ code, message }), shown
+  // verbatim instead of attempting a multi-GB load that cannot run.
+  const [blocker, setBlocker] = useState(null)
 
   const refreshCurrent = useCallback(async () => {
     try {
@@ -201,18 +205,41 @@ export function LocalLaneSections({ apiBase = '', capabilities, refreshKey = 0 }
     }
   }, [base])
 
-  // Load a supported local model into the parity chat backend and mark it active.
+  // Load a local model into the chat backend. First predict the lane with a
+  // header-only inspect (no multi-GB read): if the architecture is not implemented,
+  // surface the exact typed blocker and stop — never attempt to run it. Implemented
+  // architectures (supported or experimental) load as before.
   const useModel = async (filename) => {
     setUsingFilename(filename)
     setError('')
+    setBlocker(null)
+    const path = `${data?.models_dir || 'models'}/${filename}`
     try {
+      const inspectRes = await fetch(`${base}/api/models/inspect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      })
+      if (inspectRes.ok) {
+        const inspect = await inspectRes.json()
+        if (inspect?.blocker) {
+          setBlocker(inspect.blocker)
+          return
+        }
+      }
+      // Implemented (or inspect unavailable) → attempt the real load.
       const res = await fetch(`${base}/api/models/load`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: filename, path: `${data?.models_dir || 'models'}/${filename}` }),
+        body: JSON.stringify({ id: filename, path }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
+        // A typed fail-closed load error (e.g. invalid metadata) becomes a blocker.
+        if (body?.error?.code && body.error.code !== 'invalid_model') {
+          setBlocker({ code: body.error.code, message: body.error.message })
+          return
+        }
         throw new Error(body?.error?.message || `load failed (HTTP ${res.status})`)
       }
       await refreshCurrent()
@@ -295,6 +322,9 @@ export function LocalLaneSections({ apiBase = '', capabilities, refreshKey = 0 }
         from receipts and lane status, never hand-authored.
       </p>
       {error ? <p className="lane-error">{error}</p> : null}
+      {blocker ? (
+        <UnsupportedBlocker blocker={blocker} className="local-lane-blocker" />
+      ) : null}
 
       <Section
         title="Supported"
