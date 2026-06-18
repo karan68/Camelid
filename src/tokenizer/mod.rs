@@ -560,11 +560,23 @@ impl Tokenizer {
             }
         }
 
-        String::from_utf8(bytes).map_err(|_| {
-            BackendError::InvalidTokenizerMetadata(
-                "GPT-2/BPE decode produced invalid UTF-8".to_string(),
-            )
-        })
+        // A generated sequence can stop mid-multi-byte-character — e.g. truncated by
+        // max_tokens partway through an emoji — leaving valid byte-tokens that don't yet
+        // form complete UTF-8. That is normal model output, not corrupt tokenizer
+        // metadata, so return the valid UTF-8 prefix and hold back the incomplete
+        // trailing bytes instead of failing the whole request (the strict decode
+        // surfaced as a 503 that hung the chat UI). Holding the bytes back — rather than
+        // emitting a U+FFFD — lets the streaming re-decode append the character cleanly
+        // once the next token completes it (a transient U+FFFD would break the
+        // strip_prefix delta diff and duplicate the line). For complete sequences the
+        // valid prefix is the whole string, byte-for-byte identical to a strict decode,
+        // so token-AND-text parity is unaffected.
+        match std::str::from_utf8(&bytes) {
+            Ok(text) => Ok(text.to_string()),
+            Err(err) => Ok(std::str::from_utf8(&bytes[..err.valid_up_to()])
+                .unwrap_or("")
+                .to_string()),
+        }
     }
 
     fn normalize_spm_text(&self, text: &str, parse_special: bool) -> String {
@@ -1152,10 +1164,14 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
-    let decoded = String::from_utf8(std::mem::take(bytes)).map_err(|_| {
-        BackendError::InvalidTokenizerMetadata("byte fallback produced invalid UTF-8".to_string())
-    })?;
-    text.push_str(&decoded);
+    // SPM byte-fallback can likewise end mid-character when generation is truncated;
+    // push the valid UTF-8 prefix and hold back any incomplete trailing bytes rather
+    // than erroring. Identical to a strict decode for complete sequences (parity-safe).
+    let taken = std::mem::take(bytes);
+    match std::str::from_utf8(&taken) {
+        Ok(decoded) => text.push_str(decoded),
+        Err(err) => text.push_str(std::str::from_utf8(&taken[..err.valid_up_to()]).unwrap_or("")),
+    }
     Ok(())
 }
 
