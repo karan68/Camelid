@@ -837,13 +837,22 @@ fn launch_gemm_batched(
     k_tokens: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<(), cudarc::driver::DriverError> {
-    let block = 256u32;
-    let warps_per_block = block / 32;
+    // Each warp computes one output row; warps_per_block only sets how many rows a
+    // block handles, so it never changes the per-row block-order reduction (the
+    // result is bit-identical for any warps_per_block). Cap it so the
+    // [warp][token][block] ordered-sum scratch fits the 48 KiB default shared-mem
+    // limit — necessary once K grows (e.g. K=8, blocks_per_row=256 needs 6 warps,
+    // not the historic 8). Use a 46 KiB budget for headroom. The K=4 / small-row
+    // cases keep the full 8 warps/block (unchanged from before).
+    const SHARED_BUDGET: u32 = 46 * 1024;
+    let per_warp_bytes = (k_tokens as u32) * (blocks_per_row as u32) * 4;
+    let warps_per_block = (SHARED_BUDGET / per_warp_bytes.max(1)).clamp(1, 8);
+    let block = warps_per_block * 32;
     let cfg = LaunchConfig {
         grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
         block_dim: (block, 1, 1),
         // [warp][token][block] ordered-sum scratch.
-        shared_mem_bytes: warps_per_block * (k_tokens as u32) * (blocks_per_row as u32) * 4,
+        shared_mem_bytes: warps_per_block * per_warp_bytes,
     };
     let (r, bpr, kt) = (rows as i32, blocks_per_row as i32, k_tokens as i32);
     let mut b = s.launch_builder(f);
@@ -1411,9 +1420,15 @@ pub struct CudaResidentDecode {
 }
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
-/// per-(token,block) sum in shared memory, so `MAX_VERIFY_K * blocks_per_row *
-/// warps_per_block * 4` must fit (4 * 256 * 8 * 4 = 32 KiB for the 1B/3B FFN).
-pub(crate) const MAX_VERIFY_K: usize = 4;
+/// per-(token,block) sum in shared memory (`k * blocks_per_row * warps_per_block *
+/// 4` bytes). At K=8 the 3B FFN (blocks_per_row=256) would need 64 KiB at the
+/// historic 8 warps/block, past the 48 KiB default shared-mem limit, so
+/// `launch_gemm_batched` now caps warps/block to fit the budget (warps map to
+/// output rows, so fewer-warps-per-block changes only the grid shape, never the
+/// per-row block-order reduction — the result stays bit-identical). A larger K
+/// lets each weight read verify more drafts per round, raising the ceiling on
+/// repetitive/structured output where n-gram acceptance is high.
+pub(crate) const MAX_VERIFY_K: usize = 8;
 
 /// K-batched scratch buffers for `verify_batch`, sized `MAX_VERIFY_K * dim`.
 struct VerifyScratch {
