@@ -1,12 +1,16 @@
 export function cleanLegacyDemoCapCopy(value) {
   if (typeof value !== 'string') return value
-  return value
+  const stripped = value
     .replace(/\s*\(demo cap\)/gi, '')
     .replace(/\s*·\s*raw\s+16-token-cap\s+local\s+run;\s*inspect\s+before\s+trusting\s+polish/gi, ' · raw local run')
     .replace(/\s*Longer-generation\s+polish\s+still\s+needs\s+separate\s+validation\.?/gi, '')
     .replace(/\s*Longer\s+generation\s+is\s+not\s+polished\s+yet\.?/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
+  // Only tidy up whitespace when a legacy phrase was actually removed; content
+  // with no legacy phrases is returned untouched so multi-line code and
+  // markdown keep their newlines and indentation intact. Even when cleaning,
+  // collapse only runs of horizontal whitespace (spaces/tabs) — never newlines.
+  if (stripped === value) return value
+  return stripped.replace(/[^\S\n]{2,}/g, ' ').trim()
 }
 
 export function normalizeStoredMessage(message, { clearStaleStreaming = false } = {}) {
