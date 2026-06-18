@@ -61,8 +61,13 @@ cudarc = { version = "0.19", default-features = false, features = [
 ], optional = true }
 
 [features]
-# Off by default: the CPU reference path is the default build and the parity
-# reference. Enable with `cargo build --features cuda` on a CUDA host.
+# CUDA is ON by default so a bare `cargo build` / `test` / `clippy` includes the
+# GPU backend (the primary dev host is a CUDA box). cudarc uses
+# `fallback-dynamic-loading`, so this still builds on CPU-only non-macOS hosts and
+# simply no-ops at runtime when no CUDA driver is present. The pure CPU reference /
+# parity build is `cargo build --no-default-features`; macOS (where cudarc is
+# target-gated out above) must also use `--no-default-features`.
+default = ["cuda"]
 cuda = ["dep:cudarc"]
 
 [dev-dependencies]
