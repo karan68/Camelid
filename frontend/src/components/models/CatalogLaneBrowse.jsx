@@ -172,14 +172,18 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
           </div>
         </div>
       ) : phase === 'installing' ? (
-        <div className="catalog-progress">
-          <div className="catalog-progress-bar">
-            <span style={{ width: `${pct}%` }} />
-          </div>
-          <small>
-            Downloading {prettySize(progress?.bytes)} / {prettySize(progress?.total)} ({pct}%)
-          </small>
-        </div>
+        <button
+          type="button"
+          className={`catalog-row-action catalog-row-action--progress${pct === 0 ? ' is-indeterminate' : ''}`}
+          disabled
+          aria-label={`Downloading, ${pct} percent`}
+          aria-busy="true"
+        >
+          <span className="catalog-row-action__fill" style={{ width: `${pct}%` }} aria-hidden="true" />
+          <span className="catalog-row-action__label">
+            Downloading {pct}% · {prettySize(progress?.bytes)} / {prettySize(progress?.total)}
+          </span>
+        </button>
       ) : phase === 'smoking' ? (
         <p className="catalog-row-faint">Download complete — running smoke-admission…</p>
       ) : (
