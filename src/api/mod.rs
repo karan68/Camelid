@@ -901,6 +901,13 @@ pub struct ChatCompletionResponse {
     /// Present only when the request opted in via `camelid_receipt: true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camelid_receipt: Option<ParityReceipt>,
+    /// Serve-lane disclosure. Present and `"experimental"` only when the active
+    /// model is an implemented decoder that is NOT a supported exact row — the
+    /// output is unverified and carries no parity claim. Omitted for supported rows
+    /// (whose support is asserted by `/api/capabilities`, never by this field) and
+    /// is NEVER a parity receipt: the live token stream is not evidence of support.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lane: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1284,6 +1291,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/execution-plan", get(execution_plan))
         .route("/api/execution-plan", get(execution_plan))
         .route("/api/models/load", post(load_model))
+        .route("/api/models/inspect", post(inspect_model))
         .route("/api/models/unload", post(unload_model))
         .route("/api/models/current", get(current_model))
         .route("/api/models/metadata", get(model_metadata))
@@ -3033,9 +3041,12 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
     match load_model_from_path(&state, req.path, req.id).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
+        // Fail closed with the exact typed reason and a stable, switchable code.
+        // The message already carries the offending architecture/quant and any
+        // dedicated-lane redirect (e.g. `camelid diffusion-gemma-chat`).
         Err(err) => api_error(
             StatusCode::BAD_REQUEST,
-            "invalid_model",
+            backend_error_code(&err),
             err.to_string(),
             Some("path"),
         ),
@@ -3048,6 +3059,96 @@ async fn load_model_from_path(
     id: Option<String>,
 ) -> Result<LoadedModel, BackendError> {
     load_model_from_path_with_activation(state, path, id, true).await
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectModelRequest {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectBlocker {
+    /// Stable, frontend-switchable code (same vocabulary as `error.code`).
+    code: &'static str,
+    /// Exact typed reason, including the offending architecture and any dedicated-
+    /// lane redirect (e.g. `camelid diffusion-gemma-chat`).
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectModelResponse {
+    architecture: Option<String>,
+    quant: Option<String>,
+    /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
+    lane_class: ModelLaneClass,
+    /// The exact typed blocker the load would hit — predicted WITHOUT binding
+    /// tensors or loading weights. `None` when the architecture is implemented
+    /// (it would load and run, supported or experimental).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocker: Option<InspectBlocker>,
+}
+
+/// `POST /api/models/inspect` — header-only prediction of a GGUF's lane and the
+/// exact reason it would fail closed, WITHOUT loading weights, so the UI can warn
+/// before a multi-GB load attempt. Reads only the GGUF metadata header.
+async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
+    let path = req.path.clone();
+    let parsed = tokio::task::spawn_blocking(move || read_metadata(&path)).await;
+    let gguf = match parsed {
+        Ok(Ok(gguf)) => gguf,
+        Ok(Err(err)) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            );
+        }
+        Err(_) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "inspect_task_failed",
+                "metadata inspection task panicked".to_string(),
+                None,
+            );
+        }
+    };
+
+    let architecture = gguf.architecture().map(ToOwned::to_owned);
+    let filename = req
+        .path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let quant = Some(crate::runnable::headline_quant_of(&gguf)).filter(|q| !q.is_empty());
+
+    // Parse the config header (no tensor bind, no weight load). Ok ⇒ it would load;
+    // Err ⇒ it would fail closed with this exact typed reason.
+    let (lane_class, blocker) = match LlamaModelConfig::from_gguf(&gguf) {
+        Ok(_) => (
+            classify_model_lane(architecture.as_deref(), &filename),
+            None,
+        ),
+        Err(err) => (
+            ModelLaneClass::Unsupported,
+            Some(InspectBlocker {
+                code: backend_error_code(&err),
+                message: err.to_string(),
+            }),
+        ),
+    };
+
+    (
+        StatusCode::OK,
+        Json(InspectModelResponse {
+            architecture,
+            quant,
+            lane_class,
+            blocker,
+        }),
+    )
+        .into_response()
 }
 
 /// The Gemma 4 serve path is gated behind `CAMELID_GEMMA4_SERVE` (1/true/yes).
@@ -3127,6 +3228,32 @@ mod gemma4_template_tests {
             "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
+    }
+
+    #[test]
+    fn phi3_prompt_renders_end_marked_turns_and_generation_prompt() {
+        let messages = [
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "system".to_string(),
+                content: "Be concise.".to_string(),
+            },
+            ChatMessage {
+                unsupported_content_parts: Vec::new(),
+                role: "user".to_string(),
+                content: "Capital of France?".to_string(),
+            },
+        ];
+        assert_eq!(
+            render_phi3_prompt(&messages),
+            "<|system|>\nBe concise.<|end|>\n<|user|>\nCapital of France?<|end|>\n<|assistant|>\n"
+        );
+        // Phi-3's <|end|>-separated template must be detected before TinyLlama's.
+        let phi3_tmpl = "<|user|>\n{{content}}<|end|>\n<|assistant|>\n";
+        assert!(is_phi3_template(phi3_tmpl));
+        assert!(!is_phi3_template(
+            "<|user|>\n{{content}}</s>\n<|assistant|>\n"
+        ));
     }
 
     #[test]
@@ -3951,7 +4078,7 @@ async fn load_model_from_path_with_activation(
             }
         }
     }
-    let gguf = read_metadata(&path)?;
+    let mut gguf = read_metadata(&path)?;
     let outcome = plan_for_model(&path, &gguf, state.configured_threads);
     state.planner_env.apply(&outcome.env_updates);
     log_selected_execution_plan(&outcome.plan);
@@ -3960,13 +4087,26 @@ async fn load_model_from_path_with_activation(
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
         .unwrap_or_else(|| "loaded-model".to_string());
     let llama_config_result = LlamaModelConfig::from_gguf(&gguf);
-    let unsupported_runtime = match &llama_config_result {
-        Err(BackendError::UnsupportedModelArchitecture(message)) => {
-            Some(UnsupportedRuntimeSummary {
-                code: "unsupported_model_architecture",
-                message: message.clone(),
-            })
+    // Some dense decoders (e.g. phi3) ship fused attn_qkv / gate-up tensors. Synthesize
+    // the split tensors the binder + forward path expect (no-op for already-split rows),
+    // so the fused layout becomes attemptable without touching the parity-gated path.
+    if let Ok(config) = &llama_config_result {
+        if let Err(err) = crate::model::expand_fused_dense_tensors(&mut gguf, config) {
+            eprintln!("[camelid] fused-tensor expansion skipped: {err}");
         }
+    }
+    // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
+    // WHY it fails closed (architecture not implemented, missing/invalid metadata,
+    // DiffusionGemma redirect, …) instead of silently sitting non-generative.
+    let unsupported_runtime = match &llama_config_result {
+        Err(
+            err @ (BackendError::UnsupportedModelArchitecture(_)
+            | BackendError::InvalidModelMetadata(_)
+            | BackendError::UnsupportedGguf(_)),
+        ) => Some(UnsupportedRuntimeSummary {
+            code: backend_error_code(err),
+            message: err.to_string(),
+        }),
         _ => None,
     };
     let llama_config = llama_config_result.ok();
@@ -5122,6 +5262,25 @@ async fn chat_completions(
                 }
                 None => None,
             };
+            // Disclose the serve lane: "experimental" only when the active model is
+            // an implemented decoder that is NOT a supported exact row. Never set
+            // for supported rows; never a parity claim.
+            let lane = match state.loaded_models.read().await.get(&model_id) {
+                Some(model)
+                    if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented =>
+                {
+                    Some("experimental")
+                }
+                _ => None,
+            };
+            // Experimental models have no parity contract, so trim the leading/trailing
+            // whitespace some of them emit around the answer for a clean chat bubble.
+            // Supported rows are left byte-identical (their generated text is contractual).
+            let content = if lane.is_some() {
+                generated.text.trim().to_string()
+            } else {
+                generated.text
+            };
             (
                 StatusCode::OK,
                 Json(ChatCompletionResponse {
@@ -5133,7 +5292,7 @@ async fn chat_completions(
                         index: 0,
                         message: ChatCompletionMessage {
                             role: "assistant",
-                            content: generated.text,
+                            content,
                         },
                         finish_reason: generated.finish_reason,
                     }],
@@ -5155,6 +5314,7 @@ async fn chat_completions(
                         timings_ms: generated.timings,
                     },
                     camelid_receipt,
+                    lane,
                 }),
             )
                 .into_response()
@@ -8369,6 +8529,20 @@ fn render_chat_prompt_for_tokenization_fallback(
         // as EOS when tokenizing the rendered template — so chat prompts
         // parse specials (chat_prompt_parse_special), with dummy-prefix
         // handling after control tokens preserved by encode_piece.
+        // Checked BEFORE tinyllama: Phi-3 reuses the same <|user|>/<|assistant|>
+        // marker spellings but separates turns with <|end|> (not </s>) and stops on
+        // <|end|>. Routing it through the tinyllama renderer used the wrong separator
+        // and stop token, so generation rambled.
+        if is_phi3_template(template) {
+            return RenderedPrompt {
+                text: render_phi3_prompt(messages),
+                // Phi-3 sets add_bos_token=true; the tokenizer prepends <s>.
+                add_special: true,
+                // Parse specials so <|user|>/<|assistant|>/<|end|> become the control
+                // token ids — in particular <|end|> as the end-of-turn stop token.
+                parse_special: true,
+            };
+        }
         if is_tinyllama_marker_template(template) {
             return RenderedPrompt {
                 text: render_tinyllama_marker_prompt(messages, tokenizer),
@@ -8551,6 +8725,17 @@ fn is_mistral_instruct_template(template: &str) -> bool {
 /// rendered by [`render_qwen3_chatml_prompt`] instead.
 fn is_qwen3_chatml_template(template: &str) -> bool {
     template.contains("<|im_start|>") && template.contains("<|im_end|>")
+}
+
+/// Phi-3 chat template detector: `<|user|>`/`<|assistant|>` turns separated by the
+/// `<|end|>` turn marker. Phi-3 shares the `<|user|>`/`<|assistant|>`/`<|system|>`
+/// spellings with TinyLlama's marker template (which separates turns with `</s>`),
+/// so the `<|end|>` marker is the distinguishing signal and this MUST be checked
+/// before [`is_tinyllama_marker_template`].
+fn is_phi3_template(template: &str) -> bool {
+    template.contains("<|assistant|>")
+        && template.contains("<|end|>")
+        && template.contains("<|user|>")
 }
 
 fn exact_llama32_metadata_jinja_chat_template_error(message: &str) -> MiniJinjaError {
@@ -8954,6 +9139,27 @@ fn agent_call_to_mistral_json(content: &str, id: &str) -> String {
         }
     }
     serde_json::to_string(&calls).unwrap_or_else(|_| "[]".into())
+}
+
+/// Render the Phi-3 chat template: each turn as `<|{role}|>\n{content}<|end|>\n`,
+/// then the `<|assistant|>\n` generation prompt. Mirrors the GGUF jinja template;
+/// `<|end|>` is the end-of-turn marker (and stop token under `parse_special`).
+fn render_phi3_prompt(messages: &[ChatMessage]) -> String {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = match message.role.trim() {
+            "system" => "system",
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        prompt.push_str("<|");
+        prompt.push_str(role);
+        prompt.push_str("|>\n");
+        prompt.push_str(&message.content);
+        prompt.push_str("<|end|>\n");
+    }
+    prompt.push_str("<|assistant|>\n");
+    prompt
 }
 
 fn render_role_colon_prompt(messages: &[ChatMessage]) -> String {
@@ -9543,6 +9749,63 @@ mod tests {
                 "{id} ctx512"
             );
         }
+    }
+
+    #[test]
+    fn classify_model_lane_separates_supported_experimental_and_unsupported() {
+        // Exact supported curated artifact → Supported.
+        assert_eq!(
+            classify_model_lane(Some("llama"), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
+        // Implemented architecture but NOT a supported exact artifact (different
+        // quant/filename) → experimental, never falsely supported.
+        assert_eq!(
+            classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q4_K_M.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
+        assert_eq!(
+            classify_model_lane(Some("mistral"), "some-random-mistral-finetune-Q8_0.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
+        // Architecture not in the implemented set → Unsupported (fails closed at load).
+        assert_eq!(
+            classify_model_lane(Some("falcon"), "falcon-7b-Q8_0.gguf"),
+            ModelLaneClass::Unsupported,
+        );
+        assert_eq!(
+            classify_model_lane(None, "headerless.gguf"),
+            ModelLaneClass::Unsupported,
+        );
+    }
+
+    #[test]
+    fn backend_error_code_is_stable_and_switchable() {
+        use crate::BackendError;
+        assert_eq!(
+            backend_error_code(&BackendError::UnsupportedModelArchitecture("falcon".into())),
+            "unsupported_model_architecture",
+        );
+        assert_eq!(
+            backend_error_code(&BackendError::InvalidModelMetadata("x".into())),
+            "invalid_model_metadata",
+        );
+        assert_eq!(
+            backend_error_code(&BackendError::UnsupportedTokenizer("x".into())),
+            "unsupported_tokenizer",
+        );
+        assert_eq!(
+            backend_error_code(&BackendError::UnsupportedGguf("x".into())),
+            "unsupported_gguf",
+        );
+        // The offending architecture rides in the message, not the code.
+        assert!(BackendError::UnsupportedModelArchitecture("falcon".into())
+            .to_string()
+            .contains("falcon"));
     }
 
     #[test]
@@ -12099,11 +12362,76 @@ pub struct CatalogItem {
 /// lane each entry would land in without downloading it. `oracle_qualified` means the
 /// `(architecture, quant)` combo is anchored → it would be Compatible after download
 /// (unless it also matches a supported contract row, which the frontend resolves).
+///
+/// Owns its strings so it can carry both **curated** rows (authoritative metadata,
+/// `arch_detected: true`) and **experimental** live Hugging Face results
+/// (`arch_detected: false`, where `architecture`/`quant` are filename guesses). The
+/// JSON field names are unchanged from the previous flattened `CatalogItem` shape;
+/// `group`/`arch_detected` are additive. Experimental rows always report
+/// `oracle_qualified: false` — a filename guess can never anchor a lane, so the
+/// frontend resolves them to "not yet in a lane" regardless of name coincidence.
 #[derive(Debug, serde::Serialize)]
 pub struct CatalogItemView {
-    #[serde(flatten)]
-    pub item: CatalogItem,
+    pub catalog_id: String,
+    pub name: String,
+    pub repo_id: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub downloads: u64,
+    pub likes: u64,
+    pub quant: String,
+    pub architecture: String,
+    pub license: String,
     pub oracle_qualified: bool,
+    /// `"curated"` (pinned, known-good, authoritative metadata) or `"experimental"`
+    /// (live from Hugging Face; metadata is advisory and must never read as support).
+    pub group: &'static str,
+    /// Whether `architecture` is authoritative (curated) vs a filename guess (live).
+    pub arch_detected: bool,
+}
+
+impl CatalogItemView {
+    /// Build a view for a curated row: authoritative architecture, lane predicted
+    /// from the real `(architecture, quant)` via `runnable::oracle_qualified`.
+    fn from_curated(item: &CatalogItem) -> Self {
+        CatalogItemView {
+            catalog_id: item.catalog_id.to_string(),
+            name: item.name.to_string(),
+            repo_id: item.repo_id.to_string(),
+            filename: item.filename.to_string(),
+            size_bytes: item.size_bytes,
+            downloads: item.downloads,
+            likes: item.likes,
+            quant: item.quant.to_string(),
+            architecture: item.architecture.to_string(),
+            license: item.license.to_string(),
+            oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
+            group: "curated",
+            arch_detected: true,
+        }
+    }
+
+    /// Build a view for a live Hugging Face result. Architecture/quant are filename
+    /// guesses (`arch_detected: false`); `oracle_qualified` is forced `false` so the
+    /// experimental row is never predicted Compatible/Supported on a guess alone.
+    fn from_hf(file: crate::hf_browse::HfGgufFile) -> Self {
+        let catalog_id = format!("hf::{}::{}", file.repo_id, file.filename);
+        CatalogItemView {
+            catalog_id,
+            name: file.filename.clone(),
+            repo_id: file.repo_id,
+            filename: file.filename,
+            size_bytes: file.size_bytes,
+            downloads: file.downloads,
+            likes: file.likes,
+            quant: file.quant,
+            architecture: file.architecture,
+            license: String::new(),
+            oracle_qualified: false,
+            group: "experimental",
+            arch_detected: false,
+        }
+    }
 }
 
 pub fn curated_catalog() -> Vec<CatalogItem> {
@@ -12302,6 +12630,9 @@ pub struct CatalogResponse {
 #[derive(Debug, serde::Deserialize)]
 pub struct CatalogQuery {
     pub query: Option<String>,
+    /// Opaque Hugging Face pagination cursor for the experimental group (from a
+    /// prior response's `next_cursor`). Ignored when `query` is absent/trivial.
+    pub cursor: Option<String>,
 }
 
 /// One local on-disk GGUF with the facts the Models tab needs to bucket it by lane.
@@ -12333,6 +12664,12 @@ pub struct LocalModelEntry {
     pub chat_capable: bool,
     /// Trained context window (tokens) from the GGUF — a model capability.
     pub context_length: Option<u32>,
+    /// Server-computed lane class from real header metadata (architecture) + the
+    /// exact-artifact supported-row check. `experimental_implemented` means the
+    /// architecture is implemented but this is NOT a supported row — attemptable,
+    /// unverified, no parity claim. Corroborates the frontend contract gate; it
+    /// never promotes a row.
+    pub lane_class: ModelLaneClass,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -12466,6 +12803,7 @@ async fn local_models() -> Json<LocalModelsResponse> {
                 }
             };
 
+            let lane_class = classify_model_lane(meta.architecture.as_deref(), &filename);
             models.push(LocalModelEntry {
                 runnable_receipt_present: runnable_smoke_receipt_path(&filename).exists(),
                 filename,
@@ -12478,6 +12816,7 @@ async fn local_models() -> Json<LocalModelsResponse> {
                 oracle_qualified: meta.oracle_qualified,
                 chat_capable: meta.chat_capable,
                 context_length: meta.context_length,
+                lane_class,
             });
         }
     }
@@ -12597,34 +12936,153 @@ async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
     }
 }
 
+/// Number of Hugging Face repos a single experimental search inspects (each repo's
+/// tree is one extra network round-trip, so this also bounds search latency).
+const HF_SEARCH_LIMIT: usize = 15;
+
+/// Lane classification for a downloaded/loaded model, driven only by real GGUF
+/// metadata (`general.architecture`) and the exact-artifact supported-row check —
+/// never a filename guess of the architecture. Drives experimental UI copy only; it
+/// never promotes a row or widens what `LlamaModelConfig::from_gguf` accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelLaneClass {
+    /// Exact supported row (asserted by `/api/capabilities`) — the full supported lane.
+    Supported,
+    /// Architecture is implemented but this is NOT a supported row: attemptable,
+    /// unverified, no parity claim.
+    ExperimentalImplemented,
+    /// Architecture is not in the implemented set — fails closed at load.
+    Unsupported,
+}
+
+/// The `id`s of `/api/capabilities` compatibility rows whose status is `supported*`.
+/// Memoized — these are static contract literals. Reads the SAME rows the contract
+/// publishes, so this introduces no second ledger.
+fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'static str> {
+    static IDS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        capabilities_response_with_plan(None)
+            .model_compatibility
+            .into_iter()
+            .filter(|row| row.status == "supported" || row.status.starts_with("supported_"))
+            .map(|row| row.id)
+            .collect()
+    })
+}
+
+/// True when `filename` is the exact GGUF artifact of a curated row whose
+/// `catalog_id` is a `supported_*` compatibility row. The ledger is exact-artifact
+/// gated, so an exact-filename match is the honest server-side "is this a supported
+/// row?" test. Deliberately conservative: a supported model loaded under a
+/// non-curated filename classifies as experimental, never falsely as supported.
+fn filename_is_supported_exact_row(filename: &str) -> bool {
+    let supported = supported_compatibility_row_ids();
+    curated_catalog()
+        .iter()
+        .any(|c| c.filename == filename && supported.contains(c.catalog_id))
+}
+
+/// Classify a model from real header metadata. `architecture` is the parsed
+/// `general.architecture` (NOT a filename guess); `filename` identifies the exact
+/// artifact for the supported-row check.
+fn classify_model_lane(architecture: Option<&str>, filename: &str) -> ModelLaneClass {
+    match architecture {
+        Some(arch) if crate::model::is_implemented_architecture(arch) => {
+            if filename_is_supported_exact_row(filename) {
+                ModelLaneClass::Supported
+            } else {
+                ModelLaneClass::ExperimentalImplemented
+            }
+        }
+        _ => ModelLaneClass::Unsupported,
+    }
+}
+
+/// Classify a loaded model from its real GGUF metadata + exact artifact path.
+fn classify_loaded_model(model: &LoadedModel) -> ModelLaneClass {
+    let filename = model
+        .path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or_default();
+    classify_model_lane(model.gguf.architecture(), filename)
+}
+
+/// Stable, frontend-switchable `error.code` for a typed backend failure. The
+/// human message (which already carries the offending architecture/quant and any
+/// dedicated-lane redirect, e.g. `camelid diffusion-gemma-chat`) travels separately
+/// in `error.message`.
+fn backend_error_code(err: &BackendError) -> &'static str {
+    match err {
+        BackendError::UnsupportedModelArchitecture(_) => "unsupported_model_architecture",
+        BackendError::InvalidModelMetadata(_) => "invalid_model_metadata",
+        BackendError::UnsupportedGguf(_) => "unsupported_gguf",
+        BackendError::InvalidGguf(_) => "invalid_gguf",
+        BackendError::UnsupportedTokenizer(_) => "unsupported_tokenizer",
+        BackendError::InvalidTokenizerMetadata(_) => "invalid_tokenizer_metadata",
+        BackendError::UnsupportedTensorType(_) => "unsupported_tensor_type",
+        BackendError::InvalidTensorData(_) => "invalid_tensor_data",
+        BackendError::Io { .. } => "model_io_error",
+        _ => "invalid_model",
+    }
+}
+
+/// The Models-tab catalog: a **curated** group (pinned, known-good rows, always
+/// first) followed, when the user is searching, by an **experimental** group of
+/// live Hugging Face results. Experimental rows are advisory-only — `oracle_qualified`
+/// is forced false and the frontend marks them unverified — so live browse can never
+/// widen what Camelid claims. A non-trivial `query` (≥2 chars) triggers the HF search;
+/// a network failure degrades silently to curated-only.
 async fn get_catalog(
     axum::extract::Query(q): axum::extract::Query<CatalogQuery>,
 ) -> Json<CatalogResponse> {
-    let items = curated_catalog();
-    let filtered = if let Some(query_str) = q.query {
-        let qs = query_str.to_lowercase();
-        items
-            .into_iter()
-            .filter(|item| {
+    let query = q.query.unwrap_or_default();
+    let trimmed = query.trim();
+
+    // Curated group: filter by query exactly as before, always emitted first.
+    let curated: Vec<CatalogItemView> = curated_catalog()
+        .iter()
+        .filter(|item| {
+            trimmed.is_empty() || {
+                let qs = trimmed.to_lowercase();
                 item.name.to_lowercase().contains(&qs)
                     || item.repo_id.to_lowercase().contains(&qs)
                     || item.filename.to_lowercase().contains(&qs)
-            })
-            .collect()
-    } else {
-        items
-    };
-    let items = filtered
-        .into_iter()
-        .map(|item| CatalogItemView {
-            oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
-            item,
+            }
         })
+        .map(CatalogItemView::from_curated)
         .collect();
-    Json(CatalogResponse {
-        items,
-        next_cursor: None,
-    })
+
+    let mut items = curated;
+    let mut next_cursor = None;
+
+    // Experimental group: live Hugging Face results, only when actively searching.
+    if trimmed.len() >= 2 {
+        match crate::hf_browse::search_gguf(trimmed, HF_SEARCH_LIMIT, q.cursor.as_deref()).await {
+            Ok(page) => {
+                next_cursor = page.next_cursor;
+                // A file already pinned in the curated group is shown there (vetted),
+                // not duplicated as a raw experimental row.
+                let curated_files: std::collections::HashSet<(String, String)> = curated_catalog()
+                    .iter()
+                    .map(|c| (c.repo_id.to_string(), c.filename.to_string()))
+                    .collect();
+                items.extend(
+                    page.files
+                        .into_iter()
+                        .filter(|f| {
+                            !curated_files.contains(&(f.repo_id.clone(), f.filename.clone()))
+                        })
+                        .map(CatalogItemView::from_hf),
+                );
+            }
+            // Offline / Hub error: keep curated-only rather than failing the page.
+            Err(err) => eprintln!("hugging face browse unavailable: {err}"),
+        }
+    }
+
+    Json(CatalogResponse { items, next_cursor })
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

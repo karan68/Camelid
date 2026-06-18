@@ -84,6 +84,18 @@ pub struct Token {
     pub kind: TokenKind,
 }
 
+/// True for `<|...|>` chat-control markers (e.g. Phi-3's `<|end|>`/`<|assistant|>`,
+/// ChatML's `<|im_start|>`) carried as `UserDefined` tokens. These are turn
+/// scaffolding, never user-visible content, so they are stripped from decoded
+/// output under `remove_special` — exactly like `Control` tokens. Content-bearing
+/// `UserDefined` tokens that are NOT this shape (e.g. Qwen3's `<think>`/`</think>`,
+/// which begin `<` but not `<|`) are preserved.
+fn is_chat_control_marker(token: &Token) -> bool {
+    token.kind == TokenKind::UserDefined
+        && token.text.starts_with("<|")
+        && token.text.ends_with("|>")
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BpeRegistry {
     ranks: HashMap<(String, String), usize>,
@@ -328,7 +340,27 @@ impl Tokenizer {
             .or_else(|| file.metadata_u32("tokenizer.ggml.seperator_token_id"));
         let pad = file.metadata_u32("tokenizer.ggml.padding_token_id");
         let mask = file.metadata_u32("tokenizer.ggml.mask_token_id");
-        let eog = [eos, eot, eom].into_iter().flatten().collect();
+        // Well-known end-of-turn markers used by chat templates. Some GGUFs set
+        // `eos` to a generic `<|endoftext|>` but END EACH CHAT TURN with a distinct
+        // token and never populate `eot_token_id` — notably Phi-3 (`<|end|>`), so
+        // without this its chat turns never stop and the model rambles into new
+        // turns. llama.cpp likewise flags these as EOG. Purely additive: only ids
+        // that genuinely exist in this vocab are added, and a supported row's
+        // turn-end is already its `eos`/`eot`, so its stop set is unchanged.
+        const EOG_MARKER_TEXTS: &[&str] = &[
+            "<|end|>",       // Phi-3
+            "<|eot_id|>",    // Llama 3
+            "<|im_end|>",    // ChatML / Qwen
+            "<end_of_turn>", // Gemma
+            "<|eom_id|>",
+        ];
+        let mut eog: std::collections::BTreeSet<TokenId> =
+            [eos, eot, eom].into_iter().flatten().collect();
+        for marker in EOG_MARKER_TEXTS {
+            if let Some(&id) = token_to_id.get(*marker) {
+                eog.insert(id);
+            }
+        }
 
         validate_token_id("bos", bos, tokens.len())?;
         validate_token_id("eos", eos, tokens.len())?;
@@ -451,7 +483,8 @@ impl Tokenizer {
             let token = self.tokens.get(*id as usize).ok_or_else(|| {
                 BackendError::InvalidTokenizerMetadata(format!("token id {id} out of range"))
             })?;
-            if token.kind == TokenKind::Control && remove_special {
+            if remove_special && (token.kind == TokenKind::Control || is_chat_control_marker(token))
+            {
                 continue;
             }
             if let Some(byte) = parse_byte_token(&token.text) {
@@ -545,7 +578,8 @@ impl Tokenizer {
             let token = self.tokens.get(*id as usize).ok_or_else(|| {
                 BackendError::InvalidTokenizerMetadata(format!("token id {id} out of range"))
             })?;
-            if remove_special && token.kind == TokenKind::Control {
+            if remove_special && (token.kind == TokenKind::Control || is_chat_control_marker(token))
+            {
                 continue;
             }
             for ch in token.text.chars() {
@@ -1177,7 +1211,51 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bpe_pretokenize, bpe_pretokenize_with, BpeRegistry};
+    use super::{
+        bpe_pretokenize, bpe_pretokenize_with, is_chat_control_marker, BpeRegistry, Token,
+        TokenKind,
+    };
+
+    fn tok(text: &str, kind: TokenKind) -> Token {
+        Token {
+            id: 0,
+            text: text.to_string(),
+            score: 0.0,
+            kind,
+        }
+    }
+
+    #[test]
+    fn chat_control_markers_are_stripped_but_think_tags_are_kept() {
+        // Phi-3 / ChatML <|...|> markers are turn scaffolding → strippable.
+        assert!(is_chat_control_marker(&tok(
+            "<|end|>",
+            TokenKind::UserDefined
+        )));
+        assert!(is_chat_control_marker(&tok(
+            "<|assistant|>",
+            TokenKind::UserDefined
+        )));
+        assert!(is_chat_control_marker(&tok(
+            "<|im_end|>",
+            TokenKind::UserDefined
+        )));
+        // Qwen3 reasoning tags are content (and <...>, not <|...|>) → preserved.
+        assert!(!is_chat_control_marker(&tok(
+            "<think>",
+            TokenKind::UserDefined
+        )));
+        assert!(!is_chat_control_marker(&tok(
+            "</think>",
+            TokenKind::UserDefined
+        )));
+        // Normal/content tokens are never markers regardless of shape.
+        assert!(!is_chat_control_marker(&tok("<|end|>", TokenKind::Normal)));
+        assert!(!is_chat_control_marker(&tok(
+            "hello",
+            TokenKind::UserDefined
+        )));
+    }
 
     #[test]
     fn bpe_registry_uses_ranked_heap_priority_for_merges() {

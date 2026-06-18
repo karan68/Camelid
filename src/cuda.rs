@@ -15,6 +15,17 @@
 //! implementation is `#[cfg(feature = "cuda")]` and a stub returns "unavailable"
 //! otherwise, so callers never need their own cfg gates.
 
+// CUDA is part of the DEFAULT build on Windows (the primary CUDA dev host): `build.rs`
+// injects the `cuda` cfg there, and `cudarc` is a non-optional Windows dependency.
+// This fails the build loudly if that wiring ever regresses, so a Windows `cargo
+// build` can never silently drop to the CPU-only path. (Linux/macOS keep CUDA opt-in.)
+#[cfg(all(windows, not(feature = "cuda")))]
+compile_error!(
+    "CUDA must be enabled by default on Windows: build.rs should emit \
+     `cargo:rustc-cfg=feature=\"cuda\"` for windows targets and Cargo.toml should \
+     declare cudarc as a non-optional Windows dependency."
+);
+
 /// Result of probing for a usable CUDA device at startup.
 #[derive(Debug, Clone, Default)]
 pub struct CudaDeviceInfo {

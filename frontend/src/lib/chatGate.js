@@ -8,7 +8,12 @@ export function getChatGateState(capabilities, model, runtime) {
   const hint = findCompatibilityHint(capabilities, model)
   const contractSupported = isCompatibilitySupportedForModel(capabilities, model)
   const chatUnlocked = Boolean(runtimeReady && contractSupported)
-  const chatMode = contractSupported ? 'supported' : 'blocked'
+  // Experimental lane: the model loaded and is generation-ready (so its architecture
+  // is implemented — generation_ready is false for unimplemented archs) but it is NOT
+  // a supported contract row. A separate, weaker affordance from the supported gate:
+  // chat is allowed but every turn is marked unverified with no parity claim.
+  const experimentalUnlocked = Boolean(runtimeReady && !contractSupported)
+  const chatMode = contractSupported ? 'supported' : experimentalUnlocked ? 'experimental' : 'blocked'
 
   return {
     hint,
@@ -17,6 +22,7 @@ export function getChatGateState(capabilities, model, runtime) {
     runtimeGenerationReady,
     contractSupported,
     chatUnlocked,
+    experimentalUnlocked,
     chatMode,
     label: compatibilityHintLabel(hint, 'No matching COMPATIBILITY.md row'),
     copy: compatibilityHintCopy(hint),

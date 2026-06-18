@@ -66,7 +66,7 @@ function App() {
     thinkingMode, setThinkingMode,
     loadingModelId, registerForm, setRegisterForm, externalForm, setExternalForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
-    selectedModel, selectedModelRunnable, latestAssistantMessage, pendingConversation,
+    selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
     createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
     installModel, installCatalogModel, cancelModelDownload, activateModel, unloadCurrentModel,
@@ -276,6 +276,7 @@ function App() {
               setThinkingMode={setThinkingMode}
               stoppingGeneration={stoppingGeneration}
               selectedModelRunnable={selectedModelRunnable}
+              selectedModelExperimental={selectedModelExperimental}
               setTab={navigateTab}
               showNewChatLanding={startNewChat}
               demoMode={DEMO_UI}

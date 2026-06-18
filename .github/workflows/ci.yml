@@ -53,19 +53,20 @@ jobs:
         # Windows file-I/O / mmap path (src/platform_fs.rs, the memmap2 wire
         # mapping) and runs the same exact-row gates as the other hosts.
         #
-        # `features` is per-OS: the optional `cuda` backend depends on `cudarc`,
-        # which is gated to non-macOS (macOS's GPU lane is Metal). So macOS uses
-        # the default feature set, while ubuntu/windows use --all-features, which
-        # additionally compiles and lints the CUDA backend. The CUDA correctness
-        # tests self-skip without a CUDA device (CI runners have no GPU), exactly
-        # like the Metal tests; GPU parity is validated on a CUDA host locally.
+        # `features` is per-OS. CUDA is the DEFAULT build on Windows only (build.rs
+        # injects the `cuda` cfg and cudarc is a non-optional Windows dep), so the
+        # plain default build on windows-latest already exercises the GPU backend.
+        # On Linux CUDA is opt-in, so ubuntu-latest uses --all-features to also build
+        # and lint it (cudarc dynamic-loads — no CUDA SDK needed, and the GPU tests
+        # self-skip without a device). macOS has no cudarc (its GPU lane is Metal), so
+        # it uses the default feature set. GPU parity is validated on a CUDA host.
         include:
           - os: ubuntu-latest
             features: --all-features
           - os: macos-latest
             features: ''
           - os: windows-latest
-            features: --all-features
+            features: ''
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

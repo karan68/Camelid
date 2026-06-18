@@ -45,13 +45,21 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
 ] }
+# Windows: CUDA is part of the DEFAULT build (the primary dev host is a CUDA box).
+# cudarc is non-optional here and `build.rs` turns on the `cuda` cfg, so a bare
+# `cargo build` includes the GPU backend with no `--features` flag. Driver/NVRTC are
+# loaded dynamically at runtime (no CUDA SDK needed to build; no-ops without a GPU).
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "cuda-12090",
+    "fallback-dynamic-loading",
+] }
 
-# Optional CUDA backend (additive, gated behind `--features cuda`). The CPU path
-# stays the default and the correctness reference; CUDA must reproduce the same
-# parity evidence. Not built on macOS (Metal is the GPU lane there). Driver API
-# + runtime NVRTC kernel compilation; CUDA libraries are loaded dynamically at
-# runtime, so no build-time CUDA linking is required.
-[target.'cfg(all(not(target_os = "macos")))'.dependencies]
+# Linux (non-macOS unix): CUDA is OPT-IN via `--features cuda` (CI uses
+# `--all-features`). macOS has no cudarc — its GPU lane is Metal.
+[target.'cfg(all(not(target_os = "macos"), not(windows)))'.dependencies]
 cudarc = { version = "0.19", default-features = false, features = [
     "std",
     "driver",
@@ -61,8 +69,11 @@ cudarc = { version = "0.19", default-features = false, features = [
 ], optional = true }
 
 [features]
-# Off by default: the CPU reference path is the default build and the parity
-# reference. Enable with `cargo build --features cuda` on a CUDA host.
+# CUDA builds by DEFAULT on Windows only: `build.rs` enables the `cuda` cfg there and
+# the Windows cudarc above is always linked, so no `--features` flag is needed. On
+# Linux it is opt-in via `--features cuda` (or `--all-features`); macOS never has it.
+# The CPU path remains the parity reference everywhere.
+default = []
 cuda = ["dep:cudarc"]
 
 [dev-dependencies]

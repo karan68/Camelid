@@ -46,6 +46,16 @@ function MessageMetaFooter({ message }) {
           size="sm"
         />
       )}
+      {message.experimental_lane && (
+        <EvidenceChip
+          state="unsupported"
+          asText
+          source={{ detail: 'Experimental lane: implemented architecture, not a supported row. Unverified, no parity claim.' }}
+          size="sm"
+        >
+          Experimental — unverified
+        </EvidenceChip>
+      )}
       {usage && Number.isFinite(Number(usage.prompt_tokens)) && (
         <span className="cxturn__meta-item" title={message.usage_source === 'backend' ? 'Token counts reported by the backend' : 'Token counts estimated client-side (backend sent no usage)'}>
           {usageLabel} {usage.prompt_tokens}→{usage.completion_tokens}
@@ -171,7 +181,7 @@ export const MessageTurn = memo(function MessageTurn({ message, generationElapse
       <div className="cxturn__body">
         {showStreamingStatus && <StreamingLoader elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} compact />}
         {(messageContent || !assistantStreaming) && <AssistantMarkdown content={messageContent} streaming={assistantStreaming} />}
-        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} />}
+        {showLiveGenerationBadge && <LiveGenerationBadge elapsedSeconds={generationElapsedSeconds} label={liveStatusLabel} tokensPerSec={message.tokens_out_per_sec} />}
 
         {showLengthWarning && (
           <div className="cxturn__warning" role="status">Stopped before completing. Ask “continue” for a complete file.</div>

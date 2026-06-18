@@ -17,6 +17,10 @@ function prettySize(bytes) {
 
 /* Predicted lane for a catalog entry — derived, never a hand-authored label. */
 function predictedLane(item, capabilities) {
+  // Experimental (live Hugging Face) rows are advisory only: their architecture/quant
+  // are filename guesses, so they can never anchor a lane or imply support — even when
+  // the filename happens to coincide with a supported contract row. Always not-anchored.
+  if (item.group === 'experimental') return 'not_anchored'
   if (isCompatibilitySupportedForModel(capabilities, null, item)) return 'supported'
   if (item.oracle_qualified) return 'compatible'
   return 'not_anchored'
@@ -136,7 +140,13 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
         <p className="catalog-row-faint">Already on disk — shown in its lane section above.</p>
       ) : phase === 'idle' ? (
         <>
-          {lane === 'not_anchored' ? (
+          {item.group === 'experimental' ? (
+            <p className="catalog-row-faint">
+              From Hugging Face — unverified, no parity claim. Architecture/quant
+              {item.architecture || item.quant ? ` (guessed ${[item.architecture, item.quant].filter(Boolean).join(' / ')})` : ''}{' '}
+              are read from the filename, not the model; the real lane is only known after it loads.
+            </p>
+          ) : lane === 'not_anchored' ? (
             <p className="catalog-row-faint">
               Its {item.architecture}/{item.quant} combo is not yet in the runnable lane — still
               downloadable; a machine with the right support lane can run it.
@@ -162,14 +172,18 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
           </div>
         </div>
       ) : phase === 'installing' ? (
-        <div className="catalog-progress">
-          <div className="catalog-progress-bar">
-            <span style={{ width: `${pct}%` }} />
-          </div>
-          <small>
-            Downloading {prettySize(progress?.bytes)} / {prettySize(progress?.total)} ({pct}%)
-          </small>
-        </div>
+        <button
+          type="button"
+          className={`catalog-row-action catalog-row-action--progress${pct === 0 ? ' is-indeterminate' : ''}`}
+          disabled
+          aria-label={`Downloading, ${pct} percent`}
+          aria-busy="true"
+        >
+          <span className="catalog-row-action__fill" style={{ width: `${pct}%` }} aria-hidden="true" />
+          <span className="catalog-row-action__label">
+            Downloading {pct}% · {prettySize(progress?.bytes)} / {prettySize(progress?.total)}
+          </span>
+        </button>
       ) : phase === 'smoking' ? (
         <p className="catalog-row-faint">Download complete — running smoke-admission…</p>
       ) : (
@@ -179,57 +193,25 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
   )
 }
 
-export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
-  const base = (apiBase || '').replace(/\/$/, '')
-  const [items, setItems] = useState(null)
-  const [localNames, setLocalNames] = useState(new Set())
-  const [query, setQuery] = useState('')
-  const [error, setError] = useState('')
-
-  const load = useCallback(async () => {
-    setError('')
-    try {
-      const params = query ? `?query=${encodeURIComponent(query)}` : ''
-      const [cat, local] = await Promise.all([
-        fetch(`${base}/api/models/catalog${params}`),
-        fetch(`${base}/api/models/local`),
-      ])
-      if (!cat.ok) throw new Error(`catalog HTTP ${cat.status}`)
-      const catBody = await cat.json()
-      setItems(catBody.items || [])
-      if (local.ok) {
-        const lb = await local.json()
-        setLocalNames(new Set((lb.models || []).map((m) => m.filename)))
-      }
-    } catch (err) {
-      setError(String(err?.message || err))
-    }
-  }, [base, query])
-
-  useEffect(() => {
-    load()
-  }, [load])
-
-  if (items === null && !error) return <p className="lane-empty">Loading catalog…</p>
-
+/* Persistent, non-dismissible marker for the experimental group. Reuses the
+   unsupported EvidenceChip so it can never read as an endorsement. */
+function ExperimentalMarker() {
   return (
-    <div className="catalog-lane-browse">
-      <div className="local-lane-head">
-        <h2>Catalog — acquire from HuggingFace</h2>
+    <span className="catalog-experimental-marker">
+      <EvidenceChip state="unsupported" asText>Experimental — unverified, no parity claim</EvidenceChip>
+    </span>
+  )
+}
+
+function CatalogGroup({ title, marker, items, capabilities, localNames, base, onAcquired, emptyText }) {
+  return (
+    <section className="catalog-group">
+      <div className="catalog-group-head">
+        <h3>{title}</h3>
+        {marker}
       </div>
-      <p className="local-lane-intro">
-        Each entry shows which lane it would land in. Downloads are explicit and confirmed; after a
-        download we run smoke-admission and the model joins its lane section above.
-      </p>
-      <input
-        className="catalog-search"
-        value={query}
-        onChange={(e) => setQuery(e.target.value)}
-        placeholder="Filter by name, repo, or filename"
-      />
-      {error ? <p className="lane-error">{error}</p> : null}
       <div className="catalog-list">
-        {(items || []).map((item) => (
+        {items.map((item) => (
           <CatalogRow
             key={item.catalog_id}
             item={item}
@@ -239,8 +221,135 @@ export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
             onAcquired={onAcquired}
           />
         ))}
-        {items && items.length === 0 ? <p className="lane-empty">No catalog entries match.</p> : null}
+        {items.length === 0 ? <p className="lane-empty">{emptyText}</p> : null}
       </div>
+    </section>
+  )
+}
+
+export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
+  const base = (apiBase || '').replace(/\/$/, '')
+  const [items, setItems] = useState(null)
+  const [localNames, setLocalNames] = useState(new Set())
+  const [query, setQuery] = useState('')
+  const [debouncedQuery, setDebouncedQuery] = useState('')
+  const [nextCursor, setNextCursor] = useState(null)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [error, setError] = useState('')
+
+  // Debounce the query so each keystroke doesn't fire a live Hugging Face search.
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedQuery(query.trim()), 350)
+    return () => clearTimeout(t)
+  }, [query])
+
+  const load = useCallback(async () => {
+    setError('')
+    try {
+      const params = debouncedQuery ? `?query=${encodeURIComponent(debouncedQuery)}` : ''
+      const [cat, local] = await Promise.all([
+        fetch(`${base}/api/models/catalog${params}`),
+        fetch(`${base}/api/models/local`),
+      ])
+      if (!cat.ok) throw new Error(`catalog HTTP ${cat.status}`)
+      const catBody = await cat.json()
+      setItems(catBody.items || [])
+      setNextCursor(catBody.next_cursor || null)
+      if (local.ok) {
+        const lb = await local.json()
+        setLocalNames(new Set((lb.models || []).map((m) => m.filename)))
+      }
+    } catch (err) {
+      setError(String(err?.message || err))
+    }
+  }, [base, debouncedQuery])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  // Append the next page of experimental (Hugging Face) results.
+  const loadMore = useCallback(async () => {
+    if (!nextCursor || !debouncedQuery) return
+    setLoadingMore(true)
+    try {
+      const params = `?query=${encodeURIComponent(debouncedQuery)}&cursor=${encodeURIComponent(nextCursor)}`
+      const res = await fetch(`${base}/api/models/catalog${params}`)
+      if (!res.ok) throw new Error(`catalog HTTP ${res.status}`)
+      const body = await res.json()
+      const more = (body.items || []).filter((it) => it.group === 'experimental')
+      setItems((prev) => {
+        const seen = new Set((prev || []).map((it) => it.catalog_id))
+        return [...(prev || []), ...more.filter((it) => !seen.has(it.catalog_id))]
+      })
+      setNextCursor(body.next_cursor || null)
+    } catch (err) {
+      setError(String(err?.message || err))
+    } finally {
+      setLoadingMore(false)
+    }
+  }, [base, debouncedQuery, nextCursor])
+
+  if (items === null && !error) return <p className="lane-empty">Loading catalog…</p>
+
+  const curated = (items || []).filter((it) => it.group !== 'experimental')
+  const experimental = (items || []).filter((it) => it.group === 'experimental')
+  const searching = debouncedQuery.length >= 2
+
+  return (
+    <div className="catalog-lane-browse">
+      <div className="local-lane-head">
+        <h2>Catalog — acquire from HuggingFace</h2>
+      </div>
+      <p className="local-lane-intro">
+        Curated rows are pinned and known-good. Searching also browses live Hugging Face GGUFs as an
+        experimental group — those are unverified and carry no parity claim. Downloads are explicit
+        and confirmed; after a download we run smoke-admission and the model joins its lane section
+        above.
+      </p>
+      <input
+        className="catalog-search"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search curated rows and live Hugging Face GGUFs (name, repo, filename)"
+      />
+      {error ? <p className="lane-error">{error}</p> : null}
+
+      <CatalogGroup
+        title="Curated"
+        marker={null}
+        items={curated}
+        capabilities={capabilities}
+        localNames={localNames}
+        base={base}
+        onAcquired={onAcquired}
+        emptyText="No curated entries match."
+      />
+
+      {searching ? (
+        <>
+          <CatalogGroup
+            title="Experimental (Hugging Face)"
+            marker={<ExperimentalMarker />}
+            items={experimental}
+            capabilities={capabilities}
+            localNames={localNames}
+            base={base}
+            onAcquired={onAcquired}
+            emptyText="No live Hugging Face GGUFs match (or the Hub is unreachable)."
+          />
+          {nextCursor ? (
+            <button
+              type="button"
+              className="catalog-row-action"
+              onClick={loadMore}
+              disabled={loadingMore}
+            >
+              {loadingMore ? 'Loading…' : 'Load more from Hugging Face'}
+            </button>
+          ) : null}
+        </>
+      ) : null}
     </div>
   )
 }

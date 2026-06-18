@@ -34,6 +34,7 @@
 .ev-chip__label {
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 0;
 }
 .ev-chip__icon {
   display: inline-flex;

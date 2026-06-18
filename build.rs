@@ -14,6 +14,13 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
     if target_os == "windows" {
+        // CUDA is part of the DEFAULT Windows build: turn on the `cuda` cfg so the GPU
+        // backend compiles without an explicit `--features cuda`. The Windows-only
+        // cudarc dependency in Cargo.toml is always linked; the driver/NVRTC load
+        // dynamically at runtime (no CUDA SDK needed to build; no-ops without a GPU).
+        // Other platforms keep CUDA opt-in via the `cuda` feature.
+        println!("cargo:rustc-cfg=feature=\"cuda\"");
+
         // Export the Optimus / Enduro hints so a laptop's hybrid-graphics driver
         // routes this process to the discrete NVIDIA (or AMD) GPU instead of the
         // integrated Intel one. Reading these exported DWORDs at process start is

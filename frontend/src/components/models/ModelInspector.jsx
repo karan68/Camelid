@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { EvidenceChip } from '../ui/EvidenceChip'
+import { UnsupportedBlocker } from './UnsupportedBlocker'
 import { quantLabelFromGgufFileType } from '../../lib/capabilities'
 
 /* Model inspector (Phase 3): a metadata drawer for the LOADED model, fed by
@@ -87,6 +88,10 @@ export function ModelInspector({ apiBase, onClose }) {
 
         {loading && <p className="model-inspector__note">Reading /api/models/current…</p>}
         {error && <p className="model-inspector__note">{error}</p>}
+
+        {current?.unsupported_runtime && (
+          <UnsupportedBlocker blocker={current.unsupported_runtime} />
+        )}
 
         {current && (
           <>
