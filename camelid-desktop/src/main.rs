@@ -43,7 +43,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building camelid-desktop")
         .run(|app_handle, event| {
-            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
                 shutdown_engine(app_handle);
             }
         });

@@ -41,15 +41,23 @@ pub struct EngineError {
 
 impl EngineError {
     fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), stderr: None }
+        Self {
+            message: message.into(),
+            stderr: None,
+        }
     }
     fn with_stderr(message: impl Into<String>, stderr: Option<String>) -> Self {
-        Self { message: message.into(), stderr }
+        Self {
+            message: message.into(),
+            stderr,
+        }
     }
     /// Human-readable detail block for the splash error pane.
     pub fn detail(&self) -> String {
         match &self.stderr {
-            Some(s) if !s.trim().is_empty() => format!("{}\n\n--- engine stderr ---\n{}", self.message, s.trim()),
+            Some(s) if !s.trim().is_empty() => {
+                format!("{}\n\n--- engine stderr ---\n{}", self.message, s.trim())
+            }
             _ => self.message.clone(),
         }
     }
@@ -204,7 +212,8 @@ fn http_health_ok(port: u16) -> bool {
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(2000)));
-    let req = format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let req =
+        format!("GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -262,8 +271,8 @@ impl JobObject {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
         use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
-            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
 
