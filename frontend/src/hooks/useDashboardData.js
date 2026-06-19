@@ -552,21 +552,18 @@ export function useDashboardData({ showNotice, clearNotice }) {
                 status: newStatus,
                 bytes_downloaded: dl.bytes_downloaded,
                 total_bytes: dl.total_bytes,
-                progress,
+                progress: newStatus === 'registered' ? 100 : progress,
                 install_error: installError,
                 updated_at: nowIso(),
               }
             }
           } else {
-            // If the download has vanished from the active list without explicitly transitioning to failed,
-            // assume it completed successfully.
-            modelsUpdated = true
-            return {
-              ...model,
-              status: 'registered',
-              progress: 100,
-              updated_at: nowIso(),
-            }
+            // The download is not in the backend's active list. Do NOT assume it
+            // completed — a model is only marked ready when the backend reports
+            // status 'completed' (handled above). Leaving it 'downloading' avoids a
+            // premature "Downloaded"/loadable state when the list momentarily omits
+            // it (e.g. right after starting, or after a server restart).
+            return model
           }
         }
         return model
