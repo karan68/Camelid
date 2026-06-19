@@ -105,7 +105,7 @@ export const SUPPORTED_MODELS = [
   },
   {
     catalog_id: 'gemma4_12b_it_q8_0',
-    name: 'Gemma 4 12B-It (two-Mac distributed)',
+    name: 'Gemma 4 12B-It (distributed)',
     repo_id: 'unsloth/gemma-4-12b-it-GGUF',
     filename: 'gemma-4-12b-it-Q8_0.gguf',
     size_bytes: 12669646240,
@@ -114,7 +114,7 @@ export const SUPPORTED_MODELS = [
   },
   {
     catalog_id: 'gemma4_26b_a4b_it_q4_0',
-    name: 'Gemma 4 26B-A4B-It QAT (two-Mac distributed, MoE)',
+    name: 'Gemma 4 26B-A4B-It QAT (distributed, MoE)',
     repo_id: 'google/gemma-4-26B-A4B-it-qat-q4_0-gguf',
     filename: 'gemma-4-26B_q4_0-it.gguf',
     size_bytes: 14439361440,
