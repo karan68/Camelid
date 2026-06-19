@@ -38,6 +38,10 @@ The desktop app simply wraps the same engine in a native window — same models,
 
 The simplest way to run a model locally: a native app, no browser tab, no command line.
 
+![Camelid Desktop — native Windows app](docs/assets/camelid-desktop-window.png)
+
+<div align="center"><sub>Camelid Desktop on Windows — the same chat surface in a native window, with the supported Llama 3.2 3B row loaded and ready.</sub></div>
+
 1. Download the **Camelid Desktop installer** (`Camelid.Desktop_<version>_x64-setup.exe`) from the [latest release](https://github.com/timtoole02/Camelid/releases/latest).
 2. Double-click it and follow the prompts. It's **code-signed** (verified publisher); if Windows SmartScreen warns on a fresh download, click *More info → Run anyway*.
 3. Launch **Camelid Desktop** from the Start menu. It starts the engine for you and opens the chat window — pick a model to download, and chat.
