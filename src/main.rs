@@ -113,15 +113,33 @@ fn auto_select_model() -> Option<PathBuf> {
 }
 
 /// Windows + CUDA: make the NVIDIA runtime DLLs (NVRTC etc.) loadable without the
-/// user having to add the CUDA `bin` directory to PATH. Locates the installed
-/// toolkit (via `CUDA_PATH*` or the standard install root) and prepends its `bin`
-/// to the process PATH before any GPU code runs, so the shipped app finds the GPU
-/// on its own. No-op if the toolkit is absent (the engine then falls back to CPU).
+/// user having to add the CUDA `bin` directory to PATH. Looks in two places, in
+/// priority order: (1) the running exe's OWN directory, so a self-contained
+/// download that ships the NVRTC redistributable DLLs beside `camelid.exe` runs
+/// on the GPU with only the NVIDIA *driver* installed (no CUDA toolkit); and
+/// (2) an installed toolkit (via `CUDA_PATH*` or the standard install root). The
+/// matching `bin`/exe dirs are prepended to the process PATH before any GPU code
+/// runs. No-op if neither is present (the engine then falls back to CPU).
 #[cfg(all(windows, feature = "cuda"))]
 fn ensure_cuda_runtime_on_path() {
     use std::path::{Path, PathBuf};
 
     let mut candidates: Vec<PathBuf> = Vec::new();
+    // The exe's own directory goes FIRST so a shipped, version-matched NVRTC pair
+    // (staged by scripts/package-windows-cuda.ps1) wins over any — possibly
+    // mismatched — system-installed toolkit. Windows already searches the exe dir
+    // for `LoadLibrary`, but adding it to PATH explicitly is robust against
+    // altered DLL search policies and makes the self-contained path intentional.
+    // Only add it when NVRTC is actually present, to avoid polluting PATH (e.g. a
+    // dev build under target/debug, where the DLLs are not staged).
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        if dir_has_nvrtc(&dir) {
+            candidates.push(dir);
+        }
+    }
     for (key, value) in std::env::vars_os() {
         let key = key.to_string_lossy();
         if key == "CUDA_PATH" || key.starts_with("CUDA_PATH_V") {
@@ -163,6 +181,22 @@ fn ensure_cuda_runtime_on_path() {
     }
     prefix.push(current);
     std::env::set_var("PATH", prefix);
+}
+
+/// Whether `dir` contains an NVRTC runtime DLL (`nvrtc64_*.dll`). Used to decide
+/// if the exe's own directory carries a shipped, self-contained CUDA runtime.
+#[cfg(all(windows, feature = "cuda"))]
+fn dir_has_nvrtc(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with("nvrtc64_")
+    })
 }
 
 #[cfg(not(all(windows, feature = "cuda")))]

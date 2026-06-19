@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Last updated: 2026-05-01
+Last updated: 2026-06-18
 
 ## Scope note
 
@@ -44,6 +44,26 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+### NVIDIA CUDA NVRTC runtime (prebuilt Windows GPU release)
+
+Camelid's prebuilt Windows release bundles the NVIDIA CUDA NVRTC runtime-compilation
+redistributable libraries (`nvrtc64_*.dll` and `nvrtc-builtins64_*.dll`) alongside the
+executable, so the GPU path works on a host that has only the NVIDIA display driver
+installed (no CUDA Toolkit). These libraries are NVIDIA's own work, are shipped
+unmodified, and are not part of Camelid. They are redistributed under the NVIDIA CUDA
+Toolkit End User License Agreement, which lists NVRTC among its redistributable
+components. The CUDA driver itself (`nvcuda.dll`) is **not** redistributed — it is
+provided by the user's installed NVIDIA GPU driver.
+
+This notice and the bundled libraries apply only to the prebuilt Windows download;
+building Camelid from source pulls no NVIDIA libraries (the CUDA runtime is loaded
+dynamically at runtime when present).
+
+- Product: NVIDIA CUDA NVRTC (runtime compilation library), a component of the NVIDIA CUDA Toolkit
+- Source: <https://developer.nvidia.com/cuda-toolkit>
+- License: NVIDIA CUDA Toolkit EULA — redistributable components (see Attachment A)
+- License text: <https://docs.nvidia.com/cuda/eula/index.html>
 
 ## Maintenance note
 
