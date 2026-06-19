@@ -13119,13 +13119,20 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
 
     std::fs::create_dir_all("models").ok();
     let dest_path = format!("models/{}", req.filename);
+    // Download into a `.part` file and only promote it to the final path once curl
+    // exits successfully. The loadable GGUF therefore never exists until the
+    // download is genuinely complete, so a half-downloaded model cannot be loaded.
+    let part_path = format!("{dest_path}.part");
     let url = format!(
         "https://huggingface.co/{}/resolve/main/{}",
         req.repo_id, req.filename
     );
 
+    // `-f` makes curl FAIL on an HTTP error (404/403/…) instead of writing the
+    // error page to the output file and exiting 0 — which previously looked like an
+    // instant successful download.
     match std::process::Command::new("curl")
-        .args(["-L", "-C", "-", "-o", &dest_path, &url])
+        .args(["-f", "-L", "-C", "-", "-o", &part_path, &url])
         .spawn()
     {
         Ok(child) => {
@@ -13142,17 +13149,22 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
             map.insert(req.catalog_id.clone(), download);
 
             let catalog_id_clone = req.catalog_id.clone();
+            let part_path_clone = part_path.clone();
+            let dest_path_clone = dest_path.clone();
             tokio::spawn(async move {
                 let mut child = child;
-                if let Ok(status) = child.wait() {
-                    let mut map = active_downloads_map().lock().unwrap();
-                    if let Some(dl) = map.get_mut(&catalog_id_clone) {
-                        if status.success() {
-                            dl.status = "completed";
-                        } else {
-                            dl.status = "failed";
-                        }
-                    }
+                let succeeded = matches!(child.wait(), Ok(status) if status.success());
+                // Completion is the curl exit code AND a successful promote of the
+                // .part file to the final path — never a size heuristic.
+                let promoted =
+                    succeeded && std::fs::rename(&part_path_clone, &dest_path_clone).is_ok();
+                if !promoted {
+                    // Leave nothing loadable behind on failure/cancel.
+                    std::fs::remove_file(&part_path_clone).ok();
+                }
+                let mut map = active_downloads_map().lock().unwrap();
+                if let Some(dl) = map.get_mut(&catalog_id_clone) {
+                    dl.status = if promoted { "completed" } else { "failed" };
                 }
             });
 
@@ -13175,12 +13187,13 @@ async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
             continue;
         }
 
-        let path = format!("models/{}", dl.filename);
-        if let Ok(metadata) = std::fs::metadata(&path) {
+        // Progress comes from the in-flight `.part` file. Completion is driven
+        // ONLY by curl's exit code (set in the spawn task above), never by a size
+        // comparison against the catalog's approximate `size_bytes`, which could
+        // flip a download to "completed" before it actually finished.
+        let part_path = format!("models/{}.part", dl.filename);
+        if let Ok(metadata) = std::fs::metadata(&part_path) {
             dl.bytes_downloaded = metadata.len();
-            if dl.bytes_downloaded >= dl.total_bytes {
-                dl.status = "completed";
-            }
         }
     }
 
