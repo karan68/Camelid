@@ -3801,7 +3801,7 @@ async fn load_model_rejects_truncated_weight_payload() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "invalid_model");
+    assert_eq!(body["error"]["code"], "invalid_gguf");
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()

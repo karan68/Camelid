@@ -386,6 +386,7 @@ assert.deepEqual(
     runtimeGenerationReady: true,
     contractSupported: true,
     chatUnlocked: true,
+    experimentalUnlocked: false,
     chatMode: 'supported',
     label: 'llama32_1b_instruct_q8_0: supported exact row smoke',
     copy: compatibilityHintCopy(llama32OneBHint),
