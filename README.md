@@ -20,6 +20,63 @@ Camelid loads GGUF models directly, serves them over a local OpenAI-style API, a
 
 ---
 
+## Install
+
+**Two ways to run Camelid — both use the same engine and the same models. Pick what fits:**
+
+| | 🪟 Camelid Desktop | ⚙️ Camelid engine |
+|---|---|---|
+| **What it is** | A native Windows app | The prebuilt `camelid` binary |
+| **Best for** | Just chatting on your own PC — the easy button | Sharing on a network, the API, scripting |
+| **How you chat** | A native window (no browser, no terminal) | In your **browser**, or a **server** others connect to |
+| **Install** | Double-click the signed installer | Unzip and run `camelid.exe` |
+| **Runs on** | Windows | Windows · macOS · Linux |
+
+The desktop app simply wraps the same engine in a native window — same models, same support gate, same GPU acceleration. **If you just want to chat, get the desktop app. If you want to share it or use the API, get the engine.**
+
+### 🪟 Camelid Desktop (Windows) — easiest
+
+The simplest way to run a model locally: a native app, no browser tab, no command line.
+
+1. Download the **Camelid Desktop installer** (`Camelid.Desktop_<version>_x64-setup.exe`) from the [latest release](https://github.com/timtoole02/Camelid/releases/latest).
+2. Double-click it and follow the prompts. It's **code-signed** (verified publisher); if Windows SmartScreen warns on a fresh download, click *More info → Run anyway*.
+3. Launch **Camelid Desktop** from the Start menu. It starts the engine for you and opens the chat window — pick a model to download, and chat.
+
+Installs just for you under `%LOCALAPPDATA%\Camelid Desktop` — **no admin rights needed**. GPU acceleration works on any NVIDIA card with only the normal driver (the CUDA runtime is bundled); no GPU, it runs on the CPU.
+
+### ⚙️ Camelid engine — run it in a browser, or serve it to share
+
+The prebuilt binary, with the web UI baked in. Run it to chat in your **browser**, or serve it so **other people or apps** can connect over an OpenAI-style API — on Windows, macOS, or Linux. Get it from the [latest release](https://github.com/timtoole02/Camelid/releases/latest).
+
+**Windows (x86_64):**
+
+1. Download **`camelid-windows-x64.zip`** and right-click → **Extract All…** to a folder (your Desktop is fine).
+2. Run **`.\camelid.exe serve`** in a terminal (or double-click `camelid.exe`).
+
+The chat UI opens automatically at <http://127.0.0.1:8181> in your default browser. The binary is **Authenticode code-signed**, and GPU acceleration works out of the box on any NVIDIA card (normal driver only — the CUDA runtime is bundled). No Python, Node, Docker, or CUDA Toolkit to install.
+
+**macOS (Apple Silicon) / Linux (x86_64):**
+
+```bash
+# macOS (Apple Silicon)
+curl -L https://github.com/timtoole02/Camelid/releases/latest/download/camelid-macos-arm64.tar.gz | tar -xz
+cd camelid-macos-arm64
+xattr -d com.apple.quarantine ./camelid 2>/dev/null || true   # allow the unsigned binary to run
+
+# Linux (x86_64): same, with camelid-linux-x86_64.tar.gz
+```
+
+**Then: download a model and chat (any OS):**
+
+```bash
+./camelid pull llama32_3b      # download a supported model into ./models
+./camelid serve --model models/Llama-3.2-3B-Instruct-Q8_0.gguf
+```
+
+`serve` runs one static binary serving the OpenAI-style API and the web UI on the same port. **Sharing on a network?** `camelid serve --addr 0.0.0.0:8181` lets anyone on your LAN open the same chat UI and API. Prefer to build from source? See [Build from source](#quickstart).
+
+---
+
 ## Why Camelid is different
 
 Most local runtimes optimize for breadth — "point it at any GGUF." Camelid optimizes for **trust**, and treats the boundary as the feature:
@@ -31,16 +88,9 @@ Most local runtimes optimize for breadth — "point it at any GGUF." Camelid opt
 
 ---
 
-## Get started in two commands
+## More ways to run
 
-Grab the binary for your platform from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) (the chat UI is built in), then:
-
-```bash
-./camelid pull llama32_3b      # download a supported model into ./models
-./camelid serve --model models/Llama-3.2-3B-Instruct-Q8_0.gguf
-```
-
-`serve` opens the chat UI in your browser automatically. **No Python, no Node, no Docker, no separate server** — one static binary that serves the OpenAI-style API and the web UI on the same port. Full details in [Install](#install) and [Quickstart](#quickstart).
+You already have the web chat UI from `serve` (see [Install](#install) above). Camelid also runs **in your terminal** and as a **sandboxed agent** — covered just below.
 
 Want a single command that proves the whole path end to end? `scripts/smoke.sh` pulls TinyLlama, serves it, does one real chat round-trip, and asserts on the reply — no mocks. See [Quickstart](#quickstart).
 
@@ -185,34 +235,6 @@ Both rows serve over HTTP through the same lane — set `CAMELID_GEMMA4_SERVE=1`
 > Scope guardrails: these are exact-row claims only — no Gemma-family-wide support, and no model-native/larger context beyond the checked packs.
 
 ---
-
-## Install
-
-Download a prebuilt binary from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) — the web UI is baked in, so there's nothing else to install.
-
-### Windows (x86_64) — easiest
-
-1. Download **`camelid-windows-x64.zip`** from the [latest release](https://github.com/timtoole02/Camelid/releases/latest).
-2. Right-click the zip → **Extract All…** to a folder (your Desktop is fine).
-3. Open that folder and run **`camelid.exe`** (double-click, or `.\camelid.exe serve` in a terminal).
-
-The chat UI opens at <http://127.0.0.1:8181>. That's it — no Python, Node, Docker, or CUDA Toolkit to install.
-
-- **Signed:** the binary is Authenticode code-signed, so Windows shows a verified publisher.
-- **GPU works out of the box:** on any NVIDIA card you only need the normal GPU driver — the CUDA runtime is bundled in the download. Camelid auto-detects the GPU and accelerates inference; with no NVIDIA GPU it runs on the CPU.
-
-### macOS (Apple Silicon) / Linux (x86_64)
-
-```bash
-# macOS (Apple Silicon)
-curl -L https://github.com/timtoole02/Camelid/releases/latest/download/camelid-macos-arm64.tar.gz | tar -xz
-cd camelid-macos-arm64
-xattr -d com.apple.quarantine ./camelid 2>/dev/null || true   # allow the unsigned binary to run
-
-# Linux (x86_64): camelid-linux-x86_64.tar.gz
-```
-
-Then jump to [Quickstart](#quickstart) — `./camelid pull` to get a model, `./camelid serve --model …` to chat.
 
 ## Quickstart
 
