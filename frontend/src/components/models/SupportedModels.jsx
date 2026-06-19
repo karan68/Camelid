@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { formatBytes } from '../../lib/formatters'
 import { Button } from '../ui/Button'
@@ -9,12 +10,41 @@ import { IconCheck, IconDownload, IconStop } from '../ui/icons'
 export function SupportedModels({
   models = [],
   runtime,
+  apiBase = '',
   installCatalogModel,
   cancelModelDownload,
   activateModel,
   loadingModelId = '',
 }) {
   const online = runtime?.status === 'online'
+
+  // "Downloaded" must mean the GGUF is actually on disk right now — verify against
+  // the backend's live models/ scan (/api/models/local), never a persisted client
+  // record alone. A localStorage record (id === catalog_id) lingers after the file
+  // is deleted or after a half-finished download, which would otherwise make the
+  // card show "Downloaded" instantly without the file. Mirrors CatalogLaneBrowse.
+  const base = (apiBase || '').replace(/\/$/, '')
+  const [localNames, setLocalNames] = useState(new Set())
+  useEffect(() => {
+    if (!online) return undefined
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const res = await fetch(`${base}/api/models/local`)
+        if (!res.ok) return
+        const body = await res.json()
+        if (!cancelled) setLocalNames(new Set((body.models || []).map((m) => m.filename)))
+      } catch {
+        /* keep the previous snapshot on a transient error */
+      }
+    }
+    refresh()
+    const timer = setInterval(refresh, 4000)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [base, online])
 
   return (
     <section className="supported-models" aria-label="Supported models you can download">
@@ -32,9 +62,12 @@ export function SupportedModels({
           const status = tracked?.status
           const downloading = status === 'downloading' || status === 'canceling'
           const progress = Math.max(0, Math.min(100, Number(tracked?.progress) || 0))
-          const downloaded = Boolean(tracked) && !downloading && status !== 'failed'
+          // Authoritative: the GGUF is present in models/ on disk right now.
+          const present = localNames.has(item.filename)
+          const downloaded = present && !downloading
           const loadedNow = Boolean(tracked?.loaded_now)
-          const busy = loadingModelId === tracked?.id
+          const loadId = tracked?.id || item.catalog_id
+          const busy = loadingModelId === loadId
 
           return (
             <article key={item.catalog_id} className={`supported-model ${item.recommended ? 'is-recommended' : ''}`}>
@@ -65,7 +98,7 @@ export function SupportedModels({
                   ) : downloaded ? (
                     <>
                       <Chip tone="ready" icon={<IconCheck size={15} />}>Downloaded</Chip>
-                      <Button variant="primary" size="sm" loading={busy} onClick={() => activateModel(tracked.id)}>
+                      <Button variant="primary" size="sm" loading={busy} onClick={() => activateModel(loadId)}>
                         Load
                       </Button>
                     </>

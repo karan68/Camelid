@@ -568,6 +568,7 @@ export default function ModelsView({
       <SupportedModels
         models={models}
         runtime={runtime}
+        apiBase={catalogApiBase || apiBase}
         installCatalogModel={installCatalogModel}
         cancelModelDownload={cancelModelDownload}
         activateModel={activateModel}
