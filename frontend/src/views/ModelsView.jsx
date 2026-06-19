@@ -565,6 +565,14 @@ export default function ModelsView({
         capabilities={capabilities}
         refreshKey={localRefreshKey}
       />
+      <SupportedModels
+        models={models}
+        runtime={runtime}
+        installCatalogModel={installCatalogModel}
+        cancelModelDownload={cancelModelDownload}
+        activateModel={activateModel}
+        loadingModelId={loadingModelId}
+      />
       <CatalogLaneBrowse
         apiBase={catalogApiBase || apiBase}
         capabilities={capabilities}
@@ -644,15 +652,6 @@ export default function ModelsView({
           </button>
         </div>
       </div>
-
-      <SupportedModels
-        models={models}
-        runtime={runtime}
-        installCatalogModel={installCatalogModel}
-        cancelModelDownload={cancelModelDownload}
-        activateModel={activateModel}
-        loadingModelId={loadingModelId}
-      />
 
       <section className="models-status-grid" aria-label="Camelid runtime model readiness">
         <div className="cxv-card cxv-panel">
