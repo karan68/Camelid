@@ -191,7 +191,13 @@ function normalizeEngineName(value) {
 }
 
 function normalizeLocalModelStatus(status) {
-  return status === 'ready' || status === 'registered' || status === 'failed' ? status : 'registered'
+  // Preserve the in-flight states too — coercing them to 'registered' made a freshly
+  // started download look instantly "registered"/downloaded and killed the progress
+  // bar (the `status === 'downloading'` UI branch could never fire).
+  return status === 'ready' || status === 'registered' || status === 'failed'
+    || status === 'downloading' || status === 'canceling'
+    ? status
+    : 'registered'
 }
 
 function normalizeLocalModelRecord(record) {
@@ -216,6 +222,11 @@ function normalizeLocalModelRecord(record) {
     load_error: optionalString(record.load_error),
     last_load_attempt_at: optionalString(record.last_load_attempt_at),
     last_loaded_at: optionalString(record.last_loaded_at),
+    // Download-progress fields must survive normalization so the progress bar can
+    // render a live percentage while status === 'downloading'.
+    bytes_downloaded: Number(record.bytes_downloaded) || 0,
+    total_bytes: Number(record.total_bytes) || 0,
+    progress: Number(record.progress) || 0,
     loaded_now: false,
     generation_ready: false,
     camelid: {
@@ -235,6 +246,25 @@ function upsertLocalModelRecord(records, record) {
   const normalized = normalizeLocalModelRecord(record)
   if (!normalized) return records
   return [normalized, ...records.filter((item) => item.id !== normalized.id)].sort(compareModelsByName)
+}
+
+// A persisted local record is "stale" when it claims a GGUF that should live in
+// models/ but the backend's authoritative directory scan (/api/models/local) no
+// longer lists it — e.g. the file was deleted, or a catalog download was recorded
+// but never actually landed on disk. Such records must not linger and keep
+// presenting a model as downloaded/loadable. Records that are safe and must never
+// be dropped: hosted/external API models, in-flight downloads (by status OR by an
+// active backend download for that id, since the status field can be coerced), and
+// user-registered GGUFs that live outside models/ (presence can't be verified from
+// the models/ scan).
+function isStaleLocalModelRecord(model, presentFilenames, activeDownloadIds) {
+  if (!model || isExternalModel(model)) return false
+  if (model.status === 'downloading' || model.status === 'canceling') return false
+  if (activeDownloadIds.has(model.id)) return false
+  const path = String(model.model_path || '')
+  if (!/^models[\\/]/.test(path)) return false
+  const filename = path.split(/[\\/]/).filter(Boolean).pop() || ''
+  return Boolean(filename) && !presentFilenames.has(filename)
 }
 
 function modelReadinessFromCurrent(currentModel, active, generationReady) {
@@ -518,7 +548,7 @@ export function useDashboardData({ showNotice, clearNotice }) {
       const currentLocalConversations = localConversationsRef.current
       const currentLocalMemories = localMemoriesRef.current
       const healthStartedAt = performance.now()
-      const [health, modelList, capabilities, downloads] = await Promise.all([
+      const [health, modelList, capabilities, downloads, localList] = await Promise.all([
         fetchJson(`${normalizedApiBase}/v1/health`).then((result) => {
           recordHealthPoll({ ok: true, latencyMs: performance.now() - healthStartedAt })
           return result
@@ -529,6 +559,9 @@ export function useDashboardData({ showNotice, clearNotice }) {
         fetchJson(`${normalizedApiBase}/v1/models`),
         fetchJson(`${normalizedApiBase}/api/capabilities`).catch(() => null),
         fetchJson(`${normalizedApiBase}/api/models/catalog/downloads`).catch(() => []),
+        // Authoritative on-disk presence; null (not []) on failure so a transient
+        // error can't be read as "nothing present" and wrongly drop records.
+        fetchJson(`${normalizedApiBase}/api/models/local`).catch(() => null),
       ])
 
       let modelsUpdated = false
@@ -569,9 +602,27 @@ export function useDashboardData({ showNotice, clearNotice }) {
         return model
       })
 
+      // Reconcile persisted local records against the backend's authoritative
+      // models/ scan: drop catalog/download records whose GGUF is no longer on disk
+      // so a stale localStorage entry can't keep presenting a model as downloaded or
+      // loadable. Only runs when the scan succeeded (localList is non-null).
+      let reconciledLocalModels = updatedLocalModels
+      let droppedStale = false
+      if (localList && Array.isArray(localList.models)) {
+        const presentFilenames = new Set(localList.models.map((m) => m.filename))
+        const activeDownloadIds = new Set((downloads || []).map((d) => d.id))
+        const kept = updatedLocalModels.filter(
+          (model) => !isStaleLocalModelRecord(model, presentFilenames, activeDownloadIds),
+        )
+        if (kept.length !== updatedLocalModels.length) {
+          reconciledLocalModels = kept
+          droppedStale = true
+        }
+      }
+
       let activeLocalModels = currentLocalModels
-      if (modelsUpdated) {
-        activeLocalModels = persistLocalModels(updatedLocalModels)
+      if (modelsUpdated || droppedStale) {
+        activeLocalModels = persistLocalModels(reconciledLocalModels)
       }
 
       const currentModel = health?.active_model_id
