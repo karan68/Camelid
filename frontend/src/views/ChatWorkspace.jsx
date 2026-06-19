@@ -188,7 +188,7 @@ export default function ChatWorkspace({
       : selectedModelIssue || selectedModelReadinessCopy
     : 'Choose a model before starting a Camelid chat.'
 
-  const productHeroTitle = selectedModelRunnable ? 'How can I help?' : "Hi Tim, let's get into it"
+  const productHeroTitle = selectedModelRunnable ? 'How can I help?' : "Hi there, let's get into it"
   const productHeroSummary = selectedModelRunnable
     ? 'Local chat is ready. Ask anything — responses stay grounded in the loaded model.'
     : apiUnavailable
