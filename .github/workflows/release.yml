@@ -190,13 +190,32 @@ jobs:
 
   # ---------------------------------------------------------------------------------
   # ADDITIVE: native Windows desktop app (camelid-desktop). Fully independent of the
-  # server `build` / `build-windows` jobs AND of `release` — it is NOT in any job's
-  # `needs`, so it cannot change or gate the server artifacts, their checksums, or the
+  # server `build` / `build-windows` jobs AND of `release` — it is in NO job's `needs`,
+  # so it cannot change or gate the server artifacts, their checksums, or the server
   # publish step. Skippable via the `skip_desktop` dispatch input. It bundles the SAME
-  # release camelid.exe as a loopback sidecar. See camelid-desktop/README.md, DECISIONS.md D11.
+  # release camelid.exe as a loopback sidecar, signs its artifacts with the same Azure
+  # Trusted Signing identity as build-windows, and attaches them to the release itself.
+  #
+  # Signing layout (azure/artifact-signing-action is folder-based / post-build; Tauri
+  # PATCHES camelid-desktop.exe during bundling so it can only be signed after the bundle):
+  #   - sidecar camelid.exe  -> signed BEFORE bundling (so it is signed inside the installer
+  #                             and the portable zip)
+  #   - camelid-desktop.exe  -> signed AFTER bundling (portable copy)
+  #   - NSIS installer       -> signed AFTER bundling
+  # Accepted v1 limitation: the camelid-desktop.exe baked INSIDE the installer is unsigned
+  # (the installer itself, the portable exe, and the sidecar are signed).
+  # See camelid-desktop/README.md, DECISIONS.md D11.
   desktop-windows:
     if: ${{ github.event.inputs.skip_desktop != 'true' }}
     runs-on: windows-latest
+    # Same Azure Trusted Signing identity as build-windows: the `release` environment is the
+    # stable OIDC subject (repo:<owner>/<repo>:environment:release) the federated credential
+    # is bound to. id-token mints the OIDC token; contents:write lets this job attach its own
+    # signed artifacts to the release (the server `release` job stays untouched).
+    environment: release
+    permissions:
+      id-token: write
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -250,6 +269,28 @@ jobs:
           Copy-Item target/release/camelid.exe $sidecar -Force
           ./scripts/package-windows-cuda.ps1 -OutDir $sidecar
 
+      # OIDC sign-in (same federated credential as build-windows).
+      - name: Azure login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Sign the sidecar BEFORE bundling so the camelid.exe baked into the installer AND the
+      # portable zip is signed. (NVRTC DLLs are already NVIDIA-signed; filter = exe only.)
+      - name: Sign sidecar camelid.exe (Azure Artifact Signing)
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\camelid-desktop\sidecar
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Build desktop bundle (NSIS installer)
         working-directory: camelid-desktop
         # The bundle-only config overlay adds the staged sidecar/* as resources. It is
@@ -257,12 +298,11 @@ jobs:
         # (no sidecar staged) never hits the empty-glob error.
         run: npx tauri build --config tauri.bundle.conf.json
 
-      # NOTE: Authenticode signing is intentionally deferred (unsigned-but-documented for
-      # now), and is NOT a blocker for the first build. When ready, reuse the server's Azure
-      # Artifact Signing path here as a separate step — sign BOTH camelid-desktop.exe and the
-      # bundled sidecar/camelid.exe before they are zipped/installer-packaged.
-
-      - name: Assemble portable zip + checksum
+      # Assemble the portable layout, and stage the installer INTO it so a single post-build
+      # signing pass covers both the portable camelid-desktop.exe and the NSIS installer.
+      # (Tauri patches camelid-desktop.exe during bundling, so it can only be signed now —
+      # after the bundle. The sidecar camelid.exe was already signed above.)
+      - name: Assemble portable layout (+ stage installer for signing)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -273,14 +313,38 @@ jobs:
           Copy-Item camelid-desktop/sidecar/* $dist -Force
           Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md $dist -Force
           Copy-Item camelid-desktop/README.md (Join-Path $dist 'DESKTOP_README.md') -Force
-          # Collect the NSIS installer too.
-          $nsis = Get-ChildItem -Recurse -Path target/release/bundle/nsis -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($nsis) { Copy-Item $nsis.FullName . -Force; Write-Host "installer: $($nsis.Name)" }
+          $nsis = Get-ChildItem -Recurse -Path target/release/bundle/nsis -Filter *.exe | Select-Object -First 1
+          Copy-Item $nsis.FullName (Join-Path $dist $nsis.Name) -Force
+          "installer=$($nsis.Name)" | Out-File -FilePath $env:GITHUB_ENV -Encoding ascii -Append
+          Write-Host "installer: $($nsis.Name)"
+
+      # Sign the portable camelid-desktop.exe AND the NSIS installer (both now in $dist).
+      # filter = exe signs every .exe in the folder (re-signing the already-signed sidecar
+      # camelid.exe is harmless); the NVRTC DLLs are left as their NVIDIA signatures.
+      - name: Sign desktop exe + installer (Azure Artifact Signing)
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\camelid-desktop-windows-x64
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Package portable zip + checksum (extract signed installer)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'camelid-desktop-windows-x64'
+          # Move the signed installer OUT of the portable folder (it is a separate artifact).
+          Move-Item (Join-Path $dist $env:installer) . -Force
           Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip" -Force
           $hash = (Get-FileHash -Algorithm SHA256 "$dist.zip").Hash.ToLower()
           "$hash  $dist.zip" | Out-File -Encoding ascii -NoNewline "$dist.zip.sha256"
 
-      - name: Upload desktop artifacts
+      - name: Upload desktop artifacts (CI)
         uses: actions/upload-artifact@v4
         with:
           name: camelid-desktop-windows-x64
@@ -288,14 +352,21 @@ jobs:
             camelid-desktop-windows-x64.zip
             camelid-desktop-windows-x64.zip.sha256
             *-setup.exe
-      # The desktop bundle is produced as a CI build artifact (above). It is intentionally
-      # NOT attached to the GitHub release by default: `release` only `needs:
-      # [build, build-windows]`, so it does not wait for this job and must not — keeping the
-      # server publish path fully independent and this job skippable. To ALSO publish the
-      # desktop bundle on the GitHub release, opt in by adding `desktop-windows` to the
-      # `release` job's `needs` (its download step is unfiltered/merge-multiple, so it will
-      # then pick this artifact up). Left as opt-in so a desktop failure can never block the
-      # server release.
+
+      # Publish the SIGNED desktop artifacts to the SAME GitHub release, independently of the
+      # server `release` job (which is left untouched and is in no way gated by this job).
+      # softprops is idempotent: it creates the release if absent, or appends these files if
+      # the server job already created it. A desktop failure therefore never blocks the
+      # server release; it just means the desktop files are not attached.
+      - name: Publish signed desktop artifacts to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            camelid-desktop-windows-x64.zip
+            camelid-desktop-windows-x64.zip.sha256
+            *-setup.exe
+          fail_on_unmatched_files: true
 
   release:
     needs: [build, build-windows]
