@@ -8,7 +8,6 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-orange.svg)
 ![Platform: macOS · Linux · Windows](https://img.shields.io/badge/platform-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)
-![Verified gate: TinyLlama 1.1B Q8_0](https://img.shields.io/badge/verified%20gate-TinyLlama%201.1B%20Q8__0-success.svg)
 
 </div>
 
