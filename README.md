@@ -69,6 +69,10 @@ Promotion is decided by the **`camelid agent-eval --model <gguf>`** harness, whi
 
 **`Llama 3.2 3B Instruct Q8_0` is the first promoted row** — it earned a `PASS` receipt ([`qa/agent-eval/`](qa/agent-eval/)): with the corrected render it emits well-formed tool calls, reads the fixture, and answers correctly. So `camelid chat --agent --model models/Llama-3.2-3B-Instruct-Q8_0.gguf` runs the live loop. (The 1B is too weak — it `FAIL`s the harness with malformed args even with the correct render — so it stays gated, as does any row without a PASS receipt.) The capability moves only on harness evidence, never a claim.
 
+### Native Windows desktop app (add-on)
+
+Prefer a desktop window over a browser tab? **[Camelid Desktop](camelid-desktop/README.md)** is an additive native Windows app (Tauri v2 + WebView2) that embeds the **same** `camelid` engine — it spawns `camelid serve` as a loopback sidecar and hosts the existing web UI in a native window. It inherits the **identical** support contract and the same runtime-ready + exact-supported-row chat gate (it talks to the same `/api/capabilities`); it makes no broader claims about supported models or performance, and any tokens/sec readout is sourced from real generation events. The web path remains canonical. See [`camelid-desktop/README.md`](camelid-desktop/README.md).
+
 ---
 
 ## Which model should I try first?

@@ -11,6 +11,10 @@ on:
       tag:
         description: 'Release tag to publish (e.g. v0.1.1)'
         required: true
+      skip_desktop:
+        description: 'Skip the additive camelid-desktop (Windows) build'
+        required: false
+        default: 'false'
 
 permissions:
   contents: write
@@ -183,6 +187,115 @@ jobs:
           path: |
             camelid-windows-x64.zip
             camelid-windows-x64.zip.sha256
+
+  # ---------------------------------------------------------------------------------
+  # ADDITIVE: native Windows desktop app (camelid-desktop). Fully independent of the
+  # server `build` / `build-windows` jobs AND of `release` — it is NOT in any job's
+  # `needs`, so it cannot change or gate the server artifacts, their checksums, or the
+  # publish step. Skippable via the `skip_desktop` dispatch input. It bundles the SAME
+  # release camelid.exe as a loopback sidecar. See camelid-desktop/README.md, DECISIONS.md D11.
+  desktop-windows:
+    if: ${{ github.event.inputs.skip_desktop != 'true' }}
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # The desktop app points at the engine's EMBEDDED web UI, so the UI must be baked
+      # into camelid.exe (rust-embed) — identical to the server job's web UI build.
+      - name: Build web UI
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.87.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
+
+      # The RELEASE sidecar is the shipped, working engine. (The debug build has a
+      # pre-existing main-thread stack overflow at startup; release optimization elides it.)
+      - name: Build sidecar (camelid.exe, release)
+        run: cargo build --release --locked --bin camelid
+
+      # windows-latest has no CUDA Toolkit; install just the NVRTC runtime component to
+      # source the redistributable DLLs (same as the server job).
+      - name: Install CUDA NVRTC (packaging source)
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvrtc"]'
+
+      # Stage the sidecar + its NVRTC redistributables into camelid-desktop/sidecar/ so
+      # `tauri build` bundles them as resources (resolved at runtime beside the sidecar).
+      - name: Stage sidecar
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sidecar = 'camelid-desktop/sidecar'
+          New-Item -ItemType Directory -Force -Path $sidecar | Out-Null
+          Copy-Item target/release/camelid.exe $sidecar -Force
+          ./scripts/package-windows-cuda.ps1 -OutDir $sidecar
+
+      - name: Build desktop bundle (NSIS installer)
+        working-directory: camelid-desktop
+        # The bundle-only config overlay adds the staged sidecar/* as resources. It is
+        # kept out of the base tauri.conf.json so a plain `cargo build -p camelid-desktop`
+        # (no sidecar staged) never hits the empty-glob error.
+        run: npx tauri build --config tauri.bundle.conf.json
+
+      # NOTE: Authenticode signing is intentionally deferred (unsigned-but-documented for
+      # now), and is NOT a blocker for the first build. When ready, reuse the server's Azure
+      # Artifact Signing path here as a separate step — sign BOTH camelid-desktop.exe and the
+      # bundled sidecar/camelid.exe before they are zipped/installer-packaged.
+
+      - name: Assemble portable zip + checksum
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dist = 'camelid-desktop-windows-x64'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item target/release/camelid-desktop.exe $dist -Force
+          # Portable layout: sidecar + NVRTC sit BESIDE the desktop exe (beside-exe resolution).
+          Copy-Item camelid-desktop/sidecar/* $dist -Force
+          Copy-Item README.md, LICENSE, THIRD_PARTY_NOTICES.md $dist -Force
+          Copy-Item camelid-desktop/README.md (Join-Path $dist 'DESKTOP_README.md') -Force
+          # Collect the NSIS installer too.
+          $nsis = Get-ChildItem -Recurse -Path target/release/bundle/nsis -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($nsis) { Copy-Item $nsis.FullName . -Force; Write-Host "installer: $($nsis.Name)" }
+          Compress-Archive -Path "$dist/*" -DestinationPath "$dist.zip" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 "$dist.zip").Hash.ToLower()
+          "$hash  $dist.zip" | Out-File -Encoding ascii -NoNewline "$dist.zip.sha256"
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: camelid-desktop-windows-x64
+          path: |
+            camelid-desktop-windows-x64.zip
+            camelid-desktop-windows-x64.zip.sha256
+            *-setup.exe
+      # The desktop bundle is produced as a CI build artifact (above). It is intentionally
+      # NOT attached to the GitHub release by default: `release` only `needs:
+      # [build, build-windows]`, so it does not wait for this job and must not — keeping the
+      # server publish path fully independent and this job skippable. To ALSO publish the
+      # desktop bundle on the GitHub release, opt in by adding `desktop-windows` to the
+      # `release` job's `needs` (its download step is unfiltered/merge-multiple, so it will
+      # then pick this artifact up). Left as opt-in so a desktop failure can never block the
+      # server release.
 
   release:
     needs: [build, build-windows]

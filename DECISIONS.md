@@ -531,3 +531,42 @@ first user message **only when the template rejects a standalone system role** (
 The system-role path is tried first and is unchanged, so the promoted 3B is unaffected (re-verified
 PASS). This is a correct robustness fix (system-less templates no longer error) and a stepping stone
 toward Mistral support. The only promoted row remains `llama32_3b_instruct_q8_0`.
+
+## D11 — Native Windows desktop app (`camelid-desktop`): sidecar + embedded-UI WebView (2026-06-19)
+
+Add a second, **additive** Windows executable (`camelid-desktop`) that gives users a native
+desktop chat experience with no browser. Two binding choices, both confirmed before coding:
+
+**1. Engine integration = sidecar, not in-process.** The desktop process spawns the shipped
+`camelid serve --addr 127.0.0.1:<ephemeral> --no-open` bound to **loopback only**, health-gates
+on `/v1/health`, and kills it on window close. `api::router_with_state()` is `pub` so in-process
+*was* feasible, but sidecar is chosen for v1 because it guarantees byte-identical generation
+behavior to the shipped server and isolates engine crashes from the UI. Any divergence in
+generation between desktop and `camelid serve` would be a regression, not a feature.
+
+**2. UI delivery = point the WebView at the sidecar's already-embedded UI, NOT re-bundle the
+frontend.** The `camelid` router's fallback route (`*` → `crate::web_ui::handler`, `src/api/mod.rs`)
+already serves the same React app the web path uses, embedded in the binary via `rust-embed`.
+The desktop WebView therefore navigates to `http://127.0.0.1:<port>/`, making UI **and** API
+same-origin: the frontend's `defaultApiBase()` resolves to `window.location.origin`
+(`frontend/src/hooks/useDashboardData.js`), so no base-URL injection or ephemeral-port plumbing
+is needed, and the runtime-ready + exact-supported-row capability gate is inherited **verbatim**
+(it is literally the same UI hitting the same `/api/capabilities`). The brief's literal Phase 2
+("bundle the frontend as Tauri assets") is therefore intentionally collapsed: the frontend is
+already bundled *inside `camelid.exe`*; the desktop `.exe` needs no npm/Vite at runtime and keeps
+no second copy of the UI. Tauri ships only a tiny static "starting engine…" splash page.
+
+**Stack:** Tauri v2 (Rust backend + WebView2). WebView2 ships with supported Windows 10/11.
+
+**Workspace:** the root `Cargo.toml` becomes a workspace (`resolver = "2"`,
+`default-members = ["."]`) with `camelid-desktop` added as a member. CI builds the server with
+`cargo build --release --locked --bin camelid`, which does not pull the desktop member into its
+build graph, so the server binary stays byte-for-byte unaffected. `default-members = ["."]` keeps
+bare `cargo build`/`cargo test` scoped to `camelid` as before; the desktop app is built explicitly
+with `-p camelid-desktop`.
+
+**No new inference / no metric fabrication / no support-contract drift / additive CI:** the desktop
+app reuses the shipped engine and gate wholesale; any tokens/sec readout (Phase 3) is sourced from
+the existing SSE `decode_tps` real generation event, rendered unavailable when absent. The new
+release job is additive and independently skippable; existing server artifacts are untouched.
+See `camelid-desktop/README.md`.
