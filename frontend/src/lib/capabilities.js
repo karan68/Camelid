@@ -413,7 +413,7 @@ export function rowSupportBoundaryCopy(target, apiFeatures = []) {
   if (!target) return 'No exact row selected.'
   const blockers = String(target.full_support_blockers || '').trim()
   if (!blockers) return 'No remaining full-support boundary is advertised for this exact row.'
-  const remaining = filterResolvedSupportCaveats(blockers, target, apiFeatures)
+  const remaining = stripPlatformLanguage(filterResolvedSupportCaveats(blockers, target, apiFeatures))
 
   return remaining.length ? remaining : 'Template/Jinja and production-throughput lanes are green for this exact row; remaining readiness follows runtime loaded_now/generation_ready and any other /api/capabilities fields.'
 }
@@ -422,7 +422,7 @@ export function rowSupportNextStepCopy(target, apiFeatures = []) {
   if (!target) return 'No exact row selected.'
   const nextStep = String(target.next_step || '').trim()
   if (!nextStep) return 'No next support step is advertised for this exact row.'
-  const remaining = filterResolvedSupportCaveats(nextStep, target, apiFeatures)
+  const remaining = stripPlatformLanguage(filterResolvedSupportCaveats(nextStep, target, apiFeatures))
   return remaining.length ? remaining : 'Template/Jinja and production-throughput are already represented by green row-scoped readiness lanes for this exact row; continue to require runtime loaded_now/generation_ready and any other advertised evidence before widening support.'
 }
 
@@ -471,9 +471,10 @@ export function frontendSupportContractCopy(capabilities) {
   if (!currentGate) return 'Capabilities unavailable'
   const templateReady = supportedRowsHaveGreenLane(capabilities, 'template')
   const throughputReady = supportedRowsHaveGreenLane(capabilities, 'throughput')
-  if (!templateReady && !throughputReady) return currentGate
+  const neutralFallback = 'Current exact-row support is governed by /api/capabilities; chat unlocks only for an exact supported row that is loaded and generation-ready.'
+  if (!templateReady && !throughputReady) return stripPlatformLanguage(currentGate) || neutralFallback
 
-  return stripResolvedCurrentGateCaveats(currentGate, { templateReady, throughputReady })
+  return stripPlatformLanguage(stripResolvedCurrentGateCaveats(currentGate, { templateReady, throughputReady })) || neutralFallback
 }
 
 export function isGuardedCapabilityStatus(status = '') {
@@ -708,7 +709,26 @@ function displayObservedQuant(value) {
   return text
 }
 
-export function compatibilityHintCopy(hint) {
+// Camelid runs on every supported system, so nothing shown on the Models page may
+// single out an OS / GPU vendor. This drops whole sentence-segments that name a
+// platform (macOS, Apple Silicon, Metal, two-Mac, Windows, CUDA, NVIDIA, Linux, …)
+// from any user-facing copy or evidence string before it is rendered.
+const PLATFORM_MENTION = /\b(mac\s?os|macos|mac|apple|silicon|metal|two[-\s]?macs?|windows|msvc|cuda|nvidia|rtx|geforce|ubuntu|linux|x86[-_]?64|x86|aarch64|arm64|optimus|igpu|intel|m[1-4])\b/i
+export function stripPlatformLanguage(value = '') {
+  const text = String(value || '').trim()
+  if (!text) return ''
+  return text
+    .split(/(?<=[.;])\s+/)
+    .filter((seg) => seg && !PLATFORM_MENTION.test(seg))
+    .join(' ')
+    .replace(/\(\s*\)/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s+([.,;:])/g, '$1')
+    .replace(/^[\s,;:.]+/, '')
+    .trim()
+}
+
+function compatibilityHintCopyRaw(hint) {
   if (!hint) return 'No exact COMPATIBILITY.md row matched this model name/path, so the UI will not infer model-family support; load results and typed backend errors remain the source of truth.'
   if (hint.kind === 'family') {
     const boundary = hint.target?.notes || hint.target?.next_step || `${hint.target?.id || 'This family row'} is ${formatCapabilityStatus(hint.target?.status || 'not_supported')}`
@@ -718,6 +738,11 @@ export function compatibilityHintCopy(hint) {
   if (hint.kind === 'quant_missing') return `${hint.target.id} is the right model-size row, but this local record does not expose a quant label yet. Do not unlock chat from a size/name match alone; wait for GGUF quant evidence from the loaded model metadata plus generation_ready=true.`
   if (hint.kind === 'quant_mismatch') return `${hint.target.id} is scoped to ${hint.target.quantization}, but this entry appears to be ${displayObservedQuant(hint.observedQuant) || 'a different quantization'}. Do not inherit the supported gate from a same-family row; wait for an exact COMPATIBILITY.md row plus generation_ready=true.`
   return `${hint.target.family} · ${hint.target.quantization} · ${hint.target.evidence || hint.target.next_step}. Match source: ${hint.confidence}; runtime generation still requires loaded_now=true and generation_ready=true.`
+}
+
+export function compatibilityHintCopy(hint) {
+  return stripPlatformLanguage(compatibilityHintCopyRaw(hint))
+    || 'Runtime generation requires the exact supported row plus loaded_now=true and generation_ready=true.'
 }
 
 export function isExactCompatibilityHint(hint) {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { LLAMA32_3B_ACCEPTANCE_AVAILABILITY, LLAMA32_3B_ACCEPTANCE_GATING_NOTE, LLAMA32_3B_ACCEPTANCE_SUMMARY, LLAMA32_3B_ACCEPTANCE_TARGET } from '../lib/acceptanceTargets'
-import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, compatibilityHintMatchesExactTarget, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy } from '../lib/capabilities'
+import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, compatibilityHintMatchesExactTarget, exactRowSupportLanes, findCompatibilityHint, formatCapabilityStatus, frontendSupportContractCopy, getCurrentCompatibilityTarget, getTrackedCompatibilityTargets, isExactCompatibilityHint, isSupportedCapabilityStatus, rowSupportBoundaryCopy, rowSupportNextStepCopy, stripPlatformLanguage } from '../lib/capabilities'
 import { getChatGateState } from '../lib/chatGate'
 import { formatBytes, formatCompactNumber } from '../lib/formatters'
 import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, modelRuntimeIdMatches } from '../lib/modelState'
@@ -846,7 +846,7 @@ export default function ModelsView({
                     <div>
                       <span>Why supported</span>
                       <strong>{supportStatusSentence(target, apiFeatures)}</strong>
-                      <small>{target.evidence || 'No evidence copy returned for this row.'}</small>
+                      <small>{stripPlatformLanguage(target.evidence) || 'Evidence for this exact row is recorded in /api/capabilities.'}</small>
                     </div>
                     <div>
                       <span>What it can do</span>
@@ -863,7 +863,7 @@ export default function ModelsView({
                   <details className="models-card-details">
                     <summary>Full row evidence</summary>
                     <div className="models-card-copy-stack">
-                    <p className="model-summary"><b>Evidence:</b> {target.evidence}</p>
+                    <p className="model-summary"><b>Evidence:</b> {stripPlatformLanguage(target.evidence) || 'Recorded for this exact row in /api/capabilities.'}</p>
                     {supportLanes.map((lane) => (
                       <p className="model-summary" key={lane.key}><b>{supportLaneTitle(lane)}:</b> {lane.copy}</p>
                     ))}
