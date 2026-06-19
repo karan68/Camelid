@@ -184,7 +184,20 @@ Both rows serve over HTTP through the same lane — set `CAMELID_GEMMA4_SERVE=1`
 
 ## Install
 
-Download a prebuilt binary from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) — the web UI is baked in, so there's nothing else to install:
+Download a prebuilt binary from the [latest release](https://github.com/timtoole02/Camelid/releases/latest) — the web UI is baked in, so there's nothing else to install.
+
+### Windows (x86_64) — easiest
+
+1. Download **`camelid-windows-x64.zip`** from the [latest release](https://github.com/timtoole02/Camelid/releases/latest).
+2. Right-click the zip → **Extract All…** to a folder (your Desktop is fine).
+3. Open that folder and run **`camelid.exe`** (double-click, or `.\camelid.exe serve` in a terminal).
+
+The chat UI opens at <http://127.0.0.1:8181>. That's it — no Python, Node, Docker, or CUDA Toolkit to install.
+
+- **Signed:** the binary is Authenticode code-signed, so Windows shows a verified publisher.
+- **GPU works out of the box:** on any NVIDIA card you only need the normal GPU driver — the CUDA runtime is bundled in the download. Camelid auto-detects the GPU and accelerates inference; with no NVIDIA GPU it runs on the CPU.
+
+### macOS (Apple Silicon) / Linux (x86_64)
 
 ```bash
 # macOS (Apple Silicon)
@@ -208,7 +221,7 @@ cargo build --release                       # embeds it into the binary
 
 ### Build from source on Windows (x86_64, MSVC)
 
-Windows `x86_64-pc-windows-msvc` is a tracked CPU platform (see [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support). There is no prebuilt Windows binary yet, so build from source. Prerequisites: the **MSVC** toolchain (Visual Studio Build Tools with the C++ workload — *not* MinGW), Rust via `rustup` with the `x86_64-pc-windows-msvc` host, and Node.js for the embedded web UI. Then, in PowerShell:
+Windows `x86_64-pc-windows-msvc` is a tracked platform (see [`COMPATIBILITY.md`](COMPATIBILITY.md) → Platform support). Most users should grab the prebuilt **signed** Windows download in [Install](#install) above (GPU acceleration included); build from source only if you want to modify Camelid. Prerequisites: the **MSVC** toolchain (Visual Studio Build Tools with the C++ workload — *not* MinGW), Rust via `rustup` with the `x86_64-pc-windows-msvc` host, and Node.js for the embedded web UI. Then, in PowerShell:
 
 ```powershell
 cd frontend; npm ci; npm run build; cd ..   # bundles the web UI
