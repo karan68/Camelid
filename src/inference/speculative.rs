@@ -64,6 +64,15 @@ impl SpeculativeDrafter {
             Self::Model(drafter) => drafter.draft(history, max_tokens),
         }
     }
+
+    /// Draft-decode profiling: (resident GPU forward µs, resident steps, CPU-fallback steps).
+    /// Zero for the n-gram drafter (no model forward). Resets on read.
+    pub fn take_forward_stats(&mut self) -> (u128, u64, u64) {
+        match self {
+            Self::NGram(_) => (0, 0, 0),
+            Self::Model(drafter) => drafter.take_forward_stats(),
+        }
+    }
 }
 
 /// Prompt-lookup drafting: find the longest n-gram suffix of `history`
@@ -126,6 +135,12 @@ pub struct ModelDrafter {
     /// round. The prefix of these that the target accepted is now real
     /// history, so its KV entries can be kept instead of re-ingested.
     speculative_fed: Vec<u32>,
+    /// Profiling: summed GPU forward microseconds reported by the resident decode for draft
+    /// steps, the count of resident steps, and the count that fell back to the CPU path. Lets a
+    /// caller compare the GPU forward time against the wall-clock draft time to localize overhead.
+    resident_forward_us: u128,
+    resident_steps: u64,
+    cpu_fallback_steps: u64,
 }
 
 impl ModelDrafter {
@@ -148,7 +163,24 @@ impl ModelDrafter {
             session,
             committed: 0,
             speculative_fed: Vec::new(),
+            resident_forward_us: 0,
+            resident_steps: 0,
+            cpu_fallback_steps: 0,
         }
+    }
+
+    /// Take and reset the draft-decode profiling counters: (summed resident GPU forward µs,
+    /// resident step count, CPU-fallback step count).
+    pub fn take_forward_stats(&mut self) -> (u128, u64, u64) {
+        let stats = (
+            self.resident_forward_us,
+            self.resident_steps,
+            self.cpu_fallback_steps,
+        );
+        self.resident_forward_us = 0;
+        self.resident_steps = 0;
+        self.cpu_fallback_steps = 0;
+        stats
     }
 
     pub fn draft(&mut self, history: &[u32], max_tokens: usize) -> Result<Vec<u32>> {
@@ -189,15 +221,25 @@ impl ModelDrafter {
         // seeded), in which case nothing has been fed so re-feeding the whole chunk is consistent.
         // Lossless either way — the target verify is authoritative, so the draft's greedy choice
         // only affects accept rate, never the emitted tokens.
+        // Feed the pending (known) tokens one at a time on the fast resident GPU-argmax lane; the
+        // prediction after the LAST is the first draft. Token-by-token keeps the draft KV exactly
+        // in sync (the batched-prefill diagnostics path desyncs the drafter's resident engine and
+        // tanks accept). The diagnostics path is the fallback only when the resident engine isn't
+        // ready, in which case nothing has been fed yet so re-feeding the whole chunk is consistent.
         let (&head, rest) = pending.split_first().expect("pending is non-empty (checked above)");
         let first = match self.session.generate_next_token_greedy_resident(head)? {
-            Some((mut pred, _us)) => {
+            Some((mut pred, us)) => {
+                self.resident_forward_us += us;
+                self.resident_steps += 1;
                 for &tok in rest {
                     pred = match self.session.generate_next_token_greedy_resident(tok)? {
-                        Some((id, _us)) => id,
-                        // Residency is stable within a round; if it drops, feed just this one
-                        // token via the general step so the KV stays consistent (one token each).
+                        Some((id, us)) => {
+                            self.resident_forward_us += us;
+                            self.resident_steps += 1;
+                            id
+                        }
                         None => {
+                            self.cpu_fallback_steps += 1;
                             self.session
                                 .generate_next_token_with_history_diagnostics(
                                     &[tok],
@@ -212,6 +254,7 @@ impl ModelDrafter {
                 pred
             }
             None => {
+                self.cpu_fallback_steps += 1;
                 self.session
                     .generate_next_token_with_history_diagnostics(
                         pending,
@@ -229,8 +272,13 @@ impl ModelDrafter {
             let last = *drafts.last().expect("drafts is non-empty");
             // Sequential draft steps on the fast resident GPU-argmax lane (no full-logits copy).
             let next = match self.session.generate_next_token_greedy_resident(last)? {
-                Some((id, _us)) => id,
+                Some((id, us)) => {
+                    self.resident_forward_us += us;
+                    self.resident_steps += 1;
+                    id
+                }
                 None => {
+                    self.cpu_fallback_steps += 1;
                     self.session
                         .generate_next_token_with_history_diagnostics(
                             &[last],

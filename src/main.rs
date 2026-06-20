@@ -2616,7 +2616,7 @@ fn run_bench_speculative(
     // reserve) is established BEFORE any target build, so the target builds once under the
     // coexistence budget and the draft stays GPU-resident; the plain reference then reuses that
     // same resident target (so its tps is the coexistence-config target, flagged in the record).
-    let (plain, spec) = if spec_only {
+    let (plain, spec, (draft_fwd_us, draft_resident_steps, draft_cpu_steps)) = if spec_only {
         if warmup {
             eprintln!("[bench-speculative] warmup (unmeasured, spec-only)...");
             let mut w = build_drafter()?;
@@ -2641,6 +2641,7 @@ fn run_bench_speculative(
             &mut drafter,
             gamma,
         )?;
+        let draft_stats = drafter.take_forward_stats();
         // Plain reference reuses the resident coexistence target engine (no rebuild).
         let plain = generate_run(
             &config,
@@ -2650,7 +2651,7 @@ fn run_bench_speculative(
             &sampler,
             max_tokens,
         )?;
-        (plain, spec)
+        (plain, spec, draft_stats)
     } else {
         if warmup {
             eprintln!("[bench-speculative] warmup (unmeasured)...");
@@ -2695,7 +2696,8 @@ fn run_bench_speculative(
             &mut drafter,
             gamma,
         )?;
-        (plain, spec)
+        let draft_stats = drafter.take_forward_stats();
+        (plain, spec, draft_stats)
     };
     let plain_decode_tokens = plain.generated.len().saturating_sub(1);
     let plain_tps = if plain.decode_ms > 0.0 && plain_decode_tokens > 0 {
@@ -2709,6 +2711,32 @@ fn run_bench_speculative(
     } else {
         0.0
     };
+    // Draft-decode profiling: the GPU forward time of the draft steps vs the wall-clock draft
+    // time tells whether the draft cost is in the forward kernels or in sync/overhead around them.
+    if draft_resident_steps + draft_cpu_steps > 0 {
+        eprintln!(
+            "[draft-profile] resident steps {} ({:.1} ms/step GPU forward) | cpu-fallback steps {} | \
+             wall draft {:.1} ms total = {:.1} ms/step | GPU-forward fraction {:.0}%",
+            draft_resident_steps,
+            if draft_resident_steps > 0 {
+                draft_fwd_us as f64 / 1000.0 / draft_resident_steps as f64
+            } else {
+                0.0
+            },
+            draft_cpu_steps,
+            spec.draft_us as f64 / 1000.0,
+            if draft_resident_steps + draft_cpu_steps > 0 {
+                spec.draft_us as f64 / 1000.0 / (draft_resident_steps + draft_cpu_steps) as f64
+            } else {
+                0.0
+            },
+            if spec.draft_us > 0 {
+                draft_fwd_us as f64 / spec.draft_us as f64 * 100.0
+            } else {
+                0.0
+            },
+        );
+    }
 
     // Lossless gate: first index where the spec stream diverges from plain greedy (-1 if the
     // two streams are identical). A positive cell with any divergence is a correctness bug.
