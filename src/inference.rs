@@ -1692,9 +1692,15 @@ impl LlamaInferenceSession {
     /// offloads enough of its own trailing layers to leave the room.
     #[cfg(feature = "cuda")]
     pub fn spec_coexist_reserve_estimate(&self) -> u64 {
+        // Flat margin (logits row + scratch + fragmentation) the draft engine needs beyond its
+        // weights + KV. Env-tunable: on a 6 GB card every MiB counts to fit both without spilling.
+        let flat_mb = std::env::var("CAMELID_SPEC_DRAFT_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(48);
         self.resident_weight_bytes()
             + self.resident_kv_bytes_per_pos() * spec_draft_kv_context() as u64
-            + 96 * 1024 * 1024
+            + flat_mb * 1024 * 1024
     }
     #[cfg(not(feature = "cuda"))]
     pub fn spec_coexist_reserve_estimate(&self) -> u64 {

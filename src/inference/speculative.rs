@@ -181,28 +181,67 @@ impl ModelDrafter {
         if max_tokens == 0 {
             return Ok(Vec::new());
         }
-        // Drafting runs on the tuned generation path (chunked prefill for the
-        // pending tokens, packed-GEMV decode for the sequential draft steps)
-        // rather than one-row verify chunks — the decode step is the fast
-        // route for single tokens.
-        let step = self.session.generate_next_token_with_history_diagnostics(
-            pending,
-            LlamaSampler::Greedy,
-            history,
-            false,
-        )?;
+        // Re-ingest the pending (known) tokens, then the prediction after the LAST one is the
+        // first draft. The whole chunk rides the fast resident GPU-argmax lane (the draft only
+        // needs the argmax, so the full-logits copy + CPU sample the diagnostics path does is pure
+        // per-round overhead — the dominant cost once the draft model is GPU-resident). The
+        // diagnostics path is the fallback only when the resident engine isn't ready (not yet
+        // seeded), in which case nothing has been fed so re-feeding the whole chunk is consistent.
+        // Lossless either way — the target verify is authoritative, so the draft's greedy choice
+        // only affects accept rate, never the emitted tokens.
+        let (&head, rest) = pending.split_first().expect("pending is non-empty (checked above)");
+        let first = match self.session.generate_next_token_greedy_resident(head)? {
+            Some((mut pred, _us)) => {
+                for &tok in rest {
+                    pred = match self.session.generate_next_token_greedy_resident(tok)? {
+                        Some((id, _us)) => id,
+                        // Residency is stable within a round; if it drops, feed just this one
+                        // token via the general step so the KV stays consistent (one token each).
+                        None => {
+                            self.session
+                                .generate_next_token_with_history_diagnostics(
+                                    &[tok],
+                                    LlamaSampler::Greedy,
+                                    history,
+                                    false,
+                                )?
+                                .next_token_id
+                        }
+                    };
+                }
+                pred
+            }
+            None => {
+                self.session
+                    .generate_next_token_with_history_diagnostics(
+                        pending,
+                        LlamaSampler::Greedy,
+                        history,
+                        false,
+                    )?
+                    .next_token_id
+            }
+        };
         self.committed = history.len();
         let mut drafts = Vec::with_capacity(max_tokens);
-        drafts.push(step.next_token_id);
+        drafts.push(first);
         while drafts.len() < max_tokens {
             let last = *drafts.last().expect("drafts is non-empty");
-            let step = self.session.generate_next_token_with_history_diagnostics(
-                &[last],
-                LlamaSampler::Greedy,
-                history,
-                false,
-            )?;
-            drafts.push(step.next_token_id);
+            // Sequential draft steps on the fast resident GPU-argmax lane (no full-logits copy).
+            let next = match self.session.generate_next_token_greedy_resident(last)? {
+                Some((id, _us)) => id,
+                None => {
+                    self.session
+                        .generate_next_token_with_history_diagnostics(
+                            &[last],
+                            LlamaSampler::Greedy,
+                            history,
+                            false,
+                        )?
+                        .next_token_id
+                }
+            };
+            drafts.push(next);
         }
         // KV now holds `committed` history tokens plus the fed drafts (all
         // but the last drafted token); the next round keeps whatever prefix
