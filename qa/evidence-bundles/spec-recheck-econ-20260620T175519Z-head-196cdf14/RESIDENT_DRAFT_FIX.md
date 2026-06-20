@@ -87,3 +87,165 @@ camelid bench-speculative <4B> --drafter draft --draft-model <0.6B> --spec-only 
 # CAMELID_RESIDENT_TRACE=1 shows the coexist gate decision + per-engine VRAM sizing.
 # CAMELID_SPEC_DRAFT_CONTEXT caps the draft KV (default 512).
 ```
+
+---
+
+# Part 2 — f16 KV + coexistence: the 0.6B now stays on GPU (commits 683238fc, 1e987b85, de130301)
+
+Part 1 concluded the 6 GB unlock needed f16 resident KV. Done — and it turned out to be a free,
+bit-identical change because the resident engine ALREADY f16-rounds every K/V value (`kv_scatter`
+calls `f16_round`); it just stored them in f32 containers. Storing the f16 bits (u16) directly
+halves KV VRAM with zero numerical change (the attention kernels read back via `f16_bits_to_f32`).
+
+## What landed
+
+1. **f16 resident KV** (683238fc): KV cache stored as `u16` (f16 bits) instead of `f32`. All 13
+   `cuda_resident` GPU parity tests pass (per-kernel + full_forward + verify_batch + prefill→decode)
+   — bit-identical. Halves KV VRAM for every resident model; general win.
+2. **Coexistence headroom + bounded spill** (1e987b85): `CAMELID_SPEC_COEXIST_HEADROOM_MB` (small
+   per-engine margin under coexistence) + `CAMELID_SPEC_COEXIST_SPILL_MB` (bounded WDDM spill).
+   Default-off / unchanged for single-model.
+3. **Fast resident draft loop** (de130301): the draft's pending re-ingest + sequential steps now
+   ride the GPU-argmax lane (no full-logits copy). Restored draft accept 48% → 92.5% and improved
+   the draft-model path S_sync 0.10× → 0.77×.
+
+## Result: both models fully GPU-resident on 6 GB, lossless
+
+With f16 KV + tight contexts (no spill needed), the trace shows BOTH resident, 0 layers offloaded:
+
+```
+[resident-cuda] VRAM sizing: ... weights 4315 MiB (resident 4315; 0/36 offloaded) -> cap 384   (target)
+[resident-cuda] VRAM sizing: ... weights  639 MiB (resident  639; 0/28 offloaded) -> cap 256   (draft)
+draft γ=4 spec-only | accept 92.5% | gpu/cpu verify 14/0 | LOSSLESS ✓
+```
+
+The 0.6B **stays on GPU** — the literal goal. Lossless, GPU batched verify.
+
+## Honest ceiling: still not a *speed* win on this 6 GB laptop GPU
+
+| draft | latency | why |
+|---|---|---|
+| 0.6B alone (bench-generate) | **7.5 ms/tok** | native resident decode |
+| 0.6B as draft, coexisting with 4B | **~31 ms/tok** | GPU resource contention when both models are resident |
+| 4B target plain decode | 27 ms/tok | the bar a draft token must beat |
+
+S_sync on 6 GB peaks at **0.77×**. The blocker is now neither residency, paging, nor the draft
+loop (all fixed) but **coexistence contention**: a resident 0.6B that decodes at 7.5 ms alone slows
+to ~31 ms when it shares the 6 GB card with the resident 4B. Since 31 ms/draft-token > the 4B's own
+27 ms/token, **drafting costs more than it saves on this hardware, for any draft window** — so spec
+cannot beat plain decode here. (llama.cpp's draft runs ~4 ms/tok; its 1.37× win depends on the
+draft staying that fast under coexistence, which Camelid's stack does not achieve on this card.)
+
+## Net
+
+- f16 KV: shipped, bit-identical, halves KV VRAM everywhere — a real general win and the enabler.
+- The 0.6B now stays GPU-resident on 6 GB, lossless (goal met).
+- Draft-model spec improved 0.10× → 0.77× on 6 GB; it becomes a **win on a GPU without the
+  coexistence contention** (more headroom / sustained clocks), where the draft keeps its ~7.5 ms.
+- Remaining work for a 6 GB win: eliminate the coexistence per-token contention (GPU profiling;
+  likely clock/occupancy/stream-scheduling on the shared laptop GPU) — beyond residency/VRAM.
+- On ≤6 GB today, **synchronous n-gram remains the shippable win** (1.3–1.6× code/JSON, single model).
+
+---
+
+# Part 3 — profiling the "coexistence contention" (commit 16eec2d2): it isn't contention
+
+Part 2 attributed the remaining S_sync < 1 to "GPU resource contention when both models are
+resident." Profiling disproves that. Added per-draft-step counters (`[draft-profile]`: summed GPU
+forward µs vs wall draft µs, resident vs CPU-fallback step counts) + `nvidia-smi` clock/throttle
+logging.
+
+## What the profile shows
+
+| signal | finding | conclusion |
+|---|---|---|
+| GPU SM clock, 0.6B alone | 1755 MHz, throttle 0x0 (none) | — |
+| GPU SM clock, coexistence | ~1740 MHz, throttle 0x4 (SW power cap) | ~1% slower — **clocks not the cause** |
+| draft GPU-forward fraction | **100%** (wall draft == summed forward µs) | **no sync stalls / overhead around the forward** |
+| draft resident vs CPU steps | 237 resident, **0 CPU-fallback** | draft genuinely runs resident |
+| draft per-step (short prompt) | **~10.5 ms/step** | the 0.6B's native resident decode rate |
+
+The "7.5 ms alone vs 31 ms coexist" gap from Part 2 was a **conflation**: 7.5 ms was a warmup-boosted
+number; steady-state 0.6B decode is ~10–13 ms, and the draft runs at exactly that. The earlier
+~31 ms/tok was inflated by the **first round re-ingesting the 88-token prompt as 88 sequential
+decode steps** (the batched-prefill alternative was tried and **desyncs the drafter's resident
+engine → accept 90% → 41%**, so token-by-token re-ingest is kept). With a short prompt the draft
+is a clean ~10.5 ms/tok.
+
+## The real reason draft-model spec doesn't win here
+
+It's the **draft/target speed ratio**, not contention. Camelid's 0.6B decodes at ~10.5 ms vs the
+4B's ~26 ms — a **0.4× ratio**. Clean steady-state economics (short prompt, γ=6, accept 54%):
+
+```
+spec round = draft 65 ms + verify 58 ms = 123 ms  →  4.16 tokens
+plain      = 4.16 × 26.1 ms             = 109 ms  →  4.16 tokens     → spec 0.89×
+```
+
+The draft (65 ms, 6 drafts at 10.5 ms of which ~2 are rejected) + the batched verify (58 ms) exceed
+plain-decoding the same tokens. **Why the 0.6B is "only" 0.4×:** Camelid's resident decode carries
+~8–12 ms of **FIXED per-token overhead** (≈168 kernel launches across 28 layers + per-layer CPU
+orchestration + one host sync) — bandwidth alone is ~2 ms. That fixed cost is ~constant across model
+sizes, so it dominates the small draft. llama.cpp's 0.6B runs ~4 ms (CUDA graphs / fused launches →
+near-zero fixed overhead), a **0.22× ratio**, which is exactly why it wins 1.37× on this same card.
+
+## The lever for a 6 GB win (next, separate work)
+
+Cut the fixed per-token resident-decode overhead — **CUDA graphs** (capture the per-token launch
+sequence once, replay it) and/or kernel fusion — which collapses the ~168 per-token launches into
+~one replay. This helps small models most (the draft), pulling the 0.6B toward llama's ~4 ms and the
+ratio toward 0.2×, at which point the draft-model path wins on 6 GB. It also speeds the 4B target
+decode (closing part of the 0.73× base-kernel gap). This is decode-kernel work, independent of the
+VRAM/residency/coexistence changes in Parts 1–2.
+
+## Net (all parts)
+
+- f16 KV (683238fc): shipped, bit-identical, halves KV VRAM everywhere.
+- Both 4B + 0.6B fully GPU-resident on 6 GB, lossless (goal met); verify-offload correctness guard.
+- Draft-model spec improved 0.10× → ~0.88× on 6 GB (resident draft + fast draft loop).
+- Profiled the residual: it is NOT coexistence contention but the 0.6B's per-token decode overhead
+  (fixed launch/orchestration cost). The remaining win needs CUDA-graph/fused decode, not more
+  VRAM work. On ≤6 GB today, synchronous n-gram remains the shippable win.
+
+---
+
+# Part 4 — CUDA graphs: already built, and CONFIRMED not the lever (corrects Part 3)
+
+Part 3 named CUDA graphs as the fix for the small-draft decode overhead. Investigated — and it's
+wrong. The CUDA graph decode path **already exists** in `cuda_resident.rs` (`decode_graph`,
+`forward_token_greedy_graphed`, capture-once/replay), gated `CAMELID_CUDA_GRAPHS=1`, default-off
+with a documented prior finding: on the RTX 3060 it saved nothing (3B 53.2→52.5, TinyLlama
+129→124 tok/s — slightly *slower*).
+
+Measured it on the small model, the case Part 3 assumed would differ:
+
+| config | tok/s |
+|---|---|
+| 0.6B alone, graphs OFF | 81.78 |
+| 0.6B alone, graphs ON | 80.72 |
+| coexistence spec, graphs ON | draft falls to CPU (0 resident steps), S_sync 0.44× (worse) |
+
+**No benefit on the small model either.** The earlier "~168 kernel-launch overhead" framing was
+the error: `forward_us == wall (100%)` does NOT mean launch-bound — it means the host **waits for
+the GPU to finish**, so the ~12 ms IS GPU *execution* time. The ~168 launches enqueue ahead
+asynchronously, so their host cost is already hidden behind GPU execution (precisely why graphs,
+which only remove launch overhead, save nothing). The GPU is genuinely busy ~12 ms running the
+small kernels: ~3–6 ms real work (weight reads, attention) + ~6 ms inefficiency (small-GEMV
+occupancy, per-kernel startup, inter-dependent-kernel gaps across ~168 kernels/token).
+
+## The actual lever: kernel FUSION (not graphs)
+
+To cut GPU *execution* time for the small draft, fuse the ~6 kernels per layer (rmsnorm+quantize,
+the QKV/gate/up GEMVs, rope+kv_scatter, attention, silu+down, residual) into a few larger kernels —
+fewer launches AND fewer dependent-kernel gaps AND better occupancy. This is what gives llama.cpp's
+0.6B ~4 ms (vs Camelid's ~12 ms). It is a substantial resident-decode kernel rewrite with full
+parity re-validation — a different and much larger effort than graphs, and the real remaining work
+for a 6 GB draft-model speculation win. (It also speeds the 4B target, narrowing the 0.73× base gap.)
+
+## Corrected net
+
+- CUDA graphs: already implemented + gated; **confirmed not helpful on this GPU** (decode is
+  GPU-execution-bound, not launch-bound) — keep default-off.
+- The small-draft decode cost is GPU kernel-execution time → needs **kernel fusion**, not graphs.
+- Everything from Parts 1–2 stands (f16 KV shipped; both models resident on 6 GB, lossless).
+- On ≤6 GB today, **synchronous n-gram remains the shippable win**.
