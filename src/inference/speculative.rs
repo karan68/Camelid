@@ -138,6 +138,12 @@ impl ModelDrafter {
         // rather than reseeded. If the draft engine doesn't fit in VRAM it falls
         // back to the CPU path per token automatically.
         session.set_is_drafter(true);
+        // Register the draft's resident VRAM footprint so a target engine built AFTER this
+        // (e.g. when the drafter is configured before the target's first decode) leaves room for
+        // the draft to stay GPU-resident too. Only honored on a GPU where the target still fits
+        // fully resident after the reserve; otherwise the draft falls back to CPU. No-op on
+        // non-CUDA builds. (Does not evict an already-built target — see set_spec_coexist_reserve.)
+        crate::inference::set_spec_coexist_reserve(session.spec_coexist_reserve_estimate());
         Self {
             session,
             committed: 0,

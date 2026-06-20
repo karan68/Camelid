@@ -746,6 +746,13 @@ enum Command {
         /// it does not fit in VRAM.
         #[arg(long, default_value_t = false)]
         cpu_draft: bool,
+        /// Build the coexistence target + resident draft once (drafter/reserve set BEFORE the
+        /// target builds) and measure only the speculative run; the plain reference reuses that
+        /// same resident target. Avoids an in-process full-size target rebuild whose VRAM the
+        /// cudarc pool will not release back to the sizing probe. The plain tps reported here is
+        /// the same-config (coexistence) target, not a full-resident-target baseline.
+        #[arg(long, default_value_t = false)]
+        spec_only: bool,
         /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
@@ -1437,6 +1444,7 @@ async fn main() -> anyhow::Result<()> {
             draft_model,
             draft_tokens,
             cpu_draft,
+            spec_only,
             prompt_file,
             prompt,
             workload,
@@ -1450,6 +1458,7 @@ async fn main() -> anyhow::Result<()> {
                 draft_model,
                 draft_tokens,
                 cpu_draft,
+                spec_only,
                 prompt_file,
                 prompt,
                 workload,
@@ -2463,6 +2472,10 @@ struct BenchSpeculativeRecord {
     quantization: String,
     drafter: String,
     cpu_draft: bool,
+    /// True when --spec-only: the plain fields below are the coexistence-config target (draft
+    /// resident), NOT a full-resident-target baseline. S_sync here is speculation efficiency on
+    /// the same target; the full-resident denominator comes from the n-gram/bench-generate runs.
+    spec_only: bool,
     draft_tokens: usize,
     prompt_tokens: usize,
     max_tokens: usize,
@@ -2546,6 +2559,7 @@ fn run_bench_speculative(
     draft_model: Option<PathBuf>,
     draft_tokens: Option<usize>,
     cpu_draft: bool,
+    spec_only: bool,
     prompt_file: Option<PathBuf>,
     prompt: Option<String>,
     workload: String,
@@ -2597,9 +2611,38 @@ fn run_bench_speculative(
 
     let sampler = LlamaSampler::Greedy;
 
-    if warmup {
-        eprintln!("[bench-speculative] warmup (unmeasured)...");
-        let _ = generate_run(
+    // Two orderings. Default: the plain baseline runs FIRST on a full-resident target (the truest
+    // S_sync denominator), then the drafter is added. spec_only: the drafter (and its coexistence
+    // reserve) is established BEFORE any target build, so the target builds once under the
+    // coexistence budget and the draft stays GPU-resident; the plain reference then reuses that
+    // same resident target (so its tps is the coexistence-config target, flagged in the record).
+    let (plain, spec) = if spec_only {
+        if warmup {
+            eprintln!("[bench-speculative] warmup (unmeasured, spec-only)...");
+            let mut w = build_drafter()?;
+            let _ = generate_run_speculative(
+                &config,
+                &weights,
+                &tokenizer,
+                &prompt_token_ids,
+                max_tokens,
+                &mut w,
+                gamma,
+            )?;
+        }
+        camelid::inference::reset_stage_timings();
+        let mut drafter = build_drafter()?;
+        let spec = generate_run_speculative(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            max_tokens,
+            &mut drafter,
+            gamma,
+        )?;
+        // Plain reference reuses the resident coexistence target engine (no rebuild).
+        let plain = generate_run(
             &config,
             &weights,
             &tokenizer,
@@ -2607,47 +2650,59 @@ fn run_bench_speculative(
             &sampler,
             max_tokens,
         )?;
-        let mut warm = build_drafter()?;
-        let _ = generate_run_speculative(
+        (plain, spec)
+    } else {
+        if warmup {
+            eprintln!("[bench-speculative] warmup (unmeasured)...");
+            let _ = generate_run(
+                &config,
+                &weights,
+                &tokenizer,
+                &prompt_token_ids,
+                &sampler,
+                max_tokens,
+            )?;
+            let mut warm = build_drafter()?;
+            let _ = generate_run_speculative(
+                &config,
+                &weights,
+                &tokenizer,
+                &prompt_token_ids,
+                max_tokens,
+                &mut warm,
+                gamma,
+            )?;
+        }
+        camelid::inference::reset_stage_timings();
+        // Single-model baseline: clear any reserve a warmup drafter set so the denominator is a
+        // full-resident target, not one that left room for a draft.
+        camelid::inference::set_spec_coexist_reserve(0);
+        let plain = generate_run(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            &sampler,
+            max_tokens,
+        )?;
+        let mut drafter = build_drafter()?;
+        let spec = generate_run_speculative(
             &config,
             &weights,
             &tokenizer,
             &prompt_token_ids,
             max_tokens,
-            &mut warm,
+            &mut drafter,
             gamma,
         )?;
-    }
-
-    camelid::inference::reset_stage_timings();
-
-    // Plain greedy baseline (S_sync denominator + lossless reference stream).
-    let plain = generate_run(
-        &config,
-        &weights,
-        &tokenizer,
-        &prompt_token_ids,
-        &sampler,
-        max_tokens,
-    )?;
+        (plain, spec)
+    };
     let plain_decode_tokens = plain.generated.len().saturating_sub(1);
     let plain_tps = if plain.decode_ms > 0.0 && plain_decode_tokens > 0 {
         plain_decode_tokens as f64 / (plain.decode_ms / 1000.0)
     } else {
         0.0
     };
-
-    // Speculative run.
-    let mut drafter = build_drafter()?;
-    let spec = generate_run_speculative(
-        &config,
-        &weights,
-        &tokenizer,
-        &prompt_token_ids,
-        max_tokens,
-        &mut drafter,
-        gamma,
-    )?;
     let spec_decode_tokens = spec.generated.len().saturating_sub(1);
     let spec_tps = if spec.decode_ms > 0.0 && spec_decode_tokens > 0 {
         spec_decode_tokens as f64 / (spec.decode_ms / 1000.0)
@@ -2688,6 +2743,7 @@ fn run_bench_speculative(
         quantization: infer_quantization(&model),
         drafter: drafter_kind,
         cpu_draft,
+        spec_only,
         draft_tokens: gamma,
         prompt_tokens,
         max_tokens,
@@ -2724,14 +2780,16 @@ fn run_bench_speculative(
         handle.flush()?;
     }
     eprintln!(
-        "[bench-speculative] {} | {} γ={} | accept {:.1}% | tok/round {:.2} | f_draft {:.3} | \
-         plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | gpu/cpu verify {}/{} | drafted {} rounds {}",
+        "[bench-speculative] {} | {} γ={}{} | accept {:.1}% | tok/round {:.2} | f_draft {:.3} | \
+         draft {:.1} ms/tok | plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | gpu/cpu verify {}/{} | drafted {} rounds {}",
         record.workload,
         record.drafter,
         record.draft_tokens,
+        if record.spec_only { " spec-only" } else { "" },
         record.accept_rate * 100.0,
         record.mean_accepted_tokens_per_round,
         record.f_draft,
+        if record.drafted > 0 { record.draft_ms / record.drafted as f64 } else { 0.0 },
         record.plain_tokens_per_second,
         record.spec_tokens_per_second,
         record.s_sync,
