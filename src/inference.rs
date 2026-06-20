@@ -1674,12 +1674,12 @@ impl LlamaInferenceSession {
             + blk(self.weights.output_projection())
     }
 
-    /// GPU KV-cache cost per position in bytes (f32 K and V across every layer).
+    /// GPU KV-cache cost per position in bytes (f16 K and V across every layer).
     #[cfg(feature = "cuda")]
     pub fn resident_kv_bytes_per_pos(&self) -> u64 {
         match DenseLlamaDims::from_config(&self.config) {
             Ok(dims) => {
-                (self.weights.layers.len() * dims.attention_head_count_kv * dims.head_dim * 2 * 4)
+                (self.weights.layers.len() * dims.attention_head_count_kv * dims.head_dim * 2 * 2)
                     as u64
             }
             Err(_) => 0,
@@ -9758,14 +9758,15 @@ fn build_resident_cuda_engine(
     // VRAM-driven resident-context sizing (portability, not hardcoded to any card):
     //   resident weights are uploaded once and live for the engine's lifetime; the
     //   GPU KV cache is allocated once at `cap` positions, costing
-    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 4(f32) each. Size the
+    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 2(f16 bits) each. Size the
     //   cap so weights + KV + a scratch/headroom reserve fit in *detected free* VRAM:
     //     cap = min(requested, (free_vram − weights − headroom) / kv_bytes_per_pos)
     //   On a 6 GB card this stays conservative; on a 24 GB card it grows automatically
     //   to a long context. If even the floor (256) cannot fit, return None so the
     //   caller runs the model on the CPU path rather than oversubscribing VRAM.
     const MIN_RESIDENT_CONTEXT: usize = 256;
-    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 4) as u64;
+    // f16 KV: 2 bytes per element (K and V), see cuda_resident's u16 cache.
+    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 2) as u64;
     let weights_bytes: u64 = weights.layers[range.clone()]
         .iter()
         .flat_map(|l| {

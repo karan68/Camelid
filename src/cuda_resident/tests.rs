@@ -941,6 +941,22 @@ fn attention_decode_matches_cpu() {
             }
         }
     }
+    // The GPU KV cache stores f16 bits, so round the reference K/V through f16 (the real path
+    // does this in kv_scatter) and upload the bits — then GPU and CPU read identical values.
+    for x in cache_k.iter_mut() {
+        *x = crate::inference::f16_bits_to_f32(crate::inference::f32_to_f16_bits(*x));
+    }
+    for x in cache_v.iter_mut() {
+        *x = crate::inference::f16_bits_to_f32(crate::inference::f32_to_f16_bits(*x));
+    }
+    let cache_k_bits: Vec<u16> = cache_k
+        .iter()
+        .map(|&x| crate::inference::f32_to_f16_bits(x))
+        .collect();
+    let cache_v_bits: Vec<u16> = cache_v
+        .iter()
+        .map(|&x| crate::inference::f32_to_f16_bits(x))
+        .collect();
     // CPU reference
     let mut expected = vec![0f32; n_heads * head_dim];
     for head in 0..n_heads {
@@ -972,8 +988,8 @@ fn attention_decode_matches_cpu() {
     }
     // GPU
     let dq = k.stream.clone_htod(&q).unwrap();
-    let dk = k.stream.clone_htod(&cache_k).unwrap();
-    let dv = k.stream.clone_htod(&cache_v).unwrap();
+    let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
+    let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
     let mut dout = k.stream.alloc_zeros::<f32>(n_heads * head_dim).unwrap();
     let (nh, nkv, hd, mp) = (n_heads as i32, n_kv as i32, head_dim as i32, max_pos as i32);
     // The kernel reads position from device memory and uses position_count = pos+1.
