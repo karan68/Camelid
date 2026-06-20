@@ -22,6 +22,10 @@ use camelid::{
     gguf::{read_metadata, GgufTensorType},
     ghost::{GhostFile, GhostPrefetcher},
     inference::{
+        speculative::{
+            accepted_draft_prefix, ModelDrafter, NGramDrafter, SpeculativeDrafter,
+            DEFAULT_MODEL_DRAFT_TOKENS, DEFAULT_NGRAM_DRAFT_TOKENS,
+        },
         LlamaForwardTimings, LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights,
         LlamaSampler, Q8ResidencyReport, SamplingConfig,
     },
@@ -719,6 +723,48 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
+    /// SPEC_RECHECK measurement harness: run lossless greedy speculative decode and a plain
+    /// greedy baseline back-to-back on one prompt, and emit a single JSON record with the
+    /// per-run economics (acceptance rate, draft/verify latency split, f_draft, S_sync) plus
+    /// the lossless verdict (the spec token stream's first divergence vs Camelid plain greedy).
+    /// Default off; moves no support ledger; reuses the existing drafters + GPU verify.
+    BenchSpeculative {
+        /// Target GGUF model path (the model whose output must be reproduced exactly).
+        model: PathBuf,
+        /// Drafter: "ngram" (prompt lookup, no draft model) or "draft" (a smaller
+        /// same-tokenizer model; requires --draft-model).
+        #[arg(long, default_value = "ngram")]
+        drafter: String,
+        /// Draft model GGUF for --drafter draft. Must share the target's token mapping.
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
+        /// Drafted tokens per round (γ). Capped at MAX_VERIFY_K - 1 = 7 by the verify path.
+        #[arg(long)]
+        draft_tokens: Option<usize>,
+        /// Force the draft model onto the CPU forward path (Path 3 in SPEC_RECHECK). Default
+        /// leaves the draft GPU-resident (its own drafter cache), falling back to CPU only if
+        /// it does not fit in VRAM.
+        #[arg(long, default_value_t = false)]
+        cpu_draft: bool,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Workload label recorded in the JSON (e.g. "code", "json", "extraction").
+        #[arg(long, default_value = "unlabeled")]
+        workload: String,
+        /// Maximum tokens to generate (fixed per workload for a reproducible matrix).
+        #[arg(long, default_value_t = 128)]
+        max_tokens: usize,
+        /// Run one unmeasured warmup pair before the measured run.
+        #[arg(long, default_value_t = false)]
+        warmup: bool,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// EXPERIMENTAL ghost (layer-streaming) mode: execute a model one transformer block at
     /// a time, streaming each block's weights from a layer-contiguous `.cghost` file
     /// (see the `repack-ghost` tool) and holding only a one-layer working window plus the
@@ -1381,6 +1427,33 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 temperature,
                 iterations,
+                warmup,
+                threads,
+            )?;
+        }
+        Command::BenchSpeculative {
+            model,
+            drafter,
+            draft_model,
+            draft_tokens,
+            cpu_draft,
+            prompt_file,
+            prompt,
+            workload,
+            max_tokens,
+            warmup,
+            threads,
+        } => {
+            run_bench_speculative(
+                model,
+                drafter,
+                draft_model,
+                draft_tokens,
+                cpu_draft,
+                prompt_file,
+                prompt,
+                workload,
+                max_tokens,
                 warmup,
                 threads,
             )?;
@@ -2212,6 +2285,484 @@ fn run_bench_generate(
     // Per-stage CPU decode profile (no-op unless CAMELID_STAGE_TIMINGS=1).
     camelid::inference::dump_stage_timings();
     Ok(())
+}
+
+/// One full speculative generation, instrumented for SPEC_RECHECK economics. Mirrors the
+/// server's accept/verify/rollback loop (`api::generate`): a normal greedy first step seeds
+/// the resident engine, then each round drafts ≤γ tokens, verifies them in ONE batched
+/// forward (`verify_drafts_gpu` on the resident GPU, else the CPU chunk verify), accepts the
+/// longest confirmed prefix plus the target's own next token, and rolls the rest back. Every
+/// emitted token is the target's greedy argmax — lossless by construction. The draft and
+/// verify spans are timed separately so f_draft = draft / (draft + verify) is observable.
+struct SpeculativeRun {
+    generated: Vec<u32>,
+    prefill_ms: f64,
+    ttft_ms: f64,
+    decode_ms: f64,
+    rounds: u64,
+    drafted: u64,
+    accepted_drafts: u64,
+    draft_us: u128,
+    verify_us: u128,
+    /// Single-token plain steps taken when the drafter proposed nothing (no n-gram match).
+    normal_steps: u64,
+    gpu_verify_rounds: u64,
+    cpu_verify_rounds: u64,
+}
+
+fn generate_run_speculative(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    tokenizer: &Tokenizer,
+    prompt_tokens: &[u32],
+    max_tokens: usize,
+    drafter: &mut SpeculativeDrafter,
+    draft_tokens: usize,
+) -> anyhow::Result<SpeculativeRun> {
+    let mut session = LlamaInferenceSession::new(config.clone(), weights.clone())?;
+    // Keep the target on the resident GPU path so verify_drafts_gpu engages (this mirrors
+    // the server with CAMELID_SPEC_GPU on); resident decode is the default when a CUDA
+    // device is present, so this is the natural state, asserted explicitly here.
+    session.set_resident_paths_disabled(false);
+
+    let mut history: Vec<u32> = prompt_tokens.to_vec();
+    let mut input: Vec<u32> = prompt_tokens.to_vec();
+    let mut generated: Vec<u32> = Vec::new();
+
+    // TTFT span: prefill + first token. This normal step also seeds the resident engine.
+    let ttft_start = Instant::now();
+    let step = session.generate_next_token_with_history_diagnostics(
+        &input,
+        LlamaSampler::Greedy,
+        &history,
+        false,
+    )?;
+    let ttft_ms = ttft_start.elapsed().as_secs_f64() * 1000.0;
+    let prefill_ms = step.prefill_timings.total as f64 / 1000.0;
+    let first = step.next_token_id;
+    generated.push(first);
+    history.push(first);
+    let mut finished = tokenizer.special.eog.contains(&first);
+    input.clear();
+    input.push(first);
+
+    let mut run = SpeculativeRun {
+        generated: Vec::new(),
+        prefill_ms,
+        ttft_ms,
+        decode_ms: 0.0,
+        rounds: 0,
+        drafted: 0,
+        accepted_drafts: 0,
+        draft_us: 0,
+        verify_us: 0,
+        normal_steps: 0,
+        gpu_verify_rounds: 0,
+        cpu_verify_rounds: 0,
+    };
+
+    let decode_start = Instant::now();
+    while !finished && generated.len() < max_tokens {
+        let remaining = max_tokens.saturating_sub(generated.len());
+        let context_room = session.remaining_context();
+        let budget = draft_tokens
+            .min(remaining.saturating_sub(1))
+            .min(context_room.saturating_sub(1));
+        let draft_started = Instant::now();
+        let drafts = if budget > 0 && context_room > 0 {
+            drafter.draft(&history, budget)?
+        } else {
+            Vec::new()
+        };
+        run.draft_us += draft_started.elapsed().as_micros();
+
+        if drafts.is_empty() {
+            // No draft proposed → one plain resident greedy step (same path the plain
+            // baseline takes), so a config that never drafts measures as plain decode.
+            let step_started = Instant::now();
+            let next = match session.generate_next_token_greedy_resident(input[0])? {
+                Some((id, _us)) => id,
+                None => {
+                    session
+                        .generate_next_token_with_history_diagnostics(
+                            &input,
+                            LlamaSampler::Greedy,
+                            &history,
+                            false,
+                        )?
+                        .next_token_id
+                }
+            };
+            run.verify_us += step_started.elapsed().as_micros();
+            run.normal_steps += 1;
+            generated.push(next);
+            history.push(next);
+            if tokenizer.special.eog.contains(&next) {
+                finished = true;
+            }
+            input.clear();
+            input.push(*generated.last().expect("just pushed a token"));
+            continue;
+        }
+
+        // Verify all drafts in one batched forward: GPU resident when ready, else the CPU
+        // chunk verify with an explicit KV rollback. Both are lossless — the emitted tokens
+        // are the target's own greedy argmax given the accepted prefix.
+        let verify_started = Instant::now();
+        let emitted: Vec<u32> = match session.verify_drafts_gpu(input[0], &drafts)? {
+            Some(accepted) => {
+                run.gpu_verify_rounds += 1;
+                run.rounds += 1;
+                run.drafted += drafts.len() as u64;
+                run.accepted_drafts += (accepted.len() as u64).saturating_sub(1);
+                accepted
+            }
+            None => {
+                let base_position = session.kv_position();
+                let mut batch = Vec::with_capacity(1 + drafts.len());
+                batch.push(input[0]);
+                batch.extend_from_slice(&drafts);
+                let (predictions, _timings) = session.forward_greedy_verify_chunk(&batch)?;
+                let accepted = accepted_draft_prefix(&drafts, &predictions);
+                session.rollback_to_position(base_position + 1 + accepted)?;
+                run.cpu_verify_rounds += 1;
+                run.rounds += 1;
+                run.drafted += drafts.len() as u64;
+                run.accepted_drafts += accepted as u64;
+                predictions[..=accepted].to_vec()
+            }
+        };
+        run.verify_us += verify_started.elapsed().as_micros();
+
+        for token in emitted {
+            if generated.len() >= max_tokens {
+                break;
+            }
+            generated.push(token);
+            history.push(token);
+            if tokenizer.special.eog.contains(&token) {
+                finished = true;
+                break;
+            }
+        }
+        input.clear();
+        input.push(*generated.last().expect("a round emits at least one token"));
+    }
+    run.decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    run.generated = generated;
+    Ok(run)
+}
+
+#[derive(Serialize)]
+struct BenchSpeculativeRecord {
+    runtime: &'static str,
+    commit: String,
+    workload: String,
+    model: String,
+    draft_model: Option<String>,
+    quantization: String,
+    drafter: String,
+    cpu_draft: bool,
+    draft_tokens: usize,
+    prompt_tokens: usize,
+    max_tokens: usize,
+
+    // Plain greedy baseline (this run, same target, same machine).
+    plain_generated_tokens: usize,
+    plain_ttft_ms: f64,
+    plain_decode_ms: f64,
+    plain_tokens_per_second: f64,
+
+    // Speculative run.
+    spec_generated_tokens: usize,
+    spec_ttft_ms: f64,
+    spec_decode_ms: f64,
+    spec_tokens_per_second: f64,
+
+    // Economics.
+    rounds: u64,
+    drafted: u64,
+    accepted_drafts: u64,
+    accept_rate: f64,
+    mean_accepted_tokens_per_round: f64,
+    draft_ms: f64,
+    verify_ms: f64,
+    /// draft / (draft + verify): the fraction of round time spent drafting. The Phase-4
+    /// decision gate turns on this — ~0 for n-gram (nothing to hide with concurrency).
+    f_draft: f64,
+    /// Synchronous speedup over this machine's own plain greedy decode (spec t/s ÷ plain t/s).
+    s_sync: f64,
+    normal_steps: u64,
+    gpu_verify_rounds: u64,
+    cpu_verify_rounds: u64,
+
+    // Lossless gate (intra-Camelid: spec stream vs this run's plain greedy stream).
+    first_divergent_generated_token_index: i64,
+    lossless: bool,
+
+    peak_memory_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offload: Option<camelid::offload::OffloadRunStatus>,
+}
+
+/// Load a draft GGUF and wrap it as a `ModelDrafter`. Mirrors the target load path so the
+/// draft rides the same execution plan; the drafter routes to its own resident cache.
+fn load_model_drafter(
+    path: &std::path::Path,
+    target_tokenizer: &Tokenizer,
+    cpu_draft: bool,
+    threads: Option<usize>,
+) -> anyhow::Result<SpeculativeDrafter> {
+    let gguf = read_metadata(path)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(path, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(path, &gguf);
+    let draft_tokenizer = Tokenizer::from_gguf(&gguf)?;
+    // Drafted token ids must mean the same text in the target vocabulary. Lossless either
+    // way (the verify is authoritative), but a mismatched vocab silently drives accept to ~0.
+    anyhow::ensure!(
+        draft_tokenizer.model == target_tokenizer.model,
+        "draft model tokenizer ({:?}) differs from target ({:?}); drafted ids would not share \
+         the target vocabulary",
+        draft_tokenizer.model,
+        target_tokenizer.model
+    );
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let mut session = LlamaInferenceSession::new(config, weights)?;
+    if cpu_draft {
+        // Path 3 (SPEC_RECHECK): force the draft onto the CPU forward (the previously
+        // "blocked" configuration). Otherwise the draft stays GPU-resident by default.
+        session.set_resident_paths_disabled(true);
+    }
+    Ok(SpeculativeDrafter::Model(Box::new(ModelDrafter::new(session))))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_speculative(
+    model: PathBuf,
+    drafter_kind: String,
+    draft_model: Option<PathBuf>,
+    draft_tokens: Option<usize>,
+    cpu_draft: bool,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    workload: String,
+    max_tokens: usize,
+    warmup: bool,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    configure_rayon_threads(threads)?;
+    camelid::capability::HardwareProfile::detect().log();
+
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    // Load the target exactly as bench-generate does (execution plan applied before weights).
+    let gguf = read_metadata(&model)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    let prompt_tokens = prompt_token_ids.len();
+    anyhow::ensure!(prompt_tokens >= 1, "prompt encoded to zero tokens");
+
+    let gamma = draft_tokens.unwrap_or(match drafter_kind.as_str() {
+        "draft" => DEFAULT_MODEL_DRAFT_TOKENS,
+        _ => DEFAULT_NGRAM_DRAFT_TOKENS,
+    });
+
+    let build_drafter = || -> anyhow::Result<SpeculativeDrafter> {
+        match drafter_kind.as_str() {
+            "ngram" => Ok(SpeculativeDrafter::NGram(NGramDrafter::default())),
+            "draft" => {
+                let path = draft_model.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--drafter draft requires --draft-model <gguf>")
+                })?;
+                load_model_drafter(path, &tokenizer, cpu_draft, threads)
+            }
+            other => anyhow::bail!("unknown --drafter {other:?}; expected \"ngram\" or \"draft\""),
+        }
+    };
+
+    let sampler = LlamaSampler::Greedy;
+
+    if warmup {
+        eprintln!("[bench-speculative] warmup (unmeasured)...");
+        let _ = generate_run(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            &sampler,
+            max_tokens,
+        )?;
+        let mut warm = build_drafter()?;
+        let _ = generate_run_speculative(
+            &config,
+            &weights,
+            &tokenizer,
+            &prompt_token_ids,
+            max_tokens,
+            &mut warm,
+            gamma,
+        )?;
+    }
+
+    camelid::inference::reset_stage_timings();
+
+    // Plain greedy baseline (S_sync denominator + lossless reference stream).
+    let plain = generate_run(
+        &config,
+        &weights,
+        &tokenizer,
+        &prompt_token_ids,
+        &sampler,
+        max_tokens,
+    )?;
+    let plain_decode_tokens = plain.generated.len().saturating_sub(1);
+    let plain_tps = if plain.decode_ms > 0.0 && plain_decode_tokens > 0 {
+        plain_decode_tokens as f64 / (plain.decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    // Speculative run.
+    let mut drafter = build_drafter()?;
+    let spec = generate_run_speculative(
+        &config,
+        &weights,
+        &tokenizer,
+        &prompt_token_ids,
+        max_tokens,
+        &mut drafter,
+        gamma,
+    )?;
+    let spec_decode_tokens = spec.generated.len().saturating_sub(1);
+    let spec_tps = if spec.decode_ms > 0.0 && spec_decode_tokens > 0 {
+        spec_decode_tokens as f64 / (spec.decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+
+    // Lossless gate: first index where the spec stream diverges from plain greedy (-1 if the
+    // two streams are identical). A positive cell with any divergence is a correctness bug.
+    let first_divergent = first_divergence(&spec.generated, &plain.generated);
+
+    let accept_rate = if spec.drafted > 0 {
+        spec.accepted_drafts as f64 / spec.drafted as f64
+    } else {
+        0.0
+    };
+    // Each verify round emits accepted drafts + 1 bonus token.
+    let mean_accepted_tokens_per_round = if spec.rounds > 0 {
+        (spec.accepted_drafts + spec.rounds) as f64 / spec.rounds as f64
+    } else {
+        0.0
+    };
+    let draft_ms = spec.draft_us as f64 / 1000.0;
+    let verify_ms = spec.verify_us as f64 / 1000.0;
+    let f_draft = if draft_ms + verify_ms > 0.0 {
+        draft_ms / (draft_ms + verify_ms)
+    } else {
+        0.0
+    };
+    let s_sync = if plain_tps > 0.0 { spec_tps / plain_tps } else { 0.0 };
+
+    let record = BenchSpeculativeRecord {
+        runtime: "camelid",
+        commit: std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string()),
+        workload,
+        model: model.display().to_string(),
+        draft_model: draft_model.as_ref().map(|p| p.display().to_string()),
+        quantization: infer_quantization(&model),
+        drafter: drafter_kind,
+        cpu_draft,
+        draft_tokens: gamma,
+        prompt_tokens,
+        max_tokens,
+        plain_generated_tokens: plain.generated.len(),
+        plain_ttft_ms: plain.ttft_ms,
+        plain_decode_ms: plain.decode_ms,
+        plain_tokens_per_second: plain_tps,
+        spec_generated_tokens: spec.generated.len(),
+        spec_ttft_ms: spec.ttft_ms,
+        spec_decode_ms: spec.decode_ms,
+        spec_tokens_per_second: spec_tps,
+        rounds: spec.rounds,
+        drafted: spec.drafted,
+        accepted_drafts: spec.accepted_drafts,
+        accept_rate,
+        mean_accepted_tokens_per_round,
+        draft_ms,
+        verify_ms,
+        f_draft,
+        s_sync,
+        normal_steps: spec.normal_steps,
+        gpu_verify_rounds: spec.gpu_verify_rounds,
+        cpu_verify_rounds: spec.cpu_verify_rounds,
+        first_divergent_generated_token_index: first_divergent,
+        lossless: first_divergent < 0,
+        peak_memory_bytes: peak_rss_bytes(),
+        offload: camelid::offload::offload_run_status(),
+    };
+
+    let stdout = std::io::stdout();
+    {
+        let mut handle = stdout.lock();
+        writeln!(handle, "{}", serde_json::to_string(&record)?)?;
+        handle.flush()?;
+    }
+    eprintln!(
+        "[bench-speculative] {} | {} γ={} | accept {:.1}% | tok/round {:.2} | f_draft {:.3} | \
+         plain {:.2} t/s → spec {:.2} t/s | S_sync {:.2}x | {} | gpu/cpu verify {}/{} | drafted {} rounds {}",
+        record.workload,
+        record.drafter,
+        record.draft_tokens,
+        record.accept_rate * 100.0,
+        record.mean_accepted_tokens_per_round,
+        record.f_draft,
+        record.plain_tokens_per_second,
+        record.spec_tokens_per_second,
+        record.s_sync,
+        if record.lossless {
+            "LOSSLESS ✓".to_string()
+        } else {
+            format!("DIVERGED @ {}", record.first_divergent_generated_token_index)
+        },
+        record.gpu_verify_rounds,
+        record.cpu_verify_rounds,
+        record.drafted,
+        record.rounds,
+    );
+    Ok(())
+}
+
+/// First index at which `a` and `b` differ, or `-1` if one is a prefix of the other AND they
+/// are the same length (i.e. identical). Differing lengths count as a divergence at the
+/// shorter length — for the lossless gate, two greedy streams must be byte-identical.
+fn first_divergence(a: &[u32], b: &[u32]) -> i64 {
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        if a[i] != b[i] {
+            return i as i64;
+        }
+    }
+    if a.len() == b.len() {
+        -1
+    } else {
+        n as i64
+    }
 }
 
 /// Best-effort quantization label from the GGUF filename.
