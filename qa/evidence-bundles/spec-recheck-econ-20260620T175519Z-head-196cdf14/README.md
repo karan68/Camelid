@@ -1,4 +1,4 @@
-# SPEC_RECHECK Phase 1–2 — where lossless speculation pays on this machine
+# SPEC_RECHECK Phase 1–4 — where lossless speculation pays on this machine
 
 Date (UTC): 2026-06-20
 Machine: RTX 3060 Laptop GPU (GA106, CC 8.6, 6 GB GDDR6, ~5.0 GiB free), i7-11800H (8C/16T,
@@ -8,7 +8,7 @@ harness below; serving paths byte-for-byte unchanged — speculation is default-
 support-ledger row)
 Target model: Qwen3-4B-Q8_0 (GPU-resident, all 36 layers in VRAM)
 Draft model (Path B): Qwen3-0.6B-Q8_0 (same tokenizer family)
-Competitor (Phase 3, not run here — see scope): llama.cpp `llama-speculative` pinned `acd79d6`
+Competitor (Phase 3, run): llama.cpp `llama-speculative` pinned `acd79d6` (`-ngl 99 -ngld 99`)
 
 ## Scope of this run
 
@@ -20,8 +20,10 @@ SPEED_CAMPAIGN skipped**, on the one draft/target pair that is fully local:
 - **Path B — GPU-resident draft model** (`ModelDrafter`, Qwen3-0.6B → 4B): the path the prior
   campaign forced CPU-only. Focused matrix (see Path B for why the γ sweep is reduced).
 
-Out of scope here (needs the multi-GB downloads — the "full matrix" option): Phase 3 head-to-head
-vs llama.cpp-speculative, the Llama cross-tokenizer-family pair, and the Qwen3-8B target.
+Phase 3 head-to-head vs llama.cpp-speculative IS run here too — it needs only the local Qwen3 pair
+(`llama-speculative` keeps both models resident), so no download was required after all. Out of
+scope (needs the multi-GB downloads — the "full matrix" option): the Llama cross-tokenizer-family
+pair and the Qwen3-8B target.
 
 ## Method (the harness)
 
@@ -105,10 +107,15 @@ regression on prose at γ≤4. Shippable as-is.
 The accept rate is **excellent (92.5%, well above n-gram's 84% on code)** — the 0.6B predicts the
 4B very well. But S_sync is **0.10×** — a 10× *slowdown* — because the draft costs ~253 ms per
 draft-token (`f_draft 0.90`). The forced-CPU control is **identical**, which proves the default
-"GPU-resident" draft is **not actually resident on this 6 GB box**: the 4B target's resident
-engine + KV saturate VRAM (≈5.0 GiB free, 4B≈4.3 GiB + 0.6B≈0.6 GiB + KV), so the draft silently
-falls back to the same slow CPU forward. The draft is draft-bound, and because the draft is
-sequential, more γ only makes it worse — so the S_sync verdict is γ-insensitive and negative.
+"GPU-resident" draft is **not actually resident** — it silently runs the same slow CPU forward.
+The draft is draft-bound, and because the draft is sequential, more γ only makes it worse — so the
+S_sync verdict is γ-insensitive and negative.
+
+> **Correction (from Phase 3):** this is a **Camelid implementation gap, not a 6 GB VRAM wall.**
+> llama.cpp's `llama-speculative` runs the *same* 0.6B draft + 4B target **both fully GPU-resident
+> on this identical box** (`-ngl 99 -ngld 99`) and gets a 1.4–2.0× spec win (Phase 3). So both
+> models *do* fit resident on 6 GB; Camelid's draft session just fails to claim GPU residency and
+> falls back to CPU. Fixing that — not concurrency — is the real lever (see Phase 4).
 
 ### Focused matrix — 6 workloads × γ{2,4} (12 cells, ALL LOSSLESS ✓)
 
@@ -164,7 +171,45 @@ Inherited from the parity-locked verify, asserted per config here.
 
 ---
 
-## Phase 4 — decision: do NOT build the Bactrian concurrent pipeline; ship synchronous n-gram
+## Phase 3 — head-to-head vs llama.cpp speculative decode (RUN; local Qwen3 pair)
+
+`llama-speculative` @ `acd79d6` on the **same prompt files**, greedy/lossless, both models
+GPU-resident (`-ngl 99 -ngld 99 --spec-draft-n-max 8 -c 2048`), 128 tok, median of 3 reps (very
+low variance). Camelid column = its best path per workload (n-gram everywhere — the draft-model
+path is draft-bound, so it never wins). llama raw 4B = 54.5 t/s (llama-bench, `-fa1`).
+
+| workload | Camelid best | Camelid t/s | llama-spec t/s | **Camelid / llama** | Cam accept | llama accept | llama-spec / llama-raw |
+|---|---|---|---|---|---|---|---|
+| code | n-gram γ=2 | 50.2 | 97.8 | **0.51×** | 84% | 68% | 1.79× |
+| json | n-gram γ=4 | 47.5 | 108.7 | **0.44×** | 65% | 79% | 1.99× |
+| extraction | n-gram γ=2 | 32.5 | 76.2 | **0.43×** | 46% | 52% | 1.40× |
+| chat | n-gram γ=4 | 32.1 | 49.5 | **0.65×** | 50% | 28% | 0.91× |
+| creative | n-gram γ=2 | 31.7 | 37.7 | **0.84×** | 0% | 18% | 0.69× |
+| adversarial | n-gram γ=2 | 32.6 | 45.3 | **0.72×** | 54% | 25% | 0.83× |
+
+### Reading it
+
+- **Camelid-spec loses every workload, 0.43–0.84×.** As the spec predicted, synchronous
+  speculation does not close the head-to-head — the ~0.73× base-kernel deficit scales through and,
+  on structured text, *compounds* with llama's bigger spec multiplier.
+- **llama's winning lever is the GPU-resident draft model** it gets 1.79× (code) / 1.99× (json) /
+  1.40× (extraction) because its 0.6B drafts on-GPU at ~free cost with good accept. This is exactly
+  the path Camelid's implementation fails to realize on the identical box (Path B). The
+  head-to-head is **worst where only a model drafter helps** (structured: 0.43–0.51×).
+- **Camelid's n-gram is regression-safe; llama's draft-model spec is not.** On my high-entropy
+  prose prompts llama's draft accept collapses (creative 18%, adversarial 25%) and its spec drops
+  **below its own raw decode** (creative 0.69×, chat 0.91×, adversarial 0.83×) — the draft cost
+  isn't recovered. Camelid's n-gram simply drafts nothing on novel text and decays to plain decode
+  (creative 0% accept → 0.84× of llama, the narrowest gap), never regressing. A small but real
+  robustness edge — though Camelid still loses on absolute t/s everywhere because of the base
+  kernel.
+
+**Gate 3:** no cell where Camelid-spec ≥ llama.cpp-spec. Closest is creative (0.84×), and only
+because llama's own spec self-regressed there. No head-to-head win, synchronous, on any workload.
+
+---
+
+## Phase 4 — decision
 
 Decided from the data, per the SPEC_RECHECK decision gate:
 
@@ -183,25 +228,35 @@ overlap lands at the draft time → ~0.1× of plain. Concurrency cannot turn a 1
 win while the draft is this slow. This reconfirms SPEED_CAMPAIGN Phase 4 — now from the
 previously-skipped GPU-resident draft path, which on 6 GB is not actually resident.
 
-**3. What would change the answer (flagged, not built — both pre-existing workstreams):** the
-draft *accept rate* is already excellent (75–92% structured), so the model drafter's *quality* is
-not the problem. Two prerequisites would have to land first, in order: (a) the draft must actually
-run fast — either GPU-resident on a GPU with VRAM for both models (≥~12 GB), or a much faster CPU
-draft kernel (the CPU-perf mission: AVX2/VNNI + more threads, ~5–10× headroom exists); **and**
-(b) a leaner `verify_batch` (the γ≥6 n-gram regression shows the batched verify is heavier than a
-single resident decode). Only once draft ≲ verify does concurrency have anything to overlap. Until
-both hold, Bactrian is premature.
+**3. The real unlock is GPU-resident drafting — NOT concurrency — and Phase 3 proves it is
+reachable on this exact box.** The draft *accept rate* is already excellent (75–92% structured),
+so the model drafter's *quality* is not the problem; its *throughput* is, and only because
+Camelid's draft session fails to claim GPU residency and falls to CPU. llama.cpp runs the same
+0.6B+4B **both resident on this same 6 GB GPU** (`-ngld 99`) and turns that into a real 1.4–2.0×
+spec win across structured *and* (modestly) prose. So the highest-value next step is **fixing
+Camelid's resident draft-model path** (find why the drafter engine doesn't go resident and make it
+behave like `-ngld 99`), which yields a ~free, high-accept draft *synchronously* — no concurrency
+needed, and it would help every workload (not just structured, where n-gram is capped). A leaner
+`verify_batch` (the γ≥6 n-gram regression shows the batched verify is heavier than one resident
+decode) is the secondary lever. Bactrian (CPU-draft/GPU-verify overlap) is the *wrong* lever:
+llama.cpp wins with a resident draft and serialized draft-then-verify, no overlap at all.
 
-**4. Head-to-head vs llama.cpp (Phase 3) — not run (out of local scope), expectation stated.**
-Camelid raw decode is ~0.73× llama.cpp (Phase 3 roofline). Synchronous n-gram at 1.26× × 0.73 ≈
-**0.92×** of an equivalent llama.cpp prompt-lookup run — so synchronous Camelid-spec most likely
-does **not** win the head-to-head, exactly as the spec predicts. The only lever that could is the
-concurrent overlap, which §2 shows is not reachable here. No head-to-head win is claimed.
+**4. Head-to-head vs llama.cpp (Phase 3) — RUN; Camelid does not win.** Camelid-spec lands
+**0.43–0.84×** of llama.cpp-spec on every workload (full table above), confirming the spec's
+expectation: the ~0.73× base-kernel deficit scales through and, on structured text, compounds with
+llama's larger (resident-draft) multiplier. No synchronous head-to-head win on any cell. The lever
+that could change it is §3 (resident drafting + leaner verify + the base-kernel/roofline work),
+not the concurrent overlap.
 
 ### Honest ceilings / caveats
 
 - Single draft/target pair (Qwen3-0.6B→4B), single box. The Llama cross-family pair and Qwen3-8B
-  target were not downloaded; Phase 3 not run. These are the "full matrix" option, deferred.
+  target were not downloaded. These are the "full matrix" option, deferred.
+- Phase 3 prompts are byte-identical across engines; token *streams* are not (each engine is
+  lossless vs its OWN greedy — a speed comparison at matched settings, not an identical-output
+  claim). llama reps had very low variance; Camelid per-cell plain t/s varies 31–40 (laptop clock
+  drift across the ~12-min run), so head-to-head ratios carry ~±a few % from clock noise — far
+  inside the 0.43–0.84× verdict.
 - Laptop GPU clocks are unpinned (thermal drift). The verdicts (n-gram +25%, draft −90%) are far
   outside any clock noise; the exact tok/s digits are not pinned-clock numbers.
 - "extraction" here is format-repetitive but content-novel; n-gram's low score on it is a property
@@ -216,10 +271,13 @@ concurrent overlap, which §2 shows is not reachable here. No head-to-head win i
 
 - `prompts/*.txt` — the 6 fixed workload prompts (raw continuations).
 - `workloads.md` — workload manifest (all `max_tokens=128`, greedy, `--warmup`).
-- `run_matrix.sh` — driver: `run_matrix.sh <ngram|draft-gpu|draft-cpu> ["<γ list>"]`.
-- `analyze.mjs` — renders the matrices from `results/*.jsonl`.
-- `results/ngram.jsonl` (24), `results/draft-gpu.jsonl` (12) — one JSON record per cell.
-- `results/matrices.md` — rendered S_sync / accept-rate / detail tables.
+- `run_matrix.sh` — Camelid driver: `run_matrix.sh <ngram|draft-gpu|draft-cpu> ["<γ list>"]`.
+- `phase3_llama_spec.sh` — Phase 3 driver: runs `llama-speculative` on the same prompts.
+- `analyze.mjs` — renders the Camelid matrices from `results/*.jsonl`.
+- `results/ngram.jsonl` (24), `results/draft-gpu.jsonl` (12) — one Camelid JSON record per cell.
+- `results/phase3-llama-spec.jsonl` (6) — llama.cpp-speculative per workload (median of 3 reps).
+- `results/matrices.md` — rendered Camelid S_sync / accept-rate / detail tables.
+- `results/headtohead.md` + `.json` — Phase 3 Camelid-vs-llama table.
 
 ## Reproduce
 
@@ -228,6 +286,8 @@ concurrent overlap, which §2 shows is not reachable here. No head-to-head win i
 bash run_matrix.sh ngram "2 4 6 7"
 # GPU-resident draft model (Qwen3-0.6B → 4B)
 bash run_matrix.sh draft-gpu "2 4"
+# Phase 3: llama.cpp-speculative on the same prompts (both models GPU-resident)
+bash phase3_llama_spec.sh
 # single cell:
 CAMELID_COMMIT=$(git rev-parse --short HEAD) camelid.exe bench-speculative \
   Qwen3-4B-Q8_0.gguf --drafter ngram --draft-tokens 4 --workload code \
@@ -239,6 +299,6 @@ CAMELID_COMMIT=$(git rev-parse --short HEAD) camelid.exe bench-speculative \
 - Camelid commit: `feat/bactrian-experimental-fast` @ 196cdf14
 - Target Qwen3-4B-Q8_0 sha256: `8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300`
 - Draft Qwen3-0.6B-Q8_0 sha256: `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`
-- llama.cpp pin (Phase 3, not run): `acd79d603cb2e1c84c0886137b80f1ad649b6857`
+- llama.cpp pin (Phase 3, run): `acd79d603cb2e1c84c0886137b80f1ad649b6857` (`-ngl 99 -ngld 99`)
 - Backend: CUDA 12.9, RTX 3060 Laptop (6 GB), GPU-resident target decode + GPU batched verify.
 
