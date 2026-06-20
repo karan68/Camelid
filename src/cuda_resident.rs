@@ -230,7 +230,7 @@ extern "C" __global__ void rms_norm_quantize(
 extern "C" __global__ void q8_gemv(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
-    float* __restrict__ output
+    float* __restrict__ output, int residual
 ) {
     extern __shared__ unsigned char smem[];
     signed char* s_iq = (signed char*)smem;                          // blocks_per_row*32 i8
@@ -276,7 +276,42 @@ extern "C" __global__ void q8_gemv(
     if (row < rows && lane == 0) {
         float acc = 0.0f;
         for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
-        output[row] = acc;
+        // residual!=0 fuses the post-projection residual add (output += acc), saving a
+        // separate residual_add launch + the f32 projection round-trip. Bit-identical:
+        // output[row] (old hidden) + acc == hidden + projection, the same f32 sum.
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
+// ---- Fused SiLU-gate * up + Q8_0 quantize (F3) ------------------------------
+// One thread per 32-block: compute silu(gate)*up for the block's 32 elements (bit-
+// identical to silu_mul) and quantize them (bit-identical to quantize_q8_0), straight
+// to the down-projection's input — no f32 `ffn_act` round-trip, one fewer launch. No
+// shared memory, so it is not bounded by the FFN width.
+extern "C" __global__ void silu_mul_quantize(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n_blocks
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    float vals[32];
+    float max_abs = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        float g = gate[(long)b * 32 + j];
+        float v = (g / (1.0f + expf(-g))) * up[(long)b * 32 + j];
+        vals[j] = v;
+        float a = fabsf(v);
+        if (a > max_abs) max_abs = a;
+    }
+    float unrounded = max_abs / 127.0f;
+    scales[b] = f16_round(unrounded);
+    float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
+    signed char* qb = quants + (long)b * 32;
+    for (int j = 0; j < 32; j++) {
+        float v = rintf(vals[j] * inv);
+        if (v > 127.0f) v = 127.0f;
+        if (v < -128.0f) v = -128.0f;
+        qb[j] = (signed char)v;
     }
 }
 
@@ -712,6 +747,7 @@ pub struct CudaResidentKernels {
     pub(crate) kv_scatter: CudaFunction,
     pub(crate) attention: CudaFunction,
     pub(crate) silu_mul: CudaFunction,
+    pub(crate) silu_mul_quantize: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
@@ -753,6 +789,7 @@ impl CudaResidentKernels {
             kv_scatter: f("kv_scatter")?,
             attention: f("attention_decode")?,
             silu_mul: f("silu_mul")?,
+            silu_mul_quantize: f("silu_mul_quantize")?,
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
@@ -886,13 +923,72 @@ fn launch_gemv(
         shared_mem_bytes: bpr_u * 36 + warps_per_block * bpr_u * 4,
     };
     let (r, bpr) = (rows as i32, blocks_per_row as i32);
+    let residual = 0i32;
     let mut b = s.launch_builder(f);
     b.arg(in_scales)
         .arg(in_quants)
         .arg(weight)
         .arg(&r)
         .arg(&bpr)
-        .arg(out);
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q8 GEMV that fuses the post-projection residual add: writes `out[row] += acc` instead of
+/// `= acc`, so `out` must be the residual (hidden) buffer. Saves a separate residual_add launch
+/// and the projection's f32 round-trip. Bit-identical to gemv-then-residual_add (F2).
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_residual(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let bpr_u = blocks_per_row as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: bpr_u * 36 + warps_per_block * bpr_u * 4,
+    };
+    let (r, bpr) = (rows as i32, blocks_per_row as i32);
+    let residual = 1i32;
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&bpr)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+// Fused SiLU*up + Q8_0 quantize (F3): one thread per 32-block, no shared memory.
+fn launch_silu_mul_quantize(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n_blocks: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_blocks as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb = n_blocks as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(gate).arg(up).arg(quants).arg(scales).arg(&nb);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -2278,25 +2374,39 @@ impl CudaResidentDecode {
                 qb,
             )
             .map_err(map)?;
-            launch_gemv(
-                &s,
-                &self.k.gemv,
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &wo,
-                self.hidden,
-                qb,
-                &mut self.d_proj,
-            )
-            .map_err(map)?;
-            launch_residual(
-                &s,
-                &self.k.residual_add,
-                &mut self.d_hidden,
-                &self.d_proj,
-                self.hidden,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_gemv_residual(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wo,
+                    self.hidden,
+                    qb,
+                    &mut self.d_hidden,
+                )
+                .map_err(map)?;
+            } else {
+                launch_gemv(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wo,
+                    self.hidden,
+                    qb,
+                    &mut self.d_proj,
+                )
+                .map_err(map)?;
+                launch_residual(
+                    &s,
+                    &self.k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_proj,
+                    self.hidden,
+                )
+                .map_err(map)?;
+            }
             // ffn norm + gate/up + silu + down + residual
             if fused {
                 launch_rmsnorm_quantize(
@@ -2353,43 +2463,70 @@ impl CudaResidentDecode {
                 &mut self.d_up,
             )
             .map_err(map)?;
-            launch_silu_mul(
-                &s,
-                &self.k.silu_mul,
-                &self.d_gate,
-                &self.d_up,
-                &mut self.d_ffn_act,
-                self.ffn_dim,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_ffn_act,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                fb,
-            )
-            .map_err(map)?;
-            launch_gemv(
-                &s,
-                &self.k.gemv,
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &wdown,
-                self.hidden,
-                fb,
-                &mut self.d_proj,
-            )
-            .map_err(map)?;
-            launch_residual(
-                &s,
-                &self.k.residual_add,
-                &mut self.d_hidden,
-                &self.d_proj,
-                self.hidden,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_silu_mul_quantize(
+                    &s,
+                    &self.k.silu_mul_quantize,
+                    &self.d_gate,
+                    &self.d_up,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    fb,
+                )
+                .map_err(map)?;
+            } else {
+                launch_silu_mul(
+                    &s,
+                    &self.k.silu_mul,
+                    &self.d_gate,
+                    &self.d_up,
+                    &mut self.d_ffn_act,
+                    self.ffn_dim,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_ffn_act,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    fb,
+                )
+                .map_err(map)?;
+            }
+            if fused {
+                launch_gemv_residual(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wdown,
+                    self.hidden,
+                    fb,
+                    &mut self.d_hidden,
+                )
+                .map_err(map)?;
+            } else {
+                launch_gemv(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wdown,
+                    self.hidden,
+                    fb,
+                    &mut self.d_proj,
+                )
+                .map_err(map)?;
+                launch_residual(
+                    &s,
+                    &self.k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_proj,
+                    self.hidden,
+                )
+                .map_err(map)?;
+            }
             if offloaded {
                 if let Some(cs) = &copy_stream {
                     // This layer is done reading scratch[cur_buf]: record compute_done so
