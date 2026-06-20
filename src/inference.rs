@@ -9808,14 +9808,45 @@ fn build_resident_cuda_engine(
     // reserve, build the target full-resident (NORMAL headroom), and let the draft fall back to
     // CPU (the prior, lossless behavior). So the resident-draft win is taken only on a GPU big
     // enough to hold BOTH models fully resident (no offload).
-    let normal_headroom = (vocab as u64 * 4) + (512 * 1024 * 1024);
     let raw_reserve = if is_drafter {
         0
     } else {
         spec_coexist_reserve_bytes()
     };
-    let honor_reserve =
-        raw_reserve > 0 && weights_bytes + normal_headroom + min_kv_floor + raw_reserve <= free_probe;
+    // Under speculative coexistence both engines pack onto one card, so the per-engine safety
+    // margin must be much smaller than the 512 MiB a sole engine keeps. Env-tunable because the
+    // dual-resident fit on ~6 GB is on a knife's edge even with f16 KV. Used for BOTH the honor
+    // gate and the per-engine build headroom so sizing and the backstop agree.
+    let coexist_headroom_mb = std::env::var("CAMELID_SPEC_COEXIST_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(64);
+    let coexist_fit_headroom = (vocab as u64 * 4) + (coexist_headroom_mb * 1024 * 1024);
+    // Bounded over-allocation the WDDM driver pages to shared host memory (how llama.cpp fits both
+    // models on a 6 GB card): treat free VRAM as larger by this much for the coexistence sizing.
+    // Default 0 (strict — no spill). Opt in via CAMELID_SPEC_COEXIST_SPILL_MB on a tight card.
+    let coexist_spill = std::env::var("CAMELID_SPEC_COEXIST_SPILL_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        * 1024
+        * 1024;
+    // Effective free VRAM for coexistence sizing (actual free + the permitted spill). Applies to
+    // BOTH the target (raw_reserve > 0) and the draft engine (is_drafter, reserve 0) while a draft
+    // is configured, so the draft also gets the spill room to pack in.
+    let coexist_active = spec_coexist_reserve_bytes() > 0;
+    let free_eff = if coexist_active {
+        free_probe + coexist_spill
+    } else {
+        free_probe
+    };
+    // Honor the reserve only if the target still fits fully resident after it (measured with the
+    // small coexist headroom; the reserve already accounts for the draft's footprint). If not,
+    // drop the reserve and build the target full-resident — offloading it to make room is a net
+    // loss (slow target + serial/CPU verify that diverges at near-ties from the resident plain
+    // decode), so the draft falls back to CPU (the prior lossless behavior).
+    let honor_reserve = raw_reserve > 0
+        && weights_bytes + coexist_fit_headroom + min_kv_floor + raw_reserve <= free_eff;
     let coexist_reserve = if honor_reserve { raw_reserve } else { 0 };
     if raw_reserve > 0 && !honor_reserve && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
         eprintln!(
@@ -9824,13 +9855,11 @@ fn build_resident_cuda_engine(
             raw_reserve / (1024 * 1024)
         );
     }
-    // Headroom must match the honor decision so sizing and the backstop agree: a draft engine,
-    // or a target whose reserve is honored (both packing onto the card), uses a small margin;
-    // otherwise the normal 512 MiB sole-engine floor. Env override wins for either.
-    let default_headroom_mb = if is_drafter {
-        64
-    } else if honor_reserve {
-        160
+    // Headroom matches the honor decision so sizing and the backstop agree: a draft engine, or a
+    // target whose reserve is honored (both packing onto the card), uses the small coexist margin;
+    // otherwise the normal 512 MiB sole-engine floor. Env override (below) wins for either.
+    let default_headroom_mb = if is_drafter || honor_reserve {
+        coexist_headroom_mb
     } else {
         512
     };
@@ -9847,7 +9876,7 @@ fn build_resident_cuda_engine(
     } else {
         kv_cap
     };
-    let free_vram = free_probe.saturating_sub(coexist_reserve);
+    let free_vram = free_eff.saturating_sub(coexist_reserve);
 
     // Per-layer resident weight bytes (raw Q8_0 layout, same unit as `weights_bytes`),
     // for the offload split decision. Index i is layer `range.start + i`.
@@ -9975,11 +10004,12 @@ fn build_resident_cuda_engine(
         // double-count and falsely refuse). The draft, allocating last, likewise needs only the
         // small margin. Outside coexistence this is the normal 512 MiB post-load floor.
         let min_head_mib = if coexist_reserve > 0 || is_drafter {
-            64
+            coexist_headroom_mb
         } else {
             crate::cuda_vram::min_headroom_mib()
         };
-        if let Err(short) = crate::cuda_vram::evaluate(free_probe, projected_alloc, min_head_mib) {
+        // Evaluate against the effective free (actual + permitted coexistence spill).
+        if let Err(short) = crate::cuda_vram::evaluate(free_eff, projected_alloc, min_head_mib) {
             eprintln!("[resident-cuda] refusing resident load: {short}; using CPU path");
             return None;
         }
