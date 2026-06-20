@@ -169,6 +169,47 @@ extern "C" __global__ void quantize_q8_0(
     }
 }
 
+// ---- Fused RMS-norm + Q8_0 quantize (F1) -----------------------------------
+// One block stages the row in shared, thread 0 does the in-order sum-of-squares
+// (bit-identical to rms_norm_f32), every thread applies norm*weight back into shared,
+// then quantizes 32-wide blocks straight from shared (bit-identical to quantize_q8_0).
+// Fuses two kernels + drops the f32 `normed` global round-trip — same arithmetic.
+extern "C" __global__ void rms_norm_quantize(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n, float eps
+) {
+    extern __shared__ float xs[]; // n floats
+    __shared__ float s_scale;
+    int tid = threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += xs[i] * xs[i]; // CPU-order serial sum
+        s_scale = 1.0f / sqrtf(sum / (float)n + eps);
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = xs[i] * scale * weight[i];
+    __syncthreads();
+    int n_blocks = n >> 5; // n / 32
+    for (int b = tid; b < n_blocks; b += blockDim.x) {
+        const float* xb = xs + ((long)b << 5);
+        float max_abs = 0.0f;
+        for (int j = 0; j < 32; j++) { float a = fabsf(xb[j]); if (a > max_abs) max_abs = a; }
+        float unrounded = max_abs / 127.0f;
+        scales[b] = f16_round(unrounded); // f16-rounded block scale
+        float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
+        signed char* qb = quants + (long)b * 32;
+        for (int j = 0; j < 32; j++) {
+            float v = rintf(xb[j] * inv);
+            if (v > 127.0f) v = 127.0f;
+            if (v < -128.0f) v = -128.0f;
+            qb[j] = (signed char)v;
+        }
+    }
+}
+
 // ---- Q8_0 GEMV: one warp per output row, __dp4a dot, ordered float sum -------
 // weight_bytes is the repacked SoA layout (see repack_q8_soa): all quants first
 // (rows*blocks_per_row*32 i8, 16-byte aligned), then all scales (rows*blocks_per_row
@@ -665,6 +706,7 @@ pub struct CudaResidentKernels {
     pub(crate) rms_norm: CudaFunction,
     pub(crate) rms_norm_per_head: CudaFunction,
     pub(crate) quantize: CudaFunction,
+    pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
@@ -705,6 +747,7 @@ impl CudaResidentKernels {
             rms_norm: f("rms_norm_f32")?,
             rms_norm_per_head: f("rms_norm_per_head_f32")?,
             quantize: f("quantize_q8_0")?,
+            rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
@@ -788,6 +831,32 @@ fn launch_quantize(
     let nb = n_blocks as i32;
     let mut b = s.launch_builder(f);
     b.arg(x).arg(quants).arg(scales).arg(&nb);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+// Fused RMS-norm + Q8_0 quantize (F1): one block stages the `n`-element row in shared
+// for the in-order sum (same as rms_norm), then quantizes from shared — replacing a
+// launch_rmsnorm + launch_quantize pair and the f32 `normed` round-trip.
+#[allow(clippy::too_many_arguments)]
+fn launch_rmsnorm_quantize(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: (n as u32) * 4, // stage the whole row for the in-order sum
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(w).arg(quants).arg(scales).arg(&n_i).arg(&eps);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -1474,6 +1543,18 @@ fn cuda_graphs_enabled() -> bool {
     )
 }
 
+/// Whether the resident decode uses the fused kernels (rms-norm+quantize, etc.). Default ON:
+/// the fused kernels are bit-identical to the unfused chain (validated by the cuda_resident
+/// parity tests) and cut the per-token kernel count, which is the dominant cost for small
+/// models (the speculative draft). Set `CAMELID_RESIDENT_NO_FUSION=1` to fall back to the
+/// separate kernels (A/B comparison, debugging).
+fn resident_fusion_enabled() -> bool {
+    !matches!(
+        std::env::var("CAMELID_RESIDENT_NO_FUSION").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 impl CudaResidentDecode {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1940,6 +2021,7 @@ impl CudaResidentDecode {
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
+        let fused = resident_fusion_enabled();
         let hb = self.hidden / 32; // hidden blocks
         let fb = self.ffn_dim / 32; // ffn blocks
         let qb = self.q_width / 32; // q_width blocks
@@ -2029,25 +2111,39 @@ impl CudaResidentDecode {
                 )
             };
             // attention norm + quantize
-            launch_rmsnorm(
-                &s,
-                &self.k.rms_norm,
-                &self.d_hidden,
-                &self.layers[li].attn_norm,
-                &mut self.d_normed,
-                self.hidden,
-                self.eps,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_normed,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                hb,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_rmsnorm_quantize(
+                    &s,
+                    &self.k.rms_norm_quantize,
+                    &self.d_hidden,
+                    &self.layers[li].attn_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            } else {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.layers[li].attn_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_normed,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    hb,
+                )
+                .map_err(map)?;
+            }
             // Q,K,V
             launch_gemv(
                 &s,
@@ -2202,25 +2298,39 @@ impl CudaResidentDecode {
             )
             .map_err(map)?;
             // ffn norm + gate/up + silu + down + residual
-            launch_rmsnorm(
-                &s,
-                &self.k.rms_norm,
-                &self.d_hidden,
-                &self.layers[li].ffn_norm,
-                &mut self.d_normed,
-                self.hidden,
-                self.eps,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_normed,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                hb,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_rmsnorm_quantize(
+                    &s,
+                    &self.k.rms_norm_quantize,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            } else {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_normed,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    hb,
+                )
+                .map_err(map)?;
+            }
             launch_gemv(
                 &s,
                 &self.k.gemv,
@@ -2303,25 +2413,39 @@ impl CudaResidentDecode {
             return Ok(());
         }
         // final norm + output projection -> d_logits (no argmax / no sync here).
-        launch_rmsnorm(
-            &s,
-            &self.k.rms_norm,
-            &self.d_hidden,
-            &self.final_norm,
-            &mut self.d_normed,
-            self.hidden,
-            self.eps,
-        )
-        .map_err(map)?;
-        launch_quantize(
-            &s,
-            &self.k.quantize,
-            &self.d_normed,
-            &mut self.d_in_quants,
-            &mut self.d_in_scales,
-            hb,
-        )
-        .map_err(map)?;
+        if fused {
+            launch_rmsnorm_quantize(
+                &s,
+                &self.k.rms_norm_quantize,
+                &self.d_hidden,
+                &self.final_norm,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+        } else {
+            launch_rmsnorm(
+                &s,
+                &self.k.rms_norm,
+                &self.d_hidden,
+                &self.final_norm,
+                &mut self.d_normed,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &self.d_normed,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                hb,
+            )
+            .map_err(map)?;
+        }
         launch_gemv(
             &s,
             &self.k.gemv,
