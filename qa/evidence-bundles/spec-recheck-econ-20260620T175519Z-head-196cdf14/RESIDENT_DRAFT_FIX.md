@@ -249,3 +249,55 @@ for a 6 GB draft-model speculation win. (It also speeds the 4B target, narrowing
 - The small-draft decode cost is GPU kernel-execution time → needs **kernel fusion**, not graphs.
 - Everything from Parts 1–2 stands (f16 KV shipped; both models resident on 6 GB, lossless).
 - On ≤6 GB today, **synchronous n-gram remains the shippable win**.
+
+---
+
+# Part 5 — kernel fusion (commits 6f69acfa, dcc8d53a): real but ~5%, glue isn't the bottleneck
+
+Part 4 named kernel fusion as the lever for the small-draft decode cost. Implemented three fusions
+in the resident single-token decode, each **bit-identical** (all 13 cuda_resident parity tests pass,
+incl. full_forward_token_matches_cpu), default-on with `CAMELID_RESIDENT_NO_FUSION=1` to A/B:
+
+- **F1** `rms_norm_quantize`: fuse each RMS-norm with the following Q8_0 quantize (2/layer + output).
+- **F2** residual-into-GEMV: the O- and down-projection GEMVs write `out[row] += acc` straight into
+  the hidden buffer, dropping the residual_add launch + projection round-trip (2/layer).
+- **F3** `silu_mul_quantize`: fuse SiLU(gate)*up with the down-proj input quantize (1/layer).
+
+Together they remove ~5 launches/layer (~140/token on a 28-layer 0.6B) plus several f32 round-trips.
+
+## Result: +5.3% on the small model, ~0 on the large
+
+| model | fusion off | fusion on | Δ |
+|---|---|---|---|
+| 0.6B decode (bench-generate) | 78.0 t/s | 82.1 t/s | **+5.3%** |
+| 4B decode | 36.7 t/s | 36.95 t/s | +0.8% (bandwidth-bound) |
+| coexistence spec S_sync | 0.88× | 0.88× | within noise |
+
+Real and free (bit-identical, no regression), and it helps small models most — but **~5% is the
+ceiling of glue-kernel fusion**, and it's within run-to-run noise for the spec, which stays 0.88×.
+
+## Why fusion didn't move the needle (the honest finding)
+
+The per-kernel scheduling gap is only ~5 µs, so removing ~140 launches saves ~0.7 ms of ~12 ms
+(~5%). The other ~11 ms is the **GEMV and attention kernels' own execution time** — real memory/
+compute work plus their inefficiency (the q8_gemv runs at ~76% of peak DRAM; the decode attention
+is a simple non-tensor-core kernel). That is the **0.73× base-kernel gap** vs llama.cpp, and it is
+what makes Camelid's 0.6B ~12 ms vs llama's ~4 ms. Glue fusion can't touch it.
+
+## The actual remaining lever (deeper, separate)
+
+Faster **GEMV and attention kernels**: tensor-core / MMA Q8 GEMV, a FlashAttention-style fused
+attention, better occupancy/vectorization. That is what closes the 0.73× base gap (helping every
+model, target and draft) and is the only thing that gets the 0.6B draft near llama's ~4 ms so
+draft-model speculation wins on 6 GB. It is a substantial kernel-engineering effort of its own.
+
+## Net (Parts 1–5)
+
+- f16 KV (bit-identical, halves KV VRAM) + coexistence → both 4B+0.6B fully GPU-resident on 6 GB,
+  lossless (the literal goal, met); verify-offload correctness guard.
+- draft-model spec 0.10× → ~0.88× on 6 GB.
+- Profiled the residual to GPU kernel-execution time (not contention, not launch overhead).
+- CUDA graphs: already built, confirmed not helpful (decode is GPU-bound). Kernel **glue** fusion:
+  done, bit-identical, +5.3% small-model — but glue isn't the bottleneck.
+- The last lever is GEMV/attention **kernel-execution** efficiency (the 0.73× base gap) — a deeper
+  effort. On ≤6 GB today, **synchronous n-gram remains the shippable win**.
