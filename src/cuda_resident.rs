@@ -255,21 +255,46 @@ extern "C" __global__ void q8_gemv(
             reinterpret_cast<const float*>(weight_bytes + total_blocks * 32);
         long row_block0 = (long)row * blocks_per_row;
         const int4* siq = reinterpret_cast<const int4*>(s_iq);
-        for (int b = lane; b < blocks_per_row; b += 32) {
-            float w_scale = scales[row_block0 + b];
-            const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
-            int4 w0 = wq[0], w1 = wq[1];
-            int4 i0 = siq[b * 2], i1 = siq[b * 2 + 1];
-            int int_sum = 0;
-            int_sum = __dp4a(w0.x, i0.x, int_sum);
-            int_sum = __dp4a(w0.y, i0.y, int_sum);
-            int_sum = __dp4a(w0.z, i0.z, int_sum);
-            int_sum = __dp4a(w0.w, i0.w, int_sum);
-            int_sum = __dp4a(w1.x, i1.x, int_sum);
-            int_sum = __dp4a(w1.y, i1.y, int_sum);
-            int_sum = __dp4a(w1.z, i1.z, int_sum);
-            int_sum = __dp4a(w1.w, i1.w, int_sum);
-            myterms[b] = (float)int_sum * w_scale * s_is[b];
+        // Process U blocks per lane-iteration: issue all U weight loads FIRST, then do the
+        // dp4a math — so ~U weight loads are in flight at once instead of ~1, hiding DRAM
+        // latency (the batch-1 GEMV is latency-bound, ~60% of peak DRAM otherwise). Each
+        // per-u load is still coalesced across the warp (lanes read consecutive blocks), and
+        // every term lands in myterms[b] by block index, so the lane-0 ordered sum below is
+        // unchanged — bit-identical to the one-block-at-a-time loop.
+        const int U = 4;
+        for (int base = lane; base < blocks_per_row; base += 32 * U) {
+            int4 w0[U], w1[U];
+            float ws[U];
+            int present = 0;
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                int b = base + u * 32;
+                if (b < blocks_per_row) {
+                    const int4* wq =
+                        reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
+                    w0[u] = wq[0];
+                    w1[u] = wq[1];
+                    ws[u] = scales[row_block0 + b];
+                    present |= (1 << u);
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                if (present & (1 << u)) {
+                    int b = base + u * 32;
+                    int4 i0 = siq[b * 2], i1 = siq[b * 2 + 1];
+                    int int_sum = 0;
+                    int_sum = __dp4a(w0[u].x, i0.x, int_sum);
+                    int_sum = __dp4a(w0[u].y, i0.y, int_sum);
+                    int_sum = __dp4a(w0[u].z, i0.z, int_sum);
+                    int_sum = __dp4a(w0[u].w, i0.w, int_sum);
+                    int_sum = __dp4a(w1[u].x, i1.x, int_sum);
+                    int_sum = __dp4a(w1[u].y, i1.y, int_sum);
+                    int_sum = __dp4a(w1[u].z, i1.z, int_sum);
+                    int_sum = __dp4a(w1[u].w, i1.w, int_sum);
+                    myterms[b] = (float)int_sum * ws[u] * s_is[b];
+                }
+            }
         }
     }
     __syncwarp();
