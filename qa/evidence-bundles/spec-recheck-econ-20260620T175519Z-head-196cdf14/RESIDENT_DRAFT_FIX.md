@@ -301,3 +301,47 @@ draft-model speculation wins on 6 GB. It is a substantial kernel-engineering eff
   done, bit-identical, +5.3% small-model — but glue isn't the bottleneck.
 - The last lever is GEMV/attention **kernel-execution** efficiency (the 0.73× base gap) — a deeper
   effort. On ≤6 GB today, **synchronous n-gram remains the shippable win**.
+
+---
+
+# Part 6 — q8_gemv memory micro-opt (commit 3fa34f75): marginal, and the draft can't benefit
+
+Tensor cores were ruled out (batch-1 GEMV is M=1 + memory-bound). The honest "faster GEMV" target is
+the measured ~76%→86% peak-DRAM gap. The kernel is latency-bound (~60% DRAM at coalesced access — too
+few in-flight loads), so the lever is memory-level parallelism: unroll the per-lane block loop to
+issue several weight loads before the dp4a.
+
+Implemented (U=4), bit-identical (13/13 parity tests). Result:
+
+| model | before | after | Δ |
+|---|---|---|---|
+| 4B decode | 36.95 t/s | ~37.4 t/s | +1.3–1.6% |
+| 0.6B decode | 82 t/s | 82 t/s | flat |
+
+**It does not close the gap, and the draft can't benefit — for a structural reason.** The unroll only
+has room when `blocks_per_row` is large. The 0.6B's projections have few blocks/row (hidden 1024 → 32
+blocks; 32 lanes cover them in ~1 pass), so U degenerates to 1 — no MLP to gain. The small-model GEMV
+is **not** within-warp-latency-bound; it is **work-starved**: batch-1 of a small model has too few
+rows/blocks to saturate the GPU per kernel. No GEMV micro-opt fixes "not enough work." The 4B gains a
+little (80 blocks/row → some unroll room), but even there the gap to llama's 86% needs a ground-up
+kernel redesign (different work decomposition), not a loop tweak — and that still wouldn't help the
+draft.
+
+## Final conclusion of the kernel-perf arc (Parts 4–6)
+
+Every decode-kernel lever has now been tried and measured:
+- CUDA graphs — no benefit (decode is GPU-execution-bound, not launch-bound).
+- Glue-kernel fusion (F1–F3) — +5.3% small models, bit-identical.
+- GEMV MLP unroll — +1.5% large, flat small.
+- Tensor cores — ruled out by hardware (M=1, memory-bound).
+
+None makes draft-model speculation win on 6 GB, because the draft's cost is the **0.6B's batch-1
+decode being work-starved on the GPU** — an architectural property of single-token decode of a small
+model, not a kernel inefficiency. llama.cpp's ~4 ms comes from a fundamentally more optimized
+small-batch decode path (kernel design + scheduling), a large from-scratch rewrite with uncertain
+payoff and no bearing on the shippable result.
+
+**Shipped & real across the whole effort:** f16 KV (bit-identical, halves KV VRAM), both models
+resident on 6 GB lossless, verify-offload correctness guard, glue fusion (+5.3% small), GEMV unroll
+(+1.5% large) — and the synchronous **n-gram win (1.3–1.6× code/JSON), which remains the shippable
+≤6 GB speedup.** Draft-model speculation on ≤6 GB is not reachable by these levers.
