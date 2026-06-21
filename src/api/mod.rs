@@ -91,6 +91,14 @@ pub struct AppState {
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
+    /// Serializes token generation across requests. The CUDA-resident Q8 runtime
+    /// keeps KV / decode state in GPU-resident buffers that are reached through
+    /// shared `Arc`s under read locks, so two decodes running at once clobber each
+    /// other's state — producing garbled "word-salad" output, non-deterministic
+    /// greedy decoding, and an intermittent out-of-bounds slice panic in the
+    /// worker. This lock is held for the full duration of every generation,
+    /// including the entire SSE stream, so only one decode is ever in flight.
+    generation_lock: Arc<tokio::sync::Mutex<()>>,
     planner_env: PlannerEnv,
     configured_threads: Option<usize>,
     /// Server-wide default for opt-in thinking mode (`serve --enable-thinking`).
@@ -111,6 +119,7 @@ impl Default for AppState {
             model_last_used: Arc::new(RwLock::new(HashMap::new())),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
+            generation_lock: Arc::new(tokio::sync::Mutex::new(())),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
             default_enable_thinking: false,
@@ -1897,6 +1906,9 @@ async fn llama_server_completion(
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
+    // Serialize generation so only one decode runs against the shared
+    // CUDA-resident KV state at a time (see AppState::generation_lock).
+    let _gen_guard = state.generation_lock.clone().lock_owned().await;
     let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -5089,14 +5101,19 @@ async fn completions(
         default_max_tokens_cap: None,
     };
     let stream = req.stream.unwrap_or(false);
+    // Serialize generation so only one decode runs against the shared
+    // CUDA-resident KV state at a time (see AppState::generation_lock).
+    let gen_guard = state.generation_lock.clone().lock_owned().await;
     let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
     if stream {
-        return stream_completion(prepared, false);
+        return stream_completion(prepared, false, gen_guard);
     }
 
+    // Hold the generation lock until the non-streaming response is built.
+    let _gen_guard = gen_guard;
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
     let effective_max_tokens = prepared.max_tokens;
@@ -5242,14 +5259,19 @@ async fn chat_completions(
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
     };
     let stream = req.stream.unwrap_or(false);
+    // Serialize generation so only one decode runs against the shared
+    // CUDA-resident KV state at a time (see AppState::generation_lock).
+    let gen_guard = state.generation_lock.clone().lock_owned().await;
     let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
     if stream {
-        return stream_completion(prepared, true);
+        return stream_completion(prepared, true, gen_guard);
     }
 
+    // Hold the generation lock until the non-streaming response is built.
+    let _gen_guard = gen_guard;
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
     let effective_max_tokens = prepared.max_tokens;
@@ -7954,7 +7976,11 @@ fn stream_first_content_accounting_json(
     })
 }
 
-fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
+fn stream_completion(
+    mut prepared: PreparedGeneration,
+    chat: bool,
+    gen_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
     // GPU-resident lanes the speculative pin would otherwise turn off).
@@ -7969,6 +7995,10 @@ fn stream_completion(mut prepared: PreparedGeneration, chat: bool) -> Response {
         format!("cmpl-{}", uuid::Uuid::new_v4())
     };
     let events = async_stream::stream! {
+        // Hold the generation lock for the entire stream so no other decode
+        // starts until this one finishes — or the client disconnects and the
+        // stream is dropped, releasing the guard. See AppState::generation_lock.
+        let _gen_guard = gen_guard;
         let stream_started = Instant::now();
         // Lifecycle telemetry for the streaming path. Dropping the stream
         // (client disconnect, error return) closes the run via the guard's
@@ -9342,6 +9372,50 @@ mod tests {
     };
 
     use super::*;
+
+    /// Regression test for the concurrent-decode corruption bug: the
+    /// CUDA-resident Q8 runtime shares decode / KV state across requests, so the
+    /// generation handlers (`completions`, `chat_completions`,
+    /// `llama_server_completion`) and `stream_completion` must hold
+    /// `AppState::generation_lock` for the whole decode. This verifies the lock
+    /// actually serializes — with many tasks acquiring it the way the handlers
+    /// do, never more than one is inside the critical section at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_lock_serializes_decoding() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let state = AppState::default();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let lock = state.generation_lock.clone();
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::spawn(async move {
+                // Same acquisition every generation handler performs per decode.
+                let _guard = lock.lock_owned().await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                // Yield repeatedly while holding the guard. If the lock failed to
+                // serialize, another task would enter here and push `active` > 1.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "generation_lock must serialize decoding: never more than one decode in flight",
+        );
+    }
 
     fn completion_request_with(
         prompt: Option<&str>,
