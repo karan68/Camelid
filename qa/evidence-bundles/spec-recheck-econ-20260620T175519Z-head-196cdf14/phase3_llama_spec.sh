@@ -4,9 +4,9 @@
 # 3 reps/workload, median decode t/s. Output: results/phase3-llama-spec.jsonl
 set -u
 cd "$(dirname "$0")"
-EXE="C:/Users/timto/llama.cpp/build/bin/llama-speculative.exe"
-TARGET="C:/Users/timto/models/Qwen3-4B-Q8_0.gguf"
-DRAFT="C:/Users/timto/camelid-dltest/models/Qwen3-0.6B-Q8_0.gguf"
+EXE="$HOME/llama.cpp/build/bin/llama-speculative.exe"
+TARGET="$HOME/models/Qwen3-4B-Q8_0.gguf"
+DRAFT="$HOME/camelid-dltest/models/Qwen3-0.6B-Q8_0.gguf"
 OUT="results/phase3-llama-spec.jsonl"
 : > "$OUT"
 median() { printf '%s\n' "$@" | sort -n | awk '{a[NR]=$1} END{print (NR%2)?a[(NR+1)/2]:(a[NR/2]+a[NR/2+1])/2}'; }

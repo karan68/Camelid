@@ -9,10 +9,10 @@
 ==PROF== Profiling "q8_gemv": 0%....50%....100% - 7 passes
 ==PROF== Profiling "q8_gemv": 0%....50%....100% - 7 passes
 ==PROF== Profiling "q8_gemv": 0%....50%....100% - 7 passes
-{"runtime":"camelid","commit":"unknown","model":"C:/Users/timto/models/Qwen3-4B-Q8_0.gguf","quantization":"Q8_0","iteration":0,"prompt_tokens":2,"generated_tokens":2,"load_ms":6765.4743,"prefill_ms":2217.307,"ttft_ms":25619.0956,"decode_ms":100.1364,"tokens_per_second":9.986378579617401,"peak_memory_bytes":9318912000,"offload":{"total_layers":36,"layers_resident":36,"layers_offloaded":0,"per_layer_bytes":0,"free_vram_bytes":5343543296,"pcie_gbps":null,"source":"none"},"experimental_fast":false,"output_text":", I","output_token_ids":[11,358]}
+{"runtime":"camelid","commit":"unknown","model":"$HOME/models/Qwen3-4B-Q8_0.gguf","quantization":"Q8_0","iteration":0,"prompt_tokens":2,"generated_tokens":2,"load_ms":6765.4743,"prefill_ms":2217.307,"ttft_ms":25619.0956,"decode_ms":100.1364,"tokens_per_second":9.986378579617401,"peak_memory_bytes":9318912000,"offload":{"total_layers":36,"layers_resident":36,"layers_offloaded":0,"per_layer_bytes":0,"free_vram_bytes":5343543296,"pcie_gbps":null,"source":"none"},"experimental_fast":false,"output_text":", I","output_token_ids":[11,358]}
 [bench-generate] iter 0 | prompt 2 tok | gen 2 tok | ttft 25619.1 ms | decode 100.1 ms | 9.99 tok/s | peak 8.68 GB
 ==PROF== Disconnected from process 24528
-[24528] camelid.exe@127.0.0.1
+[24528] camelid.exe@localhost
   q8_gemv (512, 1, 1)x(256, 1, 1), Context 2, Stream 14, Device 0, CC 8.6
     Section: Command line profiler metrics
     ------------------------------------------------------ ----------- ------------

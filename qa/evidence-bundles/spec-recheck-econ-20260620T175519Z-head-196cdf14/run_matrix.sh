@@ -6,9 +6,9 @@ set -u
 cd "$(dirname "$0")"
 KIND="$1"
 GAMMAS="${2:-2 4 6 7}"
-EXE="C:/Users/timto/Camelid/target/release/camelid.exe"
-TARGET="C:/Users/timto/models/Qwen3-4B-Q8_0.gguf"
-DRAFT="C:/Users/timto/camelid-dltest/models/Qwen3-0.6B-Q8_0.gguf"
+EXE="$HOME/Camelid/target/release/camelid.exe"
+TARGET="$HOME/models/Qwen3-4B-Q8_0.gguf"
+DRAFT="$HOME/camelid-dltest/models/Qwen3-0.6B-Q8_0.gguf"
 export CAMELID_COMMIT="$(git rev-parse --short HEAD)"
 
 case "$KIND" in
