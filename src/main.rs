@@ -2305,7 +2305,6 @@ fn run_bench_generate(
 /// verify spans are timed separately so f_draft = draft / (draft + verify) is observable.
 struct SpeculativeRun {
     generated: Vec<u32>,
-    prefill_ms: f64,
     ttft_ms: f64,
     decode_ms: f64,
     rounds: u64,
@@ -2347,7 +2346,6 @@ fn generate_run_speculative(
         false,
     )?;
     let ttft_ms = ttft_start.elapsed().as_secs_f64() * 1000.0;
-    let prefill_ms = step.prefill_timings.total as f64 / 1000.0;
     let first = step.next_token_id;
     generated.push(first);
     history.push(first);
@@ -2357,7 +2355,6 @@ fn generate_run_speculative(
 
     let mut run = SpeculativeRun {
         generated: Vec::new(),
-        prefill_ms,
         ttft_ms,
         decode_ms: 0.0,
         rounds: 0,
