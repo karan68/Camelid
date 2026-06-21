@@ -1645,6 +1645,67 @@ impl LlamaInferenceSession {
         self.kv_cache.position == 0
             || self.kv_cache.allocated_sequence_length >= self.kv_cache.position
     }
+
+    /// Approximate resident-weight footprint of this session in bytes: the raw Q8_0 block
+    /// bytes of every layer's attention + FFN tensors plus the output projection — the same
+    /// unit `build_resident_cuda_engine` sizes VRAM against. Used to compute the
+    /// speculative-coexistence reserve (how much VRAM a draft model needs to stay resident).
+    #[cfg(feature = "cuda")]
+    pub fn resident_weight_bytes(&self) -> u64 {
+        let blk = |t: &CpuTensor| {
+            t.q8_0_blocks
+                .as_deref()
+                .map(|b| q8_0_blocks_as_bytes(b).len() as u64)
+                .unwrap_or(0)
+        };
+        self.weights
+            .layers
+            .iter()
+            .map(|l| {
+                blk(&l.attention_q)
+                    + blk(&l.attention_k)
+                    + blk(&l.attention_v)
+                    + blk(&l.attention_output)
+                    + blk(&l.ffn_gate)
+                    + blk(&l.ffn_up)
+                    + blk(&l.ffn_down)
+            })
+            .sum::<u64>()
+            + blk(self.weights.output_projection())
+    }
+
+    /// GPU KV-cache cost per position in bytes (f16 K and V across every layer).
+    #[cfg(feature = "cuda")]
+    pub fn resident_kv_bytes_per_pos(&self) -> u64 {
+        match DenseLlamaDims::from_config(&self.config) {
+            Ok(dims) => {
+                (self.weights.layers.len() * dims.attention_head_count_kv * dims.head_dim * 2 * 2)
+                    as u64
+            }
+            Err(_) => 0,
+        }
+    }
+
+    /// Estimate the VRAM a draft model of this session needs to stay GPU-resident beside the
+    /// target: weights + a capped KV cache (`spec_draft_kv_context` positions) + a flat margin
+    /// for logits/scratch/fragmentation. The target's resident build subtracts this so it
+    /// offloads enough of its own trailing layers to leave the room.
+    #[cfg(feature = "cuda")]
+    pub fn spec_coexist_reserve_estimate(&self) -> u64 {
+        // Flat margin (logits row + scratch + fragmentation) the draft engine needs beyond its
+        // weights + KV. Env-tunable: on a 6 GB card every MiB counts to fit both without spilling.
+        let flat_mb = std::env::var("CAMELID_SPEC_DRAFT_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(48);
+        self.resident_weight_bytes()
+            + self.resident_kv_bytes_per_pos() * spec_draft_kv_context() as u64
+            + flat_mb * 1024 * 1024
+    }
+    #[cfg(not(feature = "cuda"))]
+    pub fn spec_coexist_reserve_estimate(&self) -> u64 {
+        0
+    }
 }
 
 impl Clone for LlamaInferenceSession {
@@ -2126,6 +2187,7 @@ impl LlamaInferenceSession {
                 vocab,
                 rms_eps,
                 tables.split_half_pairing,
+                self.is_drafter,
             ) {
                 Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
                 None => return Ok(false),
@@ -2408,9 +2470,17 @@ impl LlamaInferenceSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Only run when the engine already holds this model with the KV materialized
         // exactly up to `position` (mid-decode). Otherwise let the caller take a normal
-        // step, which builds/seeds the engine.
+        // step, which builds/seeds the engine. An OFFLOADED engine is also rejected: the
+        // batched verify (`run_batched_layer_stack`) reads each layer's resident VRAM slice
+        // directly, but an offloaded layer's slice is a 1-byte placeholder (its real weights
+        // stream into scratch only on the single-token path), so a batched verify over an
+        // offloaded target would read garbage and break losslessness. Falling back to `None`
+        // routes the caller to the CPU chunk verify, which is correct for offloaded layers.
         let ready = guard.as_ref().is_some_and(|slot| {
-            slot.key == key && slot.engine.weights_ready() && slot.engine.filled() == position
+            slot.key == key
+                && slot.engine.weights_ready()
+                && slot.engine.filled() == position
+                && !slot.engine.is_offloaded()
         });
         if !ready {
             return Ok(None);
@@ -2627,6 +2697,7 @@ impl LlamaInferenceSession {
                 vocab,
                 rms_eps,
                 tables.split_half_pairing,
+                self.is_drafter,
             ) {
                 Some(engine) => *guard = Some(ResidentCudaSlot { key, engine }),
                 None => {
@@ -9585,6 +9656,60 @@ fn resident_cuda_drafter_cache() -> &'static std::sync::Mutex<Option<ResidentCud
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// Speculative coexistence reserve, in bytes. When > 0, a draft model is in play and the
+/// **target** resident engine subtracts this from its VRAM budget so it leaves room for the
+/// draft to stay GPU-resident too (auto-offloading its own trailing layers via the existing
+/// path). Set from `ModelDrafter::new` via `LlamaInferenceSession::spec_coexist_reserve_estimate`.
+/// Zero (the default) leaves the single-model resident path byte-for-byte unchanged.
+#[cfg(feature = "cuda")]
+static SPEC_COEXIST_RESERVE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record the draft model's resident footprint so the target leaves room for it. Pass 0 to
+/// disable (single-model path). Does NOT evict already-built engines: a resident target built
+/// before the reserve was set keeps running (reused, not rebuilt) — rebuilding it would free
+/// its VRAM only to the cudarc pool (which the free-VRAM probe does not see), so the rebuild
+/// would wrongly fall to CPU. The reserve therefore only shapes engines built AFTER it is set
+/// (e.g. when the drafter is configured before the target's first decode).
+#[cfg(feature = "cuda")]
+pub fn set_spec_coexist_reserve(bytes: u64) {
+    SPEC_COEXIST_RESERVE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(not(feature = "cuda"))]
+pub fn set_spec_coexist_reserve(_bytes: u64) {}
+
+#[cfg(feature = "cuda")]
+fn spec_coexist_reserve_bytes() -> u64 {
+    SPEC_COEXIST_RESERVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// KV-cache positions a speculative draft engine is sized for (env-tunable). The draft only
+/// needs to span the prompt + generated tokens it drafts over; capping it keeps the draft's
+/// VRAM small so it fits beside the resident target. Lossless either way — the target verify is
+/// authoritative, so a shorter draft context only affects accept rate, never correctness.
+#[cfg(feature = "cuda")]
+fn spec_draft_kv_context() -> usize {
+    std::env::var("CAMELID_SPEC_DRAFT_CONTEXT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= 256)
+        .unwrap_or(512)
+}
+
+/// Clear both resident-engine caches (target + drafter) so the next decode rebuilds them. Used
+/// when the VRAM budget changes (entering/leaving speculative coexistence). No-op without CUDA.
+#[cfg(feature = "cuda")]
+pub fn reset_resident_caches() {
+    *resident_cuda_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+    *resident_cuda_drafter_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+#[cfg(not(feature = "cuda"))]
+pub fn reset_resident_caches() {}
+
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
 /// Cheap (no model), and it hits whenever the model repeats a phrase already in
@@ -9631,6 +9756,7 @@ fn build_resident_cuda_engine(
     vocab: usize,
     rms_eps: f32,
     split_half_pairing: bool,
+    is_drafter: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
         t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
@@ -9638,14 +9764,15 @@ fn build_resident_cuda_engine(
     // VRAM-driven resident-context sizing (portability, not hardcoded to any card):
     //   resident weights are uploaded once and live for the engine's lifetime; the
     //   GPU KV cache is allocated once at `cap` positions, costing
-    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 4(f32) each. Size the
+    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 2(f16 bits) each. Size the
     //   cap so weights + KV + a scratch/headroom reserve fit in *detected free* VRAM:
     //     cap = min(requested, (free_vram − weights − headroom) / kv_bytes_per_pos)
     //   On a 6 GB card this stays conservative; on a 24 GB card it grows automatically
     //   to a long context. If even the floor (256) cannot fit, return None so the
     //   caller runs the model on the CPU path rather than oversubscribing VRAM.
     const MIN_RESIDENT_CONTEXT: usize = 256;
-    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 4) as u64;
+    // f16 KV: 2 bytes per element (K and V), see cuda_resident's u16 cache.
+    let kv_bytes_per_pos = (n_layers * n_kv * head_dim * 2 * 2) as u64;
     let weights_bytes: u64 = weights.layers[range.clone()]
         .iter()
         .flat_map(|l| {
@@ -9669,14 +9796,93 @@ fn build_resident_cuda_engine(
     // env-overridable (CAMELID_CUDA_RESIDENT_HEADROOM_MB) so a second engine can be
     // packed onto a small card — e.g. drafter + target for speculative decode, where
     // the default 512 MiB per engine would not leave room for both.
+    // The flat margin defaults to 512 MiB for a sole resident engine. Under speculative
+    // coexistence both engines pack onto the card, so 512 MiB each would not fit: the draft
+    // takes a small margin, and the target a modest one (its reserve already accounts for the
+    // draft; this margin only covers its own driver/context/fragmentation overhead).
+    let free_probe = crate::cuda::probe_capability()
+        .map(|c| c.vram_free_bytes)
+        .unwrap_or(0);
+    let min_kv_floor = kv_bytes_per_pos * MIN_RESIDENT_CONTEXT as u64;
+    // Speculative coexistence: the TARGET reserves the draft's footprint out of its own VRAM
+    // budget so the draft can stay GPU-resident beside it (reserve = 0 for the draft, which
+    // takes the remaining free VRAM). BUT only honor the reserve when the target still fits
+    // FULLY resident after it, measured against the NORMAL single-engine headroom. If reserving
+    // would force the target to offload trailing layers, that offload (a) slows the target
+    // forward and (b) pushes the batched verify onto the serial/CPU path — a different backend
+    // than the resident plain decode, which diverges at near-ties. Not worth it: drop the
+    // reserve, build the target full-resident (NORMAL headroom), and let the draft fall back to
+    // CPU (the prior, lossless behavior). So the resident-draft win is taken only on a GPU big
+    // enough to hold BOTH models fully resident (no offload).
+    let raw_reserve = if is_drafter {
+        0
+    } else {
+        spec_coexist_reserve_bytes()
+    };
+    // Under speculative coexistence both engines pack onto one card, so the per-engine safety
+    // margin must be much smaller than the 512 MiB a sole engine keeps. Env-tunable because the
+    // dual-resident fit on ~6 GB is on a knife's edge even with f16 KV. Used for BOTH the honor
+    // gate and the per-engine build headroom so sizing and the backstop agree.
+    let coexist_headroom_mb = std::env::var("CAMELID_SPEC_COEXIST_HEADROOM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(64);
+    let coexist_fit_headroom = (vocab as u64 * 4) + (coexist_headroom_mb * 1024 * 1024);
+    // Bounded over-allocation the WDDM driver pages to shared host memory (how llama.cpp fits both
+    // models on a 6 GB card): treat free VRAM as larger by this much for the coexistence sizing.
+    // Default 0 (strict — no spill). Opt in via CAMELID_SPEC_COEXIST_SPILL_MB on a tight card.
+    let coexist_spill = std::env::var("CAMELID_SPEC_COEXIST_SPILL_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        * 1024
+        * 1024;
+    // Effective free VRAM for coexistence sizing (actual free + the permitted spill). Applies to
+    // BOTH the target (raw_reserve > 0) and the draft engine (is_drafter, reserve 0) while a draft
+    // is configured, so the draft also gets the spill room to pack in.
+    let coexist_active = spec_coexist_reserve_bytes() > 0;
+    let free_eff = if coexist_active {
+        free_probe + coexist_spill
+    } else {
+        free_probe
+    };
+    // Honor the reserve only if the target still fits fully resident after it (measured with the
+    // small coexist headroom; the reserve already accounts for the draft's footprint). If not,
+    // drop the reserve and build the target full-resident — offloading it to make room is a net
+    // loss (slow target + serial/CPU verify that diverges at near-ties from the resident plain
+    // decode), so the draft falls back to CPU (the prior lossless behavior).
+    let honor_reserve = raw_reserve > 0
+        && weights_bytes + coexist_fit_headroom + min_kv_floor + raw_reserve <= free_eff;
+    let coexist_reserve = if honor_reserve { raw_reserve } else { 0 };
+    if raw_reserve > 0 && !honor_reserve && std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+        eprintln!(
+            "[resident-cuda] coexist: honoring the {} MiB draft reserve would offload the target; \
+             building target full-resident instead (draft falls back to CPU)",
+            raw_reserve / (1024 * 1024)
+        );
+    }
+    // Headroom matches the honor decision so sizing and the backstop agree: a draft engine, or a
+    // target whose reserve is honored (both packing onto the card), uses the small coexist margin;
+    // otherwise the normal 512 MiB sole-engine floor. Env override (below) wins for either.
+    let default_headroom_mb = if is_drafter || honor_reserve {
+        coexist_headroom_mb
+    } else {
+        512
+    };
     let headroom_mb = std::env::var("CAMELID_CUDA_RESIDENT_HEADROOM_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(512);
+        .unwrap_or(default_headroom_mb);
     let headroom = (vocab as u64 * 4) + (headroom_mb * 1024 * 1024);
-    let free_vram = crate::cuda::probe_capability()
-        .map(|c| c.vram_free_bytes)
-        .unwrap_or(0);
+    // A draft model only needs to span the prompt + the tokens it drafts; cap its KV so it
+    // stays small enough to sit beside the resident target. (Lossless: the target verify is
+    // authoritative, so a shorter draft context only lowers accept rate, never correctness.)
+    let kv_cap = if is_drafter {
+        kv_cap.min(spec_draft_kv_context())
+    } else {
+        kv_cap
+    };
+    let free_vram = free_eff.saturating_sub(coexist_reserve);
 
     // Per-layer resident weight bytes (raw Q8_0 layout, same unit as `weights_bytes`),
     // for the offload split decision. Index i is layer `range.start + i`.
@@ -9795,14 +10001,21 @@ fn build_resident_cuda_engine(
     // (fall back to CPU) with a named shortfall rather than allocating into an
     // eventual mid-load OOM. By construction `cap` already reserves `headroom`, so
     // a model that currently loads still passes; this is the explicit backstop.
-    if free_vram > 0 {
+    if free_probe > 0 {
         let projected_alloc =
             resident_weights_bytes + scratch_reserve + (cap as u64) * kv_bytes_per_pos;
-        if let Err(short) = crate::cuda_vram::evaluate(
-            free_vram,
-            projected_alloc,
-            crate::cuda_vram::min_headroom_mib(),
-        ) {
+        // Evaluate against ACTUAL free VRAM. Under coexistence the budget already excludes the
+        // draft's reserve, so the target's sizing leaves that reserve free by construction —
+        // here we only require a small absolute safety margin (NOT reserve+margin, which would
+        // double-count and falsely refuse). The draft, allocating last, likewise needs only the
+        // small margin. Outside coexistence this is the normal 512 MiB post-load floor.
+        let min_head_mib = if coexist_reserve > 0 || is_drafter {
+            coexist_headroom_mb
+        } else {
+            crate::cuda_vram::min_headroom_mib()
+        };
+        // Evaluate against the effective free (actual + permitted coexistence spill).
+        if let Err(short) = crate::cuda_vram::evaluate(free_eff, projected_alloc, min_head_mib) {
             eprintln!("[resident-cuda] refusing resident load: {short}; using CPU path");
             return None;
         }

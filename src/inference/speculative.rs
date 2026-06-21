@@ -64,6 +64,15 @@ impl SpeculativeDrafter {
             Self::Model(drafter) => drafter.draft(history, max_tokens),
         }
     }
+
+    /// Draft-decode profiling: (resident GPU forward µs, resident steps, CPU-fallback steps).
+    /// Zero for the n-gram drafter (no model forward). Resets on read.
+    pub fn take_forward_stats(&mut self) -> (u128, u64, u64) {
+        match self {
+            Self::NGram(_) => (0, 0, 0),
+            Self::Model(drafter) => drafter.take_forward_stats(),
+        }
+    }
 }
 
 /// Prompt-lookup drafting: find the longest n-gram suffix of `history`
@@ -126,6 +135,12 @@ pub struct ModelDrafter {
     /// round. The prefix of these that the target accepted is now real
     /// history, so its KV entries can be kept instead of re-ingested.
     speculative_fed: Vec<u32>,
+    /// Profiling: summed GPU forward microseconds reported by the resident decode for draft
+    /// steps, the count of resident steps, and the count that fell back to the CPU path. Lets a
+    /// caller compare the GPU forward time against the wall-clock draft time to localize overhead.
+    resident_forward_us: u128,
+    resident_steps: u64,
+    cpu_fallback_steps: u64,
 }
 
 impl ModelDrafter {
@@ -138,11 +153,34 @@ impl ModelDrafter {
         // rather than reseeded. If the draft engine doesn't fit in VRAM it falls
         // back to the CPU path per token automatically.
         session.set_is_drafter(true);
+        // Register the draft's resident VRAM footprint so a target engine built AFTER this
+        // (e.g. when the drafter is configured before the target's first decode) leaves room for
+        // the draft to stay GPU-resident too. Only honored on a GPU where the target still fits
+        // fully resident after the reserve; otherwise the draft falls back to CPU. No-op on
+        // non-CUDA builds. (Does not evict an already-built target — see set_spec_coexist_reserve.)
+        crate::inference::set_spec_coexist_reserve(session.spec_coexist_reserve_estimate());
         Self {
             session,
             committed: 0,
             speculative_fed: Vec::new(),
+            resident_forward_us: 0,
+            resident_steps: 0,
+            cpu_fallback_steps: 0,
         }
+    }
+
+    /// Take and reset the draft-decode profiling counters: (summed resident GPU forward µs,
+    /// resident step count, CPU-fallback step count).
+    pub fn take_forward_stats(&mut self) -> (u128, u64, u64) {
+        let stats = (
+            self.resident_forward_us,
+            self.resident_steps,
+            self.cpu_fallback_steps,
+        );
+        self.resident_forward_us = 0;
+        self.resident_steps = 0;
+        self.cpu_fallback_steps = 0;
+        stats
     }
 
     pub fn draft(&mut self, history: &[u32], max_tokens: usize) -> Result<Vec<u32>> {
@@ -175,28 +213,85 @@ impl ModelDrafter {
         if max_tokens == 0 {
             return Ok(Vec::new());
         }
-        // Drafting runs on the tuned generation path (chunked prefill for the
-        // pending tokens, packed-GEMV decode for the sequential draft steps)
-        // rather than one-row verify chunks — the decode step is the fast
-        // route for single tokens.
-        let step = self.session.generate_next_token_with_history_diagnostics(
-            pending,
-            LlamaSampler::Greedy,
-            history,
-            false,
-        )?;
+        // Re-ingest the pending (known) tokens, then the prediction after the LAST one is the
+        // first draft. The whole chunk rides the fast resident GPU-argmax lane (the draft only
+        // needs the argmax, so the full-logits copy + CPU sample the diagnostics path does is pure
+        // per-round overhead — the dominant cost once the draft model is GPU-resident). The
+        // diagnostics path is the fallback only when the resident engine isn't ready (not yet
+        // seeded), in which case nothing has been fed so re-feeding the whole chunk is consistent.
+        // Lossless either way — the target verify is authoritative, so the draft's greedy choice
+        // only affects accept rate, never the emitted tokens.
+        // Feed the pending (known) tokens one at a time on the fast resident GPU-argmax lane; the
+        // prediction after the LAST is the first draft. Token-by-token keeps the draft KV exactly
+        // in sync (the batched-prefill diagnostics path desyncs the drafter's resident engine and
+        // tanks accept). The diagnostics path is the fallback only when the resident engine isn't
+        // ready, in which case nothing has been fed yet so re-feeding the whole chunk is consistent.
+        let (&head, rest) = pending
+            .split_first()
+            .expect("pending is non-empty (checked above)");
+        let first = match self.session.generate_next_token_greedy_resident(head)? {
+            Some((mut pred, us)) => {
+                self.resident_forward_us += us;
+                self.resident_steps += 1;
+                for &tok in rest {
+                    pred = match self.session.generate_next_token_greedy_resident(tok)? {
+                        Some((id, us)) => {
+                            self.resident_forward_us += us;
+                            self.resident_steps += 1;
+                            id
+                        }
+                        None => {
+                            self.cpu_fallback_steps += 1;
+                            self.session
+                                .generate_next_token_with_history_diagnostics(
+                                    &[tok],
+                                    LlamaSampler::Greedy,
+                                    history,
+                                    false,
+                                )?
+                                .next_token_id
+                        }
+                    };
+                }
+                pred
+            }
+            None => {
+                self.cpu_fallback_steps += 1;
+                self.session
+                    .generate_next_token_with_history_diagnostics(
+                        pending,
+                        LlamaSampler::Greedy,
+                        history,
+                        false,
+                    )?
+                    .next_token_id
+            }
+        };
         self.committed = history.len();
         let mut drafts = Vec::with_capacity(max_tokens);
-        drafts.push(step.next_token_id);
+        drafts.push(first);
         while drafts.len() < max_tokens {
             let last = *drafts.last().expect("drafts is non-empty");
-            let step = self.session.generate_next_token_with_history_diagnostics(
-                &[last],
-                LlamaSampler::Greedy,
-                history,
-                false,
-            )?;
-            drafts.push(step.next_token_id);
+            // Sequential draft steps on the fast resident GPU-argmax lane (no full-logits copy).
+            let next = match self.session.generate_next_token_greedy_resident(last)? {
+                Some((id, us)) => {
+                    self.resident_forward_us += us;
+                    self.resident_steps += 1;
+                    id
+                }
+                None => {
+                    self.cpu_fallback_steps += 1;
+                    self.session
+                        .generate_next_token_with_history_diagnostics(
+                            &[last],
+                            LlamaSampler::Greedy,
+                            history,
+                            false,
+                        )?
+                        .next_token_id
+                }
+            };
+            drafts.push(next);
         }
         // KV now holds `committed` history tokens plus the fed drafts (all
         // but the last drafted token); the next round keeps whatever prefix

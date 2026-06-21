@@ -169,6 +169,47 @@ extern "C" __global__ void quantize_q8_0(
     }
 }
 
+// ---- Fused RMS-norm + Q8_0 quantize (F1) -----------------------------------
+// One block stages the row in shared, thread 0 does the in-order sum-of-squares
+// (bit-identical to rms_norm_f32), every thread applies norm*weight back into shared,
+// then quantizes 32-wide blocks straight from shared (bit-identical to quantize_q8_0).
+// Fuses two kernels + drops the f32 `normed` global round-trip — same arithmetic.
+extern "C" __global__ void rms_norm_quantize(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n, float eps
+) {
+    extern __shared__ float xs[]; // n floats
+    __shared__ float s_scale;
+    int tid = threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += xs[i] * xs[i]; // CPU-order serial sum
+        s_scale = 1.0f / sqrtf(sum / (float)n + eps);
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < n; i += blockDim.x) xs[i] = xs[i] * scale * weight[i];
+    __syncthreads();
+    int n_blocks = n >> 5; // n / 32
+    for (int b = tid; b < n_blocks; b += blockDim.x) {
+        const float* xb = xs + ((long)b << 5);
+        float max_abs = 0.0f;
+        for (int j = 0; j < 32; j++) { float a = fabsf(xb[j]); if (a > max_abs) max_abs = a; }
+        float unrounded = max_abs / 127.0f;
+        scales[b] = f16_round(unrounded); // f16-rounded block scale
+        float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
+        signed char* qb = quants + (long)b * 32;
+        for (int j = 0; j < 32; j++) {
+            float v = rintf(xb[j] * inv);
+            if (v > 127.0f) v = 127.0f;
+            if (v < -128.0f) v = -128.0f;
+            qb[j] = (signed char)v;
+        }
+    }
+}
+
 // ---- Q8_0 GEMV: one warp per output row, __dp4a dot, ordered float sum -------
 // weight_bytes is the repacked SoA layout (see repack_q8_soa): all quants first
 // (rows*blocks_per_row*32 i8, 16-byte aligned), then all scales (rows*blocks_per_row
@@ -189,7 +230,7 @@ extern "C" __global__ void quantize_q8_0(
 extern "C" __global__ void q8_gemv(
     const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
     const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
-    float* __restrict__ output
+    float* __restrict__ output, int residual
 ) {
     extern __shared__ unsigned char smem[];
     signed char* s_iq = (signed char*)smem;                          // blocks_per_row*32 i8
@@ -214,28 +255,88 @@ extern "C" __global__ void q8_gemv(
             reinterpret_cast<const float*>(weight_bytes + total_blocks * 32);
         long row_block0 = (long)row * blocks_per_row;
         const int4* siq = reinterpret_cast<const int4*>(s_iq);
-        for (int b = lane; b < blocks_per_row; b += 32) {
-            float w_scale = scales[row_block0 + b];
-            const int4* wq = reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
-            int4 w0 = wq[0], w1 = wq[1];
-            int4 i0 = siq[b * 2], i1 = siq[b * 2 + 1];
-            int int_sum = 0;
-            int_sum = __dp4a(w0.x, i0.x, int_sum);
-            int_sum = __dp4a(w0.y, i0.y, int_sum);
-            int_sum = __dp4a(w0.z, i0.z, int_sum);
-            int_sum = __dp4a(w0.w, i0.w, int_sum);
-            int_sum = __dp4a(w1.x, i1.x, int_sum);
-            int_sum = __dp4a(w1.y, i1.y, int_sum);
-            int_sum = __dp4a(w1.z, i1.z, int_sum);
-            int_sum = __dp4a(w1.w, i1.w, int_sum);
-            myterms[b] = (float)int_sum * w_scale * s_is[b];
+        // Process U blocks per lane-iteration: issue all U weight loads FIRST, then do the
+        // dp4a math — so ~U weight loads are in flight at once instead of ~1, hiding DRAM
+        // latency (the batch-1 GEMV is latency-bound, ~60% of peak DRAM otherwise). Each
+        // per-u load is still coalesced across the warp (lanes read consecutive blocks), and
+        // every term lands in myterms[b] by block index, so the lane-0 ordered sum below is
+        // unchanged — bit-identical to the one-block-at-a-time loop.
+        const int U = 4;
+        for (int base = lane; base < blocks_per_row; base += 32 * U) {
+            int4 w0[U], w1[U];
+            float ws[U];
+            int present = 0;
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                int b = base + u * 32;
+                if (b < blocks_per_row) {
+                    const int4* wq =
+                        reinterpret_cast<const int4*>(quants + (row_block0 + b) * 32);
+                    w0[u] = wq[0];
+                    w1[u] = wq[1];
+                    ws[u] = scales[row_block0 + b];
+                    present |= (1 << u);
+                }
+            }
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                if (present & (1 << u)) {
+                    int b = base + u * 32;
+                    int4 i0 = siq[b * 2], i1 = siq[b * 2 + 1];
+                    int int_sum = 0;
+                    int_sum = __dp4a(w0[u].x, i0.x, int_sum);
+                    int_sum = __dp4a(w0[u].y, i0.y, int_sum);
+                    int_sum = __dp4a(w0[u].z, i0.z, int_sum);
+                    int_sum = __dp4a(w0[u].w, i0.w, int_sum);
+                    int_sum = __dp4a(w1[u].x, i1.x, int_sum);
+                    int_sum = __dp4a(w1[u].y, i1.y, int_sum);
+                    int_sum = __dp4a(w1[u].z, i1.z, int_sum);
+                    int_sum = __dp4a(w1[u].w, i1.w, int_sum);
+                    myterms[b] = (float)int_sum * ws[u] * s_is[b];
+                }
+            }
         }
     }
     __syncwarp();
     if (row < rows && lane == 0) {
         float acc = 0.0f;
         for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
-        output[row] = acc;
+        // residual!=0 fuses the post-projection residual add (output += acc), saving a
+        // separate residual_add launch + the f32 projection round-trip. Bit-identical:
+        // output[row] (old hidden) + acc == hidden + projection, the same f32 sum.
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
+// ---- Fused SiLU-gate * up + Q8_0 quantize (F3) ------------------------------
+// One thread per 32-block: compute silu(gate)*up for the block's 32 elements (bit-
+// identical to silu_mul) and quantize them (bit-identical to quantize_q8_0), straight
+// to the down-projection's input — no f32 `ffn_act` round-trip, one fewer launch. No
+// shared memory, so it is not bounded by the FFN width.
+extern "C" __global__ void silu_mul_quantize(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n_blocks
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    float vals[32];
+    float max_abs = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        float g = gate[(long)b * 32 + j];
+        float v = (g / (1.0f + expf(-g))) * up[(long)b * 32 + j];
+        vals[j] = v;
+        float a = fabsf(v);
+        if (a > max_abs) max_abs = a;
+    }
+    float unrounded = max_abs / 127.0f;
+    scales[b] = f16_round(unrounded);
+    float inv = (unrounded == 0.0f) ? 0.0f : 1.0f / unrounded;
+    signed char* qb = quants + (long)b * 32;
+    for (int j = 0; j < 32; j++) {
+        float v = rintf(vals[j] * inv);
+        if (v > 127.0f) v = 127.0f;
+        if (v < -128.0f) v = -128.0f;
+        qb[j] = (signed char)v;
     }
 }
 
@@ -325,7 +426,7 @@ extern "C" __global__ void rope_rotate(
 // ---- KV scatter: write current position's K (or V) with f16 round-trip -----
 // cache layout [kv_head][position][head_dim].
 extern "C" __global__ void kv_scatter(
-    const float* __restrict__ src, float* __restrict__ cache,
+    const float* __restrict__ src, unsigned short* __restrict__ cache,
     const int* __restrict__ position_ptr, int n_kv_heads, int head_dim, int max_pos
 ) {
     int position = position_ptr[0];
@@ -333,15 +434,18 @@ extern "C" __global__ void kv_scatter(
     if (idx >= n_kv_heads * head_dim) return;
     int kv_head = idx / head_dim;
     int d = idx % head_dim;
-    float v = f16_round(src[(long)kv_head * head_dim + d]);
-    cache[((long)kv_head * max_pos + position) * head_dim + d] = v;
+    // KV stored as f16 bits (half the VRAM). The value is f16-rounded either way, so this is
+    // bit-identical to storing f16_round(src) in f32 — the attention kernels read it back via
+    // f16_bits_to_f32 and feed the same f32 into the dot product.
+    cache[((long)kv_head * max_pos + position) * head_dim + d] =
+        f32_to_f16_bits(src[(long)kv_head * head_dim + d]);
 }
 
 // ---- Attention decode: per query head, GQA, scale, softmax, weighted V -----
 // One block per query head. cache_k/v layout [kv_head][position][head_dim].
 extern "C" __global__ void attention_decode(
-    const float* __restrict__ q, const float* __restrict__ cache_k,
-    const float* __restrict__ cache_v, float* __restrict__ out,
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
     int max_pos, float scale
 ) {
@@ -352,8 +456,9 @@ extern "C" __global__ void attention_decode(
     int repeats = n_heads / n_kv_heads;
     int kv_head = head / repeats;
     const float* qh = q + (long)head * head_dim;
-    const float* kbase = cache_k + (long)kv_head * max_pos * head_dim;
-    const float* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+    // KV is stored as f16 bits; read back to f32 (exact for the f16-rounded values written).
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
 
     extern __shared__ float shared[];
     float* qsh = shared;                 // head_dim
@@ -364,9 +469,9 @@ extern "C" __global__ void attention_decode(
 
     // scores
     for (int p = tid; p < position_count; p += blockDim.x) {
-        const float* kp = kbase + (long)p * head_dim;
+        const unsigned short* kp = kbase + (long)p * head_dim;
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) dot += qsh[d] * kp[d];
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
         scores[p] = dot * scale;
     }
     __syncthreads();
@@ -392,7 +497,8 @@ extern "C" __global__ void attention_decode(
     // weighted V: each thread handles a subset of output dims
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
-        for (int p = 0; p < position_count; p++) acc += (scores[p] * inv) * vbase[(long)p * head_dim + d];
+        for (int p = 0; p < position_count; p++)
+            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
         out[(long)head * head_dim + d] = acc;
     }
 }
@@ -545,7 +651,7 @@ extern "C" __global__ void rope_batched(
 
 // Scatter K tokens' K/V into the cache at consecutive positions base..base+K-1.
 extern "C" __global__ void kv_scatter_batched(
-    const float* __restrict__ src, float* __restrict__ cache, int base_position,
+    const float* __restrict__ src, unsigned short* __restrict__ cache, int base_position,
     int n_kv_heads, int head_dim, int max_pos, int per_token_dim, int k_tokens
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -556,15 +662,16 @@ extern "C" __global__ void kv_scatter_batched(
     int kv_head = rem / head_dim;
     int d = rem % head_dim;
     int position = base_position + t;
-    float v = f16_round(src[(long)t * per_token_dim + (long)kv_head * head_dim + d]);
-    cache[((long)kv_head * max_pos + position) * head_dim + d] = v;
+    // f16-bit KV store (see kv_scatter): bit-identical to f16_round into f32.
+    cache[((long)kv_head * max_pos + position) * head_dim + d] =
+        f32_to_f16_bits(src[(long)t * per_token_dim + (long)kv_head * head_dim + d]);
 }
 
 // Causal attention for K tokens: token t (at position base+t) attends [0, base+t].
 // One block per (token, query head). Shared sized for the longest prefix (base+K).
 extern "C" __global__ void attention_batched(
-    const float* __restrict__ q, const float* __restrict__ cache_k,
-    const float* __restrict__ cache_v, float* __restrict__ out,
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
     int q_per_token, int k_tokens
 ) {
@@ -575,8 +682,9 @@ extern "C" __global__ void attention_batched(
     int repeats = n_heads / n_kv_heads;
     int kv_head = head / repeats;
     const float* qh = q + (long)t * q_per_token + (long)head * head_dim;
-    const float* kbase = cache_k + (long)kv_head * max_pos * head_dim;
-    const float* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+    // f16-bit KV (see attention_decode): read back to f32 for the dot product.
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
 
     extern __shared__ float shared[];
     float* qsh = shared;               // head_dim
@@ -585,9 +693,9 @@ extern "C" __global__ void attention_batched(
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
     for (int p = tid; p < position_count; p += blockDim.x) {
-        const float* kp = kbase + (long)p * head_dim;
+        const unsigned short* kp = kbase + (long)p * head_dim;
         float dot = 0.0f;
-        for (int d = 0; d < head_dim; d++) dot += qsh[d] * kp[d];
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
         scores[p] = dot * scale;
     }
     __syncthreads();
@@ -610,7 +718,7 @@ extern "C" __global__ void attention_batched(
     for (int d = tid; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int p = 0; p < position_count; p++)
-            acc += (scores[p] * inv) * vbase[(long)p * head_dim + d];
+            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
         out[(long)t * q_per_token + (long)head * head_dim + d] = acc;
     }
 }
@@ -658,11 +766,13 @@ pub struct CudaResidentKernels {
     pub(crate) rms_norm: CudaFunction,
     pub(crate) rms_norm_per_head: CudaFunction,
     pub(crate) quantize: CudaFunction,
+    pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
     pub(crate) attention: CudaFunction,
     pub(crate) silu_mul: CudaFunction,
+    pub(crate) silu_mul_quantize: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
@@ -698,11 +808,13 @@ impl CudaResidentKernels {
             rms_norm: f("rms_norm_f32")?,
             rms_norm_per_head: f("rms_norm_per_head_f32")?,
             quantize: f("quantize_q8_0")?,
+            rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
             attention: f("attention_decode")?,
             silu_mul: f("silu_mul")?,
+            silu_mul_quantize: f("silu_mul_quantize")?,
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
@@ -784,6 +896,32 @@ fn launch_quantize(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+// Fused RMS-norm + Q8_0 quantize (F1): one block stages the `n`-element row in shared
+// for the in-order sum (same as rms_norm), then quantizes from shared — replacing a
+// launch_rmsnorm + launch_quantize pair and the f32 `normed` round-trip.
+#[allow(clippy::too_many_arguments)]
+fn launch_rmsnorm_quantize(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: (n as u32) * 4, // stage the whole row for the in-order sum
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(w).arg(quants).arg(scales).arg(&n_i).arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_gemv(
     s: &Arc<CudaStream>,
@@ -810,13 +948,72 @@ fn launch_gemv(
         shared_mem_bytes: bpr_u * 36 + warps_per_block * bpr_u * 4,
     };
     let (r, bpr) = (rows as i32, blocks_per_row as i32);
+    let residual = 0i32;
     let mut b = s.launch_builder(f);
     b.arg(in_scales)
         .arg(in_quants)
         .arg(weight)
         .arg(&r)
         .arg(&bpr)
-        .arg(out);
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q8 GEMV that fuses the post-projection residual add: writes `out[row] += acc` instead of
+/// `= acc`, so `out` must be the residual (hidden) buffer. Saves a separate residual_add launch
+/// and the projection's f32 round-trip. Bit-identical to gemv-then-residual_add (F2).
+#[allow(clippy::too_many_arguments)]
+fn launch_gemv_residual(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let bpr_u = blocks_per_row as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: bpr_u * 36 + warps_per_block * bpr_u * 4,
+    };
+    let (r, bpr) = (rows as i32, blocks_per_row as i32);
+    let residual = 1i32;
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&bpr)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+// Fused SiLU*up + Q8_0 quantize (F3): one thread per 32-block, no shared memory.
+fn launch_silu_mul_quantize(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n_blocks: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_blocks as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb = n_blocks as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(gate).arg(up).arg(quants).arg(scales).arg(&nb);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -936,7 +1133,7 @@ fn launch_kv_scatter_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
-    cache: &mut CudaSlice<f32>,
+    cache: &mut CudaSlice<u16>,
     base_position: usize,
     n_kv_heads: usize,
     head_dim: usize,
@@ -975,8 +1172,8 @@ fn launch_attention_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<f32>,
-    cache_v: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
     out: &mut CudaSlice<f32>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -1096,7 +1293,7 @@ fn launch_kv_scatter(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
-    cache: &mut CudaSlice<f32>,
+    cache: &mut CudaSlice<u16>,
     position: &CudaSlice<i32>,
     n_kv_heads: usize,
     head_dim: usize,
@@ -1124,8 +1321,8 @@ fn launch_attention(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
-    cache_k: &CudaSlice<f32>,
-    cache_v: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
     out: &mut CudaSlice<f32>,
     n_heads: usize,
     n_kv_heads: usize,
@@ -1378,8 +1575,10 @@ pub struct CudaResidentDecode {
     layers: Vec<ResidentLayer>,
     final_norm: CudaSlice<f32>,
     output_weight: CudaSlice<u8>,
-    cache_k: Vec<CudaSlice<f32>>,
-    cache_v: Vec<CudaSlice<f32>>,
+    // KV cache stored as f16 bits (u16) — half the VRAM of f32, bit-identical because the
+    // stored values are f16-rounded either way (see the kv_scatter / attention kernels).
+    cache_k: Vec<CudaSlice<u16>>,
+    cache_v: Vec<CudaSlice<u16>>,
     /// Number of KV positions materialized on the GPU (so the driver knows
     /// whether the session needs (re)seeding from the CPU history).
     filled: usize,
@@ -1465,6 +1664,18 @@ fn cuda_graphs_enabled() -> bool {
     )
 }
 
+/// Whether the resident decode uses the fused kernels (rms-norm+quantize, etc.). Default ON:
+/// the fused kernels are bit-identical to the unfused chain (validated by the cuda_resident
+/// parity tests) and cut the per-token kernel count, which is the dominant cost for small
+/// models (the speculative draft). Set `CAMELID_RESIDENT_NO_FUSION=1` to fall back to the
+/// separate kernels (A/B comparison, debugging).
+fn resident_fusion_enabled() -> bool {
+    !matches!(
+        std::env::var("CAMELID_RESIDENT_NO_FUSION").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 impl CudaResidentDecode {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1487,11 +1698,11 @@ impl CudaResidentDecode {
         let max_in = hidden.max(ffn_dim).max(q_width); // widest quantize input
         let alloc_f = |n: usize| s.alloc_zeros::<f32>(n).map_err(|e| format!("alloc: {e}"));
         let cache_k = (0..n_layers)
-            .map(|_| s.alloc_zeros::<f32>(kv_width * max_pos))
+            .map(|_| s.alloc_zeros::<u16>(kv_width * max_pos))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("kv alloc: {e}"))?;
         let cache_v = (0..n_layers)
-            .map(|_| s.alloc_zeros::<f32>(kv_width * max_pos))
+            .map(|_| s.alloc_zeros::<u16>(kv_width * max_pos))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("kv alloc: {e}"))?;
         Ok(Self {
@@ -1842,11 +2053,21 @@ impl CudaResidentDecode {
         for h in 0..n_kv {
             let hsrc = h * span; // host: head h's [0,position) block
             let gdst = h * max_pos * hd; // gpu: head h's base (positions 0..)
+                                         // The GPU KV cache holds f16 bits; convert host f32 (already f16-rounded) before
+                                         // upload so the bytes match what kv_scatter writes.
+            let kbits: Vec<u16> = ck[hsrc..hsrc + span]
+                .iter()
+                .map(|&x| crate::inference::f32_to_f16_bits(x))
+                .collect();
             let mut vk = self.cache_k[layer].slice_mut(gdst..gdst + span);
-            s.memcpy_htod(&ck[hsrc..hsrc + span], &mut vk)
+            s.memcpy_htod(&kbits, &mut vk)
                 .map_err(|e| format!("seed htod k: {e}"))?;
+            let vbits: Vec<u16> = cv[hsrc..hsrc + span]
+                .iter()
+                .map(|&x| crate::inference::f32_to_f16_bits(x))
+                .collect();
             let mut vv = self.cache_v[layer].slice_mut(gdst..gdst + span);
-            s.memcpy_htod(&cv[hsrc..hsrc + span], &mut vv)
+            s.memcpy_htod(&vbits, &mut vv)
                 .map_err(|e| format!("seed htod v: {e}"))?;
         }
         Ok(())
@@ -1864,18 +2085,19 @@ impl CudaResidentDecode {
         let (hd, max_pos, n_kv) = (self.head_dim, self.max_pos, self.n_kv_heads);
         let s = self.k.stream.clone();
         let span = n_positions * hd;
-        let mut k_out = vec![0f32; n_kv * span];
-        let mut v_out = vec![0f32; n_kv * span];
+        // KV is stored as f16 bits on the GPU; download to u16 then convert back to f32.
+        let mut k_bits = vec![0u16; n_kv * span];
+        let mut v_bits = vec![0u16; n_kv * span];
         for h in 0..n_kv {
             let gsrc = h * max_pos * hd;
             s.memcpy_dtoh(
                 &self.cache_k[layer].slice(gsrc..gsrc + span),
-                &mut k_out[h * span..(h + 1) * span],
+                &mut k_bits[h * span..(h + 1) * span],
             )
             .map_err(|e| format!("read_kv_layer K dtoh: {e}"))?;
             s.memcpy_dtoh(
                 &self.cache_v[layer].slice(gsrc..gsrc + span),
-                &mut v_out[h * span..(h + 1) * span],
+                &mut v_bits[h * span..(h + 1) * span],
             )
             .map_err(|e| format!("read_kv_layer V dtoh: {e}"))?;
         }
@@ -1883,6 +2105,14 @@ impl CudaResidentDecode {
             .ctx
             .synchronize()
             .map_err(|e| format!("read_kv_layer sync: {e}"))?;
+        let k_out = k_bits
+            .iter()
+            .map(|&b| crate::inference::f16_bits_to_f32(b))
+            .collect();
+        let v_out = v_bits
+            .iter()
+            .map(|&b| crate::inference::f16_bits_to_f32(b))
+            .collect();
         Ok((k_out, v_out))
     }
 
@@ -1912,6 +2142,7 @@ impl CudaResidentDecode {
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
+        let fused = resident_fusion_enabled();
         let hb = self.hidden / 32; // hidden blocks
         let fb = self.ffn_dim / 32; // ffn blocks
         let qb = self.q_width / 32; // q_width blocks
@@ -2001,25 +2232,39 @@ impl CudaResidentDecode {
                 )
             };
             // attention norm + quantize
-            launch_rmsnorm(
-                &s,
-                &self.k.rms_norm,
-                &self.d_hidden,
-                &self.layers[li].attn_norm,
-                &mut self.d_normed,
-                self.hidden,
-                self.eps,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_normed,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                hb,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_rmsnorm_quantize(
+                    &s,
+                    &self.k.rms_norm_quantize,
+                    &self.d_hidden,
+                    &self.layers[li].attn_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            } else {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.layers[li].attn_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_normed,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    hb,
+                )
+                .map_err(map)?;
+            }
             // Q,K,V
             launch_gemv(
                 &s,
@@ -2154,45 +2399,73 @@ impl CudaResidentDecode {
                 qb,
             )
             .map_err(map)?;
-            launch_gemv(
-                &s,
-                &self.k.gemv,
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &wo,
-                self.hidden,
-                qb,
-                &mut self.d_proj,
-            )
-            .map_err(map)?;
-            launch_residual(
-                &s,
-                &self.k.residual_add,
-                &mut self.d_hidden,
-                &self.d_proj,
-                self.hidden,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_gemv_residual(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wo,
+                    self.hidden,
+                    qb,
+                    &mut self.d_hidden,
+                )
+                .map_err(map)?;
+            } else {
+                launch_gemv(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wo,
+                    self.hidden,
+                    qb,
+                    &mut self.d_proj,
+                )
+                .map_err(map)?;
+                launch_residual(
+                    &s,
+                    &self.k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_proj,
+                    self.hidden,
+                )
+                .map_err(map)?;
+            }
             // ffn norm + gate/up + silu + down + residual
-            launch_rmsnorm(
-                &s,
-                &self.k.rms_norm,
-                &self.d_hidden,
-                &self.layers[li].ffn_norm,
-                &mut self.d_normed,
-                self.hidden,
-                self.eps,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_normed,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                hb,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_rmsnorm_quantize(
+                    &s,
+                    &self.k.rms_norm_quantize,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            } else {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_normed,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    hb,
+                )
+                .map_err(map)?;
+            }
             launch_gemv(
                 &s,
                 &self.k.gemv,
@@ -2215,43 +2488,70 @@ impl CudaResidentDecode {
                 &mut self.d_up,
             )
             .map_err(map)?;
-            launch_silu_mul(
-                &s,
-                &self.k.silu_mul,
-                &self.d_gate,
-                &self.d_up,
-                &mut self.d_ffn_act,
-                self.ffn_dim,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_ffn_act,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                fb,
-            )
-            .map_err(map)?;
-            launch_gemv(
-                &s,
-                &self.k.gemv,
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &wdown,
-                self.hidden,
-                fb,
-                &mut self.d_proj,
-            )
-            .map_err(map)?;
-            launch_residual(
-                &s,
-                &self.k.residual_add,
-                &mut self.d_hidden,
-                &self.d_proj,
-                self.hidden,
-            )
-            .map_err(map)?;
+            if fused {
+                launch_silu_mul_quantize(
+                    &s,
+                    &self.k.silu_mul_quantize,
+                    &self.d_gate,
+                    &self.d_up,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    fb,
+                )
+                .map_err(map)?;
+            } else {
+                launch_silu_mul(
+                    &s,
+                    &self.k.silu_mul,
+                    &self.d_gate,
+                    &self.d_up,
+                    &mut self.d_ffn_act,
+                    self.ffn_dim,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_ffn_act,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    fb,
+                )
+                .map_err(map)?;
+            }
+            if fused {
+                launch_gemv_residual(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wdown,
+                    self.hidden,
+                    fb,
+                    &mut self.d_hidden,
+                )
+                .map_err(map)?;
+            } else {
+                launch_gemv(
+                    &s,
+                    &self.k.gemv,
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &wdown,
+                    self.hidden,
+                    fb,
+                    &mut self.d_proj,
+                )
+                .map_err(map)?;
+                launch_residual(
+                    &s,
+                    &self.k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_proj,
+                    self.hidden,
+                )
+                .map_err(map)?;
+            }
             if offloaded {
                 if let Some(cs) = &copy_stream {
                     // This layer is done reading scratch[cur_buf]: record compute_done so
@@ -2275,25 +2575,39 @@ impl CudaResidentDecode {
             return Ok(());
         }
         // final norm + output projection -> d_logits (no argmax / no sync here).
-        launch_rmsnorm(
-            &s,
-            &self.k.rms_norm,
-            &self.d_hidden,
-            &self.final_norm,
-            &mut self.d_normed,
-            self.hidden,
-            self.eps,
-        )
-        .map_err(map)?;
-        launch_quantize(
-            &s,
-            &self.k.quantize,
-            &self.d_normed,
-            &mut self.d_in_quants,
-            &mut self.d_in_scales,
-            hb,
-        )
-        .map_err(map)?;
+        if fused {
+            launch_rmsnorm_quantize(
+                &s,
+                &self.k.rms_norm_quantize,
+                &self.d_hidden,
+                &self.final_norm,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+        } else {
+            launch_rmsnorm(
+                &s,
+                &self.k.rms_norm,
+                &self.d_hidden,
+                &self.final_norm,
+                &mut self.d_normed,
+                self.hidden,
+                self.eps,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &self.d_normed,
+                &mut self.d_in_quants,
+                &mut self.d_in_scales,
+                hb,
+            )
+            .map_err(map)?;
+        }
         launch_gemv(
             &s,
             &self.k.gemv,
