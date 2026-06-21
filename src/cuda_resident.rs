@@ -1455,7 +1455,6 @@ fn launch_kv_scatter(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-#[allow(clippy::too_many_arguments)]
 // Max splits the split-K decode attention may use (scratch in CudaResidentDecode is
 // sized to this), and the context length above which it is used. Below the threshold the
 // one-block-per-head `launch_attention` is cheaper (one launch, no scratch round-trip);
@@ -1547,12 +1546,18 @@ fn launch_attention_splitk(
             shared_mem_bytes: 0,
         };
         let mut b = s.launch_builder(&k.attn_sk_combine);
-        b.arg(&mut *lsum_buf).arg(&mut *acc_buf).arg(out).arg(&nh).arg(&hd).arg(&ns);
+        b.arg(&mut *lsum_buf)
+            .arg(&mut *acc_buf)
+            .arg(out)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&ns);
         unsafe { b.launch(cfg) }?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn launch_attention(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
