@@ -3709,14 +3709,18 @@ impl LlamaInferenceSession {
         {
             let prefill_token_ids = &token_ids[..prefill_count];
             let prefill_chunk_tokens = prefill_layer_major_chunk_token_count(prefill_count);
-            let layer_major_timings = self
-                .forward_prefill_layer_major_timed_fast(prefill_token_ids, prefill_chunk_tokens)?;
+            // Compute-bound GEMM: run on the wider prefill pool (see prefill_thread_pool).
+            let layer_major_timings = run_on_prefill_pool(|| {
+                self.forward_prefill_layer_major_timed_fast(prefill_token_ids, prefill_chunk_tokens)
+            })?;
             timings.add_assign(&layer_major_timings);
             prefill_timings.add_assign(&layer_major_timings);
         } else if prefill_count > 0 && prefill_chunk_tokens > 1 {
             let mut telemetry_tokens_done = 0usize;
             for chunk in token_ids[..prefill_count].chunks(prefill_chunk_tokens) {
-                let chunk_timings = self.forward_prefill_chunk_timed_fast(chunk)?;
+                // Compute-bound GEMM: run on the wider prefill pool (see prefill_thread_pool).
+                let chunk_timings =
+                    run_on_prefill_pool(|| self.forward_prefill_chunk_timed_fast(chunk))?;
                 timings.add_assign(&chunk_timings);
                 prefill_timings.add_assign(&chunk_timings);
                 telemetry_tokens_done += chunk.len();
@@ -3728,7 +3732,10 @@ impl LlamaInferenceSession {
         } else {
             for (telemetry_done, token_id) in token_ids[..prefill_count].iter().enumerate() {
                 add_q8_schedule_counter(&Q8_SCHED_PREFILL_SINGLE_TOKEN_FALLBACKS, 1);
-                let timed = self.forward_single_token_timed_internal(*token_id, false, false)?;
+                // Prompt tokens (still prefill): run on the wider prefill pool.
+                let timed = run_on_prefill_pool(|| {
+                    self.forward_single_token_timed_internal(*token_id, false, false)
+                })?;
                 timings.add_assign(&timed.timings);
                 prefill_timings.add_assign(&timed.timings);
                 telemetry::emit(telemetry::Event::PrefillProgress {
@@ -4080,6 +4087,107 @@ fn prefill_layer_major_enabled(weights: &LlamaLoadedWeights) -> bool {
         }
         Err(env::VarError::NotPresent) => weights.has_lazy_q8_0_file_backing(),
         Err(_) => weights.has_lazy_q8_0_file_backing(),
+    }
+}
+
+/// Dedicated, wider Rayon pool for the compute-bound prompt-prefill GEMM.
+///
+/// Prompt prefill is a matrix–matrix multiply (high arithmetic intensity): it
+/// scales with *logical* cores, gaining throughput from SMT siblings. Single-token
+/// decode is the opposite — a matrix–vector stream that is memory-bandwidth-bound,
+/// where SMT siblings only add memory-controller contention and *cost* throughput.
+/// Measured on an i7-11800H (8C/16T): prefill 19.5→23.6 tok/s going 8→16 threads
+/// (+21%), while decode peaks near 6 threads and falls 5.7→5.2 over the same range
+/// (see `docs/perf-deep-dive/PERF_RECEIPTS/.../p1-cpu-thread-sweep`). The global
+/// pool stays sized for decode (physical cores on Windows, see
+/// `configure_rayon_threads`); only the prefill forward pass installs onto this
+/// wider pool, so each phase runs at its own optimum.
+///
+/// Bit-exact: the prefill matmul parallelizes over *independent* output rows, and
+/// each row's block accumulation is serial, so the thread count never changes the
+/// numeric result (verified byte-identical across 4–16 threads in the sweep above).
+///
+/// Returns `None` (prefill stays on the global pool) on non-Windows/x86_64 targets,
+/// under an explicit `CAMELID_PREFILL_THREADS=0|off|global`, when the operator has
+/// hand-pinned the global pool via `CAMELID_THREADS` without a prefill override, or
+/// when the resolved width would not exceed the global pool.
+fn prefill_thread_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(build_prefill_thread_pool).as_ref()
+}
+
+fn build_prefill_thread_pool() -> Option<rayon::ThreadPool> {
+    let global = rayon::current_num_threads();
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(global);
+    let target = resolve_prefill_thread_count_from(
+        env::var("CAMELID_PREFILL_THREADS").ok().as_deref(),
+        env::var("CAMELID_THREADS").is_ok(),
+        logical,
+        cfg!(all(target_os = "windows", target_arch = "x86_64")),
+    )?;
+    if target <= global {
+        return None;
+    }
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(target)
+        .thread_name(|i| format!("camelid-prefill-{i}"))
+        .build()
+    {
+        Ok(pool) => {
+            tracing::info!(
+                prefill_threads = target,
+                decode_threads = global,
+                "phase-adaptive CPU threading: prefill on a wider pool ({target} threads), \
+                 decode/global pool stays at {global}"
+            );
+            Some(pool)
+        }
+        Err(err) => {
+            tracing::warn!("failed to build prefill thread pool ({err}); using global pool");
+            None
+        }
+    }
+}
+
+/// Pure resolution of the prefill pool width, factored out for testing.
+///
+/// * `spec` — the raw `CAMELID_PREFILL_THREADS` value, if set.
+/// * `global_pinned` — whether `CAMELID_THREADS` explicitly pinned the global pool.
+/// * `logical` — logical core count (the default widen target).
+/// * `widen_by_default` — whether this target auto-widens prefill (Windows/x86_64).
+fn resolve_prefill_thread_count_from(
+    spec: Option<&str>,
+    global_pinned: bool,
+    logical: usize,
+    widen_by_default: bool,
+) -> Option<usize> {
+    if let Some(spec) = spec {
+        let trimmed = spec.trim();
+        if trimmed.eq_ignore_ascii_case("off")
+            || trimmed.eq_ignore_ascii_case("global")
+            || trimmed == "0"
+        {
+            return None;
+        }
+        return trimmed.parse::<usize>().ok().filter(|n| *n > 0);
+    }
+    // No explicit prefill override: only widen on measured targets, and never
+    // silently override an operator's hand-pinned global thread count.
+    if !widen_by_default || global_pinned {
+        return None;
+    }
+    Some(logical)
+}
+
+/// Run the compute-bound prefill `op` on the wider prefill pool when one is
+/// configured, otherwise inline on the current (global) pool. See
+/// [`prefill_thread_pool`] for the rationale and bit-exactness guarantee.
+fn run_on_prefill_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    match prefill_thread_pool() {
+        Some(pool) => pool.install(op),
+        None => op(),
     }
 }
 
