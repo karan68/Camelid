@@ -226,7 +226,9 @@ impl ModelDrafter {
         // in sync (the batched-prefill diagnostics path desyncs the drafter's resident engine and
         // tanks accept). The diagnostics path is the fallback only when the resident engine isn't
         // ready, in which case nothing has been fed yet so re-feeding the whole chunk is consistent.
-        let (&head, rest) = pending.split_first().expect("pending is non-empty (checked above)");
+        let (&head, rest) = pending
+            .split_first()
+            .expect("pending is non-empty (checked above)");
         let first = match self.session.generate_next_token_greedy_resident(head)? {
             Some((mut pred, us)) => {
                 self.resident_forward_us += us;

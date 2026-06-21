@@ -2053,8 +2053,8 @@ impl CudaResidentDecode {
         for h in 0..n_kv {
             let hsrc = h * span; // host: head h's [0,position) block
             let gdst = h * max_pos * hd; // gpu: head h's base (positions 0..)
-            // The GPU KV cache holds f16 bits; convert host f32 (already f16-rounded) before
-            // upload so the bytes match what kv_scatter writes.
+                                         // The GPU KV cache holds f16 bits; convert host f32 (already f16-rounded) before
+                                         // upload so the bytes match what kv_scatter writes.
             let kbits: Vec<u16> = ck[hsrc..hsrc + span]
                 .iter()
                 .map(|&x| crate::inference::f32_to_f16_bits(x))

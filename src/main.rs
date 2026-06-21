@@ -2549,7 +2549,9 @@ fn load_model_drafter(
         // "blocked" configuration). Otherwise the draft stays GPU-resident by default.
         session.set_resident_paths_disabled(true);
     }
-    Ok(SpeculativeDrafter::Model(Box::new(ModelDrafter::new(session))))
+    Ok(SpeculativeDrafter::Model(Box::new(ModelDrafter::new(
+        session,
+    ))))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2760,7 +2762,11 @@ fn run_bench_speculative(
     } else {
         0.0
     };
-    let s_sync = if plain_tps > 0.0 { spec_tps / plain_tps } else { 0.0 };
+    let s_sync = if plain_tps > 0.0 {
+        spec_tps / plain_tps
+    } else {
+        0.0
+    };
 
     let record = BenchSpeculativeRecord {
         runtime: "camelid",
