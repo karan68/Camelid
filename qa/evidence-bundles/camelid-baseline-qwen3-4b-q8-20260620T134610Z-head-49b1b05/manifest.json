@@ -46,7 +46,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -94,7 +94,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -142,7 +142,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -190,7 +190,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -238,7 +238,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -286,7 +286,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -334,7 +334,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -386,7 +386,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -438,7 +438,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -490,7 +490,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -542,7 +542,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -594,7 +594,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"

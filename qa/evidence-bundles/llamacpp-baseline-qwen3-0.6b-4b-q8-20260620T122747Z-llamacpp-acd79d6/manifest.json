@@ -51,7 +51,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -78,7 +78,7 @@
                                                     1755
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-bench.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-bench.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
                       "lossless_note":  "llama.cpp greedy raw decode; its own non-spec reference (D1)."
                   },
                   {
@@ -107,7 +107,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-4b",
-                                    "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                    "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                     "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -134,7 +134,7 @@
                                                     1755
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-bench.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-bench.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
                       "lossless_note":  "llama.cpp greedy raw decode; its own non-spec reference (D1)."
                   },
                   {
@@ -163,7 +163,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-0.6b",
-                                    "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                    "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                     "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -190,7 +190,7 @@
                                                     1755
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-bench.exe -m C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-bench.exe -m <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
                       "lossless_note":  "llama.cpp greedy raw decode; its own non-spec reference (D1)."
                   },
                   {
@@ -219,7 +219,7 @@
                                   },
                       "model":  {
                                     "id":  "qwen3-0.6b",
-                                    "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                    "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                     "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                     "quant":  "Q8_0",
                                     "arch":  "qwen3"
@@ -246,7 +246,7 @@
                                                     1755
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-bench.exe -m C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-bench.exe -m <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -p 512 -n 128 -fa 1 -ngl 99 -r 5 -o json",
                       "lossless_note":  "llama.cpp greedy raw decode; its own non-spec reference (D1)."
                   },
                   {
@@ -276,13 +276,13 @@
                       "model":  {
                                     "target":  {
                                                    "id":  "qwen3-4b",
-                                                   "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                                   "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                                    "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                                    "quant":  "Q8_0"
                                                },
                                     "draft":  {
                                                   "id":  "qwen3-0.6b",
-                                                  "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                                  "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                                   "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                                   "quant":  "Q8_0"
                                               }
@@ -314,7 +314,7 @@
                                                     1747
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-speculative.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -md C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f C:\\Users\\timto\\AppData\\Local\\Temp\\specprompt_code_completion.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-speculative.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -md <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f <HOME>\\AppData\\Local\\Temp\\specprompt_code_completion.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
                       "raw_stats_log":  "specbench-code_completion.log"
                   },
                   {
@@ -344,13 +344,13 @@
                       "model":  {
                                     "target":  {
                                                    "id":  "qwen3-4b",
-                                                   "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                                   "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                                    "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                                    "quant":  "Q8_0"
                                                },
                                     "draft":  {
                                                   "id":  "qwen3-0.6b",
-                                                  "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                                  "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                                   "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                                   "quant":  "Q8_0"
                                               }
@@ -382,7 +382,7 @@
                                                     1747
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-speculative.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -md C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f C:\\Users\\timto\\AppData\\Local\\Temp\\specprompt_structured_json.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-speculative.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -md <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f <HOME>\\AppData\\Local\\Temp\\specprompt_structured_json.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
                       "raw_stats_log":  "specbench-structured_json.log"
                   },
                   {
@@ -412,13 +412,13 @@
                       "model":  {
                                     "target":  {
                                                    "id":  "qwen3-4b",
-                                                   "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                                   "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                                    "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                                    "quant":  "Q8_0"
                                                },
                                     "draft":  {
                                                   "id":  "qwen3-0.6b",
-                                                  "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                                  "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                                   "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                                   "quant":  "Q8_0"
                                               }
@@ -450,7 +450,7 @@
                                                     1747
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-speculative.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -md C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f C:\\Users\\timto\\AppData\\Local\\Temp\\specprompt_repetitive_extraction.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-speculative.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -md <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f <HOME>\\AppData\\Local\\Temp\\specprompt_repetitive_extraction.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
                       "raw_stats_log":  "specbench-repetitive_extraction.log"
                   },
                   {
@@ -480,13 +480,13 @@
                       "model":  {
                                     "target":  {
                                                    "id":  "qwen3-4b",
-                                                   "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                                   "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                                    "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                                    "quant":  "Q8_0"
                                                },
                                     "draft":  {
                                                   "id":  "qwen3-0.6b",
-                                                  "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                                  "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                                   "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                                   "quant":  "Q8_0"
                                               }
@@ -518,7 +518,7 @@
                                                     1747
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-speculative.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -md C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f C:\\Users\\timto\\AppData\\Local\\Temp\\specprompt_normal_chat.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-speculative.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -md <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f <HOME>\\AppData\\Local\\Temp\\specprompt_normal_chat.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
                       "raw_stats_log":  "specbench-normal_chat.log"
                   },
                   {
@@ -548,13 +548,13 @@
                       "model":  {
                                     "target":  {
                                                    "id":  "qwen3-4b",
-                                                   "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                                   "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                                    "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                                    "quant":  "Q8_0"
                                                },
                                     "draft":  {
                                                   "id":  "qwen3-0.6b",
-                                                  "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                                  "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                                   "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                                   "quant":  "Q8_0"
                                               }
@@ -586,7 +586,7 @@
                                                     1747
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-speculative.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -md C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f C:\\Users\\timto\\AppData\\Local\\Temp\\specprompt_creative_writing.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-speculative.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -md <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f <HOME>\\AppData\\Local\\Temp\\specprompt_creative_writing.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
                       "raw_stats_log":  "specbench-creative_writing.log"
                   },
                   {
@@ -616,13 +616,13 @@
                       "model":  {
                                     "target":  {
                                                    "id":  "qwen3-4b",
-                                                   "path":  "C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf",
+                                                   "path":  "<HOME>\\models\\Qwen3-4B-Q8_0.gguf",
                                                    "sha256":  "8c2f07f26af9747e41988551106f149b03eb9b5cb6df636027b6bf6278473300",
                                                    "quant":  "Q8_0"
                                                },
                                     "draft":  {
                                                   "id":  "qwen3-0.6b",
-                                                  "path":  "C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
+                                                  "path":  "<HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf",
                                                   "sha256":  "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
                                                   "quant":  "Q8_0"
                                               }
@@ -654,7 +654,7 @@
                                                     1747
                                                 ],
                       "sm_clock_policy":  "free (laptop boost; per-cell pre/post clock bracket recorded)",
-                      "cmd":  "C:\\Users\\timto\\llama.cpp\\build\\bin\\llama-speculative.exe -m C:\\Users\\timto\\models\\Qwen3-4B-Q8_0.gguf -md C:\\Users\\timto\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f C:\\Users\\timto\\AppData\\Local\\Temp\\specprompt_adversarial_lowaccept.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
+                      "cmd":  "<HOME>\\llama.cpp\\build\\bin\\llama-speculative.exe -m <HOME>\\models\\Qwen3-4B-Q8_0.gguf -md <HOME>\\camelid-dltest\\models\\Qwen3-0.6B-Q8_0.gguf -f <HOME>\\AppData\\Local\\Temp\\specprompt_adversarial_lowaccept.txt -n 128 --spec-draft-n-max 8 --spec-draft-n-min 1 -ngl 99 -ngld 99 --top-k 1 --temp 0 -c 2048",
                       "raw_stats_log":  "specbench-adversarial_lowaccept.log"
                   }
               ]
