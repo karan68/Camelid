@@ -461,9 +461,11 @@ extern "C" __global__ void attention_decode(
     const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
 
     extern __shared__ float shared[];
-    float* qsh = shared;                 // head_dim
-    float* scores = shared + head_dim;   // position_count
     int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;       // weighted-V groups per dim (blockDim is a multiple of head_dim)
+    float* qsh = shared;                 // head_dim
+    float* vpart = shared + head_dim;    // G * head_dim (per-dim partials, fixed-order combine)
+    float* scores = shared + head_dim + (long)G * head_dim;   // position_count
     for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
     __syncthreads();
 
@@ -494,12 +496,30 @@ extern "C" __global__ void attention_decode(
     }
     __syncthreads();
     float inv = 1.0f / s_sum;
-    // weighted V: each thread handles a subset of output dims
-    for (int d = tid; d < head_dim; d += blockDim.x) {
-        float acc = 0.0f;
-        for (int p = 0; p < position_count; p++)
-            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
-        out[(long)head * head_dim + d] = acc;
+    // weighted V (parallelized; TOKEN-PARITY, *not* bit-identical to CPU): G threads
+    // cooperate per output dim. Thread (gid,did) sums the CONTIGUOUS key range
+    // [gid*pc/G, (gid+1)*pc/G) in p-order into vpart[did*G+gid]; group gid==0 then sums
+    // the G partials in g-order into out[did]. Same math as the sequential p=0..pc-1
+    // sum but FP-REASSOCIATED (each partial restarts at 0), so logits differ in the low
+    // bits. This is the lever that fixes the O(context) weighted-V collapse at depth
+    // (the sequential reduction caps parallelism at head_dim threads). Greedy tokens
+    // are verified identical (parity gate first_divergent==-1 vs llama.cpp acd79d603).
+    // CAVEAT: attention_batched (spec-decode verify) is still the sequential reduction;
+    // for spec-decode losslessness it must get the identical reorder so decode==batched
+    // stays exact. Greedy single-token decode (this path / the benchmark) is unaffected.
+    int gid = tid / head_dim;            // 0..G-1
+    int did = tid % head_dim;            // 0..head_dim-1
+    int p_lo = (int)((long)gid * position_count / G);
+    int p_hi = (int)((long)(gid + 1) * position_count / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++)
+        acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
     }
 }
 
@@ -752,6 +772,119 @@ extern "C" __global__ void argmax_batched(
     }
     if (tid == 0) out[t] = (unsigned int)sidx[0];
 }
+
+// ---- Split-K decode attention (fills SMs at depth) --------------------------
+// One block per (head, split) instead of one block per head, so grid = n_heads x
+// n_splits covers all 30 SMs even though there are only 32 heads. TOKEN-PARITY, not
+// bit-identical: the per-position dot and exp use the EXACT sequential order and the
+// EXACT global max (so those are bit-identical), but the exp-sum and weighted-V are
+// split into contiguous chunks and recombined in chunk order — re-associating the
+// position sum exactly as the (parity-passing) Stage-2 weighted-V split does. True
+// bit-identity is impossible for a split sequential reduction. Verified token-identical.
+//
+// Pass 1: per (head, split) compute the chunk's scores (sequential d-order dot ->
+// bit-identical) into scores_buf and the chunk's max into chunkmax_buf.
+extern "C" __global__ void attn_sk_scores(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    float* __restrict__ scores_buf, float* __restrict__ chunkmax_buf,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale, int n_splits
+) {
+    int position_count = position_ptr[0] + 1;
+    int head = blockIdx.x;
+    int sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+
+    extern __shared__ float qsh[];      // head_dim
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    float local_max = -3.4e38f;
+    for (int p = p_lo + tid; p < p_hi; p += blockDim.x) {
+        const unsigned short* kp = kbase + (long)p * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        float sc = dot * scale;
+        scores_buf[(long)head * max_pos + p] = sc;
+        local_max = fmaxf(local_max, sc);
+    }
+    __shared__ float red[1024];
+    red[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    if (tid == 0) chunkmax_buf[(long)head * n_splits + sp] = red[0];
+}
+
+// Pass 2: per (head, split) read the EXACT global max over all splits, exp the chunk in
+// place (per-position, no reassociation), then write the chunk's sequential exp-sum
+// (lsum_buf) and UNNORMALIZED weighted-V (acc_buf, sequential p per dim).
+extern "C" __global__ void attn_sk_partial(
+    const unsigned short* __restrict__ cache_v, float* __restrict__ scores_buf,
+    const float* __restrict__ chunkmax_buf, float* __restrict__ lsum_buf,
+    float* __restrict__ acc_buf, int n_heads, int n_kv_heads, int head_dim,
+    const int* __restrict__ position_ptr, int max_pos, int n_splits
+) {
+    int position_count = position_ptr[0] + 1;
+    int head = blockIdx.x;
+    int sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+    float* sc_head = scores_buf + (long)head * max_pos;
+    int tid = threadIdx.x;
+
+    float gmax = -3.4e38f;
+    for (int i = 0; i < n_splits; i++) gmax = fmaxf(gmax, chunkmax_buf[(long)head * n_splits + i]);
+
+    for (int p = p_lo + tid; p < p_hi; p += blockDim.x) sc_head[p] = expf(sc_head[p] - gmax);
+    __syncthreads();
+    if (tid == 0) {
+        float ls = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) ls += sc_head[p];
+        lsum_buf[(long)head * n_splits + sp] = ls;
+    }
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float a = 0.0f;
+        for (int p = p_lo; p < p_hi; p++) a += sc_head[p] * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
+        acc_buf[(((long)head * n_splits + sp) * head_dim) + d] = a;
+    }
+}
+
+// Pass 3: per head, combine the splits in order: s = sum_sp lsum (ordered) and
+// out[d] = (sum_sp acc[sp][d]) / s (ordered). Chunk order == position order.
+extern "C" __global__ void attn_sk_combine(
+    const float* __restrict__ lsum_buf, const float* __restrict__ acc_buf,
+    float* __restrict__ out, int n_heads, int head_dim, int n_splits
+) {
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int tid = threadIdx.x;
+    __shared__ float s_inv;
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int sp = 0; sp < n_splits; sp++) s += lsum_buf[(long)head * n_splits + sp];
+        s_inv = 1.0f / s;
+    }
+    __syncthreads();
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float a = 0.0f;
+        for (int sp = 0; sp < n_splits; sp++) a += acc_buf[(((long)head * n_splits + sp) * head_dim) + d];
+        out[(long)head * head_dim + d] = a * s_inv;
+    }
+}
 "#;
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -782,6 +915,9 @@ pub struct CudaResidentKernels {
     pub(crate) kv_scatter_batched: CudaFunction,
     pub(crate) attention_batched: CudaFunction,
     pub(crate) argmax_batched: CudaFunction,
+    pub(crate) attn_sk_scores: CudaFunction,
+    pub(crate) attn_sk_partial: CudaFunction,
+    pub(crate) attn_sk_combine: CudaFunction,
 }
 
 impl CudaResidentKernels {
@@ -824,6 +960,9 @@ impl CudaResidentKernels {
             kv_scatter_batched: f("kv_scatter_batched")?,
             attention_batched: f("attention_batched")?,
             argmax_batched: f("argmax_batched")?,
+            attn_sk_scores: f("attn_sk_scores")?,
+            attn_sk_partial: f("attn_sk_partial")?,
+            attn_sk_combine: f("attn_sk_combine")?,
             ctx,
             stream,
         })
@@ -1316,6 +1455,108 @@ fn launch_kv_scatter(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+// Max splits the split-K decode attention may use (scratch in CudaResidentDecode is
+// sized to this), and the context length above which it is used. Below the threshold the
+// one-block-per-head `launch_attention` is cheaper (one launch, no scratch round-trip);
+// above it, split-K's n_heads x n_splits grid is needed to fill the SMs.
+const SPLITK_MAX: usize = 16;
+const SPLITK_THRESHOLD: usize = 512;
+
+/// Split-K decode attention: grid = n_heads x n_splits (vs one block per head), so the
+/// 30 SMs fill even with 32 heads. Three passes: (1) chunk scores + chunk max, (2) exp
+/// with the EXACT global max + chunk exp-sum + chunk unnormalized weighted-V, (3) ordered
+/// combine. TOKEN-PARITY: dot and global max are bit-identical; the cross-split sum
+/// re-associates exactly as the (parity-passing) Stage-2 weighted-V split. Verified.
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_splitk(
+    s: &Arc<CudaStream>,
+    k: &CudaResidentKernels,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
+    out: &mut CudaSlice<f32>,
+    scores_buf: &mut CudaSlice<f32>,
+    chunkmax_buf: &mut CudaSlice<f32>,
+    lsum_buf: &mut CudaSlice<f32>,
+    acc_buf: &mut CudaSlice<f32>,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position: &CudaSlice<i32>,
+    position_count: usize,
+    max_pos: usize,
+    scale: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let n_splits = position_count.div_ceil(256).clamp(2, SPLITK_MAX);
+    let (nh, nkv, hd, mp, ns) = (
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        n_splits as i32,
+    );
+    let block: u32 = 256;
+    // Pass 1: scores + per-chunk max. shared = qsh[head_dim].
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, n_splits as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: (head_dim as u32) * 4,
+        };
+        let mut b = s.launch_builder(&k.attn_sk_scores);
+        b.arg(q)
+            .arg(cache_k)
+            .arg(&mut *scores_buf)
+            .arg(&mut *chunkmax_buf)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(position)
+            .arg(&mp)
+            .arg(&scale)
+            .arg(&ns);
+        unsafe { b.launch(cfg) }?;
+    }
+    // Pass 2: exp(global max) + chunk exp-sum + chunk unnormalized weighted-V.
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, n_splits as u32, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = s.launch_builder(&k.attn_sk_partial);
+        b.arg(cache_v)
+            .arg(&mut *scores_buf)
+            .arg(&mut *chunkmax_buf)
+            .arg(&mut *lsum_buf)
+            .arg(&mut *acc_buf)
+            .arg(&nh)
+            .arg(&nkv)
+            .arg(&hd)
+            .arg(position)
+            .arg(&mp)
+            .arg(&ns);
+        unsafe { b.launch(cfg) }?;
+    }
+    // Pass 3: ordered combine -> out. One block per head, head_dim threads.
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (n_heads as u32, 1, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = s.launch_builder(&k.attn_sk_combine);
+        b.arg(&mut *lsum_buf)
+            .arg(&mut *acc_buf)
+            .arg(out)
+            .arg(&nh)
+            .arg(&hd)
+            .arg(&ns);
+        unsafe { b.launch(cfg) }?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_attention(
     s: &Arc<CudaStream>,
@@ -1335,10 +1576,25 @@ fn launch_attention(
     max_pos: usize,
     scale: f32,
 ) -> Result<(), cudarc::driver::DriverError> {
+    // Adaptive launch (occupancy/latency fix). attention_decode was starved at
+    // batch-1 (ncu @ block 64: 4.4% occupancy, 0.07 waves/SM, 0.44% DRAM) — too few
+    // warps to hide the K/V f16 read latency, and its cost is O(context) so decode
+    // collapses at depth. Size the block to the key count in units of head_dim (G
+    // weighted-V groups), capped at 1024 threads. G = block/head_dim is passed
+    // implicitly via blockDim so the kernel parallelizes the weighted-V across G
+    // contiguous key ranges. The strided score/exp loops and the tid==0 softmax
+    // reductions stay bit-identical; the weighted-V is FP-reassociated for parallelism
+    // (token-parity, not bit-identical to CPU — see the kernel body). Verified token-id.
+    let max_groups = (1024 / head_dim as u32).max(1);
+    let groups = (shared_positions.max(1) as u32)
+        .div_ceil(head_dim as u32)
+        .clamp(1, max_groups);
+    let block = groups * head_dim as u32;
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, 1, 1),
-        block_dim: (64, 1, 1),
-        shared_mem_bytes: ((head_dim + shared_positions) * 4) as u32,
+        block_dim: (block, 1, 1),
+        // qsh[head_dim] + vpart[groups*head_dim] + scores[shared_positions]
+        shared_mem_bytes: ((head_dim as u32 * (1 + groups)) + shared_positions as u32) * 4,
     };
     let (nh, nkv, hd, mp) = (
         n_heads as i32,
@@ -1589,6 +1845,13 @@ pub struct CudaResidentDecode {
     d_k: CudaSlice<f32>,
     d_v: CudaSlice<f32>,
     d_attn: CudaSlice<f32>,
+    // Split-K decode-attention scratch (sized for up to SPLITK_MAX splits). Used only
+    // when the context is long enough (see SPLITK_THRESHOLD) to need more than the
+    // one-block-per-head launch to fill the SMs.
+    d_sk_scores: CudaSlice<f32>,   // n_heads * max_pos
+    d_sk_chunkmax: CudaSlice<f32>, // n_heads * SPLITK_MAX
+    d_sk_lsum: CudaSlice<f32>,     // n_heads * SPLITK_MAX
+    d_sk_acc: CudaSlice<f32>,      // n_heads * SPLITK_MAX * head_dim
     d_proj: CudaSlice<f32>,
     d_gate: CudaSlice<f32>,
     d_up: CudaSlice<f32>,
@@ -1731,6 +1994,10 @@ impl CudaResidentDecode {
             d_k: alloc_f(kv_width)?,
             d_v: alloc_f(kv_width)?,
             d_attn: alloc_f(q_width)?,
+            d_sk_scores: alloc_f(n_heads * max_pos)?,
+            d_sk_chunkmax: alloc_f(n_heads * SPLITK_MAX)?,
+            d_sk_lsum: alloc_f(n_heads * SPLITK_MAX)?,
+            d_sk_acc: alloc_f(n_heads * SPLITK_MAX * head_dim)?,
             d_proj: alloc_f(hidden)?,
             d_gate: alloc_f(ffn_dim)?,
             d_up: alloc_f(ffn_dim)?,
@@ -2372,23 +2639,49 @@ impl CudaResidentDecode {
                 self.max_pos,
             )
             .map_err(map)?;
-            // attention
-            launch_attention(
-                &s,
-                &self.k.attention,
-                &self.d_q,
-                &self.cache_k[li],
-                &self.cache_v[li],
-                &mut self.d_attn,
-                self.n_heads,
-                self.n_kv_heads,
-                self.head_dim,
-                &self.d_position,
-                attn_shared,
-                self.max_pos,
-                scale,
-            )
-            .map_err(map)?;
+            // attention. At depth, split-K (grid n_heads x n_splits) fills the SMs that
+            // the one-block-per-head launch leaves idle; below SPLITK_THRESHOLD the single
+            // kernel is cheaper (one launch, no scratch). Both are token-parity to the same
+            // reference. Split-K is skipped during graph capture (split count is ctx-dependent).
+            if !graph_capture && attn_shared > SPLITK_THRESHOLD {
+                launch_attention_splitk(
+                    &s,
+                    &self.k,
+                    &self.d_q,
+                    &self.cache_k[li],
+                    &self.cache_v[li],
+                    &mut self.d_attn,
+                    &mut self.d_sk_scores,
+                    &mut self.d_sk_chunkmax,
+                    &mut self.d_sk_lsum,
+                    &mut self.d_sk_acc,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    &self.d_position,
+                    attn_shared,
+                    self.max_pos,
+                    scale,
+                )
+                .map_err(map)?;
+            } else {
+                launch_attention(
+                    &s,
+                    &self.k.attention,
+                    &self.d_q,
+                    &self.cache_k[li],
+                    &self.cache_v[li],
+                    &mut self.d_attn,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    &self.d_position,
+                    attn_shared,
+                    self.max_pos,
+                    scale,
+                )
+                .map_err(map)?;
+            }
             // O projection + residual
             launch_quantize(
                 &s,
