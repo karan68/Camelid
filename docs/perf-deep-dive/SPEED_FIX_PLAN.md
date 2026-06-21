@@ -36,7 +36,44 @@ Decode +20% at 1–2 threads; prefill flat (memory-saturated regardless). Output
 
 **Caveat:** the team's `windows_physical_core_count` comment frames decode as "compute-bound"; it's actually *memory-bound*, so even physical-core capping over-subscribes here. A memory-channel-aware decode thread count would be the principled universal fix, but reliable cross-platform channel detection is hard — deferred.
 
+## P0.6 — SHIPPED, bit-identical, +24% prefill on this box: phase-adaptive CPU threading
+
+**The insight P0.5 was half of.** P0.5 found decode wants *fewer* threads (memory-bound). The other half: **prefill wants *more*.** Prefill is a matrix–matrix GEMM (high arithmetic intensity) and scales with logical cores; decode is a matrix–vector stream that is bandwidth-bound and is *hurt* by SMT siblings. They pull in **opposite** directions — so a single global pool size is wrong for one phase no matter what you pick. The old Windows default (physical cores = 8) protected decode and silently left ~20% of prefill on the table.
+
+**Evidence — `CAMELID_THREADS` sweep, byte-identical across all counts (`same-host/p1-cpu-thread-sweep-llama3b-*.json`, `parity_all_identical: true`):**
+
+| threads | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| 4 | 12.18 | 5.88 |
+| 6 | 16.21 | **5.94** |
+| 8 (old default) | 19.48 | 5.73 |
+| 12 | 21.59 | 5.28 |
+| 16 (logical) | **23.56** | 5.20 |
+
+Prefill scales monotonically to logical cores (+21% at 16 vs 8); decode peaks ~6 and falls past it. Textbook compute-bound vs bandwidth-bound.
+
+**Fix (shipped).** Run *only* the compute-bound prefill forward pass on a dedicated wider Rayon pool (logical cores); the global pool stays sized for decode (physical cores). Each phase gets its own optimum, with **zero decode regression** because the decode path never touches the new pool.
+
+- `src/inference.rs`: `prefill_thread_pool()` / `run_on_prefill_pool()` (lazy `OnceLock` pool, logical-core width) + 3 call-site wraps in `generate_next_token_with_history_diagnostics` (layer-major, chunked, single-token prefill branches). Decode (`forward_single_token_timed_internal`) is left on the global pool untouched.
+- Default-on for Windows x86_64 (the measured target). `CAMELID_PREFILL_THREADS=N|off|global` overrides; an explicit `CAMELID_THREADS` pin is respected (no silent widening). Pure resolver `resolve_prefill_thread_count_from` is unit-tested.
+
+**Parity.** Prefill parallelizes over *independent* output rows; each row's block accumulation is serial, so thread count cannot change the numeric result. Proven byte-identical two ways: the sweep above, and the A/B validation below.
+
+**Validation — new default vs `CAMELID_PREFILL_THREADS=off` (old behavior), same binary (`same-host/p1-prefill-pool-validate-llama3b-*.json`):**
+
+| | prefill tok/s | decode tok/s |
+|---|---:|---:|
+| phase-adaptive (default) | **23.73** | 5.73 |
+| prefill-off (control) | 19.19 | 5.73 |
+| llama.cpp | 29.73 | 8.65 |
+
+**+24% prefill, decode unchanged, output byte-identical** (`parity_A_vs_B_decode_identical: true`). Closes the prefill gap from 0.62× → **0.80×** of llama.cpp for free — no new kernel, no precision change.
+
+**Rollback.** `CAMELID_PREFILL_THREADS=off`, or revert the `inference.rs` hunk.
+
 ## P1 — high impact, real, parity-safe, but medium–high effort: unified tiled Q8 GEMM owner
+
+> **Update (post-P0.6).** The *cheap* half of P1's prefill win is now banked by phase-adaptive threading (+24%, above) — proving the prefill gap was partly just thread width, not only kernel quality. A unified tiled GEMM remains the lever for the *residual* prefill gap (0.80× → ~1.0×) and is the only thing that helps once the prefill pool is saturated. **It does NOT help decode** — decode is bandwidth-bound (the VNNI/AVX2/scalar packed dots were measured byte-identical *and* identical-throughput; `same-host/p1-vnni-kernel-matrix-llama3b-*.json`), so a faster dot kernel cannot move decode tok/s. Scope P1 to prefill only.
 
 **Problem.** Camelid CPU is a uniform **0.61–0.68×** of llama.cpp (prefill 18.9 vs 30.6; decode 5.97 vs 9.08). The cause is architectural, not a flag: llama.cpp routes every projection through ONE tiled tinyBLAS GEMM (register-blocked M×N×K, AVX-512+FMA, REPACK) with an in-kernel chunk scheduler and a single activation quantization; Camelid runs **AVX2 bespoke per-role kernels** that re-quantize the input per projection and aren't register-tiled. The repo's own mapping note proposes exactly this owner (`CAMELID_X86_Q8_MATMUL_OWNER=ffn_down`).
 

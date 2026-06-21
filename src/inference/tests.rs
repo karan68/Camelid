@@ -840,6 +840,52 @@ fn prefill_chunk_token_count_accepts_full_prompt_probe() {
 }
 
 #[test]
+fn resolve_prefill_thread_count_widens_only_on_measured_default() {
+    // Explicit override wins, including disabling the wider pool.
+    assert_eq!(
+        resolve_prefill_thread_count_from(Some("6"), false, 16, true),
+        Some(6)
+    );
+    assert_eq!(
+        resolve_prefill_thread_count_from(Some(" 12 "), true, 16, true),
+        Some(12)
+    );
+    assert_eq!(
+        resolve_prefill_thread_count_from(Some("off"), false, 16, true),
+        None
+    );
+    assert_eq!(
+        resolve_prefill_thread_count_from(Some("GLOBAL"), false, 16, true),
+        None
+    );
+    assert_eq!(
+        resolve_prefill_thread_count_from(Some("0"), false, 16, true),
+        None
+    );
+    // Unparseable / non-positive overrides fall back to the global pool.
+    assert_eq!(
+        resolve_prefill_thread_count_from(Some("abc"), false, 16, true),
+        None
+    );
+
+    // No override: widen to logical cores only on a measured target...
+    assert_eq!(
+        resolve_prefill_thread_count_from(None, false, 16, true),
+        Some(16)
+    );
+    // ...never on unmeasured targets...
+    assert_eq!(
+        resolve_prefill_thread_count_from(None, false, 16, false),
+        None
+    );
+    // ...and never silently over an operator's hand-pinned global thread count.
+    assert_eq!(
+        resolve_prefill_thread_count_from(None, true, 16, true),
+        None
+    );
+}
+
+#[test]
 fn prefill_layer_major_chunk_token_count_has_separate_headroom_default() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");
