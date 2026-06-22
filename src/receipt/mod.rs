@@ -93,6 +93,16 @@ pub struct ParityReceipt {
     /// in-process re-run and checks it matches (see `verify`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_trace: Option<ExecutionTraceBlock>,
+    /// Optional quality-tier attestation (`camelid.quality-tier/v1`). Present only when a
+    /// run wants to declare its numeric-fidelity tier honestly (e.g. a lossy Q4_K format
+    /// carrying its measured greedy-agreement and perplexity delta against the same-format
+    /// baseline). Absent for the default headline-Q8 path, so existing receipts serialize
+    /// and digest exactly as before. When present it is part of the canonical body and so
+    /// bound into `receipt_id`. The verifier enforces a format-honesty invariant on it (see
+    /// `verify`): a `lossy` tier must compare against the SAME format and never renders as a
+    /// cross-format VERIFIED parity contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_tier: Option<QualityTier>,
     /// Deferred signing seam: an optional detached signature over
     /// `receipt_id`. Absent in v1; present-but-optional so adding it later is
     /// not a schema-breaking change. Key management is intentionally not
@@ -407,6 +417,102 @@ pub fn host_isa_marker() -> String {
     }
 }
 
+/// Schema identifier for the quality-tier block.
+pub const QUALITY_TIER_SCHEMA_V1: &str = "camelid.quality-tier/v1";
+
+/// The numeric-fidelity tier this receipt's format produces.
+///
+/// - `HeadlineQ8` — the headline Q8_0 path: full numeric fidelity, the format Camelid's
+///   parity claims are made on. A headline-Q8 receipt can be a VERIFIED parity contract.
+/// - `Lossy` — a quantization that demonstrably perturbs the output (e.g. Q4_K). It ships
+///   only with an HONEST measurement against the SAME-format baseline (never a cross-format
+///   token-match), and the verifier refuses to call it VERIFIED.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QualityTierKind {
+    #[serde(rename = "headline-q8")]
+    HeadlineQ8,
+    Lossy,
+}
+
+/// Quality-tier attestation: declares the numeric fidelity of the format this receipt was
+/// produced on, plus the measured agreement and perplexity delta against a named baseline.
+///
+/// Format honesty (enforced in `verify`): a `lossy` tier must name the SAME format as the
+/// baseline it was measured against — you may not pass off a Q4_K run as matching a Q8_0
+/// reference token-for-token. The `format` here is the format Camelid ran;
+/// `baseline_format` is the format the baseline engine ran. For a lossy tier they must be
+/// equal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QualityTier {
+    /// Always [`QUALITY_TIER_SCHEMA_V1`].
+    pub schema: String,
+    /// The fidelity tier.
+    pub tier: QualityTierKind,
+    /// The quantization format Camelid ran (e.g. `Q8_0`, `Q4_K`, `Q5_K`).
+    pub format: String,
+    /// The baseline engine the agreement/ppl were measured against (e.g. `llama.cpp`).
+    pub baseline_engine: String,
+    /// The format the baseline engine ran. For a `lossy` tier this MUST equal `format`.
+    pub baseline_format: String,
+    /// The baseline engine's build commit/version, for reproducibility.
+    pub baseline_commit: String,
+    /// Greedy-decode token-agreement percentage with the baseline (0.0–100.0).
+    pub greedy_agreement_pct: f64,
+    /// Perplexity delta vs. the baseline (Camelid PPL − baseline PPL); positive = worse.
+    pub ppl_delta: f64,
+}
+
+impl QualityTier {
+    /// A headline-Q8 tier (full fidelity, parity-eligible).
+    pub fn headline_q8(
+        baseline_engine: String,
+        baseline_commit: String,
+        greedy_agreement_pct: f64,
+        ppl_delta: f64,
+    ) -> Self {
+        Self {
+            schema: QUALITY_TIER_SCHEMA_V1.to_string(),
+            tier: QualityTierKind::HeadlineQ8,
+            format: "Q8_0".to_string(),
+            baseline_engine,
+            baseline_format: "Q8_0".to_string(),
+            baseline_commit,
+            greedy_agreement_pct,
+            ppl_delta,
+        }
+    }
+
+    /// A lossy tier measured against the SAME format (the only honest comparison).
+    pub fn lossy_same_format(
+        format: String,
+        baseline_engine: String,
+        baseline_commit: String,
+        greedy_agreement_pct: f64,
+        ppl_delta: f64,
+    ) -> Self {
+        Self {
+            schema: QUALITY_TIER_SCHEMA_V1.to_string(),
+            baseline_format: format.clone(),
+            tier: QualityTierKind::Lossy,
+            format,
+            baseline_engine,
+            baseline_commit,
+            greedy_agreement_pct,
+            ppl_delta,
+        }
+    }
+
+    /// Format-honesty invariant: a lossy tier must compare against the SAME format. A
+    /// headline-Q8 tier is unconstrained here (it asserts full fidelity on its own format).
+    pub fn is_format_honest(&self) -> bool {
+        match self.tier {
+            QualityTierKind::Lossy => self.baseline_format == self.format,
+            QualityTierKind::HeadlineQ8 => true,
+        }
+    }
+}
+
 /// Reserved for the deferred signing decision: a detached signature over
 /// `receipt_id`. Not produced by v1 emitters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -607,6 +713,7 @@ mod tests {
             },
             execution_lane: None,
             execution_trace: None,
+            quality_tier: None,
             signature: None,
         }
     }
@@ -707,6 +814,83 @@ mod tests {
         let back: ParityReceipt = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(with, back);
         assert!(back.verify_self_digest().is_ok());
+    }
+
+    #[test]
+    fn quality_tier_absent_keeps_receipt_byte_identical() {
+        // THE KEY GUARD. A receipt with no quality_tier must omit the key entirely, so every
+        // receipt written before this field existed serializes and digests byte-for-byte
+        // unchanged. Mirrors `execution_trace_absent_keeps_receipt_byte_identical`.
+        let mut receipt = sample_receipt();
+        assert!(receipt.quality_tier.is_none());
+
+        // Digest computed with the field present-but-None must equal the digest a
+        // pre-field receipt would have produced (the canonical body cannot contain the key).
+        receipt.seal().expect("seal");
+        let body = receipt.canonical_body().expect("body");
+        assert!(
+            !body.contains("quality_tier"),
+            "absent quality tier must not appear in the canonical body: {body}"
+        );
+        let json = serde_json::to_string(&receipt).expect("serialize");
+        assert!(
+            !json.contains("quality_tier"),
+            "absent quality tier must not serialize a key"
+        );
+        receipt
+            .verify_self_digest()
+            .expect("digest stable with quality_tier = None");
+    }
+
+    #[test]
+    fn quality_tier_present_round_trips_and_enters_the_digest() {
+        let mut without = sample_receipt();
+        without.seal().expect("seal");
+
+        let mut with = sample_receipt();
+        with.quality_tier = Some(QualityTier::lossy_same_format(
+            "Q4_K".to_string(),
+            "llama.cpp".to_string(),
+            "b4567".to_string(),
+            97.5,
+            0.12,
+        ));
+        with.seal().expect("seal");
+
+        // The tier is part of the canonical body, so it changes receipt_id.
+        assert_ne!(
+            without.receipt_id, with.receipt_id,
+            "a quality tier must enter the receipt digest"
+        );
+        let json = serde_json::to_string(&with).expect("serialize");
+        assert!(json.contains("camelid.quality-tier/v1"));
+        assert!(json.contains("\"tier\":\"lossy\""));
+        let back: ParityReceipt = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(with, back);
+        assert!(back.verify_self_digest().is_ok());
+    }
+
+    #[test]
+    fn quality_tier_format_honesty_helpers() {
+        // A lossy tier built via the same-format constructor is honest.
+        let lossy = QualityTier::lossy_same_format(
+            "Q4_K".to_string(),
+            "llama.cpp".to_string(),
+            "b4567".to_string(),
+            90.0,
+            0.5,
+        );
+        assert!(lossy.is_format_honest());
+        assert_eq!(lossy.baseline_format, lossy.format);
+
+        // A hand-built cross-format lossy tier is dishonest.
+        let mut dishonest = lossy.clone();
+        dishonest.baseline_format = "Q8_0".to_string();
+        assert!(!dishonest.is_format_honest());
+
+        // Headline Q8 is always format-honest.
+        let q8 = QualityTier::headline_q8("llama.cpp".to_string(), "b4567".to_string(), 100.0, 0.0);
+        assert!(q8.is_format_honest());
     }
 
     #[test]

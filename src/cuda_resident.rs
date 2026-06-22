@@ -308,6 +308,283 @@ extern "C" __global__ void q8_gemv(
     }
 }
 
+// ---- Q4_K_M GEMV: one warp per output row, fused dequant + integer dot -------
+// Bit-identical reproduction of the validated CPU oracle `q4_k_wire_row_dot`
+// (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks
+// WITH per-16 bsums), NOT Q8_0. Weights are the repacked SoA layout (see
+// repack_q4k_soa): first all expanded 4-bit quants (rows*n_sb*256 i8, the oracle's
+// `a[256]` — nibbles already expanded low-then-high in 64-value groups), then
+// per-superblock metadata: d & dmin (f32 each, the f16 super-scales already
+// widened) and the 8 unpacked 6-bit scales + 8 unpacked mins (u8 each, the kmask
+// `utmp` unpack already done on the host). The per-superblock integer dot is kept
+// scalar (correctness-first, matching the oracle's "no SIMD" doc) because the
+// oracle's 8-lane f32 split (below) cannot be reproduced by a 4-wide __dp4a, which
+// would collapse four distinct lanes into one accumulator.
+//
+// PARITY ANCHOR: the oracle keeps 8 f32 main-lane accumulators sums[0..8] plus a
+// scalar mins accumulator sumf, both summed over superblocks IN ORDER, with final
+// `sumf + sums[0] + ... + sums[7]` (left-to-right). The per-superblock integer
+// work (aux32[l] for l in 0..8, and the mins integer sumi) is exact regardless of
+// order, so the lanes compute those integers per superblock and stash them in
+// shared (the analog of q8_gemv's myterms[b]); lane 0 then replays the EXACT f32
+// accumulation order. The 8-lane split is load-bearing: dd*aux32[l] is rounded to
+// f32 per lane before summing, so collapsing the lanes would change the f32 result.
+//
+// aux32[l] = Σ_{j=0..8} scale[j] * Σ_{k=0..4} q8[j*32+k*8+l] * a[j*32+k*8+l]
+//   (lane l owns the 8th element of every 8-stride within each 32-group; folding
+//    the per-group scale into the integer accumulator matches the oracle exactly)
+// sumi      = Σ_{j=0..16} mins[j/2] * Σ_{l=0..16} q8[j*16+l]   (per-16 bsums)
+// term_main += dd * aux32[l]   (dd = d * d_act),  per superblock, per lane
+// term_min  -= dmin * d_act * sumi               per superblock
+extern "C" __global__ void q4k_gemv(
+    const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
+    const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
+    const unsigned char* __restrict__ weight_bytes, // RAW 144-byte Q4_K wire, row-major
+    int rows, int n_sb, float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem4[];
+    signed char* s_iq = (signed char*)smem4;                 // n_sb*256 i8 staged input
+    float* s_is = (float*)(smem4 + (long)n_sb * 256);        // n_sb f32 staged scales
+    // per-warp scratch: 8 aux32 lanes + 1 sumi = 9 ints, per superblock.
+    int* aux = (int*)(smem4 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*9 int
+    int tid = threadIdx.x;
+    // Stage the shared input vector cooperatively (coalesced), once per block.
+    for (int i = tid; i < n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // n_sb*256 bytes as ints
+    for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const int WIRE = 144;
+    const unsigned int KMASK1 = 0x3f3f3f3fu, KMASK2 = 0x0f0f0f0fu, KMASK3 = 0x03030303u;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myaux = aux + (long)warp * n_sb * 9;
+    if (row < rows) {
+        long row_sb0 = (long)row * n_sb;
+        // Each lane owns whole superblocks (lane, lane+32, ...); it reads the RAW wire
+        // super-block, expands the 4-bit nibbles + unpacks the kmask 6-bit scales/mins
+        // on the fly (the host no longer pre-expands — that doubled VRAM), then computes
+        // that superblock's 8 main-side integer lanes aux32[0..8] and the mins integer
+        // sumi, stashing all 9 into shared for lane 0's ordered f32 reduction.
+        // No 256-byte local `a` array (the old version spilled it to local memory, which
+        // was the bottleneck — local-memory round-trips). The wire is read with wide uint4
+        // loads (the 144 B super-block is 9*16, so it is 16-aligned off any 16-aligned row
+        // base): one uint4 for the header (d,dmin + the packed scale/min words) and one
+        // uint4 per 16 quant bytes, loaded just-in-time per byte-group to keep register
+        // pressure (hence occupancy) up and avoid a large prefetch array. Each byte-group g
+        // carries TWO scale-groups: j=2g uses the low nibble of each byte, j=2g+1 the high
+        // nibble, over the SAME 32 bytes. Element p (0..32) of a scale-group lands in
+        // aux32[p&7] with off=j*32+p (off&7==p&7), so every product matches the oracle
+        // term-for-term; the 8 integer lanes are bit-identical (integer-add order is free).
+        // Measured 1.58x faster than the a[256] version at 4096x12288 (ncu), parity green.
+        for (int b = lane; b < n_sb; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            const signed char* y256 = s_iq + (long)b * 256;  // staged activation
+            int* ax = myaux + (long)b * 9;
+            // Unpack the 8 packed 6-bit (scale, min) pairs via the kmask scheme (oracle
+            // order). The 12 scale/min bytes are header bytes 4..16 = hdr.y,.z,.w.
+            uint4 hdr = *reinterpret_cast<const uint4*>(blk);  // bytes 0..16
+            unsigned int u0 = hdr.y;
+            unsigned int u1 = hdr.z;
+            unsigned int u2 = hdr.w;
+            unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+            unsigned int uaux = u1 & KMASK1;
+            u1 = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+            u2 = uaux;
+            u0 &= KMASK1;
+            unsigned char sc[8], mn[8];
+            sc[0] = u0 & 0xff; sc[1] = (u0 >> 8) & 0xff; sc[2] = (u0 >> 16) & 0xff; sc[3] = (u0 >> 24) & 0xff;
+            sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff; sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
+            mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff; mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
+            mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff; mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
+            const uint4* q4v = reinterpret_cast<const uint4*>(blk + 16);  // 128 quant bytes
+            int aux32[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) aux32[l] = 0;
+            #pragma unroll
+            for (int g = 0; g < 4; g++) {
+                int slo = (int)sc[2 * g];
+                int shi = (int)sc[2 * g + 1];
+                int lobase = g * 64;          // a-index of low-nibble scale-group 2g
+                int hibase = g * 64 + 32;     // a-index of high-nibble scale-group 2g+1
+                // 32 bytes of this byte-group = 2 uint4 (8 uint32 words), loaded now.
+                uint4 wlo = q4v[g * 2];       // qs[g*32 .. g*32+16]
+                uint4 whi = q4v[g * 2 + 1];   // qs[g*32+16 .. g*32+32]
+                const unsigned int* wd = reinterpret_cast<const unsigned int*>(&wlo);
+                const unsigned int* wd2 = reinterpret_cast<const unsigned int*>(&whi);
+                #pragma unroll
+                for (int w = 0; w < 8; w++) {
+                    unsigned int word = (w < 4) ? wd[w] : wd2[w - 4]; // 4 packed quant bytes
+                    #pragma unroll
+                    for (int t = 0; t < 4; t++) {
+                        int p = w * 4 + t;             // 0..32 position in the group
+                        unsigned int byte = (word >> (t * 8)) & 0xff;
+                        int lo = (int)(byte & 0xF);
+                        int hi = (int)(byte >> 4);
+                        int l = p & 7;
+                        aux32[l] += slo * (int)y256[lobase + p] * lo;
+                        aux32[l] += shi * (int)y256[hibase + p] * hi;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
+            // Mins side: per-16 activation sums (bsums) times mins[group/2], summed over
+            // the 16 per-16 groups (mins index = group/2), exactly as the oracle.
+            int sumi = 0;
+            #pragma unroll
+            for (int g = 0; g < 16; g++) {
+                int bsum = 0;
+                #pragma unroll
+                for (int l = 0; l < 16; l++) bsum += (int)y256[g * 16 + l];
+                sumi += bsum * (int)mn[g >> 1];
+            }
+            ax[8] = sumi;
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        long row_sb0 = (long)row * n_sb;
+        float sums[8];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) sums[l] = 0.0f;
+        float sumf = 0.0f;
+        for (int b = 0; b < n_sb; b++) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            int* ax = myaux + (long)b * 9;
+            float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+            float dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+            float dact = s_is[b];
+            float dd = d * dact;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) sums[l] += dd * (float)ax[l];
+            sumf -= dmin * dact * (float)ax[8];
+        }
+        // Final reduction in the oracle's EXACT order: it returns
+        // `sumf + sums.iter().sum()`, i.e. the 8 main lanes are summed FIRST
+        // (left-to-right from 0.0) and only then added to the mins accumulator sumf.
+        // `(((sumf+s0)+s1)+...)` would be a different f32 association — keep this split.
+        float smain = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 8; l++) smain += sums[l];
+        float acc = sumf + smain;
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
+// ---- Q6_K GEMV: one warp per output row, fused dequant + integer dot ---------
+// Bit-identical reproduction of the validated CPU oracle `q6_k_wire_row_dot`.
+// The activation is Q8_K (256-wide blocks). Weights are read STRAIGHT from the
+// 210-byte GGUF wire super-block (ql[128] + qh[64] + scales(i8)[16] + d(f16)) —
+// no SoA repack is needed: the oracle reads the same byte layout, and each warp
+// stages the shared Q8_K activation once, so the per-row weight read is already
+// the dominant DRAM stream. The 8-lane main-side split is the SAME parity anchor
+// as q4k_gemv: the oracle keeps 8 f32 accumulators sums[0..8] summed over
+// superblocks IN ORDER, then returns sums[0]+...+sums[7] (left-to-right). The
+// weights are pre-subtracted by 32 (the oracle bakes `- 32` into the rebuilt
+// signed 6-bit value), so there is NO mins term (unlike the diffusion_gemma
+// kernel, which keeps weights unsigned and subtracts 32*isum_mins — a DIFFERENT
+// f32 association; we must match THIS oracle, not that one).
+//
+// Per superblock, the oracle's main side is:
+//   aux32[l] += scale[j] * y.qs[off+l] * a[off+l]   for j in 0..16, off=j*16,
+//                                                    l in 0..8 then l in 8..16
+// where a[256] are the rebuilt signed-6-bit weights (recombination order from
+// q6_k_wire_block_dequant). Lane l (0..8) owns its own aux32 lane; lane 0 then
+// replays sums[l] += (d_w * d_act) * aux32[l] per superblock, in order.
+extern "C" __global__ void q6k_gemv(
+    const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
+    const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
+    const unsigned char* __restrict__ weight_bytes, // raw 210-byte Q6_K wire, row-major
+    int rows, int n_sb, float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem6[];
+    signed char* s_iq = (signed char*)smem6;                 // n_sb*256 i8 staged input
+    float* s_is = (float*)(smem6 + (long)n_sb * 256);        // n_sb f32 staged scales
+    // per-warp scratch: 8 aux32 lanes per superblock (the main-side integers).
+    int* aux = (int*)(smem6 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*8 int
+    int tid = threadIdx.x;
+    for (int i = tid; i < n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // n_sb*256 bytes as ints
+    for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myaux = aux + (long)warp * n_sb * 8;
+    const int WIRE = 210;
+    if (row < rows) {
+        long row_sb0 = (long)row * n_sb;
+        for (int b = lane; b < n_sb; b += 32) {
+            const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            const signed char* sc = (const signed char*)(block + 192); // 16 i8 scales
+            const signed char* y256 = s_iq + (long)b * 256;
+            // Rebuild the 256 signed 6-bit weights exactly as q6_k_wire_block_dequant
+            // (a[w+l], a[w+l+32], a[w+l+64], a[w+l+96]; - 32), filling a[256]. NOTE: an
+            // inline-rebuild variant (no a[256], byte loads off the 210 B non-16-aligned
+            // wire) was tried and measured ~2.3x SLOWER here (the serial byte loads beat the
+            // register saving), so this clean staged build + contiguous dot is kept.
+            signed char a[256];
+            int wbase = 0, qlb = 0, qhb = 128;
+            #pragma unroll
+            for (int half = 0; half < 2; half++) {
+                for (int l = 0; l < 32; l++) {
+                    a[wbase + l] = (signed char)(((int)(block[qlb + l] & 0xF)
+                        | (((int)(block[qhb + l] & 3)) << 4)) - 32);
+                    a[wbase + l + 32] = (signed char)(((int)(block[qlb + l + 32] & 0xF)
+                        | (((int)((block[qhb + l] >> 2) & 3)) << 4)) - 32);
+                    a[wbase + l + 64] = (signed char)(((int)(block[qlb + l] >> 4)
+                        | (((int)((block[qhb + l] >> 4) & 3)) << 4)) - 32);
+                    a[wbase + l + 96] = (signed char)(((int)(block[qlb + l + 32] >> 4)
+                        | (((int)((block[qhb + l] >> 6) & 3)) << 4)) - 32);
+                }
+                wbase += 128; qlb += 64; qhb += 32;
+            }
+            int aux32[8];
+            #pragma unroll
+            for (int l = 0; l < 8; l++) aux32[l] = 0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                int scale = (int)sc[j];
+                int off = j * 16;
+                #pragma unroll
+                for (int l = 0; l < 8; l++)
+                    aux32[l] += scale * (int)y256[off + l] * (int)a[off + l];
+                #pragma unroll
+                for (int l = 0; l < 8; l++)
+                    aux32[l] += scale * (int)y256[off + 8 + l] * (int)a[off + 8 + l];
+            }
+            int* ax = myaux + (long)b * 8;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        long row_sb0 = (long)row * n_sb;
+        float sums[8];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) sums[l] = 0.0f;
+        for (int b = 0; b < n_sb; b++) {
+            const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            unsigned short d_bits = (unsigned short)block[208]
+                | ((unsigned short)block[209] << 8);
+            float d = f16_bits_to_f32(d_bits) * s_is[b];
+            int* ax = myaux + (long)b * 8;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) sums[l] += d * (float)ax[l];
+        }
+        float acc = 0.0f;
+        #pragma unroll
+        for (int l = 0; l < 8; l++) acc += sums[l];
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
 // ---- Fused SiLU-gate * up + Q8_0 quantize (F3) ------------------------------
 // One thread per 32-block: compute silu(gate)*up for the block's 32 elements (bit-
 // identical to silu_mul) and quantize them (bit-identical to quantize_q8_0), straight
@@ -338,6 +615,93 @@ extern "C" __global__ void silu_mul_quantize(
         if (v < -128.0f) v = -128.0f;
         qb[j] = (signed char)v;
     }
+}
+
+// ---- Q8_K activation quantize (256-wide blocks; K-quant input format) -------
+// Bit-exact port of inference.rs `quantize_q8_k_blocks` + `nearest_int_reference`:
+//   amax over abs but `max` is the SIGNED value at the abs-max position; iscale =
+//   -127/max; q = nearest_int(iscale*v) clamped to <=127 (no low clamp — matches
+//   the reference, which only `.min(127)`s); d = 1/iscale. The reference's
+//   nearest_int adds 1.5*2^23 and masks the mantissa (round-to-nearest-EVEN), not
+//   rintf — reproduced here bit-for-bit so the resident Q4_K/Q6_K dot matches the
+//   CPU oracle token-for-token. One thread per 256-block; `n_sb` super-blocks.
+__device__ __forceinline__ int nearest_int_ref(float fval) {
+    float v = fval + 12582912.0f; // 1.5 * 2^23
+    return (int)(__float_as_uint(v) & 0x007fffffu) - 0x00400000;
+}
+__device__ __forceinline__ void quant_q8k_block(
+    const float* xb, signed char* qb, float* scale_out
+) {
+    float amax = 0.0f, maxv = 0.0f;
+    for (int j = 0; j < 256; j++) {
+        float a = fabsf(xb[j]);
+        if (a > amax) { amax = a; maxv = xb[j]; }
+    }
+    if (amax == 0.0f) {
+        *scale_out = 0.0f;
+        for (int j = 0; j < 256; j++) qb[j] = 0;
+        return;
+    }
+    float iscale = -127.0f / maxv;
+    for (int j = 0; j < 256; j++) {
+        int q = nearest_int_ref(iscale * xb[j]);
+        if (q > 127) q = 127;
+        qb[j] = (signed char)q;
+    }
+    *scale_out = 1.0f / iscale;
+}
+// Standalone Q8_K quantize (used for the attention-output activation before the
+// O projection of a K-quant layer). One thread per 256-block.
+extern "C" __global__ void quantize_q8k(
+    const float* __restrict__ x, signed char* __restrict__ quants,
+    float* __restrict__ scales, int n_sb
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_sb) return;
+    quant_q8k_block(x + (long)b * 256, quants + (long)b * 256, scales + b);
+}
+// Fused RMS-norm + Q8_K quantize (K-quant analog of rms_norm_quantize). One block
+// stages the row in shared, thread 0 does the in-order sum-of-squares (bit-identical
+// to rms_norm_f32), every thread applies norm*weight back into shared, then each
+// thread quantizes 256-wide blocks straight from shared.
+extern "C" __global__ void rms_norm_quantize_q8k(
+    const float* __restrict__ x, const float* __restrict__ weight,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n, float eps
+) {
+    extern __shared__ float xsk[]; // n floats
+    __shared__ float s_scale;
+    int tid = threadIdx.x;
+    for (int i = tid; i < n; i += blockDim.x) xsk[i] = x[i];
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) sum += xsk[i] * xsk[i]; // CPU-order serial sum
+        s_scale = 1.0f / sqrtf(sum / (float)n + eps);
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < n; i += blockDim.x) xsk[i] = xsk[i] * scale * weight[i];
+    __syncthreads();
+    int n_sb = n >> 8; // n / 256
+    for (int b = tid; b < n_sb; b += blockDim.x)
+        quant_q8k_block(xsk + ((long)b << 8), quants + ((long)b << 8), scales + b);
+}
+// Fused SiLU(gate)*up + Q8_K quantize (K-quant analog of silu_mul_quantize). One
+// thread per 256-block: compute silu*up for the block's 256 elements into a local
+// buffer (bit-identical to silu_mul), then quantize them to Q8_K straight to the
+// down-projection's K-quant input.
+extern "C" __global__ void silu_mul_quantize_q8k(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    signed char* __restrict__ quants, float* __restrict__ scales, int n_sb
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_sb) return;
+    float vals[256];
+    for (int j = 0; j < 256; j++) {
+        float g = gate[(long)b * 256 + j];
+        vals[j] = (g / (1.0f + expf(-g))) * up[(long)b * 256 + j];
+    }
+    quant_q8k_block(vals, quants + (long)b * 256, scales + b);
 }
 
 // ---- Batched Q8 GEMM: K token-inputs against M weight rows ------------------
@@ -743,6 +1107,115 @@ extern "C" __global__ void attention_batched(
     }
 }
 
+// ---- Tree-verify kernels (lossless GPU tree speculation, Lane A) -----------
+// Generalize the linear batched verify to a draft TREE: the N nodes no longer
+// occupy consecutive positions on one branch. Each node t lives at its own KV
+// slot `node_kvslot[t]` (= base + BFS index t) and at RoPE position
+// `base + node_depth[t]`. A node attends the DENSE committed prefix [0, base)
+// PLUS only the in-chunk slots on its own root-to-node path (its ancestors).
+// On a LINEAR (single-branch) tree these reduce EXACTLY to kv_scatter_batched /
+// attention_batched (slots base..base+t, ancestors 0..t), so the tree path is
+// bit-identical to the linear verify there — the losslessness anchor.
+
+// Scatter each node t's K/V into its own cache slot node_kvslot[t]. RoPE is
+// already baked into src (the host stages per-node cos/sin at base+depth[t]),
+// so this only relocates the per-node write target vs kv_scatter_batched
+// (which writes base+t). On a linear tree node_kvslot[t] == base+t ⇒ identical.
+extern "C" __global__ void kv_scatter_tree_batched(
+    const float* __restrict__ src, unsigned short* __restrict__ cache,
+    const int* __restrict__ node_kvslot,
+    int n_kv_heads, int head_dim, int max_pos, int per_token_dim, int k_tokens
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = k_tokens * n_kv_heads * head_dim;
+    if (idx >= total) return;
+    int t = idx / (n_kv_heads * head_dim);
+    int rem = idx % (n_kv_heads * head_dim);
+    int kv_head = rem / head_dim;
+    int d = rem % head_dim;
+    int position = node_kvslot[t];
+    cache[((long)kv_head * max_pos + position) * head_dim + d] =
+        f32_to_f16_bits(src[(long)t * per_token_dim + (long)kv_head * head_dim + d]);
+}
+
+// Tree attention: node t (query) attends (a) the dense committed prefix
+// [0, base) EXACTLY as attention_batched, then (b) the in-chunk node slots on
+// its root-to-node path, in DEPTH order, so the exp-sum order matches a linear
+// decode. The path is the set of nodes j whose ancestor bit is set for t
+// (ancestor_bits[t*words + j/32] >> (j%32)); node j's K/V is at slot base+j.
+// We append ancestors in BFS-index order (== depth order along a single path,
+// since parent index < child index), giving the same sequential score / max /
+// exp-sum / weighted-V order the linear kernel uses. Masked (non-ancestor)
+// slots are SKIPPED, never scored. One block per (node, query head).
+extern "C" __global__ void attention_tree_batched(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v, float* __restrict__ out,
+    const unsigned int* __restrict__ ancestor_bits, int words,
+    int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
+    int q_per_token, int k_tokens
+) {
+    int t = blockIdx.x / n_heads;
+    int head = blockIdx.x % n_heads;
+    if (t >= k_tokens) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)t * q_per_token + (long)head * head_dim;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+    const unsigned int* anc = ancestor_bits + (long)t * words;
+
+    extern __shared__ float shared[];
+    float* qsh = shared;               // head_dim
+    float* scores = shared + head_dim;  // base + (#in-chunk ancestors)
+    int* slots = (int*)(scores + base_position + k_tokens); // absolute KV slot per score
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+    // Build the ordered list of KV slots this node attends: the dense prefix
+    // [0, base) then the in-chunk ancestor slots base+j (BFS / depth order).
+    // Thread 0 builds it (small N); the dot products parallelize over it.
+    __shared__ int s_count;
+    if (tid == 0) {
+        int n = 0;
+        for (int p = 0; p < base_position; p++) slots[n++] = p;
+        for (int j = 0; j < k_tokens; j++) {
+            if ((anc[j >> 5] >> (j & 31)) & 1u) slots[n++] = base_position + j;
+        }
+        s_count = n;
+    }
+    __syncthreads();
+    int count = s_count;
+    for (int i = tid; i < count; i += blockDim.x) {
+        const unsigned short* kp = kbase + (long)slots[i] * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        scores[i] = dot * scale;
+    }
+    __syncthreads();
+    __shared__ float s_max, s_sum;
+    if (tid == 0) {
+        float m = scores[0];
+        for (int i = 1; i < count; i++) if (scores[i] > m) m = scores[i];
+        s_max = m;
+    }
+    __syncthreads();
+    for (int i = tid; i < count; i += blockDim.x) scores[i] = expf(scores[i] - s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int i = 0; i < count; i++) sum += scores[i];
+        s_sum = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int i = 0; i < count; i++)
+            acc += (scores[i] * inv) * f16_bits_to_f32(vbase[(long)slots[i] * head_dim + d]);
+        out[(long)t * q_per_token + (long)head * head_dim + d] = acc;
+    }
+}
+
 // Argmax of each of K logit rows (one block per token). Strict-greater, lowest
 // index — the greedy choice used to verify drafts.
 extern "C" __global__ void argmax_batched(
@@ -825,6 +1298,67 @@ extern "C" __global__ void attn_sk_scores(
     if (tid == 0) chunkmax_buf[(long)head * n_splits + sp] = red[0];
 }
 
+// Pass 1 (COALESCED variant, env-gated CAMELID_ATTN_COALESCED): identical math/IO to
+// attn_sk_scores but assigns ONE WARP (32 lanes) per key position so the warp's loads of
+// kp[L..L+31] are 32 consecutive f16 = 64 contiguous bytes = coalesced (vs the scalar
+// kernel where adjacent threads scatter 256 bytes apart). head_dim=128 -> lane L sums
+// d=L,L+32,L+64,L+96; a __shfl_down_sync warp-tree reduces to the position dot. This
+// re-associates the head_dim sum (warp-tree vs sequential) -> parity-sensitive. scale,
+// scores_buf layout and chunkmax_buf semantics are IDENTICAL so passes 2/3 are unchanged.
+// block_dim must be a multiple of 32 (launched at 256 = 8 warps); warp w strides positions.
+extern "C" __global__ void attn_sk_scores_coalesced(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    float* __restrict__ scores_buf, float* __restrict__ chunkmax_buf,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale, int n_splits
+) {
+    int position_count = position_ptr[0] + 1;
+    int head = blockIdx.x;
+    int sp = blockIdx.y;
+    if (head >= n_heads || sp >= n_splits) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    int p_lo = (int)((long)sp * position_count / n_splits);
+    int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+
+    extern __shared__ float qsh[];      // head_dim
+    int tid = threadIdx.x;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    int n_warps = blockDim.x >> 5;          // 32 lanes per warp
+    int warp_id = tid >> 5;
+    int lane = tid & 31;
+
+    float local_max = -3.4e38f;
+    // warp `warp_id` processes positions p_lo+warp_id, +n_warps, ...
+    for (int p = p_lo + warp_id; p < p_hi; p += n_warps) {
+        const unsigned short* kp = kbase + (long)p * head_dim;
+        // lane L owns d = L, L+32, ... -> warp's simultaneous kp[L..L+31] loads coalesce.
+        float dot = 0.0f;
+        for (int d = lane; d < head_dim; d += 32) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        // warp-tree reduce the partial dots to lane 0.
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+        if (lane == 0) {
+            float sc = dot * scale;
+            scores_buf[(long)head * max_pos + p] = sc;
+            local_max = fmaxf(local_max, sc);
+        }
+    }
+    // per-warp max lives in lane 0 of each warp; reduce the n_warps lane-0 maxes.
+    __shared__ float wmax[32];              // up to 32 warps (block <= 1024)
+    if (lane == 0) wmax[warp_id] = local_max;
+    __syncthreads();
+    if (tid == 0) {
+        float m = -3.4e38f;
+        for (int w = 0; w < n_warps; w++) m = fmaxf(m, wmax[w]);
+        chunkmax_buf[(long)head * n_splits + sp] = m;
+    }
+}
+
 // Pass 2: per (head, split) read the EXACT global max over all splits, exp the chunk in
 // place (per-position, no reassociation), then write the chunk's sequential exp-sum
 // (lsum_buf) and UNNORMALIZED weighted-V (acc_buf, sequential p per dim).
@@ -901,6 +1435,11 @@ pub struct CudaResidentKernels {
     pub(crate) quantize: CudaFunction,
     pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
+    pub(crate) q4k_gemv: CudaFunction,
+    pub(crate) q6k_gemv: CudaFunction,
+    pub(crate) quantize_q8k: CudaFunction,
+    pub(crate) rms_norm_quantize_q8k: CudaFunction,
+    pub(crate) silu_mul_quantize_q8k: CudaFunction,
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
     pub(crate) attention: CudaFunction,
@@ -914,10 +1453,17 @@ pub struct CudaResidentKernels {
     pub(crate) rope_batched: CudaFunction,
     pub(crate) kv_scatter_batched: CudaFunction,
     pub(crate) attention_batched: CudaFunction,
+    pub(crate) kv_scatter_tree_batched: CudaFunction,
+    pub(crate) attention_tree_batched: CudaFunction,
     pub(crate) argmax_batched: CudaFunction,
     pub(crate) attn_sk_scores: CudaFunction,
+    pub(crate) attn_sk_scores_coalesced: CudaFunction,
     pub(crate) attn_sk_partial: CudaFunction,
     pub(crate) attn_sk_combine: CudaFunction,
+    /// Env-gated (CAMELID_ATTN_COALESCED) dispatch of the coalesced K-dot in
+    /// split-K pass 1. Read ONCE at construction; default OFF so the shipped
+    /// path stays byte-identical.
+    pub(crate) attn_coalesced: bool,
 }
 
 impl CudaResidentKernels {
@@ -946,6 +1492,11 @@ impl CudaResidentKernels {
             quantize: f("quantize_q8_0")?,
             rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
+            q4k_gemv: f("q4k_gemv")?,
+            q6k_gemv: f("q6k_gemv")?,
+            quantize_q8k: f("quantize_q8k")?,
+            rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
+            silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
             attention: f("attention_decode")?,
@@ -959,10 +1510,16 @@ impl CudaResidentKernels {
             rope_batched: f("rope_batched")?,
             kv_scatter_batched: f("kv_scatter_batched")?,
             attention_batched: f("attention_batched")?,
+            kv_scatter_tree_batched: f("kv_scatter_tree_batched")?,
+            attention_tree_batched: f("attention_tree_batched")?,
             argmax_batched: f("argmax_batched")?,
             attn_sk_scores: f("attn_sk_scores")?,
+            attn_sk_scores_coalesced: f("attn_sk_scores_coalesced")?,
             attn_sk_partial: f("attn_sk_partial")?,
             attn_sk_combine: f("attn_sk_combine")?,
+            attn_coalesced: std::env::var("CAMELID_ATTN_COALESCED")
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             ctx,
             stream,
         })
@@ -991,6 +1548,19 @@ fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
         quants[b * 32..b * 32 + 32].copy_from_slice(&blk[4..36]);
     }
     out
+}
+
+/// Repack one projection's wire bytes into the GPU layout its lane reads. Q8_0 is
+/// repacked to the SoA layout `q8_gemv` reads; the K-quant lanes pass the RAW GGUF
+/// super-block wire bytes straight through — `q4k_gemv` (144 B/sb) and `q6k_gemv`
+/// (210 B/sb) expand the nibbles / unpack the packed scales on the fly. Keeping the
+/// nibbles PACKED in VRAM is what lets 8B-Q4_K_M fit a 6 GB card: a host-side nibble
+/// expansion to i8 would near-double the Q4_K footprint (256 vs 128 bytes/sb).
+fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
+    match q {
+        ProjQuant::Q8_0 => repack_q8_soa(bytes),
+        ProjQuant::Q4K | ProjQuant::Q6K => bytes.to_vec(),
+    }
 }
 
 fn launch_rmsnorm(
@@ -1131,6 +1701,226 @@ fn launch_gemv_residual(
         .arg(&bpr)
         .arg(out)
         .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q4_K_M GEMV launch: same warp-per-row geometry as `launch_gemv`, but the input
+/// is Q8_K (256-wide super-blocks: `n_sb` f32 scales + `n_sb*256` i8 quants) and the
+/// weight is `repack_q4k_soa` bytes. Shared holds the staged Q8_K input vector
+/// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
+/// 9-int scratch (8 main lanes + 1 mins) for lane 0's ordered f32 reduction.
+// As repack_q4k_soa: exercised by the bit-parity test; the production per-tensor
+// dispatch into this launcher is the deferred end-to-end follow-up.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn launch_q4k_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    n_sb: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let n_sb_u = n_sb as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input: n_sb*256 i8 + n_sb*4 f32; per-warp scratch: n_sb*9 i32.
+        shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 9 * 4,
+    };
+    let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q6_K GEMV launch: same warp-per-row geometry as `launch_q4k_gemv`. Input is
+/// Q8_K (`n_sb` f32 scales + `n_sb*256` i8 quants); weight is the RAW 210-byte
+/// Q6_K wire bytes (no SoA repack). Shared holds the staged Q8_K input vector
+/// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
+/// 8-int main-lane scratch for lane 0's ordered f32 reduction.
+#[allow(clippy::too_many_arguments)]
+fn launch_q6k_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    n_sb: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let n_sb_u = n_sb as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input: n_sb*256 i8 + n_sb*4 f32; per-warp scratch: n_sb*8 i32.
+        shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 8 * 4,
+    };
+    let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Per-projection GEMV dispatch: picks the kernel + activation buffers + contraction
+/// unit by the projection's quant lane. `cols` is the contraction dimension (input
+/// width); Q8_0 reads `cols/32` 36-byte blocks from `q8_0_*`, the K-quant lanes read
+/// `cols/256` super-blocks from `q8k_*`. `residual != 0` fuses the post-projection
+/// residual add into the GEMV (only valid when `out` is the residual/hidden buffer).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_gemv(
+    s: &Arc<CudaStream>,
+    kern: &CudaResidentKernels,
+    lane: ProjQuant,
+    q8_0_scales: &CudaSlice<f32>,
+    q8_0_quants: &CudaSlice<i8>,
+    q8k_scales: &CudaSlice<f32>,
+    q8k_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    cols: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    match lane {
+        ProjQuant::Q8_0 => {
+            if residual != 0 {
+                launch_gemv_residual(
+                    s,
+                    &kern.gemv,
+                    q8_0_scales,
+                    q8_0_quants,
+                    weight,
+                    rows,
+                    cols / 32,
+                    out,
+                )
+            } else {
+                launch_gemv(
+                    s,
+                    &kern.gemv,
+                    q8_0_scales,
+                    q8_0_quants,
+                    weight,
+                    rows,
+                    cols / 32,
+                    out,
+                )
+            }
+        }
+        ProjQuant::Q4K => launch_q4k_gemv(
+            s,
+            &kern.q4k_gemv,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            out,
+            residual,
+        ),
+        ProjQuant::Q6K => launch_q6k_gemv(
+            s,
+            &kern.q6k_gemv,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            out,
+            residual,
+        ),
+    }
+}
+
+/// Standalone Q8_K activation quantize: f32 row `[n_sb*256]` -> `n_sb` Q8_K blocks
+/// (scales `[n_sb]`, quants `[n_sb*256]` i8). One thread per 256-block.
+fn launch_quantize_q8k(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n_sb: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_sb as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb = n_sb as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(quants).arg(scales).arg(&nb);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Fused RMS-norm + Q8_K quantize: stages the `n`-element row in shared for the
+/// in-order sum, then quantizes 256-wide blocks straight from shared. K-quant
+/// analog of `launch_rmsnorm_quantize`.
+#[allow(clippy::too_many_arguments)]
+fn launch_rmsnorm_quantize_q8k(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: (n as u32) * 4,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(w).arg(quants).arg(scales).arg(&n_i).arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Fused SiLU(gate)*up + Q8_K quantize: one thread per 256-block. K-quant analog
+/// of `launch_silu_mul_quantize`.
+fn launch_silu_mul_quantize_q8k(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    gate: &CudaSlice<f32>,
+    up: &CudaSlice<f32>,
+    quants: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    n_sb: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n_sb as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nb = n_sb as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(gate).arg(up).arg(quants).arg(scales).arg(&nb);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -1355,6 +2145,99 @@ fn launch_attention_batched(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn launch_kv_scatter_tree_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    src: &CudaSlice<f32>,
+    cache: &mut CudaSlice<u16>,
+    node_kvslot: &CudaSlice<i32>,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_pos: usize,
+    per_token_dim: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let total = (k * n_kv_heads * head_dim) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nkv, hd, mp, ptd, ki) = (
+        n_kv_heads as i32,
+        head_dim as i32,
+        max_pos as i32,
+        per_token_dim as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(src)
+        .arg(cache)
+        .arg(node_kvslot)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&mp)
+        .arg(&ptd)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_attention_tree_batched(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    q: &CudaSlice<f32>,
+    cache_k: &CudaSlice<u16>,
+    cache_v: &CudaSlice<u16>,
+    out: &mut CudaSlice<f32>,
+    ancestor_bits: &CudaSlice<u32>,
+    words: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    base_position: usize,
+    max_pos: usize,
+    scale: f32,
+    q_per_token: usize,
+    k: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    // Shared = query (head_dim) + scores (<= base + k) + slot indices (<= base + k).
+    // scores are f32 and slots are i32, both 4 bytes ⇒ 2*(base+k) words past head_dim.
+    let shared = ((head_dim + 2 * (base_position + k)) as u32) * 4;
+    let cfg = LaunchConfig {
+        grid_dim: ((k * n_heads) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: shared,
+    };
+    let (wd, nh, nkv, hd, bp, mp, qpt, ki) = (
+        words as i32,
+        n_heads as i32,
+        n_kv_heads as i32,
+        head_dim as i32,
+        base_position as i32,
+        max_pos as i32,
+        q_per_token as i32,
+        k as i32,
+    );
+    let mut b = s.launch_builder(f);
+    b.arg(q)
+        .arg(cache_k)
+        .arg(cache_v)
+        .arg(out)
+        .arg(ancestor_bits)
+        .arg(&wd)
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&bp)
+        .arg(&mp)
+        .arg(&scale)
+        .arg(&qpt)
+        .arg(&ki);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 fn launch_argmax_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
@@ -1503,7 +2386,14 @@ fn launch_attention_splitk(
             block_dim: (block, 1, 1),
             shared_mem_bytes: (head_dim as u32) * 4,
         };
-        let mut b = s.launch_builder(&k.attn_sk_scores);
+        // Env-gated coalesced K-dot (CAMELID_ATTN_COALESCED). Identical signature,
+        // shared-mem and grid; only the K access pattern differs. Default OFF.
+        let scores_fn = if k.attn_coalesced {
+            &k.attn_sk_scores_coalesced
+        } else {
+            &k.attn_sk_scores
+        };
+        let mut b = s.launch_builder(scores_fn);
         b.arg(q)
             .arg(cache_k)
             .arg(&mut *scores_buf)
@@ -1783,6 +2673,28 @@ struct OffloadState {
     compute_done: Vec<CudaEvent>,
 }
 
+/// Per-projection quantization lane the resident decode dispatches on. Q8_0 is the
+/// historical default (byte-identical to before); Q4K and Q6K are the K-quant lanes
+/// added for Q4_K_M models (mixed quant — Q4_K projections plus Q6_K attn_v/ffn_down
+/// and the Q6_K lm_head). The activation a projection consumes is Q8_0 for `Q8_0` and
+/// Q8_K for `Q4K`/`Q6K`, so `needs_q8k()` lets the per-norm-point quantizer pick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProjQuant {
+    Q8_0,
+    Q4K,
+    Q6K,
+}
+
+impl ProjQuant {
+    /// Whether the GEMV reads a Q8_K activation (true for the K-quant lanes).
+    fn needs_q8k(self) -> bool {
+        matches!(self, ProjQuant::Q4K | ProjQuant::Q6K)
+    }
+}
+
+/// The seven projection quant types of one layer, in q,k,v,o,gate,up,down order.
+type LayerQuants = [ProjQuant; 7];
+
 struct ResidentLayer {
     // Resident VRAM projections. For an OFFLOADED layer (`offloaded.is_some()`) these
     // are 1-byte placeholders that are never read — the real bytes live in `offloaded`
@@ -1799,6 +2711,10 @@ struct ResidentLayer {
     q_norm: Option<CudaSlice<f32>>,
     k_norm: Option<CudaSlice<f32>>,
     offloaded: Option<OffloadedLayer>,
+    /// Per-projection quant lane (q,k,v,o,gate,up,down), so the forward picks the
+    /// right GEMV kernel + activation quantizer per tensor. All `Q8_0` for a plain
+    /// Q8_0 model (path stays byte-identical).
+    quants: LayerQuants,
 }
 
 /// A captured CUDA graph, wrapped to be `Send`. cudarc does not mark `CudaGraph`
@@ -1831,6 +2747,12 @@ pub struct CudaResidentDecode {
     layers: Vec<ResidentLayer>,
     final_norm: CudaSlice<f32>,
     output_weight: CudaSlice<u8>,
+    /// Quant lane of the output (lm_head) projection. Q6_K for Q4_K_M models.
+    output_quant: ProjQuant,
+    /// True if any projection in the model is a K-quant lane (Q4K/Q6K). Lets the
+    /// caller force the serial (per-token `forward_pass`) prefill, which dispatches
+    /// K-quant kernels — the batched prefill GEMM is Q8-only.
+    uses_kquant: bool,
     // KV cache stored as f16 bits (u16) — half the VRAM of f32, bit-identical because the
     // stored values are f16-rounded either way (see the kv_scatter / attention kernels).
     cache_k: Vec<CudaSlice<u16>>,
@@ -1858,6 +2780,10 @@ pub struct CudaResidentDecode {
     d_ffn_act: CudaSlice<f32>,
     d_in_scales: CudaSlice<f32>,
     d_in_quants: CudaSlice<i8>,
+    /// Q8_K activation scratch (K-quant lanes): `max_in/256` f32 scales + `max_in` i8
+    /// quants. Separate from the Q8_0 `d_in_*` so the Q8_0 path stays byte-identical.
+    d_q8k_scales: CudaSlice<f32>,
+    d_q8k_quants: CudaSlice<i8>,
     d_logits: CudaSlice<f32>,
     d_sampled: CudaSlice<u32>,
     d_cos: CudaSlice<f32>,
@@ -1876,6 +2802,10 @@ pub struct CudaResidentDecode {
     decode_graph: Option<SendCudaGraph>,
     /// Lazily-allocated K-batched scratch for the speculative-verify forward.
     verify_scratch: Option<VerifyScratch>,
+    /// Lazily-allocated TREE-verify scratch (sized to `TREE_MAX_NODES`, wider than
+    /// the linear `verify_scratch`) plus the per-node KV-slot / ancestor-bitset
+    /// device buffers the tree kernels read. Allocated by `ensure_tree_scratch`.
+    tree_scratch: Option<TreeScratch>,
     /// Shared GPU scratch for offloaded layers (None when every layer is resident).
     /// Allocated by `enable_offload_scratch` when the build decides to offload.
     offload: Option<OffloadState>,
@@ -1910,6 +2840,18 @@ struct VerifyScratch {
     vsamp: CudaSlice<u32>,
     vcos: CudaSlice<f32>,
     vsin: CudaSlice<f32>,
+}
+
+/// Tree-verify scratch: a `VerifyScratch` widened to `TREE_MAX_NODES` plus the
+/// per-node KV-slot and ancestor-bitset device buffers the two tree kernels
+/// read. Sized once for the maximum tree (`TREE_MAX_NODES` nodes, `words =
+/// ceil(N/32)` ancestor words per node).
+struct TreeScratch {
+    sc: VerifyScratch,
+    /// Per-node KV slot (absolute position) = base + BFS index. Re-uploaded per round.
+    node_kvslot: CudaSlice<i32>,
+    /// Flat ancestor bitset `[node][words]` (causal tree mask). Re-uploaded per round.
+    ancestor_bits: CudaSlice<u32>,
 }
 
 /// Whether greedy decode replays a captured CUDA graph. **Default off**: measured on
@@ -1985,6 +2927,8 @@ impl CudaResidentDecode {
             layers: Vec::with_capacity(n_layers),
             final_norm: alloc_f(hidden)?,
             output_weight: s.alloc_zeros::<u8>(1).map_err(|e| format!("alloc: {e}"))?,
+            output_quant: ProjQuant::Q8_0,
+            uses_kquant: false,
             cache_k,
             cache_v,
             filled: 0,
@@ -2006,6 +2950,10 @@ impl CudaResidentDecode {
             d_in_quants: s
                 .alloc_zeros::<i8>(max_in)
                 .map_err(|e| format!("alloc: {e}"))?,
+            d_q8k_scales: alloc_f(max_in.div_ceil(256).max(1))?,
+            d_q8k_quants: s
+                .alloc_zeros::<i8>(max_in)
+                .map_err(|e| format!("alloc: {e}"))?,
             d_logits: alloc_f(vocab)?,
             d_sampled: s.alloc_zeros::<u32>(1).map_err(|e| format!("alloc: {e}"))?,
             d_cos: alloc_f(rope_dim / 2)?,
@@ -2013,6 +2961,7 @@ impl CudaResidentDecode {
             d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
             decode_graph: None,
             verify_scratch: None,
+            tree_scratch: None,
             offload: None,
             k,
         })
@@ -2032,9 +2981,21 @@ impl CudaResidentDecode {
         attn_norm: &[f32],
         ffn_norm: &[f32],
     ) -> Result<(), String> {
-        // Default: every layer resident in VRAM (unchanged behavior).
+        // Default: every layer resident in VRAM, all Q8_0 (unchanged behavior).
         self.set_layer_located(
-            q, kk, v, o, gate, up, down, attn_norm, ffn_norm, None, None, true,
+            q,
+            kk,
+            v,
+            o,
+            gate,
+            up,
+            down,
+            attn_norm,
+            ffn_norm,
+            None,
+            None,
+            true,
+            [ProjQuant::Q8_0; 7],
         )
     }
 
@@ -2057,7 +3018,11 @@ impl CudaResidentDecode {
         q_norm: Option<&[f32]>,
         k_norm: Option<&[f32]>,
         resident: bool,
+        quants: LayerQuants,
     ) -> Result<(), String> {
+        if quants.iter().any(|q| q.needs_q8k()) {
+            self.uses_kquant = true;
+        }
         let ctx = &self.k.ctx;
         let s = &self.k.stream;
         let up_f = |b: &[f32]| s.clone_htod(b).map_err(|e| format!("htod: {e}"));
@@ -2067,42 +3032,54 @@ impl CudaResidentDecode {
         let k_norm_gpu = k_norm.map(up_f).transpose()?;
 
         if resident {
-            // Resident: each projection uploaded once to its own VRAM slice; no
-            // offload metadata.
-            let vram = |b: &[u8]| -> Result<CudaSlice<u8>, String> {
-                s.clone_htod(&repack_q8_soa(b))
+            // Resident: each projection uploaded once to its own VRAM slice (repacked
+            // into the layout its quant lane reads); no offload metadata.
+            let vram = |i: usize| -> Result<CudaSlice<u8>, String> {
+                s.clone_htod(&repack_for_lane(projections[i], quants[i]))
                     .map_err(|e| format!("htod: {e}"))
             };
             self.layers.push(ResidentLayer {
-                q: vram(projections[0])?,
-                k: vram(projections[1])?,
-                v: vram(projections[2])?,
-                o: vram(projections[3])?,
-                gate: vram(projections[4])?,
-                up: vram(projections[5])?,
-                down: vram(projections[6])?,
+                q: vram(0)?,
+                k: vram(1)?,
+                v: vram(2)?,
+                o: vram(3)?,
+                gate: vram(4)?,
+                up: vram(5)?,
+                down: vram(6)?,
                 attn_norm,
                 ffn_norm,
                 q_norm: q_norm_gpu,
                 k_norm: k_norm_gpu,
                 offloaded: None,
+                quants,
             });
             return Ok(());
         }
 
-        // Offloaded: repack all seven projections and lay them out contiguously in
-        // one pinned host buffer so the per-forward transfer is a single memcpy.
-        let repacked: Vec<Vec<u8>> = projections.iter().map(|b| repack_q8_soa(b)).collect();
+        // Offloaded: repack all seven projections (each into its lane's layout) and lay
+        // them out contiguously in one pinned host buffer so the per-forward transfer is
+        // a single memcpy.
+        let repacked: Vec<Vec<u8>> = projections
+            .iter()
+            .enumerate()
+            .map(|(i, b)| repack_for_lane(b, quants[i]))
+            .collect();
+        // 16-byte-align each projection start so the resident GEMV kernels' wide
+        // (uint4) wire loads are legal off any projection's view base (the q4k_gemv
+        // super-block is 144 B = 9*16, so every block in a row stays 16-aligned once
+        // the row base is; q6k uses byte loads so it is alignment-agnostic). Resident
+        // tensors are separate 256-aligned device allocations, so this only matters for
+        // the packed offload scratch path. Padding is at most 15 B per projection.
         let mut off = [0usize; 8];
         for (i, r) in repacked.iter().enumerate() {
-            off[i + 1] = off[i] + r.len();
+            off[i + 1] = (off[i] + r.len() + 15) & !15;
         }
         let total = off[7];
         // Cacheable pinned host buffer (faster H2D than write-combined here), filled
         // with the seven projections laid out back-to-back.
         let mut packed = vec![0u8; total];
         for (i, r) in repacked.iter().enumerate() {
-            packed[off[i]..off[i + 1]].copy_from_slice(r);
+            packed[off[i]..off[i] + r.len()].copy_from_slice(r);
         }
         let pinned = CacheablePinned::from_bytes(ctx, &packed)?;
         // 1-byte placeholders for the resident-projection fields (never read while
@@ -2121,6 +3098,7 @@ impl CudaResidentDecode {
             q_norm: q_norm_gpu,
             k_norm: k_norm_gpu,
             offloaded: Some(OffloadedLayer { host: pinned, off }),
+            quants,
         });
         Ok(())
     }
@@ -2218,13 +3196,29 @@ impl CudaResidentDecode {
         Ok(())
     }
 
-    pub fn set_output(&mut self, final_norm: &[f32], output_weight: &[u8]) -> Result<(), String> {
+    pub fn set_output(
+        &mut self,
+        final_norm: &[f32],
+        output_weight: &[u8],
+        output_quant: ProjQuant,
+    ) -> Result<(), String> {
         let s = &self.k.stream;
         self.final_norm = s.clone_htod(final_norm).map_err(|e| format!("htod: {e}"))?;
         self.output_weight = s
-            .clone_htod(&repack_q8_soa(output_weight))
+            .clone_htod(&repack_for_lane(output_weight, output_quant))
             .map_err(|e| format!("htod: {e}"))?;
+        self.output_quant = output_quant;
+        if output_quant.needs_q8k() {
+            self.uses_kquant = true;
+        }
         Ok(())
+    }
+
+    /// Whether this engine has any K-quant (Q4_K/Q6_K) projection. The caller forces
+    /// the serial per-token prefill for such models (the batched prefill GEMM is
+    /// Q8-only).
+    pub fn uses_kquant(&self) -> bool {
+        self.uses_kquant
     }
 
     /// Diagnostic: time `iters` back-to-back host->device transfers of the largest
@@ -2498,72 +3492,106 @@ impl CudaResidentDecode {
                     l.down.as_view(),
                 )
             };
-            // attention norm + quantize
-            if fused {
-                launch_rmsnorm_quantize(
+            // Per-projection quant lanes for this layer (q,k,v,o,gate,up,down).
+            let lq = self.layers[li].quants;
+            // attention norm + quantize. Produce the Q8_0 activation (existing fused/
+            // unfused path, byte-identical) when any consumer is Q8_0, and the Q8_K
+            // activation when any consumer is a K-quant lane. For an all-Q8_0 layer only
+            // the Q8_0 branch runs, so the legacy path is unchanged.
+            let attn_need_q8_0 = [lq[0], lq[1], lq[2]].iter().any(|q| *q == ProjQuant::Q8_0);
+            let attn_need_q8k = [lq[0], lq[1], lq[2]].iter().any(|q| q.needs_q8k());
+            if attn_need_q8_0 {
+                if fused {
+                    launch_rmsnorm_quantize(
+                        &s,
+                        &self.k.rms_norm_quantize,
+                        &self.d_hidden,
+                        &self.layers[li].attn_norm,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        self.hidden,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                } else {
+                    launch_rmsnorm(
+                        &s,
+                        &self.k.rms_norm,
+                        &self.d_hidden,
+                        &self.layers[li].attn_norm,
+                        &mut self.d_normed,
+                        self.hidden,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                    launch_quantize(
+                        &s,
+                        &self.k.quantize,
+                        &self.d_normed,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        hb,
+                    )
+                    .map_err(map)?;
+                }
+            }
+            if attn_need_q8k {
+                launch_rmsnorm_quantize_q8k(
                     &s,
-                    &self.k.rms_norm_quantize,
+                    &self.k.rms_norm_quantize_q8k,
                     &self.d_hidden,
                     &self.layers[li].attn_norm,
-                    &mut self.d_in_quants,
-                    &mut self.d_in_scales,
+                    &mut self.d_q8k_quants,
+                    &mut self.d_q8k_scales,
                     self.hidden,
                     self.eps,
-                )
-                .map_err(map)?;
-            } else {
-                launch_rmsnorm(
-                    &s,
-                    &self.k.rms_norm,
-                    &self.d_hidden,
-                    &self.layers[li].attn_norm,
-                    &mut self.d_normed,
-                    self.hidden,
-                    self.eps,
-                )
-                .map_err(map)?;
-                launch_quantize(
-                    &s,
-                    &self.k.quantize,
-                    &self.d_normed,
-                    &mut self.d_in_quants,
-                    &mut self.d_in_scales,
-                    hb,
                 )
                 .map_err(map)?;
             }
             // Q,K,V
-            launch_gemv(
+            dispatch_gemv(
                 &s,
-                &self.k.gemv,
+                &self.k,
+                lq[0],
                 &self.d_in_scales,
                 &self.d_in_quants,
+                &self.d_q8k_scales,
+                &self.d_q8k_quants,
                 &wq,
                 self.q_width,
-                hb,
+                self.hidden,
                 &mut self.d_q,
+                0,
             )
             .map_err(map)?;
-            launch_gemv(
+            dispatch_gemv(
                 &s,
-                &self.k.gemv,
+                &self.k,
+                lq[1],
                 &self.d_in_scales,
                 &self.d_in_quants,
+                &self.d_q8k_scales,
+                &self.d_q8k_quants,
                 &wk,
                 self.kv_width,
-                hb,
+                self.hidden,
                 &mut self.d_k,
+                0,
             )
             .map_err(map)?;
-            launch_gemv(
+            dispatch_gemv(
                 &s,
-                &self.k.gemv,
+                &self.k,
+                lq[2],
                 &self.d_in_scales,
                 &self.d_in_quants,
+                &self.d_q8k_scales,
+                &self.d_q8k_quants,
                 &wv,
                 self.kv_width,
-                hb,
+                self.hidden,
                 &mut self.d_v,
+                0,
             )
             .map_err(map)?;
             // Qwen3 QK-norm: per-head RMSNorm on Q and K after projection, before RoPE
@@ -2682,166 +3710,252 @@ impl CudaResidentDecode {
                 )
                 .map_err(map)?;
             }
-            // O projection + residual
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_attn,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                qb,
-            )
-            .map_err(map)?;
-            if fused {
-                launch_gemv_residual(
-                    &s,
-                    &self.k.gemv,
-                    &self.d_in_scales,
-                    &self.d_in_quants,
-                    &wo,
-                    self.hidden,
-                    qb,
-                    &mut self.d_hidden,
-                )
-                .map_err(map)?;
-            } else {
-                launch_gemv(
-                    &s,
-                    &self.k.gemv,
-                    &self.d_in_scales,
-                    &self.d_in_quants,
-                    &wo,
-                    self.hidden,
-                    qb,
-                    &mut self.d_proj,
-                )
-                .map_err(map)?;
-                launch_residual(
-                    &s,
-                    &self.k.residual_add,
-                    &mut self.d_hidden,
-                    &self.d_proj,
-                    self.hidden,
-                )
-                .map_err(map)?;
-            }
-            // ffn norm + gate/up + silu + down + residual
-            if fused {
-                launch_rmsnorm_quantize(
-                    &s,
-                    &self.k.rms_norm_quantize,
-                    &self.d_hidden,
-                    &self.layers[li].ffn_norm,
-                    &mut self.d_in_quants,
-                    &mut self.d_in_scales,
-                    self.hidden,
-                    self.eps,
-                )
-                .map_err(map)?;
-            } else {
-                launch_rmsnorm(
-                    &s,
-                    &self.k.rms_norm,
-                    &self.d_hidden,
-                    &self.layers[li].ffn_norm,
-                    &mut self.d_normed,
-                    self.hidden,
-                    self.eps,
-                )
-                .map_err(map)?;
+            // O projection + residual. Input is the attention output (q_width wide):
+            // quantize it to the format the O lane reads, then project + add residual.
+            if lq[3] == ProjQuant::Q8_0 {
                 launch_quantize(
                     &s,
                     &self.k.quantize,
-                    &self.d_normed,
+                    &self.d_attn,
                     &mut self.d_in_quants,
                     &mut self.d_in_scales,
-                    hb,
+                    qb,
+                )
+                .map_err(map)?;
+                if fused {
+                    launch_gemv_residual(
+                        &s,
+                        &self.k.gemv,
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &wo,
+                        self.hidden,
+                        qb,
+                        &mut self.d_hidden,
+                    )
+                    .map_err(map)?;
+                } else {
+                    launch_gemv(
+                        &s,
+                        &self.k.gemv,
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &wo,
+                        self.hidden,
+                        qb,
+                        &mut self.d_proj,
+                    )
+                    .map_err(map)?;
+                    launch_residual(
+                        &s,
+                        &self.k.residual_add,
+                        &mut self.d_hidden,
+                        &self.d_proj,
+                        self.hidden,
+                    )
+                    .map_err(map)?;
+                }
+            } else {
+                // K-quant O lane: Q8_K activation, fused-residual GEMV (bit-identical
+                // to gemv + residual_add — the kernel's residual arg adds onto d_hidden).
+                launch_quantize_q8k(
+                    &s,
+                    &self.k.quantize_q8k,
+                    &self.d_attn,
+                    &mut self.d_q8k_quants,
+                    &mut self.d_q8k_scales,
+                    self.q_width / 256,
+                )
+                .map_err(map)?;
+                dispatch_gemv(
+                    &s,
+                    &self.k,
+                    lq[3],
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &self.d_q8k_scales,
+                    &self.d_q8k_quants,
+                    &wo,
+                    self.hidden,
+                    self.q_width,
+                    &mut self.d_hidden,
+                    1,
                 )
                 .map_err(map)?;
             }
-            launch_gemv(
+            // ffn norm + gate/up + silu + down + residual. gate/up consume the ffn-norm
+            // activation; down consumes the silu(gate)*up activation. Each is produced in
+            // the format its consumers read (Q8_0 path byte-identical for an all-Q8_0 layer).
+            let ffn_need_q8_0 = lq[4] == ProjQuant::Q8_0 || lq[5] == ProjQuant::Q8_0;
+            let ffn_need_q8k = lq[4].needs_q8k() || lq[5].needs_q8k();
+            if ffn_need_q8_0 {
+                if fused {
+                    launch_rmsnorm_quantize(
+                        &s,
+                        &self.k.rms_norm_quantize,
+                        &self.d_hidden,
+                        &self.layers[li].ffn_norm,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        self.hidden,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                } else {
+                    launch_rmsnorm(
+                        &s,
+                        &self.k.rms_norm,
+                        &self.d_hidden,
+                        &self.layers[li].ffn_norm,
+                        &mut self.d_normed,
+                        self.hidden,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                    launch_quantize(
+                        &s,
+                        &self.k.quantize,
+                        &self.d_normed,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        hb,
+                    )
+                    .map_err(map)?;
+                }
+            }
+            if ffn_need_q8k {
+                launch_rmsnorm_quantize_q8k(
+                    &s,
+                    &self.k.rms_norm_quantize_q8k,
+                    &self.d_hidden,
+                    &self.layers[li].ffn_norm,
+                    &mut self.d_q8k_quants,
+                    &mut self.d_q8k_scales,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            }
+            dispatch_gemv(
                 &s,
-                &self.k.gemv,
+                &self.k,
+                lq[4],
                 &self.d_in_scales,
                 &self.d_in_quants,
+                &self.d_q8k_scales,
+                &self.d_q8k_quants,
                 &wgate,
                 self.ffn_dim,
-                hb,
+                self.hidden,
                 &mut self.d_gate,
+                0,
             )
             .map_err(map)?;
-            launch_gemv(
+            dispatch_gemv(
                 &s,
-                &self.k.gemv,
+                &self.k,
+                lq[5],
                 &self.d_in_scales,
                 &self.d_in_quants,
+                &self.d_q8k_scales,
+                &self.d_q8k_quants,
                 &wup,
                 self.ffn_dim,
-                hb,
+                self.hidden,
                 &mut self.d_up,
+                0,
             )
             .map_err(map)?;
-            if fused {
-                launch_silu_mul_quantize(
+            // SiLU(gate)*up -> down's activation, in down's format.
+            if lq[6] == ProjQuant::Q8_0 {
+                if fused {
+                    launch_silu_mul_quantize(
+                        &s,
+                        &self.k.silu_mul_quantize,
+                        &self.d_gate,
+                        &self.d_up,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        fb,
+                    )
+                    .map_err(map)?;
+                } else {
+                    launch_silu_mul(
+                        &s,
+                        &self.k.silu_mul,
+                        &self.d_gate,
+                        &self.d_up,
+                        &mut self.d_ffn_act,
+                        self.ffn_dim,
+                    )
+                    .map_err(map)?;
+                    launch_quantize(
+                        &s,
+                        &self.k.quantize,
+                        &self.d_ffn_act,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        fb,
+                    )
+                    .map_err(map)?;
+                }
+                if fused {
+                    launch_gemv_residual(
+                        &s,
+                        &self.k.gemv,
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &wdown,
+                        self.hidden,
+                        fb,
+                        &mut self.d_hidden,
+                    )
+                    .map_err(map)?;
+                } else {
+                    launch_gemv(
+                        &s,
+                        &self.k.gemv,
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &wdown,
+                        self.hidden,
+                        fb,
+                        &mut self.d_proj,
+                    )
+                    .map_err(map)?;
+                    launch_residual(
+                        &s,
+                        &self.k.residual_add,
+                        &mut self.d_hidden,
+                        &self.d_proj,
+                        self.hidden,
+                    )
+                    .map_err(map)?;
+                }
+            } else {
+                launch_silu_mul_quantize_q8k(
                     &s,
-                    &self.k.silu_mul_quantize,
+                    &self.k.silu_mul_quantize_q8k,
                     &self.d_gate,
                     &self.d_up,
-                    &mut self.d_in_quants,
-                    &mut self.d_in_scales,
-                    fb,
+                    &mut self.d_q8k_quants,
+                    &mut self.d_q8k_scales,
+                    self.ffn_dim / 256,
                 )
                 .map_err(map)?;
-            } else {
-                launch_silu_mul(
+                dispatch_gemv(
                     &s,
-                    &self.k.silu_mul,
-                    &self.d_gate,
-                    &self.d_up,
-                    &mut self.d_ffn_act,
+                    &self.k,
+                    lq[6],
+                    &self.d_in_scales,
+                    &self.d_in_quants,
+                    &self.d_q8k_scales,
+                    &self.d_q8k_quants,
+                    &wdown,
+                    self.hidden,
                     self.ffn_dim,
-                )
-                .map_err(map)?;
-                launch_quantize(
-                    &s,
-                    &self.k.quantize,
-                    &self.d_ffn_act,
-                    &mut self.d_in_quants,
-                    &mut self.d_in_scales,
-                    fb,
-                )
-                .map_err(map)?;
-            }
-            if fused {
-                launch_gemv_residual(
-                    &s,
-                    &self.k.gemv,
-                    &self.d_in_scales,
-                    &self.d_in_quants,
-                    &wdown,
-                    self.hidden,
-                    fb,
                     &mut self.d_hidden,
-                )
-                .map_err(map)?;
-            } else {
-                launch_gemv(
-                    &s,
-                    &self.k.gemv,
-                    &self.d_in_scales,
-                    &self.d_in_quants,
-                    &wdown,
-                    self.hidden,
-                    fb,
-                    &mut self.d_proj,
-                )
-                .map_err(map)?;
-                launch_residual(
-                    &s,
-                    &self.k.residual_add,
-                    &mut self.d_hidden,
-                    &self.d_proj,
-                    self.hidden,
+                    1,
                 )
                 .map_err(map)?;
             }
@@ -2867,49 +3981,69 @@ impl CudaResidentDecode {
         if !compute_logits {
             return Ok(());
         }
-        // final norm + output projection -> d_logits (no argmax / no sync here).
-        if fused {
-            launch_rmsnorm_quantize(
-                &s,
-                &self.k.rms_norm_quantize,
-                &self.d_hidden,
-                &self.final_norm,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                self.hidden,
-                self.eps,
-            )
-            .map_err(map)?;
+        // final norm + output (lm_head) projection -> d_logits (no argmax / no sync).
+        // Produce the activation in the lm_head lane's format (Q6_K for Q4_K_M).
+        if self.output_quant == ProjQuant::Q8_0 {
+            if fused {
+                launch_rmsnorm_quantize(
+                    &s,
+                    &self.k.rms_norm_quantize,
+                    &self.d_hidden,
+                    &self.final_norm,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+            } else {
+                launch_rmsnorm(
+                    &s,
+                    &self.k.rms_norm,
+                    &self.d_hidden,
+                    &self.final_norm,
+                    &mut self.d_normed,
+                    self.hidden,
+                    self.eps,
+                )
+                .map_err(map)?;
+                launch_quantize(
+                    &s,
+                    &self.k.quantize,
+                    &self.d_normed,
+                    &mut self.d_in_quants,
+                    &mut self.d_in_scales,
+                    hb,
+                )
+                .map_err(map)?;
+            }
         } else {
-            launch_rmsnorm(
+            launch_rmsnorm_quantize_q8k(
                 &s,
-                &self.k.rms_norm,
+                &self.k.rms_norm_quantize_q8k,
                 &self.d_hidden,
                 &self.final_norm,
-                &mut self.d_normed,
+                &mut self.d_q8k_quants,
+                &mut self.d_q8k_scales,
                 self.hidden,
                 self.eps,
-            )
-            .map_err(map)?;
-            launch_quantize(
-                &s,
-                &self.k.quantize,
-                &self.d_normed,
-                &mut self.d_in_quants,
-                &mut self.d_in_scales,
-                hb,
             )
             .map_err(map)?;
         }
-        launch_gemv(
+        let out_w = self.output_weight.as_view();
+        dispatch_gemv(
             &s,
-            &self.k.gemv,
+            &self.k,
+            self.output_quant,
             &self.d_in_scales,
             &self.d_in_quants,
-            &self.output_weight.as_view(),
+            &self.d_q8k_scales,
+            &self.d_q8k_quants,
+            &out_w,
             self.vocab,
-            hb,
+            self.hidden,
             &mut self.d_logits,
+            0,
         )
         .map_err(map)?;
         Ok(())
@@ -3222,6 +4356,14 @@ impl CudaResidentDecode {
         if self.verify_scratch.is_some() {
             return Ok(());
         }
+        self.verify_scratch = Some(self.alloc_verify_scratch(MAX_VERIFY_K)?);
+        Ok(())
+    }
+
+    /// Allocate a `VerifyScratch` sized to `cap` rows (`cap * dim`). Used by the
+    /// linear verify (`cap = MAX_VERIFY_K`) and the tree verify (`cap =
+    /// TREE_MAX_NODES`); the buffers are dimensionally identical, only wider.
+    fn alloc_verify_scratch(&self, cap: usize) -> Result<VerifyScratch, String> {
         let (hidden, q_width, kv_width, ffn_dim, vocab) = (
             self.hidden,
             self.q_width,
@@ -3231,13 +4373,13 @@ impl CudaResidentDecode {
         );
         let half = self.rope_dim / 2;
         let st = &self.k.stream;
-        let mk = MAX_VERIFY_K;
+        let mk = cap;
         let max_in = hidden.max(q_width).max(ffn_dim);
         let af = |n: usize| {
             st.alloc_zeros::<f32>(n)
                 .map_err(|e| format!("verify alloc: {e}"))
         };
-        self.verify_scratch = Some(VerifyScratch {
+        Ok(VerifyScratch {
             vh: af(mk * hidden)?,
             vn: af(mk * hidden)?,
             viq: st
@@ -3258,8 +4400,7 @@ impl CudaResidentDecode {
                 .map_err(|e| format!("verify alloc: {e}"))?,
             vcos: af(mk * half)?,
             vsin: af(mk * half)?,
-        });
-        Ok(())
+        })
     }
 
     /// Run the batched layer stack for `k` tokens (`1..=MAX_VERIFY_K`) at consecutive
@@ -3554,6 +4695,501 @@ impl CudaResidentDecode {
             launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
                 .map_err(map)?;
         }
+        Ok(())
+    }
+
+    /// Allocate the tree-verify scratch (sized to `TREE_MAX_NODES`) and the per-node
+    /// index device buffers if not already present. Idempotent.
+    fn ensure_tree_scratch(&mut self) -> Result<(), String> {
+        if self.tree_scratch.is_some() {
+            return Ok(());
+        }
+        let cap = crate::inference::spec_tree::TREE_MAX_NODES;
+        let words = cap.div_ceil(32);
+        let sc = self.alloc_verify_scratch(cap)?;
+        let st = &self.k.stream;
+        let node_kvslot = st
+            .alloc_zeros::<i32>(cap)
+            .map_err(|e| format!("tree alloc: {e}"))?;
+        let ancestor_bits = st
+            .alloc_zeros::<u32>(cap * words)
+            .map_err(|e| format!("tree alloc: {e}"))?;
+        self.tree_scratch = Some(TreeScratch {
+            sc,
+            node_kvslot,
+            ancestor_bits,
+        });
+        Ok(())
+    }
+
+    /// Run the batched layer stack for an N-node draft TREE. Identical to
+    /// `run_batched_layer_stack` except the two position-aware kernels are swapped
+    /// for their tree variants: `kv_scatter_tree_batched` writes node `t` to its
+    /// own slot `node_kvslot[t]` (not `base+t`), and `attention_tree_batched`
+    /// scores the dense committed prefix `[0, base)` plus only the in-chunk slots
+    /// on each node's ancestor path (the causal tree mask). RoPE per node is baked
+    /// into the staged `sc.vcos`/`sc.vsin` (position `base+depth[t]`), so
+    /// `rope_batched` is unchanged. On a LINEAR tree this reduces bit-identically
+    /// to the batched stack (proven in tests). `node_kvslot` / `ancestor_bits`
+    /// must already hold this tree's per-node data (`words` ancestor words/node).
+    #[allow(clippy::too_many_arguments)]
+    fn run_tree_layer_stack(
+        &mut self,
+        sc: &mut VerifyScratch,
+        node_kvslot: &CudaSlice<i32>,
+        ancestor_bits: &CudaSlice<u32>,
+        words: usize,
+        s: &Arc<CudaStream>,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Result<(), String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda tree layers: {e}");
+        let s = s.clone();
+        let (hidden, q_width, kv_width, ffn_dim) =
+            (self.hidden, self.q_width, self.kv_width, self.ffn_dim);
+        let (head_dim, n_heads, n_kv, rope_dim, max_pos, eps) = (
+            self.head_dim,
+            self.n_heads,
+            self.n_kv_heads,
+            self.rope_dim,
+            self.max_pos,
+            self.eps,
+        );
+        let (hb, qb, fb) = (hidden / 32, q_width / 32, ffn_dim / 32);
+        for li in 0..self.n_layers {
+            let layer = &self.layers[li];
+            launch_rms_norm_batched(
+                &s,
+                &self.k.rms_norm_batched,
+                &sc.vh,
+                &layer.attn_norm,
+                &mut sc.vn,
+                hidden,
+                eps,
+                k,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vn,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * hb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.q,
+                q_width,
+                hb,
+                k,
+                &mut sc.vq,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.k,
+                kv_width,
+                hb,
+                k,
+                &mut sc.vk,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.v,
+                kv_width,
+                hb,
+                k,
+                &mut sc.vv,
+            )
+            .map_err(map)?;
+            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm)
+            {
+                launch_rms_norm_per_head(
+                    &s,
+                    &self.k.rms_norm_per_head,
+                    &mut sc.vq,
+                    qn,
+                    k * n_heads,
+                    head_dim,
+                    eps,
+                )
+                .map_err(map)?;
+                launch_rms_norm_per_head(
+                    &s,
+                    &self.k.rms_norm_per_head,
+                    &mut sc.vk,
+                    kn,
+                    k * n_kv,
+                    head_dim,
+                    eps,
+                )
+                .map_err(map)?;
+            }
+            let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
+            launch_rope_batched(
+                &s,
+                &self.k.rope_batched,
+                &mut sc.vq,
+                &sc.vcos,
+                &sc.vsin,
+                n_heads,
+                head_dim,
+                rope_dim,
+                q_width,
+                k,
+                pairing,
+            )
+            .map_err(map)?;
+            launch_rope_batched(
+                &s,
+                &self.k.rope_batched,
+                &mut sc.vk,
+                &sc.vcos,
+                &sc.vsin,
+                n_kv,
+                head_dim,
+                rope_dim,
+                kv_width,
+                k,
+                pairing,
+            )
+            .map_err(map)?;
+            // Tree scatter: each node to its own slot node_kvslot[t].
+            launch_kv_scatter_tree_batched(
+                &s,
+                &self.k.kv_scatter_tree_batched,
+                &sc.vk,
+                &mut self.cache_k[li],
+                node_kvslot,
+                n_kv,
+                head_dim,
+                max_pos,
+                kv_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_kv_scatter_tree_batched(
+                &s,
+                &self.k.kv_scatter_tree_batched,
+                &sc.vv,
+                &mut self.cache_v[li],
+                node_kvslot,
+                n_kv,
+                head_dim,
+                max_pos,
+                kv_width,
+                k,
+            )
+            .map_err(map)?;
+            // Tree attention: dense prefix [0, base) + ancestor slots only.
+            launch_attention_tree_batched(
+                &s,
+                &self.k.attention_tree_batched,
+                &sc.vq,
+                &self.cache_k[li],
+                &self.cache_v[li],
+                &mut sc.vattn,
+                ancestor_bits,
+                words,
+                n_heads,
+                n_kv,
+                head_dim,
+                base_position,
+                max_pos,
+                scale,
+                q_width,
+                k,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vattn,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * qb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.o,
+                hidden,
+                qb,
+                k,
+                &mut sc.vproj,
+            )
+            .map_err(map)?;
+            launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+                .map_err(map)?;
+            launch_rms_norm_batched(
+                &s,
+                &self.k.rms_norm_batched,
+                &sc.vh,
+                &layer.ffn_norm,
+                &mut sc.vn,
+                hidden,
+                eps,
+                k,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vn,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * hb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.gate,
+                ffn_dim,
+                hb,
+                k,
+                &mut sc.vgate,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.up,
+                ffn_dim,
+                hb,
+                k,
+                &mut sc.vup,
+            )
+            .map_err(map)?;
+            launch_silu_mul(
+                &s,
+                &self.k.silu_mul,
+                &sc.vgate,
+                &sc.vup,
+                &mut sc.vact,
+                k * ffn_dim,
+            )
+            .map_err(map)?;
+            launch_quantize(
+                &s,
+                &self.k.quantize,
+                &sc.vact,
+                &mut sc.viq,
+                &mut sc.vis,
+                k * fb,
+            )
+            .map_err(map)?;
+            launch_gemm_batched(
+                &s,
+                &self.k.gemm_batched,
+                &sc.vis,
+                &sc.viq,
+                &layer.down,
+                hidden,
+                fb,
+                k,
+                &mut sc.vproj,
+            )
+            .map_err(map)?;
+            launch_residual(&s, &self.k.residual_add, &mut sc.vh, &sc.vproj, k * hidden)
+                .map_err(map)?;
+        }
+        Ok(())
+    }
+
+    /// Tree-verify forward: run an N-node draft TREE through the model in one batched
+    /// pass and return the greedy argmax for each node (`predicted[i]` = the model's
+    /// next token after node `i` along its path). Lossless tree speculation: the caller
+    /// feeds `predicted` to [`TokenTree::accept_longest_path`] to pick the accepted path.
+    ///
+    /// `node_kvslot[i]` = base + BFS index `i` (each node's unique cache slot);
+    /// `node_depth[i]` = depth (RoPE position = base + depth); `ancestor_bits` is the
+    /// flat `[node][words]` causal tree mask (`words = ceil(N/32)`). `embeddings` is
+    /// `N*hidden`, staged in BFS order; `cos_all`/`sin_all` are per-NODE RoPE tables
+    /// (`N*rope_dim/2`) at position `base + node_depth[i]`. `n` must be `1..=TREE_MAX_NODES`.
+    ///
+    /// After argmax, the caller's accepted path may be a strict subset of the scattered
+    /// nodes. The KV slots of the accepted path are then COMPACTED by rescatter into the
+    /// contiguous slots `base..base+L-1` (path order) via [`compact_tree_kv`], leaving the
+    /// cache exactly as a linear decode of the accepted path would — so the next round's
+    /// committed prefix is correct. For a single-branch tree this is a no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_tree(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+    ) -> Result<Vec<u32>, String> {
+        let cap = crate::inference::spec_tree::TREE_MAX_NODES;
+        if n == 0 || n > cap {
+            return Err(format!("verify_tree: n={n} out of 1..={cap}"));
+        }
+        if node_kvslot.len() < n || ancestor_bits.len() < n * words {
+            return Err("verify_tree: index slices too short".into());
+        }
+        let map = |e: cudarc::driver::DriverError| format!("cuda verify_tree: {e}");
+        let (hidden, vocab, eps) = (self.hidden, self.vocab, self.eps);
+        let half = self.rope_dim / 2;
+        let hb = hidden / 32;
+        if embeddings.len() < n * hidden || cos_all.len() < n * half || sin_all.len() < n * half {
+            return Err("verify_tree: input slices too short".into());
+        }
+        self.ensure_tree_scratch()?;
+        let s = self.k.stream.clone();
+        let mut ts = self.tree_scratch.take().expect("allocated above");
+
+        s.memcpy_htod(&embeddings[..n * hidden], &mut ts.sc.vh.slice_mut(0..n * hidden))
+            .map_err(map)?;
+        s.memcpy_htod(&cos_all[..n * half], &mut ts.sc.vcos.slice_mut(0..n * half))
+            .map_err(map)?;
+        s.memcpy_htod(&sin_all[..n * half], &mut ts.sc.vsin.slice_mut(0..n * half))
+            .map_err(map)?;
+        s.memcpy_htod(&node_kvslot[..n], &mut ts.node_kvslot.slice_mut(0..n))
+            .map_err(map)?;
+        s.memcpy_htod(
+            &ancestor_bits[..n * words],
+            &mut ts.ancestor_bits.slice_mut(0..n * words),
+        )
+        .map_err(map)?;
+
+        // Move sc/index buffers out so run_tree_layer_stack can borrow &mut self.
+        let TreeScratch {
+            mut sc,
+            node_kvslot: d_slot,
+            ancestor_bits: d_anc,
+        } = ts;
+        self.run_tree_layer_stack(&mut sc, &d_slot, &d_anc, words, &s, base_position, n, scale)?;
+        launch_rms_norm_batched(
+            &s,
+            &self.k.rms_norm_batched,
+            &sc.vh,
+            &self.final_norm,
+            &mut sc.vn,
+            hidden,
+            eps,
+            n,
+        )
+        .map_err(map)?;
+        launch_quantize(
+            &s,
+            &self.k.quantize,
+            &sc.vn,
+            &mut sc.viq,
+            &mut sc.vis,
+            n * hb,
+        )
+        .map_err(map)?;
+        launch_gemm_batched(
+            &s,
+            &self.k.gemm_batched,
+            &sc.vis,
+            &sc.viq,
+            &self.output_weight,
+            vocab,
+            hb,
+            n,
+            &mut sc.vlogits,
+        )
+        .map_err(map)?;
+        launch_argmax_batched(
+            &s,
+            &self.k.argmax_batched,
+            &sc.vlogits,
+            vocab,
+            n,
+            &mut sc.vsamp,
+        )
+        .map_err(map)?;
+        let mut out = vec![0u32; cap];
+        s.memcpy_dtoh(&sc.vsamp, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        out.truncate(n);
+        // Put the scratch back for reuse.
+        self.tree_scratch = Some(TreeScratch {
+            sc,
+            node_kvslot: d_slot,
+            ancestor_bits: d_anc,
+        });
+        Ok(out)
+    }
+
+    /// COMPACT-BY-RESCATTER the accepted path's KV into the contiguous slots
+    /// `base..base+L-1` (path order), per layer, so the cache after a tree round is
+    /// byte-for-byte what a linear decode of the accepted path would leave. `path`
+    /// is the accepted node indices INCLUDING the root anchor (node 0), root first —
+    /// exactly `tree.path_to(leaf)`. Slot of node `j` is `base + j` (its
+    /// `node_kvslot`). We copy, for each accepted node at path rank `r`, the K/V row
+    /// from source slot `base + path[r]` to destination slot `base + r`.
+    ///
+    /// CRITICAL off-by-one note: `path[0]` is the anchor (node 0, already at slot
+    /// `base + 0 = base`), so its copy is the identity and `r=0` is correct to
+    /// include. For a single-branch (linear) tree `path == [0,1,..,L-1]` so every
+    /// copy is slot→same slot — a NO-OP — which is why a linear tree needs no
+    /// compaction. Copies run front-to-back; since `path[r] >= r` always (the path
+    /// is a strictly increasing subsequence of BFS indices starting at 0), the source
+    /// slot is never below the destination, so a forward copy never clobbers a source
+    /// it still needs. After compaction the caller sets position/filled = base + L.
+    pub fn compact_tree_kv_path(&mut self, path: &[usize], base: usize) -> Result<(), String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda compact: {e}");
+        let s = self.k.stream.clone();
+        let (n_kv, head_dim, max_pos) = (self.n_kv_heads, self.head_dim, self.max_pos);
+        // A copy within one CudaSlice can't borrow it &mut and & at once (and the
+        // dst slot may equal another node's src), so route each row through host.
+        // Rows are tiny (head_dim u16) and compaction only fires when a branch
+        // diverges, so the round-trip is negligible. `path[r] >= r` always, so the
+        // gather-then-scatter is order-independent anyway.
+        let mut row = vec![0u16; head_dim];
+        for (r, &node) in path.iter().enumerate() {
+            if node == r {
+                continue; // identity (the whole linear case) — slot already correct
+            }
+            let src_pos = base + node;
+            let dst_pos = base + r;
+            for li in 0..self.n_layers {
+                for kv_head in 0..n_kv {
+                    let row_base = kv_head * max_pos * head_dim;
+                    let src = row_base + src_pos * head_dim;
+                    let dst = row_base + dst_pos * head_dim;
+                    // K
+                    s.memcpy_dtoh(&self.cache_k[li].slice(src..src + head_dim), &mut row)
+                        .map_err(map)?;
+                    s.memcpy_htod(&row, &mut self.cache_k[li].slice_mut(dst..dst + head_dim))
+                        .map_err(map)?;
+                    // V
+                    s.memcpy_dtoh(&self.cache_v[li].slice(src..src + head_dim), &mut row)
+                        .map_err(map)?;
+                    s.memcpy_htod(&row, &mut self.cache_v[li].slice_mut(dst..dst + head_dim))
+                        .map_err(map)?;
+                }
+            }
+        }
+        self.k.ctx.synchronize().map_err(map)?;
         Ok(())
     }
 

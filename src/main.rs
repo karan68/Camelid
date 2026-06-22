@@ -2367,6 +2367,81 @@ fn generate_run_speculative(
         cpu_verify_rounds: 0,
     };
 
+    // Tree-speculation lane (CAMELID_SPEC_TREE): a branching drafter proposes a tree of
+    // candidate continuations and one batched forward (`verify_tree_gpu`) confirms whichever
+    // branch the model takes. Lossless (every emitted token is the target's greedy argmax).
+    // Default off; falls back to the linear path per-round if the GPU engine isn't ready.
+    let spec_tree = std::env::var_os("CAMELID_SPEC_TREE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let mut tree_drafter = camelid::inference::suffix_decoding::SuffixDecodingDrafter::default();
+    // ACCEPTANCE-GATED DRAFTING (CAMELID_SPEC_TREE lane only).
+    //
+    // The suffix drafter only PROPOSES; `verify_tree_gpu` is the exact greedy gate, so any
+    // budget we pick here stays lossless. The PROBLEM it solves: a wide tree costs a batched
+    // verify + KV compaction every round regardless of how many tokens land. On low-acceptance
+    // workloads (prose) most branches reject, so the wide-tree overhead exceeds the ~1 token it
+    // commits and the spec lane runs SLOWER than plain decode. On high-acceptance workloads
+    // (repetitive) a wide tree commits many tokens per weight read and wins big.
+    //
+    // Fix: gate the tree budget by RECENT acceptance (a run-length latch over accepted DRAFT tokens
+    // per round; the +1 bonus is free and excluded). MEASURED full-tree acceptance on this box
+    // (3B Q8, RTX 3060 6GB) cleanly separates the workloads by their net speedup:
+    //   repetitive ~2.6 accepted/round -> S_sync ~1.28x (clear win)
+    //   code       ~1.2               -> ~0.87x (regress)
+    //   json       ~0.9               -> ~0.83x (regress)
+    //   prose      ~0.5               -> ~0.76x (regress)
+    // The batched-verify + KV-compaction per round only pays off at HIGH acceptance, so the policy
+    // is binary: speculate (full tree every round) on the repetitive stream, SKIP (plain decode,
+    // ~1.0x) on everything else. Two design points make it robust:
+    //  (1) RUN-LENGTH latch (see below) keeps a speculating stream latched ON through isolated low
+    //      rounds — only a RUN of consecutive non-productive rounds turns it off — so repetitive's
+    //      bursty per-round variance doesn't bleed away the win via stray skips.
+    //  (2) Acceptance is always measured on the SAME full tree the latch uses (warm-up and the
+    //      periodic re-probe draw the full tree, never a throttled one) — a smaller probe tree would
+    //      CAP how many drafts can be accepted and under-read repetitive's true ~2.6 into code's
+    //      range, collapsing the gate into never speculating.
+    // Thresholds are deliberately simple and collected here so they are easy to find and tune.
+    //
+    // The latch is RUN-LENGTH based, not a noisy per-round EWMA threshold: real-text acceptance is
+    // bursty (a repetitive list still has occasional 0-accept rounds), so an EWMA Schmitt-trigger
+    // flips the win off mid-stream. Instead:
+    //   - While speculating, draw the full tree EVERY round (identical to the ungated path). Stay
+    //     latched ON until EXIT_RUN *consecutive* rounds each accept fewer than PRODUCTIVE_DRAFTS
+    //     drafts. One good round resets the run, so repetitive (which keeps landing multi-token
+    //     accepts) never trips the exit; prose/code (which consistently accept ~0-1) trip it fast.
+    //   - While latched OFF, SKIP (plain decode, ~1.0x). Every LOW_REPROBE skips, spend ONE
+    //     full-tree probe; if it lands >= ENTER_DRAFTS accepted, re-latch ON (a stream that turned
+    //     repetitive recovers). The probe is rare, so a novel stream pays ~1 wasted verify / 64 tok.
+    const PRODUCTIVE_DRAFTS: u32 = 2; // a round accepting >= this many drafts is "productive"
+    const EXIT_RUN: u32 = 4; // consecutive NON-productive rounds before we latch speculation OFF.
+                             // 4 (not 2) because repetitive's bursty acceptance DOES string together
+                             // 2-3 sub-2 rounds even mid-list — a smaller value exits the win early
+                             // (measured: EXIT_RUN=2 cut repetitive ~26 rounds to ~15, eroding it
+                             // below 1.2x). 4 keeps repetitive fully latched; low-accept workloads
+                             // still exit after 4 verifies (~3% of a 128-token run) and then skip.
+    const ENTER_DRAFTS: u32 = 2; // a re-probe landing >= this many accepted drafts re-latches ON
+    const WARMUP_ROUNDS: u64 = 1; // ONE verified round to measure before the latch can turn off
+                                  // (kept minimal: each warm-up verify is overhead on a low-accept
+                                  // stream, and one round is enough to see if drafts land)
+    const LOW_REPROBE: u32 = 64; // consecutive skips before ONE full-tree re-probe (rare on purpose:
+                                 // a novel stream pays ~1 wasted verify per 64 tokens)
+    // Escape hatch for A/B measurement: CAMELID_SPEC_TREE_GATE=0 forces the OLD ungated policy
+    // (full tree every round, never skip) so the gated-vs-ungated S_sync can be measured from the
+    // SAME binary. Default ON (gated). The gate only changes which budget the drafter PROPOSES;
+    // losslessness is the verify's job either way.
+    let gate_enabled = std::env::var_os("CAMELID_SPEC_TREE_GATE")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    // Start speculating so warm-up measures true acceptance; the run-length latch turns it off if
+    // acceptance proves low. The suffix drafter often finds nothing for the first few tokens
+    // (recurrence hasn't built up yet), and those anchor-only misses do NOT count as verified
+    // rounds, so they can't trip the latch before real acceptance is observed.
+    let mut spec_rounds_done: u64 = 0; // VERIFIED rounds only (anchor-only misses don't count)
+    let mut consecutive_skips: u32 = 0; // skips since the last attempted draft (LOW re-probe)
+    let mut nonproductive_run: u32 = 0; // consecutive verified rounds accepting < PRODUCTIVE_DRAFTS
+    let mut speculating = true; // run-length latch: are we currently drawing full trees every round?
+
     let decode_start = Instant::now();
     while !finished && generated.len() < max_tokens {
         let remaining = max_tokens.saturating_sub(generated.len());
@@ -2374,6 +2449,165 @@ fn generate_run_speculative(
         let budget = draft_tokens
             .min(remaining.saturating_sub(1))
             .min(context_room.saturating_sub(1));
+
+        // Tree round: draft a branching tree and verify it in one batched forward.
+        if spec_tree && budget > 0 && context_room > 0 {
+            use camelid::inference::spec_tree::{TreeDrafter, TREE_MAX_NODES};
+            let anchor = input[0];
+
+            // Choose this round's tree budget from the run-length latch (the gate). Returns None to
+            // SKIP speculation: take a plain greedy step instead. The FULL tree is the original
+            // ungated budget: a gamma-deep chain (the suffix drafter may branch within the node
+            // cap). Every band that speculates draws this same full tree so acceptance is measured
+            // at the size the latched-ON band actually uses (a throttled probe would under-read it).
+            let full_tree = ((budget + 1).min(TREE_MAX_NODES), budget);
+            let chosen_budget: Option<(usize, usize)> = if !gate_enabled {
+                // Ungated baseline (A/B): the original always-full-tree policy.
+                Some(full_tree)
+            } else if spec_rounds_done < WARMUP_ROUNDS {
+                // Warm-up: ALWAYS speculate (full tree) for the first few verified rounds to MEASURE
+                // this workload's true acceptance before the latch can turn off.
+                Some(full_tree)
+            } else if speculating {
+                // Latched ON: full tree every round — the repetitive win. Identical to the ungated
+                // path (no skips) until EXIT_RUN consecutive non-productive rounds latch it off.
+                Some(full_tree)
+            } else if consecutive_skips >= LOW_REPROBE {
+                // Latched OFF but time to re-probe: spend ONE full-tree round to re-measure whether
+                // the stream has turned repetitive again. Full tree (not a thin one) so the
+                // measurement isn't artificially capped.
+                Some(full_tree)
+            } else {
+                // Latched OFF: skip speculation entirely — no draft/verify/compaction overhead (~1.0x).
+                None
+            };
+
+            if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
+                eprintln!(
+                    "[spec-tree] round_seen={} spec={} nonprod_run={} skips={} budget={} -> {:?}",
+                    spec_rounds_done, speculating, nonproductive_run, consecutive_skips, budget, chosen_budget
+                );
+            }
+            let Some((max_nodes, max_depth)) = chosen_budget else {
+                // Latched OFF: one plain resident greedy step (no speculation this round). Recovery
+                // is handled by the periodic LOW_REPROBE full-tree probe every LOW_REPROBE skips;
+                // no speculation cost is paid here.
+                consecutive_skips += 1;
+                let step_started = Instant::now();
+                let next = match session.generate_next_token_greedy_resident(input[0])? {
+                    Some((id, _us)) => id,
+                    None => {
+                        session
+                            .generate_next_token_with_history_diagnostics(
+                                &input,
+                                LlamaSampler::Greedy,
+                                &history,
+                                false,
+                            )?
+                            .next_token_id
+                    }
+                };
+                run.verify_us += step_started.elapsed().as_micros();
+                run.normal_steps += 1;
+                generated.push(next);
+                history.push(next);
+                if tokenizer.special.eog.contains(&next) {
+                    finished = true;
+                }
+                input.clear();
+                input.push(*generated.last().expect("just pushed a token"));
+                continue;
+            };
+
+            let draft_started = Instant::now();
+            let tree = tree_drafter.draft_tree(&history, anchor, max_nodes, max_depth);
+            run.draft_us += draft_started.elapsed().as_micros();
+            if tree.nodes() > 1 {
+                let verify_started = Instant::now();
+                if let Some(emitted) = session.verify_tree_gpu(&tree)? {
+                    run.verify_us += verify_started.elapsed().as_micros();
+                    // A verified round drives the run-length latch. accepted_drafts = emitted minus
+                    // the guaranteed +1 bonus. Reset the skip clock — we just got a real measurement.
+                    let accepted_drafts = (emitted.len() as u64).saturating_sub(1) as u32;
+                    consecutive_skips = 0;
+                    if accepted_drafts >= PRODUCTIVE_DRAFTS {
+                        // Productive round: reset the non-productive run and (re-)latch ON if a probe
+                        // landed enough. A productive run keeps repetitive latched indefinitely.
+                        nonproductive_run = 0;
+                        if !speculating && accepted_drafts >= ENTER_DRAFTS {
+                            speculating = true;
+                        }
+                    } else {
+                        // Non-productive round (accepted < PRODUCTIVE_DRAFTS): grow the run; after
+                        // EXIT_RUN consecutive such rounds, latch OFF (stop paying the per-round
+                        // overhead). One productive round above resets this, so bursty repetitive
+                        // text stays latched while sustained low-accept text exits quickly.
+                        nonproductive_run = nonproductive_run.saturating_add(1);
+                        if speculating && nonproductive_run >= EXIT_RUN {
+                            speculating = false;
+                            nonproductive_run = 0;
+                        }
+                    }
+                    spec_rounds_done += 1;
+                    run.gpu_verify_rounds += 1;
+                    run.rounds += 1;
+                    run.drafted += (tree.nodes() - 1) as u64;
+                    run.accepted_drafts += (emitted.len() as u64).saturating_sub(1);
+                    for token in emitted {
+                        if generated.len() >= max_tokens {
+                            break;
+                        }
+                        generated.push(token);
+                        history.push(token);
+                        if tokenizer.special.eog.contains(&token) {
+                            finished = true;
+                            break;
+                        }
+                    }
+                    input.clear();
+                    input.push(*generated.last().expect("a tree round emits >=1 token"));
+                    continue;
+                }
+                // Engine not ready (e.g. first round before seed): fall through to a plain step.
+                // Don't score this as a low-acceptance round — it's an engine-readiness miss,
+                // not a drafter miss — so leave the EWMA untouched.
+                run.verify_us += verify_started.elapsed().as_micros();
+            } else {
+                // The drafter found NO recurrence (anchor-only tree). This is TRANSIENT and common
+                // early in a stream (the recurrence hasn't built up yet), so it must NOT crash the
+                // EWMA into the LOW band before the stream's true acceptance is ever observed. Treat
+                // it exactly like the ungated path does: take a cheap plain step and try again next
+                // round. The suffix scan that produced it is O(window) and cheap, and crucially NO
+                // batched verify or KV compaction ran (the expensive part) — so on purely novel
+                // text this costs essentially the same as plain decode. Leave the EWMA untouched.
+            }
+            // No usable tree this round → one plain resident greedy step.
+            let step_started = Instant::now();
+            let next = match session.generate_next_token_greedy_resident(input[0])? {
+                Some((id, _us)) => id,
+                None => {
+                    session
+                        .generate_next_token_with_history_diagnostics(
+                            &input,
+                            LlamaSampler::Greedy,
+                            &history,
+                            false,
+                        )?
+                        .next_token_id
+                }
+            };
+            run.verify_us += step_started.elapsed().as_micros();
+            run.normal_steps += 1;
+            generated.push(next);
+            history.push(next);
+            if tokenizer.special.eog.contains(&next) {
+                finished = true;
+            }
+            input.clear();
+            input.push(*generated.last().expect("just pushed a token"));
+            continue;
+        }
+
         let draft_started = Instant::now();
         let drafts = if budget > 0 && context_room > 0 {
             drafter.draft(&history, budget)?

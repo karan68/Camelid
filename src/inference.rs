@@ -25,6 +25,7 @@ use crate::telemetry;
 #[cfg(target_arch = "aarch64")]
 mod cpu_neon;
 mod diagnostic_config;
+pub mod draft_merge;
 pub(crate) mod gemma4;
 mod kv_cache;
 mod metal_resident;
@@ -33,7 +34,12 @@ mod q8_block_reader;
 mod q8_runtime;
 mod q8_telemetry;
 mod rope;
+pub mod spec_tree;
+#[cfg(test)]
+mod spec_tree_lossless;
 pub mod speculative;
+pub mod suffix_decoding;
+pub mod token_recycling;
 
 #[cfg(test)]
 use diagnostic_config::diagnostic_zero_delta_value;
@@ -392,6 +398,18 @@ impl LlamaLoadedWeights {
             );
         }
         let load_linear = |name: &str| {
+            // K-quant (Q4_K / Q6_K) 2-D linears: retain only the raw super-block wire
+            // bytes (no f32 materialization — an 8B model fully decoded to f32 is ~32 GB
+            // and OOMs). The GPU-resident decode reads these via q4k_gemv / q6k_gemv.
+            if let Ok(desc) = store.descriptor(name) {
+                if matches!(
+                    desc.tensor_type,
+                    GgufTensorType::Q4K | GgufTensorType::Q6K
+                ) && desc.dimensions.len() == 2
+                {
+                    return store.load_kquant_wire_linear(name);
+                }
+            }
             if nocopy_fast_load {
                 store.load_q8_0_wire_pages_linear(name)
             } else if force_lazy_q8_0 {
@@ -1900,6 +1918,35 @@ impl LlamaInferenceSession {
             t.source_type == Some(GgufTensorType::Q8_0)
                 && (t.q8_0_blocks.is_some() || (wire_ok && t.q8_0_wire_pages.is_some()))
         };
+        // Q4_K_M residency: the tensor is Q4_K with its 144-byte super-block wire
+        // bytes materialized, and its contraction dimension is a whole number of
+        // 256-value super-blocks (the q4k_gemv kernel processes one super-block at a
+        // time). The decode dispatch picks q8_gemv vs q4k_gemv per tensor by
+        // source_type, so a model may be all-Q8_0, all-Q4_K, or mixed.
+        // The contraction dimension (in_features) is gguf dim(0) in the runtime shape:
+        // a `[in, out]` gguf linear is stored out-major (out rows of `in` contiguous
+        // values), so each output row spans `in/256` super-blocks — the kernel's `n_sb`.
+        // (The output/lm_head, with a non-256-aligned vocab in dim(1), is the case that
+        // makes checking the wrong dim wrongly reject it.)
+        let is_q4k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q4K)
+                && t.q4_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
+        // Q6_K residency: 210-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks (the q6k_gemv
+        // kernel reads the wire bytes a super-block at a time). Q4_K_M promotes
+        // attn_v/ffn_down (and the lm_head) to Q6_K, so a Q4_K_M model is mixed Q4K+Q6K.
+        let is_q6k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q6K)
+                && t.q6_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
+        // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
+        // (Q4_K / Q6_K). Q8_0 behavior is byte-identical to before.
+        let is_resident_quant = |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t);
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
             .weights
@@ -1911,16 +1958,16 @@ impl LlamaInferenceSession {
         }
         for (idx, layer) in self.weights.layers[range].iter().enumerate() {
             if layer.moe_router.is_some()
-                || !is_q8(&layer.attention_q)
-                || !is_q8(&layer.attention_k)
-                || !is_q8(&layer.attention_v)
-                || !is_q8(&layer.attention_output)
-                || !is_q8(&layer.ffn_gate)
-                || !is_q8(&layer.ffn_up)
-                || !is_q8(&layer.ffn_down)
+                || !is_resident_quant(&layer.attention_q)
+                || !is_resident_quant(&layer.attention_k)
+                || !is_resident_quant(&layer.attention_v)
+                || !is_resident_quant(&layer.attention_output)
+                || !is_resident_quant(&layer.ffn_gate)
+                || !is_resident_quant(&layer.ffn_up)
+                || !is_resident_quant(&layer.ffn_down)
             {
                 bail!(format!(
-                    "layer {idx} not plain Q8_0 with materialized blocks or wire pages (blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
+                    "layer {idx} not resident-eligible Q8_0/Q4_K (q8 blocks/pages present: q={}/{} k={}/{} v={}/{} o={}/{} gate={}/{} up={}/{} down={}/{})",
                     layer.attention_q.q8_0_blocks.is_some(),
                     layer.attention_q.q8_0_wire_pages.is_some(),
                     layer.attention_k.q8_0_blocks.is_some(),
@@ -1944,8 +1991,8 @@ impl LlamaInferenceSession {
         // produce hidden state (want_logits=false) skip these (a first/middle node does not
         // even own the output tensors).
         if want_logits {
-            if !is_q8(self.weights.output_projection()) {
-                bail!("output projection not plain Q8_0 with materialized blocks");
+            if !is_resident_quant(self.weights.output_projection()) {
+                bail!("output projection not resident-eligible Q8_0/Q4_K with materialized blocks");
             }
             if self
                 .weights
@@ -2112,7 +2159,12 @@ impl LlamaInferenceSession {
                 let v = v.trim();
                 v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
             })
-            .unwrap_or(false);
+            // K-quant (Q4_K/Q6_K) models MUST use the serial per-token prefill: the
+            // batched prefill GEMM (`q8_gemm_batched`) is Q8_0-only, while the serial
+            // `prefill` shares the per-token `forward_pass`, which dispatches the K-quant
+            // kernels. (Decode after either is token-identical for Q8_0; for K-quant only
+            // the serial path exists.)
+            .unwrap_or_else(|| slot.engine.uses_kquant());
         let prefill_result = if serial_prefill {
             slot.engine
                 .prefill(&embeddings.data, &tables.cos, &tables.sin, n, scale)
@@ -2410,6 +2462,127 @@ impl LlamaInferenceSession {
         drop(guard);
         self.kv_cache.position = new_position;
         Ok(Some(accepted))
+    }
+
+    /// Verify a draft TREE against the resident GPU engine in one batched pass and
+    /// return the accepted path's emitted tokens (the longest root-to-leaf branch the
+    /// model confirms, plus the bonus at the divergence point). Generalizes
+    /// [`Self::verify_drafts_gpu`] from a linear chain to a tree: several branches share
+    /// a prefix, so one forward can confirm whichever branch the model actually takes.
+    /// Lossless: every emitted token is the target's own greedy argmax along the accepted
+    /// path ([`TokenTree::accept_longest_path`]). Returns `Ok(None)` (caller takes a
+    /// normal step) when the engine isn't ready exactly at the current position. On a
+    /// single-branch (linear) tree this is bit-identical to `verify_drafts_gpu`.
+    #[cfg(feature = "cuda")]
+    pub fn verify_tree_gpu(
+        &mut self,
+        tree: &crate::inference::spec_tree::TokenTree,
+    ) -> Result<Option<Vec<u32>>> {
+        use crate::inference::spec_tree::TREE_MAX_NODES;
+        if !resident_decode_cuda_enabled() || self.resident_paths_disabled {
+            return Ok(None);
+        }
+        let n = tree.nodes();
+        if n == 0 {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        // Each node lands at slot base+BFS-idx; the longest path is at most n-1 deep, so
+        // the committed tokens never exceed n. Bound by the cache and the node cap.
+        if n > TREE_MAX_NODES
+            || position + n > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(None);
+        }
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // Embeddings in BFS (node) order: node 0 is the anchor, nodes 1.. the drafts.
+        let embeddings = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&tree.tokens, "token_embedding_tree_verify")?;
+        // Per-node RoPE tables at position base + node_depth[i].
+        let node_depth = tree.node_depth();
+        let mut cos_all = Vec::with_capacity(n * head_dim);
+        let mut sin_all = Vec::with_capacity(n * head_dim);
+        for &d in &node_depth {
+            match rope::resident_decode_rope_tables(
+                position + d as usize,
+                head_dim,
+                &self.config,
+                self.weights.rope_freqs.as_ref(),
+            )? {
+                Some(t) => {
+                    cos_all.extend_from_slice(&t.cos);
+                    sin_all.extend_from_slice(&t.sin);
+                }
+                _ => return Ok(None),
+            }
+        }
+        let node_kvslot = tree.node_kvslot(position);
+        let (ancestor_bits, words) = tree.ancestor_bitset();
+
+        let key = self
+            .resident_cache_key
+            .map(|k| k as usize)
+            .unwrap_or_else(|| Arc::as_ptr(&self.weights) as *const () as usize);
+        let cache = self.resident_cache();
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready = guard.as_ref().is_some_and(|slot| {
+            slot.key == key
+                && slot.engine.weights_ready()
+                && slot.engine.filled() == position
+                && !slot.engine.is_offloaded()
+        });
+        if !ready {
+            return Ok(None);
+        }
+        let slot = guard.as_mut().expect("ready checked above");
+        let predicted = match slot.engine.verify_tree(
+            &embeddings.data,
+            &cos_all,
+            &sin_all,
+            &node_kvslot,
+            &ancestor_bits,
+            words,
+            position,
+            n,
+            scale,
+        ) {
+            Ok(m) => m,
+            Err(_) => return Ok(None),
+        };
+
+        // Host accept: longest greedy-exact path through the tree, then COMPACT the
+        // accepted path's KV into contiguous slots base..base+L-1 so the cache matches
+        // a linear decode of that path (no-op for a single-branch tree). Then advance.
+        let (emitted, leaf) = tree.accept_longest_path(&predicted);
+        let path = tree.path_to(leaf); // includes the anchor (node 0); root first
+        if let Err(e) = slot.engine.compact_tree_kv_path(&path, position) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "tree KV compaction failed: {e}"
+            )));
+        }
+        let new_position = position + emitted.len();
+        slot.engine.set_filled(new_position);
+        drop(guard);
+        self.kv_cache.position = new_position;
+        Ok(Some(emitted))
+    }
+
+    /// Non-CUDA build: tree verify is unavailable, fall back to the caller's normal step.
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_variables)]
+    pub fn verify_tree_gpu(
+        &mut self,
+        tree: &crate::inference::spec_tree::TokenTree,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
     }
 
     /// Non-CUDA build: the GPU resident speculative-verify path is unavailable,
@@ -9586,8 +9759,34 @@ fn build_resident_cuda_engine(
     split_half_pairing: bool,
     is_drafter: bool,
 ) -> Option<crate::cuda_resident::CudaResidentDecode> {
+    use crate::cuda_resident::ProjQuant;
+    // The resident upload byte source for a projection: Q8_0 36-byte blocks, or the
+    // raw K-quant super-block wire bytes (144 B for Q4_K, 210 B for Q6_K). These are
+    // the bytes `set_layer_located`/`set_output` repack per lane.
     fn raw(t: &CpuTensor) -> Option<&[u8]> {
-        t.q8_0_blocks.as_deref().map(q8_0_blocks_as_bytes)
+        if let Some(b) = t.q8_0_blocks.as_deref() {
+            return Some(q8_0_blocks_as_bytes(b));
+        }
+        if t.source_type == Some(GgufTensorType::Q4K) {
+            if let Some(w) = t.q4_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
+        if t.source_type == Some(GgufTensorType::Q6K) {
+            if let Some(w) = t.q6_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
+        None
+    }
+    // The resident GEMV lane a projection dispatches on (drives the upload repack and
+    // the per-tensor kernel/activation-quantizer choice). Defaults to Q8_0.
+    fn proj_quant(t: &CpuTensor) -> ProjQuant {
+        match t.source_type {
+            Some(GgufTensorType::Q4K) if t.q4_k_wire_bytes.is_some() => ProjQuant::Q4K,
+            Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
+            _ => ProjQuant::Q8_0,
+        }
     }
     // VRAM-driven resident-context sizing (portability, not hardcoded to any card):
     //   resident weights are uploaded once and live for the engine's lifetime; the
@@ -9877,6 +10076,18 @@ fn build_resident_cuda_engine(
             }
             _ => return None,
         };
+        // Per-projection quant lanes (q,k,v,o,gate,up,down) — drives the per-tensor
+        // repack + GEMV kernel + activation quantizer. Q4_K_M is mixed: most
+        // projections Q4_K, with attn_v/ffn_down promoted to Q6_K in ~half the layers.
+        let quants = [
+            proj_quant(&l.attention_q),
+            proj_quant(&l.attention_k),
+            proj_quant(&l.attention_v),
+            proj_quant(&l.attention_output),
+            proj_quant(&l.ffn_gate),
+            proj_quant(&l.ffn_up),
+            proj_quant(&l.ffn_down),
+        ];
         engine
             .set_layer_located(
                 q,
@@ -9891,6 +10102,7 @@ fn build_resident_cuda_engine(
                 l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
                 l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
                 idx < n_resident_layers,
+                quants,
             )
             .ok()?;
     }
@@ -9928,7 +10140,11 @@ fn build_resident_cuda_engine(
     eprintln!("{}", status.describe());
     crate::offload::set_offload_run_status(Some(status));
     engine
-        .set_output(&weights.output_norm.data, raw(weights.output_projection())?)
+        .set_output(
+            &weights.output_norm.data,
+            raw(weights.output_projection())?,
+            proj_quant(weights.output_projection()),
+        )
         .ok()?;
     Some(engine)
 }
