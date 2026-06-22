@@ -945,6 +945,79 @@ extern "C" __global__ void attention_decode(
     }
 }
 
+// ---- Sliding-window attention decode (gemma4 sliding layers) ---------------
+// Identical to attention_decode but attends only the last `window` keys:
+//   start = (window > 0 && position_count > window) ? position_count - window : 0
+// then keys [start, position_count). window <= 0 reproduces full-causal
+// attention_decode exactly (so the non-sliding gemma4 layers / any caller can
+// share this kernel). Same online softmax + FP-reassociated weighted-V
+// (token-parity, not bit-identical) shape as attention_decode.
+extern "C" __global__ void attention_decode_sw(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale, int window
+) {
+    int position_count = position_ptr[0] + 1;
+    int start = (window > 0 && position_count > window) ? (position_count - window) : 0;
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+
+    extern __shared__ float shared_sw[];
+    int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;
+    float* qsh = shared_sw;
+    float* vpart = shared_sw + head_dim;
+    float* scores = shared_sw + head_dim + (long)G * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = start + tid; p < position_count; p += blockDim.x) {
+        const unsigned short* kp = kbase + (long)p * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max_sw, s_sum_sw;
+    if (tid == 0) {
+        float m = scores[start];
+        for (int p = start + 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max_sw = m;
+    }
+    __syncthreads();
+    for (int p = start + tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max_sw);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = start; p < position_count; p++) sum += scores[p];
+        s_sum_sw = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum_sw;
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    int active = position_count - start;
+    int p_lo = start + (int)((long)gid * active / G);
+    int p_hi = start + (int)((long)(gid + 1) * active / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++)
+        acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
+    }
+}
+
 // ---- SwiGLU: out[i] = silu(gate[i]) * up[i], silu(x)=x/(1+exp(-x)) ---------
 extern "C" __global__ void silu_mul(
     const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ out, int n
@@ -1528,6 +1601,7 @@ pub struct CudaResidentKernels {
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
     pub(crate) attention: CudaFunction,
+    pub(crate) attention_sw: CudaFunction,
     pub(crate) silu_mul: CudaFunction,
     pub(crate) silu_mul_quantize: CudaFunction,
     pub(crate) geglu_mul: CudaFunction,
@@ -1588,6 +1662,7 @@ impl CudaResidentKernels {
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
             attention: f("attention_decode")?,
+            attention_sw: f("attention_decode_sw")?,
             silu_mul: f("silu_mul")?,
             silu_mul_quantize: f("silu_mul_quantize")?,
             geglu_mul: f("geglu_mul")?,

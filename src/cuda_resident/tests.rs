@@ -1097,6 +1097,121 @@ fn attention_decode_matches_cpu() {
     assert!(close(&got, &expected, 1e-4), "attention diverged");
 }
 
+// Sliding-window attention parity (gemma4 sliding layers): only the last `window`
+// keys are attended. Same setup as attention_decode_matches_cpu but the CPU ref
+// masks to [start, position_count) with start = position_count - window. Validates
+// the window masking; weighted-V is FP-reassociated so this is tolerance-, not
+// bit-, exact (1e-4, same as the full-causal test).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn attention_decode_sw_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n_heads = 32usize;
+    let n_kv = 4usize;
+    let head_dim = 64usize;
+    let max_pos = 128usize;
+    let position_count = 40usize;
+    let window = 16usize; // start = 40 - 16 = 24
+    let start = if window > 0 && position_count > window {
+        position_count - window
+    } else {
+        0
+    };
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let repeats = n_heads / n_kv;
+    let mut rng = Lcg(13);
+    let q: Vec<f32> = (0..n_heads * head_dim).map(|_| rng.next_f32()).collect();
+    let mut cache_k = vec![0f32; n_kv * max_pos * head_dim];
+    let mut cache_v = vec![0f32; n_kv * max_pos * head_dim];
+    for kv in 0..n_kv {
+        for p in 0..position_count {
+            for d in 0..head_dim {
+                cache_k[(kv * max_pos + p) * head_dim + d] = rng.next_f32();
+                cache_v[(kv * max_pos + p) * head_dim + d] = rng.next_f32();
+            }
+        }
+    }
+    // Round K/V through f16 (the real path does this in kv_scatter), upload the bits.
+    for x in cache_k.iter_mut() {
+        *x = crate::inference::f16_bits_to_f32(crate::inference::f32_to_f16_bits(*x));
+    }
+    for x in cache_v.iter_mut() {
+        *x = crate::inference::f16_bits_to_f32(crate::inference::f32_to_f16_bits(*x));
+    }
+    let cache_k_bits: Vec<u16> = cache_k
+        .iter()
+        .map(|&x| crate::inference::f32_to_f16_bits(x))
+        .collect();
+    let cache_v_bits: Vec<u16> = cache_v
+        .iter()
+        .map(|&x| crate::inference::f32_to_f16_bits(x))
+        .collect();
+    // CPU reference: windowed [start, position_count).
+    let mut expected = vec![0f32; n_heads * head_dim];
+    for head in 0..n_heads {
+        let kv_head = head / repeats;
+        let qh = &q[head * head_dim..head * head_dim + head_dim];
+        let mut scores = vec![0f32; position_count];
+        for p in start..position_count {
+            let kbase = (kv_head * max_pos + p) * head_dim;
+            let mut dot = 0f32;
+            for d in 0..head_dim {
+                dot += qh[d] * cache_k[kbase + d];
+            }
+            scores[p] = dot * scale;
+        }
+        let m = scores[start..position_count]
+            .iter()
+            .cloned()
+            .fold(f32::MIN, f32::max);
+        let mut sum = 0f32;
+        for s in scores[start..position_count].iter_mut() {
+            *s = (*s - m).exp();
+            sum += *s;
+        }
+        let inv = 1.0 / sum;
+        for d in 0..head_dim {
+            let mut acc = 0f32;
+            for p in start..position_count {
+                acc += (scores[p] * inv) * cache_v[(kv_head * max_pos + p) * head_dim + d];
+            }
+            expected[head * head_dim + d] = acc;
+        }
+    }
+    // GPU
+    let dq = k.stream.clone_htod(&q).unwrap();
+    let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
+    let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+    let mut dout = k.stream.alloc_zeros::<f32>(n_heads * head_dim).unwrap();
+    let (nh, nkv, hd, mp) = (n_heads as i32, n_kv as i32, head_dim as i32, max_pos as i32);
+    let win = window as i32;
+    let dpos = k.stream.clone_htod(&[(position_count - 1) as i32]).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (n_heads as u32, 1, 1),
+        block_dim: (64, 1, 1),
+        shared_mem_bytes: ((head_dim + position_count) * 4) as u32,
+    };
+    let mut b = k.stream.launch_builder(&k.attention_sw);
+    b.arg(&dq)
+        .arg(&dk)
+        .arg(&dv)
+        .arg(&mut dout)
+        .arg(&nh)
+        .arg(&nkv)
+        .arg(&hd)
+        .arg(&dpos)
+        .arg(&mp)
+        .arg(&scale)
+        .arg(&win);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got = vec![0f32; n_heads * head_dim];
+    k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 1e-4), "attention_decode_sw diverged");
+}
+
 // ---- QK-norm per-head parity ----
 
 fn cpu_rms_norm_per_head(
