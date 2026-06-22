@@ -5,8 +5,8 @@
 # Usage: bash tree_verify_check.sh "<gate value e.g. suffix|merge|ngram>" <prompt-file> [maxtok]
 # Run only when the GPU is free (no other camelid.exe). Reuses parity_check.mjs.
 set -u
-cd /c/Users/timto/Camelid
-MODEL=/c/Users/timto/models/Qwen3-4B-Q8_0.gguf
+cd "$(git rev-parse --show-toplevel)"
+MODEL="${MODEL:-../models/Qwen3-4B-Q8_0.gguf}"  # override with MODEL=/path/to.gguf
 GATE="${1:-suffix}"
 PROMPT="${2:-qa/speed/depth_prompt.txt}"
 MAXTOK="${3:-128}"

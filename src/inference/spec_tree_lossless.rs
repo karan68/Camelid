@@ -145,7 +145,9 @@ fn tree_accept_equals_linear_accept_for_equivalent_inputs() {
     // Deterministic pseudo-random cases.
     let mut state = 0x1234_5678u64;
     let mut rng = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for _ in 0..2000 {
@@ -208,8 +210,12 @@ fn merged_drafters_lossless_under_oracle() {
             max_nodes: usize,
             max_depth: usize,
         ) -> TokenTree {
-            let t_suffix = self.suffix.draft_tree(history, anchor, max_nodes, max_depth);
-            let t_recycle = self.recycle.draft_tree(history, anchor, max_nodes, max_depth);
+            let t_suffix = self
+                .suffix
+                .draft_tree(history, anchor, max_nodes, max_depth);
+            let t_recycle = self
+                .recycle
+                .draft_tree(history, anchor, max_nodes, max_depth);
             let k = (max_nodes - 1).min(max_depth);
             let t_ngram = TokenTree::linear(anchor, &self.ngram.draft(history, k));
             merge_trees(&[t_suffix, t_recycle, t_ngram], max_nodes)

@@ -2426,10 +2426,10 @@ fn generate_run_speculative(
                                   // stream, and one round is enough to see if drafts land)
     const LOW_REPROBE: u32 = 64; // consecutive skips before ONE full-tree re-probe (rare on purpose:
                                  // a novel stream pays ~1 wasted verify per 64 tokens)
-    // Escape hatch for A/B measurement: CAMELID_SPEC_TREE_GATE=0 forces the OLD ungated policy
-    // (full tree every round, never skip) so the gated-vs-ungated S_sync can be measured from the
-    // SAME binary. Default ON (gated). The gate only changes which budget the drafter PROPOSES;
-    // losslessness is the verify's job either way.
+                                 // Escape hatch for A/B measurement: CAMELID_SPEC_TREE_GATE=0 forces the OLD ungated policy
+                                 // (full tree every round, never skip) so the gated-vs-ungated S_sync can be measured from the
+                                 // SAME binary. Default ON (gated). The gate only changes which budget the drafter PROPOSES;
+                                 // losslessness is the verify's job either way.
     let gate_enabled = std::env::var_os("CAMELID_SPEC_TREE_GATE")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -2485,7 +2485,12 @@ fn generate_run_speculative(
             if std::env::var_os("CAMELID_SPEC_TREE_TRACE").is_some() {
                 eprintln!(
                     "[spec-tree] round_seen={} spec={} nonprod_run={} skips={} budget={} -> {:?}",
-                    spec_rounds_done, speculating, nonproductive_run, consecutive_skips, budget, chosen_budget
+                    spec_rounds_done,
+                    speculating,
+                    nonproductive_run,
+                    consecutive_skips,
+                    budget,
+                    chosen_budget
                 );
             }
             let Some((max_nodes, max_depth)) = chosen_budget else {

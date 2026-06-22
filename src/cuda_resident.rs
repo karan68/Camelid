@@ -3498,7 +3498,7 @@ impl CudaResidentDecode {
             // unfused path, byte-identical) when any consumer is Q8_0, and the Q8_K
             // activation when any consumer is a K-quant lane. For an all-Q8_0 layer only
             // the Q8_0 branch runs, so the legacy path is unchanged.
-            let attn_need_q8_0 = [lq[0], lq[1], lq[2]].iter().any(|q| *q == ProjQuant::Q8_0);
+            let attn_need_q8_0 = [lq[0], lq[1], lq[2]].contains(&ProjQuant::Q8_0);
             let attn_need_q8k = [lq[0], lq[1], lq[2]].iter().any(|q| q.needs_q8k());
             if attn_need_q8_0 {
                 if fused {
@@ -5064,8 +5064,11 @@ impl CudaResidentDecode {
         let s = self.k.stream.clone();
         let mut ts = self.tree_scratch.take().expect("allocated above");
 
-        s.memcpy_htod(&embeddings[..n * hidden], &mut ts.sc.vh.slice_mut(0..n * hidden))
-            .map_err(map)?;
+        s.memcpy_htod(
+            &embeddings[..n * hidden],
+            &mut ts.sc.vh.slice_mut(0..n * hidden),
+        )
+        .map_err(map)?;
         s.memcpy_htod(&cos_all[..n * half], &mut ts.sc.vcos.slice_mut(0..n * half))
             .map_err(map)?;
         s.memcpy_htod(&sin_all[..n * half], &mut ts.sc.vsin.slice_mut(0..n * half))

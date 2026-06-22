@@ -1269,8 +1269,9 @@ struct SynthLayer {
 
 impl SynthModel {
     fn new() -> Self {
-        let (n_layers, hidden, n_heads, n_kv, head_dim, ffn, vocab, max_pos) =
-            (2usize, 64usize, 2usize, 1usize, 32usize, 128usize, 96usize, 64usize);
+        let (n_layers, hidden, n_heads, n_kv, head_dim, ffn, vocab, max_pos) = (
+            2usize, 64usize, 2usize, 1usize, 32usize, 128usize, 96usize, 64usize,
+        );
         let rope_dim = 32usize;
         let eps = 1e-5f32;
         let base = 10000f32;
@@ -1287,27 +1288,60 @@ impl SynthModel {
                 gate: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
                 up: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
                 down: quantize_blocks(&rand(&mut rng, hidden * ffn), ffn),
-                an: rand(&mut rng, hidden).iter().map(|v| v * 0.2 + 1.0).collect(),
-                fnv: rand(&mut rng, hidden).iter().map(|v| v * 0.2 + 1.0).collect(),
+                an: rand(&mut rng, hidden)
+                    .iter()
+                    .map(|v| v * 0.2 + 1.0)
+                    .collect(),
+                fnv: rand(&mut rng, hidden)
+                    .iter()
+                    .map(|v| v * 0.2 + 1.0)
+                    .collect(),
             })
             .collect();
-        let final_norm: Vec<f32> = rand(&mut rng, hidden).iter().map(|v| v * 0.2 + 1.0).collect();
+        let final_norm: Vec<f32> = rand(&mut rng, hidden)
+            .iter()
+            .map(|v| v * 0.2 + 1.0)
+            .collect();
         let output_w = quantize_blocks(&rand(&mut rng, vocab * hidden), hidden);
         SynthModel {
-            n_layers, n_heads, n_kv, head_dim, hidden, ffn, rope_dim, max_pos, vocab, eps, scale,
-            layers, final_norm, output_w, base,
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            scale,
+            layers,
+            final_norm,
+            output_w,
+            base,
         }
     }
 
     fn build(&self) -> CudaResidentDecode {
         let mut e = CudaResidentDecode::new(
-            self.n_layers, self.n_heads, self.n_kv, self.head_dim, self.hidden, self.ffn,
-            self.rope_dim, self.max_pos, self.vocab, self.eps, false,
+            self.n_layers,
+            self.n_heads,
+            self.n_kv,
+            self.head_dim,
+            self.hidden,
+            self.ffn,
+            self.rope_dim,
+            self.max_pos,
+            self.vocab,
+            self.eps,
+            false,
         )
         .unwrap();
         for l in &self.layers {
-            e.set_layer(&l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down, &l.an, &l.fnv)
-                .unwrap();
+            e.set_layer(
+                &l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down, &l.an, &l.fnv,
+            )
+            .unwrap();
         }
         e.set_output(&self.final_norm, &self.output_w, ProjQuant::Q8_0)
             .unwrap();
@@ -1350,7 +1384,9 @@ fn tree_linear_matches_verify_batch() {
     let m = SynthModel::new();
     let pairs = m.rope_dim / 2;
     let prefix = 5usize; // committed prefix so base_position > 0 (exercises dense prefix)
-    let prefix_tokens: Vec<u32> = (0..prefix as u32).map(|t| (t * 7 + 3) % m.vocab as u32).collect();
+    let prefix_tokens: Vec<u32> = (0..prefix as u32)
+        .map(|t| (t * 7 + 3) % m.vocab as u32)
+        .collect();
     // The linear chain: anchor + drafts.
     let anchor = 11u32;
     let drafts = [13u32, 17, 23, 29, 31];
@@ -1360,7 +1396,8 @@ fn tree_linear_matches_verify_batch() {
     let seed = |e: &mut CudaResidentDecode| {
         for (i, &tok) in prefix_tokens.iter().enumerate() {
             let (cos, sin) = m.rope(i);
-            e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, false).unwrap();
+            e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, false)
+                .unwrap();
         }
         e.set_filled(prefix);
     };
@@ -1369,7 +1406,9 @@ fn tree_linear_matches_verify_batch() {
     let mut embs = vec![0f32; k * m.hidden];
     let mut cos_all = vec![0f32; k * pairs];
     let mut sin_all = vec![0f32; k * pairs];
-    let chain: Vec<u32> = std::iter::once(anchor).chain(drafts.iter().copied()).collect();
+    let chain: Vec<u32> = std::iter::once(anchor)
+        .chain(drafts.iter().copied())
+        .collect();
     for (i, &tok) in chain.iter().enumerate() {
         embs[i * m.hidden..(i + 1) * m.hidden].copy_from_slice(&m.embed(tok));
         let (cos, sin) = m.rope(prefix + i);
@@ -1391,10 +1430,23 @@ fn tree_linear_matches_verify_batch() {
     let mut e_tree = m.build();
     seed(&mut e_tree);
     let tre = e_tree
-        .verify_tree(&embs, &cos_all, &sin_all, &node_kvslot, &anc, words, prefix, k, m.scale)
+        .verify_tree(
+            &embs,
+            &cos_all,
+            &sin_all,
+            &node_kvslot,
+            &anc,
+            words,
+            prefix,
+            k,
+            m.scale,
+        )
         .unwrap();
 
-    assert_eq!(lin, tre, "tree verify on a linear tree != linear verify_batch");
+    assert_eq!(
+        lin, tre,
+        "tree verify on a linear tree != linear verify_batch"
+    );
 }
 
 /// THE CRITICAL ONE: drive a multi-round decode with a BRANCHING drafter and
@@ -1421,13 +1473,19 @@ fn tree_verify_multiround_lossless() {
         let mut last = 0u32;
         for (i, &tok) in prompt.iter().enumerate() {
             let (cos, sin) = m.rope(i);
-            last = e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true).unwrap().unwrap();
+            last = e
+                .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+                .unwrap()
+                .unwrap();
             pos = i + 1;
         }
         let mut out = vec![last];
         for _ in 1..count {
             let (cos, sin) = m.rope(pos);
-            last = e.forward_token(&m.embed(last), &cos, &sin, pos, m.scale, true).unwrap().unwrap();
+            last = e
+                .forward_token(&m.embed(last), &cos, &sin, pos, m.scale, true)
+                .unwrap()
+                .unwrap();
             pos += 1;
             out.push(last);
         }
@@ -1443,7 +1501,10 @@ fn tree_verify_multiround_lossless() {
     let mut last = 0u32;
     for (i, &tok) in prompt.iter().enumerate() {
         let (cos, sin) = m.rope(i);
-        last = e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true).unwrap().unwrap();
+        last = e
+            .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+            .unwrap()
+            .unwrap();
         pos = i + 1;
     }
     e.set_filled(pos);
@@ -1496,7 +1557,17 @@ fn tree_verify_multiround_lossless() {
         let node_kvslot = tree.node_kvslot(pos);
         let (anc, words) = tree.ancestor_bitset();
         let predicted = e
-            .verify_tree(&embs, &cos_all, &sin_all, &node_kvslot, &anc, words, pos, n, m.scale)
+            .verify_tree(
+                &embs,
+                &cos_all,
+                &sin_all,
+                &node_kvslot,
+                &anc,
+                words,
+                pos,
+                n,
+                m.scale,
+            )
             .unwrap();
         let (round_emit, leaf) = tree.accept_longest_path(&predicted);
         let path = tree.path_to(leaf);
@@ -1550,13 +1621,19 @@ fn tree_verify_forced_compaction_lossless() {
         let mut last = 0u32;
         for (i, &tok) in prompt.iter().enumerate() {
             let (cos, sin) = m.rope(i);
-            last = e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true).unwrap().unwrap();
+            last = e
+                .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+                .unwrap()
+                .unwrap();
             pos = i + 1;
         }
         let mut out = vec![last];
         for _ in 1..count {
             let (cos, sin) = m.rope(pos);
-            last = e.forward_token(&m.embed(last), &cos, &sin, pos, m.scale, true).unwrap().unwrap();
+            last = e
+                .forward_token(&m.embed(last), &cos, &sin, pos, m.scale, true)
+                .unwrap()
+                .unwrap();
             pos += 1;
             out.push(last);
         }
@@ -1573,7 +1650,10 @@ fn tree_verify_forced_compaction_lossless() {
     let mut last = 0u32;
     for (i, &tok) in prompt.iter().enumerate() {
         let (cos, sin) = m.rope(i);
-        last = e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true).unwrap().unwrap();
+        last = e
+            .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+            .unwrap()
+            .unwrap();
         pos = i + 1;
     }
     e.set_filled(pos);
@@ -1596,7 +1676,12 @@ fn tree_verify_forced_compaction_lossless() {
             //          0
             //        / | \
             //       1  2  3       (wrong, want, other)
-            tokens: vec![anchor, wrong, want, (anchor.wrapping_add(5)) % m.vocab as u32],
+            tokens: vec![
+                anchor,
+                wrong,
+                want,
+                (anchor.wrapping_add(5)) % m.vocab as u32,
+            ],
             parent: vec![-1, 0, 0, 0],
             depth: vec![0, 1, 1, 1],
         };
@@ -1614,7 +1699,17 @@ fn tree_verify_forced_compaction_lossless() {
         let node_kvslot = tree.node_kvslot(pos);
         let (anc, words) = tree.ancestor_bitset();
         let predicted = e
-            .verify_tree(&embs, &cos_all, &sin_all, &node_kvslot, &anc, words, pos, n, m.scale)
+            .verify_tree(
+                &embs,
+                &cos_all,
+                &sin_all,
+                &node_kvslot,
+                &anc,
+                words,
+                pos,
+                n,
+                m.scale,
+            )
             .unwrap();
         let (round_emit, leaf) = tree.accept_longest_path(&predicted);
         let path = tree.path_to(leaf);
@@ -1631,7 +1726,10 @@ fn tree_verify_forced_compaction_lossless() {
         }
     }
     emitted.truncate(count);
-    assert_eq!(emitted, truth, "forced-compaction tree decode diverged from greedy");
+    assert_eq!(
+        emitted, truth,
+        "forced-compaction tree decode diverged from greedy"
+    );
     assert!(
         compaction_rounds > 0,
         "test did not exercise the rescatter — no compacting rounds occurred"

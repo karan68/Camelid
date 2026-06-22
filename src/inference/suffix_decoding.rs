@@ -112,8 +112,8 @@ impl TreeDrafter for SuffixDecodingDrafter {
         // To keep this bounded and model-free, the context we match on is the
         // history suffix extended by the path tokens drafted so far.
         let mut frontier: Vec<usize> = vec![0]; // node indices to expand
-        // path_tokens[node] = tokens drafted from anchor down to (and
-        // including) this node, used to extend the match context.
+                                                // path_tokens[node] = tokens drafted from anchor down to (and
+                                                // including) this node, used to extend the match context.
         let mut path_tokens: HashMap<usize, Vec<u32>> = HashMap::new();
         path_tokens.insert(0, Vec::new());
 
@@ -130,7 +130,9 @@ impl TreeDrafter for SuffixDecodingDrafter {
             // so the search pattern is a suffix of `hist` extended by the path.
             let path = path_tokens.get(&node).cloned().unwrap_or_default();
             // Try the longest match length down to min_match.
-            let max_n = self.max_match.min(hist.len().saturating_sub(1) + path.len());
+            let max_n = self
+                .max_match
+                .min(hist.len().saturating_sub(1) + path.len());
             let mut chosen: Vec<u32> = Vec::new();
             for n in (self.min_match..=max_n).rev() {
                 let pattern = build_pattern(hist, &path, n);

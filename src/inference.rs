@@ -402,10 +402,8 @@ impl LlamaLoadedWeights {
             // bytes (no f32 materialization — an 8B model fully decoded to f32 is ~32 GB
             // and OOMs). The GPU-resident decode reads these via q4k_gemv / q6k_gemv.
             if let Ok(desc) = store.descriptor(name) {
-                if matches!(
-                    desc.tensor_type,
-                    GgufTensorType::Q4K | GgufTensorType::Q6K
-                ) && desc.dimensions.len() == 2
+                if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
+                    && desc.dimensions.len() == 2
                 {
                     return store.load_kquant_wire_linear(name);
                 }

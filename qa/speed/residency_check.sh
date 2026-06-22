@@ -4,8 +4,8 @@
 # resident (no host offload) + measures decode tok/s. Run when the model is
 # present and the Q4_K kernel build is done. ONE camelid at a time (kill strays).
 set -u
-cd /c/Users/timto/Camelid
-MODEL=/c/Users/timto/models/Qwen3-8B-Q4_K_M.gguf
+cd "$(git rev-parse --show-toplevel)"
+MODEL="${MODEL:-../models/Qwen3-8B-Q4_K_M.gguf}"  # override with MODEL=/path/to.gguf
 PROMPT="${1:-Explain, step by step, how a transformer decoder generates text one token at a time, and why decode is memory-bandwidth bound.}"
 if [ ! -f "$MODEL" ]; then echo "model not present: $MODEL"; exit 1; fi
 echo "=== 8B-Q4_K residency + decode (CUDA resident path) ==="

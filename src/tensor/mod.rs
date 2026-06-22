@@ -2030,6 +2030,7 @@ impl CpuTensor {
     /// bytes (the wire-only loader leaves `data` empty). Only the few requested rows are
     /// dequantized via `dequant_block`, so this is cheap. `block_bytes` is the wire
     /// super-block size (144 for Q4_K, 210 for Q6_K); each super-block holds 256 values.
+    #[allow(clippy::too_many_arguments)]
     fn embedding_lookup_kquant_wire(
         &self,
         token_ids: &[u32],
@@ -2060,7 +2061,9 @@ impl CpuTensor {
         let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
         for token_id in token_ids {
             let token_idx = usize::try_from(*token_id).map_err(|_| {
-                BackendError::RuntimeShapeMismatch(format!("token id {token_id} does not fit usize"))
+                BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} does not fit usize"
+                ))
             })?;
             if token_idx >= vocab {
                 return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -3283,10 +3286,7 @@ impl TensorStore {
     pub fn load_kquant_wire_linear(&self, name: &str) -> Result<CpuTensor> {
         let desc = self.descriptor(name)?.clone();
         let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
-        let is_kquant = matches!(
-            desc.tensor_type,
-            GgufTensorType::Q4K | GgufTensorType::Q6K
-        );
+        let is_kquant = matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K);
         if !is_kquant || shape.dims.len() != 2 {
             return self.load_cpu_f32(name);
         }

@@ -4,8 +4,8 @@
 # baseline (flag off) and candidate (CAMELID_ATTN_COALESCED=1) so both share the
 # same thermal state each round -> the RATIO is valid even if clocks droop.
 set -u
-cd /c/Users/timto/Camelid
-MODEL=/c/Users/timto/models/Qwen3-4B-Q8_0.gguf
+cd "$(git rev-parse --show-toplevel)"
+MODEL="${MODEL:-../models/Qwen3-4B-Q8_0.gguf}"  # override with MODEL=/path/to.gguf
 PROMPT=${PROMPT:-qa/speed/depth_prompt.txt}
 ROUNDS=${ROUNDS:-5}
 MAXTOK=${MAXTOK:-128}
