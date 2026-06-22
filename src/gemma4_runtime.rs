@@ -2072,3 +2072,59 @@ static PREP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static FWD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// CUDA-resident gemma4 decode engine (Windows/NVIDIA). Wraps a CPU-loaded
+/// [`Gemma4Runtime`] (weights mmap, config, tokenizer) and drives the per-token
+/// forward through the shared `crate::cuda_resident` kernels. The per-token
+/// forward (embedding scale -> PLE injection -> per-layer attn/ffn -> tied head
+/// -> soft-cap) is assembled on top of this scaffold; its building blocks are the
+/// validated kernels (q4_0_gemv, geglu_mul, soft_cap, attention_decode_sw) plus
+/// the reused q8/q6k GEMV, rmsnorm, per-head norm, rope, and kv_scatter kernels.
+/// The `plan` carries gemma4's per-layer geometry (head_dim 256/512, RoPE theta,
+/// sliding window, cross-layer KV source) — the single source of truth the
+/// forward indexes per layer.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // fields consumed as the forward driver is assembled
+pub struct Gemma4CudaResident {
+    cpu: Gemma4Runtime,
+    kernels: crate::cuda_resident::CudaResidentKernels,
+    plan: Vec<crate::model::Gemma4LayerPlan>,
+    block_count: usize,
+    heads: usize,
+    hidden: usize,
+    max_positions: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl Gemma4CudaResident {
+    /// Load the model on the CPU runtime (weights mmap'd, lost on restart) and
+    /// bring up the CUDA kernel set. `max_positions` bounds the resident KV cache.
+    pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
+        let cpu = Gemma4Runtime::load(path)?;
+        let kernels = crate::cuda_resident::CudaResidentKernels::new()
+            .map_err(BackendError::InvalidModelMetadata)?;
+        let block_count = cpu.config.block_count as usize;
+        let heads = cpu.config.attention_head_count as usize;
+        let hidden = cpu.config.embedding_length as usize;
+        let plan = cpu.g.layer_plan(block_count, heads);
+        Ok(Self {
+            cpu,
+            kernels,
+            plan,
+            block_count,
+            heads,
+            hidden,
+            max_positions,
+        })
+    }
+
+    /// The tokenizer (shared with the CPU runtime).
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.cpu.tokenizer
+    }
+
+    /// Per-layer decode plan (head_dim / KV source / sliding window / RoPE theta).
+    pub fn layer_plan(&self) -> &[crate::model::Gemma4LayerPlan] {
+        &self.plan
+    }
+}
