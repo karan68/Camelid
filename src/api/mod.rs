@@ -5875,7 +5875,65 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
     Ok(total)
 }
 
+/// Whether this model's linears are all GPU-resident-eligible quants (Q8_0 / Q4_K /
+/// Q6_K) in a dense (non-MoE) layout. Such a model is loaded WIRE-ONLY: K-quant 2-D
+/// linears keep only their packed super-block wire bytes (see `load_kquant_wire_linear`
+/// in `LlamaLoadedWeights::load_with_ownership`) and Q8_0 linears keep their 36-byte
+/// blocks/pages — neither materializes the f32 the CPU-budget guard estimates. The CUDA
+/// resident decode engine reads those packed bytes in place (q8_gemv / q4k_gemv /
+/// q6k_gemv), so the f32 quantity the guard sizes is never produced for this model.
+///
+/// This is the binding-level mirror of `LlamaInferenceSession::resident_decode_eligible`
+/// (which needs a built session); it intentionally checks only what the guard needs —
+/// the per-tensor quant types and the dense layout. Anything else (an f16/f32 linear, a
+/// MoE router/expert stack) keeps the eager-f32 CPU path and stays under the guard.
+fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
+    let is_resident_quant = |desc: &GgufTensorDescriptor| {
+        matches!(
+            desc.tensor_type,
+            GgufTensorType::Q8_0 | GgufTensorType::Q4K | GgufTensorType::Q6K
+        )
+    };
+    if !is_resident_quant(&binding.token_embedding) {
+        return false;
+    }
+    if !binding.output_is_tied_embedding && !is_resident_quant(&binding.output) {
+        return false;
+    }
+    binding.layers.iter().all(|layer| {
+        let dense = match &layer.ffn {
+            LlamaFfnTensors::Dense { gate, up, down } => {
+                is_resident_quant(gate) && is_resident_quant(up) && is_resident_quant(down)
+            }
+            // MoE is not resident-eligible; its experts take the eager-f32 CPU path,
+            // which the guard must keep protecting.
+            LlamaFfnTensors::MoE { .. } => false,
+        };
+        dense
+            && is_resident_quant(&layer.attention_q)
+            && is_resident_quant(&layer.attention_k)
+            && is_resident_quant(&layer.attention_v)
+            && is_resident_quant(&layer.attention_output)
+    })
+}
+
+/// Whether the GPU-resident decode engine will run this model — and therefore the
+/// CPU f32 weight materialization the budget guard estimates is never produced. True
+/// only when CUDA resident decode is active for this process AND every linear is a
+/// resident-eligible quant (`binding_all_resident_quant_linears`). On non-CUDA builds
+/// `resident_decode_cuda_active()` is `false`, so the guard always applies there.
+fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
+    crate::inference::resident_decode_cuda_active() && binding_all_resident_quant_linears(binding)
+}
+
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
+    // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
+    // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
+    // CPU budget for them — but ONLY them; genuinely CPU-bound large models (or any
+    // build/host without the resident GPU path) still hit the guard below.
+    if binding_runs_on_resident_gpu(binding) {
+        return Ok(0);
+    }
     let estimated_bytes = estimate_cpu_weight_materialization_bytes(binding)?;
     let limit_bytes = cpu_weight_materialization_limit_bytes()?;
     if estimated_bytes > limit_bytes {
@@ -10579,6 +10637,37 @@ mod tests {
 
         assert!(err.contains("invalid CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES"));
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn binding_all_resident_quant_linears_accepts_kquant_and_q8_dense() {
+        // Q4_K / Q6_K / Q8_0 dense bindings load wire-only and run on the resident
+        // GPU engine, so they must classify as resident-eligible (the f32 guard's
+        // estimate never materializes for them).
+        for ty in [
+            GgufTensorType::Q8_0,
+            GgufTensorType::Q4K,
+            GgufTensorType::Q6K,
+        ] {
+            let binding = materialization_binding(false, ty, vec![256, 256]);
+            assert!(
+                binding_all_resident_quant_linears(&binding),
+                "{ty:?} dense binding should classify as resident-eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_all_resident_quant_linears_rejects_non_quant_linears() {
+        // An f32/f16 linear is NOT resident-eligible — it takes the eager-f32 CPU path,
+        // which the guard must keep protecting.
+        for ty in [GgufTensorType::F32, GgufTensorType::F16] {
+            let binding = materialization_binding(false, ty, vec![256, 256]);
+            assert!(
+                !binding_all_resident_quant_linears(&binding),
+                "{ty:?} binding must not bypass the CPU materialization guard"
+            );
+        }
     }
 
     #[test]
