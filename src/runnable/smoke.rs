@@ -315,6 +315,7 @@ fn build_runnable_receipt(
         // The load-bearing distinction: this is a runnable-lane receipt.
         execution_lane: Some(ExecutionLane::Runnable),
         execution_trace: None,
+        quality_tier: None,
         signature: None,
     };
     receipt

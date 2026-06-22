@@ -3,7 +3,7 @@
 //! isolated to a single kernel. All require a CUDA device (`#[ignore]`d in
 //! GPU-less CI); run with `cargo test --features cuda -- --ignored`.
 
-use super::{CudaResidentDecode, CudaResidentKernels};
+use super::{CudaResidentDecode, CudaResidentKernels, ProjQuant};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 // f16 round-trip matching the engine.
@@ -217,7 +217,9 @@ fn full_forward_token_matches_cpu() {
             )
             .unwrap();
     }
-    engine.set_output(&final_norm, &output_w).unwrap();
+    engine
+        .set_output(&final_norm, &output_w, ProjQuant::Q8_0)
+        .unwrap();
 
     // CPU reference KV cache, layout [kv_head][position][head_dim] per layer.
     let mut cpu_k = vec![vec![0f32; kv_width * max_pos]; n_layers];
@@ -372,7 +374,9 @@ fn prefill_then_decode_matches_sequential() {
                 )
                 .unwrap();
         }
-        engine.set_output(final_norm, output_w).unwrap();
+        engine
+            .set_output(final_norm, output_w, ProjQuant::Q8_0)
+            .unwrap();
         engine
     };
 
@@ -513,6 +517,13 @@ impl Lcg {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0 // [-1, 1)
+    }
+    fn next_u8(&mut self) -> u8 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 56) as u8
     }
 }
 
@@ -681,7 +692,8 @@ fn verify_batch_matches_sequential() {
             )
             .unwrap();
         }
-        e.set_output(&final_norm, &output_w).unwrap();
+        e.set_output(&final_norm, &output_w, ProjQuant::Q8_0)
+            .unwrap();
         e
     };
     let ktok = 4usize;
@@ -1218,5 +1230,719 @@ fn rope_adjacent_parity() {
         "rope_adjacent diverged\ngot: {:?}\nexp: {:?}",
         &got[..8],
         &expected[..8]
+    );
+}
+
+// ---- Tree-verify parity (lossless GPU tree speculation, Lane A) -------------
+
+/// A tiny synthetic Llama-shaped model on the GPU, built deterministically so the
+/// linear verify, the tree verify, and the sequential single-token path all run
+/// on identical weights. Returns a fresh engine each call (own KV cache).
+struct SynthModel {
+    n_layers: usize,
+    n_heads: usize,
+    n_kv: usize,
+    head_dim: usize,
+    hidden: usize,
+    ffn: usize,
+    rope_dim: usize,
+    max_pos: usize,
+    vocab: usize,
+    eps: f32,
+    scale: f32,
+    layers: Vec<SynthLayer>,
+    final_norm: Vec<f32>,
+    output_w: Vec<u8>,
+    base: f32,
+}
+struct SynthLayer {
+    q: Vec<u8>,
+    k: Vec<u8>,
+    v: Vec<u8>,
+    o: Vec<u8>,
+    gate: Vec<u8>,
+    up: Vec<u8>,
+    down: Vec<u8>,
+    an: Vec<f32>,
+    fnv: Vec<f32>,
+}
+
+impl SynthModel {
+    fn new() -> Self {
+        let (n_layers, hidden, n_heads, n_kv, head_dim, ffn, vocab, max_pos) = (
+            2usize, 64usize, 2usize, 1usize, 32usize, 128usize, 96usize, 64usize,
+        );
+        let rope_dim = 32usize;
+        let eps = 1e-5f32;
+        let base = 10000f32;
+        let q_width = n_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut rng = Lcg(0x5eed_cafe);
+        let rand = |rng: &mut Lcg, n: usize| (0..n).map(|_| rng.next_f32()).collect::<Vec<f32>>();
+        let layers = (0..n_layers)
+            .map(|_| SynthLayer {
+                q: quantize_blocks(&rand(&mut rng, q_width * hidden), hidden),
+                k: quantize_blocks(&rand(&mut rng, n_kv * head_dim * hidden), hidden),
+                v: quantize_blocks(&rand(&mut rng, n_kv * head_dim * hidden), hidden),
+                o: quantize_blocks(&rand(&mut rng, hidden * q_width), q_width),
+                gate: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
+                up: quantize_blocks(&rand(&mut rng, ffn * hidden), hidden),
+                down: quantize_blocks(&rand(&mut rng, hidden * ffn), ffn),
+                an: rand(&mut rng, hidden)
+                    .iter()
+                    .map(|v| v * 0.2 + 1.0)
+                    .collect(),
+                fnv: rand(&mut rng, hidden)
+                    .iter()
+                    .map(|v| v * 0.2 + 1.0)
+                    .collect(),
+            })
+            .collect();
+        let final_norm: Vec<f32> = rand(&mut rng, hidden)
+            .iter()
+            .map(|v| v * 0.2 + 1.0)
+            .collect();
+        let output_w = quantize_blocks(&rand(&mut rng, vocab * hidden), hidden);
+        SynthModel {
+            n_layers,
+            n_heads,
+            n_kv,
+            head_dim,
+            hidden,
+            ffn,
+            rope_dim,
+            max_pos,
+            vocab,
+            eps,
+            scale,
+            layers,
+            final_norm,
+            output_w,
+            base,
+        }
+    }
+
+    fn build(&self) -> CudaResidentDecode {
+        let mut e = CudaResidentDecode::new(
+            self.n_layers,
+            self.n_heads,
+            self.n_kv,
+            self.head_dim,
+            self.hidden,
+            self.ffn,
+            self.rope_dim,
+            self.max_pos,
+            self.vocab,
+            self.eps,
+            false,
+        )
+        .unwrap();
+        for l in &self.layers {
+            e.set_layer(
+                &l.q, &l.k, &l.v, &l.o, &l.gate, &l.up, &l.down, &l.an, &l.fnv,
+            )
+            .unwrap();
+        }
+        e.set_output(&self.final_norm, &self.output_w, ProjQuant::Q8_0)
+            .unwrap();
+        e
+    }
+
+    /// Deterministic embedding for a token id (no real embedding table needed —
+    /// any fixed function works as long as it's the same everywhere).
+    fn embed(&self, tok: u32) -> Vec<f32> {
+        let mut rng = Lcg(0xE3B0_0000u64 ^ (tok as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        (0..self.hidden).map(|_| rng.next_f32()).collect()
+    }
+
+    /// RoPE tables (cos, sin) for an absolute position, matching the test's other
+    /// RoPE construction (theta = base^(-2p/rope_dim)).
+    fn rope(&self, pos: usize) -> (Vec<f32>, Vec<f32>) {
+        let pairs = self.rope_dim / 2;
+        let mut cos = vec![0f32; pairs];
+        let mut sin = vec![0f32; pairs];
+        for p in 0..pairs {
+            let theta = self.base.powf(-(2.0 * p as f32) / self.rope_dim as f32);
+            cos[p] = (pos as f32 * theta).cos();
+            sin[p] = (pos as f32 * theta).sin();
+        }
+        (cos, sin)
+    }
+}
+
+/// LINEAR TREE == LINEAR VERIFY: on a single-branch tree, `verify_tree`'s argmax
+/// per node must equal `verify_batch`'s argmax — i.e. the tree kernels reduce
+/// bit-identically to the batched kernels (the losslessness anchor). Both run on
+/// fresh copies of the same synthetic model with the same KV seeded by a prefill.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn tree_linear_matches_verify_batch() {
+    if kernels().is_none() {
+        return;
+    }
+    use crate::inference::spec_tree::TokenTree;
+    let m = SynthModel::new();
+    let pairs = m.rope_dim / 2;
+    let prefix = 5usize; // committed prefix so base_position > 0 (exercises dense prefix)
+    let prefix_tokens: Vec<u32> = (0..prefix as u32)
+        .map(|t| (t * 7 + 3) % m.vocab as u32)
+        .collect();
+    // The linear chain: anchor + drafts.
+    let anchor = 11u32;
+    let drafts = [13u32, 17, 23, 29, 31];
+    let k = drafts.len() + 1;
+
+    // Seed both engines with the SAME prefix via the sequential path.
+    let seed = |e: &mut CudaResidentDecode| {
+        for (i, &tok) in prefix_tokens.iter().enumerate() {
+            let (cos, sin) = m.rope(i);
+            e.forward_token(&m.embed(tok), &cos, &sin, i, m.scale, false)
+                .unwrap();
+        }
+        e.set_filled(prefix);
+    };
+
+    // Build the K-token chunk inputs (embeddings + per-token RoPE at base+i).
+    let mut embs = vec![0f32; k * m.hidden];
+    let mut cos_all = vec![0f32; k * pairs];
+    let mut sin_all = vec![0f32; k * pairs];
+    let chain: Vec<u32> = std::iter::once(anchor)
+        .chain(drafts.iter().copied())
+        .collect();
+    for (i, &tok) in chain.iter().enumerate() {
+        embs[i * m.hidden..(i + 1) * m.hidden].copy_from_slice(&m.embed(tok));
+        let (cos, sin) = m.rope(prefix + i);
+        cos_all[i * pairs..(i + 1) * pairs].copy_from_slice(&cos);
+        sin_all[i * pairs..(i + 1) * pairs].copy_from_slice(&sin);
+    }
+
+    // Linear verify.
+    let mut e_lin = m.build();
+    seed(&mut e_lin);
+    let lin = e_lin
+        .verify_batch(&embs, &cos_all, &sin_all, prefix, k, m.scale)
+        .unwrap();
+
+    // Tree verify on the equivalent linear() tree.
+    let tree = TokenTree::linear(anchor, &drafts);
+    let node_kvslot = tree.node_kvslot(prefix);
+    let (anc, words) = tree.ancestor_bitset();
+    let mut e_tree = m.build();
+    seed(&mut e_tree);
+    let tre = e_tree
+        .verify_tree(
+            &embs,
+            &cos_all,
+            &sin_all,
+            &node_kvslot,
+            &anc,
+            words,
+            prefix,
+            k,
+            m.scale,
+        )
+        .unwrap();
+
+    assert_eq!(
+        lin, tre,
+        "tree verify on a linear tree != linear verify_batch"
+    );
+}
+
+/// THE CRITICAL ONE: drive a multi-round decode with a BRANCHING drafter and
+/// assert the emitted token-id stream is IDENTICAL to plain greedy decode. This
+/// exercises COMPACT-BY-RESCATTER every round a non-first branch is taken; an
+/// off-by-one in the KV compaction corrupts the NEXT round silently, so we span
+/// many rounds and compare the whole stream. Pure synthetic model — no download.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn tree_verify_multiround_lossless() {
+    if kernels().is_none() {
+        return;
+    }
+    use crate::inference::spec_tree::TokenTree;
+    let m = SynthModel::new();
+    let pairs = m.rope_dim / 2;
+    let prompt: Vec<u32> = vec![3, 8, 1, 6, 2];
+    let count = 40usize;
+
+    // --- Ground truth: plain greedy decode via the proven single-token path. ---
+    let truth: Vec<u32> = {
+        let mut e = m.build();
+        let mut pos = 0usize;
+        let mut last = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let (cos, sin) = m.rope(i);
+            last = e
+                .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+                .unwrap()
+                .unwrap();
+            pos = i + 1;
+        }
+        let mut out = vec![last];
+        for _ in 1..count {
+            let (cos, sin) = m.rope(pos);
+            last = e
+                .forward_token(&m.embed(last), &cos, &sin, pos, m.scale, true)
+                .unwrap()
+                .unwrap();
+            pos += 1;
+            out.push(last);
+        }
+        out
+    };
+
+    // --- Tree-driven decode. A deterministic branching drafter builds a tree of
+    // candidate continuations from the running history; whichever branch (if any)
+    // the model confirms is accepted + compacted, the rest discarded. ---
+    let mut e = m.build();
+    // Prefill the prompt; the first emitted token is the argmax after the last prompt token.
+    let mut pos = 0usize;
+    let mut last = 0u32;
+    for (i, &tok) in prompt.iter().enumerate() {
+        let (cos, sin) = m.rope(i);
+        last = e
+            .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+            .unwrap()
+            .unwrap();
+        pos = i + 1;
+    }
+    e.set_filled(pos);
+    let mut emitted: Vec<u32> = vec![last];
+    let mut history: Vec<u32> = prompt.clone();
+    history.push(last);
+
+    // A drafter that proposes a BRANCHING tree: from the anchor it offers a few
+    // candidate next tokens (some deliberately wrong so branches diverge and the
+    // accepted path is rarely node 1 — forcing real compaction), and from the
+    // first candidate, a couple of grandchildren. Tokens are derived from history
+    // so they vary round to round.
+    let draft = |anchor: u32, hist: &[u32]| -> TokenTree {
+        let h = hist.len() as u32;
+        // children of the anchor (nodes 1..=3)
+        let c1 = (anchor.wrapping_mul(5).wrapping_add(h)) % m.vocab as u32;
+        let c2 = (anchor.wrapping_mul(3).wrapping_add(7)) % m.vocab as u32;
+        let c3 = (anchor.wrapping_add(h).wrapping_mul(2)) % m.vocab as u32;
+        // grandchildren of c1 (nodes 4,5) and c2 (node 6)
+        let g1 = (c1.wrapping_mul(11).wrapping_add(1)) % m.vocab as u32;
+        let g2 = (c1.wrapping_add(13)) % m.vocab as u32;
+        let g3 = (c2.wrapping_mul(7)) % m.vocab as u32;
+        TokenTree {
+            tokens: vec![anchor, c1, c2, c3, g1, g2, g3],
+            parent: vec![-1, 0, 0, 0, 1, 1, 2],
+            depth: vec![0, 1, 1, 1, 2, 2, 2],
+        }
+    };
+
+    let mut rounds = 0usize;
+    let mut accepted_total = 0usize;
+    let mut compaction_rounds = 0usize; // rounds where the accepted path was NOT node-1-prefixed
+    while emitted.len() < count {
+        rounds += 1;
+        assert!(rounds < 10_000, "tree decode did not terminate");
+        let anchor = *history.last().unwrap();
+        let tree = draft(anchor, &history);
+        let n = tree.nodes();
+        // Stage node-order inputs.
+        let mut embs = vec![0f32; n * m.hidden];
+        let mut cos_all = vec![0f32; n * pairs];
+        let mut sin_all = vec![0f32; n * pairs];
+        let node_depth = tree.node_depth();
+        for i in 0..n {
+            embs[i * m.hidden..(i + 1) * m.hidden].copy_from_slice(&m.embed(tree.tokens[i]));
+            let (cos, sin) = m.rope(pos + node_depth[i] as usize);
+            cos_all[i * pairs..(i + 1) * pairs].copy_from_slice(&cos);
+            sin_all[i * pairs..(i + 1) * pairs].copy_from_slice(&sin);
+        }
+        let node_kvslot = tree.node_kvslot(pos);
+        let (anc, words) = tree.ancestor_bitset();
+        let predicted = e
+            .verify_tree(
+                &embs,
+                &cos_all,
+                &sin_all,
+                &node_kvslot,
+                &anc,
+                words,
+                pos,
+                n,
+                m.scale,
+            )
+            .unwrap();
+        let (round_emit, leaf) = tree.accept_longest_path(&predicted);
+        let path = tree.path_to(leaf);
+        // A path is "compacting" when some accepted node's BFS index != its path rank
+        // (i.e. a non-first branch was taken) — exactly the rescatter off-by-one risk.
+        if path.iter().enumerate().any(|(r, &node)| node != r) {
+            compaction_rounds += 1;
+        }
+        e.compact_tree_kv_path(&path, pos).unwrap();
+        accepted_total += round_emit.len();
+        pos += round_emit.len();
+        e.set_filled(pos);
+        for t in round_emit {
+            emitted.push(t);
+            history.push(t);
+        }
+    }
+    emitted.truncate(count);
+    assert_eq!(
+        emitted, truth,
+        "tree-verify decode diverged from plain greedy (lossless violated)"
+    );
+    eprintln!(
+        "tree_verify_multiround_lossless: {} tokens over {} rounds, {:.2} accepted/round, {} compacting rounds",
+        count, rounds, accepted_total as f64 / rounds as f64, compaction_rounds
+    );
+}
+
+/// Sibling of the multi-round test that GUARANTEES the rescatter fires: a drafter
+/// whose FIRST child is always a deliberately-wrong token, so any accepted draft
+/// must come from a non-node-1 branch (path rank != BFS index) — forcing the
+/// compact-by-rescatter copy. Steered so the model's own argmax (mined live from a
+/// throwaway probe forward) is planted at node 2's grandchild, making the accepted
+/// path [0,2,6] and the compaction non-trivial on real rounds.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn tree_verify_forced_compaction_lossless() {
+    if kernels().is_none() {
+        return;
+    }
+    use crate::inference::spec_tree::TokenTree;
+    let m = SynthModel::new();
+    let pairs = m.rope_dim / 2;
+    let prompt: Vec<u32> = vec![2, 9, 4, 1, 7, 3];
+    let count = 32usize;
+
+    // Ground truth: plain greedy.
+    let truth: Vec<u32> = {
+        let mut e = m.build();
+        let mut pos = 0usize;
+        let mut last = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let (cos, sin) = m.rope(i);
+            last = e
+                .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+                .unwrap()
+                .unwrap();
+            pos = i + 1;
+        }
+        let mut out = vec![last];
+        for _ in 1..count {
+            let (cos, sin) = m.rope(pos);
+            last = e
+                .forward_token(&m.embed(last), &cos, &sin, pos, m.scale, true)
+                .unwrap()
+                .unwrap();
+            pos += 1;
+            out.push(last);
+        }
+        out
+    };
+
+    // Tree decode. To force the accepted path off node 1, build the tree so the
+    // model's actual next token (taken from `truth`) is planted at node 2 (a
+    // sibling of node 1), and node 1's token is something else. The accepted path
+    // then becomes [0, 2] every time the model confirms a token here — exercising
+    // the rescatter (slot pos+2 -> pos+1) on EVERY accepted round.
+    let mut e = m.build();
+    let mut pos = 0usize;
+    let mut last = 0u32;
+    for (i, &tok) in prompt.iter().enumerate() {
+        let (cos, sin) = m.rope(i);
+        last = e
+            .forward_token(&m.embed(tok), &cos, &sin, i, m.scale, true)
+            .unwrap()
+            .unwrap();
+        pos = i + 1;
+    }
+    e.set_filled(pos);
+    let mut emitted: Vec<u32> = vec![last];
+    let mut history: Vec<u32> = prompt.clone();
+    history.push(last);
+
+    let mut rounds = 0usize;
+    let mut compaction_rounds = 0usize;
+    let mut accepted_total = 0usize;
+    while emitted.len() < count {
+        rounds += 1;
+        assert!(rounds < 10_000, "decode did not terminate");
+        let anchor = *history.last().unwrap();
+        // The token the model WILL pick next (from ground truth) goes at node 2,
+        // never node 1. Node 1 gets a deliberately different token.
+        let want = truth[emitted.len().min(truth.len() - 1)];
+        let wrong = (want + 1) % m.vocab as u32;
+        let tree = TokenTree {
+            //          0
+            //        / | \
+            //       1  2  3       (wrong, want, other)
+            tokens: vec![
+                anchor,
+                wrong,
+                want,
+                (anchor.wrapping_add(5)) % m.vocab as u32,
+            ],
+            parent: vec![-1, 0, 0, 0],
+            depth: vec![0, 1, 1, 1],
+        };
+        let n = tree.nodes();
+        let mut embs = vec![0f32; n * m.hidden];
+        let mut cos_all = vec![0f32; n * pairs];
+        let mut sin_all = vec![0f32; n * pairs];
+        let node_depth = tree.node_depth();
+        for i in 0..n {
+            embs[i * m.hidden..(i + 1) * m.hidden].copy_from_slice(&m.embed(tree.tokens[i]));
+            let (cos, sin) = m.rope(pos + node_depth[i] as usize);
+            cos_all[i * pairs..(i + 1) * pairs].copy_from_slice(&cos);
+            sin_all[i * pairs..(i + 1) * pairs].copy_from_slice(&sin);
+        }
+        let node_kvslot = tree.node_kvslot(pos);
+        let (anc, words) = tree.ancestor_bitset();
+        let predicted = e
+            .verify_tree(
+                &embs,
+                &cos_all,
+                &sin_all,
+                &node_kvslot,
+                &anc,
+                words,
+                pos,
+                n,
+                m.scale,
+            )
+            .unwrap();
+        let (round_emit, leaf) = tree.accept_longest_path(&predicted);
+        let path = tree.path_to(leaf);
+        if path.iter().enumerate().any(|(r, &node)| node != r) {
+            compaction_rounds += 1;
+        }
+        e.compact_tree_kv_path(&path, pos).unwrap();
+        accepted_total += round_emit.len();
+        pos += round_emit.len();
+        e.set_filled(pos);
+        for t in round_emit {
+            emitted.push(t);
+            history.push(t);
+        }
+    }
+    emitted.truncate(count);
+    assert_eq!(
+        emitted, truth,
+        "forced-compaction tree decode diverged from greedy"
+    );
+    assert!(
+        compaction_rounds > 0,
+        "test did not exercise the rescatter — no compacting rounds occurred"
+    );
+    eprintln!(
+        "tree_verify_forced_compaction_lossless: {} tokens, {} rounds, {} COMPACTING rounds, {:.2} accepted/round",
+        count, rounds, compaction_rounds, accepted_total as f64 / rounds as f64
+    );
+}
+
+// Build `rows*n_sb` synthetic Q4_K_M super-blocks (144 bytes each, row-major).
+// The bytes need not be a "real" quantization — the kernel and the oracle interpret
+// the SAME bytes, so any pattern exercises bit-parity. d/dmin are small positive
+// f16 values; scales (12 bytes) and quants (128 bytes) are random.
+fn synth_q4k_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 144;
+    let mut out = vec![0u8; rows * n_sb * WIRE];
+    for sb in 0..rows * n_sb {
+        let blk = &mut out[sb * WIRE..(sb + 1) * WIRE];
+        // small positive f16 super-scales so the products stay in a sane f32 range.
+        let d = (rng.next_f32().abs() * 0.05 + 0.001).min(0.2);
+        let dmin = (rng.next_f32().abs() * 0.05 + 0.001).min(0.2);
+        let db = crate::inference::f32_to_f16_bits(d).to_le_bytes();
+        let dmb = crate::inference::f32_to_f16_bits(dmin).to_le_bytes();
+        blk[0] = db[0];
+        blk[1] = db[1];
+        blk[2] = dmb[0];
+        blk[3] = dmb[1];
+        for b in blk.iter_mut().take(144).skip(4) {
+            *b = rng.next_u8();
+        }
+    }
+    out
+}
+
+// Bit-parity receipt for the Q4_K_M fused-dequant decode GEMV. Generates synthetic
+// Q4_K super-block weight bytes + a Q8_K-quantized activation, runs q4k_gemv on the
+// GPU, and asserts each output row reproduces the validated CPU oracle
+// `q4_k_wire_row_dot` on the SAME bytes. The kernel mirrors the oracle's ordered
+// f32 accumulation (8 main lanes + scalar mins, summed left-to-right per row), so
+// the result is expected BIT-IDENTICAL — but we accept the same tiny ordered-f32
+// tolerance the q8 parity tests use to stay robust across compilers.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4k_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let n_sb = 3usize; // contraction dim = 3*256 = 768
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x4b_4b_4b);
+
+    // Synthetic Q4_K weight wire bytes (rows*n_sb super-blocks). The kernel reads the
+    // RAW 144-byte wire layout directly (nibbles + kmask scales expanded on the fly),
+    // so no host repack — the same bytes the resident upload passes through.
+    let wire = synth_q4k_wire(rows, n_sb, &mut rng);
+    let wsoa = wire.clone();
+
+    // Q8_K activation: quantize a random f32 row, then split into per-superblock
+    // scales (y.d) and the concatenated 256-wide i8 quants (y.qs).
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8k = crate::inference::quantize_q8_k_blocks(&act);
+    assert_eq!(q8k.len(), n_sb);
+    let in_scales: Vec<f32> = q8k.iter().map(|b| b.d).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8k.iter().enumerate() {
+        in_quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+    }
+
+    // CPU oracle per output row.
+    const WIRE: usize = 144;
+    let row_bytes = n_sb * WIRE;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = crate::inference::q4_k_wire_row_dot(row_wire, &q8k);
+    }
+
+    // GPU.
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wsoa).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_q4k_gemv(
+        &k.stream,
+        &k.q4k_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wsoa.len()),
+        rows,
+        n_sb,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    // The kernel reproduces the oracle's exact ordered f32 sum, so this should be
+    // bit-identical; report the worst lane and assert within the q8 ordered-f32 tol.
+    let mut worst = 0f32;
+    let mut exact = 0usize;
+    for (g, e) in got.iter().zip(&expected) {
+        if g.to_bits() == e.to_bits() {
+            exact += 1;
+        }
+        let d = (g - e).abs() / e.abs().max(1.0);
+        if d > worst {
+            worst = d;
+        }
+    }
+    eprintln!(
+        "q4k_gemv_matches_oracle: {}/{} rows bit-identical, worst rel diff {:.3e}",
+        exact, rows, worst
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "q4k_gemv diverged from q4_k_wire_row_dot oracle (worst rel {worst:.3e})"
+    );
+}
+
+// Synthetic Q6_K weight wire bytes: rows*n_sb super-blocks of 210 bytes each
+// (ql[128] + qh[64] + scales(i8)[16] + d(f16)). Random payload with a small
+// positive f16 super-scale so the products stay in a sane f32 range.
+fn synth_q6k_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 210;
+    let mut out = vec![0u8; rows * n_sb * WIRE];
+    for sb in 0..rows * n_sb {
+        let blk = &mut out[sb * WIRE..(sb + 1) * WIRE];
+        for b in blk.iter_mut().take(208) {
+            *b = rng.next_u8();
+        }
+        let d = (rng.next_f32().abs() * 0.03 + 0.001).min(0.1);
+        let db = crate::inference::f32_to_f16_bits(d).to_le_bytes();
+        blk[208] = db[0];
+        blk[209] = db[1];
+    }
+    out
+}
+
+// Bit-parity receipt for the Q6_K resident decode GEMV. Generates synthetic Q6_K
+// wire bytes + a Q8_K activation, runs q6k_gemv on the GPU, and asserts each output
+// row reproduces the validated CPU oracle `q6_k_wire_row_dot` on the SAME bytes. The
+// kernel mirrors the oracle's ordered 8-lane f32 accumulation (weights pre-minus-32,
+// no mins term), so the result is expected bit-identical within the q8 ordered-f32 tol.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q6k_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let n_sb = 3usize; // contraction dim = 3*256 = 768
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x6b_6b_6b);
+
+    let wire = synth_q6k_wire(rows, n_sb, &mut rng);
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8k = crate::inference::quantize_q8_k_blocks(&act);
+    assert_eq!(q8k.len(), n_sb);
+    let in_scales: Vec<f32> = q8k.iter().map(|b| b.d).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8k.iter().enumerate() {
+        in_quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+    }
+
+    const WIRE: usize = 210;
+    let row_bytes = n_sb * WIRE;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = crate::inference::q6_k_wire_row_dot(row_wire, &q8k);
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_q6k_gemv(
+        &k.stream,
+        &k.q6k_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wire.len()),
+        rows,
+        n_sb,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let mut worst = 0f32;
+    let mut exact = 0usize;
+    for (g, e) in got.iter().zip(&expected) {
+        if g.to_bits() == e.to_bits() {
+            exact += 1;
+        }
+        let d = (g - e).abs() / e.abs().max(1.0);
+        if d > worst {
+            worst = d;
+        }
+    }
+    eprintln!(
+        "q6k_gemv_matches_oracle: {}/{} rows bit-identical, worst rel diff {:.3e}",
+        exact, rows, worst
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "q6k_gemv diverged from q6_k_wire_row_dot oracle (worst rel {worst:.3e})"
     );
 }

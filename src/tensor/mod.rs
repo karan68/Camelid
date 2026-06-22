@@ -890,6 +890,16 @@ pub struct CpuTensor {
     pub q8_0_wire_mmap: Option<crate::wire_mmap::WireMmapTensor>,
     pub q8_0_wire_pages: Option<std::sync::Arc<crate::wire_mmap::WirePages>>,
     pub q8_0_split_file_backing: Option<Vec<Q8_0FileBacking>>,
+    /// Q4_K_M super-block wire bytes (144 bytes/super-block, row-major), retained
+    /// when the tensor's `source_type` is `Q4K` so the GPU-resident decode path can
+    /// repack them into the `q4k_gemv` SoA layout. Populated by the Q4_K load path;
+    /// `None` for non-Q4_K tensors.
+    pub q4_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Q6_K super-block wire bytes (210 bytes/super-block, row-major), retained when
+    /// the tensor's `source_type` is `Q6K` so the GPU-resident decode path can feed
+    /// them straight to the `q6k_gemv` kernel (which reads the wire layout directly).
+    /// Populated by the Q6_K load path; `None` for non-Q6_K tensors.
+    pub q6_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     pub data: Vec<f32>,
 }
 
@@ -1041,6 +1051,8 @@ impl Q8_0TensorBlocks {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
             data,
         })
     }
@@ -1108,6 +1120,8 @@ impl CpuTensor {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
             data,
         })
     }
@@ -1191,6 +1205,8 @@ impl CpuTensor {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
             data: Vec::new(),
         })
     }
@@ -1218,6 +1234,8 @@ impl CpuTensor {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1240,6 +1258,8 @@ impl CpuTensor {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1262,6 +1282,8 @@ impl CpuTensor {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: Some(backings),
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1832,6 +1854,36 @@ impl CpuTensor {
         if let Some(blocks) = self.q8_0_blocks.as_deref() {
             return self.embedding_lookup_q8_0_block_backed(token_ids, name, vocab, width, blocks);
         }
+        // K-quant token-embedding: the wire-only loader leaves `data` empty, so gather
+        // each requested row by dequantizing its super-blocks straight from wire bytes.
+        if let Some(wire) = self.q4_k_wire_bytes.as_deref() {
+            return self.embedding_lookup_kquant_wire(
+                token_ids,
+                name,
+                vocab,
+                width,
+                wire,
+                Q4_K_BLOCK_BYTES,
+                |b, out| {
+                    let blk: &[u8; Q4_K_BLOCK_BYTES] = b.try_into().unwrap();
+                    Q4KBlock::from_bytes(blk).dequantize(out);
+                },
+            );
+        }
+        if let Some(wire) = self.q6_k_wire_bytes.as_deref() {
+            return self.embedding_lookup_kquant_wire(
+                token_ids,
+                name,
+                vocab,
+                width,
+                wire,
+                Q6_K_BLOCK_BYTES,
+                |b, out| {
+                    let blk: &[u8; Q6_K_BLOCK_BYTES] = b.try_into().unwrap();
+                    Q6KBlock::from_bytes(blk).dequantize(out);
+                },
+            );
+        }
         let output_len = token_ids.len().checked_mul(width).ok_or_else(|| {
             BackendError::RuntimeShapeMismatch(
                 "embedding lookup output element count overflow".to_string(),
@@ -1969,6 +2021,59 @@ impl CpuTensor {
                         .iter()
                         .map(|quant| block.scale * f32::from(*quant)),
                 );
+            }
+        }
+        Self::from_f32(name, vec![token_ids.len(), width], out)
+    }
+
+    /// Gather K-quant (Q4_K / Q6_K) embedding rows straight from the super-block wire
+    /// bytes (the wire-only loader leaves `data` empty). Only the few requested rows are
+    /// dequantized via `dequant_block`, so this is cheap. `block_bytes` is the wire
+    /// super-block size (144 for Q4_K, 210 for Q6_K); each super-block holds 256 values.
+    #[allow(clippy::too_many_arguments)]
+    fn embedding_lookup_kquant_wire(
+        &self,
+        token_ids: &[u32],
+        name: impl Into<String>,
+        vocab: usize,
+        width: usize,
+        wire: &[u8],
+        block_bytes: usize,
+        dequant_block: impl Fn(&[u8], &mut [f32; QK_K_BLOCK_SIZE]),
+    ) -> Result<Self> {
+        if !width.is_multiple_of(QK_K_BLOCK_SIZE) {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "K-quant embedding width {width} is not divisible by {QK_K_BLOCK_SIZE}"
+            )));
+        }
+        let blocks_per_row = width / QK_K_BLOCK_SIZE;
+        let row_bytes = blocks_per_row * block_bytes;
+        let expected = vocab.checked_mul(row_bytes).ok_or_else(|| {
+            BackendError::RuntimeShapeMismatch("K-quant embedding byte count overflow".to_string())
+        })?;
+        if wire.len() != expected {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "K-quant embedding wire bytes {} do not match expected {expected}",
+                wire.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(token_ids.len() * width);
+        let mut values = [0.0_f32; QK_K_BLOCK_SIZE];
+        for token_id in token_ids {
+            let token_idx = usize::try_from(*token_id).map_err(|_| {
+                BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} does not fit usize"
+                ))
+            })?;
+            if token_idx >= vocab {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "token id {token_id} out of range for vocab size {vocab}"
+                )));
+            }
+            let row = &wire[token_idx * row_bytes..(token_idx + 1) * row_bytes];
+            for b in 0..blocks_per_row {
+                dequant_block(&row[b * block_bytes..(b + 1) * block_bytes], &mut values);
+                out.extend_from_slice(&values);
             }
         }
         Self::from_f32(name, vec![token_ids.len(), width], out)
@@ -3170,6 +3275,48 @@ impl TensorStore {
         CpuTensor::from_q8_0_blocks(tensor_name, shape, blocks)
     }
 
+    /// Load a 2-D K-quant (Q4_K / Q6_K) linear retaining ONLY the raw super-block wire
+    /// bytes — NO f32 `data` materialization. This mirrors `from_q8_0_blocks` (which
+    /// leaves `data` empty): an 8B model fully decoded to f32 is ~32 GB and OOMs a
+    /// 16 GB box, so the GPU-resident decode path (which reads the wire bytes via
+    /// `q4k_gemv`/`q6k_gemv`) must not pay that cost. The tensor carries empty `data`,
+    /// so the CPU dense-matmul fallback can NOT run it — callers take this path only
+    /// when the resident path will own the forward. Q8_0 / non-K-quant / non-2D tensors
+    /// fall back to the f32 loader unchanged.
+    pub fn load_kquant_wire_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        let is_kquant = matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K);
+        if !is_kquant || shape.dims.len() != 2 {
+            return self.load_cpu_f32(name);
+        }
+        let bytes = self.tensor_bytes(name)?;
+        let mut q4_k_wire_bytes = None;
+        let mut q6_k_wire_bytes = None;
+        match desc.tensor_type {
+            GgufTensorType::Q4K => q4_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
+            GgufTensorType::Q6K => q6_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
+            _ => unreachable!(),
+        }
+        Ok(CpuTensor {
+            name: name.to_string(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(desc.tensor_type),
+            q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes,
+            q6_k_wire_bytes,
+            data: Vec::new(),
+        })
+    }
+
     pub fn load_q8_0_split_file_backed_tensor(
         &self,
         name: impl Into<String>,
@@ -3306,6 +3453,11 @@ impl TensorStore {
         let expected_elements = shape.element_count()?;
         let mut q8_0_blocks = None;
         let mut q8_0_file_backing = None;
+        // Retain the raw K-quant super-block wire bytes so the GPU-resident decode path
+        // can repack/feed them (q4k_gemv reads a SoA repack; q6k_gemv reads the wire
+        // bytes directly). The CPU f32 `data` is still decoded below for the CPU path.
+        let mut q4_k_wire_bytes = None;
+        let mut q6_k_wire_bytes = None;
         let data = match desc.tensor_type {
             GgufTensorType::F32 => decode_f32_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::F16 => decode_f16_tensor(name, &bytes, expected_elements)?,
@@ -3329,9 +3481,18 @@ impl TensorStore {
             GgufTensorType::Q5_1 => decode_q5_1_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q2K => decode_q2_k_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q3K => decode_q3_k_tensor(name, &bytes, expected_elements)?,
-            GgufTensorType::Q4K => decode_q4_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q4K => {
+                // The GGUF bytes ARE the 144-byte super-block wire layout the resident
+                // q4k path repacks; keep them alongside the decoded f32.
+                q4_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec()));
+                decode_q4_k_tensor(name, &bytes, expected_elements)?
+            }
             GgufTensorType::Q5K => decode_q5_k_tensor(name, &bytes, expected_elements)?,
-            GgufTensorType::Q6K => decode_q6_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q6K => {
+                // 210-byte super-block wire layout — fed straight to the resident q6k GEMV.
+                q6_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec()));
+                decode_q6_k_tensor(name, &bytes, expected_elements)?
+            }
             GgufTensorType::Q8K => decode_q8_k_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::IQ4NL => decode_iq4_nl_tensor(name, &bytes, expected_elements)?,
             other => {
@@ -3365,6 +3526,8 @@ impl TensorStore {
             q8_0_wire_mmap: None,
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
+            q4_k_wire_bytes,
+            q6_k_wire_bytes,
             data,
         })
     }
