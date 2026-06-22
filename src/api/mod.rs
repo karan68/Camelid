@@ -5508,6 +5508,7 @@ async fn build_server_receipt(
         // the legacy default) so existing receipts keep their exact digests.
         execution_lane: None,
         execution_trace,
+        quality_tier: None,
         signature: None,
     };
     if let Err(err) = receipt.seal() {

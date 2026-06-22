@@ -65,6 +65,12 @@ pub enum VerifyOutcome {
     /// is a divergence record, not a parity claim, and is never reported as
     /// `RECEIPT VERIFIED`.
     DivergenceRecord,
+    /// The receipt carries a `lossy` quality tier. A lossy format does not
+    /// produce the headline token stream, so it is reported as a quality
+    /// ATTESTATION (its measured same-format agreement and ppl delta), never as
+    /// a `RECEIPT VERIFIED` parity contract. Distinct from `NotVerified`: the
+    /// receipt is honest, it just makes a weaker (non-parity) claim.
+    LossyAttestation,
     /// A verification step failed.
     NotVerified,
 }
@@ -76,6 +82,47 @@ impl VerifyOutcome {
             Self::NotVerified => 1,
             Self::NotReproducible => 2,
             Self::DivergenceRecord => 3,
+            // Honest non-parity attestation: distinct from a hard failure (1)
+            // and from a divergence record (3).
+            Self::LossyAttestation => 4,
+        }
+    }
+}
+
+/// The format-honesty invariant on a receipt's quality tier, factored out pure
+/// so it is unit-testable without a model or a server.
+///
+/// Returns:
+/// - `Ok(None)` — no tier, or a headline-Q8 tier: defer to the normal parity flow.
+/// - `Ok(Some(()))` — a HONEST lossy tier: the caller reports a [`VerifyOutcome::LossyAttestation`]
+///   (never `RECEIPT VERIFIED`). A lossy tier must compare against the SAME format.
+/// - `Err(reason)` — a DISHONEST tier (e.g. a lossy run claiming a cross-format match);
+///   the caller reports [`VerifyOutcome::NotVerified`].
+pub fn check_format_honesty(receipt: &ParityReceipt) -> Result<Option<()>, String> {
+    use crate::receipt::QualityTierKind;
+    let Some(tier) = &receipt.quality_tier else {
+        return Ok(None);
+    };
+    if tier.schema != crate::receipt::QUALITY_TIER_SCHEMA_V1 {
+        return Err(format!(
+            "unknown quality-tier schema {:?} (this verifier understands {:?})",
+            tier.schema,
+            crate::receipt::QUALITY_TIER_SCHEMA_V1
+        ));
+    }
+    match tier.tier {
+        QualityTierKind::HeadlineQ8 => Ok(None),
+        QualityTierKind::Lossy => {
+            if !tier.is_format_honest() {
+                Err(format!(
+                    "lossy quality tier compares format {:?} against a DIFFERENT baseline \
+                     format {:?}; a lossy tier may only be measured against its own format \
+                     (never a cross-format token match)",
+                    tier.format, tier.baseline_format
+                ))
+            } else {
+                Ok(Some(()))
+            }
         }
     }
 }
@@ -107,6 +154,50 @@ pub async fn run(options: VerifyOptions) -> VerifyOutcome {
             receipt.schema
         );
         return not_verified("self-digest");
+    }
+
+    // Format-honesty gate (pure): a lossy quality tier must compare against the SAME
+    // format and is reported as a quality ATTESTATION, never as RECEIPT VERIFIED. A
+    // cross-format lossy tier is dishonest and fails outright. Headline-Q8 / no tier
+    // defers to the normal parity flow. Checked before any model load so the verdict is
+    // cheap and unambiguous.
+    match check_format_honesty(&receipt) {
+        Ok(None) => {}
+        Ok(Some(())) => {
+            let tier = receipt
+                .quality_tier
+                .as_ref()
+                .expect("lossy tier present (check_format_honesty returned Some)");
+            // Still confirm the receipt is not tampered.
+            if let Err(err) = receipt.verify_self_digest() {
+                println!("FAIL self-digest: {err}; the receipt is tampered or malformed");
+                return not_verified("self-digest");
+            }
+            println!(
+                "PASS self-digest: receipt_id matches the canonical body ({})",
+                receipt.receipt_id
+            );
+            println!(
+                "NOTE quality-tier: this is a LOSSY {} receipt (baseline {} {} @ {}); it does \
+                 NOT produce the headline token stream. Reported as a quality attestation: \
+                 greedy_agreement={:.3}%, ppl_delta={:.4} (measured against the SAME format).",
+                tier.format,
+                tier.baseline_engine,
+                tier.baseline_format,
+                tier.baseline_commit,
+                tier.greedy_agreement_pct,
+                tier.ppl_delta
+            );
+            println!(
+                "RECEIPT IS A LOSSY QUALITY ATTESTATION (honest non-parity claim; not verified \
+                 as parity)"
+            );
+            return VerifyOutcome::LossyAttestation;
+        }
+        Err(reason) => {
+            println!("FAIL quality-tier: {reason}");
+            return not_verified("quality-tier");
+        }
     }
 
     // Full verification runs as two isolated subprocess passes — a reference
@@ -442,6 +533,7 @@ fn outcome_from_exit_code(code: i32) -> VerifyOutcome {
     match code {
         2 => VerifyOutcome::NotReproducible,
         3 => VerifyOutcome::DivergenceRecord,
+        4 => VerifyOutcome::LossyAttestation,
         _ => VerifyOutcome::NotVerified,
     }
 }
@@ -907,5 +999,136 @@ mod tests {
     fn rejects_malformed_chunked_body() {
         assert!(decode_chunked(b"zz\r\n").is_err());
         assert!(decode_chunked(b"5\r\nab").is_err());
+    }
+
+    use crate::receipt::{
+        LaneIdentity, ParityBlock, QualityTier, ReceiptRequest, ReceiptResult, ReferenceIdentity,
+        NO_DIVERGENCE, RECEIPT_SCHEMA_V1,
+    };
+    use serde_json::json;
+
+    fn receipt_with_tier(tier: Option<QualityTier>) -> ParityReceipt {
+        let mut r = ParityReceipt {
+            schema: RECEIPT_SCHEMA_V1.to_string(),
+            receipt_id: String::new(),
+            created_utc: "2026-06-21T00:00:00Z".to_string(),
+            lane: LaneIdentity {
+                model_id: "m".to_string(),
+                gguf_sha256: "ab".repeat(32),
+                gguf_filename: "m.gguf".to_string(),
+                quantization: "Q4_K".to_string(),
+                architecture: "qwen3".to_string(),
+                tokenizer_kind: "bpe".to_string(),
+                tokenizer_sha256: None,
+                camelid_version: "0.1.0".to_string(),
+                camelid_commit: "deadbee".to_string(),
+            },
+            reference: ReferenceIdentity {
+                tool: "llama.cpp".to_string(),
+                binary: "llama-server".to_string(),
+                version: Some("b4567".to_string()),
+                commit: None,
+            },
+            request: ReceiptRequest {
+                endpoint: "/v1/chat/completions".to_string(),
+                messages_or_prompt: json!([{"role":"user","content":"hi"}]),
+                max_tokens: 8,
+                temperature: 0.0,
+                top_p: None,
+                top_k: None,
+                seed: None,
+                stop: vec![],
+            },
+            reproducible: true,
+            result: ReceiptResult {
+                prompt_token_ids: vec![1, 2],
+                generated_token_ids: vec![3, 4],
+                generated_text: "x".to_string(),
+                completion_tokens: 2,
+                finish_reason: "length".to_string(),
+            },
+            parity: ParityBlock {
+                compared_against_reference: true,
+                prompt_tokens_match: Some(true),
+                generated_tokens_match: Some(true),
+                generated_text_match: Some(true),
+                first_divergent_token_index: Some(NO_DIVERGENCE),
+            },
+            execution_lane: None,
+            execution_trace: None,
+            quality_tier: tier,
+            signature: None,
+        };
+        r.seal().expect("seal");
+        r
+    }
+
+    #[test]
+    fn format_honesty_passes_no_tier_and_headline() {
+        // No tier ⇒ defer to the normal parity flow.
+        let r = receipt_with_tier(None);
+        assert_eq!(check_format_honesty(&r), Ok(None));
+        // Headline-Q8 ⇒ also defers.
+        let r = receipt_with_tier(Some(QualityTier::headline_q8(
+            "llama.cpp".to_string(),
+            "b4567".to_string(),
+            100.0,
+            0.0,
+        )));
+        assert_eq!(check_format_honesty(&r), Ok(None));
+    }
+
+    #[test]
+    fn format_honesty_accepts_same_format_lossy() {
+        // A lossy tier measured against its own format is honest ⇒ attestation.
+        let r = receipt_with_tier(Some(QualityTier::lossy_same_format(
+            "Q4_K".to_string(),
+            "llama.cpp".to_string(),
+            "b4567".to_string(),
+            96.0,
+            0.2,
+        )));
+        assert_eq!(check_format_honesty(&r), Ok(Some(())));
+    }
+
+    #[test]
+    fn format_honesty_rejects_cross_format_lossy() {
+        // A lossy tier that claims a DIFFERENT baseline format is dishonest.
+        let mut tier = QualityTier::lossy_same_format(
+            "Q4_K".to_string(),
+            "llama.cpp".to_string(),
+            "b4567".to_string(),
+            99.0,
+            0.05,
+        );
+        tier.baseline_format = "Q8_0".to_string(); // cross-format token match
+        let r = receipt_with_tier(Some(tier));
+        assert!(
+            check_format_honesty(&r).is_err(),
+            "cross-format lossy tier must be rejected"
+        );
+    }
+
+    #[test]
+    fn format_honesty_rejects_unknown_tier_schema() {
+        let mut tier = QualityTier::lossy_same_format(
+            "Q4_K".to_string(),
+            "llama.cpp".to_string(),
+            "b4567".to_string(),
+            99.0,
+            0.05,
+        );
+        tier.schema = "camelid.quality-tier/v999".to_string();
+        let r = receipt_with_tier(Some(tier));
+        assert!(check_format_honesty(&r).is_err());
+    }
+
+    #[test]
+    fn lossy_attestation_exit_code_is_distinct() {
+        // Distinct from VERIFIED(0), NOT VERIFIED(1), and divergence(3).
+        assert_eq!(VerifyOutcome::LossyAttestation.exit_code(), 4);
+        assert_eq!(VerifyOutcome::Verified.exit_code(), 0);
+        assert_eq!(VerifyOutcome::NotVerified.exit_code(), 1);
+        assert_eq!(VerifyOutcome::DivergenceRecord.exit_code(), 3);
     }
 }
