@@ -891,6 +891,74 @@ fn silu_mul_matches_cpu() {
     assert!(close(&got, &expected, 1e-5), "silu_mul diverged");
 }
 
+// Gemma GeGLU parity: out = gelu_pytorch_tanh(gate) * up. The expected values
+// replicate inference::gemma4::gelu_tanh exactly (same constants + f32 order);
+// tanhf's last-bit transcendental rounding makes this tolerance-, not bit-, exact.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn geglu_mul_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 5632usize;
+    let mut rng = Lcg(11);
+    let gate: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 8.0).collect();
+    let up: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+    let expected: Vec<f32> = gate
+        .iter()
+        .zip(&up)
+        .map(|(&g, &u)| {
+            let inner = 0.79788456f32 * (g + 0.044715f32 * g * g * g);
+            (0.5f32 * g * (1.0f32 + inner.tanh())) * u
+        })
+        .collect();
+    let dg = k.stream.clone_htod(&gate).unwrap();
+    let du = k.stream.clone_htod(&up).unwrap();
+    let mut dout = k.stream.alloc_zeros::<f32>(n).unwrap();
+    let n_i = n as i32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = k.stream.launch_builder(&k.geglu_mul);
+    b.arg(&dg).arg(&du).arg(&mut dout).arg(&n_i);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got = vec![0f32; n];
+    k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 1e-5), "geglu_mul diverged");
+}
+
+// Gemma final-logit soft-cap parity: x = cap*tanh(x/cap), cap=30, in place.
+// Matches inference::gemma4::soft_cap_in_place (tolerance for tanhf).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn soft_cap_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 4096usize;
+    let cap = 30.0f32;
+    let mut rng = Lcg(7);
+    let x: Vec<f32> = (0..n).map(|_| (rng.next_f32() - 0.5) * 200.0).collect();
+    let expected: Vec<f32> = x.iter().map(|&v| cap * (v / cap).tanh()).collect();
+    let mut dx = k.stream.clone_htod(&x).unwrap();
+    let n_i = n as i32;
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut b = k.stream.launch_builder(&k.soft_cap);
+    b.arg(&mut dx).arg(&n_i).arg(&cap);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got = vec![0f32; n];
+    k.stream.memcpy_dtoh(&dx, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 1e-5), "soft_cap diverged");
+}
+
 #[test]
 #[ignore = "requires a CUDA device"]
 fn argmax_matches_cpu() {
@@ -1850,6 +1918,104 @@ fn q4k_gemv_matches_oracle() {
     assert!(
         close(&got, &expected, 1e-4),
         "q4k_gemv diverged from q4_k_wire_row_dot oracle (worst rel {worst:.3e})"
+    );
+}
+
+// Synthetic Q4_0 weight wire bytes: rows*bpr blocks of 18 bytes each (f16 scale +
+// 16 nibble bytes). Small positive f16 scale keeps the dequant products in range.
+fn synth_q4_0_wire(rows: usize, bpr: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 18;
+    let mut out = vec![0u8; rows * bpr * WIRE];
+    for blk_idx in 0..rows * bpr {
+        let blk = &mut out[blk_idx * WIRE..(blk_idx + 1) * WIRE];
+        let d = (rng.next_f32().abs() * 0.03 + 0.001).min(0.1);
+        let db = crate::inference::f32_to_f16_bits(d).to_le_bytes();
+        blk[0] = db[0];
+        blk[1] = db[1];
+        for b in blk.iter_mut().skip(2) {
+            *b = rng.next_u8();
+        }
+    }
+    out
+}
+
+// Bit-parity receipt for the Q4_0 resident GEMV. Generates synthetic Q4_0 wire bytes
+// + a Q8_0 activation, runs q4_0_gemv on the GPU, and asserts each output row
+// reproduces the validated CPU oracle `q4_0_wire_row_dot` on the SAME bytes. The
+// kernel mirrors the oracle's exact per-block integer dot + ordered f32 accumulation
+// (the same contract as q8_gemv), so the result is expected bit-identical.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_0_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let bpr = 24usize; // contraction dim = 24*32 = 768
+    let kdim = bpr * 32;
+    let mut rng = Lcg(0x40_40_40);
+
+    let wire = synth_q4_0_wire(rows, bpr, &mut rng);
+
+    // Q8_0 activation: quantize a random f32 row to Q8_0 blocks (the oracle format),
+    // then split into per-block scales + concatenated i8 quants for the GPU.
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8 = crate::inference::quantize_q8_0_blocks(&act);
+    assert_eq!(q8.len(), bpr);
+    let in_scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8.iter().enumerate() {
+        in_quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+    }
+
+    // CPU oracle per output row.
+    const WIRE: usize = 18;
+    let row_bytes = bpr * WIRE;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = crate::inference::q4_0_wire_row_dot(row_wire, &q8);
+    }
+
+    // GPU.
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_q4_0_gemv(
+        &k.stream,
+        &k.q4_0_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wire.len()),
+        rows,
+        bpr,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let mut worst = 0f32;
+    let mut exact = 0usize;
+    for (g, e) in got.iter().zip(&expected) {
+        if g.to_bits() == e.to_bits() {
+            exact += 1;
+        }
+        let d = (g - e).abs() / e.abs().max(1.0);
+        if d > worst {
+            worst = d;
+        }
+    }
+    eprintln!(
+        "q4_0_gemv_matches_oracle: {}/{} rows bit-identical, worst rel diff {:.3e}",
+        exact, rows, worst
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "q4_0_gemv diverged from q4_0_wire_row_dot oracle (worst rel {worst:.3e})"
     );
 }
 

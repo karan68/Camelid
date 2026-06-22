@@ -308,6 +308,64 @@ extern "C" __global__ void q8_gemv(
     }
 }
 
+// ---- Q4_0 GEMV: one warp per output row, raw 18-byte wire, Q8_0 activation ----
+// Bit-identical reproduction of the validated CPU oracle `q4_0_wire_row_dot_scalar`
+// (the gemma4 QAT linear lane). Per 18-byte block: scale = f16(blk[0..2]); for
+// j in 0..16, lo = (byte & 0xF) - 8, hi = (byte >> 4) - 8; isum += lo*y[j] +
+// hi*y[j+16]; term = (float)isum * w_scale * x_scale[b]. Lane 0 sums the per-block
+// terms IN ORDER — the exact same ordered-f32 contract as q8_gemv, so the result is
+// bit-identical to the CPU. Weights are read RAW (nibbles packed) to keep the 4-bit
+// footprint; the activation is Q8_0 (input_scales[bpr] + input_quants[bpr*32] i8),
+// staged once in shared like q8_gemv. The -8 bias precludes a clean __dp4a, so the
+// per-block integer dot is the scalar nibble unpack the oracle uses (parity-first).
+extern "C" __global__ void q4_0_gemv(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem40[];
+    signed char* s_iq = (signed char*)smem40;                        // blocks_per_row*32 i8
+    float* s_is = (float*)(smem40 + (long)blocks_per_row * 32);       // blocks_per_row f32
+    float* terms = (float*)(smem40 + (long)blocks_per_row * 36);      // warps*blocks_per_row f32
+    int tid = threadIdx.x;
+    // Stage the shared Q8_0 input vector cooperatively (coalesced), once per block.
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];             // blocks_per_row*32 bytes as ints
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    const int WIRE = 18;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_block0 + b) * WIRE;
+            float w_scale = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = 0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                unsigned char byte = blk[2 + j];
+                int lo = (int)(byte & 0xF) - 8;
+                int hi = (int)(byte >> 4) - 8;
+                isum += lo * (int)y[j];
+                isum += hi * (int)y[j + 16];
+            }
+            myterms[b] = (float)isum * w_scale * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
 // ---- Q4_K_M GEMV: one warp per output row, fused dequant + integer dot -------
 // Bit-identical reproduction of the validated CPU oracle `q4_k_wire_row_dot`
 // (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks
@@ -897,6 +955,32 @@ extern "C" __global__ void silu_mul(
     out[i] = (g / (1.0f + expf(-g))) * up[i];
 }
 
+// ---- Gemma GeGLU: out[i] = gelu_tanh(gate[i]) * up[i] ---------------------
+// gelu_pytorch_tanh: 0.5*x*(1 + tanh(0.79788456*(x + 0.044715*x^3))). Same
+// constants and left-to-right f32 order as the CPU oracle
+// inference::gemma4::gelu_tanh; only tanhf's transcendental last-bit rounding
+// differs (validated to tolerance, not bit-exact). --fmad=false keeps the
+// polynomial unfused so the non-transcendental part matches.
+extern "C" __global__ void geglu_mul(
+    const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ out, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x = gate[i];
+    float inner = 0.79788456f * (x + 0.044715f * x * x * x);
+    float gv = 0.5f * x * (1.0f + tanhf(inner));
+    out[i] = gv * up[i];
+}
+
+// ---- Gemma final-logit soft-cap (in place): x = cap*tanh(x/cap) -----------
+// Mirrors inference::gemma4::soft_cap_in_place (cap = 30 for Gemma 4). The
+// caller passes a finite, positive cap (disabled-cap is handled host-side).
+extern "C" __global__ void soft_cap(float* __restrict__ x, int n, float cap) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = cap * tanhf(x[i] / cap);
+}
+
 // ---- Residual add: acc[i] += add[i] ---------------------------------------
 extern "C" __global__ void residual_add(float* __restrict__ acc, const float* __restrict__ add, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1435,6 +1519,7 @@ pub struct CudaResidentKernels {
     pub(crate) quantize: CudaFunction,
     pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
+    pub(crate) q4_0_gemv: CudaFunction,
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
@@ -1445,6 +1530,8 @@ pub struct CudaResidentKernels {
     pub(crate) attention: CudaFunction,
     pub(crate) silu_mul: CudaFunction,
     pub(crate) silu_mul_quantize: CudaFunction,
+    pub(crate) geglu_mul: CudaFunction,
+    pub(crate) soft_cap: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
@@ -1492,6 +1579,7 @@ impl CudaResidentKernels {
             quantize: f("quantize_q8_0")?,
             rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
+            q4_0_gemv: f("q4_0_gemv")?,
             q4k_gemv: f("q4k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
             quantize_q8k: f("quantize_q8k")?,
@@ -1502,6 +1590,8 @@ impl CudaResidentKernels {
             attention: f("attention_decode")?,
             silu_mul: f("silu_mul")?,
             silu_mul_quantize: f("silu_mul_quantize")?,
+            geglu_mul: f("geglu_mul")?,
+            soft_cap: f("soft_cap")?,
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
@@ -1771,6 +1861,44 @@ fn launch_q6k_gemv(
         shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 8 * 4,
     };
     let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q4_0 GEMV launch: same warp-per-row geometry as `launch_gemv` (q8). Input is
+/// Q8_0 (`blocks_per_row` f32 scales + `blocks_per_row*32` i8 quants); weight is the
+/// RAW 18-byte Q4_0 wire bytes (no SoA repack). Shared holds the staged Q8_0 input
+/// (`bpr*32` i8 + `bpr` f32) shared by all warps, then each warp's per-block f32 term
+/// scratch for lane 0's ordered reduction (mirrors q8_gemv).
+#[allow(dead_code, clippy::too_many_arguments)]
+fn launch_q4_0_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let bpr = blocks_per_row as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input: bpr*32 i8 + bpr*4 f32; per-warp scratch: bpr f32 terms.
+        shared_mem_bytes: bpr * 32 + bpr * 4 + warps_per_block * bpr * 4,
+    };
+    let (r, nb) = (rows as i32, blocks_per_row as i32);
     let mut b = s.launch_builder(f);
     b.arg(in_scales)
         .arg(in_quants)
