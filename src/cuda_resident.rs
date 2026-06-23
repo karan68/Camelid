@@ -1054,6 +1054,27 @@ extern "C" __global__ void soft_cap(float* __restrict__ x, int n, float cap) {
     x[i] = cap * tanhf(x[i] / cap);
 }
 
+// ---- f32 GEMV: out[o] = sum_i W[o*in_dim + i] * x[i] (row-major, out-major) ----
+// For gemma4's small f32 PLE matrices (ple_inp_gate, ple_proj). One thread per
+// output row, sequential per-row sum — bit-identical to the CPU f32_matvec order.
+extern "C" __global__ void f32_gemv(
+    const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ out,
+    int in_dim, int out_dim
+) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= out_dim) return;
+    const float* row = w + (long)o * in_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < in_dim; i++) acc += row[i] * x[i];
+    out[o] = acc;
+}
+
+// ---- Scalar scale (in place): x[i] *= s (gemma4 PLE ple_output_scale) --------
+extern "C" __global__ void scale_f32(float* __restrict__ x, int n, float s) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= s;
+}
+
 // ---- Residual add: acc[i] += add[i] ---------------------------------------
 extern "C" __global__ void residual_add(float* __restrict__ acc, const float* __restrict__ add, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1606,6 +1627,8 @@ pub struct CudaResidentKernels {
     pub(crate) silu_mul_quantize: CudaFunction,
     pub(crate) geglu_mul: CudaFunction,
     pub(crate) soft_cap: CudaFunction,
+    pub(crate) f32_gemv: CudaFunction,
+    pub(crate) scale_f32: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
@@ -1667,6 +1690,8 @@ impl CudaResidentKernels {
             silu_mul_quantize: f("silu_mul_quantize")?,
             geglu_mul: f("geglu_mul")?,
             soft_cap: f("soft_cap")?,
+            f32_gemv: f("f32_gemv")?,
+            scale_f32: f("scale_f32")?,
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
@@ -2743,6 +2768,45 @@ pub(crate) fn launch_residual(
     let n_i = n as i32;
     let mut b = s.launch_builder(f);
     b.arg(acc).arg(add).arg(&n_i);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_f32_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    w: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((out_dim as u32).div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (i, o) = (in_dim as i32, out_dim as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(w).arg(x).arg(out).arg(&i).arg(&o);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+pub(crate) fn launch_scale(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &mut CudaSlice<f32>,
+    n: usize,
+    factor: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(&n_i).arg(&factor);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
