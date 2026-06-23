@@ -9727,7 +9727,9 @@ mod tests {
         assert!(!stream_options_include_usage(Some(
             &json!({"include_usage": "yes"})
         )));
-        assert!(!stream_options_include_usage(Some(&json!({"include_usage": 1}))));
+        assert!(!stream_options_include_usage(Some(
+            &json!({"include_usage": 1})
+        )));
         // (c) the one true case.
         assert!(stream_options_include_usage(Some(
             &json!({"include_usage": true})
