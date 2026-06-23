@@ -2138,6 +2138,100 @@ fn q4_0_gemv_matches_oracle() {
     );
 }
 
+// Synthetic Q4_1 wire bytes: rows*bpr blocks of 20 bytes (f16 d, f16 m, 16 nibbles).
+fn synth_q4_1_wire(rows: usize, bpr: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 20;
+    let mut out = vec![0u8; rows * bpr * WIRE];
+    for blk_idx in 0..rows * bpr {
+        let blk = &mut out[blk_idx * WIRE..(blk_idx + 1) * WIRE];
+        let d = (rng.next_f32().abs() * 0.03 + 0.001).min(0.1);
+        let m = (rng.next_f32() - 0.5) * 0.05;
+        let db = crate::inference::f32_to_f16_bits(d).to_le_bytes();
+        let mb = crate::inference::f32_to_f16_bits(m).to_le_bytes();
+        blk[0] = db[0];
+        blk[1] = db[1];
+        blk[2] = mb[0];
+        blk[3] = mb[1];
+        for b in blk.iter_mut().skip(4) {
+            *b = rng.next_u8();
+        }
+    }
+    out
+}
+
+// Bit-parity receipt for the Q4_1 resident GEMV vs the CPU oracle `q4_1_wire_row_dot`
+// on the same synthetic bytes (the gemma4 mixed-Q4_0 ffn_down lane).
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q4_1_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let bpr = 24usize; // contraction dim = 24*32 = 768
+    let kdim = bpr * 32;
+    let mut rng = Lcg(0x41_41_41);
+
+    let wire = synth_q4_1_wire(rows, bpr, &mut rng);
+
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8 = crate::inference::quantize_q8_0_blocks(&act);
+    assert_eq!(q8.len(), bpr);
+    let in_scales: Vec<f32> = q8.iter().map(|b| b.scale).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8.iter().enumerate() {
+        in_quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+    }
+
+    const WIRE: usize = 20;
+    let row_bytes = bpr * WIRE;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = crate::inference::q4_1_wire_row_dot(row_wire, &q8);
+    }
+
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wire).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_q4_1_gemv(
+        &k.stream,
+        &k.q4_1_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wire.len()),
+        rows,
+        bpr,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let mut worst = 0f32;
+    let mut exact = 0usize;
+    for (g, e) in got.iter().zip(&expected) {
+        if g.to_bits() == e.to_bits() {
+            exact += 1;
+        }
+        let d = (g - e).abs() / e.abs().max(1.0);
+        if d > worst {
+            worst = d;
+        }
+    }
+    eprintln!(
+        "q4_1_gemv_matches_oracle: {}/{} rows bit-identical, worst rel diff {:.3e}",
+        exact, rows, worst
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "q4_1_gemv diverged from q4_1_wire_row_dot oracle (worst rel {worst:.3e})"
+    );
+}
+
 // Synthetic Q6_K weight wire bytes: rows*n_sb super-blocks of 210 bytes each
 // (ql[128] + qh[64] + scales(i8)[16] + d(f16)). Random payload with a small
 // positive f16 super-scale so the products stay in a sane f32 range.
