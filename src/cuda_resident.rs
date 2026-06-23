@@ -366,6 +366,64 @@ extern "C" __global__ void q4_0_gemv(
     }
 }
 
+// ---- Q4_1 GEMV: one warp per output row, raw 20-byte wire, Q8_0 activation -----
+// Bit-identical to the CPU oracle `q4_1_wire_row_dot`. Q4_1 block = 20 bytes: d =
+// f16(blk[0..2]), m = f16(blk[2..4]), then 16 nibble bytes. The nibble is UNSIGNED
+// (no -8 bias); dequant = q*d + m. Factored exactly like the oracle: per block
+// isum = Σ q*y, asum = Σ y; term = (d*isum + m*asum) * x_scale[b]. Lane 0 sums the
+// per-block terms IN ORDER (same ordered-f32 contract as q4_0/q8). The activation is
+// Q8_0 (input_scales[bpr] + input_quants[bpr*32] i8), staged once in shared.
+extern "C" __global__ void q4_1_gemv(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem41[];
+    signed char* s_iq = (signed char*)smem41;                        // blocks_per_row*32 i8
+    float* s_is = (float*)(smem41 + (long)blocks_per_row * 32);       // blocks_per_row f32
+    float* terms = (float*)(smem41 + (long)blocks_per_row * 36);      // warps*blocks_per_row f32
+    int tid = threadIdx.x;
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    const int WIRE = 20;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_block0 + b) * WIRE;
+            float w_d = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            float w_m = f16_bits_to_f32((unsigned short)(blk[2] | (blk[3] << 8)));
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = 0;
+            int asum = 0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                unsigned char byte = blk[4 + j];
+                int lo = (int)(byte & 0xF);
+                int hi = (int)(byte >> 4);
+                int ylo = (int)y[j];
+                int yhi = (int)y[j + 16];
+                isum += lo * ylo + hi * yhi;
+                asum += ylo + yhi;
+            }
+            myterms[b] = (w_d * (float)isum + w_m * (float)asum) * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
 // ---- Q4_K_M GEMV: one warp per output row, fused dequant + integer dot -------
 // Bit-identical reproduction of the validated CPU oracle `q4_k_wire_row_dot`
 // (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks
@@ -1614,6 +1672,7 @@ pub struct CudaResidentKernels {
     pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
     pub(crate) q4_0_gemv: CudaFunction,
+    pub(crate) q4_1_gemv: CudaFunction,
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
@@ -1677,6 +1736,7 @@ impl CudaResidentKernels {
             rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
             q4_0_gemv: f("q4_0_gemv")?,
+            q4_1_gemv: f("q4_1_gemv")?,
             q4k_gemv: f("q4k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
             quantize_q8k: f("quantize_q8k")?,
@@ -1996,6 +2056,40 @@ pub(crate) fn launch_q4_0_gemv(
         grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
         block_dim: (block, 1, 1),
         // staged input: bpr*32 i8 + bpr*4 f32; per-warp scratch: bpr f32 terms.
+        shared_mem_bytes: bpr * 32 + bpr * 4 + warps_per_block * bpr * 4,
+    };
+    let (r, nb) = (rows as i32, blocks_per_row as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q4_1 GEMV launch: identical geometry + shared layout to `launch_q4_0_gemv` (Q8_0
+/// activation, raw 20-byte Q4_1 wire, no SoA repack); only the kernel `f` differs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_q4_1_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let bpr = blocks_per_row as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
         shared_mem_bytes: bpr * 32 + bpr * 4 + warps_per_block * bpr * 4,
     };
     let (r, nb) = (rows as i32, blocks_per_row as i32);
