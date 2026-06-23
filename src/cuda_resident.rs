@@ -1728,7 +1728,7 @@ fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
     }
 }
 
-fn launch_rmsnorm(
+pub(crate) fn launch_rmsnorm(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1750,7 +1750,7 @@ fn launch_rmsnorm(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_quantize(
+pub(crate) fn launch_quantize(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1774,7 +1774,7 @@ fn launch_quantize(
 // for the in-order sum (same as rms_norm), then quantizes from shared — replacing a
 // launch_rmsnorm + launch_quantize pair and the f32 `normed` round-trip.
 #[allow(clippy::too_many_arguments)]
-fn launch_rmsnorm_quantize(
+pub(crate) fn launch_rmsnorm_quantize(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1797,7 +1797,7 @@ fn launch_rmsnorm_quantize(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_gemv(
+pub(crate) fn launch_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1838,7 +1838,7 @@ fn launch_gemv(
 /// `= acc`, so `out` must be the residual (hidden) buffer. Saves a separate residual_add launch
 /// and the projection's f32 round-trip. Bit-identical to gemv-then-residual_add (F2).
 #[allow(clippy::too_many_arguments)]
-fn launch_gemv_residual(
+pub(crate) fn launch_gemv_residual(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1877,7 +1877,7 @@ fn launch_gemv_residual(
 // As repack_q4k_soa: exercised by the bit-parity test; the production per-tensor
 // dispatch into this launcher is the deferred end-to-end follow-up.
 #[allow(dead_code, clippy::too_many_arguments)]
-fn launch_q4k_gemv(
+pub(crate) fn launch_q4k_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1915,7 +1915,7 @@ fn launch_q4k_gemv(
 /// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
 /// 8-int main-lane scratch for lane 0's ordered f32 reduction.
 #[allow(clippy::too_many_arguments)]
-fn launch_q6k_gemv(
+pub(crate) fn launch_q6k_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1953,7 +1953,7 @@ fn launch_q6k_gemv(
 /// (`bpr*32` i8 + `bpr` f32) shared by all warps, then each warp's per-block f32 term
 /// scratch for lane 0's ordered reduction (mirrors q8_gemv).
 #[allow(dead_code, clippy::too_many_arguments)]
-fn launch_q4_0_gemv(
+pub(crate) fn launch_q4_0_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -2058,7 +2058,7 @@ fn dispatch_gemv(
 
 /// Standalone Q8_K activation quantize: f32 row `[n_sb*256]` -> `n_sb` Q8_K blocks
 /// (scales `[n_sb]`, quants `[n_sb*256]` i8). One thread per 256-block.
-fn launch_quantize_q8k(
+pub(crate) fn launch_quantize_q8k(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -2082,7 +2082,7 @@ fn launch_quantize_q8k(
 /// in-order sum, then quantizes 256-wide blocks straight from shared. K-quant
 /// analog of `launch_rmsnorm_quantize`.
 #[allow(clippy::too_many_arguments)]
-fn launch_rmsnorm_quantize_q8k(
+pub(crate) fn launch_rmsnorm_quantize_q8k(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -2106,7 +2106,7 @@ fn launch_rmsnorm_quantize_q8k(
 
 /// Fused SiLU(gate)*up + Q8_K quantize: one thread per 256-block. K-quant analog
 /// of `launch_silu_mul_quantize`.
-fn launch_silu_mul_quantize_q8k(
+pub(crate) fn launch_silu_mul_quantize_q8k(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     gate: &CudaSlice<f32>,
@@ -2128,7 +2128,7 @@ fn launch_silu_mul_quantize_q8k(
 }
 
 // Fused SiLU*up + Q8_0 quantize (F3): one thread per 32-block, no shared memory.
-fn launch_silu_mul_quantize(
+pub(crate) fn launch_silu_mul_quantize(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     gate: &CudaSlice<f32>,
@@ -2155,7 +2155,7 @@ fn launch_silu_mul_quantize(
 // exercises it today.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-fn launch_gemm_batched(
+pub(crate) fn launch_gemm_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -2196,7 +2196,7 @@ fn launch_gemm_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rms_norm_batched(
+pub(crate) fn launch_rms_norm_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -2218,7 +2218,7 @@ fn launch_rms_norm_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rope_batched(
+pub(crate) fn launch_rope_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     vec: &mut CudaSlice<f32>,
@@ -2261,7 +2261,7 @@ fn launch_rope_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_kv_scatter_batched(
+pub(crate) fn launch_kv_scatter_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
@@ -2300,7 +2300,7 @@ fn launch_kv_scatter_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attention_batched(
+pub(crate) fn launch_attention_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
@@ -2349,7 +2349,7 @@ fn launch_attention_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_kv_scatter_tree_batched(
+pub(crate) fn launch_kv_scatter_tree_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
@@ -2387,7 +2387,7 @@ fn launch_kv_scatter_tree_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attention_tree_batched(
+pub(crate) fn launch_attention_tree_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
@@ -2441,7 +2441,7 @@ fn launch_attention_tree_batched(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_argmax_batched(
+pub(crate) fn launch_argmax_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     logits: &CudaSlice<f32>,
@@ -2462,7 +2462,7 @@ fn launch_argmax_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rope(
+pub(crate) fn launch_rope(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     vec: &mut CudaSlice<f32>,
@@ -2492,7 +2492,7 @@ fn launch_rope(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rms_norm_per_head(
+pub(crate) fn launch_rms_norm_per_head(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     buf: &mut CudaSlice<f32>,
@@ -2514,7 +2514,7 @@ fn launch_rms_norm_per_head(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_kv_scatter(
+pub(crate) fn launch_kv_scatter(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
@@ -2554,7 +2554,7 @@ const SPLITK_THRESHOLD: usize = 512;
 /// combine. TOKEN-PARITY: dot and global max are bit-identical; the cross-split sum
 /// re-associates exactly as the (parity-passing) Stage-2 weighted-V split. Verified.
 #[allow(clippy::too_many_arguments)]
-fn launch_attention_splitk(
+pub(crate) fn launch_attention_splitk(
     s: &Arc<CudaStream>,
     k: &CudaResidentKernels,
     q: &CudaSlice<f32>,
@@ -2651,7 +2651,7 @@ fn launch_attention_splitk(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attention(
+pub(crate) fn launch_attention(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
@@ -2709,7 +2709,7 @@ fn launch_attention(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_silu_mul(
+pub(crate) fn launch_silu_mul(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     gate: &CudaSlice<f32>,
@@ -2728,7 +2728,7 @@ fn launch_silu_mul(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_residual(
+pub(crate) fn launch_residual(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     acc: &mut CudaSlice<f32>,
@@ -2746,7 +2746,7 @@ fn launch_residual(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_argmax(
+pub(crate) fn launch_argmax(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     logits: &CudaSlice<f32>,
@@ -2766,7 +2766,7 @@ fn launch_argmax(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_sample_gumbel(
+pub(crate) fn launch_sample_gumbel(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     logits: &CudaSlice<f32>,
