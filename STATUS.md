@@ -365,6 +365,10 @@ Selected source artifacts recorded by those committed files:
 
 ## Latest promotion-relevant work
 
+### OpenAI `stream_options.include_usage` (streaming usage chunk)
+
+Chat-completions SSE streaming now supports OpenAI `stream_options.include_usage`, closing a user-reported gap where Camelid rejected `stream_options` (which broke usage reporting for OpenAI-compatible agent clients such as OpenCode and OpenClaw). When `include_usage:true`, the stream appends exactly one terminal chunk (`choices: []`) carrying `usage:{prompt_tokens,completion_tokens,total_tokens}` after the finish-reason chunk and before `[DONE]`; the integers are bound to — and verified equal to — the non-streaming endpoint's counts for the same request. Omitting `stream_options` is byte-identical to the prior baseline. Parsing is permissive (any other shape or subfield is tolerated and ignored, no 4xx), matching the pinned llama-server oracle `acd79d6`. This is a protocol-surface change only — no decode/sampler/parity kernel was touched — and adds exactly one `/api/capabilities` `api_features` row. Evidence (oracle + Camelid SSE captures, structural diff, streaming==non-streaming consistency check, and OpenCode + OpenClaw end-to-end proofs): `qa/evidence-bundles/stream-options-include-usage-20260623/`.
+
 ### Docs professionalism pass
 
 The top-level documentation set was tightened for executive readability, hierarchy, and release consistency without changing support truth. `README.md`, `COMPATIBILITY.md`, `ROADMAP.md`, and `STATUS.md` remain the public sources of truth. The README now pairs the front-door support ledger with a clearer reading order, while visible llama.cpp / ggml acknowledgement and the MIT notice remain intact wherever reference tooling and parity evidence depend on them. Recon and planning docs continue to carry explicit note banners.
