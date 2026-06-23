@@ -208,7 +208,7 @@ Per-row detail and the exact evidence artifacts live in [`SUPPORT_MATRIX_v0.1.md
 | Q8_0 inference | ✅ Working | The validated quantization; support is per exact row (see above). |
 | Gemma 4 engine | ✅ Working | From-scratch `gemma4` engine — see [Gemma 4](#gemma-4) below. |
 | OpenAI-style API | ✅ Working | `/v1/chat/completions`, `/v1/completions`, `/v1/models`, plus capability/health routes. |
-| Streaming chat | ✅ Working | SSE streaming on the chat endpoint. |
+| Streaming chat | ✅ Working | SSE streaming on the chat endpoint, including OpenAI `stream_options.include_usage` — opt in for a terminal `usage` chunk whose `prompt_tokens`/`completion_tokens`/`total_tokens` are identical to the non-streaming response. |
 | Apple Silicon Metal path | ✅ Working | GPU-resident prefill and decode, auto-selected when a Metal device is present; CPU fallback otherwise. |
 | NVIDIA CUDA path (Windows) | ✅ Working | GPU-resident decode + single-shot prefill (`--features cuda`), auto-selected when a CUDA device is present; validated on the dense Qwen3 Q8_0 rows and the **Gemma 4 E4B-It Q8_0** row (RTX 3060 Laptop); models that exceed VRAM use automatic VRAM+host-RAM layer offload; CPU fallback otherwise. Results are GPU/driver/CUDA-version specific. |
 | Web frontend | ✅ Working | Local React/Vite chat surface, embedded in the binary and served at the same address; unlocks chat only for recognized model rows. |

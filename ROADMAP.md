@@ -230,7 +230,7 @@ Active rule set:
 Near-term candidates include:
 
 - richer logprob support
-- broader streaming metadata completeness
+- broader streaming metadata completeness (OpenAI `stream_options.include_usage` is delivered — a terminal usage chunk on chat-completions streaming, see `COMPATIBILITY.md`; further streaming metadata fields remain pending)
 - multi-choice generation
 - stronger seeded sampling validation
 
