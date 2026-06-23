@@ -2084,6 +2084,22 @@ struct Gemma4LayerNormsDev {
     post_ffw_norm: cudarc::driver::CudaSlice<f32>,
 }
 
+/// Per-layer projection weights kept resident on the GPU in the SoA layout
+/// `q8_gemv` reads (uploaded once at load). For E4B Q8 this is ~4–4.5 GB and fits
+/// a 6 GB card because the big embeddings (`token_embd`, `per_layer_token_embd`)
+/// stay on the CPU for the head + PLE gather. `k`/`v` exist only on owning layers;
+/// `v` is `None` on V-less layers (V reuses the K projection).
+#[cfg(feature = "cuda")]
+struct Gemma4LayerWeightsDev {
+    q: cudarc::driver::CudaSlice<u8>,
+    k: Option<cudarc::driver::CudaSlice<u8>>,
+    v: Option<cudarc::driver::CudaSlice<u8>>,
+    o: cudarc::driver::CudaSlice<u8>,
+    gate: cudarc::driver::CudaSlice<u8>,
+    up: cudarc::driver::CudaSlice<u8>,
+    down: cudarc::driver::CudaSlice<u8>,
+}
+
 #[cfg(feature = "cuda")]
 fn cu(e: cudarc::driver::DriverError) -> BackendError {
     BackendError::InvalidModelMetadata(format!("gemma4 cuda: {e}"))
@@ -2123,6 +2139,7 @@ pub struct Gemma4CudaResident {
     kernels: crate::cuda_resident::CudaResidentKernels,
     plan: Vec<crate::model::Gemma4LayerPlan>,
     norms: Vec<Gemma4LayerNormsDev>,
+    lweights: Vec<Gemma4LayerWeightsDev>,
     block_count: usize,
     heads: usize,
     hidden: usize,
@@ -2205,6 +2222,34 @@ impl Gemma4CudaResident {
             });
         }
 
+        // Per-layer projection weights, resident in the SoA layout q8_gemv reads
+        // (uploaded once; the big embeddings stay on the CPU). k/v only on owning layers.
+        let upw = |wq: &WireQuant| s.clone_htod(&q8_wire_to_soa(wq.bytes())).map_err(cu);
+        let mut lweights = Vec::with_capacity(block_count);
+        for (li, lw) in cpu.layers.iter().enumerate() {
+            let owns = plan[li].owns_kv;
+            lweights.push(Gemma4LayerWeightsDev {
+                q: upw(&lw.attn_q)?,
+                k: if owns {
+                    Some(upw(lw.attn_k.as_ref().expect("owning layer binds attn_k"))?)
+                } else {
+                    None
+                },
+                v: if owns {
+                    match lw.attn_v.as_ref() {
+                        Some(wv) => Some(upw(wv)?),
+                        None => None,
+                    }
+                } else {
+                    None
+                },
+                o: upw(&lw.attn_output)?,
+                gate: upw(&lw.ffn_gate)?,
+                up: upw(&lw.ffn_up)?,
+                down: upw(&lw.ffn_down)?,
+            });
+        }
+
         // Per-owning-layer f16 KV caches sized to that layer's kv geometry.
         let mut cache_k = Vec::with_capacity(block_count);
         let mut cache_v = Vec::with_capacity(block_count);
@@ -2223,6 +2268,7 @@ impl Gemma4CudaResident {
         let alloc_i = |n: usize| s.alloc_zeros::<i8>(n.max(1));
         Ok(Self {
             norms,
+            lweights,
             block_count,
             heads,
             hidden,
@@ -2327,6 +2373,7 @@ impl Gemma4CudaResident {
             let ffn_dim = self.cpu.g.ffn_length_at(li) as usize;
             let lw = &self.cpu.layers[li];
             let nrm = &self.norms[li];
+            let lwd = &self.lweights[li];
 
             // attention RMSNorm + Q8_0 quantize of the activation (shared by q/k/v).
             crate::cuda_resident::launch_rmsnorm(
@@ -2337,13 +2384,10 @@ impl Gemma4CudaResident {
             ).map_err(cu)?;
 
             // Q projection -> per-head q-norm -> RoPE (split-half, dual-θ).
-            {
-                let w = s.clone_htod(&q8_wire_to_soa(lw.attn_q.bytes())).map_err(cu)?;
-                crate::cuda_resident::launch_gemv(
-                    &s, &k.gemv, &self.d_ins, &self.d_inq, &w.slice(0..w.len()),
-                    q_dim, hidden / 32, &mut self.d_q,
-                ).map_err(cu)?;
-            }
+            crate::cuda_resident::launch_gemv(
+                &s, &k.gemv, &self.d_ins, &self.d_inq, &lwd.q.slice(0..lwd.q.len()),
+                q_dim, hidden / 32, &mut self.d_q,
+            ).map_err(cu)?;
             crate::cuda_resident::launch_rms_norm_per_head(
                 &s, &k.rms_norm_per_head, &mut self.d_q, &nrm.q_norm, heads, hd, eps,
             ).map_err(cu)?;
@@ -2375,18 +2419,15 @@ impl Gemma4CudaResident {
             // K/V projection + norms + RoPE + cache scatter — owning layers only.
             if p.owns_kv {
                 {
-                    let wk = s.clone_htod(&q8_wire_to_soa(
-                        lw.attn_k.as_ref().expect("owning layer binds attn_k").bytes(),
-                    )).map_err(cu)?;
+                    let wk = lwd.k.as_ref().expect("owning layer has resident K");
                     crate::cuda_resident::launch_gemv(
                         &s, &k.gemv, &self.d_ins, &self.d_inq, &wk.slice(0..wk.len()),
                         kv_dim, hidden / 32, &mut self.d_k,
                     ).map_err(cu)?;
-                    match lw.attn_v.as_ref() {
+                    match lwd.v.as_ref() {
                         Some(wv) => {
-                            let wvd = s.clone_htod(&q8_wire_to_soa(wv.bytes())).map_err(cu)?;
                             crate::cuda_resident::launch_gemv(
-                                &s, &k.gemv, &self.d_ins, &self.d_inq, &wvd.slice(0..wvd.len()),
+                                &s, &k.gemv, &self.d_ins, &self.d_inq, &wv.slice(0..wv.len()),
                                 kv_dim, hidden / 32, &mut self.d_v,
                             ).map_err(cu)?;
                         }
@@ -2458,13 +2499,10 @@ impl Gemma4CudaResident {
             crate::cuda_resident::launch_quantize(
                 &s, &k.quantize, &self.d_attn, &mut self.d_attnq, &mut self.d_attns, q_dim / 32,
             ).map_err(cu)?;
-            {
-                let wo = s.clone_htod(&q8_wire_to_soa(lw.attn_output.bytes())).map_err(cu)?;
-                crate::cuda_resident::launch_gemv(
-                    &s, &k.gemv, &self.d_attns, &self.d_attnq, &wo.slice(0..wo.len()),
-                    hidden, q_dim / 32, &mut self.d_o,
-                ).map_err(cu)?;
-            }
+            crate::cuda_resident::launch_gemv(
+                &s, &k.gemv, &self.d_attns, &self.d_attnq, &lwd.o.slice(0..lwd.o.len()),
+                hidden, q_dim / 32, &mut self.d_o,
+            ).map_err(cu)?;
             crate::cuda_resident::launch_rmsnorm(
                 &s, &k.rms_norm, &self.d_o, &nrm.post_attn_norm, &mut self.d_normed, hidden, eps,
             ).map_err(cu)?;
@@ -2479,18 +2517,14 @@ impl Gemma4CudaResident {
             crate::cuda_resident::launch_quantize(
                 &s, &k.quantize, &self.d_normed, &mut self.d_inq, &mut self.d_ins, hidden / 32,
             ).map_err(cu)?;
-            {
-                let wg = s.clone_htod(&q8_wire_to_soa(lw.ffn_gate.bytes())).map_err(cu)?;
-                crate::cuda_resident::launch_gemv(
-                    &s, &k.gemv, &self.d_ins, &self.d_inq, &wg.slice(0..wg.len()),
-                    ffn_dim, hidden / 32, &mut self.d_gate,
-                ).map_err(cu)?;
-                let wu = s.clone_htod(&q8_wire_to_soa(lw.ffn_up.bytes())).map_err(cu)?;
-                crate::cuda_resident::launch_gemv(
-                    &s, &k.gemv, &self.d_ins, &self.d_inq, &wu.slice(0..wu.len()),
-                    ffn_dim, hidden / 32, &mut self.d_up,
-                ).map_err(cu)?;
-            }
+            crate::cuda_resident::launch_gemv(
+                &s, &k.gemv, &self.d_ins, &self.d_inq, &lwd.gate.slice(0..lwd.gate.len()),
+                ffn_dim, hidden / 32, &mut self.d_gate,
+            ).map_err(cu)?;
+            crate::cuda_resident::launch_gemv(
+                &s, &k.gemv, &self.d_ins, &self.d_inq, &lwd.up.slice(0..lwd.up.len()),
+                ffn_dim, hidden / 32, &mut self.d_up,
+            ).map_err(cu)?;
             {
                 let cfg = LaunchConfig {
                     grid_dim: ((ffn_dim as u32).div_ceil(256), 1, 1),
@@ -2506,13 +2540,10 @@ impl Gemma4CudaResident {
                 &s, &k.quantize, &self.d_geglu, &mut self.d_geglu_q, &mut self.d_geglu_s,
                 ffn_dim / 32,
             ).map_err(cu)?;
-            {
-                let wd = s.clone_htod(&q8_wire_to_soa(lw.ffn_down.bytes())).map_err(cu)?;
-                crate::cuda_resident::launch_gemv(
-                    &s, &k.gemv, &self.d_geglu_s, &self.d_geglu_q, &wd.slice(0..wd.len()),
-                    hidden, ffn_dim / 32, &mut self.d_ffn_out,
-                ).map_err(cu)?;
-            }
+            crate::cuda_resident::launch_gemv(
+                &s, &k.gemv, &self.d_geglu_s, &self.d_geglu_q, &lwd.down.slice(0..lwd.down.len()),
+                hidden, ffn_dim / 32, &mut self.d_ffn_out,
+            ).map_err(cu)?;
             crate::cuda_resident::launch_rmsnorm(
                 &s, &k.rms_norm, &self.d_ffn_out, &nrm.post_ffw_norm, &mut self.d_normed, hidden,
                 eps,
