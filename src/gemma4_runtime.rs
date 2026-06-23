@@ -2296,7 +2296,7 @@ impl Gemma4CudaResident {
         // the decode bottleneck — versus a few ms for the GEMV. ~0.55-0.7 GB on E4B.
         let softcap = cpu.g.final_logit_softcapping.unwrap_or(0.0);
         let gpu_head = match cpu.token_embd.format {
-            WireFormat::Q8_0 if hidden % 32 == 0 => {
+            WireFormat::Q8_0 if hidden.is_multiple_of(32) => {
                 let blocks = hidden / 32;
                 Some(Gemma4HeadDev {
                     lane: HeadLane::Q8_0,
@@ -2311,7 +2311,7 @@ impl Gemma4CudaResident {
                     softcap,
                 })
             }
-            WireFormat::Q6K if hidden % 256 == 0 => {
+            WireFormat::Q6K if hidden.is_multiple_of(256) => {
                 let blocks = hidden / 256;
                 Some(Gemma4HeadDev {
                     lane: HeadLane::Q6K,
@@ -3147,11 +3147,10 @@ impl Gemma4CudaResident {
         }
 
         // ---- Final norm + tied head + soft-cap. ----
-        if self.gpu_head.is_some() {
+        if let Some(head) = self.gpu_head.as_mut() {
             // GPU Q6_K head: fused rms_norm+Q8K-quant -> q6k_gemv over the vocab ->
             // soft-cap, on the capture stream; only the logits are copied back. This
             // replaces the ~1.2 s/token CPU Q6_K matvec that dominates decode.
-            let head = self.gpu_head.as_mut().expect("gpu head present");
             let wlen = head.weight.len();
             match head.lane {
                 HeadLane::Q8_0 => {
@@ -3242,8 +3241,7 @@ impl Gemma4CudaResident {
             logits = self.forward_token(tok, pos, pos == last_prompt)?;
         }
         let mut generated = Vec::new();
-        let mut pos = prompt_tokens.len();
-        for _ in 0..max_new {
+        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
             let next = logits
                 .iter()
                 .enumerate()
@@ -3255,7 +3253,6 @@ impl Gemma4CudaResident {
             }
             generated.push(next);
             logits = self.forward_token(next, pos, true)?;
-            pos += 1;
         }
         let text = self.cpu.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
@@ -3279,8 +3276,7 @@ impl Gemma4CudaResident {
         }
         let mut generated = Vec::new();
         let mut prev_text = String::new();
-        let mut pos = prompt_tokens.len();
-        for _ in 0..max_new {
+        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
             let next = logits
                 .iter()
                 .enumerate()
@@ -3297,7 +3293,6 @@ impl Gemma4CudaResident {
             }
             prev_text = text;
             logits = self.forward_token(next, pos, true)?;
-            pos += 1;
         }
         Ok((prev_text, generated))
     }

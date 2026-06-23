@@ -908,6 +908,8 @@ fn geglu_mul_matches_cpu() {
         .iter()
         .zip(&up)
         .map(|(&g, &u)| {
+            // gelu coefficient sqrt(2/pi), matched to the kernel's literal for parity.
+            #[allow(clippy::excessive_precision)]
             let inner = 0.79788456f32 * (g + 0.044715f32 * g * g * g);
             (0.5f32 * g * (1.0f32 + inner.tanh())) * u
         })
@@ -1154,6 +1156,8 @@ fn attention_decode_sw_matches_cpu() {
         let kv_head = head / repeats;
         let qh = &q[head * head_dim..head * head_dim + head_dim];
         let mut scores = vec![0f32; position_count];
+        // `p` indexes scores AND computes the cache_k base offset, so a range loop is clearest.
+        #[allow(clippy::needless_range_loop)]
         for p in start..position_count {
             let kbase = (kv_head * max_pos + p) * head_dim;
             let mut dot = 0f32;

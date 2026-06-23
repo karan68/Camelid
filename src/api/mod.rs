@@ -3606,6 +3606,10 @@ impl Gemma4ChannelFilter {
 /// completion handlers are lane-agnostic. The distributed lane is configured
 /// at model-load time via `CAMELID_GEMMA4_WORKER` + `CAMELID_GEMMA4_SPLIT`
 /// (alongside `CAMELID_GEMMA4_SERVE=1`).
+// Always stored behind an Arc (AppState::gemma4_runtimes), so there is exactly one
+// heap-allocated instance per loaded model; the Cuda variant's resident scratch dwarfs
+// the others, but the inline size disparity has no practical cost here.
+#[allow(clippy::large_enum_variant)]
 pub enum Gemma4ServeRuntime {
     Local(crate::gemma4_runtime::Gemma4Runtime),
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
