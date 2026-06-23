@@ -3049,8 +3049,13 @@ mod cuda_parity_tests {
     #[test]
     #[ignore = "requires a CUDA device + the gemma4 E4B Q8_0 model"]
     fn gemma4_cuda_matches_cpu_greedy() {
-        let path_s = std::env::var("CAMELID_GEMMA4_GGUF")
-            .unwrap_or_else(|_| "C:/Users/timto/models/gemma-4-E4B-it-Q8_0.gguf".to_string());
+        let path_s = match std::env::var("CAMELID_GEMMA4_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip: set CAMELID_GEMMA4_GGUF to the gemma4 E4B Q8_0 gguf path");
+                return;
+            }
+        };
         let path = std::path::Path::new(&path_s);
         if !path.exists() {
             eprintln!("skip: gemma4 model not found at {path_s}");
