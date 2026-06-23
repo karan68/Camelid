@@ -2166,6 +2166,20 @@ struct Gemma4HeadDev {
     softcap: f32,
 }
 
+/// Resident PLE context-projection (the `proj·h` matvec that dominated CPU prep).
+/// `proj` (per_layer_model_proj, [block_count*ple_dim x hidden] f32, ~110 MB) and
+/// `proj_norm` stay resident; `ti` holds this token's per_layer_token_embd row
+/// (gathered+dequantized on the CPU each token — that table is too big to reside).
+#[cfg(feature = "cuda")]
+struct Gemma4PleCtxDev {
+    proj: cudarc::driver::CudaSlice<f32>,
+    proj_norm: cudarc::driver::CudaSlice<f32>,
+    ti: cudarc::driver::CudaSlice<f32>,
+    ple_total: usize,
+    proj_scale: f32,
+    embed_scale: f32,
+}
+
 /// CUDA gemma4 decode engine (Windows/NVIDIA). Wraps a CPU-loaded [`Gemma4Runtime`]
 /// for weights/config/tokenizer and runs the per-token forward through the shared
 /// `crate::cuda_resident` kernels. Layer projection weights are streamed from the
@@ -2207,6 +2221,10 @@ pub struct Gemma4CudaResident {
     /// the ~1.2 s/token CPU Q6_K matvec that otherwise dominates decode. `None` keeps
     /// the head on the CPU (non-Q6_K head, or `hidden` not a multiple of 256).
     gpu_head: Option<Gemma4HeadDev>,
+    /// GPU PLE context projection. `Some` runs `proj·h` + per-layer rms-norm + combine
+    /// on the GPU (writing `d_pli` directly), replacing the ~27.5M-mult CPU matvec that
+    /// was the remaining prep bottleneck. `None` falls back to the CPU pli compute.
+    gpu_ple_ctx: Option<Gemma4PleCtxDev>,
     // Per-owning-layer f16 KV caches ([kv_head][pos][head_dim]); None on shared layers.
     cache_k: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
     cache_v: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
@@ -2302,6 +2320,29 @@ impl Gemma4CudaResident {
                     ins: s.alloc_zeros::<f32>(blocks).map_err(cu)?,
                     blocks,
                     softcap,
+                })
+            }
+            _ => None,
+        };
+
+        // GPU PLE context projection: make per_layer_model_proj (~110 MB f32) + proj_norm
+        // resident so `proj·h` (the ~27.5M-mult per-token matvec that dominated CPU prep)
+        // runs on the GPU. The per_layer_token_embd table stays CPU (too big to reside);
+        // only this token's row is gathered/dequantized + uploaded each step.
+        let gpu_ple_ctx = match (
+            cpu.per_layer_model_proj.as_ref(),
+            cpu.per_layer_proj_norm.as_ref(),
+            cpu.per_layer_token_embd.as_ref(),
+        ) {
+            (Some(proj), Some(pn), Some(_)) if ple_dim > 0 => {
+                let ple_total = block_count * ple_dim;
+                Some(Gemma4PleCtxDev {
+                    proj: s.clone_htod(&proj[0..ple_total * hidden]).map_err(cu)?,
+                    proj_norm: s.clone_htod(pn).map_err(cu)?,
+                    ti: s.alloc_zeros::<f32>(ple_total).map_err(cu)?,
+                    ple_total,
+                    proj_scale: (hidden as f32).powf(-0.5),
+                    embed_scale: (ple_dim as f32).sqrt(),
                 })
             }
             _ => None,
@@ -2443,6 +2484,7 @@ impl Gemma4CudaResident {
             kernels,
             cap_stream,
             gpu_head,
+            gpu_ple_ctx,
             cpu,
         })
     }
@@ -2467,7 +2509,7 @@ impl Gemma4CudaResident {
         let ple_dim = self.ple_dim;
         let eps = self.eps;
 
-        // ---- CPU: scaled embedding + PLE per-layer inputs (small f32 work) ----
+        // ---- CPU: scaled embedding (small f32 gather); upload before the GPU PLE proj ----
         let h: Vec<f32> = self
             .cpu
             .token_embd
@@ -2476,7 +2518,48 @@ impl Gemma4CudaResident {
             .map(|v| v * (hidden as f32).sqrt())
             .collect();
         let ple_total = self.block_count * ple_dim;
-        let pli: Vec<Vec<f32>> = if let (Some(te), Some(proj), Some(pn)) = (
+        s.memcpy_htod(&h, &mut self.d_hidden).map_err(cu)?;
+        s.memcpy_htod(&[position as i32], &mut self.d_position).map_err(cu)?;
+        // PLE per-layer inputs -> d_pli. GPU path: ctx = proj·h (f32_gemv) -> *proj_scale ->
+        // per-layer rms_norm(proj_norm) -> + ti*embed_scale -> *1/sqrt(2), all on device
+        // (the ~27.5M-mult matvec was the CPU prep bottleneck). The per_layer_token_embd
+        // row `ti` is gathered on the CPU (that table is too big to reside). CPU fallback below.
+        if let Some(ctxdev) = self.gpu_ple_ctx.as_mut() {
+            let ti = self
+                .cpu
+                .per_layer_token_embd
+                .as_ref()
+                .expect("gpu_ple_ctx implies per_layer_token_embd")
+                .dequantize_elements(token as usize * ctxdev.ple_total, ctxdev.ple_total)?;
+            s.memcpy_htod(&ti, &mut ctxdev.ti).map_err(cu)?;
+            crate::cuda_resident::launch_f32_gemv(
+                &s, &self.kernels.f32_gemv, &ctxdev.proj, &self.d_hidden, &mut self.d_pli,
+                hidden, ctxdev.ple_total,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_scale(
+                &s, &self.kernels.scale_f32, &mut self.d_pli, ctxdev.ple_total, ctxdev.proj_scale,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_rms_norm_per_head(
+                &s, &self.kernels.rms_norm_per_head, &mut self.d_pli, &ctxdev.proj_norm,
+                self.block_count, ple_dim, eps,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_scale(
+                &s, &self.kernels.scale_f32, &mut ctxdev.ti, ctxdev.ple_total, ctxdev.embed_scale,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_residual(
+                &s, &self.kernels.residual_add, &mut self.d_pli, &ctxdev.ti, ctxdev.ple_total,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_scale(
+                &s, &self.kernels.scale_f32, &mut self.d_pli, ctxdev.ple_total,
+                std::f32::consts::FRAC_1_SQRT_2,
+            )
+            .map_err(cu)?;
+        } else if let (Some(te), Some(proj), Some(pn)) = (
             self.cpu.per_layer_token_embd.as_ref(),
             self.cpu.per_layer_model_proj.as_ref(),
             self.cpu.per_layer_proj_norm.as_ref(),
@@ -2485,8 +2568,8 @@ impl Gemma4CudaResident {
             let ctx = f32_matvec(&proj[0..ple_total * hidden], hidden, ple_total, &h);
             let proj_scale = (hidden as f32).powf(-0.5);
             let ple_embed_scale = (ple_dim as f32).sqrt();
-            (0..self.block_count)
-                .map(|li| {
+            let pli_flat: Vec<f32> = (0..self.block_count)
+                .flat_map(|li| {
                     let ctx_l: Vec<f32> =
                         (0..ple_dim).map(|d| ctx[li * ple_dim + d] * proj_scale).collect();
                     let ctx_n = rms_norm(&ctx_l, Some(pn), eps);
@@ -2495,19 +2578,9 @@ impl Gemma4CudaResident {
                             (ctx_n[d] + ti[li * ple_dim + d] * ple_embed_scale)
                                 * std::f32::consts::FRAC_1_SQRT_2
                         })
-                        .collect()
+                        .collect::<Vec<f32>>()
                 })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        s.memcpy_htod(&h, &mut self.d_hidden).map_err(cu)?;
-        s.memcpy_htod(&[position as i32], &mut self.d_position).map_err(cu)?;
-        // Upload this token's per-layer PLE inputs once (the per-layer injection reads
-        // d_pli[li*ple_dim..] on the GPU — no host round-trip during the layer loop).
-        if !pli.is_empty() {
-            let pli_flat: Vec<f32> = pli.iter().flatten().copied().collect();
+                .collect();
             s.memcpy_htod(&pli_flat, &mut self.d_pli).map_err(cu)?;
         }
         // Precompute every layer's RoPE table for this position (slot li = li*half_max)
