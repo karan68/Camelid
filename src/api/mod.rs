@@ -3172,6 +3172,17 @@ fn gemma4_serve_enabled() -> bool {
     )
 }
 
+/// Additionally route the gemma4 serve lane through the CUDA decode engine when
+/// `CAMELID_GEMMA4_CUDA` is set (and the build has the `cuda` feature). Off by
+/// default; with it off the gemma4 serve lane stays the CPU runtime, unchanged.
+#[cfg(feature = "cuda")]
+fn gemma4_cuda_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_GEMMA4_CUDA").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 /// Model family from the GGUF `general.architecture`.
 fn model_family(gguf: &GgufFile) -> &'static str {
     match gguf.architecture() {
@@ -3598,6 +3609,9 @@ impl Gemma4ChannelFilter {
 pub enum Gemma4ServeRuntime {
     Local(crate::gemma4_runtime::Gemma4Runtime),
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
+    /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
+    #[cfg(feature = "cuda")]
+    Cuda(std::sync::Mutex<crate::gemma4_runtime::Gemma4CudaResident>),
 }
 
 impl Gemma4ServeRuntime {
@@ -3605,6 +3619,11 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(r) => r.generate_greedy(prompt, max_new),
             Self::Distributed(r) => r.generate_greedy(prompt, max_new),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(m) => m
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .generate_greedy(prompt, max_new),
         }
     }
 
@@ -3617,6 +3636,11 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
             Self::Distributed(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(m) => m
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .generate_greedy_streaming(prompt, max_new, on_delta),
         }
     }
 }
@@ -4200,6 +4224,13 @@ async fn load_gemma4_serve_runtime(
         )
         .map(Gemma4ServeRuntime::Distributed),
         None => {
+            #[cfg(feature = "cuda")]
+            {
+                if gemma4_cuda_enabled() {
+                    return crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 2048)
+                        .map(|r| Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)));
+                }
+            }
             crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
         }
     })
@@ -4210,6 +4241,8 @@ async fn load_gemma4_serve_runtime(
     let lane = match &runtime {
         Gemma4ServeRuntime::Local(_) => "local",
         Gemma4ServeRuntime::Distributed(_) => "distributed",
+        #[cfg(feature = "cuda")]
+        Gemma4ServeRuntime::Cuda(_) => "cuda",
     };
     state
         .gemma4_runtimes

@@ -2622,6 +2622,46 @@ impl Gemma4CudaResident {
         let text = self.cpu.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
     }
+
+    /// Greedy-generate emitting a per-token text delta (for SSE streaming): after
+    /// each token the full output is re-decoded and the new suffix is handed to
+    /// `on_delta` (robust to tokenizer spacing).
+    pub fn generate_greedy_streaming<F: FnMut(&str)>(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        mut on_delta: F,
+    ) -> Result<(String, Vec<u32>)> {
+        let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.forward_token(tok, pos)?;
+        }
+        let mut generated = Vec::new();
+        let mut prev_text = String::new();
+        let mut pos = prompt_tokens.len();
+        for _ in 0..max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            let text = self.cpu.tokenizer.decode(&generated, true)?;
+            if text.len() > prev_text.len() {
+                on_delta(&text[prev_text.len()..]);
+            }
+            prev_text = text;
+            logits = self.forward_token(next, pos)?;
+            pos += 1;
+        }
+        Ok((prev_text, generated))
+    }
 }
 
 #[cfg(all(test, feature = "cuda"))]
