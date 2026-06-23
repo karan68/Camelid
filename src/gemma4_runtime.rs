@@ -2089,6 +2089,25 @@ fn cu(e: cudarc::driver::DriverError) -> BackendError {
     BackendError::InvalidModelMetadata(format!("gemma4 cuda: {e}"))
 }
 
+/// Repack a GGUF Q8_0 weight tensor (34-byte blocks: f16 scale + 32 i8) into the
+/// SoA layout `q8_gemv` reads: all 32-i8 quant groups first, then all f32 scales
+/// (the f16 scale widened). Mirrors `cuda_resident::repack_q8_soa` but consumes
+/// the raw GGUF wire directly (that helper expects an already-f32-scale 36B block).
+#[cfg(feature = "cuda")]
+fn q8_wire_to_soa(wire: &[u8]) -> Vec<u8> {
+    const W: usize = 34;
+    let n = wire.len() / W;
+    let mut out = vec![0u8; n * 32 + n * 4];
+    let (quants, scales) = out.split_at_mut(n * 32);
+    for b in 0..n {
+        let blk = &wire[b * W..b * W + W];
+        let sc = crate::inference::f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        quants[b * 32..b * 32 + 32].copy_from_slice(&blk[2..34]);
+        scales[b * 4..b * 4 + 4].copy_from_slice(&sc.to_le_bytes());
+    }
+    out
+}
+
 /// CUDA gemma4 decode engine (Windows/NVIDIA). Wraps a CPU-loaded [`Gemma4Runtime`]
 /// for weights/config/tokenizer and runs the per-token forward through the shared
 /// `crate::cuda_resident` kernels. Layer projection weights are streamed from the
@@ -2319,7 +2338,7 @@ impl Gemma4CudaResident {
 
             // Q projection -> per-head q-norm -> RoPE (split-half, dual-θ).
             {
-                let w = s.clone_htod(lw.attn_q.bytes()).map_err(cu)?;
+                let w = s.clone_htod(&q8_wire_to_soa(lw.attn_q.bytes())).map_err(cu)?;
                 crate::cuda_resident::launch_gemv(
                     &s, &k.gemv, &self.d_ins, &self.d_inq, &w.slice(0..w.len()),
                     q_dim, hidden / 32, &mut self.d_q,
@@ -2356,16 +2375,16 @@ impl Gemma4CudaResident {
             // K/V projection + norms + RoPE + cache scatter — owning layers only.
             if p.owns_kv {
                 {
-                    let wk = s.clone_htod(
+                    let wk = s.clone_htod(&q8_wire_to_soa(
                         lw.attn_k.as_ref().expect("owning layer binds attn_k").bytes(),
-                    ).map_err(cu)?;
+                    )).map_err(cu)?;
                     crate::cuda_resident::launch_gemv(
                         &s, &k.gemv, &self.d_ins, &self.d_inq, &wk.slice(0..wk.len()),
                         kv_dim, hidden / 32, &mut self.d_k,
                     ).map_err(cu)?;
                     match lw.attn_v.as_ref() {
                         Some(wv) => {
-                            let wvd = s.clone_htod(wv.bytes()).map_err(cu)?;
+                            let wvd = s.clone_htod(&q8_wire_to_soa(wv.bytes())).map_err(cu)?;
                             crate::cuda_resident::launch_gemv(
                                 &s, &k.gemv, &self.d_ins, &self.d_inq, &wvd.slice(0..wvd.len()),
                                 kv_dim, hidden / 32, &mut self.d_v,
@@ -2440,7 +2459,7 @@ impl Gemma4CudaResident {
                 &s, &k.quantize, &self.d_attn, &mut self.d_attnq, &mut self.d_attns, q_dim / 32,
             ).map_err(cu)?;
             {
-                let wo = s.clone_htod(lw.attn_output.bytes()).map_err(cu)?;
+                let wo = s.clone_htod(&q8_wire_to_soa(lw.attn_output.bytes())).map_err(cu)?;
                 crate::cuda_resident::launch_gemv(
                     &s, &k.gemv, &self.d_attns, &self.d_attnq, &wo.slice(0..wo.len()),
                     hidden, q_dim / 32, &mut self.d_o,
@@ -2461,12 +2480,12 @@ impl Gemma4CudaResident {
                 &s, &k.quantize, &self.d_normed, &mut self.d_inq, &mut self.d_ins, hidden / 32,
             ).map_err(cu)?;
             {
-                let wg = s.clone_htod(lw.ffn_gate.bytes()).map_err(cu)?;
+                let wg = s.clone_htod(&q8_wire_to_soa(lw.ffn_gate.bytes())).map_err(cu)?;
                 crate::cuda_resident::launch_gemv(
                     &s, &k.gemv, &self.d_ins, &self.d_inq, &wg.slice(0..wg.len()),
                     ffn_dim, hidden / 32, &mut self.d_gate,
                 ).map_err(cu)?;
-                let wu = s.clone_htod(lw.ffn_up.bytes()).map_err(cu)?;
+                let wu = s.clone_htod(&q8_wire_to_soa(lw.ffn_up.bytes())).map_err(cu)?;
                 crate::cuda_resident::launch_gemv(
                     &s, &k.gemv, &self.d_ins, &self.d_inq, &wu.slice(0..wu.len()),
                     ffn_dim, hidden / 32, &mut self.d_up,
@@ -2488,7 +2507,7 @@ impl Gemma4CudaResident {
                 ffn_dim / 32,
             ).map_err(cu)?;
             {
-                let wd = s.clone_htod(lw.ffn_down.bytes()).map_err(cu)?;
+                let wd = s.clone_htod(&q8_wire_to_soa(lw.ffn_down.bytes())).map_err(cu)?;
                 crate::cuda_resident::launch_gemv(
                     &s, &k.gemv, &self.d_geglu_s, &self.d_geglu_q, &wd.slice(0..wd.len()),
                     hidden, ffn_dim / 32, &mut self.d_ffn_out,
@@ -2571,5 +2590,34 @@ impl Gemma4CudaResident {
         }
         let text = self.cpu.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_parity_tests {
+    use super::*;
+
+    // Greedy parity: the CUDA gemma4 forward must match the CPU Gemma4Runtime oracle
+    // token-for-token on the E4B Q8_0 file (the oracle that the CPU runtime loads).
+    // Weights stream from host per layer, so it fits the 6 GB card; kept short.
+    #[test]
+    #[ignore = "requires a CUDA device + the gemma4 E4B Q8_0 model"]
+    fn gemma4_cuda_matches_cpu_greedy() {
+        let path_s = std::env::var("CAMELID_GEMMA4_GGUF")
+            .unwrap_or_else(|_| "C:/Users/timto/models/gemma-4-E4B-it-Q8_0.gguf".to_string());
+        let path = std::path::Path::new(&path_s);
+        if !path.exists() {
+            eprintln!("skip: gemma4 model not found at {path_s}");
+            return;
+        }
+        let prompt = "The capital of France is";
+        let n = 5usize;
+        let cpu = Gemma4Runtime::load(path).expect("cpu load");
+        let (cpu_text, cpu_ids) = cpu.generate_greedy(prompt, n).expect("cpu gen");
+        let mut gpu = Gemma4CudaResident::load(path, 2048).expect("gpu load");
+        let (gpu_text, gpu_ids) = gpu.generate_greedy(prompt, n).expect("gpu gen");
+        eprintln!("CPU ids {cpu_ids:?} -> {cpu_text:?}");
+        eprintln!("GPU ids {gpu_ids:?} -> {gpu_text:?}");
+        assert_eq!(gpu_ids, cpu_ids, "gemma4 CUDA greedy diverged from CPU oracle");
     }
 }
