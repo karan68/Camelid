@@ -435,6 +435,14 @@ pub struct ChatCompletionRequest {
     /// mode); the model's tool-call output is parsed by the client. Models whose
     /// template does not render tools simply ignore them.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI `stream_options`. The only honored subfield is `include_usage`
+    /// (bool); any other shape or subfield is tolerated silently and ignored,
+    /// matching the permissive llama-server oracle. Parsed as a raw value so a
+    /// malformed `stream_options` never rejects the request (see
+    /// `stream_options_include_usage`). Declaring it here also removes it from
+    /// `unsupported_fields`, so the chat route no longer returns the old
+    /// "stream_options are not supported yet" error.
+    pub stream_options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
@@ -1116,6 +1124,15 @@ pub struct ChatCompletionStreamChunk {
     pub choices: Vec<ChatCompletionStreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camelid: Option<serde_json::Value>,
+    /// Terminal usage frame for OpenAI `stream_options.include_usage`. `None` on
+    /// every role/content/finish chunk, so the field is omitted from the wire
+    /// (matching the llama-server oracle, which omits `usage` on content chunks
+    /// rather than sending `usage: null`, and keeping the usage-off baseline
+    /// byte-identical). `Some` only on the single terminal chunk that carries an
+    /// empty `choices` array, emitted after the finish_reason chunk and before
+    /// `[DONE]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<CompletionUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2990,6 +3007,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 id: "openai_chat_completions",
                 status: "supported_current_gate",
                 notes: "non-streaming and SSE streaming for loaded supported dense GGUF models",
+            },
+            SupportItem {
+                id: "stream_options.include_usage",
+                status: "supported_current_gate",
+                notes: "chat-completions streaming only: stream_options.include_usage:true appends one terminal chunk with choices:[] and a usage object {prompt_tokens, completion_tokens, total_tokens} identical to the non-streaming endpoint's counts, then [DONE]. Omitting it is byte-identical to the prior baseline. Malformed/other stream_options shapes and subfields are tolerated and ignored (no error), matching the llama-server acd79d6 oracle; no other stream_options subfield is supported. Evidence: qa/evidence-bundles/stream-options-include-usage-20260623/.",
             },
             SupportItem {
                 id: "tokenizer_encode_decode",
@@ -5155,7 +5177,9 @@ async fn completions(
         Err(response) => return response,
     };
     if stream {
-        return stream_completion(prepared, false, gen_guard);
+        // Text-completion streaming does not implement stream_options yet
+        // (scope: chat-completions only), so usage is never emitted here.
+        return stream_completion(prepared, false, gen_guard, false);
     }
 
     // Hold the generation lock until the non-streaming response is built.
@@ -5272,6 +5296,11 @@ async fn chat_completions(
     } else {
         None
     };
+    // OpenAI stream_options.include_usage: resolved here (permissive — see
+    // stream_options_include_usage) before `req` is consumed into the generation
+    // request. Threaded into stream_completion; ignored on the non-streaming
+    // branch, which already returns `usage`.
+    let include_usage = stream_options_include_usage(req.stream_options.as_ref());
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: None,
@@ -5313,7 +5342,7 @@ async fn chat_completions(
         Err(response) => return response,
     };
     if stream {
-        return stream_completion(prepared, true, gen_guard);
+        return stream_completion(prepared, true, gen_guard, include_usage);
     }
 
     // Hold the generation lock until the non-streaming response is built.
@@ -6733,6 +6762,24 @@ fn static_param_name(param: &str) -> &'static str {
     }
 }
 
+/// Resolve OpenAI `stream_options.include_usage` permissively, matching the
+/// pinned llama-server oracle (commit acd79d6), which returns HTTP 200 for every
+/// malformed shape rather than a structured error. Returns `false` (usage chunk
+/// off) when `stream_options` is absent, `null`, or not an object; when
+/// `include_usage` is absent or not a boolean; and ignores any unknown subfields.
+/// Only an explicit `include_usage: true` turns the terminal usage chunk on, so
+/// it is the sole honored subfield (exact-row support); nothing else is claimed.
+/// `stream: false` needs no handling here — the non-streaming response already
+/// carries `usage`, so a non-streaming request with `stream_options` "just works"
+/// untouched.
+fn stream_options_include_usage(stream_options: Option<&serde_json::Value>) -> bool {
+    stream_options
+        .and_then(serde_json::Value::as_object)
+        .and_then(|map| map.get("include_usage"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn stop_sequences_from_request(
     stop: Option<&StopSpec>,
 ) -> std::result::Result<Vec<String>, Box<Response>> {
@@ -8085,6 +8132,7 @@ fn stream_completion(
     mut prepared: PreparedGeneration,
     chat: bool,
     gen_guard: tokio::sync::OwnedMutexGuard<()>,
+    include_usage: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
     // a spec-enabled server keep the unchanged vanilla path (including the
@@ -8129,6 +8177,7 @@ fn stream_completion(
                     finish_reason: None,
                 }],
                 camelid: None,
+                usage: None,
             };
             yield sse_json_event(&role_chunk);
             if stream_poll_yield {
@@ -8152,6 +8201,12 @@ fn stream_completion(
         }
         let mut input = prepared.token_ids.clone();
         let mut history = prepared.token_ids.clone();
+        // Captured before decode so the streaming usage frame reports the exact
+        // same prompt count as the non-streaming path (which also reads
+        // `prepared.token_ids.len()`). `prepared.token_ids` is never mutated
+        // during the stream, but capturing here mirrors the non-streaming path
+        // and binds the two counts by construction (single source of truth).
+        let prompt_token_count = prepared.token_ids.len();
         let mut generated = Vec::new();
         let mut top_logits = Vec::new();
         let mut output_projection = Vec::new();
@@ -8333,6 +8388,7 @@ fn stream_completion(
                             finish_reason: None,
                         }],
                         camelid: None,
+                        usage: None,
                     };
                     yield sse_json_event(&chunk);
                     if stream_poll_yield {
@@ -8398,10 +8454,10 @@ fn stream_completion(
 
         if chat {
             let final_chunk = ChatCompletionStreamChunk {
-                id: stream_id,
+                id: stream_id.clone(),
                 object: "chat.completion.chunk",
                 created: 0,
-                model: model_id,
+                model: model_id.clone(),
                 choices: vec![ChatCompletionStreamChoice {
                     index: 0,
                     delta: ChatCompletionDelta {
@@ -8411,8 +8467,32 @@ fn stream_completion(
                     finish_reason: Some(finish_reason),
                 }],
                 camelid: camelid_diagnostics.clone(),
+                usage: None,
             };
             yield sse_json_event(&final_chunk);
+            // OpenAI stream_options.include_usage: exactly one terminal chunk
+            // with an empty `choices` array, carrying the same usage integers the
+            // non-streaming endpoint returns for this prompt+output (prompt =
+            // prepared.token_ids.len(); completion = sampled-token count). Emitted
+            // after the finish_reason chunk and before [DONE], matching the
+            // llama-server oracle ordering. Omitted entirely when include_usage is
+            // false, so the usage-off stream is byte-identical to the baseline.
+            if include_usage {
+                let usage_chunk = ChatCompletionStreamChunk {
+                    id: stream_id,
+                    object: "chat.completion.chunk",
+                    created: 0,
+                    model: model_id,
+                    choices: Vec::new(),
+                    camelid: None,
+                    usage: Some(CompletionUsage {
+                        prompt_tokens: prompt_token_count,
+                        completion_tokens: generated.len(),
+                        total_tokens: prompt_token_count + generated.len(),
+                    }),
+                };
+                yield sse_json_event(&usage_chunk);
+            }
         } else {
             let final_chunk = CompletionStreamChunk {
                 id: stream_id,
@@ -9617,9 +9697,93 @@ mod tests {
                 finish_reason: None,
             }],
             camelid: None,
+            usage: None,
         };
 
         let value = serde_json::to_value(chunk).expect("stream chunk should serialize");
+        assert!(value.get("camelid").is_none());
+        // The usage frame is omitted from the wire on every non-terminal chunk
+        // (stream_options.include_usage off), keeping the baseline byte-identical.
+        assert!(value.get("usage").is_none());
+    }
+
+    #[test]
+    fn stream_options_include_usage_resolves_permissively() {
+        use serde_json::json;
+        // (a) absent -> off.
+        assert!(!stream_options_include_usage(None));
+        // null / non-object stream_options -> off (tolerated, never an error).
+        assert!(!stream_options_include_usage(Some(&json!(null))));
+        assert!(!stream_options_include_usage(Some(&json!("yes"))));
+        assert!(!stream_options_include_usage(Some(&json!(true))));
+        // Object without include_usage -> off.
+        assert!(!stream_options_include_usage(Some(&json!({}))));
+        // (b) include_usage: false -> off.
+        assert!(!stream_options_include_usage(Some(
+            &json!({"include_usage": false})
+        )));
+        // Wrong-typed include_usage -> off (matches the permissive oracle; the
+        // request is never rejected — see ref_err_bad_type capture, HTTP 200).
+        assert!(!stream_options_include_usage(Some(
+            &json!({"include_usage": "yes"})
+        )));
+        assert!(!stream_options_include_usage(Some(&json!({"include_usage": 1}))));
+        // (c) the one true case.
+        assert!(stream_options_include_usage(Some(
+            &json!({"include_usage": true})
+        )));
+        // Unknown subfields are tolerated and ignored (never promoted to a
+        // support row); include_usage is still honored alongside them.
+        assert!(stream_options_include_usage(Some(&json!({
+            "include_usage": true,
+            "continuous_usage_stats": true
+        }))));
+        assert!(!stream_options_include_usage(Some(&json!({
+            "some_future_field": 42
+        }))));
+    }
+
+    #[test]
+    fn chat_request_accepts_stream_options_without_marking_it_unsupported() {
+        // Declaring stream_options as a typed field removes it from the
+        // flatten-captured unsupported_fields, so the chat route no longer
+        // returns the old "stream_options are not supported yet" error.
+        let req: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "qwen3",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("request with stream_options should deserialize");
+        assert!(req.stream_options.is_some());
+        assert!(!req.unsupported_fields.contains_key("stream_options"));
+        assert!(stream_options_include_usage(req.stream_options.as_ref()));
+    }
+
+    #[test]
+    fn terminal_usage_chunk_has_empty_choices_array_and_usage() {
+        // The terminal include_usage frame: empty `choices` array (not omitted),
+        // the three real usage integers, no camelid diagnostics. Mirrors the
+        // llama-server oracle terminal chunk (minus its server-specific extras).
+        let chunk = ChatCompletionStreamChunk {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion.chunk",
+            created: 0,
+            model: "test-model".into(),
+            choices: Vec::new(),
+            camelid: None,
+            usage: Some(CompletionUsage {
+                prompt_tokens: 21,
+                completion_tokens: 16,
+                total_tokens: 37,
+            }),
+        };
+        let value = serde_json::to_value(chunk).expect("usage chunk should serialize");
+        assert_eq!(value.get("choices"), Some(&serde_json::json!([])));
+        assert_eq!(value["object"], "chat.completion.chunk");
+        assert_eq!(value["usage"]["prompt_tokens"], 21);
+        assert_eq!(value["usage"]["completion_tokens"], 16);
+        assert_eq!(value["usage"]["total_tokens"], 37);
         assert!(value.get("camelid").is_none());
     }
 
