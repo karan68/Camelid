@@ -2438,7 +2438,7 @@ impl Gemma4CudaResident {
 
         let alloc_f = |n: usize| s.alloc_zeros::<f32>(n.max(1));
         let alloc_i = |n: usize| s.alloc_zeros::<i8>(n.max(1));
-        Ok(Self {
+        let me = Self {
             norms,
             lweights,
             ple,
@@ -2486,7 +2486,14 @@ impl Gemma4CudaResident {
             gpu_head,
             gpu_ple_ctx,
             cpu,
-        })
+        };
+        // Re-enable cudarc's auto event-tracking now that every gemma4 device slice is
+        // allocated. Those slices were created while it was off, so they carry no
+        // CudaEvents and the decode-graph capture stays clean; restoring it here keeps
+        // multi-stream synchronization correct for any other model loaded into this
+        // context afterwards (e.g. a later Llama reload in a serve process).
+        unsafe { me.kernels.ctx.enable_event_tracking() };
+        Ok(me)
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
