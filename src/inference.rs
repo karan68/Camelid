@@ -7279,6 +7279,11 @@ fn output_projection_with_layout_with_plan(
                 )));
             }
             let name = name.into();
+            // Tied Q6_K embed/lm_head: stream the Q6_K wire blocks instead of the generic
+            // f32 matmul over the materialised embedding (which dominated decode at ~88%).
+            if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+                return matmul_rhs_transposed_q6_k_block_dot(input, weight, name.as_str());
+            }
             if let Some(output) =
                 try_x86_q8_output_packed_rows4_matmul_path(input, weight, &name, runtime_plan)?
             {
@@ -15260,6 +15265,59 @@ fn accumulate_transposed_linear_row_tq2_0(input_row: &[f32], wire: &[u8], output
         let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
         *slot = tq2_0_dot(w_row, &q8, &bsums, blocks_per_row);
     });
+}
+
+/// Streaming Q6_K linear (used for the tied embed/lm_head output projection): rather than
+/// materialise the ~1.6 GB f32 embedding and run a generic f32 matmul (which dominated
+/// decode at ~88% of the per-token time), quantise each input row to Q8_K once and dot it
+/// against the retained Q6_K wire blocks (rayon-parallel over the vocab dimension).
+fn matmul_rhs_transposed_q6_k_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let n_rows = input.dim(0)?;
+    let in_dim = input.dim(1)?;
+    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q6_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let wire = weight.q6_k_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Q6_K weight missing wire bytes".to_string())
+    })?;
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q6_K_WIRE_BYTES_PER_BLOCK;
+    // The output projection passes the tied embed as [hidden, vocab]; the wire bytes are
+    // token-major ([vocab, hidden] row-major, one contiguous hidden-row per vocab entry),
+    // so derive the output (vocab) dimension from the wire length rather than weight.dim(0).
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q6_K weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    let out_dim = wire.len() / row_bytes;
+    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            preps
+                .iter()
+                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
 }
 
 /// Dequantize a single Q6_K wire superblock (210 bytes) into 256 f32 values,
