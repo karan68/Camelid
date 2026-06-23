@@ -900,6 +900,11 @@ pub struct CpuTensor {
     /// them straight to the `q6k_gemv` kernel (which reads the wire layout directly).
     /// Populated by the Q6_K load path; `None` for non-Q6_K tensors.
     pub q6_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Ternary TQ2_0 wire bytes (66 bytes/256-weight block, row-major), retained when
+    /// the tensor's `source_type` is `Tq2_0` so the CPU ternary block-dot streams the
+    /// quantized weights instead of materialising f32 (a 4B model fully decoded to f32 is
+    /// ~16 GB and OOMs). Populated by `load_tq2_0_wire_linear`; `None` otherwise.
+    pub tq2_0_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     pub data: Vec<f32>,
 }
 
@@ -1053,6 +1058,7 @@ impl Q8_0TensorBlocks {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data,
         })
     }
@@ -1122,6 +1128,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data,
         })
     }
@@ -1207,6 +1214,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         })
     }
@@ -1236,6 +1244,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1260,6 +1269,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1284,6 +1294,7 @@ impl CpuTensor {
             q8_0_split_file_backing: Some(backings),
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -3313,6 +3324,37 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q6_k_wire_bytes,
+            tq2_0_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    /// Load a TQ2_0 (ternary) 2-D linear by retaining its raw wire bytes only — no f32
+    /// materialisation. The CPU ternary block-dot streams these directly. Mirrors
+    /// `load_kquant_wire_linear`. Falls back to f32 for non-TQ2_0 / non-2-D tensors.
+    pub fn load_tq2_0_wire_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if !matches!(desc.tensor_type, GgufTensorType::Tq2_0) || shape.dims.len() != 2 {
+            return self.load_cpu_f32(name);
+        }
+        let bytes = self.tensor_bytes(name)?;
+        Ok(CpuTensor {
+            name: name.to_string(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(desc.tensor_type),
+            q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: Some(std::sync::Arc::new(bytes.to_vec())),
             data: Vec::new(),
         })
     }
@@ -3530,6 +3572,7 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q6_k_wire_bytes,
+            tq2_0_wire_bytes: None,
             data,
         })
     }

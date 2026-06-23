@@ -402,6 +402,11 @@ impl LlamaLoadedWeights {
             // bytes (no f32 materialization — an 8B model fully decoded to f32 is ~32 GB
             // and OOMs). The GPU-resident decode reads these via q4k_gemv / q6k_gemv.
             if let Ok(desc) = store.descriptor(name) {
+                // Ternary TQ2_0 2-D linears: stream the wire bytes (the CPU ternary
+                // block-dot reads them); never materialise f32 (a 4B model is ~16 GB f32).
+                if matches!(desc.tensor_type, GgufTensorType::Tq2_0) && desc.dimensions.len() == 2 {
+                    return store.load_tq2_0_wire_linear(name);
+                }
                 if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
                     && desc.dimensions.len() == 2
                 {
@@ -7087,6 +7092,7 @@ struct BorrowedLinearWeight<'a> {
     q8_0_packed_rows4_4x8: Option<&'a Q8_0PackedRows4>,
     q8_0_runtime_storage: Option<&'a Q8_0RuntimeStorage>,
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
+    tq2_0_wire_bytes: Option<&'a [u8]>,
 }
 
 impl<'a> BorrowedLinearWeight<'a> {
@@ -7107,6 +7113,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_packed_rows4_4x8: weight.q8_0_packed_rows4_4x8.as_ref(),
             q8_0_runtime_storage: weight.q8_0_runtime_storage.as_ref(),
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
+            tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
         })
     }
 
@@ -7346,6 +7353,9 @@ fn matmul_rhs_transposed_with_precision_with_plan(
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<CpuTensor> {
     let input_width = input.dim(1)?;
+    if weight.source_type == Some(GgufTensorType::Tq2_0) && weight.tq2_0_wire_bytes.is_some() {
+        return matmul_rhs_transposed_tq2_0_block_dot(input, weight, name);
+    }
     if should_use_q8_0_block_dot_with_plan(weight, input_width, runtime_plan) {
         return matmul_rhs_transposed_q8_0_block_dot_with_plan(input, weight, name, runtime_plan);
     }
@@ -15054,6 +15064,92 @@ pub(crate) fn quantize_q8_k_blocks(input: &[f32]) -> Vec<Q8KBlock> {
         .collect()
 }
 
+/// Per-row ternary dot: one TQ2_0 weight row (66-byte/256-weight blocks) against a
+/// Q8_K-quantised activation row. Scalar port of ggml `ggml_vec_dot_tq2_0_q8_K_generic`:
+/// per block, sumi = Σ (code-1)·q8, then scaled by d_x·d_y. The 2-bit codes {0,1,2}
+/// recenter to {-1,0,+1} via the `-1`.
+fn tq2_0_row_dot(w_row: &[u8], q8: &[Q8KBlock], blocks_per_row: usize) -> f32 {
+    let mut sumf = 0f32;
+    for b in 0..blocks_per_row {
+        let wb = &w_row[b * 66..b * 66 + 66];
+        let qs = &wb[0..64];
+        let dw = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([wb[64], wb[65]]));
+        let yb = &q8[b];
+        let mut sumi: i32 = 0;
+        let mut j = 0usize;
+        while j < 64 {
+            for l in 0..4 {
+                let base = j * 4 + l * 32;
+                for k in 0..32 {
+                    let code = ((qs[j + k] >> (2 * l)) & 3) as i32;
+                    sumi += (code - 1) * (yb.qs[base + k] as i32);
+                }
+            }
+            j += 32;
+        }
+        sumf += sumi as f32 * (yb.d * dw);
+    }
+    sumf
+}
+
+/// Streaming TQ2_0 (ternary) linear: `output[n_rows, out_dim] = input @ weightᵀ`, with
+/// the weight held as raw TQ2_0 wire bytes (never materialised to f32). Each input row is
+/// quantised to Q8_K once and dotted against every weight row (rayon-parallel over the
+/// output dimension). Correctness-first scalar dot; SIMD/tiling is a follow-up.
+fn matmul_rhs_transposed_tq2_0_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let n_rows = input.dim(0)?;
+    let in_dim = input.dim(1)?;
+    let out_dim = weight.dim(0)?;
+    if in_dim % 256 != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "TQ2_0 block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let blocks_per_row = in_dim / 256;
+    let wire = weight.tq2_0_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("TQ2_0 weight missing wire bytes".to_string())
+    })?;
+    let row_bytes = blocks_per_row * 66; // TQ2_0 = 66 bytes / 256-weight block
+    if wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "TQ2_0 weight wire length {} != out_dim {out_dim} * {row_bytes}",
+            wire.len()
+        )));
+    }
+    let mut out = vec![0f32; n_rows * out_dim];
+    for r in 0..n_rows {
+        let in_row = &input.data[r * in_dim..(r + 1) * in_dim];
+        let q8 = quantize_q8_k_blocks(in_row);
+        out[r * out_dim..(r + 1) * out_dim]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(o, slot)| {
+                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                *slot = tq2_0_row_dot(w_row, &q8, blocks_per_row);
+            });
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+/// Single-row (decode) variant of the streaming TQ2_0 linear: quantise the one input
+/// row to Q8_K once, then dot against every weight row (rayon-parallel over `output`).
+fn accumulate_transposed_linear_row_tq2_0(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let in_dim = input_row.len();
+    let blocks_per_row = in_dim / 256;
+    let row_bytes = blocks_per_row * 66;
+    let q8 = quantize_q8_k_blocks(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = tq2_0_row_dot(w_row, &q8, blocks_per_row);
+    });
+}
+
 /// Dequantize a single Q6_K wire superblock (210 bytes) into 256 f32 values,
 /// mirroring the reference `dequantize_row_q6_K` exactly (nibble/2-bit
 /// recombination order, per-16 i8 scales, f16 super-scale).
@@ -16883,6 +16979,12 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
     output: &mut [f32],
     runtime_plan: &ResolvedRuntimePlan,
 ) {
+    if weight.source_type == Some(GgufTensorType::Tq2_0) {
+        if let Some(wire) = weight.tq2_0_wire_bytes {
+            accumulate_transposed_linear_row_tq2_0(input_row, wire, output);
+            return;
+        }
+    }
     if should_use_borrowed_q8_0_block_dot_with_plan(weight, input_row.len(), runtime_plan) {
         accumulate_transposed_linear_row_q8_0_block_dot_with_flags(
             input_row,
