@@ -13,8 +13,9 @@
 use crate::gguf::{read_metadata, GgufTensorType};
 use crate::inference::gemma4::{gelu_tanh, soft_cap_in_place};
 use crate::inference::{
-    q4_0_wire_block_dequant, q4_0_wire_row_dot, q6_k_wire_block_dequant, q6_k_wire_row_dot,
-    q8_0_wire_row_dot, quantize_q8_0_blocks, quantize_q8_k_blocks,
+    q4_0_wire_block_dequant, q4_0_wire_row_dot, q4_1_wire_row_dot, q4_k_wire_row_dot,
+    q6_k_wire_block_dequant, q6_k_wire_row_dot, q8_0_wire_row_dot, quantize_q8_0_blocks,
+    quantize_q8_k_blocks,
 };
 use crate::model::{Gemma4Binding, Gemma4Metadata, LlamaModelConfig};
 use crate::tensor::{f16_bits_to_f32, Q8_0Block, TensorStore};
@@ -37,6 +38,9 @@ const Q8_WIRE_BYTES_PER_BLOCK: usize = 34;
 enum WireFormat {
     Q8_0,
     Q4_0,
+    Q4_1,
+    Q4K,
+    Q5K,
     Q6K,
 }
 
@@ -44,8 +48,8 @@ impl WireFormat {
     #[inline]
     fn values_per_block(self) -> usize {
         match self {
-            WireFormat::Q8_0 | WireFormat::Q4_0 => 32,
-            WireFormat::Q6K => crate::inference::Q6_K_VALUES_PER_BLOCK,
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => 32,
+            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => 256,
         }
     }
 
@@ -54,6 +58,10 @@ impl WireFormat {
         match self {
             WireFormat::Q8_0 => Q8_WIRE_BYTES_PER_BLOCK,
             WireFormat::Q4_0 => crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK,
+            // block_q4_1 = f16 d + f16 m + 16 nibbles; Q4_K/Q5_K K-quant superblocks.
+            WireFormat::Q4_1 => 20,
+            WireFormat::Q4K => 144,
+            WireFormat::Q5K => 176,
             WireFormat::Q6K => crate::inference::Q6_K_WIRE_BYTES_PER_BLOCK,
         }
     }
@@ -79,10 +87,13 @@ impl WireQuant {
         let format = match desc.tensor_type {
             GgufTensorType::Q8_0 => WireFormat::Q8_0,
             GgufTensorType::Q4_0 => WireFormat::Q4_0,
+            GgufTensorType::Q4_1 => WireFormat::Q4_1,
+            GgufTensorType::Q4K => WireFormat::Q4K,
+            GgufTensorType::Q5K => WireFormat::Q5K,
             GgufTensorType::Q6K => WireFormat::Q6K,
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
-                    "tensor {name} is {other:?}; gemma4 wire load supports Q8_0, Q4_0, and Q6_K"
+                    "tensor {name} is {other:?}; gemma4 wire load supports Q8_0, Q4_0, Q4_1, Q4_K, Q5_K, and Q6_K"
                 )))
             }
         };
@@ -141,10 +152,14 @@ impl WireQuant {
             "matvec assumes block-aligned rows"
         );
         match self.format {
-            WireFormat::Q8_0 | WireFormat::Q4_0 => self.matvec_q(out_dim, &quantize_q8_0_blocks(x)),
-            // Q6_K rows dot against Q8_K activations (the reference's K-quant
-            // activation format) — used by the QAT tied embedding head.
-            WireFormat::Q6K => self.matvec_q8k(out_dim, &quantize_q8_k_blocks(x)),
+            WireFormat::Q8_0 | WireFormat::Q4_0 | WireFormat::Q4_1 => {
+                self.matvec_q(out_dim, &quantize_q8_0_blocks(x))
+            }
+            // K-quant rows dot against Q8_K activations (the reference's K-quant
+            // activation format) — Q6_K/Q4_K used by the QAT tied embedding head.
+            WireFormat::Q4K | WireFormat::Q6K => self.matvec_q8k(out_dim, &quantize_q8_k_blocks(x)),
+            // Q5_K is gather-only here (per_layer_token_embd); never a matvec weight.
+            WireFormat::Q5K => unreachable!("Q5_K is gather-only (per_layer_token_embd)"),
         }
     }
 
@@ -165,7 +180,10 @@ impl WireQuant {
         let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
             WireFormat::Q8_0 => q8_0_wire_row_dot,
             WireFormat::Q4_0 => q4_0_wire_row_dot,
-            WireFormat::Q6K => unreachable!("Q6_K matvec routes through matvec_q8k"),
+            WireFormat::Q4_1 => q4_1_wire_row_dot,
+            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
+                unreachable!("K-quant matvec routes through matvec_q8k")
+            }
         };
         let mut out = vec![0f32; out_dim];
         out.par_chunks_mut(ROW_CHUNK)
@@ -192,7 +210,10 @@ impl WireQuant {
         let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
             WireFormat::Q8_0 => q8_0_wire_row_dot,
             WireFormat::Q4_0 => q4_0_wire_row_dot,
-            WireFormat::Q6K => unreachable!("Q6_K rows route through matvec_q8k"),
+            WireFormat::Q4_1 => q4_1_wire_row_dot,
+            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
+                unreachable!("K-quant rows route through matvec_q8k")
+            }
         };
         let mut out = vec![0f32; out_count];
         out.par_chunks_mut(ROW_CHUNK)
@@ -225,7 +246,10 @@ impl WireQuant {
         let row_dot: fn(&[u8], &[Q8_0Block]) -> f32 = match self.format {
             WireFormat::Q8_0 => q8_0_wire_row_dot,
             WireFormat::Q4_0 => q4_0_wire_row_dot,
-            WireFormat::Q6K => unreachable!("Q6_K matmul routes through matmul_q8k"),
+            WireFormat::Q4_1 => q4_1_wire_row_dot,
+            WireFormat::Q4K | WireFormat::Q5K | WireFormat::Q6K => {
+                unreachable!("K-quant matmul routes through matmul_q8k")
+            }
         };
         // out[ki][o]; one Vec per activation. Chunk over output rows (the same fixed
         // chunking matvec_q uses) so each weight row is read once and dotted against
@@ -260,6 +284,11 @@ impl WireQuant {
         const ROW_CHUNK: usize = 64;
         let row_bytes = xq.len() * self.format.bytes_per_block();
         let bytes = self.bytes();
+        let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
+            WireFormat::Q6K => q6_k_wire_row_dot,
+            WireFormat::Q4K => q4_k_wire_row_dot,
+            _ => unreachable!("matvec_q8k is only for Q6_K/Q4_K weights"),
+        };
         let mut out = vec![0f32; out_dim];
         out.par_chunks_mut(ROW_CHUNK)
             .enumerate()
@@ -267,7 +296,7 @@ impl WireQuant {
                 let base = chunk_idx * ROW_CHUNK;
                 for (i, d) in dst.iter_mut().enumerate() {
                     let o = base + i;
-                    *d = q6_k_wire_row_dot(&bytes[o * row_bytes..(o + 1) * row_bytes], xq);
+                    *d = row_dot(&bytes[o * row_bytes..(o + 1) * row_bytes], xq);
                 }
             });
         out
@@ -284,6 +313,11 @@ impl WireQuant {
         }
         let row_bytes = xqs[0].len() * self.format.bytes_per_block();
         let bytes = self.bytes();
+        let row_dot: fn(&[u8], &[crate::inference::Q8KBlock]) -> f32 = match self.format {
+            WireFormat::Q6K => q6_k_wire_row_dot,
+            WireFormat::Q4K => q4_k_wire_row_dot,
+            _ => unreachable!("matmul_q8k is only for Q6_K/Q4_K weights"),
+        };
         let mut flat = vec![0f32; out_dim * k];
         flat.par_chunks_mut(ROW_CHUNK * k)
             .enumerate()
@@ -294,7 +328,7 @@ impl WireQuant {
                     let o = base + r;
                     let w = &bytes[o * row_bytes..(o + 1) * row_bytes];
                     for (ki, xq) in xqs.iter().enumerate() {
-                        dst[r * k + ki] = q6_k_wire_row_dot(w, xq);
+                        dst[r * k + ki] = row_dot(w, xq);
                     }
                 }
             });
@@ -357,6 +391,32 @@ impl WireQuant {
                     }
                     out.push(decoded[e % BV]);
                 }
+            }
+            // Q4_K tied head + Q5_K per_layer_token_embd are gathered for the input
+            // embedding / PLE; decode one 256-value superblock at a time via the shared
+            // K-quant decoders (reused, not reimplemented).
+            WireFormat::Q4K | WireFormat::Q5K => {
+                const BV: usize = 256;
+                let bb = self.format.bytes_per_block();
+                let mut block = usize::MAX;
+                let mut decoded: Vec<f32> = Vec::new();
+                for e in start..end {
+                    if e / BV != block {
+                        block = e / BV;
+                        let sb = &bytes[block * bb..(block + 1) * bb];
+                        decoded = match self.format {
+                            WireFormat::Q4K => {
+                                crate::tensor::decode_q4_k_tensor("gemma4 wire gather", sb, BV)?
+                            }
+                            _ => crate::tensor::decode_q5_k_tensor("gemma4 wire gather", sb, BV)?,
+                        };
+                    }
+                    out.push(decoded[e % BV]);
+                }
+            }
+            // Q4_1 is a matvec-only weight here (ffn_down); never gathered.
+            WireFormat::Q4_1 => {
+                unreachable!("Q4_1 is matvec-only (ffn_down); never gathered")
             }
         }
         Ok(out)
@@ -3351,5 +3411,32 @@ mod cuda_parity_tests {
             &cpu_ids[..],
             "gemma4 CUDA greedy diverged from the CPU oracle within the shared prefix"
         );
+    }
+}
+
+#[cfg(test)]
+mod q4_0_cpu_tests {
+    use super::*;
+
+    // Phase 1 gate (mission C): the CPU oracle must LOAD the mixed-quant Q4_0 file
+    // (Q4_0 + Q4_1 ffn_down + Q4_K tied head + Q5_K per_layer_token_embd + BF16 proj)
+    // and generate coherent greedy text. Set CAMELID_GEMMA4_Q4_GGUF to the file.
+    #[test]
+    #[ignore = "set CAMELID_GEMMA4_Q4_GGUF to the mixed Q4_0 gemma4 gguf"]
+    fn cpu_loads_and_decodes_mixed_q4_0() {
+        let path = match std::env::var("CAMELID_GEMMA4_Q4_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip: set CAMELID_GEMMA4_Q4_GGUF");
+                return;
+            }
+        };
+        let cpu = Gemma4Runtime::load(std::path::Path::new(&path)).expect("load mixed Q4_0");
+        let (text, ids) = cpu
+            .generate_greedy("The capital of France is", 16)
+            .expect("cpu generate");
+        eprintln!("Q4_0 CPU ids:  {ids:?}");
+        eprintln!("Q4_0 CPU text: {text:?}");
+        assert!(!ids.is_empty(), "generated no tokens");
     }
 }

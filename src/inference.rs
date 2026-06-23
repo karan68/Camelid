@@ -14962,6 +14962,39 @@ pub(crate) fn q4_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
     total
 }
 
+/// Q4_1 weight row dotted against a Q8_0-quantized activation. Q4_1 block = 20 bytes
+/// (f16 scale `d` + f16 min `m` + 16 nibble bytes, 32 values); the nibble is UNSIGNED
+/// (no -8 bias) and dequant is `q*d + m` (matches `decode_q4_1_tensor`/`Q4_1Block`).
+/// Factored exactly: per block `act_scale * (d * sum(q*act_q) + m * sum(act_q))`.
+pub(crate) fn q4_1_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
+    const WIRE: usize = 20;
+    let mut total = 0.0_f32;
+    for (b, i_block) in input.iter().enumerate() {
+        let base = b * WIRE;
+        let d = f16_bits_to_f32(u16::from_le_bytes([
+            weight_wire[base],
+            weight_wire[base + 1],
+        ]));
+        let m = f16_bits_to_f32(u16::from_le_bytes([
+            weight_wire[base + 2],
+            weight_wire[base + 3],
+        ]));
+        let mut isum = 0i32; // sum(q * act_q)
+        let mut asum = 0i32; // sum(act_q)
+        for j in 0..16 {
+            let byte = weight_wire[base + 4 + j];
+            let lo = (byte & 0x0F) as i32;
+            let hi = (byte >> 4) as i32;
+            let a_lo = i_block.quants[j] as i32;
+            let a_hi = i_block.quants[j + 16] as i32;
+            isum += lo * a_lo + hi * a_hi;
+            asum += a_lo + a_hi;
+        }
+        total += i_block.scale * (d * isum as f32 + m * asum as f32);
+    }
+    total
+}
+
 /// Values per Q6_K superblock.
 pub(crate) const Q6_K_VALUES_PER_BLOCK: usize = 256;
 /// Bytes per Q6_K wire superblock: ql[128] + qh[64] + scales(i8)[16] + d(f16).

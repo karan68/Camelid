@@ -363,3 +363,49 @@ fn real_row_metadata_snapshot_matches() {
     // Every non-global probe layer before the first global one is sliding.
     assert!(g.is_sliding_layer(0), "{} layer 0 must be sliding", row.row);
 }
+
+/// Recon probe: confirm the mixed-quant Q4_0 gemma4 file opens and dump the quant type
+/// of every tensor class. Set CAMELID_GEMMA4_Q4_GGUF to the file. Read-only; no asserts.
+#[test]
+#[ignore = "set CAMELID_GEMMA4_Q4_GGUF to the mixed Q4_0 gemma4 gguf"]
+fn dump_q4_0_tensor_types() {
+    let path = match std::env::var("CAMELID_GEMMA4_Q4_GGUF") {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("skip: set CAMELID_GEMMA4_Q4_GGUF");
+            return;
+        }
+    };
+    let gguf = camelid::gguf::read_metadata(std::path::Path::new(&path)).expect("read_metadata");
+    let normalize = |name: &str| -> String {
+        name.split('.')
+            .map(|seg| {
+                if !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) {
+                    "*"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let mut by_class: BTreeMap<String, std::collections::BTreeSet<String>> = BTreeMap::new();
+    let mut type_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for t in &gguf.tensors {
+        by_class
+            .entry(normalize(&t.name))
+            .or_default()
+            .insert(format!("{:?}", t.tensor_type));
+        *type_counts
+            .entry(format!("{:?}", t.tensor_type))
+            .or_default() += 1;
+    }
+    eprintln!("=== {} tensors; distinct types ===", gguf.tensors.len());
+    for (ty, c) in &type_counts {
+        eprintln!("  {ty}: {c}");
+    }
+    eprintln!("=== tensor class -> type(s) ===");
+    for (cls, tys) in &by_class {
+        eprintln!("  {cls} -> {tys:?}");
+    }
+}
