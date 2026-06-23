@@ -2072,3 +2072,1284 @@ static PREP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 static GPU_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static FWD_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-layer RMSNorm weights kept resident on the GPU (small; ~tens of KB/layer).
+#[cfg(feature = "cuda")]
+struct Gemma4LayerNormsDev {
+    attn_norm: cudarc::driver::CudaSlice<f32>,
+    q_norm: cudarc::driver::CudaSlice<f32>,
+    k_norm: Option<cudarc::driver::CudaSlice<f32>>,
+    post_attn_norm: cudarc::driver::CudaSlice<f32>,
+    ffn_norm: cudarc::driver::CudaSlice<f32>,
+    post_ffw_norm: cudarc::driver::CudaSlice<f32>,
+}
+
+/// Per-layer projection weights kept resident on the GPU in the SoA layout
+/// `q8_gemv` reads (uploaded once at load). For E4B Q8 this is ~4–4.5 GB and fits
+/// a 6 GB card because the big embeddings (`token_embd`, `per_layer_token_embd`)
+/// stay on the CPU for the head + PLE gather. `k`/`v` exist only on owning layers;
+/// `v` is `None` on V-less layers (V reuses the K projection).
+#[cfg(feature = "cuda")]
+struct Gemma4LayerWeightsDev {
+    q: cudarc::driver::CudaSlice<u8>,
+    k: Option<cudarc::driver::CudaSlice<u8>>,
+    v: Option<cudarc::driver::CudaSlice<u8>>,
+    o: cudarc::driver::CudaSlice<u8>,
+    gate: cudarc::driver::CudaSlice<u8>,
+    up: cudarc::driver::CudaSlice<u8>,
+    down: cudarc::driver::CudaSlice<u8>,
+}
+
+/// Per-layer PLE weights resident on the GPU (small f32 matrices), so the
+/// per-layer PLE injection runs entirely on the device — no host round-trip.
+#[cfg(feature = "cuda")]
+struct Gemma4LayerPleDev {
+    inp_gate: cudarc::driver::CudaSlice<f32>,
+    proj: cudarc::driver::CudaSlice<f32>,
+    post_norm: cudarc::driver::CudaSlice<f32>,
+    output_scale: f32,
+}
+
+/// A captured decode CUDA graph, wrapped Send: cudarc's `CudaGraph` is not `Send`,
+/// but the engine lives behind a `Mutex` in `Arc<Gemma4ServeRuntime>` (one request
+/// at a time), so the raw graph handle is only ever touched under the lock.
+#[cfg(feature = "cuda")]
+struct SendGraph(cudarc::driver::CudaGraph);
+#[cfg(feature = "cuda")]
+unsafe impl Send for SendGraph {}
+
+#[cfg(feature = "cuda")]
+fn cu(e: cudarc::driver::DriverError) -> BackendError {
+    BackendError::InvalidModelMetadata(format!("gemma4 cuda: {e}"))
+}
+
+/// Repack a GGUF Q8_0 weight tensor (34-byte blocks: f16 scale + 32 i8) into the
+/// SoA layout `q8_gemv` reads: all 32-i8 quant groups first, then all f32 scales
+/// (the f16 scale widened). Mirrors `cuda_resident::repack_q8_soa` but consumes
+/// the raw GGUF wire directly (that helper expects an already-f32-scale 36B block).
+#[cfg(feature = "cuda")]
+fn q8_wire_to_soa(wire: &[u8]) -> Vec<u8> {
+    const W: usize = 34;
+    let n = wire.len() / W;
+    let mut out = vec![0u8; n * 32 + n * 4];
+    let (quants, scales) = out.split_at_mut(n * 32);
+    for b in 0..n {
+        let blk = &wire[b * W..b * W + W];
+        let sc = crate::inference::f16_bits_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        quants[b * 32..b * 32 + 32].copy_from_slice(&blk[2..34]);
+        scales[b * 4..b * 4 + 4].copy_from_slice(&sc.to_le_bytes());
+    }
+    out
+}
+
+/// Quant lane of the GPU tied head: Q8_0 (`q8_gemv` over SoA-repacked weight, Q8_0
+/// input) or Q6_K (`q6k_gemv` over raw wire, Q8_K input).
+#[cfg(feature = "cuda")]
+enum HeadLane {
+    Q8_0,
+    Q6K,
+}
+
+/// Resident GPU tied head. `weight` is the vocab-major projection (SoA for Q8_0, raw
+/// Q6_K wire otherwise); input is quantized by the fused rms_norm+quantize into
+/// `inq`/`ins`; `logits` is dtoh'd once per token. `blocks` is blocks-per-row passed
+/// to the GEMV (`hidden/32` for Q8_0, `hidden/256` for Q6_K).
+#[cfg(feature = "cuda")]
+struct Gemma4HeadDev {
+    lane: HeadLane,
+    weight: cudarc::driver::CudaSlice<u8>,
+    output_norm: cudarc::driver::CudaSlice<f32>,
+    logits: cudarc::driver::CudaSlice<f32>,
+    inq: cudarc::driver::CudaSlice<i8>,
+    ins: cudarc::driver::CudaSlice<f32>,
+    blocks: usize,
+    softcap: f32,
+}
+
+/// Resident PLE context-projection (the `proj·h` matvec that dominated CPU prep).
+/// `proj` (per_layer_model_proj, [block_count*ple_dim x hidden] f32, ~110 MB) and
+/// `proj_norm` stay resident; `ti` holds this token's per_layer_token_embd row
+/// (gathered+dequantized on the CPU each token — that table is too big to reside).
+#[cfg(feature = "cuda")]
+struct Gemma4PleCtxDev {
+    proj: cudarc::driver::CudaSlice<f32>,
+    proj_norm: cudarc::driver::CudaSlice<f32>,
+    ti: cudarc::driver::CudaSlice<f32>,
+    ple_total: usize,
+    proj_scale: f32,
+    embed_scale: f32,
+}
+
+/// CUDA gemma4 decode engine (Windows/NVIDIA). Wraps a CPU-loaded [`Gemma4Runtime`]
+/// for weights/config/tokenizer and runs the per-token forward through the shared
+/// `crate::cuda_resident` kernels. Layer projection weights are streamed from the
+/// host mmap per layer (so E4B Q8 fits a 6 GB card); small ops with no large weight
+/// read — the scaled embedding and the PLE injection — run on the CPU/GPU as noted.
+/// The tied Q6_K head runs on the GPU (`gpu_head`) when resident, else on the CPU.
+/// Per-layer geometry (head_dim 256/512, dual-θ RoPE, sliding window, cross-layer KV
+/// source) comes from `plan`.
+#[cfg(feature = "cuda")]
+#[allow(dead_code)]
+pub struct Gemma4CudaResident {
+    cpu: Gemma4Runtime,
+    kernels: crate::cuda_resident::CudaResidentKernels,
+    /// A dedicated non-default stream for the decode forward. The legacy default
+    /// stream (`kernels.stream`) cannot be put into capture mode, so all per-token
+    /// work runs here to allow recording the layer stack into a CUDA graph.
+    cap_stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    plan: Vec<crate::model::Gemma4LayerPlan>,
+    norms: Vec<Gemma4LayerNormsDev>,
+    lweights: Vec<Gemma4LayerWeightsDev>,
+    ple: Vec<Option<Gemma4LayerPleDev>>,
+    block_count: usize,
+    heads: usize,
+    hidden: usize,
+    ple_dim: usize,
+    eps: f32,
+    vocab: usize,
+    max_positions: usize,
+    first_kv_shared: usize,
+    half_max: usize,
+    /// Captured per-token layer-stack graph (lazily recorded after a warmup pass);
+    /// replaying it replaces ~900 per-token kernel launches with one launch.
+    decode_graph: Option<SendGraph>,
+    /// True once the layer kernels have run once directly (cold first-launch lazy
+    /// init isn't capturable, so we warm up before recording the graph).
+    warmed: bool,
+    /// GPU tied head (Q6_K only). `Some` runs the final projection on the GPU
+    /// (fused rms_norm+Q8K-quant -> q6k_gemv over the vocab -> soft-cap), replacing
+    /// the ~1.2 s/token CPU Q6_K matvec that otherwise dominates decode. `None` keeps
+    /// the head on the CPU (non-Q6_K head, or `hidden` not a multiple of 256).
+    gpu_head: Option<Gemma4HeadDev>,
+    /// GPU PLE context projection. `Some` runs `proj·h` + per-layer rms-norm + combine
+    /// on the GPU (writing `d_pli` directly), replacing the ~27.5M-mult CPU matvec that
+    /// was the remaining prep bottleneck. `None` falls back to the CPU pli compute.
+    gpu_ple_ctx: Option<Gemma4PleCtxDev>,
+    // Per-owning-layer f16 KV caches ([kv_head][pos][head_dim]); None on shared layers.
+    cache_k: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
+    cache_v: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
+    // Reused per-token/per-layer device scratch (sized to per-layer maxima).
+    d_hidden: cudarc::driver::CudaSlice<f32>,
+    d_normed: cudarc::driver::CudaSlice<f32>,
+    d_inq: cudarc::driver::CudaSlice<i8>,
+    d_ins: cudarc::driver::CudaSlice<f32>,
+    d_q: cudarc::driver::CudaSlice<f32>,
+    d_k: cudarc::driver::CudaSlice<f32>,
+    d_v: cudarc::driver::CudaSlice<f32>,
+    d_attn: cudarc::driver::CudaSlice<f32>,
+    d_attnq: cudarc::driver::CudaSlice<i8>,
+    d_attns: cudarc::driver::CudaSlice<f32>,
+    d_o: cudarc::driver::CudaSlice<f32>,
+    d_gate: cudarc::driver::CudaSlice<f32>,
+    d_up: cudarc::driver::CudaSlice<f32>,
+    d_geglu: cudarc::driver::CudaSlice<f32>,
+    d_geglu_q: cudarc::driver::CudaSlice<i8>,
+    d_geglu_s: cudarc::driver::CudaSlice<f32>,
+    d_ffn_out: cudarc::driver::CudaSlice<f32>,
+    // All layers' RoPE tables for this token (slot li at li*half_max), uploaded once
+    // so the per-layer loop has no in-loop memcpy (required for graph capture).
+    d_cos_all: cudarc::driver::CudaSlice<f32>,
+    d_sin_all: cudarc::driver::CudaSlice<f32>,
+    d_position: cudarc::driver::CudaSlice<i32>,
+    // PLE scratch (GPU injection): d_pli holds this token's per-layer inputs.
+    d_pli: cudarc::driver::CudaSlice<f32>,
+    d_ple_gated: cudarc::driver::CudaSlice<f32>,
+    d_ple_gated2: cudarc::driver::CudaSlice<f32>,
+    d_ple_proj: cudarc::driver::CudaSlice<f32>,
+    d_ple_normed: cudarc::driver::CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+impl Gemma4CudaResident {
+    /// Load the model (CPU runtime, weights mmap'd), bring up the CUDA kernels,
+    /// upload per-layer norms, and allocate the KV caches + scratch. `max_positions`
+    /// bounds the resident KV cache.
+    pub fn load(path: &Path, max_positions: usize) -> Result<Self> {
+        let cpu = Gemma4Runtime::load(path)?;
+        let kernels = crate::cuda_resident::CudaResidentKernels::new()
+            .map_err(BackendError::InvalidModelMetadata)?;
+        // Disable cudarc's automatic cross-stream event tracking. Allocating a second
+        // (capture) stream below puts the context in multi-stream mode, which otherwise
+        // makes every launch record/drop CudaEvents on its slice args — and event
+        // create/destroy is not permitted while a stream is capturing, breaking the
+        // decode graph. The whole forward runs on a single stream (`cap_stream`), so
+        // ordering is implicit and manual; no auto-sync is needed. All gemma4 device
+        // slices are created below while this is off, so they never track events.
+        unsafe { kernels.ctx.disable_event_tracking() };
+        // Capture-capable stream for the decode graph (the default stream is not).
+        let cap_stream = kernels.ctx.new_stream().map_err(cu)?;
+        let s = kernels.stream.clone();
+        let block_count = cpu.config.block_count as usize;
+        let heads = cpu.config.attention_head_count as usize;
+        let hidden = cpu.config.embedding_length as usize;
+        let vocab = cpu.token_embd.element_count / hidden;
+        let eps = cpu.config.rms_norm_epsilon;
+        let first_kv_shared = cpu.first_kv_shared;
+        let plan = cpu.g.layer_plan(block_count, heads);
+        let ple_dim = cpu
+            .per_layer_proj_norm
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        // GPU tied head: make the vocab-major head weight resident and run the final
+        // projection on the GPU. The CPU matvec over the 262K vocab is ~1.2 s/token —
+        // the decode bottleneck — versus a few ms for the GEMV. ~0.55-0.7 GB on E4B.
+        let softcap = cpu.g.final_logit_softcapping.unwrap_or(0.0);
+        let gpu_head = match cpu.token_embd.format {
+            WireFormat::Q8_0 if hidden.is_multiple_of(32) => {
+                let blocks = hidden / 32;
+                Some(Gemma4HeadDev {
+                    lane: HeadLane::Q8_0,
+                    weight: s
+                        .clone_htod(&q8_wire_to_soa(cpu.token_embd.bytes()))
+                        .map_err(cu)?,
+                    output_norm: s.clone_htod(&cpu.output_norm).map_err(cu)?,
+                    logits: s.alloc_zeros::<f32>(vocab).map_err(cu)?,
+                    inq: s.alloc_zeros::<i8>(hidden).map_err(cu)?,
+                    ins: s.alloc_zeros::<f32>(blocks).map_err(cu)?,
+                    blocks,
+                    softcap,
+                })
+            }
+            WireFormat::Q6K if hidden.is_multiple_of(256) => {
+                let blocks = hidden / 256;
+                Some(Gemma4HeadDev {
+                    lane: HeadLane::Q6K,
+                    weight: s.clone_htod(cpu.token_embd.bytes()).map_err(cu)?,
+                    output_norm: s.clone_htod(&cpu.output_norm).map_err(cu)?,
+                    logits: s.alloc_zeros::<f32>(vocab).map_err(cu)?,
+                    inq: s.alloc_zeros::<i8>(blocks * 256).map_err(cu)?,
+                    ins: s.alloc_zeros::<f32>(blocks).map_err(cu)?,
+                    blocks,
+                    softcap,
+                })
+            }
+            _ => None,
+        };
+
+        // GPU PLE context projection: make per_layer_model_proj (~110 MB f32) + proj_norm
+        // resident so `proj·h` (the ~27.5M-mult per-token matvec that dominated CPU prep)
+        // runs on the GPU. The per_layer_token_embd table stays CPU (too big to reside);
+        // only this token's row is gathered/dequantized + uploaded each step.
+        let gpu_ple_ctx = match (
+            cpu.per_layer_model_proj.as_ref(),
+            cpu.per_layer_proj_norm.as_ref(),
+            cpu.per_layer_token_embd.as_ref(),
+        ) {
+            (Some(proj), Some(pn), Some(_)) if ple_dim > 0 => {
+                let ple_total = block_count * ple_dim;
+                Some(Gemma4PleCtxDev {
+                    proj: s.clone_htod(&proj[0..ple_total * hidden]).map_err(cu)?,
+                    proj_norm: s.clone_htod(pn).map_err(cu)?,
+                    ti: s.alloc_zeros::<f32>(ple_total).map_err(cu)?,
+                    ple_total,
+                    proj_scale: (hidden as f32).powf(-0.5),
+                    embed_scale: (ple_dim as f32).sqrt(),
+                })
+            }
+            _ => None,
+        };
+
+        // Per-layer maxima for scratch sizing.
+        let q_dim_max = plan.iter().map(|p| p.q_dim).max().unwrap_or(0);
+        let kv_dim_max = plan.iter().map(|p| p.kv_dim).max().unwrap_or(0);
+        let head_dim_max = plan.iter().map(|p| p.head_dim).max().unwrap_or(0);
+        let ffn_max = (0..block_count)
+            .map(|l| cpu.g.ffn_length_at(l) as usize)
+            .max()
+            .unwrap_or(0);
+
+        // Upload per-layer norm weights (resident; small).
+        let mut norms = Vec::with_capacity(block_count);
+        for lw in &cpu.layers {
+            norms.push(Gemma4LayerNormsDev {
+                attn_norm: s.clone_htod(&lw.attn_norm).map_err(cu)?,
+                q_norm: s.clone_htod(&lw.q_norm).map_err(cu)?,
+                k_norm: match lw.k_norm.as_ref() {
+                    Some(w) => Some(s.clone_htod(w).map_err(cu)?),
+                    None => None,
+                },
+                post_attn_norm: s.clone_htod(&lw.post_attn_norm).map_err(cu)?,
+                ffn_norm: s.clone_htod(&lw.ffn_norm).map_err(cu)?,
+                post_ffw_norm: s.clone_htod(&lw.post_ffw_norm).map_err(cu)?,
+            });
+        }
+
+        // Per-layer projection weights, resident in the SoA layout q8_gemv reads
+        // (uploaded once; the big embeddings stay on the CPU). k/v only on owning layers.
+        let upw = |wq: &WireQuant| s.clone_htod(&q8_wire_to_soa(wq.bytes())).map_err(cu);
+        let mut lweights = Vec::with_capacity(block_count);
+        for (li, lw) in cpu.layers.iter().enumerate() {
+            let owns = plan[li].owns_kv;
+            lweights.push(Gemma4LayerWeightsDev {
+                q: upw(&lw.attn_q)?,
+                k: if owns {
+                    Some(upw(lw.attn_k.as_ref().expect("owning layer binds attn_k"))?)
+                } else {
+                    None
+                },
+                v: if owns {
+                    match lw.attn_v.as_ref() {
+                        Some(wv) => Some(upw(wv)?),
+                        None => None,
+                    }
+                } else {
+                    None
+                },
+                o: upw(&lw.attn_output)?,
+                gate: upw(&lw.ffn_gate)?,
+                up: upw(&lw.ffn_up)?,
+                down: upw(&lw.ffn_down)?,
+            });
+        }
+
+        // Per-layer PLE weights resident (small f32 matrices) for on-GPU injection.
+        let mut ple = Vec::with_capacity(block_count);
+        for lw in &cpu.layers {
+            ple.push(
+                if let (Some(ig), Some(pj), Some(pn)) = (
+                    lw.ple_inp_gate.as_ref(),
+                    lw.ple_proj.as_ref(),
+                    lw.post_norm.as_ref(),
+                ) {
+                    Some(Gemma4LayerPleDev {
+                        inp_gate: s.clone_htod(ig).map_err(cu)?,
+                        proj: s.clone_htod(pj).map_err(cu)?,
+                        post_norm: s.clone_htod(pn).map_err(cu)?,
+                        output_scale: lw.ple_output_scale,
+                    })
+                } else {
+                    None
+                },
+            );
+        }
+
+        // Per-owning-layer f16 KV caches sized to that layer's kv geometry.
+        let mut cache_k = Vec::with_capacity(block_count);
+        let mut cache_v = Vec::with_capacity(block_count);
+        for p in &plan {
+            if p.owns_kv {
+                let n = p.kv_dim * max_positions;
+                cache_k.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
+                cache_v.push(Some(s.alloc_zeros::<u16>(n).map_err(cu)?));
+            } else {
+                cache_k.push(None);
+                cache_v.push(None);
+            }
+        }
+
+        let alloc_f = |n: usize| s.alloc_zeros::<f32>(n.max(1));
+        let alloc_i = |n: usize| s.alloc_zeros::<i8>(n.max(1));
+        let me = Self {
+            norms,
+            lweights,
+            ple,
+            block_count,
+            heads,
+            hidden,
+            ple_dim,
+            eps,
+            vocab,
+            max_positions,
+            first_kv_shared,
+            half_max: head_dim_max / 2,
+            decode_graph: None,
+            warmed: false,
+            cache_k,
+            cache_v,
+            d_hidden: alloc_f(hidden).map_err(cu)?,
+            d_normed: alloc_f(hidden).map_err(cu)?,
+            d_inq: alloc_i(hidden).map_err(cu)?,
+            d_ins: alloc_f(hidden / 32).map_err(cu)?,
+            d_q: alloc_f(q_dim_max).map_err(cu)?,
+            d_k: alloc_f(kv_dim_max).map_err(cu)?,
+            d_v: alloc_f(kv_dim_max).map_err(cu)?,
+            d_attn: alloc_f(q_dim_max).map_err(cu)?,
+            d_attnq: alloc_i(q_dim_max).map_err(cu)?,
+            d_attns: alloc_f(q_dim_max / 32).map_err(cu)?,
+            d_o: alloc_f(hidden).map_err(cu)?,
+            d_gate: alloc_f(ffn_max).map_err(cu)?,
+            d_up: alloc_f(ffn_max).map_err(cu)?,
+            d_geglu: alloc_f(ffn_max).map_err(cu)?,
+            d_geglu_q: alloc_i(ffn_max).map_err(cu)?,
+            d_geglu_s: alloc_f(ffn_max / 32).map_err(cu)?,
+            d_ffn_out: alloc_f(hidden).map_err(cu)?,
+            d_cos_all: alloc_f(block_count * (head_dim_max / 2)).map_err(cu)?,
+            d_sin_all: alloc_f(block_count * (head_dim_max / 2)).map_err(cu)?,
+            d_position: s.alloc_zeros::<i32>(1).map_err(cu)?,
+            d_pli: alloc_f(block_count * ple_dim).map_err(cu)?,
+            d_ple_gated: alloc_f(ple_dim).map_err(cu)?,
+            d_ple_gated2: alloc_f(ple_dim).map_err(cu)?,
+            d_ple_proj: alloc_f(hidden).map_err(cu)?,
+            d_ple_normed: alloc_f(hidden).map_err(cu)?,
+            plan,
+            kernels,
+            cap_stream,
+            gpu_head,
+            gpu_ple_ctx,
+            cpu,
+        };
+        // Re-enable cudarc's auto event-tracking now that every gemma4 device slice is
+        // allocated. Those slices were created while it was off, so they carry no
+        // CudaEvents and the decode-graph capture stays clean; restoring it here keeps
+        // multi-stream synchronization correct for any other model loaded into this
+        // context afterwards (e.g. a later Llama reload in a serve process).
+        unsafe { me.kernels.ctx.enable_event_tracking() };
+        Ok(me)
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.cpu.tokenizer
+    }
+
+    pub fn layer_plan(&self) -> &[crate::model::Gemma4LayerPlan] {
+        &self.plan
+    }
+
+    /// One token's forward; returns next-token logits. Mirrors the CPU
+    /// `Gemma4Runtime::step_range` op order exactly (the parity oracle).
+    fn forward_token(
+        &mut self,
+        token: u32,
+        position: usize,
+        want_logits: bool,
+    ) -> Result<Vec<f32>> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        // Run on the capture-capable stream (not the default stream) so the layer
+        // stack can be recorded into a CUDA graph.
+        let s = self.cap_stream.clone();
+        let hidden = self.hidden;
+        let heads = self.heads;
+        let ple_dim = self.ple_dim;
+        let eps = self.eps;
+
+        // ---- CPU: scaled embedding (small f32 gather); upload before the GPU PLE proj ----
+        let h: Vec<f32> = self
+            .cpu
+            .token_embd
+            .dequantize_elements(token as usize * hidden, hidden)?
+            .iter()
+            .map(|v| v * (hidden as f32).sqrt())
+            .collect();
+        let ple_total = self.block_count * ple_dim;
+        s.memcpy_htod(&h, &mut self.d_hidden).map_err(cu)?;
+        s.memcpy_htod(&[position as i32], &mut self.d_position)
+            .map_err(cu)?;
+        // PLE per-layer inputs -> d_pli. GPU path: ctx = proj·h (f32_gemv) -> *proj_scale ->
+        // per-layer rms_norm(proj_norm) -> + ti*embed_scale -> *1/sqrt(2), all on device
+        // (the ~27.5M-mult matvec was the CPU prep bottleneck). The per_layer_token_embd
+        // row `ti` is gathered on the CPU (that table is too big to reside). CPU fallback below.
+        if let Some(ctxdev) = self.gpu_ple_ctx.as_mut() {
+            let ti = self
+                .cpu
+                .per_layer_token_embd
+                .as_ref()
+                .expect("gpu_ple_ctx implies per_layer_token_embd")
+                .dequantize_elements(token as usize * ctxdev.ple_total, ctxdev.ple_total)?;
+            s.memcpy_htod(&ti, &mut ctxdev.ti).map_err(cu)?;
+            crate::cuda_resident::launch_f32_gemv(
+                &s,
+                &self.kernels.f32_gemv,
+                &ctxdev.proj,
+                &self.d_hidden,
+                &mut self.d_pli,
+                hidden,
+                ctxdev.ple_total,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_scale(
+                &s,
+                &self.kernels.scale_f32,
+                &mut self.d_pli,
+                ctxdev.ple_total,
+                ctxdev.proj_scale,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_rms_norm_per_head(
+                &s,
+                &self.kernels.rms_norm_per_head,
+                &mut self.d_pli,
+                &ctxdev.proj_norm,
+                self.block_count,
+                ple_dim,
+                eps,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_scale(
+                &s,
+                &self.kernels.scale_f32,
+                &mut ctxdev.ti,
+                ctxdev.ple_total,
+                ctxdev.embed_scale,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_residual(
+                &s,
+                &self.kernels.residual_add,
+                &mut self.d_pli,
+                &ctxdev.ti,
+                ctxdev.ple_total,
+            )
+            .map_err(cu)?;
+            crate::cuda_resident::launch_scale(
+                &s,
+                &self.kernels.scale_f32,
+                &mut self.d_pli,
+                ctxdev.ple_total,
+                std::f32::consts::FRAC_1_SQRT_2,
+            )
+            .map_err(cu)?;
+        } else if let (Some(te), Some(proj), Some(pn)) = (
+            self.cpu.per_layer_token_embd.as_ref(),
+            self.cpu.per_layer_model_proj.as_ref(),
+            self.cpu.per_layer_proj_norm.as_ref(),
+        ) {
+            let ti = te.dequantize_elements(token as usize * ple_total, ple_total)?;
+            let ctx = f32_matvec(&proj[0..ple_total * hidden], hidden, ple_total, &h);
+            let proj_scale = (hidden as f32).powf(-0.5);
+            let ple_embed_scale = (ple_dim as f32).sqrt();
+            let pli_flat: Vec<f32> = (0..self.block_count)
+                .flat_map(|li| {
+                    let ctx_l: Vec<f32> = (0..ple_dim)
+                        .map(|d| ctx[li * ple_dim + d] * proj_scale)
+                        .collect();
+                    let ctx_n = rms_norm(&ctx_l, Some(pn), eps);
+                    (0..ple_dim)
+                        .map(|d| {
+                            (ctx_n[d] + ti[li * ple_dim + d] * ple_embed_scale)
+                                * std::f32::consts::FRAC_1_SQRT_2
+                        })
+                        .collect::<Vec<f32>>()
+                })
+                .collect();
+            s.memcpy_htod(&pli_flat, &mut self.d_pli).map_err(cu)?;
+        }
+        // Precompute every layer's RoPE table for this position (slot li = li*half_max)
+        // and upload once — so the per-layer loop has no in-loop memcpy (graph-capturable).
+        {
+            let half_max = self.half_max;
+            let mut cos_all = vec![0f32; self.block_count * half_max];
+            let mut sin_all = vec![0f32; self.block_count * half_max];
+            for li in 0..self.block_count {
+                let p = &self.plan[li];
+                let hd = p.head_dim;
+                let half = hd / 2;
+                let theta = p.theta;
+                let factors = if p.sliding {
+                    None
+                } else {
+                    self.cpu.rope_factors.as_deref()
+                };
+                let base = li * half_max;
+                for i in 0..half {
+                    let mut freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                    if let Some(f) = factors {
+                        freq /= f[i];
+                    }
+                    let (sn, cs) = (position as f32 * freq).sin_cos();
+                    cos_all[base + i] = cs;
+                    sin_all[base + i] = sn;
+                }
+            }
+            s.memcpy_htod(&cos_all, &mut self.d_cos_all).map_err(cu)?;
+            s.memcpy_htod(&sin_all, &mut self.d_sin_all).map_err(cu)?;
+        }
+        // Capture the per-token layer stack into a CUDA graph once, then replay it
+        // (one launch instead of ~900). The loop reads device buffers only (weights
+        // resident; pli/cos/position pre-uploaded above), so it is graph-capturable.
+        // Record the graph only AFTER a warmup pass: a kernel's first launch does
+        // lazy init (module/function load) which is not stream-capturable. The warmup
+        // call runs the loop directly; the next call captures it; later calls replay.
+        let do_capture = self.decode_graph.is_none() && self.warmed;
+        if do_capture {
+            use cudarc::driver::sys;
+            s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+                .map_err(cu)?;
+        }
+        if self.decode_graph.is_none() {
+            let k = &self.kernels;
+            for li in 0..self.block_count {
+                let p = self.plan[li].clone();
+                let hd = p.head_dim;
+                let half = hd / 2;
+                let q_dim = p.q_dim;
+                let kv_dim = p.kv_dim;
+                let kv_heads = p.kv_heads;
+                let ffn_dim = self.cpu.g.ffn_length_at(li) as usize;
+                let lw = &self.cpu.layers[li];
+                let nrm = &self.norms[li];
+                let lwd = &self.lweights[li];
+
+                // attention RMSNorm + Q8_0 quantize of the activation (shared by q/k/v).
+                crate::cuda_resident::launch_rmsnorm(
+                    &s,
+                    &k.rms_norm,
+                    &self.d_hidden,
+                    &nrm.attn_norm,
+                    &mut self.d_normed,
+                    hidden,
+                    eps,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &k.quantize,
+                    &self.d_normed,
+                    &mut self.d_inq,
+                    &mut self.d_ins,
+                    hidden / 32,
+                )
+                .map_err(cu)?;
+
+                // Q projection -> per-head q-norm -> RoPE (split-half, dual-θ).
+                crate::cuda_resident::launch_gemv(
+                    &s,
+                    &k.gemv,
+                    &self.d_ins,
+                    &self.d_inq,
+                    &lwd.q.slice(0..lwd.q.len()),
+                    q_dim,
+                    hidden / 32,
+                    &mut self.d_q,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_rms_norm_per_head(
+                    &s,
+                    &k.rms_norm_per_head,
+                    &mut self.d_q,
+                    &nrm.q_norm,
+                    heads,
+                    hd,
+                    eps,
+                )
+                .map_err(cu)?;
+                // RoPE q (split-half, dual-θ): read this layer's slot from d_cos_all/d_sin_all
+                // (uploaded once before the loop). Inline launch (launch_rope takes &CudaSlice).
+                let rope_off = li * self.half_max;
+                {
+                    let cos_v = self.d_cos_all.slice(rope_off..rope_off + half);
+                    let sin_v = self.d_sin_all.slice(rope_off..rope_off + half);
+                    let cfg = LaunchConfig {
+                        grid_dim: (((heads * half) as u32).div_ceil(128).max(1), 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let (nh, hdi, rd, pr) = (heads as i32, hd as i32, hd as i32, 1i32);
+                    let mut b = s.launch_builder(&k.rope);
+                    b.arg(&mut self.d_q)
+                        .arg(&cos_v)
+                        .arg(&sin_v)
+                        .arg(&nh)
+                        .arg(&hdi)
+                        .arg(&rd)
+                        .arg(&pr);
+                    unsafe { b.launch(cfg) }.map_err(cu)?;
+                }
+
+                // K/V projection + norms + RoPE + cache scatter — owning layers only.
+                if p.owns_kv {
+                    {
+                        let wk = lwd.k.as_ref().expect("owning layer has resident K");
+                        crate::cuda_resident::launch_gemv(
+                            &s,
+                            &k.gemv,
+                            &self.d_ins,
+                            &self.d_inq,
+                            &wk.slice(0..wk.len()),
+                            kv_dim,
+                            hidden / 32,
+                            &mut self.d_k,
+                        )
+                        .map_err(cu)?;
+                        match lwd.v.as_ref() {
+                            Some(wv) => {
+                                crate::cuda_resident::launch_gemv(
+                                    &s,
+                                    &k.gemv,
+                                    &self.d_ins,
+                                    &self.d_inq,
+                                    &wv.slice(0..wv.len()),
+                                    kv_dim,
+                                    hidden / 32,
+                                    &mut self.d_v,
+                                )
+                                .map_err(cu)?;
+                            }
+                            // V-less layers: V = K projection.
+                            None => {
+                                crate::cuda_resident::launch_gemv(
+                                    &s,
+                                    &k.gemv,
+                                    &self.d_ins,
+                                    &self.d_inq,
+                                    &wk.slice(0..wk.len()),
+                                    kv_dim,
+                                    hidden / 32,
+                                    &mut self.d_v,
+                                )
+                                .map_err(cu)?;
+                            }
+                        }
+                    }
+                    // k-norm (weighted) and v-norm (weightless), per kv head.
+                    crate::cuda_resident::launch_rms_norm_per_head(
+                        &s,
+                        &k.rms_norm_per_head,
+                        &mut self.d_k,
+                        nrm.k_norm.as_ref().expect("owning layer binds attn_k_norm"),
+                        kv_heads,
+                        hd,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    {
+                        // weightless V-norm (use_weight=0; weight ptr unused by the kernel).
+                        let cfg = LaunchConfig {
+                            grid_dim: (kv_heads as u32, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: (hd as u32) * 4,
+                        };
+                        let (hdi, uw) = (hd as i32, 0i32);
+                        let mut b = s.launch_builder(&k.rms_norm_per_head);
+                        b.arg(&mut self.d_v)
+                            .arg(&nrm.q_norm)
+                            .arg(&hdi)
+                            .arg(&eps)
+                            .arg(&uw);
+                        unsafe { b.launch(cfg) }.map_err(cu)?;
+                    }
+                    {
+                        let cos_v = self.d_cos_all.slice(rope_off..rope_off + half);
+                        let sin_v = self.d_sin_all.slice(rope_off..rope_off + half);
+                        let cfg = LaunchConfig {
+                            grid_dim: (((kv_heads * half) as u32).div_ceil(128).max(1), 1, 1),
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let (nh, hdi, rd, pr) = (kv_heads as i32, hd as i32, hd as i32, 1i32);
+                        let mut b = s.launch_builder(&k.rope);
+                        b.arg(&mut self.d_k)
+                            .arg(&cos_v)
+                            .arg(&sin_v)
+                            .arg(&nh)
+                            .arg(&hdi)
+                            .arg(&rd)
+                            .arg(&pr);
+                        unsafe { b.launch(cfg) }.map_err(cu)?;
+                    }
+                    // Scatter K/V into this layer's cache at `position`.
+                    let ck = self.cache_k[li].as_mut().expect("owning layer has K cache");
+                    crate::cuda_resident::launch_kv_scatter(
+                        &s,
+                        &k.kv_scatter,
+                        &self.d_k,
+                        ck,
+                        &self.d_position,
+                        kv_heads,
+                        hd,
+                        self.max_positions,
+                    )
+                    .map_err(cu)?;
+                    let cv = self.cache_v[li].as_mut().expect("owning layer has V cache");
+                    crate::cuda_resident::launch_kv_scatter(
+                        &s,
+                        &k.kv_scatter,
+                        &self.d_v,
+                        cv,
+                        &self.d_position,
+                        kv_heads,
+                        hd,
+                        self.max_positions,
+                    )
+                    .map_err(cu)?;
+                }
+
+                // Attention against the source layer's cache (sliding window or full causal).
+                let src = p.kv_source_layer;
+                let window = p.window.map(|w| w as i32).unwrap_or(0);
+                {
+                    let ck = self.cache_k[src].as_ref().expect("KV source has K cache");
+                    let cv = self.cache_v[src].as_ref().expect("KV source has V cache");
+                    let cfg = LaunchConfig {
+                        grid_dim: (heads as u32, 1, 1),
+                        block_dim: (hd as u32, 1, 1),
+                        shared_mem_bytes: ((2 * hd + self.max_positions) as u32) * 4,
+                    };
+                    let (nh, nkv, hdi, mp) = (
+                        heads as i32,
+                        kv_heads as i32,
+                        hd as i32,
+                        self.max_positions as i32,
+                    );
+                    let scale = 1.0f32; // gemma folds the scale; attention uses no 1/sqrt(d).
+                    let mut b = s.launch_builder(&k.attention_sw);
+                    b.arg(&self.d_q)
+                        .arg(ck)
+                        .arg(cv)
+                        .arg(&mut self.d_attn)
+                        .arg(&nh)
+                        .arg(&nkv)
+                        .arg(&hdi)
+                        .arg(&self.d_position)
+                        .arg(&mp)
+                        .arg(&scale)
+                        .arg(&window);
+                    unsafe { b.launch(cfg) }.map_err(cu)?;
+                }
+
+                // O projection (quantize attn output, in=q_dim) -> post-attn norm -> residual.
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &k.quantize,
+                    &self.d_attn,
+                    &mut self.d_attnq,
+                    &mut self.d_attns,
+                    q_dim / 32,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_gemv(
+                    &s,
+                    &k.gemv,
+                    &self.d_attns,
+                    &self.d_attnq,
+                    &lwd.o.slice(0..lwd.o.len()),
+                    hidden,
+                    q_dim / 32,
+                    &mut self.d_o,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_rmsnorm(
+                    &s,
+                    &k.rms_norm,
+                    &self.d_o,
+                    &nrm.post_attn_norm,
+                    &mut self.d_normed,
+                    hidden,
+                    eps,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &s,
+                    &k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_normed,
+                    hidden,
+                )
+                .map_err(cu)?;
+
+                // FFN: norm + quantize -> gate/up -> GeGLU -> quantize -> down -> post-ffw norm -> residual.
+                crate::cuda_resident::launch_rmsnorm(
+                    &s,
+                    &k.rms_norm,
+                    &self.d_hidden,
+                    &nrm.ffn_norm,
+                    &mut self.d_normed,
+                    hidden,
+                    eps,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &k.quantize,
+                    &self.d_normed,
+                    &mut self.d_inq,
+                    &mut self.d_ins,
+                    hidden / 32,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_gemv(
+                    &s,
+                    &k.gemv,
+                    &self.d_ins,
+                    &self.d_inq,
+                    &lwd.gate.slice(0..lwd.gate.len()),
+                    ffn_dim,
+                    hidden / 32,
+                    &mut self.d_gate,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_gemv(
+                    &s,
+                    &k.gemv,
+                    &self.d_ins,
+                    &self.d_inq,
+                    &lwd.up.slice(0..lwd.up.len()),
+                    ffn_dim,
+                    hidden / 32,
+                    &mut self.d_up,
+                )
+                .map_err(cu)?;
+                {
+                    let cfg = LaunchConfig {
+                        grid_dim: ((ffn_dim as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let n_i = ffn_dim as i32;
+                    let mut b = s.launch_builder(&k.geglu_mul);
+                    b.arg(&self.d_gate)
+                        .arg(&self.d_up)
+                        .arg(&mut self.d_geglu)
+                        .arg(&n_i);
+                    unsafe { b.launch(cfg) }.map_err(cu)?;
+                }
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &k.quantize,
+                    &self.d_geglu,
+                    &mut self.d_geglu_q,
+                    &mut self.d_geglu_s,
+                    ffn_dim / 32,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_gemv(
+                    &s,
+                    &k.gemv,
+                    &self.d_geglu_s,
+                    &self.d_geglu_q,
+                    &lwd.down.slice(0..lwd.down.len()),
+                    hidden,
+                    ffn_dim / 32,
+                    &mut self.d_ffn_out,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_rmsnorm(
+                    &s,
+                    &k.rms_norm,
+                    &self.d_ffn_out,
+                    &nrm.post_ffw_norm,
+                    &mut self.d_normed,
+                    hidden,
+                    eps,
+                )
+                .map_err(cu)?;
+                crate::cuda_resident::launch_residual(
+                    &s,
+                    &k.residual_add,
+                    &mut self.d_hidden,
+                    &self.d_normed,
+                    hidden,
+                )
+                .map_err(cu)?;
+
+                // PLE injection on the GPU (no host round-trip): gated = inp_gate·h ->
+                // gelu_tanh(gated)*pli[li] -> proj·gated -> post_norm -> residual -> output_scale.
+                if let Some(pd) = self.ple[li].as_ref() {
+                    crate::cuda_resident::launch_f32_gemv(
+                        &s,
+                        &k.f32_gemv,
+                        &pd.inp_gate,
+                        &self.d_hidden,
+                        &mut self.d_ple_gated,
+                        hidden,
+                        ple_dim,
+                    )
+                    .map_err(cu)?;
+                    {
+                        let off = li * ple_dim;
+                        let pli_view = self.d_pli.slice(off..off + ple_dim);
+                        let cfg = LaunchConfig {
+                            grid_dim: ((ple_dim as u32).div_ceil(256).max(1), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let n_i = ple_dim as i32;
+                        let mut b = s.launch_builder(&k.geglu_mul);
+                        b.arg(&self.d_ple_gated)
+                            .arg(&pli_view)
+                            .arg(&mut self.d_ple_gated2)
+                            .arg(&n_i);
+                        unsafe { b.launch(cfg) }.map_err(cu)?;
+                    }
+                    crate::cuda_resident::launch_f32_gemv(
+                        &s,
+                        &k.f32_gemv,
+                        &pd.proj,
+                        &self.d_ple_gated2,
+                        &mut self.d_ple_proj,
+                        ple_dim,
+                        hidden,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &self.d_ple_proj,
+                        &pd.post_norm,
+                        &mut self.d_ple_normed,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_residual(
+                        &s,
+                        &k.residual_add,
+                        &mut self.d_hidden,
+                        &self.d_ple_normed,
+                        hidden,
+                    )
+                    .map_err(cu)?;
+                    if pd.output_scale != 1.0 {
+                        crate::cuda_resident::launch_scale(
+                            &s,
+                            &k.scale_f32,
+                            &mut self.d_hidden,
+                            hidden,
+                            pd.output_scale,
+                        )
+                        .map_err(cu)?;
+                    }
+                } else if lw.ple_output_scale != 1.0 {
+                    crate::cuda_resident::launch_scale(
+                        &s,
+                        &k.scale_f32,
+                        &mut self.d_hidden,
+                        hidden,
+                        lw.ple_output_scale,
+                    )
+                    .map_err(cu)?;
+                }
+            }
+        }
+        if do_capture {
+            use cudarc::driver::sys;
+            // Use a real enum variant (not transmute(0): the flags enum has no zero
+            // variant, which trips the debug enum-validity check). USE_NODE_PRIORITY is
+            // a no-op here (no node priorities are set), so instantiation is plain; the
+            // graph is pre-uploaded explicitly via `g.upload()` below.
+            let flags =
+                sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY;
+            match s.end_capture(flags).map_err(cu)? {
+                Some(g) => {
+                    g.upload().map_err(cu)?;
+                    self.decode_graph = Some(SendGraph(g));
+                }
+                None => {
+                    return Err(BackendError::InvalidModelMetadata(
+                        "gemma4 cuda: decode graph capture produced no graph".into(),
+                    ))
+                }
+            }
+        }
+        self.warmed = true;
+        // Replay the captured graph when present. On the warmup call there is no graph
+        // yet and the loop above already executed directly, so we skip the launch.
+        if let Some(g) = self.decode_graph.as_ref() {
+            g.0.launch().map_err(cu)?;
+        }
+
+        // Prefill tokens except the last only need their KV populated, not logits — skip
+        // the ~10ms vocab head. The layers/graph already wrote KV on the capture stream,
+        // and the next token's upload (a synchronous memcpy) orders after it, so no sync
+        // is needed here.
+        if !want_logits {
+            return Ok(Vec::new());
+        }
+
+        // ---- Final norm + tied head + soft-cap. ----
+        if let Some(head) = self.gpu_head.as_mut() {
+            // GPU Q6_K head: fused rms_norm+Q8K-quant -> q6k_gemv over the vocab ->
+            // soft-cap, on the capture stream; only the logits are copied back. This
+            // replaces the ~1.2 s/token CPU Q6_K matvec that dominates decode.
+            let wlen = head.weight.len();
+            match head.lane {
+                HeadLane::Q8_0 => {
+                    crate::cuda_resident::launch_rmsnorm_quantize(
+                        &s,
+                        &self.kernels.rms_norm_quantize,
+                        &self.d_hidden,
+                        &head.output_norm,
+                        &mut head.inq,
+                        &mut head.ins,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_gemv(
+                        &s,
+                        &self.kernels.gemv,
+                        &head.ins,
+                        &head.inq,
+                        &head.weight.slice(0..wlen),
+                        self.vocab,
+                        head.blocks,
+                        &mut head.logits,
+                    )
+                    .map_err(cu)?;
+                }
+                HeadLane::Q6K => {
+                    crate::cuda_resident::launch_rmsnorm_quantize_q8k(
+                        &s,
+                        &self.kernels.rms_norm_quantize_q8k,
+                        &self.d_hidden,
+                        &head.output_norm,
+                        &mut head.inq,
+                        &mut head.ins,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_q6k_gemv(
+                        &s,
+                        &self.kernels.q6k_gemv,
+                        &head.ins,
+                        &head.inq,
+                        &head.weight.slice(0..wlen),
+                        self.vocab,
+                        head.blocks,
+                        &mut head.logits,
+                        0,
+                    )
+                    .map_err(cu)?;
+                }
+            }
+            if head.softcap != 0.0 {
+                let cfg = LaunchConfig {
+                    grid_dim: ((self.vocab as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (n_i, cap) = (self.vocab as i32, head.softcap);
+                let mut b = s.launch_builder(&self.kernels.soft_cap);
+                b.arg(&mut head.logits).arg(&n_i).arg(&cap);
+                unsafe { b.launch(cfg) }.map_err(cu)?;
+            }
+            s.synchronize().map_err(cu)?;
+            let mut logits = vec![0f32; self.vocab];
+            s.memcpy_dtoh(&head.logits, &mut logits).map_err(cu)?;
+            return Ok(logits);
+        }
+        // CPU head fallback (non-Q6_K head): final norm + tied matvec + soft-cap.
+        s.synchronize().map_err(cu)?;
+        let mut last = vec![0f32; hidden];
+        s.memcpy_dtoh(&self.d_hidden, &mut last).map_err(cu)?;
+        let normed = rms_norm(&last, Some(&self.cpu.output_norm), eps);
+        let mut logits = self.cpu.token_embd.matvec(hidden, self.vocab, &normed);
+        if let Some(cap) = self.cpu.g.final_logit_softcapping {
+            soft_cap_in_place(&mut logits, cap);
+        }
+        Ok(logits)
+    }
+
+    /// Greedy-generate up to `max_new` tokens (mirrors the Metal runtime loop).
+    pub fn generate_greedy(&mut self, prompt: &str, max_new: usize) -> Result<(String, Vec<u32>)> {
+        let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
+        let mut logits = Vec::new();
+        let last_prompt = prompt_tokens.len().saturating_sub(1);
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.forward_token(tok, pos, pos == last_prompt)?;
+        }
+        let mut generated = Vec::new();
+        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            logits = self.forward_token(next, pos, true)?;
+        }
+        let text = self.cpu.tokenizer.decode(&generated, true)?;
+        Ok((text, generated))
+    }
+
+    /// Greedy-generate emitting a per-token text delta (for SSE streaming): after
+    /// each token the full output is re-decoded and the new suffix is handed to
+    /// `on_delta` (robust to tokenizer spacing).
+    pub fn generate_greedy_streaming<F: FnMut(&str)>(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+        mut on_delta: F,
+    ) -> Result<(String, Vec<u32>)> {
+        let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
+        let mut logits = Vec::new();
+        let last_prompt = prompt_tokens.len().saturating_sub(1);
+        for (pos, &tok) in prompt_tokens.iter().enumerate() {
+            logits = self.forward_token(tok, pos, pos == last_prompt)?;
+        }
+        let mut generated = Vec::new();
+        let mut prev_text = String::new();
+        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            let text = self.cpu.tokenizer.decode(&generated, true)?;
+            if text.len() > prev_text.len() {
+                on_delta(&text[prev_text.len()..]);
+            }
+            prev_text = text;
+            logits = self.forward_token(next, pos, true)?;
+        }
+        Ok((prev_text, generated))
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod cuda_parity_tests {
+    use super::*;
+
+    // Greedy parity: the CUDA gemma4 forward must match the CPU Gemma4Runtime oracle
+    // token-for-token on the E4B Q8_0 file (the oracle that the CPU runtime loads).
+    // Weights stream from host per layer, so it fits the 6 GB card; kept short.
+    #[test]
+    #[ignore = "requires a CUDA device + the gemma4 E4B Q8_0 model"]
+    fn gemma4_cuda_matches_cpu_greedy() {
+        let path_s = match std::env::var("CAMELID_GEMMA4_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip: set CAMELID_GEMMA4_GGUF to the gemma4 E4B Q8_0 gguf path");
+                return;
+            }
+        };
+        let path = std::path::Path::new(&path_s);
+        if !path.exists() {
+            eprintln!("skip: gemma4 model not found at {path_s}");
+            return;
+        }
+        let prompt = "The capital of France is";
+        let cpu = Gemma4Runtime::load(path).expect("cpu load");
+        let (cpu_text, cpu_ids) = cpu.generate_greedy(prompt, 8).expect("cpu gen");
+        let mut gpu = Gemma4CudaResident::load(path, 2048).expect("gpu load");
+        let t0 = std::time::Instant::now();
+        let (gpu_text, gpu_ids) = gpu.generate_greedy(prompt, 24).expect("gpu gen");
+        let secs = t0.elapsed().as_secs_f64();
+        eprintln!("CPU ids[..8] {cpu_ids:?} -> {cpu_text:?}");
+        eprintln!("GPU ids       {gpu_ids:?} -> {gpu_text:?}");
+        eprintln!(
+            "GPU decode: {} tokens in {:.1}s = {:.2} tok/s",
+            gpu_ids.len(),
+            secs,
+            gpu_ids.len() as f64 / secs.max(1e-9)
+        );
+        // Greedy-parity gate: the CUDA decode must reproduce the CPU oracle's greedy
+        // sequence for ALL of the CPU's tokens. The kernels are deterministic (ordered
+        // reductions, fixed launch configs) so this is stable run-to-run. The GPU PLE
+        // gelu uses CUDA tanhf (argmax-stable, not bit-identical), so divergence PAST
+        // this shared prefix is allowed — but a regression within it is caught.
+        assert!(
+            gpu_ids.len() >= cpu_ids.len(),
+            "GPU produced fewer tokens ({}) than the CPU oracle ({})",
+            gpu_ids.len(),
+            cpu_ids.len()
+        );
+        assert_eq!(
+            &gpu_ids[..cpu_ids.len()],
+            &cpu_ids[..],
+            "gemma4 CUDA greedy diverged from the CPU oracle within the shared prefix"
+        );
+    }
+}

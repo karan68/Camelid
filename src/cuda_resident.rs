@@ -308,6 +308,64 @@ extern "C" __global__ void q8_gemv(
     }
 }
 
+// ---- Q4_0 GEMV: one warp per output row, raw 18-byte wire, Q8_0 activation ----
+// Bit-identical reproduction of the validated CPU oracle `q4_0_wire_row_dot_scalar`
+// (the gemma4 QAT linear lane). Per 18-byte block: scale = f16(blk[0..2]); for
+// j in 0..16, lo = (byte & 0xF) - 8, hi = (byte >> 4) - 8; isum += lo*y[j] +
+// hi*y[j+16]; term = (float)isum * w_scale * x_scale[b]. Lane 0 sums the per-block
+// terms IN ORDER — the exact same ordered-f32 contract as q8_gemv, so the result is
+// bit-identical to the CPU. Weights are read RAW (nibbles packed) to keep the 4-bit
+// footprint; the activation is Q8_0 (input_scales[bpr] + input_quants[bpr*32] i8),
+// staged once in shared like q8_gemv. The -8 bias precludes a clean __dp4a, so the
+// per-block integer dot is the scalar nibble unpack the oracle uses (parity-first).
+extern "C" __global__ void q4_0_gemv(
+    const float* __restrict__ input_scales, const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, int rows, int blocks_per_row,
+    float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem40[];
+    signed char* s_iq = (signed char*)smem40;                        // blocks_per_row*32 i8
+    float* s_is = (float*)(smem40 + (long)blocks_per_row * 32);       // blocks_per_row f32
+    float* terms = (float*)(smem40 + (long)blocks_per_row * 36);      // warps*blocks_per_row f32
+    int tid = threadIdx.x;
+    // Stage the shared Q8_0 input vector cooperatively (coalesced), once per block.
+    for (int i = tid; i < blocks_per_row * 8; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];             // blocks_per_row*32 bytes as ints
+    for (int i = tid; i < blocks_per_row; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    float* myterms = terms + (long)warp * blocks_per_row;
+    const int WIRE = 18;
+    if (row < rows) {
+        long row_block0 = (long)row * blocks_per_row;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_block0 + b) * WIRE;
+            float w_scale = f16_bits_to_f32((unsigned short)(blk[0] | (blk[1] << 8)));
+            const signed char* y = s_iq + (long)b * 32;
+            int isum = 0;
+            #pragma unroll
+            for (int j = 0; j < 16; j++) {
+                unsigned char byte = blk[2 + j];
+                int lo = (int)(byte & 0xF) - 8;
+                int hi = (int)(byte >> 4) - 8;
+                isum += lo * (int)y[j];
+                isum += hi * (int)y[j + 16];
+            }
+            myterms[b] = (float)isum * w_scale * s_is[b];
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        float acc = 0.0f;
+        for (int b = 0; b < blocks_per_row; b++) acc += myterms[b];
+        output[row] = residual ? (output[row] + acc) : acc;
+    }
+}
+
 // ---- Q4_K_M GEMV: one warp per output row, fused dequant + integer dot -------
 // Bit-identical reproduction of the validated CPU oracle `q4_k_wire_row_dot`
 // (ggml_vec_dot_q4_K_q8_K_generic shape). The activation is Q8_K (256-wide blocks
@@ -887,6 +945,79 @@ extern "C" __global__ void attention_decode(
     }
 }
 
+// ---- Sliding-window attention decode (gemma4 sliding layers) ---------------
+// Identical to attention_decode but attends only the last `window` keys:
+//   start = (window > 0 && position_count > window) ? position_count - window : 0
+// then keys [start, position_count). window <= 0 reproduces full-causal
+// attention_decode exactly (so the non-sliding gemma4 layers / any caller can
+// share this kernel). Same online softmax + FP-reassociated weighted-V
+// (token-parity, not bit-identical) shape as attention_decode.
+extern "C" __global__ void attention_decode_sw(
+    const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
+    const unsigned short* __restrict__ cache_v, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, const int* __restrict__ position_ptr,
+    int max_pos, float scale, int window
+) {
+    int position_count = position_ptr[0] + 1;
+    int start = (window > 0 && position_count > window) ? (position_count - window) : 0;
+    int head = blockIdx.x;
+    if (head >= n_heads) return;
+    int repeats = n_heads / n_kv_heads;
+    int kv_head = head / repeats;
+    const float* qh = q + (long)head * head_dim;
+    const unsigned short* kbase = cache_k + (long)kv_head * max_pos * head_dim;
+    const unsigned short* vbase = cache_v + (long)kv_head * max_pos * head_dim;
+
+    extern __shared__ float shared_sw[];
+    int tid = threadIdx.x;
+    int G = blockDim.x / head_dim;
+    float* qsh = shared_sw;
+    float* vpart = shared_sw + head_dim;
+    float* scores = shared_sw + head_dim + (long)G * head_dim;
+    for (int d = tid; d < head_dim; d += blockDim.x) qsh[d] = qh[d];
+    __syncthreads();
+
+    for (int p = start + tid; p < position_count; p += blockDim.x) {
+        const unsigned short* kp = kbase + (long)p * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += qsh[d] * f16_bits_to_f32(kp[d]);
+        scores[p] = dot * scale;
+    }
+    __syncthreads();
+
+    __shared__ float s_max_sw, s_sum_sw;
+    if (tid == 0) {
+        float m = scores[start];
+        for (int p = start + 1; p < position_count; p++) if (scores[p] > m) m = scores[p];
+        s_max_sw = m;
+    }
+    __syncthreads();
+    for (int p = start + tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max_sw);
+    __syncthreads();
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = start; p < position_count; p++) sum += scores[p];
+        s_sum_sw = sum;
+    }
+    __syncthreads();
+    float inv = 1.0f / s_sum_sw;
+    int gid = tid / head_dim;
+    int did = tid % head_dim;
+    int active = position_count - start;
+    int p_lo = start + (int)((long)gid * active / G);
+    int p_hi = start + (int)((long)(gid + 1) * active / G);
+    float acc = 0.0f;
+    for (int p = p_lo; p < p_hi; p++)
+        acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+    vpart[(long)did * G + gid] = acc;
+    __syncthreads();
+    if (gid == 0) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)head * head_dim + did] = sum;
+    }
+}
+
 // ---- SwiGLU: out[i] = silu(gate[i]) * up[i], silu(x)=x/(1+exp(-x)) ---------
 extern "C" __global__ void silu_mul(
     const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ out, int n
@@ -895,6 +1026,53 @@ extern "C" __global__ void silu_mul(
     if (i >= n) return;
     float g = gate[i];
     out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
+// ---- Gemma GeGLU: out[i] = gelu_tanh(gate[i]) * up[i] ---------------------
+// gelu_pytorch_tanh: 0.5*x*(1 + tanh(0.79788456*(x + 0.044715*x^3))). Same
+// constants and left-to-right f32 order as the CPU oracle
+// inference::gemma4::gelu_tanh; only tanhf's transcendental last-bit rounding
+// differs (validated to tolerance, not bit-exact). --fmad=false keeps the
+// polynomial unfused so the non-transcendental part matches.
+extern "C" __global__ void geglu_mul(
+    const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ out, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float x = gate[i];
+    float inner = 0.79788456f * (x + 0.044715f * x * x * x);
+    float gv = 0.5f * x * (1.0f + tanhf(inner));
+    out[i] = gv * up[i];
+}
+
+// ---- Gemma final-logit soft-cap (in place): x = cap*tanh(x/cap) -----------
+// Mirrors inference::gemma4::soft_cap_in_place (cap = 30 for Gemma 4). The
+// caller passes a finite, positive cap (disabled-cap is handled host-side).
+extern "C" __global__ void soft_cap(float* __restrict__ x, int n, float cap) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = cap * tanhf(x[i] / cap);
+}
+
+// ---- f32 GEMV: out[o] = sum_i W[o*in_dim + i] * x[i] (row-major, out-major) ----
+// For gemma4's small f32 PLE matrices (ple_inp_gate, ple_proj). One thread per
+// output row, sequential per-row sum — bit-identical to the CPU f32_matvec order.
+extern "C" __global__ void f32_gemv(
+    const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ out,
+    int in_dim, int out_dim
+) {
+    int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= out_dim) return;
+    const float* row = w + (long)o * in_dim;
+    float acc = 0.0f;
+    for (int i = 0; i < in_dim; i++) acc += row[i] * x[i];
+    out[o] = acc;
+}
+
+// ---- Scalar scale (in place): x[i] *= s (gemma4 PLE ple_output_scale) --------
+extern "C" __global__ void scale_f32(float* __restrict__ x, int n, float s) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= s;
 }
 
 // ---- Residual add: acc[i] += add[i] ---------------------------------------
@@ -1435,6 +1613,7 @@ pub struct CudaResidentKernels {
     pub(crate) quantize: CudaFunction,
     pub(crate) rms_norm_quantize: CudaFunction,
     pub(crate) gemv: CudaFunction,
+    pub(crate) q4_0_gemv: CudaFunction,
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
@@ -1443,8 +1622,13 @@ pub struct CudaResidentKernels {
     pub(crate) rope: CudaFunction,
     pub(crate) kv_scatter: CudaFunction,
     pub(crate) attention: CudaFunction,
+    pub(crate) attention_sw: CudaFunction,
     pub(crate) silu_mul: CudaFunction,
     pub(crate) silu_mul_quantize: CudaFunction,
+    pub(crate) geglu_mul: CudaFunction,
+    pub(crate) soft_cap: CudaFunction,
+    pub(crate) f32_gemv: CudaFunction,
+    pub(crate) scale_f32: CudaFunction,
     pub(crate) residual_add: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
@@ -1492,6 +1676,7 @@ impl CudaResidentKernels {
             quantize: f("quantize_q8_0")?,
             rms_norm_quantize: f("rms_norm_quantize")?,
             gemv: f("q8_gemv")?,
+            q4_0_gemv: f("q4_0_gemv")?,
             q4k_gemv: f("q4k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
             quantize_q8k: f("quantize_q8k")?,
@@ -1500,8 +1685,13 @@ impl CudaResidentKernels {
             rope: f("rope_rotate")?,
             kv_scatter: f("kv_scatter")?,
             attention: f("attention_decode")?,
+            attention_sw: f("attention_decode_sw")?,
             silu_mul: f("silu_mul")?,
             silu_mul_quantize: f("silu_mul_quantize")?,
+            geglu_mul: f("geglu_mul")?,
+            soft_cap: f("soft_cap")?,
+            f32_gemv: f("f32_gemv")?,
+            scale_f32: f("scale_f32")?,
             residual_add: f("residual_add")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
@@ -1563,7 +1753,7 @@ fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
     }
 }
 
-fn launch_rmsnorm(
+pub(crate) fn launch_rmsnorm(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1585,7 +1775,7 @@ fn launch_rmsnorm(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_quantize(
+pub(crate) fn launch_quantize(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1609,7 +1799,7 @@ fn launch_quantize(
 // for the in-order sum (same as rms_norm), then quantizes from shared — replacing a
 // launch_rmsnorm + launch_quantize pair and the f32 `normed` round-trip.
 #[allow(clippy::too_many_arguments)]
-fn launch_rmsnorm_quantize(
+pub(crate) fn launch_rmsnorm_quantize(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1632,7 +1822,7 @@ fn launch_rmsnorm_quantize(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_gemv(
+pub(crate) fn launch_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1673,7 +1863,7 @@ fn launch_gemv(
 /// `= acc`, so `out` must be the residual (hidden) buffer. Saves a separate residual_add launch
 /// and the projection's f32 round-trip. Bit-identical to gemv-then-residual_add (F2).
 #[allow(clippy::too_many_arguments)]
-fn launch_gemv_residual(
+pub(crate) fn launch_gemv_residual(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1712,7 +1902,7 @@ fn launch_gemv_residual(
 // As repack_q4k_soa: exercised by the bit-parity test; the production per-tensor
 // dispatch into this launcher is the deferred end-to-end follow-up.
 #[allow(dead_code, clippy::too_many_arguments)]
-fn launch_q4k_gemv(
+pub(crate) fn launch_q4k_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1750,7 +1940,7 @@ fn launch_q4k_gemv(
 /// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
 /// 8-int main-lane scratch for lane 0's ordered f32 reduction.
 #[allow(clippy::too_many_arguments)]
-fn launch_q6k_gemv(
+pub(crate) fn launch_q6k_gemv(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1771,6 +1961,44 @@ fn launch_q6k_gemv(
         shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 8 * 4,
     };
     let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q4_0 GEMV launch: same warp-per-row geometry as `launch_gemv` (q8). Input is
+/// Q8_0 (`blocks_per_row` f32 scales + `blocks_per_row*32` i8 quants); weight is the
+/// RAW 18-byte Q4_0 wire bytes (no SoA repack). Shared holds the staged Q8_0 input
+/// (`bpr*32` i8 + `bpr` f32) shared by all warps, then each warp's per-block f32 term
+/// scratch for lane 0's ordered reduction (mirrors q8_gemv).
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn launch_q4_0_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    blocks_per_row: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let bpr = blocks_per_row as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input: bpr*32 i8 + bpr*4 f32; per-warp scratch: bpr f32 terms.
+        shared_mem_bytes: bpr * 32 + bpr * 4 + warps_per_block * bpr * 4,
+    };
+    let (r, nb) = (rows as i32, blocks_per_row as i32);
     let mut b = s.launch_builder(f);
     b.arg(in_scales)
         .arg(in_quants)
@@ -1855,7 +2083,7 @@ fn dispatch_gemv(
 
 /// Standalone Q8_K activation quantize: f32 row `[n_sb*256]` -> `n_sb` Q8_K blocks
 /// (scales `[n_sb]`, quants `[n_sb*256]` i8). One thread per 256-block.
-fn launch_quantize_q8k(
+pub(crate) fn launch_quantize_q8k(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1879,7 +2107,7 @@ fn launch_quantize_q8k(
 /// in-order sum, then quantizes 256-wide blocks straight from shared. K-quant
 /// analog of `launch_rmsnorm_quantize`.
 #[allow(clippy::too_many_arguments)]
-fn launch_rmsnorm_quantize_q8k(
+pub(crate) fn launch_rmsnorm_quantize_q8k(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -1903,7 +2131,7 @@ fn launch_rmsnorm_quantize_q8k(
 
 /// Fused SiLU(gate)*up + Q8_K quantize: one thread per 256-block. K-quant analog
 /// of `launch_silu_mul_quantize`.
-fn launch_silu_mul_quantize_q8k(
+pub(crate) fn launch_silu_mul_quantize_q8k(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     gate: &CudaSlice<f32>,
@@ -1925,7 +2153,7 @@ fn launch_silu_mul_quantize_q8k(
 }
 
 // Fused SiLU*up + Q8_0 quantize (F3): one thread per 32-block, no shared memory.
-fn launch_silu_mul_quantize(
+pub(crate) fn launch_silu_mul_quantize(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     gate: &CudaSlice<f32>,
@@ -1952,7 +2180,7 @@ fn launch_silu_mul_quantize(
 // exercises it today.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
-fn launch_gemm_batched(
+pub(crate) fn launch_gemm_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     in_scales: &CudaSlice<f32>,
@@ -1993,7 +2221,7 @@ fn launch_gemm_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rms_norm_batched(
+pub(crate) fn launch_rms_norm_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     x: &CudaSlice<f32>,
@@ -2015,7 +2243,7 @@ fn launch_rms_norm_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rope_batched(
+pub(crate) fn launch_rope_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     vec: &mut CudaSlice<f32>,
@@ -2058,7 +2286,7 @@ fn launch_rope_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_kv_scatter_batched(
+pub(crate) fn launch_kv_scatter_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
@@ -2097,7 +2325,7 @@ fn launch_kv_scatter_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attention_batched(
+pub(crate) fn launch_attention_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
@@ -2146,7 +2374,7 @@ fn launch_attention_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_kv_scatter_tree_batched(
+pub(crate) fn launch_kv_scatter_tree_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
@@ -2184,7 +2412,7 @@ fn launch_kv_scatter_tree_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attention_tree_batched(
+pub(crate) fn launch_attention_tree_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
@@ -2238,7 +2466,7 @@ fn launch_attention_tree_batched(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_argmax_batched(
+pub(crate) fn launch_argmax_batched(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     logits: &CudaSlice<f32>,
@@ -2259,7 +2487,7 @@ fn launch_argmax_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rope(
+pub(crate) fn launch_rope(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     vec: &mut CudaSlice<f32>,
@@ -2289,7 +2517,7 @@ fn launch_rope(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_rms_norm_per_head(
+pub(crate) fn launch_rms_norm_per_head(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     buf: &mut CudaSlice<f32>,
@@ -2311,7 +2539,7 @@ fn launch_rms_norm_per_head(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_kv_scatter(
+pub(crate) fn launch_kv_scatter(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     src: &CudaSlice<f32>,
@@ -2351,7 +2579,7 @@ const SPLITK_THRESHOLD: usize = 512;
 /// combine. TOKEN-PARITY: dot and global max are bit-identical; the cross-split sum
 /// re-associates exactly as the (parity-passing) Stage-2 weighted-V split. Verified.
 #[allow(clippy::too_many_arguments)]
-fn launch_attention_splitk(
+pub(crate) fn launch_attention_splitk(
     s: &Arc<CudaStream>,
     k: &CudaResidentKernels,
     q: &CudaSlice<f32>,
@@ -2448,7 +2676,7 @@ fn launch_attention_splitk(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_attention(
+pub(crate) fn launch_attention(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     q: &CudaSlice<f32>,
@@ -2506,7 +2734,7 @@ fn launch_attention(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_silu_mul(
+pub(crate) fn launch_silu_mul(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     gate: &CudaSlice<f32>,
@@ -2525,7 +2753,7 @@ fn launch_silu_mul(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_residual(
+pub(crate) fn launch_residual(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     acc: &mut CudaSlice<f32>,
@@ -2543,7 +2771,46 @@ fn launch_residual(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
-fn launch_argmax(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_f32_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    w: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((out_dim as u32).div_ceil(128).max(1), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (i, o) = (in_dim as i32, out_dim as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(w).arg(x).arg(out).arg(&i).arg(&o);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+pub(crate) fn launch_scale(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    x: &mut CudaSlice<f32>,
+    n: usize,
+    factor: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256).max(1), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(x).arg(&n_i).arg(&factor);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+pub(crate) fn launch_argmax(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     logits: &CudaSlice<f32>,
@@ -2563,7 +2830,7 @@ fn launch_argmax(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_sample_gumbel(
+pub(crate) fn launch_sample_gumbel(
     s: &Arc<CudaStream>,
     f: &CudaFunction,
     logits: &CudaSlice<f32>,

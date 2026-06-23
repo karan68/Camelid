@@ -3172,6 +3172,17 @@ fn gemma4_serve_enabled() -> bool {
     )
 }
 
+/// Additionally route the gemma4 serve lane through the CUDA decode engine when
+/// `CAMELID_GEMMA4_CUDA` is set (and the build has the `cuda` feature). Off by
+/// default; with it off the gemma4 serve lane stays the CPU runtime, unchanged.
+#[cfg(feature = "cuda")]
+fn gemma4_cuda_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_GEMMA4_CUDA").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 /// Model family from the GGUF `general.architecture`.
 fn model_family(gguf: &GgufFile) -> &'static str {
     match gguf.architecture() {
@@ -3595,9 +3606,16 @@ impl Gemma4ChannelFilter {
 /// completion handlers are lane-agnostic. The distributed lane is configured
 /// at model-load time via `CAMELID_GEMMA4_WORKER` + `CAMELID_GEMMA4_SPLIT`
 /// (alongside `CAMELID_GEMMA4_SERVE=1`).
+// Always stored behind an Arc (AppState::gemma4_runtimes), so there is exactly one
+// heap-allocated instance per loaded model; the Cuda variant's resident scratch dwarfs
+// the others, but the inline size disparity has no practical cost here.
+#[allow(clippy::large_enum_variant)]
 pub enum Gemma4ServeRuntime {
     Local(crate::gemma4_runtime::Gemma4Runtime),
     Distributed(crate::gemma4_distributed::Gemma4DistributedRuntime),
+    /// CUDA decode engine (stateful GPU runtime -> Mutex; one request at a time).
+    #[cfg(feature = "cuda")]
+    Cuda(std::sync::Mutex<crate::gemma4_runtime::Gemma4CudaResident>),
 }
 
 impl Gemma4ServeRuntime {
@@ -3605,6 +3623,11 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(r) => r.generate_greedy(prompt, max_new),
             Self::Distributed(r) => r.generate_greedy(prompt, max_new),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(m) => m
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .generate_greedy(prompt, max_new),
         }
     }
 
@@ -3617,6 +3640,11 @@ impl Gemma4ServeRuntime {
         match self {
             Self::Local(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
             Self::Distributed(r) => r.generate_greedy_streaming(prompt, max_new, on_delta),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(m) => m
+                .lock()
+                .expect("gemma4 cuda runtime lock")
+                .generate_greedy_streaming(prompt, max_new, on_delta),
         }
     }
 }
@@ -4200,6 +4228,13 @@ async fn load_gemma4_serve_runtime(
         )
         .map(Gemma4ServeRuntime::Distributed),
         None => {
+            #[cfg(feature = "cuda")]
+            {
+                if gemma4_cuda_enabled() {
+                    return crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 2048)
+                        .map(|r| Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)));
+                }
+            }
             crate::gemma4_runtime::Gemma4Runtime::load(&load_path).map(Gemma4ServeRuntime::Local)
         }
     })
@@ -4210,6 +4245,8 @@ async fn load_gemma4_serve_runtime(
     let lane = match &runtime {
         Gemma4ServeRuntime::Local(_) => "local",
         Gemma4ServeRuntime::Distributed(_) => "distributed",
+        #[cfg(feature = "cuda")]
+        Gemma4ServeRuntime::Cuda(_) => "cuda",
     };
     state
         .gemma4_runtimes
@@ -4264,6 +4301,7 @@ async fn unload_model(
 
     if let Some(id) = target_id {
         state.loaded_models.write().await.remove(&id);
+        state.gemma4_runtimes.write().await.remove(&id);
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
@@ -4274,6 +4312,7 @@ async fn unload_model(
         }
     } else {
         state.loaded_models.write().await.clear();
+        state.gemma4_runtimes.write().await.clear();
         state.execution_plans.write().await.clear();
         state.cached_weights.write().await.clear();
         state.model_last_used.write().await.clear();
@@ -4281,6 +4320,13 @@ async fn unload_model(
     }
 
     clear_prompt_prefix_cache(&state);
+    // Free the GPU VRAM held by the resident decode engine. The clears above only drop
+    // the CPU-side registries; the Llama resident engine lives in process-global caches
+    // (see inference::reset_resident_caches) that unload never touched, so its ~4.7 GB
+    // stayed on the device and starved the next model into a host-RAM spill (NVIDIA
+    // sysmem fallback), making decode ~20x slower. (A gemma4 CUDA runtime's VRAM is
+    // freed by dropping it from gemma4_runtimes above.)
+    crate::inference::reset_resident_caches();
     StatusCode::NO_CONTENT.into_response()
 }
 
