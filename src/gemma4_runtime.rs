@@ -2499,7 +2499,7 @@ impl Gemma4CudaResident {
 
     /// One token's forward; returns next-token logits. Mirrors the CPU
     /// `Gemma4Runtime::step_range` op order exactly (the parity oracle).
-    fn forward_token(&mut self, token: u32, position: usize) -> Result<Vec<f32>> {
+    fn forward_token(&mut self, token: u32, position: usize, want_logits: bool) -> Result<Vec<f32>> {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         // Run on the capture-capable stream (not the default stream) so the layer
         // stack can be recorded into a CUDA graph.
@@ -2890,6 +2890,14 @@ impl Gemma4CudaResident {
             g.0.launch().map_err(cu)?;
         }
 
+        // Prefill tokens except the last only need their KV populated, not logits — skip
+        // the ~10ms vocab head. The layers/graph already wrote KV on the capture stream,
+        // and the next token's upload (a synchronous memcpy) orders after it, so no sync
+        // is needed here.
+        if !want_logits {
+            return Ok(Vec::new());
+        }
+
         // ---- Final norm + tied head + soft-cap. ----
         if self.gpu_head.is_some() {
             // GPU Q6_K head: fused rms_norm+Q8K-quant -> q6k_gemv over the vocab ->
@@ -2958,8 +2966,9 @@ impl Gemma4CudaResident {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
         let mut logits = Vec::new();
+        let last_prompt = prompt_tokens.len().saturating_sub(1);
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            logits = self.forward_token(tok, pos)?;
+            logits = self.forward_token(tok, pos, pos == last_prompt)?;
         }
         let mut generated = Vec::new();
         let mut pos = prompt_tokens.len();
@@ -2974,7 +2983,7 @@ impl Gemma4CudaResident {
                 break;
             }
             generated.push(next);
-            logits = self.forward_token(next, pos)?;
+            logits = self.forward_token(next, pos, true)?;
             pos += 1;
         }
         let text = self.cpu.tokenizer.decode(&generated, true)?;
@@ -2993,8 +3002,9 @@ impl Gemma4CudaResident {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
         let mut logits = Vec::new();
+        let last_prompt = prompt_tokens.len().saturating_sub(1);
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            logits = self.forward_token(tok, pos)?;
+            logits = self.forward_token(tok, pos, pos == last_prompt)?;
         }
         let mut generated = Vec::new();
         let mut prev_text = String::new();
@@ -3015,7 +3025,7 @@ impl Gemma4CudaResident {
                 on_delta(&text[prev_text.len()..]);
             }
             prev_text = text;
-            logits = self.forward_token(next, pos)?;
+            logits = self.forward_token(next, pos, true)?;
             pos += 1;
         }
         Ok((prev_text, generated))
@@ -3054,13 +3064,21 @@ mod cuda_parity_tests {
             secs,
             gpu_ids.len() as f64 / secs.max(1e-9)
         );
-        // The deterministic next-token argmax (over the full 262K vocab) must agree.
-        // Later tokens may diverge on near-ties: the GPU PLE gelu uses CUDA tanhf
-        // (un-quantized f32), so it is argmax-stable but not bit-identical to the CPU.
+        // Greedy-parity gate: the CUDA decode must reproduce the CPU oracle's greedy
+        // sequence for ALL of the CPU's tokens. The kernels are deterministic (ordered
+        // reductions, fixed launch configs) so this is stable run-to-run. The GPU PLE
+        // gelu uses CUDA tanhf (argmax-stable, not bit-identical), so divergence PAST
+        // this shared prefix is allowed — but a regression within it is caught.
+        assert!(
+            gpu_ids.len() >= cpu_ids.len(),
+            "GPU produced fewer tokens ({}) than the CPU oracle ({})",
+            gpu_ids.len(),
+            cpu_ids.len()
+        );
         assert_eq!(
-            gpu_ids.first(),
-            cpu_ids.first(),
-            "gemma4 CUDA next-token argmax diverged from CPU oracle"
+            &gpu_ids[..cpu_ids.len()],
+            &cpu_ids[..],
+            "gemma4 CUDA greedy diverged from the CPU oracle within the shared prefix"
         );
     }
 }
