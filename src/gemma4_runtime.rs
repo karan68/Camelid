@@ -3467,6 +3467,16 @@ impl Gemma4CudaResident {
     fn prefill_reusing_cache(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
         let n = prompt_tokens.len();
         debug_assert!(n >= 1);
+        // Hard cap: the prompt must leave at least one slot for a generated token, and the
+        // KV cache is bounded by `max_positions`. Without this, prefilling past the cache
+        // overflowed it and the generation silently produced nothing.
+        if n >= self.max_positions {
+            return Err(BackendError::InvalidModelMetadata(format!(
+                "conversation is {n} tokens, which exceeds the gemma4 {}-token context \
+                 window — please start a new chat",
+                self.max_positions
+            )));
+        }
         let disabled = std::env::var("CAMELID_GEMMA4_NO_PREFIX_CACHE").is_ok_and(|v| v == "1");
         let mut p = 0usize;
         if !disabled {
@@ -3495,7 +3505,8 @@ impl Gemma4CudaResident {
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
         let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
         let mut generated = Vec::new();
-        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
+        let decode_end = (prompt_tokens.len() + max_new).min(self.max_positions);
+        for pos in prompt_tokens.len()..decode_end {
             let next = logits
                 .iter()
                 .enumerate()
@@ -3529,7 +3540,8 @@ impl Gemma4CudaResident {
         let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
         let mut generated = Vec::new();
         let mut prev_text = String::new();
-        for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
+        let decode_end = (prompt_tokens.len() + max_new).min(self.max_positions);
+        for pos in prompt_tokens.len()..decode_end {
             let next = logits
                 .iter()
                 .enumerate()
