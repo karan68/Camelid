@@ -210,6 +210,11 @@ pub struct MachineSig {
     pub l2_bytes: Option<u32>,
     /// Shared L3 cache size in bytes, if known.
     pub l3_bytes: Option<u32>,
+    /// Active Windows power-plan GUID (e.g. Balanced vs High performance). Part
+    /// of the fingerprint because a gait calibrated under one power envelope is
+    /// wrong under another — changing it changes the key and forces a fresh
+    /// calibration. `None` off Windows or if the query fails.
+    pub power_plan: Option<String>,
 }
 
 impl MachineSig {
@@ -236,6 +241,7 @@ impl MachineSig {
             l1d_bytes: topo.l1d_bytes,
             l2_bytes: topo.l2_bytes,
             l3_bytes: topo.l3_bytes,
+            power_plan: detect_power_plan_guid(),
         }
     }
 
@@ -270,6 +276,7 @@ impl MachineSig {
             l1d_bytes: None,
             l2_bytes: None,
             l3_bytes: None,
+            power_plan: None,
         }
     }
 
@@ -474,6 +481,50 @@ fn detect_efficiency_classes() -> Vec<u8> {
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 fn detect_efficiency_classes() -> Vec<u8> {
     Vec::new()
+}
+
+/// The active Windows power-plan GUID in canonical lowercase form. Best-effort:
+/// `None` if the query fails.
+#[cfg(windows)]
+fn detect_power_plan_guid() -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::System::Power::PowerGetActiveScheme;
+
+    // SAFETY: PowerGetActiveScheme allocates a GUID via LocalAlloc that the caller
+    // must LocalFree. We read it once, format it, and free it.
+    unsafe {
+        let mut guid_ptr: *mut windows_sys::core::GUID = std::ptr::null_mut();
+        let err = PowerGetActiveScheme(std::ptr::null_mut(), &mut guid_ptr);
+        if err != 0 || guid_ptr.is_null() {
+            return None;
+        }
+        let formatted = format_guid(&*guid_ptr);
+        LocalFree(guid_ptr as *mut core::ffi::c_void);
+        Some(formatted)
+    }
+}
+
+#[cfg(not(windows))]
+fn detect_power_plan_guid() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn format_guid(g: &windows_sys::core::GUID) -> String {
+    format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        g.data1,
+        g.data2,
+        g.data3,
+        g.data4[0],
+        g.data4[1],
+        g.data4[2],
+        g.data4[3],
+        g.data4[4],
+        g.data4[5],
+        g.data4[6],
+        g.data4[7],
+    )
 }
 
 /// The flagless selection key: `H(model_sig):H(machine_sig)`. No flags
@@ -1014,6 +1065,29 @@ mod tests {
         let loaded = load_from(&dir, &with_mem.gait_key).expect("load");
         assert_eq!(loaded, with_mem);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn format_guid_matches_canonical() {
+        // Balanced power scheme GUID.
+        let g = windows_sys::core::GUID {
+            data1: 0x381b_4222,
+            data2: 0xf694,
+            data3: 0x41f0,
+            data4: [0x96, 0x85, 0xff, 0x5b, 0xb2, 0x60, 0xdf, 0x2e],
+        };
+        assert_eq!(format_guid(&g), "381b4222-f694-41f0-9685-ff5bb260df2e");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn power_plan_guid_is_well_formed_when_present() {
+        if let Some(pp) = MachineSig::detect().power_plan {
+            assert_eq!(pp.len(), 36, "guid = {pp}");
+            assert_eq!(pp.matches('-').count(), 4);
+            assert!(pp.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        }
     }
 
     #[test]
