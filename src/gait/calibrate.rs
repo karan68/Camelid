@@ -107,12 +107,37 @@ pub struct TournamentConfig {
     /// A candidate must beat baseline by at least this factor to win; otherwise
     /// the tournament fails closed to baseline. Slower-but-correct always wins.
     pub min_speedup: f64,
+    /// Measured rounds per variant. Each round times every variant once, in the
+    /// same order, so any two share a thermal/clock neighborhood (matched-clock
+    /// A/B by interleaving). The per-variant statistic is the median across
+    /// rounds, which rejects the run-to-run outliers a single trial cannot.
+    pub rounds: usize,
+    /// Leading rounds discarded as warmup (cache/clock settling).
+    pub warmup_rounds: usize,
 }
 
 impl Default for TournamentConfig {
     fn default() -> Self {
-        Self { min_speedup: 1.05 }
+        Self {
+            min_speedup: 1.05,
+            rounds: 5,
+            warmup_rounds: 1,
+        }
     }
+}
+
+/// Per-variant measurement spread, recorded as honest evidence so a reader can
+/// see the noise behind the selection rather than just a single number.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CandidateSamples {
+    pub label: String,
+    pub median_tokens_per_s: f64,
+    pub min_tokens_per_s: f64,
+    pub max_tokens_per_s: f64,
+    pub measured_rounds: usize,
+    /// True when every round reproduced this variant's parity token AND it
+    /// matched the baseline's (eligible); false means it was disqualified.
+    pub parity_ok: bool,
 }
 
 /// The evidence a calibration produced — recorded into the gait receipt.
@@ -133,6 +158,12 @@ pub struct CalibrationOutcome {
     /// the substrate dimension existed.
     #[serde(default)]
     pub selected_eco_qos_opt_out: bool,
+    /// Measured rounds per variant behind the medians.
+    #[serde(default)]
+    pub measured_rounds: usize,
+    /// Per-variant measurement spread (baseline first), for evidence.
+    #[serde(default)]
+    pub samples: Vec<CandidateSamples>,
 }
 
 fn roofline_pct(tokens_per_s: f64, weight_bytes_per_token: u64, stream_gbs: f64) -> f64 {
@@ -142,11 +173,37 @@ fn roofline_pct(tokens_per_s: f64, weight_bytes_per_token: u64, stream_gbs: f64)
     (tokens_per_s * weight_bytes_per_token as f64) / (stream_gbs * 1e9)
 }
 
-/// Run the tournament. `trial` times one candidate and returns its throughput +
-/// parity token (or `None` if that candidate could not be run). The baseline is
-/// timed first and is the parity reference; every candidate must reproduce its
-/// parity token to be eligible. The fastest eligible candidate that clears
-/// `min_speedup` wins; otherwise the result fails closed to baseline.
+fn median(samples: &[f64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
+}
+
+/// Per-variant accumulation across interleaved rounds.
+struct VariantStats {
+    tok_samples: Vec<f64>,
+    parity_token: Option<String>,
+    parity_consistent: bool,
+}
+
+/// Run the tournament with interleaved, matched-clock rounds. Each round times
+/// every variant once in a fixed order (baseline first), so any two are measured
+/// in the same thermal/clock neighborhood; the per-variant statistic is the
+/// median across measured rounds. `trial` times one variant and returns its
+/// throughput + parity token (or `None` if it could not be run that round).
+///
+/// A candidate is eligible only if it reproduced its own parity token across all
+/// rounds AND that token equals the baseline's. The fastest eligible candidate
+/// whose median clears `min_speedup` wins; otherwise the tournament fails closed
+/// to baseline. Slower-but-correct always wins.
 pub fn run_tournament(
     baseline: &Candidate,
     candidates: &[Candidate],
@@ -157,71 +214,128 @@ pub fn run_tournament(
 ) -> CalibrationOutcome {
     let gbs = memory.stream_triad_gbs;
 
-    let base = trial(baseline);
-    let base = match base {
-        Some(r) if r.tokens_per_s > 0.0 => r,
+    // Index 0 is the baseline; the rest are candidates, measured interleaved.
+    let variants: Vec<&Candidate> = std::iter::once(baseline).chain(candidates).collect();
+    let mut stats: Vec<VariantStats> = variants
+        .iter()
+        .map(|_| VariantStats {
+            tok_samples: Vec::new(),
+            parity_token: None,
+            parity_consistent: true,
+        })
+        .collect();
+
+    let measured = config.rounds.max(1);
+    let total_rounds = config.warmup_rounds + measured;
+    for round in 0..total_rounds {
+        for (i, variant) in variants.iter().enumerate() {
+            let Some(result) = trial(variant) else { continue };
+            match &stats[i].parity_token {
+                None => stats[i].parity_token = Some(result.parity_token.clone()),
+                Some(token) if *token != result.parity_token => {
+                    stats[i].parity_consistent = false;
+                }
+                _ => {}
+            }
+            if round >= config.warmup_rounds && result.tokens_per_s > 0.0 {
+                stats[i].tok_samples.push(result.tokens_per_s);
+            }
+        }
+    }
+
+    let base_parity = stats[0].parity_token.clone();
+    let base_median = median(&stats[0].tok_samples);
+
+    // Evidence: per-variant spread, baseline first.
+    let samples: Vec<CandidateSamples> = variants
+        .iter()
+        .zip(stats.iter())
+        .map(|(variant, stat)| {
+            let med = median(&stat.tok_samples).unwrap_or(0.0);
+            let min = stat.tok_samples.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = stat.tok_samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let parity_ok = stat.parity_consistent && stat.parity_token == base_parity;
+            CandidateSamples {
+                label: variant.label.clone(),
+                median_tokens_per_s: super::round_sig6(med),
+                min_tokens_per_s: super::round_sig6(if min.is_finite() { min } else { 0.0 }),
+                max_tokens_per_s: super::round_sig6(if max.is_finite() { max } else { 0.0 }),
+                measured_rounds: stat.tok_samples.len(),
+                parity_ok,
+            }
+        })
+        .collect();
+
+    let fail_closed = |reason: String, base_tok: f64, disq: Vec<String>| CalibrationOutcome {
+        selected_profile: baseline.profile.clone(),
+        reason,
+        baseline_tokens_per_s: super::round_sig6(base_tok),
+        selected_tokens_per_s: super::round_sig6(base_tok),
+        speedup: 1.0,
+        roofline_pct: super::round_sig6(roofline_pct(base_tok, weight_bytes_per_token, gbs)),
+        fell_back: true,
+        parity_disqualified: disq,
+        selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
+        measured_rounds: measured,
+        samples: samples.clone(),
+    };
+
+    let base_tok = match base_median {
+        Some(t) if t > 0.0 => t,
         _ => {
-            return CalibrationOutcome {
-                selected_profile: baseline.profile.clone(),
-                reason: "baseline trial failed; failing closed to baseline".to_string(),
-                baseline_tokens_per_s: 0.0,
-                selected_tokens_per_s: 0.0,
-                speedup: 1.0,
-                roofline_pct: 0.0,
-                fell_back: true,
-                parity_disqualified: Vec::new(),
-                selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
-            };
+            return fail_closed(
+                "baseline trial failed; failing closed to baseline".to_string(),
+                0.0,
+                Vec::new(),
+            );
         }
     };
 
+    // Evaluate candidates (indices 1..) on their medians.
     let mut best: Option<(&Candidate, f64)> = None;
     let mut disqualified = Vec::new();
-    for candidate in candidates {
-        let Some(result) = trial(candidate) else {
-            continue; // could not run this candidate — simply skip it
-        };
-        if result.parity_token != base.parity_token {
+    for (i, candidate) in candidates.iter().enumerate() {
+        let stat = &stats[i + 1];
+        if stat.tok_samples.is_empty() {
+            continue; // never ran — skip silently
+        }
+        let eligible = stat.parity_consistent && stat.parity_token == base_parity;
+        if !eligible {
             disqualified.push(candidate.label.clone()); // PARITY GATE
             continue;
         }
+        let med = median(&stat.tok_samples).unwrap_or(0.0);
         match best {
-            Some((_, best_tok)) if result.tokens_per_s <= best_tok => {}
-            _ => best = Some((candidate, result.tokens_per_s)),
+            Some((_, best_tok)) if med <= best_tok => {}
+            _ => best = Some((candidate, med)),
         }
     }
 
     match best {
-        Some((winner, tok)) if tok >= base.tokens_per_s * config.min_speedup => {
-            let speedup = tok / base.tokens_per_s;
+        Some((winner, tok)) if tok >= base_tok * config.min_speedup => {
+            let speedup = tok / base_tok;
             CalibrationOutcome {
                 selected_profile: winner.profile.clone(),
-                reason: format!("gait: {} won at {speedup:.3}x over baseline", winner.label),
-                baseline_tokens_per_s: super::round_sig6(base.tokens_per_s),
+                reason: format!(
+                    "gait: {} won at {speedup:.3}x over baseline (median of {measured} rounds)",
+                    winner.label
+                ),
+                baseline_tokens_per_s: super::round_sig6(base_tok),
                 selected_tokens_per_s: super::round_sig6(tok),
                 speedup: super::round_sig6(speedup),
                 roofline_pct: super::round_sig6(roofline_pct(tok, weight_bytes_per_token, gbs)),
                 fell_back: false,
                 parity_disqualified: disqualified,
                 selected_eco_qos_opt_out: winner.eco_qos_opt_out,
+                measured_rounds: measured,
+                samples,
             }
         }
-        _ => CalibrationOutcome {
-            selected_profile: baseline.profile.clone(),
-            reason: "no parity-clean candidate beat baseline by margin; keeping baseline"
-                .to_string(),
-            baseline_tokens_per_s: super::round_sig6(base.tokens_per_s),
-            selected_tokens_per_s: super::round_sig6(base.tokens_per_s),
-            speedup: 1.0,
-            roofline_pct: super::round_sig6(roofline_pct(
-                base.tokens_per_s,
-                weight_bytes_per_token,
-                gbs,
-            )),
-            fell_back: true,
-            parity_disqualified: disqualified,
-            selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
-        },
+        _ => fail_closed(
+            "no parity-clean candidate beat baseline by margin; keeping baseline".to_string(),
+            base_tok,
+            disqualified,
+        ),
     }
 }
 
@@ -356,6 +470,64 @@ mod tests {
         assert!((outcome.speedup - 1.3).abs() < 1e-9);
         assert!(outcome.parity_disqualified.contains(&"faster_diverges".to_string()));
         assert!(outcome.roofline_pct > 0.0);
+    }
+
+    #[test]
+    fn median_rejects_single_round_outlier() {
+        // The candidate is genuinely faster (median 13) but one round spikes low.
+        // A single back-to-back trial that happened to hit the 4 would miss it;
+        // the interleaved median does not.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("fast", ExecutionProfile::Experimental)];
+        let cfg = TournamentConfig {
+            min_speedup: 1.05,
+            rounds: 3,
+            warmup_rounds: 0,
+        };
+        let mut fast_calls = 0;
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
+            match c.label.as_str() {
+                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                _ => {
+                    fast_calls += 1;
+                    let tps = if fast_calls == 2 { 4.0 } else { 13.0 };
+                    Some(TrialResult { tokens_per_s: tps, parity_token: "A".into() })
+                }
+            }
+        });
+        assert!(!outcome.fell_back);
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Experimental);
+        assert_eq!(outcome.measured_rounds, 3);
+        assert_eq!(outcome.samples.len(), 2); // baseline + candidate
+        let fast = outcome.samples.iter().find(|s| s.label == "fast").unwrap();
+        assert_eq!(fast.median_tokens_per_s, 13.0);
+        assert_eq!(fast.min_tokens_per_s, 4.0);
+    }
+
+    #[test]
+    fn inconsistent_parity_across_rounds_disqualifies() {
+        // A fast candidate whose output flips between rounds is non-deterministic
+        // and must be disqualified, not selected.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("flaky", ExecutionProfile::Experimental)];
+        let cfg = TournamentConfig {
+            min_speedup: 1.05,
+            rounds: 2,
+            warmup_rounds: 0,
+        };
+        let mut n = 0;
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 0, &mem(), |c| {
+            match c.label.as_str() {
+                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                _ => {
+                    n += 1;
+                    let token = if n == 1 { "A" } else { "B" };
+                    Some(TrialResult { tokens_per_s: 20.0, parity_token: token.into() })
+                }
+            }
+        });
+        assert!(outcome.fell_back);
+        assert!(outcome.parity_disqualified.contains(&"flaky".to_string()));
     }
 
     #[test]

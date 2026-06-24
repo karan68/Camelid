@@ -742,6 +742,13 @@ enum Command {
         /// Tokens to generate per trial (greedy/deterministic).
         #[arg(long, default_value_t = 64)]
         max_tokens: usize,
+        /// Measured interleaved rounds per variant (median is taken). More rounds
+        /// reject thermal/clock noise at the cost of calibration time.
+        #[arg(long, default_value_t = 4)]
+        rounds: usize,
+        /// Leading rounds discarded as warmup.
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
         /// Override Rayon worker threads.
         #[arg(long)]
         threads: Option<usize>,
@@ -1466,9 +1473,11 @@ async fn main() -> anyhow::Result<()> {
             prompt_file,
             prompt,
             max_tokens,
+            rounds,
+            warmup,
             threads,
         } => {
-            run_gait_calibrate(model, prompt_file, prompt, max_tokens, threads)?;
+            run_gait_calibrate(model, prompt_file, prompt, max_tokens, rounds, warmup, threads)?;
         }
         Command::BenchSpeculative {
             model,
@@ -1942,8 +1951,13 @@ fn gait_profile_trial(
     // Apply this candidate's Windows scheduling substrate before timing, so the
     // measured decode reflects it. Process-level, covers the Rayon pool.
     let eco_status = camelid::gait::substrate::set_eco_qos_opt_out(candidate.eco_qos_opt_out);
-    if candidate.eco_qos_opt_out {
-        eprintln!("[gait]   {} eco_qos opt-out -> {eco_status:?}", candidate.label);
+    if candidate.eco_qos_opt_out
+        && eco_status != camelid::gait::substrate::EcoQosStatus::OptedOut
+    {
+        eprintln!(
+            "[gait]   {} eco_qos opt-out unavailable -> {eco_status:?}",
+            candidate.label
+        );
     }
 
     let gguf = read_metadata(model)?;
@@ -1984,6 +1998,8 @@ fn run_gait_calibrate(
     prompt_file: Option<PathBuf>,
     prompt: Option<String>,
     max_tokens: usize,
+    rounds: usize,
+    warmup: usize,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
     use camelid::gait::calibrate::{
@@ -1992,6 +2008,7 @@ fn run_gait_calibrate(
     use camelid::execution_plan::ExecutionProfile;
 
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    anyhow::ensure!(rounds >= 1, "--rounds must be at least 1");
     // Calibration must measure the candidates we choose — never let a previously
     // cached gait receipt override the candidate's profile mid-trial.
     std::env::remove_var("CAMELID_GAIT");
@@ -2033,9 +2050,16 @@ fn run_gait_calibrate(
     let store_dir = default_store_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve the gait store directory"))?;
 
+    let config = TournamentConfig {
+        rounds,
+        warmup_rounds: warmup,
+        ..TournamentConfig::default()
+    };
     eprintln!(
-        "[gait] calibrating {} candidates (+baseline) on {} ...",
+        "[gait] calibrating {} candidates (+baseline), {} measured rounds (+{} warmup), interleaved, on {} ...",
         candidates.len(),
+        config.rounds,
+        config.warmup_rounds,
         model.display()
     );
     let trial = |candidate: &Candidate| -> Option<camelid::gait::calibrate::TrialResult> {
@@ -2056,14 +2080,7 @@ fn run_gait_calibrate(
         }
     };
 
-    let (outcome, path) = calibrate_and_store(
-        &store_dir,
-        &gguf,
-        &baseline,
-        &candidates,
-        &TournamentConfig::default(),
-        trial,
-    );
+    let (outcome, path) = calibrate_and_store(&store_dir, &gguf, &baseline, &candidates, &config, trial);
 
     println!("{}", serde_json::to_string_pretty(&outcome)?);
     match path {
