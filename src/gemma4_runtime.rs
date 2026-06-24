@@ -2372,6 +2372,11 @@ pub struct Gemma4CudaResident {
     // Per-owning-layer f16 KV caches ([kv_head][pos][head_dim]); None on shared layers.
     cache_k: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
     cache_v: Vec<Option<cudarc::driver::CudaSlice<u16>>>,
+    /// Token sequence currently represented in the persistent KV cache (the last request's
+    /// prompt + its generated tokens). On the next request the longest matching prefix is
+    /// reused, so only the genuinely new tokens are prefilled — this keeps multi-turn TTFT
+    /// roughly constant instead of growing with conversation length.
+    cached_tokens: Vec<u32>,
     // Reused per-token/per-layer device scratch (sized to per-layer maxima).
     d_hidden: cudarc::driver::CudaSlice<f32>,
     d_normed: cudarc::driver::CudaSlice<f32>,
@@ -2643,6 +2648,7 @@ impl Gemma4CudaResident {
             warmed: false,
             cache_k,
             cache_v,
+            cached_tokens: Vec::new(),
             d_hidden: alloc_f(hidden).map_err(cu)?,
             d_normed: alloc_f(hidden).map_err(cu)?,
             d_inq: alloc_i(hidden).map_err(cu)?,
@@ -3451,14 +3457,43 @@ impl Gemma4CudaResident {
     }
 
     /// Greedy-generate up to `max_new` tokens (mirrors the Metal runtime loop).
+    /// Prefill `prompt_tokens`, reusing the longest prefix already present in the KV cache
+    /// from the previous request (cross-request prefix cache) and only running
+    /// `forward_token` for the new suffix. Returns the logits predicting the first new
+    /// token. Output-equivalent to a full re-prefill: the KV for shared-prefix positions is
+    /// identical (same tokens, same positions), so only redundant compute is skipped. The
+    /// caller extends `cached_tokens` with any tokens it then generates. Disable with
+    /// `CAMELID_GEMMA4_NO_PREFIX_CACHE=1`.
+    fn prefill_reusing_cache(&mut self, prompt_tokens: &[u32]) -> Result<Vec<f32>> {
+        let n = prompt_tokens.len();
+        debug_assert!(n >= 1);
+        let disabled = std::env::var("CAMELID_GEMMA4_NO_PREFIX_CACHE").is_ok_and(|v| v == "1");
+        let mut p = 0usize;
+        if !disabled {
+            let cap = self.max_positions.min(n);
+            while p < cap
+                && p < self.cached_tokens.len()
+                && prompt_tokens[p] == self.cached_tokens[p]
+            {
+                p += 1;
+            }
+        }
+        // Always run at least the final prompt token to produce its logits.
+        let start = p.min(n - 1);
+        let last = n - 1;
+        let mut logits = Vec::new();
+        for pos in start..n {
+            logits = self.forward_token(prompt_tokens[pos], pos, pos == last)?;
+        }
+        self.cached_tokens.clear();
+        self.cached_tokens.extend_from_slice(prompt_tokens);
+        Ok(logits)
+    }
+
     pub fn generate_greedy(&mut self, prompt: &str, max_new: usize) -> Result<(String, Vec<u32>)> {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
-        let mut logits = Vec::new();
-        let last_prompt = prompt_tokens.len().saturating_sub(1);
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            logits = self.forward_token(tok, pos, pos == last_prompt)?;
-        }
+        let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
         let mut generated = Vec::new();
         for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
             let next = logits
@@ -3473,6 +3508,9 @@ impl Gemma4CudaResident {
             generated.push(next);
             logits = self.forward_token(next, pos, true)?;
         }
+        // The cache now also holds the generated tokens — record them so the next request
+        // can reuse this turn's full sequence as a prefix.
+        self.cached_tokens.extend_from_slice(&generated);
         let text = self.cpu.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
     }
@@ -3488,11 +3526,7 @@ impl Gemma4CudaResident {
     ) -> Result<(String, Vec<u32>)> {
         let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
         let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
-        let mut logits = Vec::new();
-        let last_prompt = prompt_tokens.len().saturating_sub(1);
-        for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            logits = self.forward_token(tok, pos, pos == last_prompt)?;
-        }
+        let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
         let mut generated = Vec::new();
         let mut prev_text = String::new();
         for pos in prompt_tokens.len()..prompt_tokens.len() + max_new {
@@ -3513,6 +3547,7 @@ impl Gemma4CudaResident {
             prev_text = text;
             logits = self.forward_token(next, pos, true)?;
         }
+        self.cached_tokens.extend_from_slice(&generated);
         Ok((prev_text, generated))
     }
 }
