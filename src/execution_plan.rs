@@ -254,11 +254,18 @@ pub fn plan_for_model_with_platform(
     platform: PlanPlatform,
 ) -> ExecutionPlanOutcome {
     // GAIT selector (bring-up gate `CAMELID_GAIT`, default off): consult the
-    // per-(model × machine) gait store for a cached profile. With the gate off,
-    // or on any miss/empty store, this returns None and the existing default
-    // path runs unchanged — keeping this byte-identical to today.
-    let (profile, profile_reason) =
-        crate::gait::maybe_select_profile(gguf).unwrap_or_else(requested_profile);
+    // per-(model × machine) gait store for a cached gait. With the gate off, or
+    // on any miss/empty store, this returns None and the existing default path
+    // runs unchanged — keeping this byte-identical to today. When a gait is
+    // found, apply its scheduling substrate (the coarse profile is applied by
+    // the env machinery below).
+    let (profile, profile_reason) = match crate::gait::maybe_select_profile(gguf) {
+        Some(gait) => {
+            crate::gait::apply_selected_gait(&gait);
+            (gait.profile, gait.reason)
+        }
+        None => requested_profile(),
+    };
     let row = exact_model_row(model_path, gguf);
     let support_level = support_level(&row);
     let model_family = model_family(&row, gguf);
