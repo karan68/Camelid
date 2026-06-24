@@ -723,6 +723,29 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
+    /// GAIT: run the parity-gated calibration tournament for this model on this
+    /// machine. Times the supported execution profiles, disqualifies any whose
+    /// greedy output diverges, picks the fastest parity-clean one that beats the
+    /// baseline by a margin (else fails closed to baseline), and persists a
+    /// `camelid.gait-receipt/v1`. Writes only a receipt; changes no decode path.
+    /// The receipt is consumed later only when `CAMELID_GAIT` is set.
+    #[command(hide = true)]
+    GaitCalibrate {
+        /// GGUF model path.
+        model: PathBuf,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Tokens to generate per trial (greedy/deterministic).
+        #[arg(long, default_value_t = 64)]
+        max_tokens: usize,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// SPEC_RECHECK measurement harness: run lossless greedy speculative decode and a plain
     /// greedy baseline back-to-back on one prompt, and emit a single JSON record with the
     /// per-run economics (acceptance rate, draft/verify latency split, f_draft, S_sync) plus
@@ -1438,6 +1461,15 @@ async fn main() -> anyhow::Result<()> {
                 threads,
             )?;
         }
+        Command::GaitCalibrate {
+            model,
+            prompt_file,
+            prompt,
+            max_tokens,
+            threads,
+        } => {
+            run_gait_calibrate(model, prompt_file, prompt, max_tokens, threads)?;
+        }
         Command::BenchSpeculative {
             model,
             drafter,
@@ -1882,6 +1914,159 @@ struct BenchGenerateRecord {
     offload: Option<camelid::offload::OffloadRunStatus>,
     output_text: String,
     output_token_ids: Vec<u32>,
+}
+
+fn gait_profile_env_value(profile: &camelid::execution_plan::ExecutionProfile) -> &'static str {
+    use camelid::execution_plan::ExecutionProfile::*;
+    match profile {
+        Auto => "auto",
+        Safe => "safe",
+        Experimental => "experimental",
+        Debug => "debug",
+    }
+}
+
+/// Time one candidate: select its profile for the planner, reload weights (the
+/// Q8 repack / kernel choice happens at load time, so each candidate needs its
+/// own load), run one unmeasured warmup, then a measured greedy decode. The
+/// parity token is the SHA-256 of the greedy output token ids — a candidate that
+/// changes the output is disqualified by the tournament.
+fn gait_profile_trial(
+    model: &std::path::Path,
+    threads: Option<usize>,
+    prompt_token_ids: &[u32],
+    max_tokens: usize,
+    candidate: &camelid::gait::calibrate::Candidate,
+) -> anyhow::Result<camelid::gait::calibrate::TrialResult> {
+    std::env::set_var("CAMELID_PROFILE", gait_profile_env_value(&candidate.profile));
+
+    let gguf = read_metadata(model)?;
+    // Apply this candidate's plan before loading weights, exactly as bench-generate does.
+    let plan = camelid::execution_plan::plan_for_model(model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan.env_updates);
+
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+    let sampler = LlamaSampler::Greedy;
+
+    let _ = generate_run(&config, &weights, &tokenizer, prompt_token_ids, &sampler, max_tokens)?;
+    camelid::inference::reset_stage_timings();
+    let run = generate_run(&config, &weights, &tokenizer, prompt_token_ids, &sampler, max_tokens)?;
+
+    let decode_tokens = run.generated.len().saturating_sub(1);
+    let tokens_per_s = if run.decode_ms > 0.0 && decode_tokens > 0 {
+        decode_tokens as f64 / (run.decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let mut id_bytes = Vec::with_capacity(run.generated.len() * 4);
+    for id in &run.generated {
+        id_bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    let parity_token = camelid::receipt::sha256_hex(&id_bytes);
+    Ok(camelid::gait::calibrate::TrialResult {
+        tokens_per_s,
+        parity_token,
+    })
+}
+
+fn run_gait_calibrate(
+    model: PathBuf,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    max_tokens: usize,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    use camelid::gait::calibrate::{
+        calibrate_and_store, default_store_dir, Candidate, TournamentConfig,
+    };
+    use camelid::execution_plan::ExecutionProfile;
+
+    anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    // Calibration must measure the candidates we choose — never let a previously
+    // cached gait receipt override the candidate's profile mid-trial.
+    std::env::remove_var("CAMELID_GAIT");
+    configure_rayon_threads(threads)?;
+    camelid::capability::HardwareProfile::detect().log();
+
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    let gguf = read_metadata(&model)?;
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    anyhow::ensure!(!prompt_token_ids.is_empty(), "prompt encoded to zero tokens");
+
+    let baseline = Candidate {
+        label: "auto".to_string(),
+        profile: ExecutionProfile::Auto,
+    };
+    let candidates = vec![
+        Candidate {
+            label: "safe".to_string(),
+            profile: ExecutionProfile::Safe,
+        },
+        Candidate {
+            label: "experimental".to_string(),
+            profile: ExecutionProfile::Experimental,
+        },
+    ];
+
+    let store_dir = default_store_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not resolve the gait store directory"))?;
+
+    eprintln!(
+        "[gait] calibrating {} candidates (+baseline) on {} ...",
+        candidates.len(),
+        model.display()
+    );
+    let trial = |candidate: &Candidate| -> Option<camelid::gait::calibrate::TrialResult> {
+        match gait_profile_trial(&model, threads, &prompt_token_ids, max_tokens, candidate) {
+            Ok(result) => {
+                eprintln!(
+                    "[gait] {:<13} {:>7.2} tok/s  parity {}",
+                    candidate.label,
+                    result.tokens_per_s,
+                    &result.parity_token[..12]
+                );
+                Some(result)
+            }
+            Err(err) => {
+                eprintln!("[gait] {:<13} trial failed: {err}", candidate.label);
+                None
+            }
+        }
+    };
+
+    let (outcome, path) = calibrate_and_store(
+        &store_dir,
+        &gguf,
+        &baseline,
+        &candidates,
+        &TournamentConfig::default(),
+        trial,
+    );
+
+    println!("{}", serde_json::to_string_pretty(&outcome)?);
+    match path {
+        Some(p) => eprintln!(
+            "[gait] selected {:?} :: {} :: receipt {}",
+            outcome.selected_profile,
+            outcome.reason,
+            p.display()
+        ),
+        None => eprintln!(
+            "[gait] selected {:?} :: {} :: receipt NOT stored (store write failed)",
+            outcome.selected_profile, outcome.reason
+        ),
+    }
+    Ok(())
 }
 
 struct GenerationRun {
