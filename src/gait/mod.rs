@@ -28,6 +28,8 @@ use crate::execution_plan::ExecutionProfile;
 use crate::gguf::GgufFile;
 use crate::receipt::{canonical_json, sha256_hex};
 
+pub mod calibrate;
+
 /// Schema identifier stamped into every v1 gait receipt. Mirrors the
 /// `camelid.parity-receipt/v1` family so receipts are cited by fingerprint and
 /// trivially checked for tampering.
@@ -142,7 +144,7 @@ impl ModelSig {
 /// Classify a tensor by its inference stage from its GGUF name. Coarse but
 /// deterministic; norm tensors are matched first so QK-norm weights do not fall
 /// into the attention-projection buckets.
-fn tensor_class(name: &str) -> &'static str {
+pub(crate) fn tensor_class(name: &str) -> &'static str {
     let n = name.to_ascii_lowercase();
     if n.contains("norm") {
         "norm"
@@ -498,6 +500,12 @@ pub struct GaitReceipt {
     /// receipts written before a measurement was taken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryMeasurement>,
+    /// The calibration evidence that selected `recorded_profile` — the
+    /// matched-trial speedup over baseline, roofline %, and any parity-
+    /// disqualified candidates. Absent for a hand-set or not-yet-calibrated
+    /// receipt. Part of the canonical body, so bound into `receipt_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<calibrate::CalibrationOutcome>,
 }
 
 impl GaitReceipt {
@@ -512,6 +520,7 @@ impl GaitReceipt {
             machine_sig,
             recorded_profile,
             memory: None,
+            calibration: None,
         };
         receipt.seal();
         receipt
@@ -521,6 +530,13 @@ impl GaitReceipt {
     /// canonical body).
     pub fn with_memory(mut self, memory: MemoryMeasurement) -> Self {
         self.memory = Some(memory);
+        self.seal();
+        self
+    }
+
+    /// Attach the calibration evidence and re-seal.
+    pub fn with_calibration(mut self, calibration: calibrate::CalibrationOutcome) -> Self {
+        self.calibration = Some(calibration);
         self.seal();
         self
     }
@@ -640,9 +656,23 @@ pub struct MemoryMeasurement {
 /// decode path actually sees.
 pub fn measure_memory() -> MemoryMeasurement {
     MemoryMeasurement {
-        stream_triad_gbs: measure_stream_triad_gbs(),
-        dram_latency_ns: measure_dram_latency_ns(),
+        stream_triad_gbs: round_sig6(measure_stream_triad_gbs()),
+        dram_latency_ns: round_sig6(measure_dram_latency_ns()),
     }
+}
+
+/// Round to 6 significant figures. serde_json's default parser is not bit-exact
+/// for full-precision f64 (off by ~1 ULP on the hardest cases), which would
+/// break a content-addressed receipt's self-digest after a file round-trip.
+/// Measured/derived evidence does not need more than 6 figures, and short
+/// decimals deserialize exactly — so this keeps gait receipts verifiable.
+pub(crate) fn round_sig6(x: f64) -> f64 {
+    if x == 0.0 || !x.is_finite() {
+        return x;
+    }
+    let digits = 5 - x.abs().log10().floor() as i32;
+    let factor = 10f64.powi(digits);
+    (x * factor).round() / factor
 }
 
 #[inline(never)]
