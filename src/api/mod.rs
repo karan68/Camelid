@@ -4295,7 +4295,11 @@ async fn load_gemma4_serve_runtime(
             #[cfg(feature = "cuda")]
             {
                 if gemma4_cuda_enabled() {
-                    return crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 2048)
+                    // KV-cache context window. 4096 fits the 6 GB card (the attention
+                    // kernel's shared memory is (2*head_dim + max_positions)*4 bytes, well
+                    // under 48 KB, and the f16 KV adds only ~100-200 MB) and gives real
+                    // multi-turn headroom; overflow past it is guarded in the runtime.
+                    return crate::gemma4_runtime::Gemma4CudaResident::load(&load_path, 4096)
                         .map(|r| Gemma4ServeRuntime::Cuda(std::sync::Mutex::new(r)));
                 }
             }
