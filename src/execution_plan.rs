@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, env, path::Path};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::gguf::{GgufFile, GgufTensorType};
 
@@ -75,7 +75,7 @@ const MANAGED_PASSTHROUGH_ENV_KEYS: &[ManagedPassthroughEnvKey] = &[
 
 pub const MAC_Q8_PREFILL_I8MM_MIN_ROWS: usize = 4;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionProfile {
     Safe,
@@ -253,7 +253,12 @@ pub fn plan_for_model_with_platform(
     threads: Option<usize>,
     platform: PlanPlatform,
 ) -> ExecutionPlanOutcome {
-    let (profile, profile_reason) = requested_profile();
+    // GAIT selector (bring-up gate `CAMELID_GAIT`, default off): consult the
+    // per-(model × machine) gait store for a cached profile. With the gate off,
+    // or on any miss/empty store, this returns None and the existing default
+    // path runs unchanged — keeping this byte-identical to today.
+    let (profile, profile_reason) =
+        crate::gait::maybe_select_profile(gguf).unwrap_or_else(requested_profile);
     let row = exact_model_row(model_path, gguf);
     let support_level = support_level(&row);
     let model_family = model_family(&row, gguf);
