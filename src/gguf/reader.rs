@@ -49,6 +49,8 @@ pub enum GgufTensorType {
     Q6K,
     Q8K,
     IQ4NL,
+    Tq1_0,
+    Tq2_0,
     I8,
     I16,
     I32,
@@ -76,6 +78,8 @@ impl GgufTensorType {
             14 => Self::Q6K,
             15 => Self::Q8K,
             20 => Self::IQ4NL,
+            34 => Self::Tq1_0,
+            35 => Self::Tq2_0,
             24 => Self::I8,
             25 => Self::I16,
             26 => Self::I32,
@@ -104,6 +108,10 @@ impl GgufTensorType {
             Self::Q6K => Some((256, 210)),
             Self::Q8K => Some((256, 292)),
             Self::IQ4NL => Some((32, 18)),
+            // block_tq1_0 = f16 d(2) + qh[QK_K/64]=4 + qs[(QK_K-4*QK_K/64)/5]=48 = 54 (1.69 bpw)
+            Self::Tq1_0 => Some((256, 54)),
+            // block_tq2_0 = qs[QK_K/4]=64 + f16 d(2) = 66 (2.06 bpw)
+            Self::Tq2_0 => Some((256, 66)),
             Self::I8 => Some((1, 1)),
             Self::I16 | Self::BF16 => Some((1, 2)),
             Self::I32 => Some((1, 4)),

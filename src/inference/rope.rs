@@ -297,6 +297,7 @@ pub(super) enum RopeScalingKind {
     None,
     Linear,
     Llama3,
+    Yarn,
 }
 
 impl RopeScalingKind {
@@ -305,7 +306,40 @@ impl RopeScalingKind {
             Self::None => "none",
             Self::Linear => "linear",
             Self::Llama3 => "llama3",
+            Self::Yarn => "yarn",
         }
+    }
+}
+
+// --- YaRN (NTK-by-parts) RoPE, faithful to llama.cpp ggml `rope_yarn`. Defaults match
+// ggml: beta_fast=32, beta_slow=1, ext_factor=1, attn_factor=1 (no per-model overrides in
+// the GGUF we target). The per-pair frequency is interpolated between the un-scaled
+// ("extrapolation") and 1/factor-scaled ("interpolation") angles via a correction ramp,
+// and the cos/sin magnitude is multiplied by `mscale`.
+const YARN_BETA_FAST: f32 = 32.0;
+const YARN_BETA_SLOW: f32 = 1.0;
+
+fn yarn_corr_dim(rope_dim: usize, n_ctx_orig: f32, n_rot: f32, base: f32) -> f32 {
+    (rope_dim as f32) * (n_ctx_orig / (n_rot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln())
+}
+
+fn yarn_corr_dims(rope_dim: usize, n_ctx_orig: u32, base: f32) -> (f32, f32) {
+    let start = yarn_corr_dim(rope_dim, n_ctx_orig as f32, YARN_BETA_FAST, base).floor();
+    let end = yarn_corr_dim(rope_dim, n_ctx_orig as f32, YARN_BETA_SLOW, base).ceil();
+    (start.max(0.0), end.min(rope_dim as f32 - 1.0))
+}
+
+fn yarn_ramp(low: f32, high: f32, pair_idx: usize) -> f32 {
+    let y = ((pair_idx as f32) - low) / (high - low).max(0.001);
+    1.0 - y.clamp(0.0, 1.0)
+}
+
+/// cos/sin magnitude scaling (1.0 unless YaRN). ext_factor=1, attn_factor=1, so
+/// mscale = 1 + 0.1*ln(1/freq_scale) = 1 + 0.1*ln(factor).
+pub(super) fn rope_magnitude_scale(scaling: RopeScaling) -> f32 {
+    match scaling.kind {
+        RopeScalingKind::Yarn => 1.0 + 0.1 * scaling.factor.ln(),
+        _ => 1.0,
     }
 }
 
@@ -314,6 +348,7 @@ pub(super) fn rope_scaling_from_config(config: &LlamaModelConfig) -> Result<Rope
         None | Some("") | Some("none") => RopeScalingKind::None,
         Some("linear") => RopeScalingKind::Linear,
         Some("llama3") => RopeScalingKind::Llama3,
+        Some("yarn") => RopeScalingKind::Yarn,
         Some(other) => {
             return Err(BackendError::InvalidModelMetadata(format!(
                 "unsupported llama.rope.scaling.type {other:?}; expected none, linear, or llama3"
@@ -372,6 +407,23 @@ pub(super) fn rope_scaling_from_config(config: &LlamaModelConfig) -> Result<Rope
                 high_freq_factor: Some(high_freq_factor),
             })
         }
+        RopeScalingKind::Yarn => {
+            let original_context_length =
+                config.rope_scaling_original_context_length.unwrap_or(8_192);
+            if original_context_length == 0 {
+                return Err(BackendError::InvalidModelMetadata(
+                    "yarn RoPE scaling original context length must be greater than zero"
+                        .to_string(),
+                ));
+            }
+            Ok(RopeScaling {
+                kind,
+                factor,
+                original_context_length: Some(original_context_length),
+                low_freq_factor: None,
+                high_freq_factor: None,
+            })
+        }
     }
 }
 
@@ -403,10 +455,13 @@ pub(super) fn apply_rope_with_pairing(
 fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'_>) {
     params.position = position;
     let half_rope_dim = params.rope_dim / 2;
+    let mscale = rope_magnitude_scale(params.scaling);
     for pair_idx in 0..half_rope_dim {
         let theta = rope_pair_frequency(pair_idx, &params);
         let angle = params.position_mode.effective_position(params.position) as f32 * theta;
-        let (sin, cos) = angle.sin_cos();
+        let (mut sin, mut cos) = angle.sin_cos();
+        sin *= mscale;
+        cos *= mscale;
         for head in 0..params.head_count {
             let head_start = head * params.head_dim;
             let (dim0, dim1) = match params.pairing {
@@ -451,6 +506,15 @@ fn rope_pair_frequency(pair_idx: usize, params: &RopeParams<'_>) -> f32 {
         RopeScalingKind::Linear => effective_base_frequency / params.scaling.factor,
         RopeScalingKind::Llama3 => {
             llama3_scaled_rope_frequency(effective_base_frequency, params.scaling)
+        }
+        RopeScalingKind::Yarn => {
+            // theta = interp*(1-ramp_mix) + extrap*ramp_mix, ext_factor=1 so ramp_mix=ramp.
+            let n_ctx_orig = params.scaling.original_context_length.unwrap_or(8_192);
+            let (low, high) = yarn_corr_dims(params.rope_dim, n_ctx_orig, params.freq_base);
+            let ramp_mix = yarn_ramp(low, high, pair_idx);
+            let theta_extrap = effective_base_frequency;
+            let theta_interp = theta_extrap / params.scaling.factor; // freq_scale = 1/factor
+            theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix
         }
     }
 }
@@ -508,12 +572,13 @@ pub(super) fn resident_decode_rope_tables(
     };
     let half = rope_dim / 2;
     let eff = position_mode.effective_position(position) as f32;
+    let mscale = rope_magnitude_scale(scaling);
     let mut cos = Vec::with_capacity(half);
     let mut sin = Vec::with_capacity(half);
     for pair in 0..half {
         let (s, c) = (eff * rope_pair_frequency(pair, &params)).sin_cos();
-        cos.push(c);
-        sin.push(s);
+        cos.push(c * mscale);
+        sin.push(s * mscale);
     }
     Ok(Some(ResidentRopeTables {
         cos,
@@ -565,6 +630,7 @@ pub(super) fn resident_prefill_rope_tables(
         .map(|pair| rope_pair_frequency(pair, &params))
         .collect();
 
+    let mscale = rope_magnitude_scale(scaling);
     let mut cos_all = Vec::with_capacity(n_positions * half);
     let mut sin_all = Vec::with_capacity(n_positions * half);
     cos_all.extend_from_slice(&first.cos);
@@ -573,8 +639,8 @@ pub(super) fn resident_prefill_rope_tables(
         let eff = position_mode.effective_position(pos) as f32;
         for &f in &freqs {
             let (s, c) = (eff * f).sin_cos();
-            cos_all.push(c);
-            sin_all.push(s);
+            cos_all.push(c * mscale);
+            sin_all.push(s * mscale);
         }
     }
     Ok(Some(ResidentRopeTables {

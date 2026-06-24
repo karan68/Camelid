@@ -402,6 +402,11 @@ impl LlamaLoadedWeights {
             // bytes (no f32 materialization — an 8B model fully decoded to f32 is ~32 GB
             // and OOMs). The GPU-resident decode reads these via q4k_gemv / q6k_gemv.
             if let Ok(desc) = store.descriptor(name) {
+                // Ternary TQ2_0 2-D linears: stream the wire bytes (the CPU ternary
+                // block-dot reads them); never materialise f32 (a 4B model is ~16 GB f32).
+                if matches!(desc.tensor_type, GgufTensorType::Tq2_0) && desc.dimensions.len() == 2 {
+                    return store.load_tq2_0_wire_linear(name);
+                }
                 if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
                     && desc.dimensions.len() == 2
                 {
@@ -7087,6 +7092,7 @@ struct BorrowedLinearWeight<'a> {
     q8_0_packed_rows4_4x8: Option<&'a Q8_0PackedRows4>,
     q8_0_runtime_storage: Option<&'a Q8_0RuntimeStorage>,
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
+    tq2_0_wire_bytes: Option<&'a [u8]>,
 }
 
 impl<'a> BorrowedLinearWeight<'a> {
@@ -7107,6 +7113,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_packed_rows4_4x8: weight.q8_0_packed_rows4_4x8.as_ref(),
             q8_0_runtime_storage: weight.q8_0_runtime_storage.as_ref(),
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
+            tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
         })
     }
 
@@ -7272,6 +7279,11 @@ fn output_projection_with_layout_with_plan(
                 )));
             }
             let name = name.into();
+            // Tied Q6_K embed/lm_head: stream the Q6_K wire blocks instead of the generic
+            // f32 matmul over the materialised embedding (which dominated decode at ~88%).
+            if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+                return matmul_rhs_transposed_q6_k_block_dot(input, weight, name.as_str());
+            }
             if let Some(output) =
                 try_x86_q8_output_packed_rows4_matmul_path(input, weight, &name, runtime_plan)?
             {
@@ -7346,6 +7358,9 @@ fn matmul_rhs_transposed_with_precision_with_plan(
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<CpuTensor> {
     let input_width = input.dim(1)?;
+    if weight.source_type == Some(GgufTensorType::Tq2_0) && weight.tq2_0_wire_bytes.is_some() {
+        return matmul_rhs_transposed_tq2_0_block_dot(input, weight, name);
+    }
     if should_use_q8_0_block_dot_with_plan(weight, input_width, runtime_plan) {
         return matmul_rhs_transposed_q8_0_block_dot_with_plan(input, weight, name, runtime_plan);
     }
@@ -15054,6 +15069,257 @@ pub(crate) fn quantize_q8_k_blocks(input: &[f32]) -> Vec<Q8KBlock> {
         .collect()
 }
 
+/// Quantise an activation row to Q8_K and also return per-16-group sums (`bsums`) per
+/// block, computed once per activation row and reused across every weight row (they
+/// depend only on the activation, not the weight). Used by the AVX2 ternary dot to
+/// recenter the unsigned {0,1,2} codes to {-1,0,+1}.
+fn quantize_q8_k_with_bsums(input: &[f32]) -> (Vec<Q8KBlock>, Vec<[i16; 16]>) {
+    let blocks = quantize_q8_k_blocks(input);
+    let bsums = blocks
+        .iter()
+        .map(|b| {
+            let mut bs = [0i16; 16];
+            for (g, slot) in bs.iter_mut().enumerate() {
+                let mut s = 0i32;
+                for k in 0..16 {
+                    s += b.qs[g * 16 + k] as i32;
+                }
+                *slot = s as i16;
+            }
+            bs
+        })
+        .collect();
+    (blocks, bsums)
+}
+
+/// Scalar reference dot (parity floor): one TQ2_0 weight row against a Q8_K activation
+/// row. Port of ggml `ggml_vec_dot_tq2_0_q8_K_generic`: per block, sumi = Σ (code-1)·q8,
+/// scaled by d_x·d_y; the 2-bit codes {0,1,2} recenter to {-1,0,+1} via the `-1`.
+fn tq2_0_row_dot(w_row: &[u8], q8: &[Q8KBlock], blocks_per_row: usize) -> f32 {
+    let mut sumf = 0f32;
+    for b in 0..blocks_per_row {
+        let wb = &w_row[b * 66..b * 66 + 66];
+        let qs = &wb[0..64];
+        let dw = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([wb[64], wb[65]]));
+        let yb = &q8[b];
+        let mut sumi: i32 = 0;
+        let mut j = 0usize;
+        while j < 64 {
+            for l in 0..4 {
+                let base = j * 4 + l * 32;
+                for k in 0..32 {
+                    let code = ((qs[j + k] >> (2 * l)) & 3) as i32;
+                    sumi += (code - 1) * (yb.qs[base + k] as i32);
+                }
+            }
+            j += 32;
+        }
+        sumf += sumi as f32 * (yb.d * dw);
+    }
+    sumf
+}
+
+/// AVX2 ternary dot, mirroring ggml `ggml_vec_dot_tq2_0_q8_K`: unpack the 2-bit codes,
+/// `maddubs` against the int8 activations (16-bit accumulate, safe within a 256-block),
+/// subtract the per-group activation sums (`bsums`) to recenter, then scale by d_x·d_y.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn tq2_0_row_dot_avx2(
+    w_row: &[u8],
+    q8: &[Q8KBlock],
+    bsums: &[[i16; 16]],
+    blocks_per_row: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+    let m3 = _mm256_set1_epi8(3);
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = _mm256_setzero_ps();
+    for b in 0..blocks_per_row {
+        let wb = w_row.as_ptr().add(b * 66);
+        let dw = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([
+            *w_row.get_unchecked(b * 66 + 64),
+            *w_row.get_unchecked(b * 66 + 65),
+        ]));
+        let yb = &q8[b];
+        let yptr = yb.qs.as_ptr();
+        let mut sumi0 = _mm256_setzero_si256();
+        let mut sumi1 = _mm256_setzero_si256();
+        let mut j = 0usize;
+        while j < 64 {
+            let q = _mm256_loadu_si256(wb.add(j) as *const __m256i);
+            let qx0 = _mm256_and_si256(q, m3);
+            let qx1 = _mm256_and_si256(_mm256_srli_epi16(q, 2), m3);
+            let qx2 = _mm256_and_si256(_mm256_srli_epi16(q, 4), m3);
+            let qx3 = _mm256_and_si256(_mm256_srli_epi16(q, 6), m3);
+            let qy0 = _mm256_loadu_si256(yptr.add(j * 4) as *const __m256i);
+            let qy1 = _mm256_loadu_si256(yptr.add(j * 4 + 32) as *const __m256i);
+            let qy2 = _mm256_loadu_si256(yptr.add(j * 4 + 64) as *const __m256i);
+            let qy3 = _mm256_loadu_si256(yptr.add(j * 4 + 96) as *const __m256i);
+            sumi0 = _mm256_add_epi16(
+                sumi0,
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(qx0, qy0),
+                    _mm256_maddubs_epi16(qx1, qy1),
+                ),
+            );
+            sumi1 = _mm256_add_epi16(
+                sumi1,
+                _mm256_add_epi16(
+                    _mm256_maddubs_epi16(qx2, qy2),
+                    _mm256_maddubs_epi16(qx3, qy3),
+                ),
+            );
+            j += 32;
+        }
+        let ysum = _mm256_loadu_si256(bsums[b].as_ptr() as *const __m256i);
+        let mut s = _mm256_add_epi16(sumi0, sumi1);
+        s = _mm256_sub_epi16(s, ysum);
+        let s32 = _mm256_madd_epi16(s, ones);
+        let d = _mm256_set1_ps(yb.d * dw);
+        acc = _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(s32), d), acc);
+    }
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_hadd_ps(s, s);
+    let s = _mm_hadd_ps(s, s);
+    _mm_cvtss_f32(s)
+}
+
+/// Runtime-dispatched ternary dot: AVX2 when available, else the scalar reference.
+#[inline]
+fn tq2_0_dot(w_row: &[u8], q8: &[Q8KBlock], bsums: &[[i16; 16]], blocks_per_row: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return unsafe { tq2_0_row_dot_avx2(w_row, q8, bsums, blocks_per_row) };
+        }
+    }
+    let _ = bsums;
+    tq2_0_row_dot(w_row, q8, blocks_per_row)
+}
+
+/// Streaming TQ2_0 (ternary) linear: `output[n_rows, out_dim] = input @ weightᵀ`, with
+/// the weight held as raw TQ2_0 wire bytes (never materialised to f32). PREFILL TILING:
+/// all `n_rows` activation rows are quantised once, then each weight row is streamed once
+/// (rayon-parallel over the output dimension) and dotted against every token — so the
+/// weight is read once instead of once-per-token. This is the win llama.cpp's un-tiled
+/// per-element TQ kernel leaves on the table.
+fn matmul_rhs_transposed_tq2_0_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let n_rows = input.dim(0)?;
+    let in_dim = input.dim(1)?;
+    let out_dim = weight.dim(0)?;
+    if in_dim % 256 != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "TQ2_0 block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let blocks_per_row = in_dim / 256;
+    let wire = weight.tq2_0_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("TQ2_0 weight missing wire bytes".to_string())
+    })?;
+    let row_bytes = blocks_per_row * 66; // TQ2_0 = 66 bytes / 256-weight block
+    if wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "TQ2_0 weight wire length {} != out_dim {out_dim} * {row_bytes}",
+            wire.len()
+        )));
+    }
+    // Quantise every activation row once (+ bsums); reused across all output rows.
+    let preps: Vec<(Vec<Q8KBlock>, Vec<[i16; 16]>)> = (0..n_rows)
+        .map(|r| quantize_q8_k_with_bsums(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    // One column of outputs per weight row; weight row streamed once, reused over tokens.
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            preps
+                .iter()
+                .map(|(q8, bs)| tq2_0_dot(w_row, q8, bs, blocks_per_row))
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+/// Single-row (decode) variant of the streaming TQ2_0 linear: quantise the one input
+/// row to Q8_K once, then dot against every weight row (rayon-parallel over `output`).
+fn accumulate_transposed_linear_row_tq2_0(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let blocks_per_row = input_row.len() / 256;
+    let row_bytes = blocks_per_row * 66;
+    let (q8, bsums) = quantize_q8_k_with_bsums(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = tq2_0_dot(w_row, &q8, &bsums, blocks_per_row);
+    });
+}
+
+/// Streaming Q6_K linear (used for the tied embed/lm_head output projection): rather than
+/// materialise the ~1.6 GB f32 embedding and run a generic f32 matmul (which dominated
+/// decode at ~88% of the per-token time), quantise each input row to Q8_K once and dot it
+/// against the retained Q6_K wire blocks (rayon-parallel over the vocab dimension).
+fn matmul_rhs_transposed_q6_k_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let n_rows = input.dim(0)?;
+    let in_dim = input.dim(1)?;
+    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q6_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let wire = weight.q6_k_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Q6_K weight missing wire bytes".to_string())
+    })?;
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q6_K_WIRE_BYTES_PER_BLOCK;
+    // The output projection passes the tied embed as [hidden, vocab]; the wire bytes are
+    // token-major ([vocab, hidden] row-major, one contiguous hidden-row per vocab entry),
+    // so derive the output (vocab) dimension from the wire length rather than weight.dim(0).
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q6_K weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    let out_dim = wire.len() / row_bytes;
+    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            preps
+                .iter()
+                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
 /// Dequantize a single Q6_K wire superblock (210 bytes) into 256 f32 values,
 /// mirroring the reference `dequantize_row_q6_K` exactly (nibble/2-bit
 /// recombination order, per-16 i8 scales, f16 super-scale).
@@ -16883,6 +17149,12 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
     output: &mut [f32],
     runtime_plan: &ResolvedRuntimePlan,
 ) {
+    if weight.source_type == Some(GgufTensorType::Tq2_0) {
+        if let Some(wire) = weight.tq2_0_wire_bytes {
+            accumulate_transposed_linear_row_tq2_0(input_row, wire, output);
+            return;
+        }
+    }
     if should_use_borrowed_q8_0_block_dot_with_plan(weight, input_row.len(), runtime_plan) {
         accumulate_transposed_linear_row_q8_0_block_dot_with_flags(
             input_row,

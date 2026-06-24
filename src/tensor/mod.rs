@@ -900,6 +900,11 @@ pub struct CpuTensor {
     /// them straight to the `q6k_gemv` kernel (which reads the wire layout directly).
     /// Populated by the Q6_K load path; `None` for non-Q6_K tensors.
     pub q6_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Ternary TQ2_0 wire bytes (66 bytes/256-weight block, row-major), retained when
+    /// the tensor's `source_type` is `Tq2_0` so the CPU ternary block-dot streams the
+    /// quantized weights instead of materialising f32 (a 4B model fully decoded to f32 is
+    /// ~16 GB and OOMs). Populated by `load_tq2_0_wire_linear`; `None` otherwise.
+    pub tq2_0_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     pub data: Vec<f32>,
 }
 
@@ -1053,6 +1058,7 @@ impl Q8_0TensorBlocks {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data,
         })
     }
@@ -1122,6 +1128,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data,
         })
     }
@@ -1207,6 +1214,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         })
     }
@@ -1236,6 +1244,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1260,6 +1269,7 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -1284,6 +1294,7 @@ impl CpuTensor {
             q8_0_split_file_backing: Some(backings),
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
     }
@@ -3313,6 +3324,37 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q6_k_wire_bytes,
+            tq2_0_wire_bytes: None,
+            data: Vec::new(),
+        })
+    }
+
+    /// Load a TQ2_0 (ternary) 2-D linear by retaining its raw wire bytes only — no f32
+    /// materialisation. The CPU ternary block-dot streams these directly. Mirrors
+    /// `load_kquant_wire_linear`. Falls back to f32 for non-TQ2_0 / non-2-D tensors.
+    pub fn load_tq2_0_wire_linear(&self, name: &str) -> Result<CpuTensor> {
+        let desc = self.descriptor(name)?.clone();
+        let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
+        if !matches!(desc.tensor_type, GgufTensorType::Tq2_0) || shape.dims.len() != 2 {
+            return self.load_cpu_f32(name);
+        }
+        let bytes = self.tensor_bytes(name)?;
+        Ok(CpuTensor {
+            name: name.to_string(),
+            shape,
+            dtype: RuntimeDType::F32,
+            source_type: Some(desc.tensor_type),
+            q8_0_blocks: None,
+            q8_0_packed_rows4_4x4: None,
+            q8_0_packed_rows4_4x8: None,
+            q8_0_runtime_storage: None,
+            q8_0_file_backing: None,
+            q8_0_wire_mmap: None,
+            q8_0_wire_pages: None,
+            q8_0_split_file_backing: None,
+            q4_k_wire_bytes: None,
+            q6_k_wire_bytes: None,
+            tq2_0_wire_bytes: Some(std::sync::Arc::new(bytes.to_vec())),
             data: Vec::new(),
         })
     }
@@ -3495,6 +3537,8 @@ impl TensorStore {
             }
             GgufTensorType::Q8K => decode_q8_k_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::IQ4NL => decode_iq4_nl_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Tq1_0 => decode_tq1_0_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Tq2_0 => decode_tq2_0_tensor(name, &bytes, expected_elements)?,
             other => {
                 return Err(BackendError::UnsupportedTensorType(format!(
                     "tensor {name} has unsupported storage type {other:?}; supported for CPU f32 load: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL"
@@ -3528,6 +3572,7 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q6_k_wire_bytes,
+            tq2_0_wire_bytes: None,
             data,
         })
     }
@@ -4577,6 +4622,89 @@ pub(crate) fn decode_q4_0_tensor(
         let scale = block.scale_f32();
         for val in block.unpack_values() {
             out.push(val as f32 * scale);
+        }
+    }
+    Ok(out)
+}
+
+// ---- Ternary (BitNet) TQ1_0 / TQ2_0 flat dequantization to f32 ----
+// Faithful ports of ggml `dequantize_row_tq{1,2}_0` (llama.cpp ggml-quants.c). The
+// element ORDER and the u8-truncating base-3 decode must match bit-for-bit so the
+// dequantized weights reproduce llama.cpp's outputs for greedy parity.
+const TQ1_0_BLOCK_BYTES: usize = 54; // qs[48] + qh[4] + f16 d  (1.69 bpw over 256 weights)
+const TQ2_0_BLOCK_BYTES: usize = 66; // qs[64] + f16 d          (2.06 bpw over 256 weights)
+
+pub(crate) fn decode_tq2_0_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(TQ2_0_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: TQ2_0 byte length {} is not aligned to {TQ2_0_BLOCK_BYTES}-byte blocks",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in bytes.chunks_exact(TQ2_0_BLOCK_BYTES) {
+        let qs = &block[0..64];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[64], block[65]]));
+        // ggml: for j in {0,32}; for l in 0..4; for m in 0..32: q=(qs[j+m]>>(l*2))&3; (q-1)*d
+        let mut j = 0usize;
+        while j < 64 {
+            for l in 0..4 {
+                for m in 0..32 {
+                    let q = ((qs[j + m] >> (l * 2)) & 3) as i32;
+                    out.push((q - 1) as f32 * d);
+                }
+            }
+            j += 32;
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_tq1_0_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(TQ1_0_BLOCK_BYTES) {
+        return Err(BackendError::InvalidTensorData(format!(
+            "{name}: TQ1_0 byte length {} is not aligned to {TQ1_0_BLOCK_BYTES}-byte blocks",
+            bytes.len()
+        )));
+    }
+    // pow3[n] for the base-3 digit extraction: trit_n = ((u8(qs*pow3[n]) * 3) >> 8) - 1.
+    const POW3: [u32; 5] = [1, 3, 9, 27, 81];
+    let mut out = Vec::with_capacity(expected_elements);
+    for block in bytes.chunks_exact(TQ1_0_BLOCK_BYTES) {
+        let qs = &block[0..48];
+        let qh = &block[48..52];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[52], block[53]]));
+        // part 1: j=0 (qs[0..32]), 5 trit planes x 32
+        for &pw in POW3.iter() {
+            for m in 0..32 {
+                let q = (qs[m] as u32).wrapping_mul(pw) as u8;
+                let xi = (((q as u16) * 3) >> 8) as i32;
+                out.push((xi - 1) as f32 * d);
+            }
+        }
+        // part 2: j=32 (qs[32..48]), 5 trit planes x 16
+        for &pw in POW3.iter() {
+            for m in 0..16 {
+                let q = (qs[32 + m] as u32).wrapping_mul(pw) as u8;
+                let xi = (((q as u16) * 3) >> 8) as i32;
+                out.push((xi - 1) as f32 * d);
+            }
+        }
+        // part 3: qh (4 bytes), 4 trit planes x 4
+        for &pw in POW3.iter().take(4) {
+            for jj in 0..4 {
+                let q = (qh[jj] as u32).wrapping_mul(pw) as u8;
+                let xi = (((q as u16) * 3) >> 8) as i32;
+                out.push((xi - 1) as f32 * d);
+            }
         }
     }
     Ok(out)
