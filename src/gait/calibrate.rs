@@ -86,6 +86,10 @@ fn is_matmul_stage(class: &str) -> bool {
 pub struct Candidate {
     pub label: String,
     pub profile: ExecutionProfile,
+    /// Whether this candidate disables EcoQoS execution-speed throttling (a
+    /// Windows scheduling-substrate dimension). The engine only records it; the
+    /// trial closure applies it before timing.
+    pub eco_qos_opt_out: bool,
 }
 
 /// The result of timing one candidate: its throughput and a parity token. Two
@@ -124,6 +128,11 @@ pub struct CalibrationOutcome {
     pub fell_back: bool,
     /// Candidate labels disqualified for diverging from baseline parity.
     pub parity_disqualified: Vec<String>,
+    /// Whether the selected configuration disables EcoQoS throttling. Recorded so
+    /// the gait can be reproduced. Defaults to false for receipts written before
+    /// the substrate dimension existed.
+    #[serde(default)]
+    pub selected_eco_qos_opt_out: bool,
 }
 
 fn roofline_pct(tokens_per_s: f64, weight_bytes_per_token: u64, stream_gbs: f64) -> f64 {
@@ -161,6 +170,7 @@ pub fn run_tournament(
                 roofline_pct: 0.0,
                 fell_back: true,
                 parity_disqualified: Vec::new(),
+                selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
             };
         }
     };
@@ -193,6 +203,7 @@ pub fn run_tournament(
                 roofline_pct: super::round_sig6(roofline_pct(tok, weight_bytes_per_token, gbs)),
                 fell_back: false,
                 parity_disqualified: disqualified,
+                selected_eco_qos_opt_out: winner.eco_qos_opt_out,
             }
         }
         _ => CalibrationOutcome {
@@ -209,6 +220,7 @@ pub fn run_tournament(
             )),
             fell_back: true,
             parity_disqualified: disqualified,
+            selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
         },
     }
 }
@@ -286,7 +298,11 @@ mod tests {
     }
 
     fn cand(label: &str, profile: ExecutionProfile) -> Candidate {
-        Candidate { label: label.to_string(), profile }
+        Candidate {
+            label: label.to_string(),
+            profile,
+            eco_qos_opt_out: false,
+        }
     }
 
     fn mem() -> MemoryMeasurement {
@@ -340,6 +356,28 @@ mod tests {
         assert!((outcome.speedup - 1.3).abs() < 1e-9);
         assert!(outcome.parity_disqualified.contains(&"faster_diverges".to_string()));
         assert!(outcome.roofline_pct > 0.0);
+    }
+
+    #[test]
+    fn records_selected_substrate_dimension() {
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let mut winner = cand("auto+ecoqos", ExecutionProfile::Auto);
+        winner.eco_qos_opt_out = true;
+        let outcome = run_tournament(
+            &baseline,
+            &[winner],
+            &TournamentConfig::default(),
+            1_000_000,
+            &mem(),
+            |c| {
+                Some(match c.label.as_str() {
+                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
+                    _ => TrialResult { tokens_per_s: 12.0, parity_token: "A".into() },
+                })
+            },
+        );
+        assert!(!outcome.fell_back);
+        assert!(outcome.selected_eco_qos_opt_out);
     }
 
     #[test]

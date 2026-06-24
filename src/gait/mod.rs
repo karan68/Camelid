@@ -29,6 +29,7 @@ use crate::gguf::GgufFile;
 use crate::receipt::{canonical_json, sha256_hex};
 
 pub mod calibrate;
+pub mod substrate;
 
 /// Schema identifier stamped into every v1 gait receipt. Mirrors the
 /// `camelid.parity-receipt/v1` family so receipts are cited by fingerprint and

@@ -1939,6 +1939,12 @@ fn gait_profile_trial(
     candidate: &camelid::gait::calibrate::Candidate,
 ) -> anyhow::Result<camelid::gait::calibrate::TrialResult> {
     std::env::set_var("CAMELID_PROFILE", gait_profile_env_value(&candidate.profile));
+    // Apply this candidate's Windows scheduling substrate before timing, so the
+    // measured decode reflects it. Process-level, covers the Rayon pool.
+    let eco_status = camelid::gait::substrate::set_eco_qos_opt_out(candidate.eco_qos_opt_out);
+    if candidate.eco_qos_opt_out {
+        eprintln!("[gait]   {} eco_qos opt-out -> {eco_status:?}", candidate.label);
+    }
 
     let gguf = read_metadata(model)?;
     // Apply this candidate's plan before loading weights, exactly as bench-generate does.
@@ -2003,18 +2009,24 @@ fn run_gait_calibrate(
     let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
     anyhow::ensure!(!prompt_token_ids.is_empty(), "prompt encoded to zero tokens");
 
+    // Baseline = today's behavior (Auto profile, OS-managed throttling). The
+    // candidates vary the EcoQoS substrate (and profile) so the tournament
+    // measures whether disabling throttling helps on this machine, parity-held.
     let baseline = Candidate {
         label: "auto".to_string(),
         profile: ExecutionProfile::Auto,
+        eco_qos_opt_out: false,
     };
     let candidates = vec![
         Candidate {
-            label: "safe".to_string(),
-            profile: ExecutionProfile::Safe,
+            label: "auto+ecoqos".to_string(),
+            profile: ExecutionProfile::Auto,
+            eco_qos_opt_out: true,
         },
         Candidate {
-            label: "experimental".to_string(),
+            label: "experimental+ecoqos".to_string(),
             profile: ExecutionProfile::Experimental,
+            eco_qos_opt_out: true,
         },
     ];
 
