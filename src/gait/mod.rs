@@ -665,14 +665,31 @@ pub fn load_from(dir: &Path, key: &str) -> Option<GaitReceipt> {
     Some(receipt)
 }
 
+/// A gait selected for the current (model × machine): the coarse profile the
+/// planner should use plus the scheduling substrate to apply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedGait {
+    pub profile: ExecutionProfile,
+    pub reason: String,
+    pub eco_qos_opt_out: bool,
+}
+
+/// Whether a receipt's calibration selected the EcoQoS opt-out. A receipt with
+/// no calibration block (e.g. hand-written) defaults to false.
+pub(crate) fn receipt_eco_opt_out(receipt: &GaitReceipt) -> bool {
+    receipt
+        .calibration
+        .as_ref()
+        .map(|c| c.selected_eco_qos_opt_out)
+        .unwrap_or(false)
+}
+
 /// The selector consulted at the planner's decision site.
 ///
-/// Returns `Some((profile, reason))` only when the gate is on AND a valid cached
+/// Returns `Some(SelectedGait)` only when the gate is on AND a valid cached
 /// receipt exists for this model on this machine. In every other case it returns
-/// `None`, and the planner falls through to its existing default. In this
-/// skeleton the store is always empty, so this always returns `None` — the gate
-/// being on is, today, observably identical to it being off.
-pub fn maybe_select_profile(gguf: &GgufFile) -> Option<(ExecutionProfile, String)> {
+/// `None` and the planner falls through to its existing default.
+pub fn maybe_select_profile(gguf: &GgufFile) -> Option<SelectedGait> {
     if !gait_enabled() {
         return None;
     }
@@ -681,10 +698,27 @@ pub fn maybe_select_profile(gguf: &GgufFile) -> Option<(ExecutionProfile, String
     let key = gait_key(&model_sig, &machine_sig);
     let dir = gait_dir()?;
     let receipt = load_from(&dir, &key)?;
-    Some((
-        receipt.recorded_profile,
-        format!("gait: applied cached profile for {key}"),
-    ))
+    Some(SelectedGait {
+        eco_qos_opt_out: receipt_eco_opt_out(&receipt),
+        profile: receipt.recorded_profile,
+        reason: format!("gait: applied cached profile for {key}"),
+    })
+}
+
+/// Apply the scheduling substrate recorded in a selected gait. The coarse profile
+/// is applied by the planner's existing env machinery; this applies the Windows
+/// substrate (EcoQoS) and logs the live gait so it is observable. Best-effort and
+/// process-level. Only invoked when a gait was selected (gate on + receipt found).
+pub fn apply_selected_gait(gait: &SelectedGait) {
+    if gait.eco_qos_opt_out {
+        let status = substrate::set_eco_qos_opt_out(true);
+        eprintln!(
+            "[gait] applied profile={:?} + eco_qos opt-out -> {status:?}",
+            gait.profile
+        );
+    } else {
+        eprintln!("[gait] applied profile={:?}", gait.profile);
+    }
 }
 
 /// Measured memory characteristics — the roofline denominator (sustained DRAM
@@ -1149,5 +1183,39 @@ mod tests {
         // With the gate unset, the selector must not touch the store at all.
         std::env::remove_var(GAIT_GATE_ENV);
         assert!(maybe_select_profile(&sample_gguf()).is_none());
+    }
+
+    #[test]
+    fn receipt_eco_opt_out_defaults_false_without_calibration() {
+        let receipt = GaitReceipt::new(
+            ModelSig::from_gguf(&sample_gguf()),
+            MachineSig::detect(),
+            ExecutionProfile::Auto,
+        );
+        assert!(!receipt_eco_opt_out(&receipt));
+    }
+
+    #[test]
+    fn receipt_eco_opt_out_reads_calibration_choice() {
+        let outcome = calibrate::CalibrationOutcome {
+            selected_profile: ExecutionProfile::Auto,
+            reason: "test".to_string(),
+            baseline_tokens_per_s: 1.0,
+            selected_tokens_per_s: 1.0,
+            speedup: 1.0,
+            roofline_pct: 0.0,
+            fell_back: false,
+            parity_disqualified: Vec::new(),
+            selected_eco_qos_opt_out: true,
+            measured_rounds: 1,
+            samples: Vec::new(),
+        };
+        let receipt = GaitReceipt::new(
+            ModelSig::from_gguf(&sample_gguf()),
+            MachineSig::detect(),
+            ExecutionProfile::Auto,
+        )
+        .with_calibration(outcome);
+        assert!(receipt_eco_opt_out(&receipt));
     }
 }
