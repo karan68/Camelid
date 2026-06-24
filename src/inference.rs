@@ -6991,6 +6991,21 @@ fn linear_with_diagnostic_layouts_with_plan(
     }
     let rows = weight.dim(0)?;
     let cols = weight.dim(1)?;
+    // K-quant (Q4_K / Q6_K) wire weights have no f32 data and no general CPU
+    // consumer; intercept them here — the single chokepoint both the diagnostic
+    // and runtime linear chains funnel through — with the original tensor, before
+    // any layout reinterpretation that would drop the wire bytes. The block-dot
+    // is layout-agnostic: it takes the contraction width from the input and the
+    // output width from the wire length, so a GGUF `[in, out]` weight (where
+    // cols != input_width, e.g. GQA k/v projections) is handled correctly too.
+    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
+        }
+        if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q6_k_block_dot(input, weight, name);
+        }
+    }
     if rows == input_width && cols == input_width {
         match square_layout {
             SquareLinearLayout::Descriptor => {
@@ -7093,6 +7108,8 @@ struct BorrowedLinearWeight<'a> {
     q8_0_runtime_storage: Option<&'a Q8_0RuntimeStorage>,
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
     tq2_0_wire_bytes: Option<&'a [u8]>,
+    q4_k_wire_bytes: Option<&'a [u8]>,
+    q6_k_wire_bytes: Option<&'a [u8]>,
 }
 
 impl<'a> BorrowedLinearWeight<'a> {
@@ -7114,6 +7131,8 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_runtime_storage: weight.q8_0_runtime_storage.as_ref(),
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
             tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q4_k_wire_bytes: weight.q4_k_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q6_k_wire_bytes: weight.q6_k_wire_bytes.as_deref().map(|v| v.as_slice()),
         })
     }
 
@@ -7129,6 +7148,10 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_packed_rows4_4x4: None,
             q8_0_packed_rows4_4x8: None,
             q8_0_runtime_storage,
+            // Keep the K-quant wire across the swap: the block-dot takes its
+            // contraction width from the input and its output width from the wire
+            // length (not from these logical rows/cols), so the swap does not
+            // affect its indexing.
             ..self
         }
     }
@@ -7361,6 +7384,17 @@ fn matmul_rhs_transposed_with_precision_with_plan(
     if weight.source_type == Some(GgufTensorType::Tq2_0) && weight.tq2_0_wire_bytes.is_some() {
         return matmul_rhs_transposed_tq2_0_block_dot(input, weight, name);
     }
+    // K-quant (Q4_K / Q6_K) 2-D linears retain wire bytes with no f32 data, so
+    // without an in-place CPU dot they have no CPU consumer. Dispatch them to the
+    // bit-exact block-dot kernels (gated; a Q4_K_M model mixes both quants).
+    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
+        }
+        if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q6_k_block_dot(input, weight, name);
+        }
+    }
     if should_use_q8_0_block_dot_with_plan(weight, input_width, runtime_plan) {
         return matmul_rhs_transposed_q8_0_block_dot_with_plan(input, weight, name, runtime_plan);
     }
@@ -7414,6 +7448,18 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
         )));
     }
     let output_width = weight.rows;
+    if q4_k_cpu_block_dot_enabled() && input_width % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q4K) {
+            if let Some(wire) = weight.q4_k_wire_bytes {
+                return q4_k_block_dot_core(input, wire, output_width, input_width, name);
+            }
+        }
+        if weight.source_type == Some(GgufTensorType::Q6K) {
+            if let Some(wire) = weight.q6_k_wire_bytes {
+                return q6_k_block_dot_core(input, wire, output_width, input_width, name);
+            }
+        }
+    }
     if let Some(backing) = borrowed_q8_0_reader_backing(weight, input_width, output_width)? {
         return matmul_rhs_transposed_q8_0_block_reader_with_flags(
             input,
@@ -15267,6 +15313,30 @@ fn accumulate_transposed_linear_row_tq2_0(input_row: &[f32], wire: &[u8], output
     });
 }
 
+/// Per-input-row Q4_K accumulate: quantise the row to Q8_K, dot against each
+/// output row's Q4_K wire super-blocks via the bit-exact kernel (rayon over the
+/// output dimension). Mirrors [`accumulate_transposed_linear_row_tq2_0`].
+fn accumulate_transposed_linear_row_q4_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let row_bytes = (input_row.len() / Q6_K_VALUES_PER_BLOCK) * Q4_K_WIRE_BYTES_PER_BLOCK;
+    let q8 = quantize_q8_k_blocks(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = crate::diffusion_gemma::refmath::q4_k_dot_arm(w_row, &q8);
+    });
+}
+
+/// Per-input-row Q6_K accumulate (210 B/block, `q6_k_wire_row_dot`).
+fn accumulate_transposed_linear_row_q6_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let row_bytes = (input_row.len() / Q6_K_VALUES_PER_BLOCK) * Q6_K_WIRE_BYTES_PER_BLOCK;
+    let q8 = quantize_q8_k_blocks(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = q6_k_wire_row_dot(w_row, &q8);
+    });
+}
+
 /// Streaming Q6_K linear (used for the tied embed/lm_head output projection): rather than
 /// materialise the ~1.6 GB f32 embedding and run a generic f32 matmul (which dominated
 /// decode at ~88% of the per-token time), quantise each input row to Q8_K once and dot it
@@ -15309,6 +15379,139 @@ fn matmul_rhs_transposed_q6_k_block_dot(
                 .iter()
                 .map(|q8| q6_k_wire_row_dot(w_row, q8))
                 .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+/// Whether the experimental CPU Q4_K block-dot decode path is enabled. Default
+/// off (fail-closed): without it, Q4_K 2-D linears have no CPU consumer (their
+/// wire bytes are retained for the GPU resident path), so the gate cannot
+/// regress any working CPU behavior — it only adds one.
+fn q4_k_cpu_block_dot_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_X86_Q4K_DECODE").ok().as_deref(),
+        Some("1") | Some("on") | Some("true") | Some("yes") | Some("enabled")
+    )
+}
+
+/// Streaming Q4_K linear: quantise each input row to Q8_K once, then dot it
+/// against the retained Q4_K wire super-blocks via the bit-exact AVX2 kernel
+/// (rayon over the output dimension). Mirrors [`matmul_rhs_transposed_q6_k_block_dot`].
+/// Reads ~144 B per 256-weight block with no f32 materialisation, so it both
+/// speeds up decode on a bandwidth-bound CPU and makes runnable a large Q4_K
+/// model the f32 path would OOM on. Parity oracle is llama.cpp's Q4_K decode
+/// (which likewise quantises activations to Q8_K), not Camelid's f32 path.
+/// Core Q4_K block-dot: quantise each input row to Q8_K, dot against `wire`
+/// (row-major [out_dim, in_dim] Q4_K super-blocks) via the bit-exact kernel,
+/// rayon over `out_dim`. `wire.len()` must equal `out_dim * (in_dim/256) * 144`.
+fn q4_k_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q4_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q4_K_WIRE_BYTES_PER_BLOCK;
+    if row_bytes == 0 || wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q4_K wire length {} != out_dim {out_dim} * row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    let n_rows = input.dim(0)?;
+    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            preps
+                .iter()
+                .map(|q8| crate::diffusion_gemma::refmath::q4_k_dot_arm(w_row, q8))
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+fn matmul_rhs_transposed_q4_k_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let in_dim = input.dim(1)?;
+    let wire = weight.q4_k_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Q4_K weight missing wire bytes".to_string())
+    })?;
+    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q4_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q4_K_WIRE_BYTES_PER_BLOCK;
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q4_K weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    // Tied-embed/output transpose passes [in, out]; derive out_dim from the wire.
+    let out_dim = wire.len() / row_bytes;
+    q4_k_block_dot_core(input, wire, out_dim, in_dim, name)
+}
+
+/// Q6_K analogue of [`q4_k_block_dot_core`] (210 B/block, `q6_k_wire_row_dot`),
+/// for the borrowed-weight dispatch. The owned dispatch uses the existing
+/// [`matmul_rhs_transposed_q6_k_block_dot`].
+fn q6_k_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q6_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q6_K_WIRE_BYTES_PER_BLOCK;
+    if row_bytes == 0 || wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q6_K wire length {} != out_dim {out_dim} * row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    let n_rows = input.dim(0)?;
+    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            preps.iter().map(|q8| q6_k_wire_row_dot(w_row, q8)).collect()
         })
         .collect();
     let mut out = vec![0f32; n_rows * out_dim];
@@ -17153,6 +17356,23 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
         if let Some(wire) = weight.tq2_0_wire_bytes {
             accumulate_transposed_linear_row_tq2_0(input_row, wire, output);
             return;
+        }
+    }
+    // K-quant (Q4_K / Q6_K) wire weights: no f32 data to accumulate, so dot the
+    // retained wire blocks in place. This is the universal funnel for the
+    // accumulate-based (descriptor/borrowed) matmul layouts.
+    if q4_k_cpu_block_dot_enabled() && input_row.len() % Q6_K_VALUES_PER_BLOCK == 0 {
+        if weight.source_type == Some(GgufTensorType::Q4K) {
+            if let Some(wire) = weight.q4_k_wire_bytes {
+                accumulate_transposed_linear_row_q4_k(input_row, wire, output);
+                return;
+            }
+        }
+        if weight.source_type == Some(GgufTensorType::Q6K) {
+            if let Some(wire) = weight.q6_k_wire_bytes {
+                accumulate_transposed_linear_row_q6_k(input_row, wire, output);
+                return;
+            }
         }
     }
     if should_use_borrowed_q8_0_block_dot_with_plan(weight, input_row.len(), runtime_plan) {
