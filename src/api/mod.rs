@@ -413,6 +413,12 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u64>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    /// Minimum-probability sampler filter (llama.cpp `min_p`). Keeps only tokens
+    /// with probability >= `min_p * max_probability`. `None`/`0.0` disables it.
+    pub min_p: Option<f32>,
+    /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`). `1.0`/`None`
+    /// is a no-op; values `> 1.0` discourage repeating recent tokens.
+    pub repeat_penalty: Option<f32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -459,6 +465,10 @@ pub struct CompletionRequest {
     pub seed: Option<u64>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    /// Minimum-probability sampler filter (llama.cpp `min_p`).
+    pub min_p: Option<f32>,
+    /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`).
+    pub repeat_penalty: Option<f32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -677,6 +687,10 @@ pub struct LlamaServerCompletionRequest {
     pub seed: Option<u64>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    /// Minimum-probability sampler filter (llama.cpp `min_p`).
+    pub min_p: Option<f32>,
+    /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`).
+    pub repeat_penalty: Option<f32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     #[serde(flatten)]
@@ -849,7 +863,7 @@ pub struct LlamaServerSlotCamelid {
     pub unsupported: Vec<&'static str>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct GenerationSessionRequest {
     pub model: Option<String>,
     pub prompt: Option<String>,
@@ -862,6 +876,10 @@ pub struct GenerationSessionRequest {
     pub seed: Option<u64>,
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
+    /// Minimum-probability sampler filter (llama.cpp `min_p`).
+    pub min_p: Option<f32>,
+    /// Multiplicative repetition penalty (llama.cpp `repeat_penalty`).
+    pub repeat_penalty: Option<f32>,
     pub logit_bias: Option<HashMap<String, f32>>,
     pub stop: Option<StopSpec>,
     pub n: Option<u32>,
@@ -1914,6 +1932,8 @@ async fn llama_server_completion(
         seed: req.seed,
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
+        min_p: req.min_p,
+        repeat_penalty: req.repeat_penalty,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: None,
@@ -5154,6 +5174,80 @@ async fn create_generation_session(
     }
 }
 
+/// Non-streaming multi-choice (`n` > 1) text completion. Mirrors
+/// `chat_completions_multi_choice`: each choice is an independent, reproducibly
+/// seeded generation; `camelid` diagnostics mirror the first choice; usage counts
+/// the prompt once and sums completion tokens. Streaming and receipts are rejected
+/// upstream. The caller holds the generation lock across the await.
+async fn completions_multi_choice(
+    state: &AppState,
+    req: GenerationSessionRequest,
+    n_choices: u32,
+) -> Response {
+    let base_seed = req.seed.unwrap_or(0);
+    let mut choices = Vec::with_capacity(n_choices as usize);
+    let mut total_completion_tokens = 0usize;
+    let mut prompt_token_count = 0usize;
+    let mut model_id = String::new();
+    let mut first_diagnostics: Option<GenerationDiagnostics> = None;
+    for index in 0..n_choices {
+        let mut req_choice = req.clone();
+        req_choice.n = None;
+        req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
+        let prepared = match prepare_generation(state, req_choice).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+        model_id = prepared.model_id.clone();
+        prompt_token_count = prepared.token_ids.len();
+        let generated = match generate_decoded_tokens_blocking(prepared).await {
+            Ok(generated) => generated,
+            Err(response) => return *response,
+        };
+        let finish_reason = generated.finish_reason;
+        total_completion_tokens += generated.completion_tokens;
+        let text = generated.text.clone();
+        if index == 0 {
+            first_diagnostics = Some(GenerationDiagnostics {
+                prompt_token_ids: generated.prompt_token_ids,
+                generated_token_ids: generated.generated_token_ids,
+                dense_metadata: generated.dense_metadata,
+                top_logits: generated.top_logits,
+                step_top_logits: generated.step_top_logits,
+                output_projection: generated.output_projection,
+                dense: generated.dense,
+                dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
+                timings_ms: generated.timings,
+            });
+        }
+        choices.push(CompletionChoice {
+            index,
+            text,
+            finish_reason,
+        });
+    }
+    let camelid =
+        first_diagnostics.expect("n_choices >= 1 guarantees the first choice produced diagnostics");
+    (
+        StatusCode::OK,
+        Json(CompletionResponse {
+            id: format!("cmpl-{}", uuid::Uuid::new_v4()),
+            object: "text_completion",
+            created: 0,
+            model: model_id,
+            choices,
+            usage: CompletionUsage {
+                prompt_tokens: prompt_token_count,
+                completion_tokens: total_completion_tokens,
+                total_tokens: prompt_token_count + total_completion_tokens,
+            },
+            camelid,
+            camelid_receipt: None,
+        }),
+    )
+        .into_response()
+}
+
 async fn completions(
     State(state): State<AppState>,
     payload: std::result::Result<Json<CompletionRequest>, JsonRejection>,
@@ -5174,6 +5268,42 @@ async fn completions(
         }
         Ok(None) => {}
         Err(resp) => return resp,
+    }
+    // Multi-choice (n > 1) fans out into independent generations. Validate the
+    // count and reject the combinations Camelid does not implement before the
+    // request is consumed.
+    let n_choices = req.n.unwrap_or(1);
+    if n_choices == 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_parameter",
+            "n must be at least 1".to_string(),
+            Some("n"),
+        );
+    }
+    if n_choices > MAX_N_CHOICES {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_parameter",
+            format!("n must be between 1 and {MAX_N_CHOICES}"),
+            Some("n"),
+        );
+    }
+    if n_choices > 1 && req.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "n greater than 1 is not supported with stream:true; request multiple choices without streaming".to_string(),
+            Some("n"),
+        );
+    }
+    if n_choices > 1 && req.camelid_receipt.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with n greater than 1; a receipt records one complete generation".to_string(),
+            Some("camelid_receipt"),
+        );
     }
     // Capture the receipt stamp before the request is consumed. Receipts are
     // strictly opt-in and never silently attached.
@@ -5205,6 +5335,8 @@ async fn completions(
         seed: req.seed,
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
+        min_p: req.min_p,
+        repeat_penalty: req.repeat_penalty,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: req.n,
@@ -5225,6 +5357,11 @@ async fn completions(
     // Serialize generation so only one decode runs against the shared
     // CUDA-resident KV state at a time (see AppState::generation_lock).
     let gen_guard = state.generation_lock.clone().lock_owned().await;
+    if n_choices > 1 {
+        // Non-streaming independent multi-choice generation. `gen_guard` is held
+        // in this frame across the await, so the lock spans every choice.
+        return completions_multi_choice(&state, req, n_choices).await;
+    }
     let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -5301,6 +5438,103 @@ async fn completions(
     }
 }
 
+/// Non-streaming multi-choice (`n` > 1) chat generation: runs `n_choices`
+/// independent generations, each with its own derived seed so the choices are
+/// distinct yet reproducible, and assembles them into one OpenAI response. Each
+/// choice is a full generation (its own prefill + decode) — a capability, not a
+/// throughput claim. `camelid` diagnostics mirror the first choice; usage counts
+/// the prompt once and sums completion tokens across choices. Streaming and
+/// receipts are rejected upstream for this path. The caller holds the generation
+/// lock across the await, so it spans every choice.
+async fn chat_completions_multi_choice(
+    state: &AppState,
+    req: GenerationSessionRequest,
+    n_choices: u32,
+) -> Response {
+    let base_seed = req.seed.unwrap_or(0);
+    let mut choices = Vec::with_capacity(n_choices as usize);
+    let mut total_completion_tokens = 0usize;
+    let mut prompt_token_count = 0usize;
+    let mut model_id = String::new();
+    let mut lane: Option<&'static str> = None;
+    let mut first_diagnostics: Option<GenerationDiagnostics> = None;
+    for index in 0..n_choices {
+        let mut req_choice = req.clone();
+        // Each choice is its own generation with a distinct, reproducible seed
+        // (base seed offset by the choice index), so n>1 yields independent
+        // samples that still reproduce exactly for a fixed request seed.
+        req_choice.n = None;
+        req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
+        let prepared = match prepare_generation(state, req_choice).await {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
+        };
+        model_id = prepared.model_id.clone();
+        prompt_token_count = prepared.token_ids.len();
+        let generated = match generate_decoded_tokens_blocking(prepared).await {
+            Ok(generated) => generated,
+            Err(response) => return *response,
+        };
+        lane = match state.loaded_models.read().await.get(&model_id) {
+            Some(model)
+                if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented =>
+            {
+                Some("experimental")
+            }
+            _ => None,
+        };
+        let content = if lane.is_some() {
+            generated.text.trim().to_string()
+        } else {
+            generated.text.clone()
+        };
+        let finish_reason = generated.finish_reason;
+        total_completion_tokens += generated.completion_tokens;
+        if index == 0 {
+            first_diagnostics = Some(GenerationDiagnostics {
+                prompt_token_ids: generated.prompt_token_ids,
+                generated_token_ids: generated.generated_token_ids,
+                dense_metadata: generated.dense_metadata,
+                top_logits: generated.top_logits,
+                step_top_logits: generated.step_top_logits,
+                output_projection: generated.output_projection,
+                dense: generated.dense,
+                dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
+                timings_ms: generated.timings,
+            });
+        }
+        choices.push(ChatCompletionChoice {
+            index,
+            message: ChatCompletionMessage {
+                role: "assistant",
+                content,
+            },
+            finish_reason,
+        });
+    }
+    let camelid =
+        first_diagnostics.expect("n_choices >= 1 guarantees the first choice produced diagnostics");
+    (
+        StatusCode::OK,
+        Json(ChatCompletionResponse {
+            id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
+            object: "chat.completion",
+            created: 0,
+            model: model_id,
+            choices,
+            usage: CompletionUsage {
+                prompt_tokens: prompt_token_count,
+                completion_tokens: total_completion_tokens,
+                total_tokens: prompt_token_count + total_completion_tokens,
+            },
+            camelid,
+            camelid_receipt: None,
+            lane,
+        }),
+    )
+        .into_response()
+}
+
 async fn chat_completions(
     State(state): State<AppState>,
     payload: std::result::Result<Json<ChatCompletionRequest>, JsonRejection>,
@@ -5330,6 +5564,42 @@ async fn chat_completions(
         }
         Ok(None) => {}
         Err(resp) => return resp,
+    }
+    // Multi-choice (n > 1) fans out into independent generations. Validate the
+    // count and reject the combinations Camelid does not implement before the
+    // request is consumed.
+    let n_choices = req.n.unwrap_or(1);
+    if n_choices == 0 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_parameter",
+            "n must be at least 1".to_string(),
+            Some("n"),
+        );
+    }
+    if n_choices > MAX_N_CHOICES {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_parameter",
+            format!("n must be between 1 and {MAX_N_CHOICES}"),
+            Some("n"),
+        );
+    }
+    if n_choices > 1 && req.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "n greater than 1 is not supported with stream:true; request multiple choices without streaming".to_string(),
+            Some("n"),
+        );
+    }
+    if n_choices > 1 && req.camelid_receipt.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "camelid_receipt is not supported with n greater than 1; a receipt records one complete generation".to_string(),
+            Some("camelid_receipt"),
+        );
     }
     // Capture the receipt stamp before the request is consumed. Receipts are
     // strictly opt-in and never silently attached.
@@ -5366,6 +5636,8 @@ async fn chat_completions(
         seed: req.seed,
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
+        min_p: req.min_p,
+        repeat_penalty: req.repeat_penalty,
         logit_bias: req.logit_bias,
         stop: req.stop,
         n: req.n,
@@ -5390,6 +5662,11 @@ async fn chat_completions(
     // Serialize generation so only one decode runs against the shared
     // CUDA-resident KV state at a time (see AppState::generation_lock).
     let gen_guard = state.generation_lock.clone().lock_owned().await;
+    if n_choices > 1 {
+        // Non-streaming independent multi-choice generation. `gen_guard` is held
+        // in this frame across the await, so the lock spans every choice.
+        return chat_completions_multi_choice(&state, req, n_choices).await;
+    }
     let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
@@ -5699,6 +5976,8 @@ pub async fn replay_receipt_request(
         seed: request.seed,
         presence_penalty: None,
         frequency_penalty: None,
+        min_p: None,
+        repeat_penalty: None,
         logit_bias: None,
         stop: if request.stop.is_empty() {
             None
@@ -6684,6 +6963,11 @@ fn linear_projection_orientation(
     }
 }
 
+/// Upper bound on `n` (independent choices). Each choice is a full, independent
+/// generation (its own prompt prefill + decode), so the cap keeps a single
+/// request from fanning out into unbounded server work.
+const MAX_N_CHOICES: u32 = 8;
+
 fn validate_choice_and_logprob_fields(
     req: &GenerationSessionRequest,
 ) -> std::result::Result<(), Box<Response>> {
@@ -6695,12 +6979,11 @@ fn validate_choice_and_logprob_fields(
             Some("n"),
         )));
     }
-    if matches!(req.n, Some(value) if value > 1) {
+    if matches!(req.n, Some(value) if value > MAX_N_CHOICES) {
         return Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
-            "n values greater than 1 are not supported yet; this backend returns one choice"
-                .to_string(),
+            "invalid_request_parameter",
+            format!("n must be between 1 and {MAX_N_CHOICES}"),
             Some("n"),
         )));
     }
@@ -6764,10 +7047,8 @@ fn validate_unsupported_generation_fields(
             "OpenAI stream_options are not supported yet; Camelid streams plain SSE chunks"
         }
         "echo" | "suffix" => "completion echo/suffix compatibility is not supported yet",
-        "mirostat" | "mirostat_tau" | "mirostat_eta" | "min_p" | "typical_p" | "tfs_z"
-        | "repeat_penalty" | "ignore_eos" | "n_keep" => {
-            "this llama-server sampler/control field is not supported yet"
-        }
+        "mirostat" | "mirostat_tau" | "mirostat_eta" | "typical_p" | "tfs_z" | "ignore_eos"
+        | "n_keep" => "this llama-server sampler/control field is not supported yet",
         "cache_prompt" | "id_slot" | "id_task" | "slot_id" => {
             "llama-server slot/cache controls are not supported by this compatibility route yet"
         }
@@ -6800,10 +7081,8 @@ fn static_param_name(param: &str) -> &'static str {
         "mirostat" => "mirostat",
         "mirostat_tau" => "mirostat_tau",
         "mirostat_eta" => "mirostat_eta",
-        "min_p" => "min_p",
         "typical_p" => "typical_p",
         "tfs_z" => "tfs_z",
-        "repeat_penalty" => "repeat_penalty",
         "ignore_eos" => "ignore_eos",
         "n_keep" => "n_keep",
         "cache_prompt" => "cache_prompt",
@@ -6877,9 +7156,11 @@ fn sampling_config_from_request(
         temperature: req.temperature.unwrap_or(0.0),
         top_k: req.top_k.map(|value| value as usize),
         top_p: req.top_p,
+        min_p: req.min_p,
         seed: req.seed,
         presence_penalty: req.presence_penalty.unwrap_or(0.0),
         frequency_penalty: req.frequency_penalty.unwrap_or(0.0),
+        repeat_penalty: req.repeat_penalty.unwrap_or(1.0),
         logit_bias: parse_logit_bias(req.logit_bias.as_ref()).map_err(|message| {
             Box::new(api_error(
                 StatusCode::BAD_REQUEST,
@@ -9682,6 +9963,8 @@ mod tests {
             temperature,
             top_k: None,
             top_p: None,
+            min_p: None,
+            repeat_penalty: None,
             seed: None,
             presence_penalty: None,
             frequency_penalty: None,
@@ -9820,6 +10103,66 @@ mod tests {
         assert!(req.stream_options.is_some());
         assert!(!req.unsupported_fields.contains_key("stream_options"));
         assert!(stream_options_include_usage(req.stream_options.as_ref()));
+    }
+
+    #[test]
+    fn min_p_and_repeat_penalty_are_typed_fields_not_unsupported() {
+        // Declaring min_p/repeat_penalty as typed sampler fields removes them from
+        // the flatten-captured unsupported_fields, so the generation routes no
+        // longer reject them with the old "sampler field not supported yet" error.
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "min_p": 0.05,
+            "repeat_penalty": 1.2
+        }))
+        .expect("chat request with min_p/repeat_penalty should deserialize");
+        assert_eq!(chat.min_p, Some(0.05));
+        assert_eq!(chat.repeat_penalty, Some(1.2));
+        assert!(!chat.unsupported_fields.contains_key("min_p"));
+        assert!(!chat.unsupported_fields.contains_key("repeat_penalty"));
+
+        // They thread all the way into SamplingConfig...
+        let req: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi",
+            "temperature": 0.8,
+            "min_p": 0.05,
+            "repeat_penalty": 1.2
+        }))
+        .expect("session request should deserialize");
+        let config = sampling_config_from_request(&req).expect("valid sampler config");
+        assert_eq!(config.min_p, Some(0.05));
+        assert_eq!(config.repeat_penalty, 1.2);
+
+        // ...and an out-of-range value is a typed 400, not a panic.
+        let bad: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi",
+            "min_p": 1.5
+        }))
+        .expect("session request should deserialize");
+        assert!(sampling_config_from_request(&bad).is_err());
+    }
+
+    #[test]
+    fn n_choices_bounds_are_validated() {
+        // n within [1, MAX_N_CHOICES] is accepted; 0 and > MAX are typed errors.
+        let at_cap: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi", "n": MAX_N_CHOICES
+        }))
+        .expect("session request should deserialize");
+        assert!(validate_choice_and_logprob_fields(&at_cap).is_ok());
+
+        let zero: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi", "n": 0
+        }))
+        .expect("session request should deserialize");
+        assert!(validate_choice_and_logprob_fields(&zero).is_err());
+
+        let too_many: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi", "n": MAX_N_CHOICES + 1
+        }))
+        .expect("session request should deserialize");
+        assert!(validate_choice_and_logprob_fields(&too_many).is_err());
     }
 
     #[test]
