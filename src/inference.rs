@@ -3844,15 +3844,26 @@ impl LlamaInferenceSession {
         sampler: LlamaSampler,
         token_history: &[u32],
     ) -> Result<LlamaGenerationStep> {
-        self.generate_next_token_with_history_diagnostics(token_ids, sampler, token_history, true)
+        self.generate_next_token_with_history_diagnostics(
+            token_ids,
+            sampler,
+            token_history,
+            true,
+            None,
+        )
     }
 
+    /// `allowed_tokens`, when set, is a vocab-sized mask applied to the logits
+    /// before sampling (disallowed tokens forced to `-inf`) — grammar-constrained
+    /// decoding. The unmasked logits are still returned in the step (so logprobs /
+    /// diagnostics see the real distribution).
     pub fn generate_next_token_with_history_diagnostics(
         &mut self,
         token_ids: &[u32],
         sampler: LlamaSampler,
         token_history: &[u32],
         collect_diagnostics: bool,
+        allowed_tokens: Option<&[bool]>,
     ) -> Result<LlamaGenerationStep> {
         if token_ids.is_empty() {
             return Err(BackendError::RuntimeShapeMismatch(
@@ -3960,7 +3971,14 @@ impl LlamaInferenceSession {
         let hidden_state = output.hidden_state;
         let output_norm_state = output.output_norm_state;
         let sample_started = Instant::now();
-        let next_token_id = sampler.sample_with_history(&logits, token_history)?;
+        let next_token_id = match allowed_tokens {
+            Some(allowed) => {
+                let mut masked = logits.clone();
+                apply_token_mask(&mut masked, allowed)?;
+                sampler.sample_with_history(&masked, token_history)?
+            }
+            None => sampler.sample_with_history(&logits, token_history)?,
+        };
         let sample = sample_started.elapsed().as_micros();
         if telemetry::active() {
             // Candidate probabilities are computed from the real logits of
@@ -5208,6 +5226,37 @@ fn greedy_sample_rows(logits: &CpuTensor) -> Result<Vec<u32>> {
         out.push(token_index_to_u32(best_idx)?);
     }
     Ok(out)
+}
+
+/// Force every disallowed token's logit to `-inf` (grammar-constrained decoding).
+/// Errors if the mask length does not match the vocab or masks every token.
+fn apply_token_mask(logits: &mut CpuTensor, allowed: &[bool]) -> Result<()> {
+    if allowed.len() != logits.data.len() {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "grammar mask length {} does not match vocabulary size {}",
+            allowed.len(),
+            logits.data.len()
+        )));
+    }
+    // A large *finite* negative value, not -inf: the sampler rejects non-finite
+    // logits, and this is still far below any real logit (~[-50, 50]) so greedy
+    // argmax and softmax both exclude it, while staying finite through the
+    // temperature division.
+    const MASK_LOGIT: f32 = -1e30;
+    let mut any_allowed = false;
+    for (logit, &ok) in logits.data.iter_mut().zip(allowed.iter()) {
+        if ok {
+            any_allowed = true;
+        } else {
+            *logit = MASK_LOGIT;
+        }
+    }
+    if !any_allowed {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "grammar constraint masked every token".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn sample_with_config(

@@ -9500,7 +9500,7 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
     let mut session = LlamaInferenceSession::new(config, weights).unwrap();
 
     let step = session
-        .generate_next_token_with_history_diagnostics(&[0], LlamaSampler::Greedy, &[0], true)
+        .generate_next_token_with_history_diagnostics(&[0], LlamaSampler::Greedy, &[0], true, None)
         .unwrap();
 
     assert_eq!(step.prompt_token_count, 1);
@@ -9761,14 +9761,26 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
     std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "1");
     let mut sequential = LlamaInferenceSession::new(config.clone(), weights.clone()).unwrap();
     let sequential_step = sequential
-        .generate_next_token_with_history_diagnostics(&prompt, LlamaSampler::Greedy, &prompt, false)
+        .generate_next_token_with_history_diagnostics(
+            &prompt,
+            LlamaSampler::Greedy,
+            &prompt,
+            false,
+            None,
+        )
         .unwrap();
 
     std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "2");
     std::env::set_var("CAMELID_FORWARD_RSS_TIMINGS", "1");
     let mut chunked = LlamaInferenceSession::new(config.clone(), weights.clone()).unwrap();
     let chunked_step = chunked
-        .generate_next_token_with_history_diagnostics(&prompt, LlamaSampler::Greedy, &prompt, false)
+        .generate_next_token_with_history_diagnostics(
+            &prompt,
+            LlamaSampler::Greedy,
+            &prompt,
+            false,
+            None,
+        )
         .unwrap();
 
     let prefill_memory = chunked_step
@@ -9812,7 +9824,13 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
     std::env::set_var("CAMELID_PREFILL_LAYER_MAJOR_ATTRIBUTION", "1");
     let mut layer_major = LlamaInferenceSession::new(config, weights).unwrap();
     let layer_major_step = layer_major
-        .generate_next_token_with_history_diagnostics(&prompt, LlamaSampler::Greedy, &prompt, false)
+        .generate_next_token_with_history_diagnostics(
+            &prompt,
+            LlamaSampler::Greedy,
+            &prompt,
+            false,
+            None,
+        )
         .unwrap();
     let layer_major_memory = layer_major_step
         .prefill_timings
@@ -10201,6 +10219,7 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
             LlamaSampler::Greedy,
             &[0, 1, 2],
             false,
+            None,
         )
         .unwrap();
 

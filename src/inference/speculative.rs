@@ -248,6 +248,7 @@ impl ModelDrafter {
                                     LlamaSampler::Greedy,
                                     history,
                                     false,
+                                    None,
                                 )?
                                 .next_token_id
                         }
@@ -263,6 +264,7 @@ impl ModelDrafter {
                         LlamaSampler::Greedy,
                         history,
                         false,
+                        None,
                     )?
                     .next_token_id
             }
@@ -287,6 +289,7 @@ impl ModelDrafter {
                             LlamaSampler::Greedy,
                             history,
                             false,
+                            None,
                         )?
                         .next_token_id
                 }
