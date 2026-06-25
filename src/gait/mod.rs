@@ -789,6 +789,43 @@ pub fn compute_thread_budget(physical_cores: usize) -> ComputeThreadBudget {
     ComputeThreadBudget { threads, reserved }
 }
 
+/// §1.1 free-RAM floor: GAIT keeps at least `max(20% of total, 4 GiB)` of physical
+/// RAM free, so an allocation campaign (e.g. calibration loading candidate
+/// weights) can never drive the host into swap / OOM. Pure, so it is testable.
+pub fn ram_headroom_floor(total_bytes: u64) -> u64 {
+    const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
+    (total_bytes / 5).max(FOUR_GIB)
+}
+
+/// True when `available_bytes` of free physical RAM respects the §1.1 floor for a
+/// host with `total_bytes` of physical RAM.
+pub fn ram_headroom_ok(total_bytes: u64, available_bytes: u64) -> bool {
+    available_bytes >= ram_headroom_floor(total_bytes)
+}
+
+/// Physical RAM `(total, available)` in bytes via `GlobalMemoryStatusEx`. `None`
+/// off Windows or on query failure (the caller then proceeds without the gate
+/// rather than blocking).
+#[cfg(windows)]
+pub fn host_ram_status() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a zeroed MEMORYSTATUSEX with dwLength set to its own size, exactly
+    // as GlobalMemoryStatusEx requires; the call only reads/writes that struct.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut status) == 0 {
+            return None;
+        }
+        Some((status.ullTotalPhys, status.ullAvailPhys))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn host_ram_status() -> Option<(u64, u64)> {
+    None
+}
+
 /// Measured memory characteristics — the roofline denominator (sustained DRAM
 /// bandwidth) and the latency the resonance tuning must hide. Measured at
 /// calibration, not guessed, and never folded into the gait key.
@@ -1523,5 +1560,62 @@ mod gait_safety {
             substrate::set_compute_pool_eco_qos(true),
             substrate::EcoQosStatus::Unavailable
         );
+    }
+
+    #[cfg(windows)]
+    fn hanging_child() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hanging child")
+    }
+
+    #[cfg(not(windows))]
+    fn hanging_child() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hanging child")
+    }
+
+    /// §1.4: a candidate that hangs is killed at the deadline and abandoned — the
+    /// supervisor returns promptly and the calling (serving) process survives.
+    #[test]
+    fn watchdog_survives_hung_candidate() {
+        use std::time::{Duration, Instant};
+        let child = hanging_child();
+        let started = Instant::now();
+        let outcome = calibrate::supervise(
+            child,
+            Duration::from_millis(400),
+            Duration::from_millis(20),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, calibrate::WatchdogOutcome::TimedOut),
+            "a hung candidate must time out, got {outcome:?}"
+        );
+        // Killed at the deadline, not waited out (the child would sleep ~30s); and
+        // reaching this line at all proves the supervisor did not wedge us.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "watchdog must kill promptly, took {elapsed:?}"
+        );
+    }
+
+    /// §1.1: the free-RAM floor is max(20% of total, 4 GiB), and the headroom
+    /// check honors it.
+    #[test]
+    fn ram_headroom() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // 20% dominates on a big box; the 4 GiB floor dominates on a small one.
+        assert_eq!(ram_headroom_floor(100 * GIB), 20 * GIB);
+        assert_eq!(ram_headroom_floor(8 * GIB), 4 * GIB);
+        assert!(ram_headroom_ok(100 * GIB, 30 * GIB));
+        assert!(!ram_headroom_ok(100 * GIB, 10 * GIB));
+        assert!(ram_headroom_ok(8 * GIB, 5 * GIB));
+        assert!(!ram_headroom_ok(8 * GIB, 2 * GIB));
     }
 }

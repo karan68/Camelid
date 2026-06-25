@@ -94,8 +94,9 @@ pub struct Candidate {
 
 /// The result of timing one candidate: its throughput and a parity token. Two
 /// candidates are parity-equal iff their tokens are equal — the gate that
-/// disqualifies a fast-but-divergent candidate.
-#[derive(Debug, Clone)]
+/// disqualifies a fast-but-divergent candidate. Serializable so a supervised
+/// child-process trial (§1.4 crash isolation) can hand it back over stdout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrialResult {
     pub tokens_per_s: f64,
     pub parity_token: String,
@@ -368,6 +369,53 @@ pub fn calibrate_and_store(
 /// Convenience: the default store directory for calibration output.
 pub fn default_store_dir() -> Option<PathBuf> {
     gait_dir()
+}
+
+/// Outcome of supervising a child-process trial under a hard timeout (§1.4).
+#[derive(Debug)]
+pub enum WatchdogOutcome {
+    /// The child exited on its own; carries its captured output.
+    Completed(std::process::Output),
+    /// The child overran the timeout and was killed — abandoned and disqualified.
+    TimedOut,
+    /// Could not wait on / collect the child (OS error).
+    Errored,
+}
+
+/// Supervise a child trial under a HARD `timeout`, polling every `poll` interval.
+///
+/// This is the §1.4 crash-isolation valve: candidate kernels run in a separate
+/// process, so a candidate that **segfaults** cannot take down the calibrating
+/// (or serving) process — it surfaces as a non-success exit — and a candidate
+/// that **hangs** is KILLED at the deadline rather than waited on forever. Either
+/// way the supervisor returns and the bad candidate is disqualified upstream;
+/// it is never persisted. The child should be spawned with stdout piped if the
+/// caller needs the [`TrialResult`] it prints.
+pub fn supervise(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> WatchdogOutcome {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return match child.wait_with_output() {
+                    Ok(output) => WatchdogOutcome::Completed(output),
+                    Err(_) => WatchdogOutcome::Errored,
+                };
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return WatchdogOutcome::TimedOut;
+                }
+                std::thread::sleep(poll);
+            }
+            Err(_) => return WatchdogOutcome::Errored,
+        }
+    }
 }
 
 #[cfg(test)]
