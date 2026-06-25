@@ -15511,7 +15511,10 @@ fn q6_k_block_dot_core(
         .into_par_iter()
         .map(|o| {
             let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-            preps.iter().map(|q8| q6_k_wire_row_dot(w_row, q8)).collect()
+            preps
+                .iter()
+                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .collect()
         })
         .collect();
     let mut out = vec![0f32; n_rows * out_dim];

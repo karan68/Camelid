@@ -1532,7 +1532,15 @@ async fn main() -> anyhow::Result<()> {
             warmup,
             threads,
         } => {
-            run_gait_calibrate(model, prompt_file, prompt, max_tokens, rounds, warmup, threads)?;
+            run_gait_calibrate(
+                model,
+                prompt_file,
+                prompt,
+                max_tokens,
+                rounds,
+                warmup,
+                threads,
+            )?;
         }
         Command::GaitTrial {
             model,
@@ -1547,8 +1555,16 @@ async fn main() -> anyhow::Result<()> {
             gpc_matmul,
         } => {
             run_gait_trial(
-                model, prompt_file, prompt, max_tokens, profile, eco_qos, threads, gpc_attn,
-                gpc_ffn, gpc_matmul,
+                model,
+                prompt_file,
+                prompt,
+                max_tokens,
+                profile,
+                eco_qos,
+                threads,
+                gpc_attn,
+                gpc_ffn,
+                gpc_matmul,
             )?;
         }
         Command::Gait { action } => match action {
@@ -2051,14 +2067,15 @@ fn gait_profile_trial(
     max_tokens: usize,
     candidate: &camelid::gait::calibrate::Candidate,
 ) -> anyhow::Result<camelid::gait::calibrate::TrialResult> {
-    std::env::set_var("CAMELID_PROFILE", gait_profile_env_value(&candidate.profile));
+    std::env::set_var(
+        "CAMELID_PROFILE",
+        gait_profile_env_value(&candidate.profile),
+    );
     // Apply this candidate's Windows scheduling substrate before timing, so the
     // measured decode reflects it. §1.2-scoped to the compute pool (the Rayon
     // workers + this thread), matching what production applies.
     let eco_status = camelid::gait::substrate::set_compute_pool_eco_qos(candidate.eco_qos_opt_out);
-    if candidate.eco_qos_opt_out
-        && eco_status != camelid::gait::substrate::EcoQosStatus::OptedOut
-    {
+    if candidate.eco_qos_opt_out && eco_status != camelid::gait::substrate::EcoQosStatus::OptedOut {
         eprintln!(
             "[gait]   {} eco_qos opt-out unavailable -> {eco_status:?}",
             candidate.label
@@ -2081,9 +2098,23 @@ fn gait_profile_trial(
     let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
     let sampler = LlamaSampler::Greedy;
 
-    let _ = generate_run(&config, &weights, &tokenizer, prompt_token_ids, &sampler, max_tokens)?;
+    let _ = generate_run(
+        &config,
+        &weights,
+        &tokenizer,
+        prompt_token_ids,
+        &sampler,
+        max_tokens,
+    )?;
     camelid::inference::reset_stage_timings();
-    let run = generate_run(&config, &weights, &tokenizer, prompt_token_ids, &sampler, max_tokens)?;
+    let run = generate_run(
+        &config,
+        &weights,
+        &tokenizer,
+        prompt_token_ids,
+        &sampler,
+        max_tokens,
+    )?;
 
     let decode_tokens = run.generated.len().saturating_sub(1);
     let tokens_per_s = if run.decode_ms > 0.0 && decode_tokens > 0 {
@@ -2111,10 +2142,10 @@ fn run_gait_calibrate(
     warmup: usize,
     threads: Option<usize>,
 ) -> anyhow::Result<()> {
+    use camelid::execution_plan::ExecutionProfile;
     use camelid::gait::calibrate::{
         calibrate_and_store, default_store_dir, Candidate, TournamentConfig,
     };
-    use camelid::execution_plan::ExecutionProfile;
 
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
     anyhow::ensure!(rounds >= 1, "--rounds must be at least 1");
@@ -2214,7 +2245,14 @@ fn run_gait_calibrate(
         };
         let started = std::time::Instant::now();
         let result = run_trial_in_child(
-            &exe, &model, &prompt_file, &prompt, max_tokens, candidate, threads, timeout,
+            &exe,
+            &model,
+            &prompt_file,
+            &prompt,
+            max_tokens,
+            candidate,
+            threads,
+            timeout,
         );
         if candidate.label == baseline_label && baseline_wall.is_none() {
             baseline_wall = Some(started.elapsed());
@@ -2234,7 +2272,8 @@ fn run_gait_calibrate(
         result
     };
 
-    let (outcome, path) = calibrate_and_store(&store_dir, &gguf, &baseline, &candidates, &config, trial);
+    let (outcome, path) =
+        calibrate_and_store(&store_dir, &gguf, &baseline, &candidates, &config, trial);
 
     println!("{}", serde_json::to_string_pretty(&outcome)?);
     match path {
@@ -2315,7 +2354,10 @@ fn run_gait_trial(
     let gguf = read_metadata(&model)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
-    anyhow::ensure!(!prompt_token_ids.is_empty(), "prompt encoded to zero tokens");
+    anyhow::ensure!(
+        !prompt_token_ids.is_empty(),
+        "prompt encoded to zero tokens"
+    );
 
     // §5: the three gpc knobs travel together — all present, or none.
     let groups_per_chunk = match (gpc_attn, gpc_ffn, gpc_matmul) {

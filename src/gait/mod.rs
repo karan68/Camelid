@@ -570,7 +570,11 @@ pub struct GaitReceipt {
 
 impl GaitReceipt {
     /// Construct and seal a receipt for the given fingerprints + chosen profile.
-    pub fn new(model_sig: ModelSig, machine_sig: MachineSig, recorded_profile: ExecutionProfile) -> Self {
+    pub fn new(
+        model_sig: ModelSig,
+        machine_sig: MachineSig,
+        recorded_profile: ExecutionProfile,
+    ) -> Self {
         let gait_key = gait_key(&model_sig, &machine_sig);
         let mut receipt = GaitReceipt {
             schema: GAIT_RECEIPT_SCHEMA_V1.to_string(),
@@ -645,9 +649,7 @@ pub fn gait_dir() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
         .unwrap_or_else(std::env::temp_dir);
     Some(base.join("Camelid").join("gait"))
 }
@@ -1020,9 +1022,7 @@ fn measure_dram_latency_ns() -> f64 {
 /// accumulates in f32 — it is a reference, not a fast path, so clarity and
 /// faithfulness beat speed.
 pub mod oracle {
-    use crate::tensor::{
-        Q4KBlock, Q6KBlock, QK_K_BLOCK_SIZE, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES,
-    };
+    use crate::tensor::{Q4KBlock, Q6KBlock, Q4_K_BLOCK_BYTES, Q6_K_BLOCK_BYTES, QK_K_BLOCK_SIZE};
 
     /// Reference dot of one quantized matrix row against `input`.
     ///
@@ -1491,10 +1491,8 @@ mod gait_safety {
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "camelid_gait_safety_{tag}_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("camelid_gait_safety_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1605,7 +1603,10 @@ mod gait_safety {
                 quarantined,
             } => {
                 assert_eq!(gait_key.as_deref(), Some(key.as_str()));
-                assert!(quarantined, "first unclean exit must quarantine (threshold 1)");
+                assert!(
+                    quarantined,
+                    "first unclean exit must quarantine (threshold 1)"
+                );
             }
             other => panic!("expected UncleanExit, got {other:?}"),
         }
@@ -1620,7 +1621,10 @@ mod gait_safety {
             dir.join(".quarantine").join(key_filename(&key)).exists(),
             "the suspect receipt must be preserved under .quarantine/ for diagnosis"
         );
-        assert!(!dir.join(".applying").exists(), "the marker must be cleared");
+        assert!(
+            !dir.join(".applying").exists(),
+            "the marker must be cleared"
+        );
 
         std::env::remove_var(GAIT_GATE_ENV);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1633,7 +1637,10 @@ mod gait_safety {
         for &phys in &[1usize, 2, 4, 6, 8, 12, 16, 32, 64] {
             let b = compute_thread_budget(phys);
             assert!(b.threads >= 1, "phys={phys}: must keep >=1 worker");
-            assert!(b.threads <= phys, "phys={phys}: cannot exceed physical cores");
+            assert!(
+                b.threads <= phys,
+                "phys={phys}: cannot exceed physical cores"
+            );
             assert_eq!(
                 b.reserved,
                 phys - b.threads,
@@ -1643,7 +1650,10 @@ mod gait_safety {
                 assert!(b.reserved >= 1, "phys={phys}: OS must keep >=1 core");
             }
             if (3..=8).contains(&phys) {
-                assert!(b.reserved >= 2, "phys={phys}: small boxes reserve >=2 cores");
+                assert!(
+                    b.reserved >= 2,
+                    "phys={phys}: small boxes reserve >=2 cores"
+                );
                 assert!(b.threads <= phys - 2, "phys={phys}: threads <= phys-2");
             }
             if phys > 8 {
@@ -1727,11 +1737,8 @@ mod gait_safety {
         use std::time::{Duration, Instant};
         let child = hanging_child();
         let started = Instant::now();
-        let outcome = calibrate::supervise(
-            child,
-            Duration::from_millis(400),
-            Duration::from_millis(20),
-        );
+        let outcome =
+            calibrate::supervise(child, Duration::from_millis(400), Duration::from_millis(20));
         let elapsed = started.elapsed();
         assert!(
             matches!(outcome, calibrate::WatchdogOutcome::TimedOut),
