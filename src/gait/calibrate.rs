@@ -359,9 +359,20 @@ pub fn calibrate_and_store(
 
     let outcome = run_tournament(baseline, candidates, config, weight_bytes, &memory, trial);
 
+    // §6F: attest the host-safety posture (the §1.2 cap + §1.1/§1.2 invariants) and
+    // record the measured free-RAM headroom, so the receipt audits how this gait
+    // runs. Read physical_cores before machine_sig is moved into the receipt.
+    let scheduling = super::Scheduling::attest(
+        machine_sig.physical_cores,
+        outcome.selected_eco_qos_opt_out,
+    );
+    let host_safety = super::HostSafety::capture();
+
     let receipt = GaitReceipt::new(model_sig, machine_sig, outcome.selected_profile.clone())
         .with_memory(memory)
-        .with_calibration(outcome.clone());
+        .with_calibration(outcome.clone())
+        .with_scheduling(scheduling)
+        .with_host_safety(host_safety);
     let path = store_in(dir, &receipt).ok();
     (outcome, path)
 }

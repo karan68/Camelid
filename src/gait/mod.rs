@@ -559,6 +559,13 @@ pub struct GaitReceipt {
     /// receipt. Part of the canonical body, so bound into `receipt_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<calibrate::CalibrationOutcome>,
+    /// §6F host-safety scheduling attestation (the §1.2 cap + the §1.1/§1.2
+    /// invariants). Absent for receipts written before this lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<Scheduling>,
+    /// §6F measured host-safety posture (free-RAM headroom at calibration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_safety: Option<HostSafety>,
 }
 
 impl GaitReceipt {
@@ -574,6 +581,8 @@ impl GaitReceipt {
             recorded_profile,
             memory: None,
             calibration: None,
+            scheduling: None,
+            host_safety: None,
         };
         receipt.seal();
         receipt
@@ -590,6 +599,20 @@ impl GaitReceipt {
     /// Attach the calibration evidence and re-seal.
     pub fn with_calibration(mut self, calibration: calibrate::CalibrationOutcome) -> Self {
         self.calibration = Some(calibration);
+        self.seal();
+        self
+    }
+
+    /// Attach the §6F scheduling attestation and re-seal.
+    pub fn with_scheduling(mut self, scheduling: Scheduling) -> Self {
+        self.scheduling = Some(scheduling);
+        self.seal();
+        self
+    }
+
+    /// Attach the §6F measured host-safety posture and re-seal.
+    pub fn with_host_safety(mut self, host_safety: HostSafety) -> Self {
+        self.host_safety = Some(host_safety);
         self.seal();
         self
     }
@@ -824,6 +847,72 @@ pub fn host_ram_status() -> Option<(u64, u64)> {
 #[cfg(not(windows))]
 pub fn host_ram_status() -> Option<(u64, u64)> {
     None
+}
+
+/// The host-safety scheduling posture recorded in a gait receipt (§6F) — an
+/// attestation of the guarantees Waves 1–2 enforce, so a reader can audit *how* a
+/// gait runs without trusting prose. Every field is honestly derived: the cap
+/// from the topology, the constants from architectural invariants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// The §1.2 compute-thread cap (`budget.threads`) — the most workers this gait
+    /// will use. `None` if the physical-core count was unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_threads: Option<usize>,
+    /// Cores reserved for the OS under that cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_cores: Option<usize>,
+    /// Whether the EcoQoS execution-speed opt-out is applied (compute pool only).
+    pub eco_qos_opt_out: bool,
+    /// Always `"none"` — GAIT never page-locks the weight arena (§1.1).
+    pub memory_locking: String,
+    /// Always `"untouched"` — GAIT never alters processor-performance / thermal
+    /// limits (§1.2).
+    pub thermal_limits: String,
+    /// Software weight-stream prefetch depth (0 = baseline; `>0` once §6D lands).
+    pub stream_prefetch_depth: u32,
+    /// CPU-set the compute pool is pinned to (empty until §1.2 CPU-set pinning).
+    pub compute_cpuset: Vec<u32>,
+}
+
+impl Scheduling {
+    /// Build the scheduling attestation from the machine's physical-core count and
+    /// the selected EcoQoS choice: records the §1.2 cap and the §1.1/§1.2
+    /// architectural constants.
+    pub fn attest(physical_cores: Option<usize>, eco_qos_opt_out: bool) -> Self {
+        let budget = physical_cores.map(compute_thread_budget);
+        Scheduling {
+            compute_threads: budget.map(|b| b.threads),
+            reserved_cores: budget.map(|b| b.reserved),
+            eco_qos_opt_out,
+            memory_locking: "none".to_string(),
+            thermal_limits: "untouched".to_string(),
+            stream_prefetch_depth: 0,
+            compute_cpuset: Vec::new(),
+        }
+    }
+}
+
+/// The measured host-safety posture at calibration time (§6F). Only fields GAIT
+/// genuinely measures are recorded — throttle-event counting and UI-responsiveness
+/// monitoring are deliberately ABSENT until the §1.2 throttle valve exists, so the
+/// receipt never attests a safety number it did not actually measure.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HostSafety {
+    /// Free physical RAM observed at calibration, in GiB (the §1.1 headroom).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_headroom_gib: Option<f64>,
+}
+
+impl HostSafety {
+    /// Capture the current host-safety posture (free-RAM headroom). The float is
+    /// `round_sig6`-normalized so the content-addressed receipt's self-digest
+    /// survives a file round-trip (see [`round_sig6`]).
+    pub fn capture() -> Self {
+        let ram_headroom_gib = host_ram_status()
+            .map(|(_total, avail)| round_sig6(avail as f64 / (1024.0 * 1024.0 * 1024.0)));
+        HostSafety { ram_headroom_gib }
+    }
 }
 
 /// Measured memory characteristics — the roofline denominator (sustained DRAM
@@ -1287,6 +1376,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("camelid_gait_miss_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(load_from(&dir, "deadbeef:cafef00d").is_none());
+    }
+
+    #[test]
+    fn scheduling_attest_records_cap_and_constants() {
+        let s = Scheduling::attest(Some(8), true);
+        assert_eq!(s.compute_threads, Some(6)); // 8 - 2 reserve on a small box
+        assert_eq!(s.reserved_cores, Some(2));
+        assert!(s.eco_qos_opt_out);
+        assert_eq!(s.memory_locking, "none");
+        assert_eq!(s.thermal_limits, "untouched");
+        assert_eq!(s.stream_prefetch_depth, 0);
+        assert!(s.compute_cpuset.is_empty());
+        // Unknown topology -> no thread numbers, but the invariants still hold.
+        let u = Scheduling::attest(None, false);
+        assert_eq!(u.compute_threads, None);
+        assert_eq!(u.reserved_cores, None);
+        assert_eq!(u.memory_locking, "none");
+    }
+
+    #[test]
+    fn receipt_with_scheduling_and_host_safety_round_trips() {
+        let dir = std::env::temp_dir().join(format!("camelid_gait_sched_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = GaitReceipt::new(
+            ModelSig::from_gguf(&sample_gguf()),
+            MachineSig::detect(),
+            ExecutionProfile::Auto,
+        );
+        // 9.5 is an exact binary fraction, so it survives the JSON round-trip the
+        // content-addressed self-digest depends on.
+        let enriched = base
+            .clone()
+            .with_scheduling(Scheduling::attest(Some(8), false))
+            .with_host_safety(HostSafety {
+                ram_headroom_gib: Some(9.5),
+            });
+        // Enrichment changes the sealed digest but not the key, and stays verifiable.
+        assert_ne!(enriched.receipt_id, base.receipt_id);
+        assert_eq!(enriched.gait_key, base.gait_key);
+        assert!(enriched.verify_self_digest());
+
+        store_in(&dir, &enriched).expect("store");
+        let loaded = load_from(&dir, &enriched.gait_key).expect("load");
+        assert_eq!(loaded, enriched);
+        assert_eq!(
+            loaded.scheduling.as_ref().unwrap().thermal_limits,
+            "untouched"
+        );
+        assert_eq!(loaded.host_safety.unwrap().ram_headroom_gib, Some(9.5));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
