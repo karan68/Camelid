@@ -783,6 +783,13 @@ enum Command {
         eco_qos: bool,
         #[arg(long)]
         threads: Option<usize>,
+        /// §5 groups_per_chunk tiling overrides (pass all three together).
+        #[arg(long)]
+        gpc_attn: Option<usize>,
+        #[arg(long)]
+        gpc_ffn: Option<usize>,
+        #[arg(long)]
+        gpc_matmul: Option<usize>,
     },
     /// GAIT cache maintenance (e.g. `camelid gait reset`).
     #[command(hide = true)]
@@ -1535,8 +1542,14 @@ async fn main() -> anyhow::Result<()> {
             profile,
             eco_qos,
             threads,
+            gpc_attn,
+            gpc_ffn,
+            gpc_matmul,
         } => {
-            run_gait_trial(model, prompt_file, prompt, max_tokens, profile, eco_qos, threads)?;
+            run_gait_trial(
+                model, prompt_file, prompt, max_tokens, profile, eco_qos, threads, gpc_attn,
+                gpc_ffn, gpc_matmul,
+            )?;
         }
         Command::Gait { action } => match action {
             GaitAction::Reset => run_gait_reset()?,
@@ -1994,6 +2007,28 @@ struct BenchGenerateRecord {
     output_token_ids: Vec<u32>,
 }
 
+/// §5: set (or clear) the three managed x86 Q8 `groups_per_chunk` env knobs for a
+/// trial. `None` clears them so the trial measures the profile's default tiling;
+/// `Some` pins the search candidate's values. Must be called AFTER
+/// `PlannerEnv::apply` (these keys are managed) so the override is authoritative.
+fn apply_groups_per_chunk(gpc: Option<camelid::gait::calibrate::GroupsPerChunk>) {
+    const ATTN: &str = "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK";
+    const FFN: &str = "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK";
+    const MATMUL: &str = "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK";
+    match gpc {
+        Some(g) => {
+            std::env::set_var(ATTN, g.attn_qkv_decode.to_string());
+            std::env::set_var(FFN, g.ffn_gate_up_decode.to_string());
+            std::env::set_var(MATMUL, g.packed_rows4_matmul.to_string());
+        }
+        None => {
+            std::env::remove_var(ATTN);
+            std::env::remove_var(FFN);
+            std::env::remove_var(MATMUL);
+        }
+    }
+}
+
 fn gait_profile_env_value(profile: &camelid::execution_plan::ExecutionProfile) -> &'static str {
     use camelid::execution_plan::ExecutionProfile::*;
     match profile {
@@ -2034,6 +2069,10 @@ fn gait_profile_trial(
     // Apply this candidate's plan before loading weights, exactly as bench-generate does.
     let plan = camelid::execution_plan::plan_for_model(model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan.env_updates);
+    // §5: apply this candidate's groups_per_chunk tiling AFTER the planner's
+    // env_updates — the gpc knobs are MANAGED_ENV_KEYS, so PlannerEnv::apply would
+    // otherwise clear/overwrite them. Applying here lets the search override win.
+    apply_groups_per_chunk(candidate.groups_per_chunk);
 
     let config = LlamaModelConfig::from_gguf(&gguf)?;
     let binding = LlamaTensorBinding::bind(&gguf, &config)?;
@@ -2105,19 +2144,30 @@ fn run_gait_calibrate(
         label: "auto".to_string(),
         profile: ExecutionProfile::Auto,
         eco_qos_opt_out: false,
+        groups_per_chunk: None,
     };
-    let candidates = vec![
-        Candidate {
-            label: "auto+ecoqos".to_string(),
-            profile: ExecutionProfile::Auto,
-            eco_qos_opt_out: true,
-        },
-        Candidate {
-            label: "experimental+ecoqos".to_string(),
+    // §5 bounded local search: the EcoQoS substrate dimension (auto+ecoqos) plus
+    // the experimental kernel under each groups_per_chunk neighbor. Every
+    // candidate is parity-gated + crash-isolated; the tournament fails closed to
+    // baseline if none beats it by margin (the honest outcome on a
+    // memory-bandwidth-bound box, where the tiling knob is expected to be flat).
+    let mut candidates = vec![Candidate {
+        label: "auto+ecoqos".to_string(),
+        profile: ExecutionProfile::Auto,
+        eco_qos_opt_out: true,
+        groups_per_chunk: None,
+    }];
+    for gpc in camelid::gait::calibrate::groups_per_chunk_neighbors() {
+        candidates.push(Candidate {
+            label: format!(
+                "exp+gpc[{},{},{}]",
+                gpc.attn_qkv_decode, gpc.ffn_gate_up_decode, gpc.packed_rows4_matmul
+            ),
             profile: ExecutionProfile::Experimental,
-            eco_qos_opt_out: true,
-        },
-    ];
+            eco_qos_opt_out: false,
+            groups_per_chunk: Some(gpc),
+        });
+    }
 
     let store_dir = default_store_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve the gait store directory"))?;
@@ -2228,6 +2278,7 @@ const CAL_TRIAL_CEILING: std::time::Duration = std::time::Duration::from_secs(18
 /// child process and print its TrialResult as a single JSON line to stdout. The
 /// crash/hang isolation lives in the PARENT supervisor ([`run_trial_in_child`]);
 /// here we just run the trial and report.
+#[allow(clippy::too_many_arguments)]
 fn run_gait_trial(
     model: PathBuf,
     prompt_file: Option<PathBuf>,
@@ -2236,9 +2287,12 @@ fn run_gait_trial(
     profile: String,
     eco_qos: bool,
     threads: Option<usize>,
+    gpc_attn: Option<usize>,
+    gpc_ffn: Option<usize>,
+    gpc_matmul: Option<usize>,
 ) -> anyhow::Result<()> {
     use camelid::execution_plan::ExecutionProfile;
-    use camelid::gait::calibrate::Candidate;
+    use camelid::gait::calibrate::{Candidate, GroupsPerChunk};
 
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
     std::env::remove_var("CAMELID_GAIT");
@@ -2263,10 +2317,23 @@ fn run_gait_trial(
     let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
     anyhow::ensure!(!prompt_token_ids.is_empty(), "prompt encoded to zero tokens");
 
+    // §5: the three gpc knobs travel together — all present, or none.
+    let groups_per_chunk = match (gpc_attn, gpc_ffn, gpc_matmul) {
+        (Some(a), Some(f), Some(m)) => Some(GroupsPerChunk {
+            attn_qkv_decode: a,
+            ffn_gate_up_decode: f,
+            packed_rows4_matmul: m,
+        }),
+        (None, None, None) => None,
+        _ => anyhow::bail!(
+            "groups_per_chunk override requires all three of --gpc-attn / --gpc-ffn / --gpc-matmul"
+        ),
+    };
     let candidate = Candidate {
         label: profile_label,
         profile,
         eco_qos_opt_out: eco_qos,
+        groups_per_chunk,
     };
     let result = gait_profile_trial(&model, threads, &prompt_token_ids, max_tokens, &candidate)?;
     // The ONLY stdout line — the JSON result the parent supervisor parses.
@@ -2304,6 +2371,14 @@ fn run_trial_in_child(
     }
     if let Some(t) = threads {
         cmd.arg("--threads").arg(t.to_string());
+    }
+    if let Some(g) = candidate.groups_per_chunk {
+        cmd.arg("--gpc-attn")
+            .arg(g.attn_qkv_decode.to_string())
+            .arg("--gpc-ffn")
+            .arg(g.ffn_gate_up_decode.to_string())
+            .arg("--gpc-matmul")
+            .arg(g.packed_rows4_matmul.to_string());
     }
     match (prompt_file, prompt) {
         (Some(path), _) => {

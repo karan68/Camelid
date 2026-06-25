@@ -79,9 +79,49 @@ fn is_matmul_stage(class: &str) -> bool {
     )
 }
 
+/// §5: the three managed x86 Q8 `groups_per_chunk` tiling knobs
+/// (`MANAGED_ENV_KEYS`). Tiling only — the arithmetic is unchanged, so varying
+/// these is parity-neutral *by construction* (and the tournament's parity gate
+/// enforces it regardless). The defaults match the kernel readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupsPerChunk {
+    pub attn_qkv_decode: usize,
+    pub ffn_gate_up_decode: usize,
+    pub packed_rows4_matmul: usize,
+}
+
+/// The kernel defaults — the center of the bounded search.
+pub const GPC_CENTER: GroupsPerChunk = GroupsPerChunk {
+    attn_qkv_decode: 16,
+    ffn_gate_up_decode: 16,
+    packed_rows4_matmul: 8,
+};
+
+/// A bounded coordinate-neighbor set around [`GPC_CENTER`] — a *short local
+/// search*, not a full grid, so the (expensive, child-process) trial count stays
+/// small. Each point keeps all knobs `> 0` as the kernel readers require.
+pub fn groups_per_chunk_neighbors() -> Vec<GroupsPerChunk> {
+    vec![
+        GPC_CENTER,
+        GroupsPerChunk {
+            attn_qkv_decode: 8,
+            ffn_gate_up_decode: 8,
+            ..GPC_CENTER
+        },
+        GroupsPerChunk {
+            attn_qkv_decode: 32,
+            ffn_gate_up_decode: 32,
+            ..GPC_CENTER
+        },
+        GroupsPerChunk {
+            packed_rows4_matmul: 16,
+            ..GPC_CENTER
+        },
+    ]
+}
+
 /// A configuration to evaluate. `profile` is what gets recorded and later
-/// applied; `label` is for evidence/logs. (As the campaign matures, candidates
-/// will also carry the per-stage `MANAGED_ENV_KEYS` struct.)
+/// applied; `label` is for evidence/logs.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub label: String,
@@ -90,6 +130,9 @@ pub struct Candidate {
     /// Windows scheduling-substrate dimension). The engine only records it; the
     /// trial closure applies it before timing.
     pub eco_qos_opt_out: bool,
+    /// §5: per-stage `groups_per_chunk` tiling overrides. `None` uses the
+    /// profile's kernel defaults; `Some` is applied (and recorded) by the trial.
+    pub groups_per_chunk: Option<GroupsPerChunk>,
 }
 
 /// The result of timing one candidate: its throughput and a parity token. Two
@@ -159,6 +202,10 @@ pub struct CalibrationOutcome {
     /// the substrate dimension existed.
     #[serde(default)]
     pub selected_eco_qos_opt_out: bool,
+    /// §5: the `groups_per_chunk` tiling the winner used (`None` = kernel defaults
+    /// / baseline). Recorded so the selected gait reproduces the chosen tiling.
+    #[serde(default)]
+    pub selected_groups_per_chunk: Option<GroupsPerChunk>,
     /// Measured rounds per variant behind the medians.
     #[serde(default)]
     pub measured_rounds: usize,
@@ -277,6 +324,7 @@ pub fn run_tournament(
         fell_back: true,
         parity_disqualified: disq,
         selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
+        selected_groups_per_chunk: baseline.groups_per_chunk,
         measured_rounds: measured,
         samples: samples.clone(),
     };
@@ -328,6 +376,7 @@ pub fn run_tournament(
                 fell_back: false,
                 parity_disqualified: disqualified,
                 selected_eco_qos_opt_out: winner.eco_qos_opt_out,
+                selected_groups_per_chunk: winner.groups_per_chunk,
                 measured_rounds: measured,
                 samples,
             }
@@ -475,6 +524,28 @@ mod tests {
             label: label.to_string(),
             profile,
             eco_qos_opt_out: false,
+            groups_per_chunk: None,
+        }
+    }
+
+    #[test]
+    fn gpc_neighbors_are_bounded_distinct_and_positive() {
+        let neighbors = groups_per_chunk_neighbors();
+        // A short local search, never a runaway grid.
+        assert!(
+            (2..=8).contains(&neighbors.len()),
+            "search must stay bounded, got {}",
+            neighbors.len()
+        );
+        assert!(neighbors.contains(&GPC_CENTER), "the center must be probed");
+        let mut seen = std::collections::BTreeSet::new();
+        for g in &neighbors {
+            // Every knob must stay > 0 (the kernel readers reject 0).
+            assert!(g.attn_qkv_decode > 0 && g.ffn_gate_up_decode > 0 && g.packed_rows4_matmul > 0);
+            assert!(
+                seen.insert((g.attn_qkv_decode, g.ffn_gate_up_decode, g.packed_rows4_matmul)),
+                "search points must be distinct"
+            );
         }
     }
 

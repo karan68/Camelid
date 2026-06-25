@@ -1460,6 +1460,7 @@ mod tests {
             fell_back: false,
             parity_disqualified: Vec::new(),
             selected_eco_qos_opt_out: true,
+            selected_groups_per_chunk: None,
             measured_rounds: 1,
             samples: Vec::new(),
         };
