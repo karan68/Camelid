@@ -251,6 +251,15 @@ fn pin_to_high_performance_gpu() {
 #[cfg(not(windows))]
 fn pin_to_high_performance_gpu() {}
 
+/// `camelid gait <action>` — GAIT cache maintenance subcommands.
+#[derive(Debug, Subcommand)]
+enum GaitAction {
+    /// Clear the GAIT cache (profiles, quarantine, in-progress markers, and the
+    /// DISABLE kill-file) under %LOCALAPPDATA%\Camelid\gait, fully reverting to
+    /// the baseline path.
+    Reset,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the local HTTP API server.
@@ -753,6 +762,12 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// GAIT cache maintenance (e.g. `camelid gait reset`).
+    #[command(hide = true)]
+    Gait {
+        #[command(subcommand)]
+        action: GaitAction,
+    },
     /// SPEC_RECHECK measurement harness: run lossless greedy speculative decode and a plain
     /// greedy baseline back-to-back on one prompt, and emit a single JSON record with the
     /// per-run economics (acceptance rate, draft/verify latency split, f_draft, S_sync) plus
@@ -891,6 +906,17 @@ async fn main() -> anyhow::Result<()> {
 
     // No subcommand (a bare double-click of the exe) launches the open-and-use app.
     let command = Cli::parse().command.unwrap_or_else(default_launch_command);
+
+    // §4 safe-boot: a gait/substrate that crashed or wedged the host on the
+    // previous run left an `.applying` marker; detect it now — before anything is
+    // applied — quarantine that profile, and boot the proven baseline so a crash
+    // can never loop. Inert unless the CAMELID_GAIT gate is on, so the default
+    // path is byte-identical to today.
+    if camelid::gait::gait_enabled() {
+        if let Some(dir) = camelid::gait::gait_dir() {
+            let _ = camelid::gait::sentinel::reconcile_on_startup(&dir);
+        }
+    }
     // Deterministic mode opts out of the GPU fast stack entirely; otherwise the CLI
     // defaults to the measured-fastest Metal configuration. Branch before any env is set
     // so the deterministic path never even arms the GPU defaults.
@@ -1479,6 +1505,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             run_gait_calibrate(model, prompt_file, prompt, max_tokens, rounds, warmup, threads)?;
         }
+        Command::Gait { action } => match action {
+            GaitAction::Reset => run_gait_reset()?,
+        },
         Command::BenchSpeculative {
             model,
             drafter,
@@ -1577,6 +1606,13 @@ async fn main() -> anyhow::Result<()> {
                 out_path.display()
             );
         }
+    }
+
+    // §4 safe-boot: an orderly exit — clear any in-progress gait marker so a
+    // healthy run is never mistaken for a crash on the next launch. (No-op unless
+    // a gait was applied this process.)
+    if let Some(dir) = camelid::gait::gait_dir() {
+        camelid::gait::sentinel::clean_shutdown(&dir);
     }
     Ok(())
 }
@@ -2094,6 +2130,24 @@ fn run_gait_calibrate(
             "[gait] selected {:?} :: {} :: receipt NOT stored (store write failed)",
             outcome.selected_profile, outcome.reason
         ),
+    }
+    Ok(())
+}
+
+/// `camelid gait reset` — clear the entire GAIT cache, reverting fully to the
+/// baseline path (§1.3). Best-effort and idempotent: a missing cache is not an
+/// error. Deleting the folder is the documented manual revert; this is the
+/// in-CLI equivalent.
+fn run_gait_reset() -> anyhow::Result<()> {
+    match camelid::gait::gait_dir() {
+        Some(dir) if dir.exists() => {
+            std::fs::remove_dir_all(&dir)?;
+            println!("gait: cleared cache at {}", dir.display());
+        }
+        Some(dir) => {
+            println!("gait: nothing to clear ({} does not exist)", dir.display());
+        }
+        None => println!("gait: no cache directory could be resolved"),
     }
     Ok(())
 }

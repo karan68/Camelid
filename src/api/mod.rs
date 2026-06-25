@@ -6951,7 +6951,14 @@ async fn generate_decoded_tokens_blocking(
         generate_decoded_tokens(prepared)
     });
     match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => {
+            // §4 safe-boot: a decode ran to completion under the applied gait
+            // without wedging the host, so clear the in-progress marker. Cheap
+            // and idempotent (a no-op after the first call, or when no gait was
+            // applied), so it is safe on the hot path.
+            crate::gait::sentinel::mark_healthy();
+            result
+        }
         Ok(Err(err)) => Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "generation_worker_failed",

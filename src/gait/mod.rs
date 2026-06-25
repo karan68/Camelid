@@ -29,6 +29,7 @@ use crate::gguf::GgufFile;
 use crate::receipt::{canonical_json, sha256_hex};
 
 pub mod calibrate;
+pub mod sentinel;
 pub mod substrate;
 
 /// Schema identifier stamped into every v1 gait receipt. Mirrors the
@@ -630,8 +631,9 @@ pub fn gait_dir() -> Option<PathBuf> {
 
 /// File name for a key. The key contains `:` (invalid on Windows), so it is
 /// sanitized; the full key is also recorded inside the receipt and re-checked on
-/// load.
-fn key_filename(key: &str) -> String {
+/// load. Crate-visible so the safe-boot sentinel addresses the same receipt file
+/// when quarantining a suspect gait.
+pub(crate) fn key_filename(key: &str) -> String {
     format!("{}.gait.json", key.replace(':', "_"))
 }
 
@@ -669,6 +671,10 @@ pub fn load_from(dir: &Path, key: &str) -> Option<GaitReceipt> {
 /// planner should use plus the scheduling substrate to apply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectedGait {
+    /// The `gait_key` this profile was selected for — the safe-boot sentinel
+    /// records it in the `.applying` marker so a crashing gait can be quarantined
+    /// by key on the next launch.
+    pub gait_key: String,
     pub profile: ExecutionProfile,
     pub reason: String,
     pub eco_qos_opt_out: bool,
@@ -690,18 +696,34 @@ pub(crate) fn receipt_eco_opt_out(receipt: &GaitReceipt) -> bool {
 /// receipt exists for this model on this machine. In every other case it returns
 /// `None` and the planner falls through to its existing default.
 pub fn maybe_select_profile(gguf: &GgufFile) -> Option<SelectedGait> {
+    let dir = gait_dir()?;
+    maybe_select_profile_in(&dir, gguf)
+}
+
+/// `dir`-explicit core of [`maybe_select_profile`], so the gate / `DISABLE` /
+/// quarantine behavior is testable against a temporary store. Returns `None`
+/// (the baseline path) when the gate is off, the `DISABLE` kill-file is present,
+/// or no loadable receipt exists for this `(model × machine)` — a quarantined
+/// receipt has been moved out of `dir`, so it simply misses here.
+pub(crate) fn maybe_select_profile_in(dir: &Path, gguf: &GgufFile) -> Option<SelectedGait> {
     if !gait_enabled() {
+        return None;
+    }
+    // §1.3 kill-file: while `DISABLE` exists, serve the baseline unconditionally —
+    // no cached profile and no substrate.
+    if sentinel::disable_present(dir) {
         return None;
     }
     let model_sig = ModelSig::from_gguf(gguf);
     let machine_sig = MachineSig::detect();
     let key = gait_key(&model_sig, &machine_sig);
-    let dir = gait_dir()?;
-    let receipt = load_from(&dir, &key)?;
+    let receipt = load_from(dir, &key)?;
+    let reason = format!("gait: applied cached profile for {key}");
     Some(SelectedGait {
+        gait_key: key,
         eco_qos_opt_out: receipt_eco_opt_out(&receipt),
         profile: receipt.recorded_profile,
-        reason: format!("gait: applied cached profile for {key}"),
+        reason,
     })
 }
 
@@ -710,6 +732,26 @@ pub fn maybe_select_profile(gguf: &GgufFile) -> Option<SelectedGait> {
 /// substrate (EcoQoS) and logs the live gait so it is observable. Best-effort and
 /// process-level. Only invoked when a gait was selected (gate on + receipt found).
 pub fn apply_selected_gait(gait: &SelectedGait) {
+    // §4 safe-boot: record the in-progress apply BEFORE touching the host, so a
+    // crash/freeze/wedge during apply or early use leaves a marker that the next
+    // launch detects and quarantines. The marker is cleared once a real decode
+    // completes (`sentinel::mark_healthy`) or on an orderly exit
+    // (`sentinel::clean_shutdown`).
+    //
+    // WAVE 2: the healthy-clear currently fires on the first completed decode,
+    // which fully guards the apply window and a parity-gated profile (a profile
+    // is only ever persisted after it decoded cleanly on this exact machine
+    // during calibration). When non-parity-gated, host-touching levers land
+    // (CPU-set pinning, the sustained-throttle valve, live in-process
+    // calibration), move the clear-point to *after a sustained-healthy window*
+    // so a gait that wedges the host mid-session is still caught.
+    if let Some(dir) = gait_dir() {
+        let mut layers: Vec<&str> = vec!["gait"];
+        if gait.eco_qos_opt_out {
+            layers.push("substrate");
+        }
+        sentinel::begin_apply(&dir, &gait.gait_key, &layers);
+    }
     if gait.eco_qos_opt_out {
         let status = substrate::set_eco_qos_opt_out(true);
         eprintln!(
@@ -966,6 +1008,12 @@ pub mod oracle {
     }
 }
 
+/// Serializes the tests that mutate the process-global `CAMELID_GAIT` env var so
+/// they cannot race each other (Rust runs tests in parallel by default). Held for
+/// the duration of any test that sets or clears the gate.
+#[cfg(test)]
+pub(crate) static GAIT_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,6 +1228,9 @@ mod tests {
 
     #[test]
     fn selector_is_none_when_gate_disabled() {
+        let _env = GAIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // With the gate unset, the selector must not touch the store at all.
         std::env::remove_var(GAIT_GATE_ENV);
         assert!(maybe_select_profile(&sample_gguf()).is_none());
@@ -1217,5 +1268,158 @@ mod tests {
         )
         .with_calibration(outcome);
         assert!(receipt_eco_opt_out(&receipt));
+    }
+}
+
+/// §9 host-safety gates. These assert the prime-directive guard rails the v2
+/// campaign adds, not just the happy path. Run with:
+/// `cargo test --lib -- --include-ignored gait_safety`.
+#[cfg(test)]
+mod gait_safety {
+    use super::*;
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        GAIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "camelid_gait_safety_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample_gguf() -> GgufFile {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetadataValue::String("llama".to_string()),
+        );
+        metadata.insert("llama.block_count".to_string(), GgufMetadataValue::U32(4));
+        metadata.insert(
+            "llama.embedding_length".to_string(),
+            GgufMetadataValue::U32(64),
+        );
+        GgufFile {
+            path: PathBuf::from("safety.gguf"),
+            version: 3,
+            tensor_count: 1,
+            metadata_count: metadata.len() as i64,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata,
+            tensors: vec![GgufTensorDescriptor {
+                name: "blk.0.attn_q.weight".to_string(),
+                dimensions: vec![64, 64],
+                tensor_type: GgufTensorType::Q8_0,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 0,
+            }],
+        }
+    }
+
+    /// §1.3: a `DISABLE` kill-file forces the baseline path even with the gate on
+    /// and a valid cached receipt present.
+    #[test]
+    fn disable_file_forces_baseline() {
+        let _env = lock_env();
+        let dir = temp_dir("disable");
+        let gguf = sample_gguf();
+        let receipt = GaitReceipt::new(
+            ModelSig::from_gguf(&gguf),
+            MachineSig::detect(),
+            ExecutionProfile::Auto,
+        );
+        store_in(&dir, &receipt).expect("store receipt");
+
+        std::env::set_var(GAIT_GATE_ENV, "1");
+        // Sanity: gate on + receipt present => the selector adopts it.
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_some(),
+            "precondition: a cached gait should be selected before DISABLE"
+        );
+        // Drop the kill-file: the selector must now serve baseline (None), no
+        // profile and no substrate, despite the live receipt.
+        std::fs::write(dir.join("DISABLE"), "").expect("write DISABLE");
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_none(),
+            "DISABLE must force the baseline path"
+        );
+
+        std::env::remove_var(GAIT_GATE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §4 crash-injection: a stored receipt + a stale `.applying` marker (a prior
+    /// unclean exit) must be quarantined on the next launch, after which the
+    /// selector serves the proven baseline.
+    #[test]
+    fn safe_boot_quarantines_bad_gait() {
+        let _env = lock_env();
+        let dir = temp_dir("safe_boot");
+        let gguf = sample_gguf();
+        let model_sig = ModelSig::from_gguf(&gguf);
+        let machine_sig = MachineSig::detect();
+        let key = gait_key(&model_sig, &machine_sig);
+
+        // The persisted (here, suspect) gait that crashed the prior run.
+        let receipt = GaitReceipt::new(model_sig, machine_sig, ExecutionProfile::Experimental);
+        store_in(&dir, &receipt).expect("store receipt");
+        // The marker the crashed run left behind (written directly so the global
+        // armed slot is untouched — this stands in for a previous process).
+        let marker = sentinel::ApplyingMarker {
+            gait_key: key.clone(),
+            layers: vec!["gait".to_string(), "substrate".to_string()],
+            pid: 999_999,
+            utc_epoch_secs: 0,
+        };
+        std::fs::write(
+            dir.join(".applying"),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .expect("write marker");
+
+        std::env::set_var(GAIT_GATE_ENV, "1");
+        // Sanity: before reconciliation the suspect gait is loadable.
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_some(),
+            "precondition: the suspect gait should load before reconciliation"
+        );
+
+        // Next launch reconciles the stale marker.
+        match sentinel::reconcile_on_startup(&dir) {
+            sentinel::StartupReconcile::UncleanExit {
+                gait_key,
+                quarantined,
+            } => {
+                assert_eq!(gait_key.as_deref(), Some(key.as_str()));
+                assert!(quarantined, "first unclean exit must quarantine (threshold 1)");
+            }
+            other => panic!("expected UncleanExit, got {other:?}"),
+        }
+
+        // The receipt is quarantined, the marker cleared, so the selector now
+        // boots the baseline.
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_none(),
+            "after quarantine the selector must serve baseline"
+        );
+        assert!(
+            dir.join(".quarantine").join(key_filename(&key)).exists(),
+            "the suspect receipt must be preserved under .quarantine/ for diagnosis"
+        );
+        assert!(!dir.join(".applying").exists(), "the marker must be cleared");
+
+        std::env::remove_var(GAIT_GATE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
