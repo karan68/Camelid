@@ -102,10 +102,10 @@
       "capability": "logprobs/top_logprobs at temp=0 (any causal LM)",
       "verdict": "capable",
       "oracle_class": "D",
-      "matrix_cell": "open",
-      "camelid_state": "typed_error_stub",
-      "receipt_present": false,
-      "receipt": null,
+      "matrix_cell": "done",
+      "camelid_state": "drives",
+      "receipt_present": true,
+      "receipt": "receipts/capability-receipt.logprobs.top_logprobs.llama-3.2-3b-instruct-q8_0.json",
       "model_evidence": "Logits exposed at temp=0 enable logprobs/top_logprobs; deterministic-parity checkable for any causal LM."
     },
     {

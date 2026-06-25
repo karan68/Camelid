@@ -1097,6 +1097,31 @@ pub struct ChatCompletionChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
     pub finish_reason: &'static str,
+    /// OpenAI per-token logprobs; present only when `logprobs:true` was requested
+    /// (non-streaming, single choice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChatLogprobs>,
+}
+
+/// OpenAI chat `logprobs` object: one `content` entry per generated token.
+#[derive(Debug, Serialize)]
+pub struct ChatLogprobs {
+    pub content: Vec<ChatLogprobContent>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatLogprobContent {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
+    pub top_logprobs: Vec<ChatTopLogprob>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatTopLogprob {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1124,6 +1149,19 @@ pub struct CompletionChoice {
     pub index: u32,
     pub text: String,
     pub finish_reason: &'static str,
+    /// OpenAI legacy-completions logprobs; present only when `logprobs:N` was
+    /// requested (non-streaming, single choice).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<CompletionLogprobs>,
+}
+
+/// OpenAI legacy `/v1/completions` `logprobs` object (parallel arrays).
+#[derive(Debug, Serialize)]
+pub struct CompletionLogprobs {
+    pub tokens: Vec<String>,
+    pub token_logprobs: Vec<f32>,
+    pub top_logprobs: Vec<std::collections::BTreeMap<String, f32>>,
+    pub text_offset: Vec<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1194,6 +1232,9 @@ struct PreparedGeneration {
     tokenizer: Arc<Tokenizer>,
     session: LlamaInferenceSession,
     sampling: SamplingConfig,
+    /// When set, collect per-token logprobs each step (chosen + this many top
+    /// alternatives). Forces the full-host-logits decode path (no GPU greedy-fast).
+    logprobs_top_n: Option<usize>,
     stop_sequences: Vec<String>,
     logit_diagnostic_token_ids: Vec<u32>,
     collect_dense_diagnostics: bool,
@@ -1252,6 +1293,22 @@ struct PreparedSpeculative {
     accepted_drafts: u64,
 }
 
+/// One token's logprob plus its decoded piece and raw UTF-8 bytes (OpenAI-shaped).
+#[derive(Debug, Clone)]
+struct TokenLogprob {
+    token: String,
+    logprob: f32,
+    bytes: Vec<u8>,
+}
+
+/// Per generated-token logprob record: the chosen token plus the top-N
+/// alternatives by probability. Collected only when logprobs are requested.
+#[derive(Debug, Clone)]
+struct StepLogprob {
+    chosen: TokenLogprob,
+    top: Vec<TokenLogprob>,
+}
+
 struct GeneratedText {
     text: String,
     prompt_token_ids: Vec<u32>,
@@ -1259,6 +1316,8 @@ struct GeneratedText {
     dense_metadata: DenseDiagnosticMetadata,
     top_logits: Vec<LogitDiagnostic>,
     step_top_logits: Vec<Vec<LogitDiagnostic>>,
+    /// Per-token logprobs (chosen + top-N); empty unless logprobs were requested.
+    step_logprobs: Vec<StepLogprob>,
     output_projection: Vec<LlamaOutputProjectionDiagnostic>,
     dense: Option<LlamaForwardDiagnostics>,
     dense_diagnostic_generated_index: Option<usize>,
@@ -1275,6 +1334,8 @@ struct GeneratedTokens {
     dense_metadata: DenseDiagnosticMetadata,
     top_logits: Vec<RawLogitDiagnostic>,
     step_top_logits: Vec<Vec<RawLogitDiagnostic>>,
+    /// Per-token logprobs (chosen + top-N); empty unless logprobs were requested.
+    step_logprobs: Vec<StepLogprob>,
     output_projection: Vec<LlamaOutputProjectionDiagnostic>,
     dense: Option<LlamaForwardDiagnostics>,
     dense_diagnostic_generated_index: Option<usize>,
@@ -5224,6 +5285,8 @@ async fn completions_multi_choice(
             index,
             text,
             finish_reason,
+            // Logprobs are rejected upstream for n>1.
+            logprobs: None,
         });
     }
     let camelid =
@@ -5323,6 +5386,26 @@ async fn completions(
     } else {
         None
     };
+    // Logprobs are non-streaming, single-choice only (a per-chunk / per-choice
+    // follow-up). Reject the unsupported combinations before runtime.
+    let wants_logprobs = req.logprobs.is_some();
+    if wants_logprobs && req.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "logprobs are not supported with stream:true; request logprobs without streaming"
+                .to_string(),
+            Some("logprobs"),
+        );
+    }
+    if wants_logprobs && n_choices > 1 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "logprobs are not supported with n greater than 1".to_string(),
+            Some("logprobs"),
+        );
+    }
     let req = GenerationSessionRequest {
         model: req.model,
         prompt: req.prompt,
@@ -5393,6 +5476,7 @@ async fn completions(
                 dense_metadata,
                 top_logits,
                 step_top_logits,
+                step_logprobs,
                 output_projection,
                 dense,
                 dense_diagnostic_generated_index,
@@ -5401,6 +5485,11 @@ async fn completions(
                 timings,
                 execution_trace: _,
             } = generated;
+            let completion_logprobs = if step_logprobs.is_empty() {
+                None
+            } else {
+                Some(build_completion_logprobs(&step_logprobs))
+            };
             (
                 StatusCode::OK,
                 Json(CompletionResponse {
@@ -5412,6 +5501,7 @@ async fn completions(
                         index: 0,
                         text,
                         finish_reason,
+                        logprobs: completion_logprobs,
                     }],
                     usage: CompletionUsage {
                         prompt_tokens: prompt_token_count,
@@ -5510,6 +5600,8 @@ async fn chat_completions_multi_choice(
                 content,
             },
             finish_reason,
+            // Logprobs are rejected upstream for n>1.
+            logprobs: None,
         });
     }
     let camelid =
@@ -5619,6 +5711,26 @@ async fn chat_completions(
     } else {
         None
     };
+    // Logprobs are non-streaming, single-choice only (per-chunk / per-choice logprobs
+    // are a follow-up). Reject the unsupported combinations before runtime.
+    let wants_logprobs = matches!(req.logprobs, Some(true)) || req.top_logprobs.is_some();
+    if wants_logprobs && req.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "logprobs are not supported with stream:true; request logprobs without streaming"
+                .to_string(),
+            Some("logprobs"),
+        );
+    }
+    if wants_logprobs && n_choices > 1 {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "logprobs are not supported with n greater than 1".to_string(),
+            Some("logprobs"),
+        );
+    }
     // OpenAI stream_options.include_usage: resolved here (permissive — see
     // stream_options_include_usage) before `req` is consumed into the generation
     // request. Threaded into stream_completion; ignored on the non-streaming
@@ -5722,6 +5834,11 @@ async fn chat_completions(
                             content,
                         },
                         finish_reason: generated.finish_reason,
+                        logprobs: if generated.step_logprobs.is_empty() {
+                            None
+                        } else {
+                            Some(build_chat_logprobs(&generated.step_logprobs))
+                        },
                     }],
                     usage: CompletionUsage {
                         prompt_tokens: prompt_token_count,
@@ -6658,6 +6775,13 @@ async fn prepare_generation(
         stream: req.stream.unwrap_or(false),
     };
 
+    // Logprobs request → collect chosen + top-N each step. Chat uses logprobs:true
+    // plus top_logprobs:N; legacy completions uses logprobs:N directly.
+    let logprobs_top_n = if matches!(req.chat_logprobs, Some(true)) {
+        Some(req.top_logprobs.unwrap_or(0) as usize)
+    } else {
+        req.completion_logprobs.map(|n| n as usize)
+    };
     Ok(PreparedGeneration {
         model_id: model.id,
         model_path: model.path,
@@ -6666,6 +6790,7 @@ async fn prepare_generation(
         tokenizer,
         session,
         sampling,
+        logprobs_top_n,
         stop_sequences,
         logit_diagnostic_token_ids,
         collect_dense_diagnostics,
@@ -6968,6 +7093,10 @@ fn linear_projection_orientation(
 /// request from fanning out into unbounded server work.
 const MAX_N_CHOICES: u32 = 8;
 
+/// Upper bound on requested logprobs (chosen token + this many top alternatives),
+/// for both chat `top_logprobs` and legacy completions `logprobs`.
+const MAX_LOGPROBS: u32 = 20;
+
 fn validate_choice_and_logprob_fields(
     req: &GenerationSessionRequest,
 ) -> std::result::Result<(), Box<Response>> {
@@ -7003,29 +7132,32 @@ fn validate_choice_and_logprob_fields(
             Some("best_of"),
         )));
     }
-    if req.completion_logprobs.is_some() {
+    if matches!(req.completion_logprobs, Some(value) if value > MAX_LOGPROBS) {
         return Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
-            "completion logprobs are not supported yet; omit logprobs to receive text choices without token likelihoods".to_string(),
+            "invalid_request_parameter",
+            format!("logprobs must be between 0 and {MAX_LOGPROBS}"),
             Some("logprobs"),
         )));
     }
-    if matches!(req.chat_logprobs, Some(true)) {
-        return Err(Box::new(api_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
-            "chat logprobs are not supported yet; set logprobs to false or omit it".to_string(),
-            Some("logprobs"),
-        )));
-    }
-    if req.top_logprobs.is_some() {
-        return Err(Box::new(api_error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_parameter",
-            "top_logprobs are not supported yet because token logprobs are not exposed".to_string(),
-            Some("top_logprobs"),
-        )));
+    // Chat `top_logprobs` requires `logprobs:true` and is capped, matching OpenAI.
+    if let Some(top_logprobs) = req.top_logprobs {
+        if !matches!(req.chat_logprobs, Some(true)) {
+            return Err(Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_parameter",
+                "top_logprobs requires logprobs to be set to true".to_string(),
+                Some("top_logprobs"),
+            )));
+        }
+        if top_logprobs > MAX_LOGPROBS {
+            return Err(Box::new(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_parameter",
+                format!("top_logprobs must be between 0 and {MAX_LOGPROBS}"),
+                Some("top_logprobs"),
+            )));
+        }
     }
     Ok(())
 }
@@ -7584,6 +7716,7 @@ fn generate_decoded_tokens(
                     .collect()
             })
             .collect(),
+        step_logprobs: generated.step_logprobs,
         output_projection: generated.output_projection,
         dense: generated.dense,
         dense_diagnostic_generated_index: generated.dense_diagnostic_generated_index,
@@ -7754,6 +7887,7 @@ fn generate_token_ids(
     let mut generated = Vec::new();
     let mut top_logits = Vec::new();
     let mut step_top_logits = Vec::new();
+    let mut step_logprobs: Vec<StepLogprob> = Vec::new();
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
     let mut output_projection = Vec::new();
     let mut dense = None;
@@ -7846,6 +7980,7 @@ fn generate_token_ids(
                 && matches!(sampler, LlamaSampler::Greedy)
                 && !collect_dense_for_step
                 && !collect_step_top_logits
+                && prepared.logprobs_top_n.is_none()
                 && !top_logits.is_empty()
         }) {
             let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
@@ -7966,6 +8101,7 @@ fn generate_token_ids(
         let fast_step = if input.len() == 1
             && !collect_dense_for_step
             && !collect_step_top_logits
+            && prepared.logprobs_top_n.is_none()
             && !top_logits.is_empty()
         {
             match &sampler {
@@ -8085,6 +8221,24 @@ fn generate_token_ids(
                 dense_diagnostic_generated_index = Some(generated_index);
             }
         }
+        if let Some(top_n) = prepared.logprobs_top_n {
+            step_logprobs.push(
+                compute_step_logprobs(
+                    &step.logits.data,
+                    step.next_token_id,
+                    top_n,
+                    &prepared.tokenizer,
+                )
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "logprob_capture_failed",
+                        err.to_string(),
+                        None,
+                    ))
+                })?,
+            );
+        }
         generated.push(step.next_token_id);
         history.push(step.next_token_id);
         if prepared.tokenizer.special.eog.contains(&step.next_token_id) {
@@ -8149,6 +8303,7 @@ fn generate_token_ids(
         dense_metadata: prepared.dense_metadata,
         top_logits,
         step_top_logits,
+        step_logprobs,
         output_projection,
         dense,
         dense_diagnostic_generated_index,
@@ -8156,6 +8311,142 @@ fn generate_token_ids(
         timings: prepared.timings,
         execution_trace,
     })
+}
+
+/// Numeric core (tokenizer-free, testable): the chosen-token logprob plus the
+/// top-N `(token_id, logprob)` by probability, from a stable f64 log-sum-exp over
+/// the full vocab. `logprob[t] = logit[t] - logsumexp(logits)`.
+fn step_logprob_values(
+    logits: &[f32],
+    chosen: u32,
+    top_n: usize,
+) -> crate::Result<(f32, Vec<(u32, f32)>)> {
+    if logits.is_empty() {
+        return Err(BackendError::RuntimeShapeMismatch(
+            "logprob capture received empty logits".to_string(),
+        ));
+    }
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f64;
+    for &l in logits {
+        if !l.is_finite() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "logprob capture received a non-finite logit".to_string(),
+            ));
+        }
+        sum += ((l - max) as f64).exp();
+    }
+    let log_sum_exp = max as f64 + sum.ln();
+    let logprob_of = |id: usize| -> f32 { (logits[id] as f64 - log_sum_exp) as f32 };
+
+    let chosen_idx = chosen as usize;
+    if chosen_idx >= logits.len() {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "chosen token {chosen} is outside vocabulary size {}",
+            logits.len()
+        )));
+    }
+    let chosen_lp = logprob_of(chosen_idx);
+
+    let mut top = Vec::new();
+    if top_n > 0 {
+        let mut ranked: Vec<(u32, f32)> = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(id, l)| (id as u32, l))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (id, _) in ranked.iter().take(top_n) {
+            top.push((*id, logprob_of(*id as usize)));
+        }
+    }
+    Ok((chosen_lp, top))
+}
+
+/// Compute per-token logprobs for one decode step: the chosen token plus the top-N
+/// alternatives, each decoded to its OpenAI-shaped piece + bytes.
+fn compute_step_logprobs(
+    logits: &[f32],
+    chosen: u32,
+    top_n: usize,
+    tokenizer: &Tokenizer,
+) -> crate::Result<StepLogprob> {
+    let (chosen_lp, top) = step_logprob_values(logits, chosen, top_n)?;
+    let chosen_entry = token_logprob(chosen, chosen_lp, tokenizer)?;
+    let top = top
+        .into_iter()
+        .map(|(id, lp)| token_logprob(id, lp, tokenizer))
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(StepLogprob {
+        chosen: chosen_entry,
+        top,
+    })
+}
+
+/// Decode a single token to its OpenAI-shaped logprob entry (piece text + raw bytes).
+fn token_logprob(
+    token_id: u32,
+    logprob: f32,
+    tokenizer: &Tokenizer,
+) -> crate::Result<TokenLogprob> {
+    let token = tokenizer.decode(&[token_id], false)?;
+    let bytes = token.clone().into_bytes();
+    Ok(TokenLogprob {
+        token,
+        logprob,
+        bytes,
+    })
+}
+
+/// Build the OpenAI chat `logprobs` object (one `content` entry per token).
+fn build_chat_logprobs(steps: &[StepLogprob]) -> ChatLogprobs {
+    ChatLogprobs {
+        content: steps
+            .iter()
+            .map(|s| ChatLogprobContent {
+                token: s.chosen.token.clone(),
+                logprob: s.chosen.logprob,
+                bytes: s.chosen.bytes.clone(),
+                top_logprobs: s
+                    .top
+                    .iter()
+                    .map(|t| ChatTopLogprob {
+                        token: t.token.clone(),
+                        logprob: t.logprob,
+                        bytes: t.bytes.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Build the OpenAI legacy-completions `logprobs` object (parallel arrays).
+/// `text_offset` is the running char offset of each token's piece in the output.
+fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
+    let mut tokens = Vec::with_capacity(steps.len());
+    let mut token_logprobs = Vec::with_capacity(steps.len());
+    let mut top_logprobs = Vec::with_capacity(steps.len());
+    let mut text_offset = Vec::with_capacity(steps.len());
+    let mut offset = 0usize;
+    for s in steps {
+        text_offset.push(offset);
+        offset += s.chosen.token.chars().count();
+        tokens.push(s.chosen.token.clone());
+        token_logprobs.push(s.chosen.logprob);
+        let mut map = std::collections::BTreeMap::new();
+        for t in &s.top {
+            map.insert(t.token.clone(), t.logprob);
+        }
+        top_logprobs.push(map);
+    }
+    CompletionLogprobs {
+        tokens,
+        token_logprobs,
+        top_logprobs,
+        text_offset,
+    }
 }
 
 fn top_logit_diagnostics(
@@ -10163,6 +10454,97 @@ mod tests {
         }))
         .expect("session request should deserialize");
         assert!(validate_choice_and_logprob_fields(&too_many).is_err());
+    }
+
+    #[test]
+    fn step_logprob_values_are_log_softmax() {
+        // Uniform logits: every logprob = ln(1/n); ties broken by ascending id.
+        let (chosen, top) = step_logprob_values(&[0.0, 0.0, 0.0, 0.0], 2, 2).unwrap();
+        let uniform = (0.25f32).ln();
+        assert!(
+            (chosen - uniform).abs() < 1e-5,
+            "chosen {chosen} vs {uniform}"
+        );
+        assert_eq!(
+            top.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        for (_, lp) in &top {
+            assert!((*lp - uniform).abs() < 1e-5);
+        }
+        // Non-uniform: chosen logprob == logit - logsumexp.
+        let logits = [2.0f32, 1.0, 0.0];
+        let lse = logits.iter().map(|l| l.exp()).sum::<f32>().ln();
+        let (c0, _) = step_logprob_values(&logits, 0, 0).unwrap();
+        assert!((c0 - (2.0 - lse)).abs() < 1e-4, "c0 {c0} vs {}", 2.0 - lse);
+    }
+
+    #[test]
+    fn step_logprob_values_top_is_argmax_and_normalized() {
+        let logits = [1.0f32, 3.0, 2.0, 0.5];
+        let (_, top) = step_logprob_values(&logits, 0, logits.len()).unwrap();
+        assert_eq!(top[0].0, 1, "argmax id");
+        assert_eq!(top[1].0, 2);
+        // exp of all logprobs sums to ~1 (a valid distribution).
+        let total: f32 = top.iter().map(|(_, lp)| lp.exp()).sum();
+        assert!((total - 1.0).abs() < 1e-4, "sum {total}");
+        // top_n=0 yields no alternatives; chosen out of vocab is a typed error.
+        assert!(step_logprob_values(&logits, 0, 0).unwrap().1.is_empty());
+        assert!(step_logprob_values(&logits, 99, 1).is_err());
+    }
+
+    #[test]
+    fn build_logprobs_shapes_match_steps() {
+        let step = |tok: &str, lp: f32, top: Vec<(&str, f32)>| StepLogprob {
+            chosen: TokenLogprob {
+                token: tok.to_string(),
+                logprob: lp,
+                bytes: tok.as_bytes().to_vec(),
+            },
+            top: top
+                .into_iter()
+                .map(|(t, l)| TokenLogprob {
+                    token: t.to_string(),
+                    logprob: l,
+                    bytes: t.as_bytes().to_vec(),
+                })
+                .collect(),
+        };
+        let steps = vec![
+            step("He", -0.1, vec![("He", -0.1), ("Hi", -2.0)]),
+            step("llo", -0.5, vec![("llo", -0.5)]),
+        ];
+        let chat = build_chat_logprobs(&steps);
+        assert_eq!(chat.content.len(), 2);
+        assert_eq!(chat.content[0].token, "He");
+        assert_eq!(chat.content[0].top_logprobs.len(), 2);
+        let comp = build_completion_logprobs(&steps);
+        assert_eq!(comp.tokens, vec!["He".to_string(), "llo".to_string()]);
+        assert_eq!(comp.token_logprobs.len(), 2);
+        assert_eq!(comp.text_offset, vec![0, 2]); // "He" is 2 chars
+        assert_eq!(comp.top_logprobs[0].get("Hi"), Some(&-2.0));
+    }
+
+    #[test]
+    fn logprobs_request_validation() {
+        // chat logprobs:true is now accepted (was a 400 stub).
+        let chat: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi", "chat_logprobs": true, "top_logprobs": 5
+        }))
+        .expect("deserialize");
+        assert!(validate_choice_and_logprob_fields(&chat).is_ok());
+        // top_logprobs without logprobs:true is rejected.
+        let bad: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi", "top_logprobs": 5
+        }))
+        .expect("deserialize");
+        assert!(validate_choice_and_logprob_fields(&bad).is_err());
+        // out-of-range is rejected.
+        let oob: GenerationSessionRequest = serde_json::from_value(serde_json::json!({
+            "prompt": "hi", "completion_logprobs": MAX_LOGPROBS + 1
+        }))
+        .expect("deserialize");
+        assert!(validate_choice_and_logprob_fields(&oob).is_err());
     }
 
     #[test]
@@ -12824,6 +13206,7 @@ mod tests {
             tokenizer: Arc::new(test_tokenizer()),
             session,
             sampling: SamplingConfig::default(),
+            logprobs_top_n: None,
             stop_sequences: Vec::new(),
             logit_diagnostic_token_ids: Vec::new(),
             collect_dense_diagnostics: false,

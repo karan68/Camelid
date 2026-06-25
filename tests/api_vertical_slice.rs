@@ -1485,7 +1485,8 @@ async fn chat_completion_rejects_n_above_cap_before_runtime() {
 }
 
 #[tokio::test]
-async fn completion_rejects_unsupported_logprobs_before_runtime() {
+async fn completion_rejects_logprobs_above_cap_before_runtime() {
+    // completions logprobs is now supported; only a value above the cap is rejected.
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1494,7 +1495,7 @@ async fn completion_rejects_unsupported_logprobs_before_runtime() {
                 .uri("/v1/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","prompt":"hello","max_tokens":1,"logprobs":1}"#,
+                    r#"{"model":"tiny","prompt":"hello","max_tokens":1,"logprobs":25}"#,
                 ))
                 .unwrap(),
         )
@@ -1504,12 +1505,13 @@ async fn completion_rejects_unsupported_logprobs_before_runtime() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], "invalid_request_parameter");
     assert_eq!(body["error"]["param"], "logprobs");
 }
 
 #[tokio::test]
-async fn chat_completion_rejects_unsupported_logprobs_before_runtime() {
+async fn chat_completion_rejects_logprobs_with_stream() {
+    // chat logprobs is now supported, but not together with streaming.
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1518,7 +1520,7 @@ async fn chat_completion_rejects_unsupported_logprobs_before_runtime() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"logprobs":true}"#,
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"logprobs":true,"stream":true}"#,
                 ))
                 .unwrap(),
         )
@@ -1528,12 +1530,12 @@ async fn chat_completion_rejects_unsupported_logprobs_before_runtime() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], "invalid_request_error");
     assert_eq!(body["error"]["param"], "logprobs");
 }
 
 #[tokio::test]
-async fn chat_completion_rejects_unsupported_top_logprobs_before_runtime() {
+async fn chat_completion_rejects_top_logprobs_above_cap_before_runtime() {
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1542,7 +1544,7 @@ async fn chat_completion_rejects_unsupported_top_logprobs_before_runtime() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"logprobs":false,"top_logprobs":1}"#,
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"logprobs":true,"top_logprobs":25}"#,
                 ))
                 .unwrap(),
         )
@@ -1552,12 +1554,13 @@ async fn chat_completion_rejects_unsupported_top_logprobs_before_runtime() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], "invalid_request_parameter");
     assert_eq!(body["error"]["param"], "top_logprobs");
 }
 
 #[tokio::test]
 async fn chat_completion_rejects_top_logprobs_without_logprobs_before_runtime() {
+    // top_logprobs still requires logprobs:true (now a typed validation error).
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1576,7 +1579,7 @@ async fn chat_completion_rejects_top_logprobs_without_logprobs_before_runtime() 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], "invalid_request_parameter");
     assert_eq!(body["error"]["param"], "top_logprobs");
 }
 

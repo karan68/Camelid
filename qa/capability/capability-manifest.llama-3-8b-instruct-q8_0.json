@@ -104,7 +104,7 @@
       "verdict": "capable",
       "oracle_class": "D",
       "matrix_cell": "open",
-      "camelid_state": "typed_error_stub",
+      "camelid_state": "drives",
       "receipt_present": false,
       "receipt": null,
       "model_evidence": "PROVISIONAL — not from on-disk GGUF. logprobs/top_logprobs at temp=0 are derivable for any causal LM from the final softmax; original Llama 3 8B is a standard causal decoder. Capable pending confirmation that the loaded GGUF exposes the full 128256-entry logit vector. [REVIEW: retained capable/D.]"
