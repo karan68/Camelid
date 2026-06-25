@@ -125,7 +125,7 @@
       "verdict": "incapable",
       "oracle_class": "none",
       "matrix_cell": "n/a",
-      "camelid_state": "partial",
+      "camelid_state": "drives",
       "receipt_present": false,
       "receipt": null,
       "model_evidence": "VERIFIED: chat_template has ONLY user/system/assistant role branches; no tool/tool_calls branch, and tokenizer has no tool/ipython/function control tokens. True n/a, not a gap."
