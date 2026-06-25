@@ -1605,8 +1605,8 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_ne!(body["error"]["code"], "unsupported_parameter");
 
-    // The other tool/function-calling fields remain unsupported and are still
-    // rejected before runtime.
+    // tool_choice and parallel_tool_calls are now accepted too; only the
+    // camelid-specific parse_tool_calls control remains unsupported.
     let response = camelid::api::router()
         .oneshot(
             Request::builder()
@@ -1614,7 +1614,7 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"tool_choice":"auto"}"#,
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"parse_tool_calls":true}"#,
                 ))
                 .unwrap(),
         )
@@ -1625,7 +1625,7 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "unsupported_parameter");
-    assert_eq!(body["error"]["param"], "tool_choice");
+    assert_eq!(body["error"]["param"], "parse_tool_calls");
 }
 
 #[tokio::test]
