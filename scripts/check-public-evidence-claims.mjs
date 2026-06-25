@@ -207,7 +207,12 @@ function validateBackendLocalCurrentHeadExactRowGuardrail(bundleRel, manifest) {
 }
 
 function evidenceBundlePath(path) {
-  const rel = relative(process.cwd(), path)
+  // Normalize to forward slashes so comparisons match the `/`-style paths stored
+  // in evidence manifests on every platform. Node's `relative` emits the OS
+  // separator (backslashes on Windows), which otherwise both breaks the
+  // `/manifest.json` trim below and mismatches the manifests' stored refs —
+  // producing false failures on Windows while Ubuntu CI stays green.
+  const rel = relative(process.cwd(), path).replace(/\\/g, '/')
   const marker = '/manifest.json'
   if (rel.endsWith(marker)) return rel.slice(0, -marker.length)
   const summaryMarker = '/summary.json'
