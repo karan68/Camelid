@@ -124,10 +124,10 @@
       "capability": "native tool/function calling — REQUIRES tool-call branch or tool/ipython control tokens in THIS model template",
       "verdict": "capable",
       "oracle_class": "B",
-      "matrix_cell": "wip",
-      "camelid_state": "partial",
-      "receipt_present": false,
-      "receipt": null,
+      "matrix_cell": "done",
+      "camelid_state": "drives",
+      "receipt_present": true,
+      "receipt": "receipts/capability-receipt.tools.function_calling.llama-3.2-3b-instruct-q8_0.json",
       "model_evidence": "VERIFIED in template: \"{%- elif 'tool_calls' in message %}\" branch emits assistant JSON {\"name\":..,\"parameters\":..}; \"Environment: ipython\" preamble when tools!=none; tool/ipython result role -> <|start_header_id|>ipython<|end_header_id|>. Single-tool-call only (raise_exception if tool_calls|length != 1)."
     },
     {

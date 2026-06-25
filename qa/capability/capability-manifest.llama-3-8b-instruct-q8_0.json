@@ -126,7 +126,7 @@
       "verdict": "incapable",
       "oracle_class": "none",
       "matrix_cell": "n/a",
-      "camelid_state": "partial",
+      "camelid_state": "drives",
       "receipt_present": false,
       "receipt": null,
       "model_evidence": "PROVISIONAL — not from on-disk GGUF. CORRECTED uncertain→INCAPABLE on adversarial review. The ORIGINAL Llama 3 (pre-3.1) chat template predates the 3.1 tool-calling format: it has NO tool-call/tool-response branch, no 'tool'/'ipython' role handling, and special_tokens contains NONE of <|python_tag|>, <|eom_id|>, <|eot_id| as a tool terminator>, or any tool-call control token (only the 5 header/text tokens are present). Because there is NO specific template branch or control token expressing native function calling, and per the 'choose the stricter verdict' rule, this is a definitive model-anchored NEGATIVE, not genuine uncertainty. Must still be re-confirmed against the actual GGUF chat_template + added_tokens once downloaded (and a file mislabeled as 3.1 would change this)."

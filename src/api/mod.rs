@@ -438,9 +438,17 @@ pub struct ChatCompletionRequest {
     pub camelid_enable_thinking: Option<bool>,
     /// OpenAI-style tool/function definitions. When present, they are rendered
     /// into the prompt through the loaded model's own chat template (Hybrid agent
-    /// mode); the model's tool-call output is parsed by the client. Models whose
-    /// template does not render tools simply ignore them.
+    /// mode); the model's tool-call output is parsed back into `tool_calls` (for
+    /// templates that render tools — Llama 3.x etc.). Models whose template does
+    /// not render tools simply ignore them.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// OpenAI `tool_choice`: `"auto"` (default), `"none"` (suppress parsing), or
+    /// `"required"`/a specific function (treated as `auto`). Parsed permissively
+    /// as a raw value. Declaring it here removes it from `unsupported_fields`.
+    pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
+    /// tool calls the model actually emits). Declared here so it is not rejected.
+    pub parallel_tool_calls: Option<bool>,
     /// OpenAI `stream_options`. The only honored subfield is `include_usage`
     /// (bool); any other shape or subfield is tolerated silently and ignored,
     /// matching the permissive llama-server oracle. Parsed as a raw value so a
@@ -1128,6 +1136,27 @@ pub struct ChatTopLogprob {
 pub struct ChatCompletionMessage {
     pub role: &'static str,
     pub content: String,
+    /// Parsed structured tool calls (OpenAI shape); present only when the model
+    /// emitted a tool call and the request supplied `tools`. `content` is empty
+    /// when this is set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// OpenAI tool-call object surfaced in an assistant message.
+#[derive(Debug, Serialize)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// JSON-encoded arguments string (OpenAI shape).
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -5598,6 +5627,8 @@ async fn chat_completions_multi_choice(
             message: ChatCompletionMessage {
                 role: "assistant",
                 content,
+                // Tool-call parsing is single-choice only (the non-streaming path).
+                tool_calls: None,
             },
             finish_reason,
             // Logprobs are rejected upstream for n>1.
@@ -5714,6 +5745,10 @@ async fn chat_completions(
     // Logprobs are non-streaming, single-choice only (per-chunk / per-choice logprobs
     // are a follow-up). Reject the unsupported combinations before runtime.
     let wants_logprobs = matches!(req.logprobs, Some(true)) || req.top_logprobs.is_some();
+    // Tool calls are surfaced on the non-streaming single-choice path when the
+    // request supplied tools and tool_choice is not "none".
+    let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
+        && tool_choice_allows_calls(req.tool_choice.as_ref());
     if wants_logprobs && req.stream.unwrap_or(false) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -5820,6 +5855,24 @@ async fn chat_completions(
             } else {
                 generated.text
             };
+            // Parse the model's tool-call output into structured tool_calls when the
+            // request supplied tools and tool_choice permits it. On a tool call,
+            // content is emptied and finish_reason flips to "tool_calls".
+            let tool_calls = if tools_active {
+                parse_tool_calls(&content)
+            } else {
+                None
+            };
+            let (content, finish_reason) = if tool_calls.is_some() {
+                (String::new(), "tool_calls")
+            } else {
+                (content, generated.finish_reason)
+            };
+            let logprobs = if generated.step_logprobs.is_empty() {
+                None
+            } else {
+                Some(build_chat_logprobs(&generated.step_logprobs))
+            };
             (
                 StatusCode::OK,
                 Json(ChatCompletionResponse {
@@ -5832,13 +5885,10 @@ async fn chat_completions(
                         message: ChatCompletionMessage {
                             role: "assistant",
                             content,
+                            tool_calls,
                         },
-                        finish_reason: generated.finish_reason,
-                        logprobs: if generated.step_logprobs.is_empty() {
-                            None
-                        } else {
-                            Some(build_chat_logprobs(&generated.step_logprobs))
-                        },
+                        finish_reason,
+                        logprobs,
                     }],
                     usage: CompletionUsage {
                         prompt_tokens: prompt_token_count,
@@ -7169,8 +7219,8 @@ fn validate_unsupported_generation_fields(
         return Ok(());
     };
     let message = match param {
-        "tools" | "tool_choice" | "parallel_tool_calls" | "parse_tool_calls" => {
-            "tool/function calling is not supported by Camelid generation routes yet"
+        "parse_tool_calls" => {
+            "the camelid parse_tool_calls control is not supported on this route yet"
         }
         "response_format" | "json_schema" | "schema" | "grammar" => {
             "JSON/schema/grammar constrained generation is not supported yet"
@@ -8447,6 +8497,45 @@ fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
         top_logprobs,
         text_offset,
     }
+}
+
+/// Whether `tool_choice` permits surfacing tool calls. `"none"` suppresses them;
+/// everything else (auto / required / a specific function / absent) allows.
+fn tool_choice_allows_calls(tool_choice: Option<&serde_json::Value>) -> bool {
+    !matches!(tool_choice.and_then(|value| value.as_str()), Some("none"))
+}
+
+/// Parse a model's tool-call output into OpenAI `tool_calls`. Handles the Llama
+/// 3.x form `{"name": <fn>, "parameters": {...}}` (also `"arguments"`), optionally
+/// `<|python_tag|>`-prefixed, and tolerates trailing junk small models emit.
+/// Returns `None` when the text is prose, not a tool call.
+fn parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let trimmed = text.trim();
+    let trimmed = trimmed
+        .strip_prefix("<|python_tag|>")
+        .unwrap_or(trimmed)
+        .trim_start();
+    // Read the first complete JSON value; ignore any trailing junk.
+    let value = serde_json::Deserializer::from_str(trimmed)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    let obj = value.as_object()?;
+    let name = obj.get("name")?.as_str()?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args = obj
+        .get("parameters")
+        .or_else(|| obj.get("arguments"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+    let arguments = serde_json::to_string(&args).ok()?;
+    Some(vec![ToolCall {
+        id: format!("call_{}", uuid::Uuid::new_v4().simple()),
+        kind: "function",
+        function: ToolCallFunction { name, arguments },
+    }])
 }
 
 fn top_logit_diagnostics(
@@ -10545,6 +10634,42 @@ mod tests {
         }))
         .expect("deserialize");
         assert!(validate_choice_and_logprob_fields(&oob).is_err());
+    }
+
+    #[test]
+    fn parse_tool_calls_extracts_llama_format() {
+        // Llama 3.x: {"name", "parameters"}; arguments becomes a JSON string.
+        let tc = parse_tool_calls(r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#)
+            .unwrap();
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].function.name, "get_weather");
+        assert_eq!(tc[0].kind, "function");
+        assert!(tc[0].id.starts_with("call_"));
+        let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
+        assert_eq!(args["city"], "Paris");
+    }
+
+    #[test]
+    fn parse_tool_calls_tolerates_python_tag_and_junk() {
+        // python_tag prefix + trailing junk small models emit; "arguments" variant.
+        let tc = parse_tool_calls(r#"<|python_tag|>{"name": "f", "arguments": {"x": 1}} trailing"#)
+            .unwrap();
+        assert_eq!(tc[0].function.name, "f");
+        let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
+        assert_eq!(args["x"], 1);
+        // prose is not a tool call; a JSON object without "name" is not either.
+        assert!(parse_tool_calls("The weather in Paris is sunny.").is_none());
+        assert!(parse_tool_calls(r#"{"parameters": {"x": 1}}"#).is_none());
+    }
+
+    #[test]
+    fn tool_choice_none_suppresses_calls() {
+        assert!(!tool_choice_allows_calls(Some(&serde_json::json!("none"))));
+        assert!(tool_choice_allows_calls(Some(&serde_json::json!("auto"))));
+        assert!(tool_choice_allows_calls(Some(&serde_json::json!(
+            "required"
+        ))));
+        assert!(tool_choice_allows_calls(None));
     }
 
     #[test]
