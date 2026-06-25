@@ -1,7 +1,7 @@
-58823d41c64f18da3dcf16023bac08b44bdd9baf3dfdd54b63e12681beaebbb0  capability-manifest.llama-3-8b-instruct-q8_0.json
-f14b32ca800f04c5084dd38892214c20cdd823fae8c8e5525eea65895f94c117  capability-manifest.llama-3.2-1b-instruct-q8_0.json
-ed0095c18969589f56fee66fed354ce72de47386004ad5e19d7d89cc6320ff7a  capability-manifest.llama-3.2-3b-instruct-q8_0.json
-7b74a633e371915094ebccefb92f57d446d5a668faaa2fc4d279adbca452e274  capability-manifest.tinyllama-1.1b-chat-q8_0.json
+1d708cdc641c6ffe3707076f18ab5dcb14d45f2565b04ae5cb1db80a92659bc7  capability-manifest.llama-3-8b-instruct-q8_0.json
+224463f0ce4ef6d2c17e880cc29aea7f8f376e0187df0acd1ca8147a02cdcdeb  capability-manifest.llama-3.2-1b-instruct-q8_0.json
+b5ffdc42a941522f834616664545d373287a14be17ff7c28e24fa7197636f3b5  capability-manifest.llama-3.2-3b-instruct-q8_0.json
+75f89c509b09096cf395c97bf1884df2a0b6045180a8ddb00dac03efa287b614  capability-manifest.tinyllama-1.1b-chat-q8_0.json
 2a2a9e5149dfb91100277c5a8816d1fb05610148db11f380a0dfe8e57770a493  receipts/capability-receipt.gen.length_stop.llama-3.2-1b-instruct-q8_0.json
 97249d71f821ea221f6b073f150d6f26502e3c36a8d37c8fc78d42e5effe650a  receipts/capability-receipt.gen.length_stop.llama-3.2-3b-instruct-q8_0.json
 3a08885298290e93c47e583e082be2b9a69808f9692bf1705e8c312e7dc94051  receipts/capability-receipt.gen.length_stop.tinyllama-1.1b-chat-q8_0.json
@@ -23,5 +23,8 @@ af3a0ec7379d5f973e1f10f6c2ca24138b8076405015b638065cfa8102802134  receipts/capab
 4928c99a0e19e9134d23ebae64afa09d6704078a5b7edf26a04ab294adaf3f95  receipts/capability-receipt.sampling.seed_determinism.llama-3.2-1b-instruct-q8_0.json
 89219176b1a64b285bfe77a24b0512c956f302bc2879da0c56651967a42645d8  receipts/capability-receipt.sampling.seed_determinism.llama-3.2-3b-instruct-q8_0.json
 032d1912a5b206b16c518c5ddd5f21d05194eb0269e7d148e4d35fb8b123e9e7  receipts/capability-receipt.sampling.seed_determinism.tinyllama-1.1b-chat-q8_0.json
+f999dd53325aa90e01eb87af9b252a21beb00a6cd49bbf89f545b5703fe0e19e  receipts/capability-receipt.structured.json_grammar.llama-3.2-1b-instruct-q8_0.json
+0a094029bde9c54a4c4986cc7ca00c79ef4cc5d2821a7c2ebd750d3e06b3e94f  receipts/capability-receipt.structured.json_grammar.llama-3.2-3b-instruct-q8_0.json
+1b99336114c57aa86763e15efd88c3e97494d9819835eb2e22e237ca2fcd8cc3  receipts/capability-receipt.structured.json_grammar.tinyllama-1.1b-chat-q8_0.json
 3d7f550893f566f597cf99ebe247b2448efb3afe935972f1fe4d63ae2efb4169  receipts/capability-receipt.tools.function_calling.llama-3.2-1b-instruct-q8_0.json
 190db13ae7ac80adfa7856051d6583d5d850abd093b45c39e65417889707ef35  receipts/capability-receipt.tools.function_calling.llama-3.2-3b-instruct-q8_0.json

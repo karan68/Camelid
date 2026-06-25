@@ -135,10 +135,10 @@
       "capability": "JSON mode + GBNF grammar-constrained decode (decoder-side, model-agnostic)",
       "verdict": "capable",
       "oracle_class": "B",
-      "matrix_cell": "open",
-      "camelid_state": "typed_error_stub",
-      "receipt_present": false,
-      "receipt": null,
+      "matrix_cell": "done",
+      "camelid_state": "drives",
+      "receipt_present": true,
+      "receipt": "receipts/capability-receipt.structured.json_grammar.llama-3.2-1b-instruct-q8_0.json",
       "model_evidence": "JSON mode + GBNF grammar-constrained decode is decoder-side and model-agnostic for any causal LM."
     },
     {

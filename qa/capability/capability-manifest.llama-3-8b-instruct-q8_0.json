@@ -137,7 +137,7 @@
       "verdict": "uncertain",
       "oracle_class": "B",
       "matrix_cell": "open",
-      "camelid_state": "typed_error_stub",
+      "camelid_state": "drives",
       "receipt_present": false,
       "receipt": null,
       "model_evidence": "PROVISIONAL — not from on-disk GGUF. RETAINED uncertain on adversarial review: the unknown here is purely ENGINE-side (whether the conductor's decode path implements JSON-mode / GBNF grammar-constrained decoding), which is model-agnostic and independent of Llama 3 weights. Unlike tools.function_calling (a definite model-template negative), there is no template/metadata signal to anchor a verdict either way, so flipping to 'incapable' would assert an unsupported negative about the engine. Not an overclaim; re-assess once the row is loadable and the decoder feature set is confirmed."

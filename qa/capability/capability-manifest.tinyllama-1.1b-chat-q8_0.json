@@ -135,10 +135,10 @@
       "capability": "JSON mode + GBNF grammar-constrained decode (decoder-side, model-agnostic)",
       "verdict": "capable",
       "oracle_class": "B",
-      "matrix_cell": "open",
-      "camelid_state": "typed_error_stub",
-      "receipt_present": false,
-      "receipt": null,
+      "matrix_cell": "done",
+      "camelid_state": "drives",
+      "receipt_present": true,
+      "receipt": "receipts/capability-receipt.structured.json_grammar.tinyllama-1.1b-chat-q8_0.json",
       "model_evidence": "JSON mode + GBNF grammar-constrained decode is decoder-side (logit masking), model-agnostic; arch=llama imposes no constraint."
     },
     {
