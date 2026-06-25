@@ -1985,8 +1985,9 @@ fn gait_profile_trial(
 ) -> anyhow::Result<camelid::gait::calibrate::TrialResult> {
     std::env::set_var("CAMELID_PROFILE", gait_profile_env_value(&candidate.profile));
     // Apply this candidate's Windows scheduling substrate before timing, so the
-    // measured decode reflects it. Process-level, covers the Rayon pool.
-    let eco_status = camelid::gait::substrate::set_eco_qos_opt_out(candidate.eco_qos_opt_out);
+    // measured decode reflects it. §1.2-scoped to the compute pool (the Rayon
+    // workers + this thread), matching what production applies.
+    let eco_status = camelid::gait::substrate::set_compute_pool_eco_qos(candidate.eco_qos_opt_out);
     if candidate.eco_qos_opt_out
         && eco_status != camelid::gait::substrate::EcoQosStatus::OptedOut
     {
@@ -2048,7 +2049,10 @@ fn run_gait_calibrate(
     // Calibration must measure the candidates we choose — never let a previously
     // cached gait receipt override the candidate's profile mid-trial.
     std::env::remove_var("CAMELID_GAIT");
-    configure_rayon_threads(threads)?;
+    // §1.2: calibrate under the same core-reserve cap production will run with, so
+    // the measured tok/s reflects the host-safe thread budget. The gate is off
+    // here, so configure_rayon_threads won't apply the cap itself.
+    configure_rayon_threads(host_safe_thread_count(threads))?;
     camelid::capability::HardwareProfile::detect().log();
 
     let prompt_text = match (&prompt_file, &prompt) {
@@ -4512,6 +4516,26 @@ fn windows_physical_core_count() -> Option<usize> {
     }
 }
 
+/// §1.2 core-cap: clamp a resolved compute-thread count so the OS always keeps
+/// its reserve (see [`camelid::gait::compute_thread_budget`]). Windows x86-64
+/// only — the GAIT substrate's scope; elsewhere `requested` is returned
+/// unchanged. A `None` request resolves to the full safe budget.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn host_safe_thread_count(requested: Option<usize>) -> Option<usize> {
+    let phys = windows_physical_core_count()?;
+    let budget = camelid::gait::compute_thread_budget(phys);
+    Some(
+        requested
+            .map(|r| r.min(budget.threads))
+            .unwrap_or(budget.threads),
+    )
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn host_safe_thread_count(requested: Option<usize>) -> Option<usize> {
+    requested
+}
+
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
     if let Some(t) = threads {
         anyhow::ensure!(t > 0, "--threads must be greater than zero");
@@ -4523,6 +4547,15 @@ fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
     let resolved = threads.or_else(windows_physical_core_count);
     #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
     let resolved = threads;
+
+    // §1.2 host-safety: when GAIT is engaged, cap the pool so the OS keeps a core
+    // reserve. Gated on the bring-up flag so the default path is byte-identical;
+    // when GAIT becomes the baseline the cap becomes unconditional.
+    let resolved = if camelid::gait::gait_enabled() {
+        host_safe_thread_count(resolved)
+    } else {
+        resolved
+    };
 
     #[cfg(target_os = "macos")]
     let should_configure = true;

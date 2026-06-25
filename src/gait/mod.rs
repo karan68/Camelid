@@ -753,14 +753,40 @@ pub fn apply_selected_gait(gait: &SelectedGait) {
         sentinel::begin_apply(&dir, &gait.gait_key, &layers);
     }
     if gait.eco_qos_opt_out {
-        let status = substrate::set_eco_qos_opt_out(true);
+        // §1.2: scope the EcoQoS opt-out to the compute worker threads only (the
+        // Rayon decode pool + this thread), NOT the whole process — UI and
+        // background threads keep their eco-friendly OS-managed default.
+        let status = substrate::set_compute_pool_eco_qos(true);
         eprintln!(
-            "[gait] applied profile={:?} + eco_qos opt-out -> {status:?}",
+            "[gait] applied profile={:?} + eco_qos opt-out (compute pool) -> {status:?}",
             gait.profile
         );
     } else {
         eprintln!("[gait] applied profile={:?}", gait.profile);
     }
+}
+
+/// §1.2 host-safety compute-thread budget. The compute pool must always leave the
+/// OS headroom: reserve at least one core, and at least two on small machines
+/// (`<= 8` physical cores), so the UI/OS keep a performance core no matter what.
+/// Pure arithmetic on the physical-core count, so it is platform-independent and
+/// directly testable; never returns zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeThreadBudget {
+    /// Compute worker threads permitted (`>= 1`).
+    pub threads: usize,
+    /// Cores actually left for the OS (`physical_cores - threads`).
+    pub reserved: usize,
+}
+
+/// Resolve the [`ComputeThreadBudget`] for a machine with `physical_cores`.
+pub fn compute_thread_budget(physical_cores: usize) -> ComputeThreadBudget {
+    // Reserve two cores on small boxes, one on larger ones.
+    let want_reserve = if physical_cores <= 8 { 2 } else { 1 };
+    // Never drop below a single worker, even on a 1-2 core host.
+    let threads = physical_cores.saturating_sub(want_reserve).max(1);
+    let reserved = physical_cores.saturating_sub(threads);
+    ComputeThreadBudget { threads, reserved }
 }
 
 /// Measured memory characteristics — the roofline denominator (sustained DRAM
@@ -1421,5 +1447,81 @@ mod gait_safety {
 
         std::env::remove_var(GAIT_GATE_ENV);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §1.2: the compute-thread budget always leaves the OS a core reserve, never
+    /// returns zero, and never exceeds the physical-core count.
+    #[test]
+    fn core_headroom() {
+        for &phys in &[1usize, 2, 4, 6, 8, 12, 16, 32, 64] {
+            let b = compute_thread_budget(phys);
+            assert!(b.threads >= 1, "phys={phys}: must keep >=1 worker");
+            assert!(b.threads <= phys, "phys={phys}: cannot exceed physical cores");
+            assert_eq!(
+                b.reserved,
+                phys - b.threads,
+                "phys={phys}: reserved bookkeeping"
+            );
+            if phys >= 2 {
+                assert!(b.reserved >= 1, "phys={phys}: OS must keep >=1 core");
+            }
+            if (3..=8).contains(&phys) {
+                assert!(b.reserved >= 2, "phys={phys}: small boxes reserve >=2 cores");
+                assert!(b.threads <= phys - 2, "phys={phys}: threads <= phys-2");
+            }
+            if phys > 8 {
+                assert!(b.threads <= phys - 1, "phys={phys}: threads <= phys-1");
+            }
+        }
+    }
+
+    /// §1.1: the weight/KV arena is never page-locked. Audit the load/mmap path
+    /// source for the forbidden APIs — locking pages makes them non-reclaimable
+    /// and can OOM/wedge the host (the v1 crash mechanism, REMOVED in v2).
+    #[test]
+    fn no_weight_locking() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // The weight-arena load + mmap path. (Deliberately not this file — it
+        // contains the forbidden token strings below as the search needles.)
+        let arena_files = ["src/wire_mmap.rs", "src/platform_fs.rs"];
+        let forbidden = [
+            "VirtualLock",
+            "MEM_LARGE_PAGES",
+            "GetLargePageMinimum",
+            "SetProcessWorkingSetSize",
+            "mlockall",
+            "MAP_LOCKED",
+        ];
+        for rel in arena_files {
+            let path = std::path::Path::new(root).join(rel);
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for token in forbidden {
+                assert!(
+                    !src.contains(token),
+                    "{rel} must not page-lock the weight arena (found `{token}`)"
+                );
+            }
+        }
+    }
+
+    /// §6C: off Windows the scheduling substrate is fully inert — every lever
+    /// returns Unavailable, so a non-Windows run is byte-identical to baseline.
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_byte_identical() {
+        assert_eq!(
+            substrate::set_eco_qos_opt_out(true),
+            substrate::EcoQosStatus::Unavailable
+        );
+        assert_eq!(
+            substrate::set_thread_eco_qos_opt_out(true),
+            substrate::EcoQosStatus::Unavailable
+        );
+        assert_eq!(
+            substrate::set_compute_pool_eco_qos(true),
+            substrate::EcoQosStatus::Unavailable
+        );
     }
 }
