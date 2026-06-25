@@ -2388,6 +2388,7 @@ fn run_gait_trial(
 /// parsed (the candidate is disqualified upstream). This is the §1.4 crash-
 /// isolation boundary: a segfaulting/hanging candidate kernel cannot take down
 /// the calibrating (or, in production, serving) process.
+#[allow(clippy::too_many_arguments)]
 fn run_trial_in_child(
     exe: &std::path::Path,
     model: &std::path::Path,

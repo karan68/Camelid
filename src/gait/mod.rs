@@ -1035,7 +1035,7 @@ pub mod oracle {
         block_bytes: usize,
         dequant: impl Fn(&[u8], &mut [f32; QK_K_BLOCK_SIZE]),
     ) -> Result<f32, String> {
-        if input.is_empty() || input.len() % QK_K_BLOCK_SIZE != 0 {
+        if input.is_empty() || !input.len().is_multiple_of(QK_K_BLOCK_SIZE) {
             return Err(format!(
                 "row-dot input width {} is not a positive multiple of {QK_K_BLOCK_SIZE}",
                 input.len()
@@ -1657,7 +1657,7 @@ mod gait_safety {
                 assert!(b.threads <= phys - 2, "phys={phys}: threads <= phys-2");
             }
             if phys > 8 {
-                assert!(b.threads <= phys - 1, "phys={phys}: threads <= phys-1");
+                assert!(b.threads < phys, "phys={phys}: threads <= phys-1");
             }
         }
     }

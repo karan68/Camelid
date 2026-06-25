@@ -15419,7 +15419,7 @@ fn q4_k_block_dot_core(
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
     use rayon::prelude::*;
-    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+    if !in_dim.is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Q4_K block-dot requires in_dim multiple of 256, got {in_dim}"
         )));
@@ -15491,7 +15491,7 @@ fn q6_k_block_dot_core(
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
     use rayon::prelude::*;
-    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+    if !in_dim.is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
         return Err(BackendError::RuntimeShapeMismatch(format!(
             "Q6_K block-dot requires in_dim multiple of 256, got {in_dim}"
         )));
@@ -17364,7 +17364,7 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
     // K-quant (Q4_K / Q6_K) wire weights: no f32 data to accumulate, so dot the
     // retained wire blocks in place. This is the universal funnel for the
     // accumulate-based (descriptor/borrowed) matmul layouts.
-    if q4_k_cpu_block_dot_enabled() && input_row.len() % Q6_K_VALUES_PER_BLOCK == 0 {
+    if q4_k_cpu_block_dot_enabled() && input_row.len().is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
         if weight.source_type == Some(GgufTensorType::Q4K) {
             if let Some(wire) = weight.q4_k_wire_bytes {
                 accumulate_transposed_linear_row_q4_k(input_row, wire, output);
