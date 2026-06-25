@@ -3492,6 +3492,7 @@ impl Gemma4CudaResident {
         let start = p.min(n - 1);
         let last = n - 1;
         let mut logits = Vec::new();
+        #[allow(clippy::needless_range_loop)]
         for pos in start..n {
             logits = self.forward_token(prompt_tokens[pos], pos, pos == last)?;
         }

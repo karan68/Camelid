@@ -231,7 +231,7 @@ fn median(samples: &[f64]) -> Option<f64> {
     let mut sorted = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    Some(if sorted.len() % 2 == 0 {
+    Some(if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
@@ -295,7 +295,9 @@ pub fn run_tournament(
     let total_rounds = config.warmup_rounds + measured;
     for round in 0..total_rounds {
         for (i, variant) in variants.iter().enumerate() {
-            let Some(result) = trial(variant) else { continue };
+            let Some(result) = trial(variant) else {
+                continue;
+            };
             match &stats[i].parity_token {
                 None => stats[i].parity_token = Some(result.parity_token.clone()),
                 Some(token) if *token != result.parity_token => {
@@ -318,8 +320,16 @@ pub fn run_tournament(
         .zip(stats.iter())
         .map(|(variant, stat)| {
             let med = median(&stat.tok_samples).unwrap_or(0.0);
-            let min = stat.tok_samples.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = stat.tok_samples.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let min = stat
+                .tok_samples
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            let max = stat
+                .tok_samples
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
             let parity_ok = stat.parity_consistent && stat.parity_token == base_parity;
             CandidateSamples {
                 label: variant.label.clone(),
@@ -451,10 +461,8 @@ pub fn calibrate_and_store(
     // §6F: attest the host-safety posture (the §1.2 cap + §1.1/§1.2 invariants) and
     // record the measured free-RAM headroom, so the receipt audits how this gait
     // runs. Read physical_cores before machine_sig is moved into the receipt.
-    let scheduling = super::Scheduling::attest(
-        machine_sig.physical_cores,
-        outcome.selected_eco_qos_opt_out,
-    );
+    let scheduling =
+        super::Scheduling::attest(machine_sig.physical_cores, outcome.selected_eco_qos_opt_out);
     let host_safety = super::HostSafety::capture();
 
     let receipt = GaitReceipt::new(model_sig, machine_sig, outcome.selected_profile.clone())
@@ -525,7 +533,12 @@ mod tests {
     use std::collections::BTreeMap as Map;
     use std::path::PathBuf;
 
-    fn descriptor(name: &str, ty: GgufTensorType, dims: Vec<u64>, n_bytes: u64) -> GgufTensorDescriptor {
+    fn descriptor(
+        name: &str,
+        ty: GgufTensorType,
+        dims: Vec<u64>,
+        n_bytes: u64,
+    ) -> GgufTensorDescriptor {
         GgufTensorDescriptor {
             name: name.to_string(),
             dimensions: dims,
@@ -551,9 +564,24 @@ mod tests {
             data_start_offset: 0,
             metadata,
             tensors: vec![
-                descriptor("token_embd.weight", GgufTensorType::Q8_0, vec![16, 128], 4096),
-                descriptor("blk.0.attn_q.weight", GgufTensorType::Q8_0, vec![16, 16], 256),
-                descriptor("blk.0.ffn_down.weight", GgufTensorType::Q4K, vec![32, 16], 288),
+                descriptor(
+                    "token_embd.weight",
+                    GgufTensorType::Q8_0,
+                    vec![16, 128],
+                    4096,
+                ),
+                descriptor(
+                    "blk.0.attn_q.weight",
+                    GgufTensorType::Q8_0,
+                    vec![16, 16],
+                    256,
+                ),
+                descriptor(
+                    "blk.0.ffn_down.weight",
+                    GgufTensorType::Q4K,
+                    vec![32, 16],
+                    288,
+                ),
                 descriptor("blk.0.attn_norm.weight", GgufTensorType::F32, vec![16], 64),
             ],
         }
@@ -583,14 +611,21 @@ mod tests {
             // Every knob must stay > 0 (the kernel readers reject 0).
             assert!(g.attn_qkv_decode > 0 && g.ffn_gate_up_decode > 0 && g.packed_rows4_matmul > 0);
             assert!(
-                seen.insert((g.attn_qkv_decode, g.ffn_gate_up_decode, g.packed_rows4_matmul)),
+                seen.insert((
+                    g.attn_qkv_decode,
+                    g.ffn_gate_up_decode,
+                    g.packed_rows4_matmul
+                )),
                 "search points must be distinct"
             );
         }
     }
 
     fn mem() -> MemoryMeasurement {
-        MemoryMeasurement { stream_triad_gbs: 30.0, dram_latency_ns: 80.0 }
+        MemoryMeasurement {
+            stream_triad_gbs: 30.0,
+            dram_latency_ns: 80.0,
+        }
     }
 
     #[test]
@@ -626,11 +661,23 @@ mod tests {
             &mem(),
             |c| {
                 Some(match c.label.as_str() {
-                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
-                    "fast_clean" => TrialResult { tokens_per_s: 13.0, parity_token: "A".into() },
+                    "auto" => TrialResult {
+                        tokens_per_s: 10.0,
+                        parity_token: "A".into(),
+                    },
+                    "fast_clean" => TrialResult {
+                        tokens_per_s: 13.0,
+                        parity_token: "A".into(),
+                    },
                     // Faster, but DIVERGES — must be disqualified despite winning on speed.
-                    "faster_diverges" => TrialResult { tokens_per_s: 20.0, parity_token: "B".into() },
-                    "slow_clean" => TrialResult { tokens_per_s: 9.0, parity_token: "A".into() },
+                    "faster_diverges" => TrialResult {
+                        tokens_per_s: 20.0,
+                        parity_token: "B".into(),
+                    },
+                    "slow_clean" => TrialResult {
+                        tokens_per_s: 9.0,
+                        parity_token: "A".into(),
+                    },
                     _ => unreachable!(),
                 })
             },
@@ -638,7 +685,9 @@ mod tests {
         assert!(!outcome.fell_back);
         assert_eq!(outcome.selected_profile, ExecutionProfile::Experimental);
         assert!((outcome.speedup - 1.3).abs() < 1e-9);
-        assert!(outcome.parity_disqualified.contains(&"faster_diverges".to_string()));
+        assert!(outcome
+            .parity_disqualified
+            .contains(&"faster_diverges".to_string()));
         assert!(outcome.roofline_pct > 0.0);
     }
 
@@ -655,14 +704,21 @@ mod tests {
             warmup_rounds: 0,
         };
         let mut fast_calls = 0;
-        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
-            match c.label.as_str() {
-                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
-                _ => {
-                    fast_calls += 1;
-                    let tps = if fast_calls == 2 { 4.0 } else { 13.0 };
-                    Some(TrialResult { tokens_per_s: tps, parity_token: "A".into() })
-                }
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| match c
+            .label
+            .as_str()
+        {
+            "auto" => Some(TrialResult {
+                tokens_per_s: 10.0,
+                parity_token: "A".into(),
+            }),
+            _ => {
+                fast_calls += 1;
+                let tps = if fast_calls == 2 { 4.0 } else { 13.0 };
+                Some(TrialResult {
+                    tokens_per_s: tps,
+                    parity_token: "A".into(),
+                })
             }
         });
         assert!(!outcome.fell_back);
@@ -690,17 +746,27 @@ mod tests {
         // sorted [8,9,14,14,14] -> median 14, robust_low (2nd-smallest) 9 < 10.
         let noisy = [14.0, 9.0, 14.0, 8.0, 14.0];
         let mut n = 0;
-        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
-            match c.label.as_str() {
-                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
-                _ => {
-                    let v = noisy[n % noisy.len()];
-                    n += 1;
-                    Some(TrialResult { tokens_per_s: v, parity_token: "A".into() })
-                }
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| match c
+            .label
+            .as_str()
+        {
+            "auto" => Some(TrialResult {
+                tokens_per_s: 10.0,
+                parity_token: "A".into(),
+            }),
+            _ => {
+                let v = noisy[n % noisy.len()];
+                n += 1;
+                Some(TrialResult {
+                    tokens_per_s: v,
+                    parity_token: "A".into(),
+                })
             }
         });
-        assert!(outcome.fell_back, "a broadly-noisy candidate must fail-close");
+        assert!(
+            outcome.fell_back,
+            "a broadly-noisy candidate must fail-close"
+        );
         assert_eq!(outcome.selected_profile, ExecutionProfile::Auto);
         assert!(
             outcome.reason.contains("measurement noise"),
@@ -722,14 +788,21 @@ mod tests {
         };
         let fast = [12.0, 12.0, 13.0, 12.0, 12.0]; // median 12 = 1.2x, robust_low 12
         let mut n = 0;
-        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
-            match c.label.as_str() {
-                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
-                _ => {
-                    let v = fast[n % fast.len()];
-                    n += 1;
-                    Some(TrialResult { tokens_per_s: v, parity_token: "A".into() })
-                }
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| match c
+            .label
+            .as_str()
+        {
+            "auto" => Some(TrialResult {
+                tokens_per_s: 10.0,
+                parity_token: "A".into(),
+            }),
+            _ => {
+                let v = fast[n % fast.len()];
+                n += 1;
+                Some(TrialResult {
+                    tokens_per_s: v,
+                    parity_token: "A".into(),
+                })
             }
         });
         assert!(!outcome.fell_back);
@@ -752,8 +825,14 @@ mod tests {
             &mem(),
             |c| {
                 Some(match c.label.as_str() {
-                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
-                    _ => TrialResult { tokens_per_s: 10.6, parity_token: "A".into() },
+                    "auto" => TrialResult {
+                        tokens_per_s: 10.0,
+                        parity_token: "A".into(),
+                    },
+                    _ => TrialResult {
+                        tokens_per_s: 10.6,
+                        parity_token: "A".into(),
+                    },
                 })
             },
         );
@@ -778,11 +857,17 @@ mod tests {
         let mut n = 0;
         let outcome = run_tournament(&baseline, &candidates, &cfg, 0, &mem(), |c| {
             match c.label.as_str() {
-                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                "auto" => Some(TrialResult {
+                    tokens_per_s: 10.0,
+                    parity_token: "A".into(),
+                }),
                 _ => {
                     n += 1;
                     let token = if n == 1 { "A" } else { "B" };
-                    Some(TrialResult { tokens_per_s: 20.0, parity_token: token.into() })
+                    Some(TrialResult {
+                        tokens_per_s: 20.0,
+                        parity_token: token.into(),
+                    })
                 }
             }
         });
@@ -803,8 +888,14 @@ mod tests {
             &mem(),
             |c| {
                 Some(match c.label.as_str() {
-                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
-                    _ => TrialResult { tokens_per_s: 12.0, parity_token: "A".into() },
+                    "auto" => TrialResult {
+                        tokens_per_s: 10.0,
+                        parity_token: "A".into(),
+                    },
+                    _ => TrialResult {
+                        tokens_per_s: 12.0,
+                        parity_token: "A".into(),
+                    },
                 })
             },
         );
@@ -824,9 +915,15 @@ mod tests {
             &mem(),
             |c| {
                 Some(match c.label.as_str() {
-                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
+                    "auto" => TrialResult {
+                        tokens_per_s: 10.0,
+                        parity_token: "A".into(),
+                    },
                     // Only +2%, below the 5% margin.
-                    _ => TrialResult { tokens_per_s: 10.2, parity_token: "A".into() },
+                    _ => TrialResult {
+                        tokens_per_s: 10.2,
+                        parity_token: "A".into(),
+                    },
                 })
             },
         );
@@ -865,8 +962,14 @@ mod tests {
             &TournamentConfig::default(),
             |c| {
                 Some(match c.label.as_str() {
-                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
-                    _ => TrialResult { tokens_per_s: 14.0, parity_token: "A".into() },
+                    "auto" => TrialResult {
+                        tokens_per_s: 10.0,
+                        parity_token: "A".into(),
+                    },
+                    _ => TrialResult {
+                        tokens_per_s: 14.0,
+                        parity_token: "A".into(),
+                    },
                 })
             },
         );
@@ -879,7 +982,10 @@ mod tests {
         let receipt: GaitReceipt = serde_json::from_str(&text).unwrap();
         assert!(receipt.verify_self_digest());
         assert_eq!(receipt.recorded_profile, ExecutionProfile::Experimental);
-        assert_eq!(receipt.calibration.unwrap().selected_profile, ExecutionProfile::Experimental);
+        assert_eq!(
+            receipt.calibration.unwrap().selected_profile,
+            ExecutionProfile::Experimental
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

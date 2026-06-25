@@ -4684,6 +4684,7 @@ pub(crate) fn decode_tq1_0_tensor(
         let d = f16_bits_to_f32(u16::from_le_bytes([block[52], block[53]]));
         // part 1: j=0 (qs[0..32]), 5 trit planes x 32
         for &pw in POW3.iter() {
+            #[allow(clippy::needless_range_loop)]
             for m in 0..32 {
                 let q = (qs[m] as u32).wrapping_mul(pw) as u8;
                 let xi = (((q as u16) * 3) >> 8) as i32;
@@ -4700,6 +4701,7 @@ pub(crate) fn decode_tq1_0_tensor(
         }
         // part 3: qh (4 bytes), 4 trit planes x 4
         for &pw in POW3.iter().take(4) {
+            #[allow(clippy::needless_range_loop)]
             for jj in 0..4 {
                 let q = (qh[jj] as u32).wrapping_mul(pw) as u8;
                 let xi = (((q as u16) * 3) >> 8) as i32;

@@ -36,7 +36,7 @@ pub enum EcoQosStatus {
 #[cfg(windows)]
 pub fn set_eco_qos_opt_out(opt_out: bool) -> EcoQosStatus {
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling,
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
         PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_STATE,
     };

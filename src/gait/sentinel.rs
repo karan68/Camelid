@@ -49,8 +49,7 @@ const STRIKES_SUFFIX: &str = ".strikes";
 /// above 2 — a higher tolerance would let a genuinely host-wedging gait keep
 /// getting re-applied. Enforced at compile time.
 const QUARANTINE_STRIKE_THRESHOLD: u32 = 1;
-const _: () =
-    assert!(QUARANTINE_STRIKE_THRESHOLD >= 1 && QUARANTINE_STRIKE_THRESHOLD <= 2);
+const _: () = assert!(QUARANTINE_STRIKE_THRESHOLD >= 1 && QUARANTINE_STRIKE_THRESHOLD <= 2);
 
 /// The marker written before a gait/substrate is applied. Its presence at the
 /// next launch is the unclean-exit signal.
@@ -231,10 +230,7 @@ fn clear_if_ours(path: &Path, our_pid: u32) {
 }
 
 fn strikes_path(dir: &Path, gait_key: &str) -> PathBuf {
-    dir.join(format!(
-        "{}{STRIKES_SUFFIX}",
-        gait_key.replace(':', "_")
-    ))
+    dir.join(format!("{}{STRIKES_SUFFIX}", gait_key.replace(':', "_")))
 }
 
 fn now_epoch_secs() -> u64 {
@@ -249,10 +245,8 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "camelid_sentinel_{tag}_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("camelid_sentinel_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -304,7 +298,10 @@ mod tests {
                 quarantined,
             } => {
                 assert_eq!(gait_key.as_deref(), Some(key));
-                assert!(quarantined, "default threshold 1 must quarantine immediately");
+                assert!(
+                    quarantined,
+                    "default threshold 1 must quarantine immediately"
+                );
             }
             other => panic!("expected UncleanExit, got {other:?}"),
         }
