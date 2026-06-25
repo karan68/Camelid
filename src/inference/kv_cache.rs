@@ -71,13 +71,31 @@ pub struct LlamaKvCachePositionTrace {
     pub value_first_values: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct LlamaKvCache {
     pub plan: LlamaKvCachePlan,
     pub keys: Vec<f32>,
     pub values: Vec<f32>,
     pub allocated_sequence_length: usize,
     pub position: usize,
+    /// Max f32 K+V bytes this session may materialize before the predict-and-abort
+    /// guard in `ensure_position_capacity` refuses. Host-derived operational config
+    /// (env / available RAM), NOT cache state — excluded from `PartialEq`. `pub(super)`
+    /// so sibling session code can carry it onto a hollow placeholder cache without
+    /// re-resolving (which would re-query host RAM every step).
+    pub(super) kv_budget_bytes: u64,
+}
+
+impl PartialEq for LlamaKvCache {
+    fn eq(&self, other: &Self) -> bool {
+        // Cache STATE only. `kv_budget_bytes` is host-derived operational config and
+        // must not affect equality (the session PartialEq compares caches across runs).
+        self.plan == other.plan
+            && self.keys == other.keys
+            && self.values == other.values
+            && self.allocated_sequence_length == other.allocated_sequence_length
+            && self.position == other.position
+    }
 }
 
 impl LlamaKvCache {
@@ -88,6 +106,7 @@ impl LlamaKvCache {
             values: Vec::new(),
             allocated_sequence_length: 0,
             position: 0,
+            kv_budget_bytes: resolve_kv_cache_budget_bytes(),
         })
     }
 
@@ -125,6 +144,22 @@ impl LlamaKvCache {
             return Ok(());
         }
         let target_sequence_length = self.grow_sequence_length(required_sequence_length);
+        // Predict-and-abort on host memory (conductor §9): the f32 K+V cache is the
+        // dominant, otherwise-uncapped allocation. Project the bytes of the ACTUAL
+        // (post-rounding) growth and refuse BEFORE the `resize` below — the host ceiling
+        // must never be discovered by OOMing mid-generation. Budget is
+        // `CAMELID_MAX_KV_CACHE_BYTES`, else a fraction of available physical RAM
+        // (Windows); unbounded where neither is known.
+        let projected_bytes =
+            (target_sequence_length as u64).saturating_mul(self.kv_bytes_per_token());
+        if projected_bytes > self.kv_budget_bytes {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "KV cache growth to {target_sequence_length} positions needs {projected_bytes} \
+                 bytes of f32 K+V, above the {} byte budget for this host; reduce the prompt/context \
+                 length or set {KV_CACHE_BUDGET_LIMIT_ENV} deliberately for a controlled run",
+                self.kv_budget_bytes
+            )));
+        }
         let values = target_sequence_length
             .checked_mul(self.plan.layer_count)
             .and_then(|value| value.checked_mul(self.plan.kv_head_count))
@@ -169,6 +204,14 @@ impl LlamaKvCache {
     pub(super) fn position_stride(&self) -> usize {
         self.plan.layer_count * self.plan.kv_head_count * self.plan.head_dim
     }
+
+    /// f32 bytes one token's KV occupies across all layers/heads, counting both the
+    /// K and V buffers — the per-token cost the predict-and-abort guard projects.
+    fn kv_bytes_per_token(&self) -> u64 {
+        (self.position_stride() as u64)
+            .saturating_mul(2) // K + V
+            .saturating_mul(std::mem::size_of::<f32>() as u64)
+    }
 }
 
 fn kv_cache_grow_tokens(max_sequence_length: usize) -> usize {
@@ -180,4 +223,137 @@ fn kv_cache_grow_tokens(max_sequence_length: usize) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(256)
+}
+
+/// Explicit override for the KV-cache predict-and-abort budget, in bytes. Mirrors
+/// `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES` for the weight-materialization guard.
+const KV_CACHE_BUDGET_LIMIT_ENV: &str = "CAMELID_MAX_KV_CACHE_BYTES";
+/// Default share of *available* physical RAM the KV cache may claim when no env override
+/// is set — leaves headroom for activations + the OS so a long-context request fails
+/// closed instead of pushing the host into paging / OOM.
+const KV_CACHE_BUDGET_AVAILABLE_PERCENT: u64 = 80;
+
+/// Resolve a new session's KV-cache memory budget (bytes): an explicit
+/// `CAMELID_MAX_KV_CACHE_BYTES` wins (deterministic, for tuning or controlled runs);
+/// otherwise a fraction of available physical RAM (Windows `GlobalMemoryStatusEx`).
+fn resolve_kv_cache_budget_bytes() -> u64 {
+    let env_value = env::var(KV_CACHE_BUDGET_LIMIT_ENV).ok();
+    kv_cache_budget_from(env_value.as_deref(), crate::gait::host_ram_status())
+}
+
+/// Pure budget policy (extracted so it is testable without mutating process env or
+/// querying the host): a parseable non-empty env override wins; else a fraction of
+/// available RAM; else (no env, no RAM probe — e.g. off Windows) unbounded.
+fn kv_cache_budget_from(env_value: Option<&str>, ram: Option<(u64, u64)>) -> u64 {
+    if let Some(trimmed) = env_value.map(str::trim) {
+        if !trimmed.is_empty() {
+            if let Ok(bytes) = trimmed.parse::<u64>() {
+                return bytes;
+            }
+        }
+    }
+    match ram {
+        Some((_total, available)) => {
+            available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100
+        }
+        None => u64::MAX,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan_with(
+        max_seq: usize,
+        layers: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> LlamaKvCachePlan {
+        let shape = vec![layers, max_seq, kv_heads, head_dim];
+        LlamaKvCachePlan {
+            max_sequence_length: max_seq,
+            layer_count: layers,
+            kv_head_count: kv_heads,
+            head_dim,
+            key_shape: shape.clone(),
+            value_shape: shape,
+        }
+    }
+
+    #[test]
+    fn kv_bytes_per_token_counts_k_and_v_f32() {
+        // Llama 3.2 3B shape: 28 layers * 8 kv-heads * 128 head_dim = 28672 stride;
+        // *2 (K+V) *4 (f32) = 229376 bytes/token.
+        let cache = LlamaKvCache::new(plan_with(131072, 28, 8, 128)).unwrap();
+        assert_eq!(cache.kv_bytes_per_token(), 229_376);
+        // TinyLlama shape: 22 * 4 * 64 = 5632 stride; *8 = 45056 bytes/token.
+        let cache = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();
+        assert_eq!(cache.kv_bytes_per_token(), 45_056);
+    }
+
+    #[test]
+    fn predict_and_abort_refuses_over_budget_before_allocating() {
+        // max_seq < 512 => grow_tokens == 1, so target == required (no chunk rounding) —
+        // deterministic regardless of CAMELID_KV_CACHE_GROW_TOKENS.
+        let mut cache = LlamaKvCache::new(plan_with(400, 16, 8, 64)).unwrap();
+        let per_token = cache.kv_bytes_per_token(); // 16*8*64*8 = 65536
+        cache.kv_budget_bytes = 100 * per_token; // budget for exactly 100 tokens
+                                                 // At budget: allowed, allocates exactly 100.
+        assert!(cache.ensure_position_capacity(100).is_ok());
+        assert_eq!(cache.allocated_sequence_length, 100);
+        // One token over: refused BEFORE any new allocation.
+        let err = cache.ensure_position_capacity(101).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("budget"),
+            "message should explain the budget: {msg}"
+        );
+        assert!(
+            msg.contains(KV_CACHE_BUDGET_LIMIT_ENV),
+            "message should name the override env: {msg}"
+        );
+        assert_eq!(
+            cache.allocated_sequence_length, 100,
+            "the over-budget length must not have been allocated"
+        );
+    }
+
+    #[test]
+    fn unbounded_budget_allows_normal_growth() {
+        let mut cache = LlamaKvCache::new(plan_with(4096, 16, 8, 64)).unwrap();
+        cache.kv_budget_bytes = u64::MAX;
+        assert!(cache.ensure_position_capacity(2048).is_ok());
+        assert!(cache.allocated_sequence_length >= 2048);
+    }
+
+    #[test]
+    fn budget_policy_env_override_wins_then_ram_fraction_then_unbounded() {
+        // Explicit env override (parseable) wins verbatim.
+        assert_eq!(
+            kv_cache_budget_from(Some(" 4096 "), Some((32 << 30, 16 << 30))),
+            4096
+        );
+        // Unparseable / empty env falls through to the RAM fraction.
+        assert_eq!(
+            kv_cache_budget_from(Some("not-a-number"), Some((32 << 30, 10 << 30))),
+            (10u64 << 30) * KV_CACHE_BUDGET_AVAILABLE_PERCENT / 100
+        );
+        assert_eq!(
+            kv_cache_budget_from(None, Some((32 << 30, 10 << 30))),
+            (10u64 << 30) * KV_CACHE_BUDGET_AVAILABLE_PERCENT / 100
+        );
+        // No env and no RAM probe (e.g. off Windows) -> unbounded (env remains the gate).
+        assert_eq!(kv_cache_budget_from(None, None), u64::MAX);
+    }
+
+    #[test]
+    fn budget_excluded_from_state_equality() {
+        let mut a = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();
+        let mut b = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();
+        a.kv_budget_bytes = 1 << 20;
+        b.kv_budget_bytes = 1 << 40;
+        // Different host budgets, identical state -> still equal.
+        assert_eq!(a, b);
+    }
 }

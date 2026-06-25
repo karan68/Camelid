@@ -1655,6 +1655,9 @@ impl LlamaInferenceSession {
     /// when the step finishes or the sequence loses its KV state entirely.
     pub fn take_for_step(&mut self) -> LlamaInferenceSession {
         let plan = self.kv_cache.plan.clone();
+        // Carry the resolved KV budget onto the hollow placeholder so the predict-and-abort
+        // guard stays in force without re-querying host RAM on every step.
+        let kv_budget_bytes = self.kv_cache.kv_budget_bytes;
         LlamaInferenceSession {
             config: self.config.clone(),
             weights: Arc::clone(&self.weights),
@@ -1666,6 +1669,7 @@ impl LlamaInferenceSession {
                     values: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
+                    kv_budget_bytes,
                 },
             ),
             resident_decode: self.resident_decode.take(),
