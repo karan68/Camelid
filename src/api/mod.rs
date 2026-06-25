@@ -1412,7 +1412,14 @@ pub async fn serve(
     let warm_model_id = state.active_model_id.read().await.clone();
     let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
     if let Some(model_id) = warm_model_id {
-        eprintln!("\n  🐪 Warming up the GPU (building the resident engine, one-time)…");
+        // Word the banner for the device that will actually serve — saying "GPU"
+        // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
+        let warming_msg = if crate::cuda::gpu_accel_enabled() {
+            "🐪 Warming up the GPU (building the resident engine, one-time)…"
+        } else {
+            "🐪 Warming up the model (building the engine, one-time)…"
+        };
+        eprintln!("\n  {warming_msg}");
         warmup_generation_blocking(addr, model_id).await;
     }
     print_ready_banner(&url);
