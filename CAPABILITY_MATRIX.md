@@ -13,7 +13,7 @@ Per-cell vocabulary (conductor §5):
 
 **Phase 0 status:** 3 / 4 rows discovered + hash-anchored (TinyLlama, Llama 3.2 1B, Llama 3.2 3B). **Llama 3 8B Q8_0 is not downloaded** — its column (`*`) is PROVISIONAL (spec-derived, not GGUF-anchored, Phase 0 INCOMPLETE).
 
-**Cell tally** (4 model columns × 13 capabilities = 52 cells): `n/a` 4 · `open` 17 · `wip` 13 · `done` 18. The `done` cells are each backed by a `camelid.capability-receipt/v1` under `qa/capability/receipts/`, validated this pass on the **3 on-disk rows** (TinyLlama, Llama 3.2 1B, Llama 3.2 3B) — no cross-row inheritance (conductor §6). The 8B column stays provisional until its GGUF is downloaded.
+**Cell tally** (4 model columns × 13 capabilities = 52 cells): `n/a` 4 · `open` 14 · `wip` 13 · `done` 21. The `done` cells are each backed by a `camelid.capability-receipt/v1` under `qa/capability/receipts/`, validated this pass on the **3 on-disk rows** (TinyLlama, Llama 3.2 1B, Llama 3.2 3B) — no cross-row inheritance (conductor §6). The 8B column stays provisional until its GGUF is downloaded.
 
 ## Matrix
 
@@ -24,7 +24,7 @@ Per-cell vocabulary (conductor §5):
 | `gen.length_stop` | D/C | done | done | done | open | drives |
 | `sampling.full_set` | I | done | done | done | open | partial |
 | `sampling.seed_determinism` | I | done | done | done | open | drives |
-| `logprobs.top_logprobs` | D | open | open | open | open | typed_error_stub |
+| `logprobs.top_logprobs` | D | done | done | done | open | drives |
 | `chat.system_multiturn` | D | wip | wip | wip | open | drives |
 | `tools.function_calling` | B | n/a | wip | wip | n/a | partial |
 | `structured.json_grammar` | B | open | open | open | open | typed_error_stub |
@@ -48,7 +48,7 @@ Per-cell vocabulary (conductor §5):
 - **`sampling.seed_determinism`** — fixed seed reproduces token-for-token across runs
   - DONE (class I, 3 on-disk rows): the degenerate fixed-per-seed RNG was replaced with a per-position SplitMix64 stream (seeded_unit_interval_at) — a fresh draw each decode step, still reproducible; e2e identical text across two seeded runs. Receipt minted.
 - **`logprobs.top_logprobs`** — logprobs/top_logprobs at temp=0 (any causal LM)
-  - OPEN — API rejects (HTTP 400 stub, api/mod.rs:6732). Deferred this pass: needs per-step full-vocab log_softmax capture in the shared decode loop (CPU + GPU-resident + spec lanes) + two OpenAI shapes + class-D oracle parity.
+  - DONE (class D, 3 on-disk rows): per-step log_softmax capture in the decode loop (greedy-fast bypassed) -> chat logprobs.content[] + completions logprobs.{tokens,token_logprobs,top_logprobs,text_offset}. Greedy invariant + shapes validated e2e; token IDs bit-exact vs llama.cpp acd79d6 (values within the ~5e-2 f32 envelope). Non-streaming single-choice. Receipt minted.
 - **`chat.system_multiturn`** — system role + multi-turn template fidelity (per THIS template)
   - wip — per-arch renderers drive system + multi-turn (api/mod.rs:8789+); not exercised by this pass's smoke (single user turn). Needs a system+multi-turn e2e to earn its receipt.
 - **`tools.function_calling`** — native tool/function calling — REQUIRES tool-call branch or tool/ipython control tokens in THIS model template
@@ -71,13 +71,13 @@ Per-cell vocabulary (conductor §5):
 - **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed. Memory/abort projection (conductor §9) governs the 131072 rows before any near-limit validation.
 - **6 capabilities are now `done` on the 3 on-disk rows**, each with a `camelid.capability-receipt/v1`: the **sampling lane** (`sampling.full_set` — `min_p`+`repeat_penalty` added; `sampling.seed_determinism` — degenerate per-seed RNG fixed to a per-step SplitMix64 stream, **a real correctness bug**), **`gen.n_choices`** (n>1 independent reproducibly-seeded choices, converted from a 400 stub), and the contract caps `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing`.
 - **`tools.function_calling` splits by row, exactly as the conductor demands.** TinyLlama → `n/a` (template has only user/system/assistant branches, no tool/ipython tokens). Llama 3.2 1B & 3B → **`wip`** (templates carry the Llama-3.1-style tool-call branch + `Environment: ipython`; Camelid renders the input protocol but emits no structured `tool_calls` yet). Original Llama 3 8B → `n/a`/provisional.
-- **Two greenfield `open` lanes remain** (HTTP-400 stubs, model-agnostic): `logprobs.top_logprobs` and `structured.json_grammar`.
+- **One greenfield `open` lane remains** (HTTP-400 stub, model-agnostic): `structured.json_grammar` (GBNF/JSON-mode constrained decode). `logprobs.top_logprobs` is now **`done`** (class D — token IDs bit-exact vs llama.cpp; values within the f32 envelope).
 - **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed; near-limit validation (with memory predict-and-abort) keeps it `wip`. `context.rope_scaling` is `n/a` on TinyLlama/8B and `wip` on the 1B/3B (tensor-baked llama3 scaling — see below).
 
 ## Recommended sequencing (conductor §6) — progress
 
 1. ✅ **Sampling lane** (`sampling.full_set` + `sampling.seed_determinism`) — `min_p`/`repeat_penalty` added, per-step RNG fixed, class-I invariants + e2e. **DONE.**
-2. ◐ **`gen.n_choices` + `logprobs.top_logprobs`** — `gen.n_choices` **DONE** (class C); `logprobs.top_logprobs` **deferred** (decode-loop surgery + class-D oracle parity) — the clear next lane.
+2. ✅ **`gen.n_choices` + `logprobs.top_logprobs`** — both **DONE**: n_choices (class C) and logprobs (class D — chat + completions; token IDs bit-exact vs llama.cpp, values within the f32 envelope; non-streaming single-choice).
 3. ✅ **Receipts for the already-driving caps** — `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing` minted **DONE**; `chat.system_multiturn` + `context.full_length` still `wip` (need a system/multi-turn and a near-limit e2e respectively).
 4. **`tools.function_calling`** (1B/3B only) — build the structured `tool_calls` output side; validate over a behavioral battery (class B). Gate strictly on the manifest (TinyLlama/8B stay `n/a`).
 5. **`structured.json_grammar`** — GBNF/JSON-mode constrained decode (class B), all rows.
@@ -87,7 +87,7 @@ Per-cell vocabulary (conductor §5):
 ## Artifacts
 
 - Per-row manifests: `qa/capability/capability-manifest.<row>.json` (schema `camelid.capability-manifest/v1`).
-- Capability receipts: `qa/capability/receipts/capability-receipt.<cap>.<row>.json` (schema `camelid.capability-receipt/v1`) — **18 minted** this pass (6 caps × 3 on-disk rows).
+- Capability receipts: `qa/capability/receipts/capability-receipt.<cap>.<row>.json` (schema `camelid.capability-receipt/v1`) — **21 minted** this pass (6 caps × 3 on-disk rows).
 - E2E harness: `qa/capability/smoke.sh` (boots each model on Windows CPU, exercises the validated caps).
 - Checksums: `qa/capability/SHA256SUMS` (manifests + receipts).
 - Provenance: produced on branch `feat/capability-conductor` (base `12f202d0`) with the sampling + n_choices diff **uncommitted** at receipt time — re-seal against the commit once landed.
