@@ -150,6 +150,9 @@ pub struct TrialResult {
 pub struct TournamentConfig {
     /// A candidate must beat baseline by at least this factor to win; otherwise
     /// the tournament fails closed to baseline. Slower-but-correct always wins.
+    /// The default (1.10) sits above the per-trial variance of the §1.4
+    /// child-process trials, so a sub-10% median gap — indistinguishable from
+    /// measurement noise on this execution model — never persists a gait.
     pub min_speedup: f64,
     /// Measured rounds per variant. Each round times every variant once, in the
     /// same order, so any two share a thermal/clock neighborhood (matched-clock
@@ -163,7 +166,7 @@ pub struct TournamentConfig {
 impl Default for TournamentConfig {
     fn default() -> Self {
         Self {
-            min_speedup: 1.05,
+            min_speedup: 1.10,
             rounds: 5,
             warmup_rounds: 1,
         }
@@ -233,6 +236,21 @@ fn median(samples: &[f64]) -> Option<f64> {
     } else {
         sorted[mid]
     })
+}
+
+/// An outlier-robust *low* estimate: the worst round after discarding a single
+/// unlucky outlier (the median's companion for the downside). For `>= 2` samples
+/// this is the second-smallest; for one sample it is that sample. Used by the
+/// significance gate so a single bad round does not veto a genuine win, while a
+/// broadly-noisy candidate (several rounds below baseline) is still caught.
+fn robust_low(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if sorted.len() >= 2 {
+        sorted[1]
+    } else {
+        sorted.first().copied().unwrap_or(0.0)
+    }
 }
 
 /// Per-variant accumulation across interleaved rounds.
@@ -340,9 +358,20 @@ pub fn run_tournament(
         }
     };
 
-    // Evaluate candidates (indices 1..) on their medians.
+    // Evaluate candidates (indices 1..). A candidate wins only if it clears BOTH
+    // gates: (a) MARGIN — its median beats the baseline median by `min_speedup`;
+    // and (b) SIGNIFICANCE — even after discarding a single unlucky round, its
+    // worst remaining round still beats the baseline median (`robust_low`).
+    //
+    // The significance gate exists because the §1.4 child-process trials carry
+    // wide per-trial variance (each trial is a fresh process: fresh load, fresh
+    // page-cache and scheduler placement). A margin-only gate would crown a noise
+    // winner on a lucky median and persist it. Requiring the candidate to stay
+    // above baseline even on its near-worst round rejects that, while the
+    // outlier-robust `robust_low` still admits a real win that had one bad round.
     let mut best: Option<(&Candidate, f64)> = None;
     let mut disqualified = Vec::new();
+    let mut margin_but_noisy = false;
     for (i, candidate) in candidates.iter().enumerate() {
         let stat = &stats[i + 1];
         if stat.tok_samples.is_empty() {
@@ -354,6 +383,13 @@ pub fn run_tournament(
             continue;
         }
         let med = median(&stat.tok_samples).unwrap_or(0.0);
+        if med < base_tok * config.min_speedup {
+            continue; // MARGIN GATE
+        }
+        if robust_low(&stat.tok_samples) < base_tok {
+            margin_but_noisy = true; // SIGNIFICANCE GATE — the win is within noise
+            continue;
+        }
         match best {
             Some((_, best_tok)) if med <= best_tok => {}
             _ => best = Some((candidate, med)),
@@ -361,12 +397,12 @@ pub fn run_tournament(
     }
 
     match best {
-        Some((winner, tok)) if tok >= base_tok * config.min_speedup => {
+        Some((winner, tok)) => {
             let speedup = tok / base_tok;
             CalibrationOutcome {
                 selected_profile: winner.profile.clone(),
                 reason: format!(
-                    "gait: {} won at {speedup:.3}x over baseline (median of {measured} rounds)",
+                    "gait: {} won at {speedup:.3}x over baseline (median of {measured} rounds, noise-significant)",
                     winner.label
                 ),
                 baseline_tokens_per_s: super::round_sig6(base_tok),
@@ -381,11 +417,15 @@ pub fn run_tournament(
                 samples,
             }
         }
-        _ => fail_closed(
-            "no parity-clean candidate beat baseline by margin; keeping baseline".to_string(),
-            base_tok,
-            disqualified,
-        ),
+        None => {
+            let reason = if margin_but_noisy {
+                "a candidate beat the margin but not the measurement noise (a round dipped below baseline); keeping baseline"
+                    .to_string()
+            } else {
+                "no parity-clean candidate beat baseline by margin; keeping baseline".to_string()
+            };
+            fail_closed(reason, base_tok, disqualified)
+        }
     }
 }
 
@@ -632,6 +672,96 @@ mod tests {
         let fast = outcome.samples.iter().find(|s| s.label == "fast").unwrap();
         assert_eq!(fast.median_tokens_per_s, 13.0);
         assert_eq!(fast.min_tokens_per_s, 4.0);
+    }
+
+    #[test]
+    fn noisy_candidate_rejected_despite_high_median() {
+        // High median (14 > baseline 10, clears even a 1.05 margin) but BROADLY
+        // noisy: multiple rounds dip below the baseline median, so the median is a
+        // lucky-rounds artifact, not a real win. This is the §5 child-process
+        // noise case — the significance gate (not the margin) must fail-close.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("noisy", ExecutionProfile::Experimental)];
+        let cfg = TournamentConfig {
+            min_speedup: 1.05,
+            rounds: 5,
+            warmup_rounds: 0,
+        };
+        // sorted [8,9,14,14,14] -> median 14, robust_low (2nd-smallest) 9 < 10.
+        let noisy = [14.0, 9.0, 14.0, 8.0, 14.0];
+        let mut n = 0;
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
+            match c.label.as_str() {
+                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                _ => {
+                    let v = noisy[n % noisy.len()];
+                    n += 1;
+                    Some(TrialResult { tokens_per_s: v, parity_token: "A".into() })
+                }
+            }
+        });
+        assert!(outcome.fell_back, "a broadly-noisy candidate must fail-close");
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Auto);
+        assert!(
+            outcome.reason.contains("measurement noise"),
+            "reason should name the noise gate, got: {}",
+            outcome.reason
+        );
+    }
+
+    #[test]
+    fn clean_win_survives_significance() {
+        // A stable, genuinely-faster candidate: every round clears the baseline
+        // median, even discounting the slowest. Both gates pass — it wins.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("fast", ExecutionProfile::Experimental)];
+        let cfg = TournamentConfig {
+            min_speedup: 1.10,
+            rounds: 5,
+            warmup_rounds: 0,
+        };
+        let fast = [12.0, 12.0, 13.0, 12.0, 12.0]; // median 12 = 1.2x, robust_low 12
+        let mut n = 0;
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
+            match c.label.as_str() {
+                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                _ => {
+                    let v = fast[n % fast.len()];
+                    n += 1;
+                    Some(TrialResult { tokens_per_s: v, parity_token: "A".into() })
+                }
+            }
+        });
+        assert!(!outcome.fell_back);
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Experimental);
+    }
+
+    #[test]
+    fn default_margin_rejects_small_stable_win() {
+        // A clean, stable but SMALL win (1.06x) — below the noise-robust default
+        // margin (1.10). It passes significance but not the margin, so it must
+        // fail-close: a sub-10% gait is not worth persisting under child-process
+        // measurement variance.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("slightly_faster", ExecutionProfile::Experimental)];
+        let outcome = run_tournament(
+            &baseline,
+            &candidates,
+            &TournamentConfig::default(),
+            1_000_000,
+            &mem(),
+            |c| {
+                Some(match c.label.as_str() {
+                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
+                    _ => TrialResult { tokens_per_s: 10.6, parity_token: "A".into() },
+                })
+            },
+        );
+        assert!(
+            outcome.fell_back,
+            "a sub-margin win must fail-close under the default 1.10 margin"
+        );
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Auto);
     }
 
     #[test]
