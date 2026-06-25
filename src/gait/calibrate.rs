@@ -79,9 +79,49 @@ fn is_matmul_stage(class: &str) -> bool {
     )
 }
 
+/// §5: the three managed x86 Q8 `groups_per_chunk` tiling knobs
+/// (`MANAGED_ENV_KEYS`). Tiling only — the arithmetic is unchanged, so varying
+/// these is parity-neutral *by construction* (and the tournament's parity gate
+/// enforces it regardless). The defaults match the kernel readers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupsPerChunk {
+    pub attn_qkv_decode: usize,
+    pub ffn_gate_up_decode: usize,
+    pub packed_rows4_matmul: usize,
+}
+
+/// The kernel defaults — the center of the bounded search.
+pub const GPC_CENTER: GroupsPerChunk = GroupsPerChunk {
+    attn_qkv_decode: 16,
+    ffn_gate_up_decode: 16,
+    packed_rows4_matmul: 8,
+};
+
+/// A bounded coordinate-neighbor set around [`GPC_CENTER`] — a *short local
+/// search*, not a full grid, so the (expensive, child-process) trial count stays
+/// small. Each point keeps all knobs `> 0` as the kernel readers require.
+pub fn groups_per_chunk_neighbors() -> Vec<GroupsPerChunk> {
+    vec![
+        GPC_CENTER,
+        GroupsPerChunk {
+            attn_qkv_decode: 8,
+            ffn_gate_up_decode: 8,
+            ..GPC_CENTER
+        },
+        GroupsPerChunk {
+            attn_qkv_decode: 32,
+            ffn_gate_up_decode: 32,
+            ..GPC_CENTER
+        },
+        GroupsPerChunk {
+            packed_rows4_matmul: 16,
+            ..GPC_CENTER
+        },
+    ]
+}
+
 /// A configuration to evaluate. `profile` is what gets recorded and later
-/// applied; `label` is for evidence/logs. (As the campaign matures, candidates
-/// will also carry the per-stage `MANAGED_ENV_KEYS` struct.)
+/// applied; `label` is for evidence/logs.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub label: String,
@@ -90,12 +130,16 @@ pub struct Candidate {
     /// Windows scheduling-substrate dimension). The engine only records it; the
     /// trial closure applies it before timing.
     pub eco_qos_opt_out: bool,
+    /// §5: per-stage `groups_per_chunk` tiling overrides. `None` uses the
+    /// profile's kernel defaults; `Some` is applied (and recorded) by the trial.
+    pub groups_per_chunk: Option<GroupsPerChunk>,
 }
 
 /// The result of timing one candidate: its throughput and a parity token. Two
 /// candidates are parity-equal iff their tokens are equal — the gate that
-/// disqualifies a fast-but-divergent candidate.
-#[derive(Debug, Clone)]
+/// disqualifies a fast-but-divergent candidate. Serializable so a supervised
+/// child-process trial (§1.4 crash isolation) can hand it back over stdout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrialResult {
     pub tokens_per_s: f64,
     pub parity_token: String,
@@ -106,6 +150,9 @@ pub struct TrialResult {
 pub struct TournamentConfig {
     /// A candidate must beat baseline by at least this factor to win; otherwise
     /// the tournament fails closed to baseline. Slower-but-correct always wins.
+    /// The default (1.10) sits above the per-trial variance of the §1.4
+    /// child-process trials, so a sub-10% median gap — indistinguishable from
+    /// measurement noise on this execution model — never persists a gait.
     pub min_speedup: f64,
     /// Measured rounds per variant. Each round times every variant once, in the
     /// same order, so any two share a thermal/clock neighborhood (matched-clock
@@ -119,7 +166,7 @@ pub struct TournamentConfig {
 impl Default for TournamentConfig {
     fn default() -> Self {
         Self {
-            min_speedup: 1.05,
+            min_speedup: 1.10,
             rounds: 5,
             warmup_rounds: 1,
         }
@@ -158,6 +205,10 @@ pub struct CalibrationOutcome {
     /// the substrate dimension existed.
     #[serde(default)]
     pub selected_eco_qos_opt_out: bool,
+    /// §5: the `groups_per_chunk` tiling the winner used (`None` = kernel defaults
+    /// / baseline). Recorded so the selected gait reproduces the chosen tiling.
+    #[serde(default)]
+    pub selected_groups_per_chunk: Option<GroupsPerChunk>,
     /// Measured rounds per variant behind the medians.
     #[serde(default)]
     pub measured_rounds: usize,
@@ -185,6 +236,21 @@ fn median(samples: &[f64]) -> Option<f64> {
     } else {
         sorted[mid]
     })
+}
+
+/// An outlier-robust *low* estimate: the worst round after discarding a single
+/// unlucky outlier (the median's companion for the downside). For `>= 2` samples
+/// this is the second-smallest; for one sample it is that sample. Used by the
+/// significance gate so a single bad round does not veto a genuine win, while a
+/// broadly-noisy candidate (several rounds below baseline) is still caught.
+fn robust_low(samples: &[f64]) -> f64 {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if sorted.len() >= 2 {
+        sorted[1]
+    } else {
+        sorted.first().copied().unwrap_or(0.0)
+    }
 }
 
 /// Per-variant accumulation across interleaved rounds.
@@ -276,6 +342,7 @@ pub fn run_tournament(
         fell_back: true,
         parity_disqualified: disq,
         selected_eco_qos_opt_out: baseline.eco_qos_opt_out,
+        selected_groups_per_chunk: baseline.groups_per_chunk,
         measured_rounds: measured,
         samples: samples.clone(),
     };
@@ -291,9 +358,20 @@ pub fn run_tournament(
         }
     };
 
-    // Evaluate candidates (indices 1..) on their medians.
+    // Evaluate candidates (indices 1..). A candidate wins only if it clears BOTH
+    // gates: (a) MARGIN — its median beats the baseline median by `min_speedup`;
+    // and (b) SIGNIFICANCE — even after discarding a single unlucky round, its
+    // worst remaining round still beats the baseline median (`robust_low`).
+    //
+    // The significance gate exists because the §1.4 child-process trials carry
+    // wide per-trial variance (each trial is a fresh process: fresh load, fresh
+    // page-cache and scheduler placement). A margin-only gate would crown a noise
+    // winner on a lucky median and persist it. Requiring the candidate to stay
+    // above baseline even on its near-worst round rejects that, while the
+    // outlier-robust `robust_low` still admits a real win that had one bad round.
     let mut best: Option<(&Candidate, f64)> = None;
     let mut disqualified = Vec::new();
+    let mut margin_but_noisy = false;
     for (i, candidate) in candidates.iter().enumerate() {
         let stat = &stats[i + 1];
         if stat.tok_samples.is_empty() {
@@ -305,6 +383,13 @@ pub fn run_tournament(
             continue;
         }
         let med = median(&stat.tok_samples).unwrap_or(0.0);
+        if med < base_tok * config.min_speedup {
+            continue; // MARGIN GATE
+        }
+        if robust_low(&stat.tok_samples) < base_tok {
+            margin_but_noisy = true; // SIGNIFICANCE GATE — the win is within noise
+            continue;
+        }
         match best {
             Some((_, best_tok)) if med <= best_tok => {}
             _ => best = Some((candidate, med)),
@@ -312,12 +397,12 @@ pub fn run_tournament(
     }
 
     match best {
-        Some((winner, tok)) if tok >= base_tok * config.min_speedup => {
+        Some((winner, tok)) => {
             let speedup = tok / base_tok;
             CalibrationOutcome {
                 selected_profile: winner.profile.clone(),
                 reason: format!(
-                    "gait: {} won at {speedup:.3}x over baseline (median of {measured} rounds)",
+                    "gait: {} won at {speedup:.3}x over baseline (median of {measured} rounds, noise-significant)",
                     winner.label
                 ),
                 baseline_tokens_per_s: super::round_sig6(base_tok),
@@ -327,15 +412,20 @@ pub fn run_tournament(
                 fell_back: false,
                 parity_disqualified: disqualified,
                 selected_eco_qos_opt_out: winner.eco_qos_opt_out,
+                selected_groups_per_chunk: winner.groups_per_chunk,
                 measured_rounds: measured,
                 samples,
             }
         }
-        _ => fail_closed(
-            "no parity-clean candidate beat baseline by margin; keeping baseline".to_string(),
-            base_tok,
-            disqualified,
-        ),
+        None => {
+            let reason = if margin_but_noisy {
+                "a candidate beat the margin but not the measurement noise (a round dipped below baseline); keeping baseline"
+                    .to_string()
+            } else {
+                "no parity-clean candidate beat baseline by margin; keeping baseline".to_string()
+            };
+            fail_closed(reason, base_tok, disqualified)
+        }
     }
 }
 
@@ -358,9 +448,20 @@ pub fn calibrate_and_store(
 
     let outcome = run_tournament(baseline, candidates, config, weight_bytes, &memory, trial);
 
+    // §6F: attest the host-safety posture (the §1.2 cap + §1.1/§1.2 invariants) and
+    // record the measured free-RAM headroom, so the receipt audits how this gait
+    // runs. Read physical_cores before machine_sig is moved into the receipt.
+    let scheduling = super::Scheduling::attest(
+        machine_sig.physical_cores,
+        outcome.selected_eco_qos_opt_out,
+    );
+    let host_safety = super::HostSafety::capture();
+
     let receipt = GaitReceipt::new(model_sig, machine_sig, outcome.selected_profile.clone())
         .with_memory(memory)
-        .with_calibration(outcome.clone());
+        .with_calibration(outcome.clone())
+        .with_scheduling(scheduling)
+        .with_host_safety(host_safety);
     let path = store_in(dir, &receipt).ok();
     (outcome, path)
 }
@@ -368,6 +469,53 @@ pub fn calibrate_and_store(
 /// Convenience: the default store directory for calibration output.
 pub fn default_store_dir() -> Option<PathBuf> {
     gait_dir()
+}
+
+/// Outcome of supervising a child-process trial under a hard timeout (§1.4).
+#[derive(Debug)]
+pub enum WatchdogOutcome {
+    /// The child exited on its own; carries its captured output.
+    Completed(std::process::Output),
+    /// The child overran the timeout and was killed — abandoned and disqualified.
+    TimedOut,
+    /// Could not wait on / collect the child (OS error).
+    Errored,
+}
+
+/// Supervise a child trial under a HARD `timeout`, polling every `poll` interval.
+///
+/// This is the §1.4 crash-isolation valve: candidate kernels run in a separate
+/// process, so a candidate that **segfaults** cannot take down the calibrating
+/// (or serving) process — it surfaces as a non-success exit — and a candidate
+/// that **hangs** is KILLED at the deadline rather than waited on forever. Either
+/// way the supervisor returns and the bad candidate is disqualified upstream;
+/// it is never persisted. The child should be spawned with stdout piped if the
+/// caller needs the [`TrialResult`] it prints.
+pub fn supervise(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+) -> WatchdogOutcome {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return match child.wait_with_output() {
+                    Ok(output) => WatchdogOutcome::Completed(output),
+                    Err(_) => WatchdogOutcome::Errored,
+                };
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return WatchdogOutcome::TimedOut;
+                }
+                std::thread::sleep(poll);
+            }
+            Err(_) => return WatchdogOutcome::Errored,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -416,6 +564,28 @@ mod tests {
             label: label.to_string(),
             profile,
             eco_qos_opt_out: false,
+            groups_per_chunk: None,
+        }
+    }
+
+    #[test]
+    fn gpc_neighbors_are_bounded_distinct_and_positive() {
+        let neighbors = groups_per_chunk_neighbors();
+        // A short local search, never a runaway grid.
+        assert!(
+            (2..=8).contains(&neighbors.len()),
+            "search must stay bounded, got {}",
+            neighbors.len()
+        );
+        assert!(neighbors.contains(&GPC_CENTER), "the center must be probed");
+        let mut seen = std::collections::BTreeSet::new();
+        for g in &neighbors {
+            // Every knob must stay > 0 (the kernel readers reject 0).
+            assert!(g.attn_qkv_decode > 0 && g.ffn_gate_up_decode > 0 && g.packed_rows4_matmul > 0);
+            assert!(
+                seen.insert((g.attn_qkv_decode, g.ffn_gate_up_decode, g.packed_rows4_matmul)),
+                "search points must be distinct"
+            );
         }
     }
 
@@ -502,6 +672,96 @@ mod tests {
         let fast = outcome.samples.iter().find(|s| s.label == "fast").unwrap();
         assert_eq!(fast.median_tokens_per_s, 13.0);
         assert_eq!(fast.min_tokens_per_s, 4.0);
+    }
+
+    #[test]
+    fn noisy_candidate_rejected_despite_high_median() {
+        // High median (14 > baseline 10, clears even a 1.05 margin) but BROADLY
+        // noisy: multiple rounds dip below the baseline median, so the median is a
+        // lucky-rounds artifact, not a real win. This is the §5 child-process
+        // noise case — the significance gate (not the margin) must fail-close.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("noisy", ExecutionProfile::Experimental)];
+        let cfg = TournamentConfig {
+            min_speedup: 1.05,
+            rounds: 5,
+            warmup_rounds: 0,
+        };
+        // sorted [8,9,14,14,14] -> median 14, robust_low (2nd-smallest) 9 < 10.
+        let noisy = [14.0, 9.0, 14.0, 8.0, 14.0];
+        let mut n = 0;
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
+            match c.label.as_str() {
+                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                _ => {
+                    let v = noisy[n % noisy.len()];
+                    n += 1;
+                    Some(TrialResult { tokens_per_s: v, parity_token: "A".into() })
+                }
+            }
+        });
+        assert!(outcome.fell_back, "a broadly-noisy candidate must fail-close");
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Auto);
+        assert!(
+            outcome.reason.contains("measurement noise"),
+            "reason should name the noise gate, got: {}",
+            outcome.reason
+        );
+    }
+
+    #[test]
+    fn clean_win_survives_significance() {
+        // A stable, genuinely-faster candidate: every round clears the baseline
+        // median, even discounting the slowest. Both gates pass — it wins.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("fast", ExecutionProfile::Experimental)];
+        let cfg = TournamentConfig {
+            min_speedup: 1.10,
+            rounds: 5,
+            warmup_rounds: 0,
+        };
+        let fast = [12.0, 12.0, 13.0, 12.0, 12.0]; // median 12 = 1.2x, robust_low 12
+        let mut n = 0;
+        let outcome = run_tournament(&baseline, &candidates, &cfg, 1_000_000, &mem(), |c| {
+            match c.label.as_str() {
+                "auto" => Some(TrialResult { tokens_per_s: 10.0, parity_token: "A".into() }),
+                _ => {
+                    let v = fast[n % fast.len()];
+                    n += 1;
+                    Some(TrialResult { tokens_per_s: v, parity_token: "A".into() })
+                }
+            }
+        });
+        assert!(!outcome.fell_back);
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Experimental);
+    }
+
+    #[test]
+    fn default_margin_rejects_small_stable_win() {
+        // A clean, stable but SMALL win (1.06x) — below the noise-robust default
+        // margin (1.10). It passes significance but not the margin, so it must
+        // fail-close: a sub-10% gait is not worth persisting under child-process
+        // measurement variance.
+        let baseline = cand("auto", ExecutionProfile::Auto);
+        let candidates = vec![cand("slightly_faster", ExecutionProfile::Experimental)];
+        let outcome = run_tournament(
+            &baseline,
+            &candidates,
+            &TournamentConfig::default(),
+            1_000_000,
+            &mem(),
+            |c| {
+                Some(match c.label.as_str() {
+                    "auto" => TrialResult { tokens_per_s: 10.0, parity_token: "A".into() },
+                    _ => TrialResult { tokens_per_s: 10.6, parity_token: "A".into() },
+                })
+            },
+        );
+        assert!(
+            outcome.fell_back,
+            "a sub-margin win must fail-close under the default 1.10 margin"
+        );
+        assert_eq!(outcome.selected_profile, ExecutionProfile::Auto);
     }
 
     #[test]

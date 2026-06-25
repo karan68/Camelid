@@ -28,7 +28,7 @@ pub mod chat;
 #[cfg(feature = "cuda")]
 mod cuda;
 mod reff16;
-mod refmath;
+pub(crate) mod refmath;
 pub mod refrng;
 
 /// GPU soft-embedding matmul (`emb_t @ probs`) for the self-conditioning

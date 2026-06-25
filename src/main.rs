@@ -251,6 +251,15 @@ fn pin_to_high_performance_gpu() {
 #[cfg(not(windows))]
 fn pin_to_high_performance_gpu() {}
 
+/// `camelid gait <action>` — GAIT cache maintenance subcommands.
+#[derive(Debug, Subcommand)]
+enum GaitAction {
+    /// Clear the GAIT cache (profiles, quarantine, in-progress markers, and the
+    /// DISABLE kill-file) under %LOCALAPPDATA%\Camelid\gait, fully reverting to
+    /// the baseline path.
+    Reset,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the local HTTP API server.
@@ -753,6 +762,41 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// GAIT internal: run ONE calibration candidate trial in isolation and print
+    /// its TrialResult as a single JSON line. Spawned as a child process by the
+    /// calibration supervisor (§1.4 crash isolation); not for direct use.
+    #[command(hide = true)]
+    GaitTrial {
+        /// GGUF model path.
+        model: PathBuf,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        #[arg(long)]
+        prompt: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        max_tokens: usize,
+        /// Profile label: auto | safe | experimental | debug.
+        #[arg(long)]
+        profile: String,
+        /// Apply the compute-pool EcoQoS opt-out for this trial.
+        #[arg(long, default_value_t = false)]
+        eco_qos: bool,
+        #[arg(long)]
+        threads: Option<usize>,
+        /// §5 groups_per_chunk tiling overrides (pass all three together).
+        #[arg(long)]
+        gpc_attn: Option<usize>,
+        #[arg(long)]
+        gpc_ffn: Option<usize>,
+        #[arg(long)]
+        gpc_matmul: Option<usize>,
+    },
+    /// GAIT cache maintenance (e.g. `camelid gait reset`).
+    #[command(hide = true)]
+    Gait {
+        #[command(subcommand)]
+        action: GaitAction,
+    },
     /// SPEC_RECHECK measurement harness: run lossless greedy speculative decode and a plain
     /// greedy baseline back-to-back on one prompt, and emit a single JSON record with the
     /// per-run economics (acceptance rate, draft/verify latency split, f_draft, S_sync) plus
@@ -891,6 +935,17 @@ async fn main() -> anyhow::Result<()> {
 
     // No subcommand (a bare double-click of the exe) launches the open-and-use app.
     let command = Cli::parse().command.unwrap_or_else(default_launch_command);
+
+    // §4 safe-boot: a gait/substrate that crashed or wedged the host on the
+    // previous run left an `.applying` marker; detect it now — before anything is
+    // applied — quarantine that profile, and boot the proven baseline so a crash
+    // can never loop. Inert unless the CAMELID_GAIT gate is on, so the default
+    // path is byte-identical to today.
+    if camelid::gait::gait_enabled() {
+        if let Some(dir) = camelid::gait::gait_dir() {
+            let _ = camelid::gait::sentinel::reconcile_on_startup(&dir);
+        }
+    }
     // Deterministic mode opts out of the GPU fast stack entirely; otherwise the CLI
     // defaults to the measured-fastest Metal configuration. Branch before any env is set
     // so the deterministic path never even arms the GPU defaults.
@@ -1479,6 +1534,26 @@ async fn main() -> anyhow::Result<()> {
         } => {
             run_gait_calibrate(model, prompt_file, prompt, max_tokens, rounds, warmup, threads)?;
         }
+        Command::GaitTrial {
+            model,
+            prompt_file,
+            prompt,
+            max_tokens,
+            profile,
+            eco_qos,
+            threads,
+            gpc_attn,
+            gpc_ffn,
+            gpc_matmul,
+        } => {
+            run_gait_trial(
+                model, prompt_file, prompt, max_tokens, profile, eco_qos, threads, gpc_attn,
+                gpc_ffn, gpc_matmul,
+            )?;
+        }
+        Command::Gait { action } => match action {
+            GaitAction::Reset => run_gait_reset()?,
+        },
         Command::BenchSpeculative {
             model,
             drafter,
@@ -1577,6 +1652,13 @@ async fn main() -> anyhow::Result<()> {
                 out_path.display()
             );
         }
+    }
+
+    // §4 safe-boot: an orderly exit — clear any in-progress gait marker so a
+    // healthy run is never mistaken for a crash on the next launch. (No-op unless
+    // a gait was applied this process.)
+    if let Some(dir) = camelid::gait::gait_dir() {
+        camelid::gait::sentinel::clean_shutdown(&dir);
     }
     Ok(())
 }
@@ -1925,6 +2007,28 @@ struct BenchGenerateRecord {
     output_token_ids: Vec<u32>,
 }
 
+/// §5: set (or clear) the three managed x86 Q8 `groups_per_chunk` env knobs for a
+/// trial. `None` clears them so the trial measures the profile's default tiling;
+/// `Some` pins the search candidate's values. Must be called AFTER
+/// `PlannerEnv::apply` (these keys are managed) so the override is authoritative.
+fn apply_groups_per_chunk(gpc: Option<camelid::gait::calibrate::GroupsPerChunk>) {
+    const ATTN: &str = "CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK";
+    const FFN: &str = "CAMELID_X86_Q8_FFN_GATE_UP_DECODE_GROUPS_PER_CHUNK";
+    const MATMUL: &str = "CAMELID_X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK";
+    match gpc {
+        Some(g) => {
+            std::env::set_var(ATTN, g.attn_qkv_decode.to_string());
+            std::env::set_var(FFN, g.ffn_gate_up_decode.to_string());
+            std::env::set_var(MATMUL, g.packed_rows4_matmul.to_string());
+        }
+        None => {
+            std::env::remove_var(ATTN);
+            std::env::remove_var(FFN);
+            std::env::remove_var(MATMUL);
+        }
+    }
+}
+
 fn gait_profile_env_value(profile: &camelid::execution_plan::ExecutionProfile) -> &'static str {
     use camelid::execution_plan::ExecutionProfile::*;
     match profile {
@@ -1949,8 +2053,9 @@ fn gait_profile_trial(
 ) -> anyhow::Result<camelid::gait::calibrate::TrialResult> {
     std::env::set_var("CAMELID_PROFILE", gait_profile_env_value(&candidate.profile));
     // Apply this candidate's Windows scheduling substrate before timing, so the
-    // measured decode reflects it. Process-level, covers the Rayon pool.
-    let eco_status = camelid::gait::substrate::set_eco_qos_opt_out(candidate.eco_qos_opt_out);
+    // measured decode reflects it. §1.2-scoped to the compute pool (the Rayon
+    // workers + this thread), matching what production applies.
+    let eco_status = camelid::gait::substrate::set_compute_pool_eco_qos(candidate.eco_qos_opt_out);
     if candidate.eco_qos_opt_out
         && eco_status != camelid::gait::substrate::EcoQosStatus::OptedOut
     {
@@ -1964,6 +2069,10 @@ fn gait_profile_trial(
     // Apply this candidate's plan before loading weights, exactly as bench-generate does.
     let plan = camelid::execution_plan::plan_for_model(model, &gguf, threads);
     camelid::execution_plan::PlannerEnv::capture().apply(&plan.env_updates);
+    // §5: apply this candidate's groups_per_chunk tiling AFTER the planner's
+    // env_updates — the gpc knobs are MANAGED_ENV_KEYS, so PlannerEnv::apply would
+    // otherwise clear/overwrite them. Applying here lets the search override win.
+    apply_groups_per_chunk(candidate.groups_per_chunk);
 
     let config = LlamaModelConfig::from_gguf(&gguf)?;
     let binding = LlamaTensorBinding::bind(&gguf, &config)?;
@@ -2012,19 +2121,21 @@ fn run_gait_calibrate(
     // Calibration must measure the candidates we choose — never let a previously
     // cached gait receipt override the candidate's profile mid-trial.
     std::env::remove_var("CAMELID_GAIT");
-    configure_rayon_threads(threads)?;
+    // §1.2: calibrate under the same core-reserve cap production will run with, so
+    // the measured tok/s reflects the host-safe thread budget. The gate is off
+    // here, so configure_rayon_threads won't apply the cap itself.
+    configure_rayon_threads(host_safe_thread_count(threads))?;
     camelid::capability::HardwareProfile::detect().log();
 
-    let prompt_text = match (&prompt_file, &prompt) {
-        (Some(path), _) => std::fs::read_to_string(path)?,
-        (None, Some(text)) => text.clone(),
-        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
-    };
+    anyhow::ensure!(
+        prompt_file.is_some() || prompt.is_some(),
+        "provide --prompt-file <path> or --prompt <text>"
+    );
 
+    // The gguf is needed for the fingerprint, memory measurement, and roofline
+    // numerator; each candidate's prompt encoding + decode happens in its own
+    // child trial (§1.4 crash isolation), so the parent does not load weights.
     let gguf = read_metadata(&model)?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
-    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
-    anyhow::ensure!(!prompt_token_ids.is_empty(), "prompt encoded to zero tokens");
 
     // Baseline = today's behavior (Auto profile, OS-managed throttling). The
     // candidates vary the EcoQoS substrate (and profile) so the tournament
@@ -2033,19 +2144,30 @@ fn run_gait_calibrate(
         label: "auto".to_string(),
         profile: ExecutionProfile::Auto,
         eco_qos_opt_out: false,
+        groups_per_chunk: None,
     };
-    let candidates = vec![
-        Candidate {
-            label: "auto+ecoqos".to_string(),
-            profile: ExecutionProfile::Auto,
-            eco_qos_opt_out: true,
-        },
-        Candidate {
-            label: "experimental+ecoqos".to_string(),
+    // §5 bounded local search: the EcoQoS substrate dimension (auto+ecoqos) plus
+    // the experimental kernel under each groups_per_chunk neighbor. Every
+    // candidate is parity-gated + crash-isolated; the tournament fails closed to
+    // baseline if none beats it by margin (the honest outcome on a
+    // memory-bandwidth-bound box, where the tiling knob is expected to be flat).
+    let mut candidates = vec![Candidate {
+        label: "auto+ecoqos".to_string(),
+        profile: ExecutionProfile::Auto,
+        eco_qos_opt_out: true,
+        groups_per_chunk: None,
+    }];
+    for gpc in camelid::gait::calibrate::groups_per_chunk_neighbors() {
+        candidates.push(Candidate {
+            label: format!(
+                "exp+gpc[{},{},{}]",
+                gpc.attn_qkv_decode, gpc.ffn_gate_up_decode, gpc.packed_rows4_matmul
+            ),
             profile: ExecutionProfile::Experimental,
-            eco_qos_opt_out: true,
-        },
-    ];
+            eco_qos_opt_out: false,
+            groups_per_chunk: Some(gpc),
+        });
+    }
 
     let store_dir = default_store_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve the gait store directory"))?;
@@ -2062,22 +2184,54 @@ fn run_gait_calibrate(
         config.warmup_rounds,
         model.display()
     );
-    let trial = |candidate: &Candidate| -> Option<camelid::gait::calibrate::TrialResult> {
-        match gait_profile_trial(&model, threads, &prompt_token_ids, max_tokens, candidate) {
-            Ok(result) => {
-                eprintln!(
-                    "[gait] {:<13} {:>7.2} tok/s  parity {}",
-                    candidate.label,
-                    result.tokens_per_s,
-                    &result.parity_token[..12]
-                );
-                Some(result)
-            }
-            Err(err) => {
-                eprintln!("[gait] {:<13} trial failed: {err}", candidate.label);
-                None
-            }
+    // §1.1 host-safety: do not launch the calibration allocation campaign (each
+    // child trial loads multi-GB weights) if the box is already low on free RAM.
+    #[cfg(windows)]
+    if let Some((total, avail)) = camelid::gait::host_ram_status() {
+        if !camelid::gait::ram_headroom_ok(total, avail) {
+            let floor = camelid::gait::ram_headroom_floor(total);
+            eprintln!(
+                "[gait] insufficient free RAM (avail {:.1} GiB < floor {:.1} GiB) -> skipping calibration; baseline serves",
+                avail as f64 / 1e9,
+                floor as f64 / 1e9
+            );
+            return Ok(());
         }
+    }
+
+    // §1.4 crash isolation: each candidate runs in a supervised CHILD PROCESS, so
+    // a candidate that segfaults or hangs cannot take down this process. The
+    // per-candidate timeout is min(3x the baseline's wall time, the absolute
+    // ceiling); the baseline (timed first) gets the full ceiling.
+    let exe = std::env::current_exe()
+        .map_err(|err| anyhow::anyhow!("cannot resolve current exe for child trials: {err}"))?;
+    let baseline_label = baseline.label.clone();
+    let mut baseline_wall: Option<std::time::Duration> = None;
+    let trial = |candidate: &Candidate| -> Option<camelid::gait::calibrate::TrialResult> {
+        let timeout = match baseline_wall {
+            Some(bw) => bw.mul_f64(3.0).min(CAL_TRIAL_CEILING),
+            None => CAL_TRIAL_CEILING,
+        };
+        let started = std::time::Instant::now();
+        let result = run_trial_in_child(
+            &exe, &model, &prompt_file, &prompt, max_tokens, candidate, threads, timeout,
+        );
+        if candidate.label == baseline_label && baseline_wall.is_none() {
+            baseline_wall = Some(started.elapsed());
+        }
+        match &result {
+            Some(r) => eprintln!(
+                "[gait] {:<13} {:>7.2} tok/s  parity {}",
+                candidate.label,
+                r.tokens_per_s,
+                &r.parity_token[..12.min(r.parity_token.len())]
+            ),
+            None => eprintln!(
+                "[gait] {:<13} disqualified (timeout/crash/parse)",
+                candidate.label
+            ),
+        }
+        result
     };
 
     let (outcome, path) = calibrate_and_store(&store_dir, &gguf, &baseline, &candidates, &config, trial);
@@ -2096,6 +2250,190 @@ fn run_gait_calibrate(
         ),
     }
     Ok(())
+}
+
+/// `camelid gait reset` — clear the entire GAIT cache, reverting fully to the
+/// baseline path (§1.3). Best-effort and idempotent: a missing cache is not an
+/// error. Deleting the folder is the documented manual revert; this is the
+/// in-CLI equivalent.
+fn run_gait_reset() -> anyhow::Result<()> {
+    match camelid::gait::gait_dir() {
+        Some(dir) if dir.exists() => {
+            std::fs::remove_dir_all(&dir)?;
+            println!("gait: cleared cache at {}", dir.display());
+        }
+        Some(dir) => {
+            println!("gait: nothing to clear ({} does not exist)", dir.display());
+        }
+        None => println!("gait: no cache directory could be resolved"),
+    }
+    Ok(())
+}
+
+/// Per-candidate absolute timeout ceiling for a child trial (§1.4). The live
+/// per-candidate budget is `min(3x the baseline's wall time, this ceiling)`.
+const CAL_TRIAL_CEILING: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// `camelid gait-trial` (internal): run ONE candidate trial in this isolated
+/// child process and print its TrialResult as a single JSON line to stdout. The
+/// crash/hang isolation lives in the PARENT supervisor ([`run_trial_in_child`]);
+/// here we just run the trial and report.
+#[allow(clippy::too_many_arguments)]
+fn run_gait_trial(
+    model: PathBuf,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    max_tokens: usize,
+    profile: String,
+    eco_qos: bool,
+    threads: Option<usize>,
+    gpc_attn: Option<usize>,
+    gpc_ffn: Option<usize>,
+    gpc_matmul: Option<usize>,
+) -> anyhow::Result<()> {
+    use camelid::execution_plan::ExecutionProfile;
+    use camelid::gait::calibrate::{Candidate, GroupsPerChunk};
+
+    anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    std::env::remove_var("CAMELID_GAIT");
+    configure_rayon_threads(host_safe_thread_count(threads))?;
+
+    let profile_label = profile.clone();
+    let profile = match profile.to_ascii_lowercase().as_str() {
+        "auto" => ExecutionProfile::Auto,
+        "safe" => ExecutionProfile::Safe,
+        "experimental" => ExecutionProfile::Experimental,
+        "debug" => ExecutionProfile::Debug,
+        other => anyhow::bail!("unknown profile {other:?} (want auto|safe|experimental|debug)"),
+    };
+
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+    let gguf = read_metadata(&model)?;
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    anyhow::ensure!(!prompt_token_ids.is_empty(), "prompt encoded to zero tokens");
+
+    // §5: the three gpc knobs travel together — all present, or none.
+    let groups_per_chunk = match (gpc_attn, gpc_ffn, gpc_matmul) {
+        (Some(a), Some(f), Some(m)) => Some(GroupsPerChunk {
+            attn_qkv_decode: a,
+            ffn_gate_up_decode: f,
+            packed_rows4_matmul: m,
+        }),
+        (None, None, None) => None,
+        _ => anyhow::bail!(
+            "groups_per_chunk override requires all three of --gpc-attn / --gpc-ffn / --gpc-matmul"
+        ),
+    };
+    let candidate = Candidate {
+        label: profile_label,
+        profile,
+        eco_qos_opt_out: eco_qos,
+        groups_per_chunk,
+    };
+    let result = gait_profile_trial(&model, threads, &prompt_token_ids, max_tokens, &candidate)?;
+    // The ONLY stdout line — the JSON result the parent supervisor parses.
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+/// Run ONE candidate trial in a supervised child process, returning its result or
+/// `None` if it timed out, crashed, exited non-zero, or its output could not be
+/// parsed (the candidate is disqualified upstream). This is the §1.4 crash-
+/// isolation boundary: a segfaulting/hanging candidate kernel cannot take down
+/// the calibrating (or, in production, serving) process.
+fn run_trial_in_child(
+    exe: &std::path::Path,
+    model: &std::path::Path,
+    prompt_file: &Option<PathBuf>,
+    prompt: &Option<String>,
+    max_tokens: usize,
+    candidate: &camelid::gait::calibrate::Candidate,
+    threads: Option<usize>,
+    timeout: std::time::Duration,
+) -> Option<camelid::gait::calibrate::TrialResult> {
+    use camelid::gait::calibrate::{supervise, TrialResult, WatchdogOutcome};
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new(exe);
+    cmd.arg("gait-trial")
+        .arg(model)
+        .arg("--profile")
+        .arg(gait_profile_env_value(&candidate.profile))
+        .arg("--max-tokens")
+        .arg(max_tokens.to_string());
+    if candidate.eco_qos_opt_out {
+        cmd.arg("--eco-qos");
+    }
+    if let Some(t) = threads {
+        cmd.arg("--threads").arg(t.to_string());
+    }
+    if let Some(g) = candidate.groups_per_chunk {
+        cmd.arg("--gpc-attn")
+            .arg(g.attn_qkv_decode.to_string())
+            .arg("--gpc-ffn")
+            .arg(g.ffn_gate_up_decode.to_string())
+            .arg("--gpc-matmul")
+            .arg(g.packed_rows4_matmul.to_string());
+    }
+    match (prompt_file, prompt) {
+        (Some(path), _) => {
+            cmd.arg("--prompt-file").arg(path);
+        }
+        (None, Some(text)) => {
+            cmd.arg("--prompt").arg(text);
+        }
+        (None, None) => {}
+    }
+    // CPU calibration; keep the child off the GPU and out of the gait selector.
+    cmd.env("CUDA_VISIBLE_DEVICES", "-1");
+    cmd.env_remove("CAMELID_GAIT");
+    // stdout carries the JSON result; stderr is inherited so the child's logs show.
+    cmd.stdout(Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("[gait] {:<13} child spawn failed: {err}", candidate.label);
+            return None;
+        }
+    };
+
+    match supervise(child, timeout, std::time::Duration::from_millis(100)) {
+        WatchdogOutcome::Completed(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // The result is the last parseable JSON line (robust to stray stdout).
+            stdout
+                .lines()
+                .rev()
+                .find_map(|line| serde_json::from_str::<TrialResult>(line.trim()).ok())
+        }
+        WatchdogOutcome::Completed(out) => {
+            eprintln!(
+                "[gait] {:<13} child exited {} -> disqualified",
+                candidate.label, out.status
+            );
+            None
+        }
+        WatchdogOutcome::TimedOut => {
+            eprintln!(
+                "[gait] {:<13} TIMED OUT after {timeout:?} -> disqualified",
+                candidate.label
+            );
+            None
+        }
+        WatchdogOutcome::Errored => {
+            eprintln!(
+                "[gait] {:<13} child supervision error -> disqualified",
+                candidate.label
+            );
+            None
+        }
+    }
 }
 
 struct GenerationRun {
@@ -4458,6 +4796,26 @@ fn windows_physical_core_count() -> Option<usize> {
     }
 }
 
+/// §1.2 core-cap: clamp a resolved compute-thread count so the OS always keeps
+/// its reserve (see [`camelid::gait::compute_thread_budget`]). Windows x86-64
+/// only — the GAIT substrate's scope; elsewhere `requested` is returned
+/// unchanged. A `None` request resolves to the full safe budget.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn host_safe_thread_count(requested: Option<usize>) -> Option<usize> {
+    let phys = windows_physical_core_count()?;
+    let budget = camelid::gait::compute_thread_budget(phys);
+    Some(
+        requested
+            .map(|r| r.min(budget.threads))
+            .unwrap_or(budget.threads),
+    )
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn host_safe_thread_count(requested: Option<usize>) -> Option<usize> {
+    requested
+}
+
 fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
     if let Some(t) = threads {
         anyhow::ensure!(t > 0, "--threads must be greater than zero");
@@ -4469,6 +4827,15 @@ fn configure_rayon_threads(threads: Option<usize>) -> anyhow::Result<()> {
     let resolved = threads.or_else(windows_physical_core_count);
     #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
     let resolved = threads;
+
+    // §1.2 host-safety: when GAIT is engaged, cap the pool so the OS keeps a core
+    // reserve. Gated on the bring-up flag so the default path is byte-identical;
+    // when GAIT becomes the baseline the cap becomes unconditional.
+    let resolved = if camelid::gait::gait_enabled() {
+        host_safe_thread_count(resolved)
+    } else {
+        resolved
+    };
 
     #[cfg(target_os = "macos")]
     let should_configure = true;

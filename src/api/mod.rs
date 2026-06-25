@@ -1412,7 +1412,14 @@ pub async fn serve(
     let warm_model_id = state.active_model_id.read().await.clone();
     let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
     if let Some(model_id) = warm_model_id {
-        eprintln!("\n  🐪 Warming up the GPU (building the resident engine, one-time)…");
+        // Word the banner for the device that will actually serve — saying "GPU"
+        // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
+        let warming_msg = if crate::cuda::gpu_accel_enabled() {
+            "🐪 Warming up the GPU (building the resident engine, one-time)…"
+        } else {
+            "🐪 Warming up the model (building the engine, one-time)…"
+        };
+        eprintln!("\n  {warming_msg}");
         warmup_generation_blocking(addr, model_id).await;
     }
     print_ready_banner(&url);
@@ -6951,7 +6958,14 @@ async fn generate_decoded_tokens_blocking(
         generate_decoded_tokens(prepared)
     });
     match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => {
+            // §4 safe-boot: a decode ran to completion under the applied gait
+            // without wedging the host, so clear the in-progress marker. Cheap
+            // and idempotent (a no-op after the first call, or when no gait was
+            // applied), so it is safe on the hot path.
+            crate::gait::sentinel::mark_healthy();
+            result
+        }
         Ok(Err(err)) => Err(Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "generation_worker_failed",

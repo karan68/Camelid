@@ -29,6 +29,7 @@ use crate::gguf::GgufFile;
 use crate::receipt::{canonical_json, sha256_hex};
 
 pub mod calibrate;
+pub mod sentinel;
 pub mod substrate;
 
 /// Schema identifier stamped into every v1 gait receipt. Mirrors the
@@ -558,6 +559,13 @@ pub struct GaitReceipt {
     /// receipt. Part of the canonical body, so bound into `receipt_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration: Option<calibrate::CalibrationOutcome>,
+    /// §6F host-safety scheduling attestation (the §1.2 cap + the §1.1/§1.2
+    /// invariants). Absent for receipts written before this lane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<Scheduling>,
+    /// §6F measured host-safety posture (free-RAM headroom at calibration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_safety: Option<HostSafety>,
 }
 
 impl GaitReceipt {
@@ -573,6 +581,8 @@ impl GaitReceipt {
             recorded_profile,
             memory: None,
             calibration: None,
+            scheduling: None,
+            host_safety: None,
         };
         receipt.seal();
         receipt
@@ -589,6 +599,20 @@ impl GaitReceipt {
     /// Attach the calibration evidence and re-seal.
     pub fn with_calibration(mut self, calibration: calibrate::CalibrationOutcome) -> Self {
         self.calibration = Some(calibration);
+        self.seal();
+        self
+    }
+
+    /// Attach the §6F scheduling attestation and re-seal.
+    pub fn with_scheduling(mut self, scheduling: Scheduling) -> Self {
+        self.scheduling = Some(scheduling);
+        self.seal();
+        self
+    }
+
+    /// Attach the §6F measured host-safety posture and re-seal.
+    pub fn with_host_safety(mut self, host_safety: HostSafety) -> Self {
+        self.host_safety = Some(host_safety);
         self.seal();
         self
     }
@@ -630,8 +654,9 @@ pub fn gait_dir() -> Option<PathBuf> {
 
 /// File name for a key. The key contains `:` (invalid on Windows), so it is
 /// sanitized; the full key is also recorded inside the receipt and re-checked on
-/// load.
-fn key_filename(key: &str) -> String {
+/// load. Crate-visible so the safe-boot sentinel addresses the same receipt file
+/// when quarantining a suspect gait.
+pub(crate) fn key_filename(key: &str) -> String {
     format!("{}.gait.json", key.replace(':', "_"))
 }
 
@@ -669,6 +694,10 @@ pub fn load_from(dir: &Path, key: &str) -> Option<GaitReceipt> {
 /// planner should use plus the scheduling substrate to apply.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectedGait {
+    /// The `gait_key` this profile was selected for — the safe-boot sentinel
+    /// records it in the `.applying` marker so a crashing gait can be quarantined
+    /// by key on the next launch.
+    pub gait_key: String,
     pub profile: ExecutionProfile,
     pub reason: String,
     pub eco_qos_opt_out: bool,
@@ -690,18 +719,34 @@ pub(crate) fn receipt_eco_opt_out(receipt: &GaitReceipt) -> bool {
 /// receipt exists for this model on this machine. In every other case it returns
 /// `None` and the planner falls through to its existing default.
 pub fn maybe_select_profile(gguf: &GgufFile) -> Option<SelectedGait> {
+    let dir = gait_dir()?;
+    maybe_select_profile_in(&dir, gguf)
+}
+
+/// `dir`-explicit core of [`maybe_select_profile`], so the gate / `DISABLE` /
+/// quarantine behavior is testable against a temporary store. Returns `None`
+/// (the baseline path) when the gate is off, the `DISABLE` kill-file is present,
+/// or no loadable receipt exists for this `(model × machine)` — a quarantined
+/// receipt has been moved out of `dir`, so it simply misses here.
+pub(crate) fn maybe_select_profile_in(dir: &Path, gguf: &GgufFile) -> Option<SelectedGait> {
     if !gait_enabled() {
+        return None;
+    }
+    // §1.3 kill-file: while `DISABLE` exists, serve the baseline unconditionally —
+    // no cached profile and no substrate.
+    if sentinel::disable_present(dir) {
         return None;
     }
     let model_sig = ModelSig::from_gguf(gguf);
     let machine_sig = MachineSig::detect();
     let key = gait_key(&model_sig, &machine_sig);
-    let dir = gait_dir()?;
-    let receipt = load_from(&dir, &key)?;
+    let receipt = load_from(dir, &key)?;
+    let reason = format!("gait: applied cached profile for {key}");
     Some(SelectedGait {
+        gait_key: key,
         eco_qos_opt_out: receipt_eco_opt_out(&receipt),
         profile: receipt.recorded_profile,
-        reason: format!("gait: applied cached profile for {key}"),
+        reason,
     })
 }
 
@@ -710,14 +755,163 @@ pub fn maybe_select_profile(gguf: &GgufFile) -> Option<SelectedGait> {
 /// substrate (EcoQoS) and logs the live gait so it is observable. Best-effort and
 /// process-level. Only invoked when a gait was selected (gate on + receipt found).
 pub fn apply_selected_gait(gait: &SelectedGait) {
+    // §4 safe-boot: record the in-progress apply BEFORE touching the host, so a
+    // crash/freeze/wedge during apply or early use leaves a marker that the next
+    // launch detects and quarantines. The marker is cleared once a real decode
+    // completes (`sentinel::mark_healthy`) or on an orderly exit
+    // (`sentinel::clean_shutdown`).
+    //
+    // WAVE 2: the healthy-clear currently fires on the first completed decode,
+    // which fully guards the apply window and a parity-gated profile (a profile
+    // is only ever persisted after it decoded cleanly on this exact machine
+    // during calibration). When non-parity-gated, host-touching levers land
+    // (CPU-set pinning, the sustained-throttle valve, live in-process
+    // calibration), move the clear-point to *after a sustained-healthy window*
+    // so a gait that wedges the host mid-session is still caught.
+    if let Some(dir) = gait_dir() {
+        let mut layers: Vec<&str> = vec!["gait"];
+        if gait.eco_qos_opt_out {
+            layers.push("substrate");
+        }
+        sentinel::begin_apply(&dir, &gait.gait_key, &layers);
+    }
     if gait.eco_qos_opt_out {
-        let status = substrate::set_eco_qos_opt_out(true);
+        // §1.2: scope the EcoQoS opt-out to the compute worker threads only (the
+        // Rayon decode pool + this thread), NOT the whole process — UI and
+        // background threads keep their eco-friendly OS-managed default.
+        let status = substrate::set_compute_pool_eco_qos(true);
         eprintln!(
-            "[gait] applied profile={:?} + eco_qos opt-out -> {status:?}",
+            "[gait] applied profile={:?} + eco_qos opt-out (compute pool) -> {status:?}",
             gait.profile
         );
     } else {
         eprintln!("[gait] applied profile={:?}", gait.profile);
+    }
+}
+
+/// §1.2 host-safety compute-thread budget. The compute pool must always leave the
+/// OS headroom: reserve at least one core, and at least two on small machines
+/// (`<= 8` physical cores), so the UI/OS keep a performance core no matter what.
+/// Pure arithmetic on the physical-core count, so it is platform-independent and
+/// directly testable; never returns zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComputeThreadBudget {
+    /// Compute worker threads permitted (`>= 1`).
+    pub threads: usize,
+    /// Cores actually left for the OS (`physical_cores - threads`).
+    pub reserved: usize,
+}
+
+/// Resolve the [`ComputeThreadBudget`] for a machine with `physical_cores`.
+pub fn compute_thread_budget(physical_cores: usize) -> ComputeThreadBudget {
+    // Reserve two cores on small boxes, one on larger ones.
+    let want_reserve = if physical_cores <= 8 { 2 } else { 1 };
+    // Never drop below a single worker, even on a 1-2 core host.
+    let threads = physical_cores.saturating_sub(want_reserve).max(1);
+    let reserved = physical_cores.saturating_sub(threads);
+    ComputeThreadBudget { threads, reserved }
+}
+
+/// §1.1 free-RAM floor: GAIT keeps at least `max(20% of total, 4 GiB)` of physical
+/// RAM free, so an allocation campaign (e.g. calibration loading candidate
+/// weights) can never drive the host into swap / OOM. Pure, so it is testable.
+pub fn ram_headroom_floor(total_bytes: u64) -> u64 {
+    const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
+    (total_bytes / 5).max(FOUR_GIB)
+}
+
+/// True when `available_bytes` of free physical RAM respects the §1.1 floor for a
+/// host with `total_bytes` of physical RAM.
+pub fn ram_headroom_ok(total_bytes: u64, available_bytes: u64) -> bool {
+    available_bytes >= ram_headroom_floor(total_bytes)
+}
+
+/// Physical RAM `(total, available)` in bytes via `GlobalMemoryStatusEx`. `None`
+/// off Windows or on query failure (the caller then proceeds without the gate
+/// rather than blocking).
+#[cfg(windows)]
+pub fn host_ram_status() -> Option<(u64, u64)> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: a zeroed MEMORYSTATUSEX with dwLength set to its own size, exactly
+    // as GlobalMemoryStatusEx requires; the call only reads/writes that struct.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if GlobalMemoryStatusEx(&mut status) == 0 {
+            return None;
+        }
+        Some((status.ullTotalPhys, status.ullAvailPhys))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn host_ram_status() -> Option<(u64, u64)> {
+    None
+}
+
+/// The host-safety scheduling posture recorded in a gait receipt (§6F) — an
+/// attestation of the guarantees Waves 1–2 enforce, so a reader can audit *how* a
+/// gait runs without trusting prose. Every field is honestly derived: the cap
+/// from the topology, the constants from architectural invariants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scheduling {
+    /// The §1.2 compute-thread cap (`budget.threads`) — the most workers this gait
+    /// will use. `None` if the physical-core count was unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compute_threads: Option<usize>,
+    /// Cores reserved for the OS under that cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_cores: Option<usize>,
+    /// Whether the EcoQoS execution-speed opt-out is applied (compute pool only).
+    pub eco_qos_opt_out: bool,
+    /// Always `"none"` — GAIT never page-locks the weight arena (§1.1).
+    pub memory_locking: String,
+    /// Always `"untouched"` — GAIT never alters processor-performance / thermal
+    /// limits (§1.2).
+    pub thermal_limits: String,
+    /// Software weight-stream prefetch depth (0 = baseline; `>0` once §6D lands).
+    pub stream_prefetch_depth: u32,
+    /// CPU-set the compute pool is pinned to (empty until §1.2 CPU-set pinning).
+    pub compute_cpuset: Vec<u32>,
+}
+
+impl Scheduling {
+    /// Build the scheduling attestation from the machine's physical-core count and
+    /// the selected EcoQoS choice: records the §1.2 cap and the §1.1/§1.2
+    /// architectural constants.
+    pub fn attest(physical_cores: Option<usize>, eco_qos_opt_out: bool) -> Self {
+        let budget = physical_cores.map(compute_thread_budget);
+        Scheduling {
+            compute_threads: budget.map(|b| b.threads),
+            reserved_cores: budget.map(|b| b.reserved),
+            eco_qos_opt_out,
+            memory_locking: "none".to_string(),
+            thermal_limits: "untouched".to_string(),
+            stream_prefetch_depth: 0,
+            compute_cpuset: Vec::new(),
+        }
+    }
+}
+
+/// The measured host-safety posture at calibration time (§6F). Only fields GAIT
+/// genuinely measures are recorded — throttle-event counting and UI-responsiveness
+/// monitoring are deliberately ABSENT until the §1.2 throttle valve exists, so the
+/// receipt never attests a safety number it did not actually measure.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HostSafety {
+    /// Free physical RAM observed at calibration, in GiB (the §1.1 headroom).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_headroom_gib: Option<f64>,
+}
+
+impl HostSafety {
+    /// Capture the current host-safety posture (free-RAM headroom). The float is
+    /// `round_sig6`-normalized so the content-addressed receipt's self-digest
+    /// survives a file round-trip (see [`round_sig6`]).
+    pub fn capture() -> Self {
+        let ram_headroom_gib = host_ram_status()
+            .map(|(_total, avail)| round_sig6(avail as f64 / (1024.0 * 1024.0 * 1024.0)));
+        HostSafety { ram_headroom_gib }
     }
 }
 
@@ -966,6 +1160,12 @@ pub mod oracle {
     }
 }
 
+/// Serializes the tests that mutate the process-global `CAMELID_GAIT` env var so
+/// they cannot race each other (Rust runs tests in parallel by default). Held for
+/// the duration of any test that sets or clears the gate.
+#[cfg(test)]
+pub(crate) static GAIT_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,7 +1379,60 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_attest_records_cap_and_constants() {
+        let s = Scheduling::attest(Some(8), true);
+        assert_eq!(s.compute_threads, Some(6)); // 8 - 2 reserve on a small box
+        assert_eq!(s.reserved_cores, Some(2));
+        assert!(s.eco_qos_opt_out);
+        assert_eq!(s.memory_locking, "none");
+        assert_eq!(s.thermal_limits, "untouched");
+        assert_eq!(s.stream_prefetch_depth, 0);
+        assert!(s.compute_cpuset.is_empty());
+        // Unknown topology -> no thread numbers, but the invariants still hold.
+        let u = Scheduling::attest(None, false);
+        assert_eq!(u.compute_threads, None);
+        assert_eq!(u.reserved_cores, None);
+        assert_eq!(u.memory_locking, "none");
+    }
+
+    #[test]
+    fn receipt_with_scheduling_and_host_safety_round_trips() {
+        let dir = std::env::temp_dir().join(format!("camelid_gait_sched_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = GaitReceipt::new(
+            ModelSig::from_gguf(&sample_gguf()),
+            MachineSig::detect(),
+            ExecutionProfile::Auto,
+        );
+        // 9.5 is an exact binary fraction, so it survives the JSON round-trip the
+        // content-addressed self-digest depends on.
+        let enriched = base
+            .clone()
+            .with_scheduling(Scheduling::attest(Some(8), false))
+            .with_host_safety(HostSafety {
+                ram_headroom_gib: Some(9.5),
+            });
+        // Enrichment changes the sealed digest but not the key, and stays verifiable.
+        assert_ne!(enriched.receipt_id, base.receipt_id);
+        assert_eq!(enriched.gait_key, base.gait_key);
+        assert!(enriched.verify_self_digest());
+
+        store_in(&dir, &enriched).expect("store");
+        let loaded = load_from(&dir, &enriched.gait_key).expect("load");
+        assert_eq!(loaded, enriched);
+        assert_eq!(
+            loaded.scheduling.as_ref().unwrap().thermal_limits,
+            "untouched"
+        );
+        assert_eq!(loaded.host_safety.unwrap().ram_headroom_gib, Some(9.5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn selector_is_none_when_gate_disabled() {
+        let _env = GAIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // With the gate unset, the selector must not touch the store at all.
         std::env::remove_var(GAIT_GATE_ENV);
         assert!(maybe_select_profile(&sample_gguf()).is_none());
@@ -1207,6 +1460,7 @@ mod tests {
             fell_back: false,
             parity_disqualified: Vec::new(),
             selected_eco_qos_opt_out: true,
+            selected_groups_per_chunk: None,
             measured_rounds: 1,
             samples: Vec::new(),
         };
@@ -1217,5 +1471,291 @@ mod tests {
         )
         .with_calibration(outcome);
         assert!(receipt_eco_opt_out(&receipt));
+    }
+}
+
+/// §9 host-safety gates. These assert the prime-directive guard rails the v2
+/// campaign adds, not just the happy path. Run with:
+/// `cargo test --lib -- --include-ignored gait_safety`.
+#[cfg(test)]
+mod gait_safety {
+    use super::*;
+    use crate::gguf::{GgufFile, GgufMetadataValue, GgufTensorDescriptor, GgufTensorType};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        GAIT_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "camelid_gait_safety_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample_gguf() -> GgufFile {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetadataValue::String("llama".to_string()),
+        );
+        metadata.insert("llama.block_count".to_string(), GgufMetadataValue::U32(4));
+        metadata.insert(
+            "llama.embedding_length".to_string(),
+            GgufMetadataValue::U32(64),
+        );
+        GgufFile {
+            path: PathBuf::from("safety.gguf"),
+            version: 3,
+            tensor_count: 1,
+            metadata_count: metadata.len() as i64,
+            alignment: 32,
+            data_start_offset: 0,
+            metadata,
+            tensors: vec![GgufTensorDescriptor {
+                name: "blk.0.attn_q.weight".to_string(),
+                dimensions: vec![64, 64],
+                tensor_type: GgufTensorType::Q8_0,
+                relative_offset: 0,
+                absolute_offset: 0,
+                n_bytes: 0,
+            }],
+        }
+    }
+
+    /// §1.3: a `DISABLE` kill-file forces the baseline path even with the gate on
+    /// and a valid cached receipt present.
+    #[test]
+    fn disable_file_forces_baseline() {
+        let _env = lock_env();
+        let dir = temp_dir("disable");
+        let gguf = sample_gguf();
+        let receipt = GaitReceipt::new(
+            ModelSig::from_gguf(&gguf),
+            MachineSig::detect(),
+            ExecutionProfile::Auto,
+        );
+        store_in(&dir, &receipt).expect("store receipt");
+
+        std::env::set_var(GAIT_GATE_ENV, "1");
+        // Sanity: gate on + receipt present => the selector adopts it.
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_some(),
+            "precondition: a cached gait should be selected before DISABLE"
+        );
+        // Drop the kill-file: the selector must now serve baseline (None), no
+        // profile and no substrate, despite the live receipt.
+        std::fs::write(dir.join("DISABLE"), "").expect("write DISABLE");
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_none(),
+            "DISABLE must force the baseline path"
+        );
+
+        std::env::remove_var(GAIT_GATE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §4 crash-injection: a stored receipt + a stale `.applying` marker (a prior
+    /// unclean exit) must be quarantined on the next launch, after which the
+    /// selector serves the proven baseline.
+    #[test]
+    fn safe_boot_quarantines_bad_gait() {
+        let _env = lock_env();
+        let dir = temp_dir("safe_boot");
+        let gguf = sample_gguf();
+        let model_sig = ModelSig::from_gguf(&gguf);
+        let machine_sig = MachineSig::detect();
+        let key = gait_key(&model_sig, &machine_sig);
+
+        // The persisted (here, suspect) gait that crashed the prior run.
+        let receipt = GaitReceipt::new(model_sig, machine_sig, ExecutionProfile::Experimental);
+        store_in(&dir, &receipt).expect("store receipt");
+        // The marker the crashed run left behind (written directly so the global
+        // armed slot is untouched — this stands in for a previous process).
+        let marker = sentinel::ApplyingMarker {
+            gait_key: key.clone(),
+            layers: vec!["gait".to_string(), "substrate".to_string()],
+            pid: 999_999,
+            utc_epoch_secs: 0,
+        };
+        std::fs::write(
+            dir.join(".applying"),
+            serde_json::to_string(&marker).unwrap(),
+        )
+        .expect("write marker");
+
+        std::env::set_var(GAIT_GATE_ENV, "1");
+        // Sanity: before reconciliation the suspect gait is loadable.
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_some(),
+            "precondition: the suspect gait should load before reconciliation"
+        );
+
+        // Next launch reconciles the stale marker.
+        match sentinel::reconcile_on_startup(&dir) {
+            sentinel::StartupReconcile::UncleanExit {
+                gait_key,
+                quarantined,
+            } => {
+                assert_eq!(gait_key.as_deref(), Some(key.as_str()));
+                assert!(quarantined, "first unclean exit must quarantine (threshold 1)");
+            }
+            other => panic!("expected UncleanExit, got {other:?}"),
+        }
+
+        // The receipt is quarantined, the marker cleared, so the selector now
+        // boots the baseline.
+        assert!(
+            maybe_select_profile_in(&dir, &gguf).is_none(),
+            "after quarantine the selector must serve baseline"
+        );
+        assert!(
+            dir.join(".quarantine").join(key_filename(&key)).exists(),
+            "the suspect receipt must be preserved under .quarantine/ for diagnosis"
+        );
+        assert!(!dir.join(".applying").exists(), "the marker must be cleared");
+
+        std::env::remove_var(GAIT_GATE_ENV);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §1.2: the compute-thread budget always leaves the OS a core reserve, never
+    /// returns zero, and never exceeds the physical-core count.
+    #[test]
+    fn core_headroom() {
+        for &phys in &[1usize, 2, 4, 6, 8, 12, 16, 32, 64] {
+            let b = compute_thread_budget(phys);
+            assert!(b.threads >= 1, "phys={phys}: must keep >=1 worker");
+            assert!(b.threads <= phys, "phys={phys}: cannot exceed physical cores");
+            assert_eq!(
+                b.reserved,
+                phys - b.threads,
+                "phys={phys}: reserved bookkeeping"
+            );
+            if phys >= 2 {
+                assert!(b.reserved >= 1, "phys={phys}: OS must keep >=1 core");
+            }
+            if (3..=8).contains(&phys) {
+                assert!(b.reserved >= 2, "phys={phys}: small boxes reserve >=2 cores");
+                assert!(b.threads <= phys - 2, "phys={phys}: threads <= phys-2");
+            }
+            if phys > 8 {
+                assert!(b.threads <= phys - 1, "phys={phys}: threads <= phys-1");
+            }
+        }
+    }
+
+    /// §1.1: the weight/KV arena is never page-locked. Audit the load/mmap path
+    /// source for the forbidden APIs — locking pages makes them non-reclaimable
+    /// and can OOM/wedge the host (the v1 crash mechanism, REMOVED in v2).
+    #[test]
+    fn no_weight_locking() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        // The weight-arena load + mmap path. (Deliberately not this file — it
+        // contains the forbidden token strings below as the search needles.)
+        let arena_files = ["src/wire_mmap.rs", "src/platform_fs.rs"];
+        let forbidden = [
+            "VirtualLock",
+            "MEM_LARGE_PAGES",
+            "GetLargePageMinimum",
+            "SetProcessWorkingSetSize",
+            "mlockall",
+            "MAP_LOCKED",
+        ];
+        for rel in arena_files {
+            let path = std::path::Path::new(root).join(rel);
+            let Ok(src) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for token in forbidden {
+                assert!(
+                    !src.contains(token),
+                    "{rel} must not page-lock the weight arena (found `{token}`)"
+                );
+            }
+        }
+    }
+
+    /// §6C: off Windows the scheduling substrate is fully inert — every lever
+    /// returns Unavailable, so a non-Windows run is byte-identical to baseline.
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_byte_identical() {
+        assert_eq!(
+            substrate::set_eco_qos_opt_out(true),
+            substrate::EcoQosStatus::Unavailable
+        );
+        assert_eq!(
+            substrate::set_thread_eco_qos_opt_out(true),
+            substrate::EcoQosStatus::Unavailable
+        );
+        assert_eq!(
+            substrate::set_compute_pool_eco_qos(true),
+            substrate::EcoQosStatus::Unavailable
+        );
+    }
+
+    #[cfg(windows)]
+    fn hanging_child() -> std::process::Child {
+        std::process::Command::new("cmd")
+            .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hanging child")
+    }
+
+    #[cfg(not(windows))]
+    fn hanging_child() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn hanging child")
+    }
+
+    /// §1.4: a candidate that hangs is killed at the deadline and abandoned — the
+    /// supervisor returns promptly and the calling (serving) process survives.
+    #[test]
+    fn watchdog_survives_hung_candidate() {
+        use std::time::{Duration, Instant};
+        let child = hanging_child();
+        let started = Instant::now();
+        let outcome = calibrate::supervise(
+            child,
+            Duration::from_millis(400),
+            Duration::from_millis(20),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, calibrate::WatchdogOutcome::TimedOut),
+            "a hung candidate must time out, got {outcome:?}"
+        );
+        // Killed at the deadline, not waited out (the child would sleep ~30s); and
+        // reaching this line at all proves the supervisor did not wedge us.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "watchdog must kill promptly, took {elapsed:?}"
+        );
+    }
+
+    /// §1.1: the free-RAM floor is max(20% of total, 4 GiB), and the headroom
+    /// check honors it.
+    #[test]
+    fn ram_headroom() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // 20% dominates on a big box; the 4 GiB floor dominates on a small one.
+        assert_eq!(ram_headroom_floor(100 * GIB), 20 * GIB);
+        assert_eq!(ram_headroom_floor(8 * GIB), 4 * GIB);
+        assert!(ram_headroom_ok(100 * GIB, 30 * GIB));
+        assert!(!ram_headroom_ok(100 * GIB, 10 * GIB));
+        assert!(ram_headroom_ok(8 * GIB, 5 * GIB));
+        assert!(!ram_headroom_ok(8 * GIB, 2 * GIB));
     }
 }
