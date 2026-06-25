@@ -13,7 +13,9 @@ Per-cell vocabulary (conductor §5):
 
 **Phase 0 status:** 3 / 4 rows discovered + hash-anchored (TinyLlama, Llama 3.2 1B, Llama 3.2 3B). **Llama 3 8B Q8_0 is not downloaded** — its column (`*`) is PROVISIONAL (spec-derived, not GGUF-anchored, Phase 0 INCOMPLETE).
 
-**Cell tally** (4 model columns × 13 capabilities = 52 cells): `n/a` 4 · `open` 11 · `wip` 11 · `done` 26. The `done` cells are each backed by a `camelid.capability-receipt/v1` under `qa/capability/receipts/`, validated this pass on the **3 on-disk rows** (TinyLlama, Llama 3.2 1B, Llama 3.2 3B) — no cross-row inheritance (conductor §6). The 8B column stays provisional until its GGUF is downloaded.
+**Cell tally** (4 model columns × 13 capabilities = 52 cells): `n/a` 4 · `open` 11 · `wip` 5 · `done` 32. The `done` cells are each backed by a `camelid.capability-receipt/v1` under `qa/capability/receipts/`, validated on the **3 on-disk rows** (TinyLlama, Llama 3.2 1B, Llama 3.2 3B) — no cross-row inheritance (conductor §6). The 8B column stays provisional until its GGUF is downloaded.
+
+Two `wip` cells are **host-limited, not model-limited**: `context.full_length` on Llama 3.2 1B and 3B is validated bit-exact across a long context (feasible frontier 8511 / 8304 tokens), but their trained **131072** context materializes an **8.0 GiB / 28 GiB** f32 CPU KV cache that this 15.74 GiB box cannot safely hold — so those cells stay `wip` (the model supports it; this host cannot reach it). See `qa/validation-notes/2026-06-25-capability-context-host-limits.md`, which also flags that Camelid has no pre-flight KV predict-and-abort. The remaining `wip` is `load.quant_breadth` ×3 (secondary axis).
 
 ## Matrix
 
@@ -25,11 +27,11 @@ Per-cell vocabulary (conductor §5):
 | `sampling.full_set` | I | done | done | done | open | partial |
 | `sampling.seed_determinism` | I | done | done | done | open | drives |
 | `logprobs.top_logprobs` | D | done | done | done | open | drives |
-| `chat.system_multiturn` | D | wip | wip | wip | open | drives |
+| `chat.system_multiturn` | D | done | done | done | open | drives |
 | `tools.function_calling` | B | n/a | done | done | n/a | drives |
 | `structured.json_grammar` | B | done | done | done | open | drives |
-| `context.full_length` | D | wip | wip | wip | open | drives |
-| `context.rope_scaling` | D | n/a | wip | wip | n/a | drives |
+| `context.full_length` | D | done | wip | wip | open | drives |
+| `context.rope_scaling` | D | n/a | done | done | n/a | drives |
 | `observ.usage_timing` | C | done | done | done | open | drives |
 | `load.quant_breadth` | D | wip | wip | wip | open | partial |
 
@@ -50,15 +52,15 @@ Per-cell vocabulary (conductor §5):
 - **`logprobs.top_logprobs`** — logprobs/top_logprobs at temp=0 (any causal LM)
   - DONE (class D, 3 on-disk rows): per-step log_softmax capture in the decode loop (greedy-fast bypassed) -> chat logprobs.content[] + completions logprobs.{tokens,token_logprobs,top_logprobs,text_offset}. Greedy invariant + shapes validated e2e; token IDs bit-exact vs llama.cpp acd79d6 (values within the ~5e-2 f32 envelope). Non-streaming single-choice. Receipt minted.
 - **`chat.system_multiturn`** — system role + multi-turn template fidelity (per THIS template)
-  - wip — per-arch renderers drive system + multi-turn (api/mod.rs:8789+); not exercised by this pass's smoke (single user turn). Needs a system+multi-turn e2e to earn its receipt.
+  - DONE (class D, 3 on-disk rows): a system + 2-user-turn + 1-assistant-turn conversation, greedy. GENERATION PARITY bit-exact vs llama.cpp acd79d6 on all 3 rows (prompt-pinned `verify-receipt`, first_divergent_token_index=-1). TEMPLATE FIDELITY: TinyLlama byte+token-identical to llama.cpp; Llama 3.2 1B/3B differ ONLY by the live-date "Cutting Knowledge Date / Today Date" system preamble llama.cpp injects — a non-deterministic, intended cross-engine difference (src/receipt/verify.rs:662), so parity is asserted on the pinned prompt. Harness qa/capability/system_multiturn_parity.mjs. Receipts minted.
 - **`tools.function_calling`** — native tool/function calling — REQUIRES tool-call branch or tool/ipython control tokens in THIS model template
   - DONE (class B, Llama 3.2 1B/3B): input renders tools via the model template; output now parses the Llama 3.x {name,parameters} tool-call into OpenAI tool_calls (parse_tool_calls), finish_reason=tool_calls, content emptied. tool_choice:none suppresses. Battery 6/6 structurally valid. TinyLlama/8B n/a (no tool branch).
 - **`structured.json_grammar`** — JSON mode + GBNF grammar-constrained decode (decoder-side, model-agnostic)
   - DONE (class B, 3 on-disk rows): response_format json_object -> JSON-grammar-constrained decoding (src/grammar.rs PDA + per-step logit mask in the decode loop). Battery 12/12 valid JSON. Non-streaming; json_schema/GBNF + force-close-at-max_tokens are follow-ups.
 - **`context.full_length`** — full TRAINED context length, exact value from metadata
-  - wip — honored from GGUF metadata as KV cap (model.rs:141, inference.rs:2086). Trained length differs per row: TL 2048 / 1B 131072 / 3B 131072 / 8B 8192*. Needs near-limit validation (memory predict-and-abort).
-- **`context.rope_scaling`** — RoPE scaling/extension — REQUIRES a rope scaling type/factor declared in metadata
-  - Engine implements None/Linear/Llama3/YaRN (rope.rs:296-518). TinyLlama & 8B: no scaling (n/a). Llama 3.2 1B/3B: llama3 scaling baked into rope_freqs.weight (no metadata key) reaching 131072 → capable/wip; validate parity at extended positions vs llama.cpp.
+  - DONE for TinyLlama (class D): validated bit-exact at 1953 tok = 95% of the full trained 2048; KV ~88 MiB, fully reachable; receipt minted. 1B/3B: **HOST-LIMITED, stays `wip`** — validated bit-exact at the feasible frontier (8511 / 8304 tok) but the trained 131072 needs 8.0 GiB / 28 GiB f32 CPU KV, unreachable with safe headroom on this 15.74 GiB box (NOT a model limit). Cap honored from GGUF metadata (model.rs:141, kv_cache.rs:23). Camelid has **no pre-flight KV predict-and-abort** (would OOM mid-gen at kv_cache.rs:135-136) — flagged as a follow-up. Harness qa/capability/context_parity.mjs (projects KV + aborts before an unsafe ctx). See qa/validation-notes/2026-06-25-capability-context-host-limits.md.
+- **`context.rope_scaling`** — RoPE scaling/extension (llama3 baked rope_freqs) at positions beyond the original context
+  - DONE (class D, Llama 3.2 1B/3B): bit-exact parity vs llama.cpp acd79d6 at positions BEYOND the original 8192 context (1B 8511 tok, full self+reference verify; 3B 8304 tok, reference-only) — the llama3-scaled regime. CORRECTION to the manifest synthesis_correction: scaling is baked into the rope_freqs.weight tensor (no rope.scaling.* metadata key); both engines read it identically — Camelid via rope.rs:499-500 under the `RopeScalingKind::None` arm, NOT the dormant metadata-llama3 branch at rope.rs:507. TinyLlama & 8B: no scaling (n/a). Receipts minted.
 - **`observ.usage_timing`** — prompt/completion/total token accounting + optional timing fields
   - DONE (class C, 3 on-disk rows): prompt/completion/total usage present + arithmetically correct e2e. Receipt minted. (ttft timing still not populated — not claimed.)
 - **`load.quant_breadth`** — (SECONDARY) loadability across additional quants beyond Q8_0
@@ -67,27 +69,30 @@ Per-cell vocabulary (conductor §5):
 ## Notable Phase 0 findings
 
 - **`tools.function_calling` splits by row, exactly as the conductor demands.** TinyLlama → `n/a` (template has only user/system/assistant branches, no tool/ipython tokens). Llama 3.2 1B & 3B → **capable** (their embedded templates carry the Llama-3.1-style tool-call branch + `Environment: ipython`). Original Llama 3 8B → `n/a`/provisional (pre-3.1 template, no tool tokens — must be re-confirmed against the real GGUF, since a mislabeled 3.1 file would flip it).
-- **`context.rope_scaling` splits 2 / 2 after a synthesis correction.** TinyLlama (native 2048) and original Llama 3 8B (native 8192) declare no scaling → `n/a`. The Llama 3.2 1B & 3B reach 131072 via **llama3 rope scaling baked into a `rope_freqs.weight` tensor** (no `rope.scaling.*` *metadata* key, but the transform is real and Camelid applies the llama3 path, `rope.rs:507`) → reclassified **capable / class D / `wip`**. The over-strict "metadata-key-required" Phase 0 prompt had marked these `n/a`; that was an underclaim (conductor §0/§4.6) and is corrected here. Their validation overlaps `context.full_length` at the 131072 frontier — parity at extended positions vs llama.cpp.
+- **`context.rope_scaling` splits 2 / 2 after a synthesis correction.** TinyLlama (native 2048) and original Llama 3 8B (native 8192) declare no scaling → `n/a`. The Llama 3.2 1B & 3B reach 131072 via **llama3 rope scaling baked into a `rope_freqs.weight` tensor** (no `rope.scaling.*` *metadata* key, but the transform is real). Camelid reads that tensor at `rope.rs:499-500` under the `RopeScalingKind::None` arm — NOT the metadata-llama3 branch at `rope.rs:507`, which is dormant for these GGUFs (an earlier note misnamed this path). Reclassified **capable / class D**, and **now `done`** — validated bit-exact at positions > 8192 (1B 8511 tok, 3B 8304 tok) vs llama.cpp. The over-strict "metadata-key-required" Phase 0 prompt had marked these `n/a`; that was an underclaim (conductor §0/§4.6), corrected here.
 - **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed. Memory/abort projection (conductor §9) governs the 131072 rows before any near-limit validation.
 - **6 capabilities are now `done` on the 3 on-disk rows**, each with a `camelid.capability-receipt/v1`: the **sampling lane** (`sampling.full_set` — `min_p`+`repeat_penalty` added; `sampling.seed_determinism` — degenerate per-seed RNG fixed to a per-step SplitMix64 stream, **a real correctness bug**), **`gen.n_choices`** (n>1 independent reproducibly-seeded choices, converted from a 400 stub), and the contract caps `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing`.
 - **`tools.function_calling` splits by row, exactly as the conductor demands.** TinyLlama → `n/a` (no tool branch). Llama 3.2 1B & 3B → **`done`** (class B): Camelid renders tools via the model template on input and parses the Llama 3.x tool-call output back into structured `tool_calls` (battery 6/6 valid; `tool_choice:"none"` suppresses). Original Llama 3 8B → `n/a`/provisional.
 - **Every greenfield `open` lane is now `done`.** The last one, `structured.json_grammar` (JSON-mode constrained decode), is `done` on the 3 on-disk rows (class B — battery 12/12 valid JSON via a byte-level JSON PDA + per-step logit mask). `logprobs.top_logprobs` is `done` (class D — token IDs bit-exact vs llama.cpp; values within the f32 envelope). The only non-`done` cells left are `wip` (implemented, receipt pending a row-specific e2e) or the provisional 8B column.
-- **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed; near-limit validation (with memory predict-and-abort) keeps it `wip`. `context.rope_scaling` is `n/a` on TinyLlama/8B and `wip` on the 1B/3B (tensor-baked llama3 scaling — see below).
+- **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed. TinyLlama is now `done` (validated to 1953/2048); 1B & 3B stay `wip` = **host-limited** (the trained 131072 needs 8/28 GiB f32 CPU KV, beyond safe RAM on this 15.74 GiB box — not a model limit; conductor §9 memory/abort projection). `context.rope_scaling` is `n/a` on TinyLlama/8B and now **`done`** on the 1B/3B (tensor-baked llama3 scaling, bit-exact > 8192).
 
 ## Recommended sequencing (conductor §6) — progress
 
 1. ✅ **Sampling lane** (`sampling.full_set` + `sampling.seed_determinism`) — `min_p`/`repeat_penalty` added, per-step RNG fixed, class-I invariants + e2e. **DONE.**
 2. ✅ **`gen.n_choices` + `logprobs.top_logprobs`** — both **DONE**: n_choices (class C) and logprobs (class D — chat + completions; token IDs bit-exact vs llama.cpp, values within the f32 envelope; non-streaming single-choice).
-3. ✅ **Receipts for the already-driving caps** — `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing` minted **DONE**; `chat.system_multiturn` + `context.full_length` still `wip` (need a system/multi-turn and a near-limit e2e respectively).
+3. ✅ **Receipts for the already-driving caps** — `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing` minted **DONE**.
 4. ✅ **`tools.function_calling`** (1B/3B) — **DONE** (class B): input rendered via the model template, output parsed into structured `tool_calls` (battery 6/6). Gated on the manifest (TinyLlama/8B `n/a`).
 5. ✅ **`structured.json_grammar`** — **DONE** (class B): response_format json_object -> JSON-grammar-constrained decode (byte-level PDA + per-step logit mask); battery 12/12 valid JSON. (json_schema/GBNF + force-close-at-max_tokens are follow-ups.)
-6. **Download Llama 3 8B Q8_0** to complete its Phase 0 manifest, re-resolve `tools`/`full_length`/`rope_scaling`, and extend the done receipts to that row.
-7. *(secondary)* `load.quant_breadth` — only if widening the load matrix is in scope.
+6. ✅ **`chat.system_multiturn`** (class D, 3 rows) — **DONE**: system + multi-turn parity bit-exact vs llama.cpp (prompt-pinned); TinyLlama byte+token-identical templates, 1B/3B differ only by the live-date preamble. Harness `system_multiturn_parity.mjs`.
+7. ✅ **`context.full_length` + `context.rope_scaling`** (class D) — TinyLlama full_length **DONE** (1953/2048); 1B & 3B rope_scaling **DONE** (bit-exact at 8511 / 8304 tok, positions > 8192). 1B/3B `context.full_length` stay **`wip` = host-limited** (trained 131072 KV 8/28 GiB > safe RAM here, not a model limit). Harness `context_parity.mjs`; host-limit note in `qa/validation-notes/`.
+8. **Download Llama 3 8B Q8_0** to complete its Phase 0 manifest, re-resolve `tools`/`full_length`/`rope_scaling`, and extend the done receipts to that row.
+9. *(secondary)* `load.quant_breadth` — only if widening the load matrix is in scope.
 
 ## Artifacts
 
 - Per-row manifests: `qa/capability/capability-manifest.<row>.json` (schema `camelid.capability-manifest/v1`).
-- Capability receipts: `qa/capability/receipts/capability-receipt.<cap>.<row>.json` (schema `camelid.capability-receipt/v1`) — **26 minted** this pass (6 caps × 3 on-disk rows).
-- E2E harness: `qa/capability/smoke.sh` (boots each model on Windows CPU, exercises the validated caps).
+- Capability receipts: `qa/capability/receipts/capability-receipt.<cap>.<row>.json` (schema `camelid.capability-receipt/v1`) — **32 minted** (the original 26 + `chat.system_multiturn` ×3 + `context.full_length` ×1 [TinyLlama] + `context.rope_scaling` ×2 [1B/3B]).
+- E2E harnesses: `qa/capability/smoke.sh` (sampling/n_choices/stream_usage), `tools_smoke.sh`, `json_smoke.sh`, **`system_multiturn_parity.mjs`** (system+multi-turn parity + template-fidelity diff), **`context_parity.mjs`** (long-context / rope parity with a built-in KV predict-and-abort). All Windows CPU, `CUDA_VISIBLE_DEVICES=-1`.
+- Host-limit / safety note: `qa/validation-notes/2026-06-25-capability-context-host-limits.md` (1B/3B `context.full_length` host limits + the missing in-engine KV predict-and-abort).
 - Checksums: `qa/capability/SHA256SUMS` (manifests + receipts).
-- Provenance: produced on branch `feat/capability-conductor` (base `12f202d0`) with the sampling + n_choices diff **uncommitted** at receipt time — re-seal against the commit once landed.
+- Provenance: the original 26 receipts were minted on branch `feat/capability-conductor` (base `12f202d0`); the 6 new receipts on `feat/capability-context-chat` (base `bde66bc7`, main) with the lane diff **uncommitted** at receipt time — re-seal against the commit once landed.
