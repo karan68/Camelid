@@ -449,6 +449,11 @@ pub struct ChatCompletionRequest {
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
     pub parallel_tool_calls: Option<bool>,
+    /// OpenAI `response_format`. Only `{"type":"json_object"}` is honored — it turns
+    /// on JSON-grammar-constrained decoding so the output is guaranteed valid JSON.
+    /// `{"type":"text"}`/absent is normal decoding; other shapes (json_schema) are
+    /// rejected. Declared here so it is not in `unsupported_fields`.
+    pub response_format: Option<serde_json::Value>,
     /// OpenAI `stream_options`. The only honored subfield is `include_usage`
     /// (bool); any other shape or subfield is tolerated silently and ignored,
     /// matching the permissive llama-server oracle. Parsed as a raw value so a
@@ -912,6 +917,10 @@ pub struct GenerationSessionRequest {
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
     default_max_tokens_cap: Option<u32>,
+    /// JSON-grammar-constrained decoding (`response_format: json_object`). Set by the
+    /// chat handler; never deserialized from the wire.
+    #[serde(default, skip_deserializing)]
+    json_object_mode: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1264,6 +1273,9 @@ struct PreparedGeneration {
     /// When set, collect per-token logprobs each step (chosen + this many top
     /// alternatives). Forces the full-host-logits decode path (no GPU greedy-fast).
     logprobs_top_n: Option<usize>,
+    /// JSON-grammar-constrained decoding: each step is masked to tokens that keep a
+    /// valid JSON-object prefix. Forces the full-logits CPU decode path.
+    json_object_mode: bool,
     stop_sequences: Vec<String>,
     logit_diagnostic_token_ids: Vec<u32>,
     collect_dense_diagnostics: bool,
@@ -2039,6 +2051,7 @@ async fn llama_server_completion(
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
+        json_object_mode: false,
     };
     // Serialize generation so only one decode runs against the shared
     // CUDA-resident KV state at a time (see AppState::generation_lock).
@@ -5464,6 +5477,7 @@ async fn completions(
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
+        json_object_mode: false,
     };
     let stream = req.stream.unwrap_or(false);
     // Serialize generation so only one decode runs against the shared
@@ -5749,6 +5763,20 @@ async fn chat_completions(
     // request supplied tools and tool_choice is not "none".
     let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
+    // response_format: json_object -> JSON-grammar-constrained decoding (non-streaming).
+    let json_object_mode = match json_object_mode_from_response_format(req.response_format.as_ref())
+    {
+        Ok(mode) => mode,
+        Err(response) => return *response,
+    };
+    if json_object_mode && req.stream.unwrap_or(false) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "response_format json_object is not supported with stream:true; request it without streaming".to_string(),
+            Some("response_format"),
+        );
+    }
     if wants_logprobs && req.stream.unwrap_or(false) {
         return api_error(
             StatusCode::BAD_REQUEST,
@@ -5804,6 +5832,7 @@ async fn chat_completions(
         tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
+        json_object_mode,
     };
     let stream = req.stream.unwrap_or(false);
     // Serialize generation so only one decode runs against the shared
@@ -6164,6 +6193,7 @@ pub async fn replay_receipt_request(
         tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
+        json_object_mode: false,
     };
     let prepared = match prepare_generation(&state, session_request).await {
         Ok(prepared) => prepared,
@@ -6841,6 +6871,7 @@ async fn prepare_generation(
         session,
         sampling,
         logprobs_top_n,
+        json_object_mode: req.json_object_mode,
         stop_sequences,
         logit_diagnostic_token_ids,
         collect_dense_diagnostics,
@@ -7582,6 +7613,7 @@ async fn generate_stream_step_blocking(
                 sampler,
                 &history,
                 collect_dense_diagnostics,
+                None,
             )
             .map_err(|err| {
                 Box::new(api_error(
@@ -7938,6 +7970,34 @@ fn generate_token_ids(
     let mut top_logits = Vec::new();
     let mut step_top_logits = Vec::new();
     let mut step_logprobs: Vec<StepLogprob> = Vec::new();
+    // JSON-grammar-constrained decoding setup (response_format json_object). Cache
+    // each token's output bytes once; mask the logits to valid JSON-prefix tokens
+    // each step; stop as soon as the top-level object closes.
+    let json_grammar_active = prepared.json_object_mode;
+    let grammar_vocab = prepared.tokenizer.tokens.len();
+    let grammar_token_bytes: Vec<Vec<u8>> = if json_grammar_active {
+        (0..grammar_vocab as u32)
+            .map(|id| {
+                prepared
+                    .tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_default()
+                    .into_bytes()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut grammar: Option<crate::grammar::JsonState> =
+        json_grammar_active.then(crate::grammar::JsonState::new);
+    let mut grammar_mask: Vec<bool> = vec![
+        false;
+        if json_grammar_active {
+            grammar_vocab
+        } else {
+            0
+        }
+    ];
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
     let mut output_projection = Vec::new();
     let mut dense = None;
@@ -8031,6 +8091,7 @@ fn generate_token_ids(
                 && !collect_dense_for_step
                 && !collect_step_top_logits
                 && prepared.logprobs_top_n.is_none()
+                && grammar.is_none()
                 && !top_logits.is_empty()
         }) {
             let remaining = (prepared.max_tokens as usize).saturating_sub(generated.len());
@@ -8145,6 +8206,28 @@ fn generate_token_ids(
                 continue;
             }
         }
+        // JSON-grammar mask for this step: a token is allowed iff its bytes keep a
+        // valid JSON-object prefix; EOG only once the object is complete.
+        let grammar_allowed: Option<&[bool]> = match grammar.as_ref() {
+            Some(state) => {
+                let done = state.is_done();
+                for (id, slot) in grammar_mask.iter_mut().enumerate() {
+                    let bytes = grammar_token_bytes
+                        .get(id)
+                        .map(|v| v.as_slice())
+                        .unwrap_or_default();
+                    *slot = if prepared.tokenizer.special.eog.contains(&(id as u32)) {
+                        done
+                    } else if bytes.is_empty() {
+                        false
+                    } else {
+                        state.accepts(bytes)
+                    };
+                }
+                Some(grammar_mask.as_slice())
+            }
+            None => None,
+        };
         // Single-token continuations with no per-step logit consumers ride the
         // resident GPU fast lane: greedy via GPU argmax, temperature-only sampling
         // via GPU Gumbel-max. Everything else takes the general step.
@@ -8152,6 +8235,7 @@ fn generate_token_ids(
             && !collect_dense_for_step
             && !collect_step_top_logits
             && prepared.logprobs_top_n.is_none()
+            && grammar.is_none()
             && !top_logits.is_empty()
         {
             match &sampler {
@@ -8199,6 +8283,7 @@ fn generate_token_ids(
                     sampler,
                     &history,
                     collect_dense_for_step,
+                    grammar_allowed,
                 )
                 .map_err(|err| {
                     Box::new(api_error(
@@ -8291,6 +8376,19 @@ fn generate_token_ids(
         }
         generated.push(step.next_token_id);
         history.push(step.next_token_id);
+        // Advance the JSON grammar by the chosen token's bytes; stop the moment the
+        // top-level object closes (the mask guaranteed the bytes are acceptable).
+        if let Some(state) = grammar.as_mut() {
+            if let Some(bytes) = grammar_token_bytes.get(step.next_token_id as usize) {
+                for &b in bytes {
+                    let _ = state.advance(b);
+                }
+            }
+            if state.is_done() {
+                finish_reason = "stop";
+                break;
+            }
+        }
         if prepared.tokenizer.special.eog.contains(&step.next_token_id) {
             finish_reason = "stop";
             break;
@@ -8496,6 +8594,29 @@ fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
         token_logprobs,
         top_logprobs,
         text_offset,
+    }
+}
+
+/// Interpret OpenAI `response_format`. `Ok(true)` = json_object mode (constrain to
+/// valid JSON), `Ok(false)` = normal decoding (text / absent), `Err` = a typed 400
+/// for shapes Camelid does not support yet (json_schema, unknown types).
+fn json_object_mode_from_response_format(
+    response_format: Option<&serde_json::Value>,
+) -> std::result::Result<bool, Box<Response>> {
+    let Some(value) = response_format.filter(|v| !v.is_null()) else {
+        return Ok(false);
+    };
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("json_object") => Ok(true),
+        Some("text") | None => Ok(false),
+        Some(other) => Err(Box::new(api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            format!(
+                "response_format type {other:?} is not supported yet; only json_object (and text) are honored"
+            ),
+            Some("response_format"),
+        ))),
     }
 }
 
@@ -10673,6 +10794,22 @@ mod tests {
     }
 
     #[test]
+    fn response_format_interprets_json_object_mode() {
+        use serde_json::json;
+        // json_object turns constrained decoding on; text / absent leave it off.
+        assert!(
+            json_object_mode_from_response_format(Some(&json!({"type": "json_object"}))).unwrap()
+        );
+        assert!(!json_object_mode_from_response_format(Some(&json!({"type": "text"}))).unwrap());
+        assert!(!json_object_mode_from_response_format(None).unwrap());
+        assert!(!json_object_mode_from_response_format(Some(&json!(null))).unwrap());
+        // json_schema (and other types) are a typed error, not silently ignored.
+        assert!(
+            json_object_mode_from_response_format(Some(&json!({"type": "json_schema"}))).is_err()
+        );
+    }
+
+    #[test]
     fn terminal_usage_chunk_has_empty_choices_array_and_usage() {
         // The terminal include_usage frame: empty `choices` array (not omitted),
         // the three real usage integers, no camelid diagnostics. Mirrors the
@@ -11835,6 +11972,7 @@ mod tests {
                 crate::inference::LlamaSampler::Greedy,
                 &[1, 2],
                 false,
+                None,
             )
             .unwrap();
         let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
@@ -11880,6 +12018,7 @@ mod tests {
                 crate::inference::LlamaSampler::Greedy,
                 &[1, 2],
                 false,
+                None,
             )
             .unwrap();
         let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
@@ -13332,6 +13471,7 @@ mod tests {
             session,
             sampling: SamplingConfig::default(),
             logprobs_top_n: None,
+            json_object_mode: false,
             stop_sequences: Vec::new(),
             logit_diagnostic_token_ids: Vec::new(),
             collect_dense_diagnostics: false,
@@ -13440,6 +13580,7 @@ mod tests {
                     LlamaSampler::Greedy,
                     &history,
                     false,
+                    None,
                 )
                 .unwrap();
             generated.push(step.next_token_id);
@@ -13472,6 +13613,7 @@ mod tests {
                 LlamaSampler::Greedy,
                 &history,
                 false,
+                None,
             )
             .unwrap();
         generated.push(first.next_token_id);

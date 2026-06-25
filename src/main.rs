@@ -2507,6 +2507,7 @@ fn generate_run(
         sampler.clone(),
         &history,
         false,
+        None,
     )?;
     let ttft_ms = ttft_start.elapsed().as_secs_f64() * 1000.0;
     let prefill_ms = step.prefill_timings.total as f64 / 1000.0; // microseconds -> ms
@@ -2599,6 +2600,7 @@ fn generate_run(
                         sampler.clone(),
                         &history,
                         false,
+                        None,
                     )?;
                     if time_decode {
                         wall_us += step_started.elapsed().as_micros();
@@ -2639,6 +2641,7 @@ fn generate_run(
                         sampler.clone(),
                         &history,
                         false,
+                        None,
                     )?;
                     if time_decode {
                         wall_us += step_started.elapsed().as_micros();
@@ -2939,6 +2942,7 @@ fn generate_run_speculative(
         LlamaSampler::Greedy,
         &history,
         false,
+        None,
     )?;
     let ttft_ms = ttft_start.elapsed().as_secs_f64() * 1000.0;
     let first = step.next_token_id;
@@ -3103,6 +3107,7 @@ fn generate_run_speculative(
                                 LlamaSampler::Greedy,
                                 &history,
                                 false,
+                                None,
                             )?
                             .next_token_id
                     }
@@ -3192,6 +3197,7 @@ fn generate_run_speculative(
                             LlamaSampler::Greedy,
                             &history,
                             false,
+                            None,
                         )?
                         .next_token_id
                 }
@@ -3229,6 +3235,7 @@ fn generate_run_speculative(
                             LlamaSampler::Greedy,
                             &history,
                             false,
+                            None,
                         )?
                         .next_token_id
                 }

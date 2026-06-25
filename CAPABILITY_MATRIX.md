@@ -13,7 +13,7 @@ Per-cell vocabulary (conductor §5):
 
 **Phase 0 status:** 3 / 4 rows discovered + hash-anchored (TinyLlama, Llama 3.2 1B, Llama 3.2 3B). **Llama 3 8B Q8_0 is not downloaded** — its column (`*`) is PROVISIONAL (spec-derived, not GGUF-anchored, Phase 0 INCOMPLETE).
 
-**Cell tally** (4 model columns × 13 capabilities = 52 cells): `n/a` 4 · `open` 14 · `wip` 11 · `done` 23. The `done` cells are each backed by a `camelid.capability-receipt/v1` under `qa/capability/receipts/`, validated this pass on the **3 on-disk rows** (TinyLlama, Llama 3.2 1B, Llama 3.2 3B) — no cross-row inheritance (conductor §6). The 8B column stays provisional until its GGUF is downloaded.
+**Cell tally** (4 model columns × 13 capabilities = 52 cells): `n/a` 4 · `open` 11 · `wip` 11 · `done` 26. The `done` cells are each backed by a `camelid.capability-receipt/v1` under `qa/capability/receipts/`, validated this pass on the **3 on-disk rows** (TinyLlama, Llama 3.2 1B, Llama 3.2 3B) — no cross-row inheritance (conductor §6). The 8B column stays provisional until its GGUF is downloaded.
 
 ## Matrix
 
@@ -27,7 +27,7 @@ Per-cell vocabulary (conductor §5):
 | `logprobs.top_logprobs` | D | done | done | done | open | drives |
 | `chat.system_multiturn` | D | wip | wip | wip | open | drives |
 | `tools.function_calling` | B | n/a | done | done | n/a | drives |
-| `structured.json_grammar` | B | open | open | open | open | typed_error_stub |
+| `structured.json_grammar` | B | done | done | done | open | drives |
 | `context.full_length` | D | wip | wip | wip | open | drives |
 | `context.rope_scaling` | D | n/a | wip | wip | n/a | drives |
 | `observ.usage_timing` | C | done | done | done | open | drives |
@@ -54,7 +54,7 @@ Per-cell vocabulary (conductor §5):
 - **`tools.function_calling`** — native tool/function calling — REQUIRES tool-call branch or tool/ipython control tokens in THIS model template
   - DONE (class B, Llama 3.2 1B/3B): input renders tools via the model template; output now parses the Llama 3.x {name,parameters} tool-call into OpenAI tool_calls (parse_tool_calls), finish_reason=tool_calls, content emptied. tool_choice:none suppresses. Battery 6/6 structurally valid. TinyLlama/8B n/a (no tool branch).
 - **`structured.json_grammar`** — JSON mode + GBNF grammar-constrained decode (decoder-side, model-agnostic)
-  - OPEN — rejected (HTTP 400 stub, api/mod.rs:6753); no GBNF/grammar mask in the sampler.
+  - DONE (class B, 3 on-disk rows): response_format json_object -> JSON-grammar-constrained decoding (src/grammar.rs PDA + per-step logit mask in the decode loop). Battery 12/12 valid JSON. Non-streaming; json_schema/GBNF + force-close-at-max_tokens are follow-ups.
 - **`context.full_length`** — full TRAINED context length, exact value from metadata
   - wip — honored from GGUF metadata as KV cap (model.rs:141, inference.rs:2086). Trained length differs per row: TL 2048 / 1B 131072 / 3B 131072 / 8B 8192*. Needs near-limit validation (memory predict-and-abort).
 - **`context.rope_scaling`** — RoPE scaling/extension — REQUIRES a rope scaling type/factor declared in metadata
@@ -71,7 +71,7 @@ Per-cell vocabulary (conductor §5):
 - **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed. Memory/abort projection (conductor §9) governs the 131072 rows before any near-limit validation.
 - **6 capabilities are now `done` on the 3 on-disk rows**, each with a `camelid.capability-receipt/v1`: the **sampling lane** (`sampling.full_set` — `min_p`+`repeat_penalty` added; `sampling.seed_determinism` — degenerate per-seed RNG fixed to a per-step SplitMix64 stream, **a real correctness bug**), **`gen.n_choices`** (n>1 independent reproducibly-seeded choices, converted from a 400 stub), and the contract caps `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing`.
 - **`tools.function_calling` splits by row, exactly as the conductor demands.** TinyLlama → `n/a` (no tool branch). Llama 3.2 1B & 3B → **`done`** (class B): Camelid renders tools via the model template on input and parses the Llama 3.x tool-call output back into structured `tool_calls` (battery 6/6 valid; `tool_choice:"none"` suppresses). Original Llama 3 8B → `n/a`/provisional.
-- **One greenfield `open` lane remains** (HTTP-400 stub, model-agnostic): `structured.json_grammar` (GBNF/JSON-mode constrained decode). `logprobs.top_logprobs` is now **`done`** (class D — token IDs bit-exact vs llama.cpp; values within the f32 envelope).
+- **Every greenfield `open` lane is now `done`.** The last one, `structured.json_grammar` (JSON-mode constrained decode), is `done` on the 3 on-disk rows (class B — battery 12/12 valid JSON via a byte-level JSON PDA + per-step logit mask). `logprobs.top_logprobs` is `done` (class D — token IDs bit-exact vs llama.cpp; values within the f32 envelope). The only non-`done` cells left are `wip` (implemented, receipt pending a row-specific e2e) or the provisional 8B column.
 - **`context.full_length` differs sharply per row** — 2048 / 131072 / 131072 / 8192 — and must never be cross-claimed; near-limit validation (with memory predict-and-abort) keeps it `wip`. `context.rope_scaling` is `n/a` on TinyLlama/8B and `wip` on the 1B/3B (tensor-baked llama3 scaling — see below).
 
 ## Recommended sequencing (conductor §6) — progress
@@ -80,14 +80,14 @@ Per-cell vocabulary (conductor §5):
 2. ✅ **`gen.n_choices` + `logprobs.top_logprobs`** — both **DONE**: n_choices (class C) and logprobs (class D — chat + completions; token IDs bit-exact vs llama.cpp, values within the f32 envelope; non-streaming single-choice).
 3. ✅ **Receipts for the already-driving caps** — `gen.stream_usage`, `gen.length_stop`, `observ.usage_timing` minted **DONE**; `chat.system_multiturn` + `context.full_length` still `wip` (need a system/multi-turn and a near-limit e2e respectively).
 4. ✅ **`tools.function_calling`** (1B/3B) — **DONE** (class B): input rendered via the model template, output parsed into structured `tool_calls` (battery 6/6). Gated on the manifest (TinyLlama/8B `n/a`).
-5. **`structured.json_grammar`** — GBNF/JSON-mode constrained decode (class B), all rows.
+5. ✅ **`structured.json_grammar`** — **DONE** (class B): response_format json_object -> JSON-grammar-constrained decode (byte-level PDA + per-step logit mask); battery 12/12 valid JSON. (json_schema/GBNF + force-close-at-max_tokens are follow-ups.)
 6. **Download Llama 3 8B Q8_0** to complete its Phase 0 manifest, re-resolve `tools`/`full_length`/`rope_scaling`, and extend the done receipts to that row.
 7. *(secondary)* `load.quant_breadth` — only if widening the load matrix is in scope.
 
 ## Artifacts
 
 - Per-row manifests: `qa/capability/capability-manifest.<row>.json` (schema `camelid.capability-manifest/v1`).
-- Capability receipts: `qa/capability/receipts/capability-receipt.<cap>.<row>.json` (schema `camelid.capability-receipt/v1`) — **23 minted** this pass (6 caps × 3 on-disk rows).
+- Capability receipts: `qa/capability/receipts/capability-receipt.<cap>.<row>.json` (schema `camelid.capability-receipt/v1`) — **26 minted** this pass (6 caps × 3 on-disk rows).
 - E2E harness: `qa/capability/smoke.sh` (boots each model on Windows CPU, exercises the validated caps).
 - Checksums: `qa/capability/SHA256SUMS` (manifests + receipts).
 - Provenance: produced on branch `feat/capability-conductor` (base `12f202d0`) with the sampling + n_choices diff **uncommitted** at receipt time — re-seal against the commit once landed.
