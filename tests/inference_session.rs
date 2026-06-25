@@ -255,6 +255,157 @@ fn rejects_logit_bias_outside_vocabulary() {
 }
 
 #[test]
+fn top_k_one_is_argmax_regardless_of_seed() {
+    // class-I invariant: top_k=1 collapses to the greedy argmax for any seed.
+    let logits = tensor("logits", vec![1, 3], vec![3.0, 2.0, 1.0]);
+    for seed in [0u64, 1, 7, 42, 123_456_789] {
+        let token = LlamaSampler::Sampling(SamplingConfig {
+            temperature: 1.0,
+            top_k: Some(1),
+            seed: Some(seed),
+            ..SamplingConfig::default()
+        })
+        .sample(&logits)
+        .unwrap();
+        assert_eq!(token, 0, "top_k=1 must pick the argmax for seed {seed}");
+    }
+}
+
+#[test]
+fn min_p_one_keeps_only_argmax() {
+    // class-I invariant: min_p=1.0 keeps only the max-probability token.
+    let logits = tensor("logits", vec![1, 3], vec![3.0, 2.0, 1.0]);
+    for seed in [0u64, 5, 99, 2_024] {
+        let token = LlamaSampler::Sampling(SamplingConfig {
+            temperature: 1.0,
+            min_p: Some(1.0),
+            seed: Some(seed),
+            ..SamplingConfig::default()
+        })
+        .sample(&logits)
+        .unwrap();
+        assert_eq!(token, 0, "min_p=1.0 must pick the argmax for seed {seed}");
+    }
+}
+
+#[test]
+fn min_p_zero_is_a_noop() {
+    // class-I invariant: min_p=0.0 must not change the sampled token vs no min_p.
+    let logits = tensor("logits", vec![1, 4], vec![1.0, 0.5, 0.25, 0.0]);
+    for seed in [0u64, 3, 17, 555] {
+        let baseline = LlamaSampler::Sampling(SamplingConfig {
+            temperature: 1.0,
+            seed: Some(seed),
+            ..SamplingConfig::default()
+        })
+        .sample(&logits)
+        .unwrap();
+        let with_zero = LlamaSampler::Sampling(SamplingConfig {
+            temperature: 1.0,
+            min_p: Some(0.0),
+            seed: Some(seed),
+            ..SamplingConfig::default()
+        })
+        .sample(&logits)
+        .unwrap();
+        assert_eq!(
+            baseline, with_zero,
+            "min_p=0 changed the draw for seed {seed}"
+        );
+    }
+}
+
+#[test]
+fn rejects_min_p_out_of_range() {
+    let logits = tensor("logits", vec![1, 2], vec![0.0, 1.0]);
+    let err = LlamaSampler::Sampling(SamplingConfig {
+        temperature: 1.0,
+        min_p: Some(1.5),
+        ..SamplingConfig::default()
+    })
+    .sample(&logits)
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("min_p"), "got {err}");
+}
+
+#[test]
+fn repeat_penalty_one_is_a_noop() {
+    // class-I invariant: repeat_penalty=1.0 leaves the seen-token logits untouched.
+    let logits = tensor("logits", vec![1, 3], vec![1.0, 0.9, 0.0]);
+    let with_one = LlamaSampler::Sampling(SamplingConfig {
+        repeat_penalty: 1.0,
+        ..SamplingConfig::default()
+    })
+    .sample_with_history(&logits, &[0, 0])
+    .unwrap();
+    assert_eq!(with_one, 0);
+}
+
+#[test]
+fn repeat_penalty_demotes_a_repeated_token() {
+    // class-I direction invariant: a penalty > 1 pushes a seen token below an
+    // unseen rival. Greedy would pick token 0 (1.0); dividing its positive logit
+    // by 2.0 (=0.5) lets the unseen token 1 (0.9) win.
+    let logits = tensor("logits", vec![1, 3], vec![1.0, 0.9, 0.0]);
+    let token = LlamaSampler::Sampling(SamplingConfig {
+        repeat_penalty: 2.0,
+        ..SamplingConfig::default()
+    })
+    .sample_with_history(&logits, &[0])
+    .unwrap();
+    assert_eq!(token, 1);
+}
+
+#[test]
+fn rejects_non_positive_repeat_penalty() {
+    let logits = tensor("logits", vec![1, 2], vec![0.0, 1.0]);
+    let err = LlamaSampler::Sampling(SamplingConfig {
+        repeat_penalty: 0.0,
+        ..SamplingConfig::default()
+    })
+    .sample(&logits)
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("repeat_penalty"), "got {err}");
+}
+
+#[test]
+fn seeded_sampling_advances_per_decode_step() {
+    // Regression for the degenerate-RNG bug: with a fixed seed the per-step draw
+    // used to be constant, so every decode step returned the same token. With the
+    // per-position advance a uniform distribution yields more than one distinct
+    // token across steps — and the whole sequence stays reproducible.
+    let logits = tensor("logits", vec![1, 4], vec![0.0, 0.0, 0.0, 0.0]);
+    let run = || {
+        (0..48u32)
+            .map(|step| {
+                let history = vec![0u32; step as usize];
+                LlamaSampler::Sampling(SamplingConfig {
+                    temperature: 1.0,
+                    seed: Some(0x00C0_FFEE),
+                    ..SamplingConfig::default()
+                })
+                .sample_with_history(&logits, &history)
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = run();
+    let second = run();
+    let distinct: std::collections::BTreeSet<u32> = first.iter().copied().collect();
+    assert!(
+        distinct.len() >= 2,
+        "per-step draw did not advance: all {} steps returned the same token",
+        first.len()
+    );
+    assert_eq!(
+        first, second,
+        "a fixed seed must reproduce the sequence token-for-token"
+    );
+}
+
+#[test]
 fn rejects_empty_prompt_for_next_token_generation() {
     let config = tiny_config();
     let weights = tiny_weights();

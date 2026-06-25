@@ -1526,9 +1526,19 @@ pub struct SamplingConfig {
     pub temperature: f32,
     pub top_k: Option<usize>,
     pub top_p: Option<f32>,
+    /// Minimum-probability filter: keep only tokens whose probability is at
+    /// least `min_p * max_probability`. `None`/`0.0` disables it; `1.0` keeps
+    /// only the argmax. Applied after softmax, before `top_p`.
+    pub min_p: Option<f32>,
     pub seed: Option<u64>,
     pub presence_penalty: f32,
     pub frequency_penalty: f32,
+    /// Multiplicative repetition penalty (llama.cpp/HF `repeat_penalty`): for a
+    /// token already in the history, a positive logit is divided and a negative
+    /// logit is multiplied by this factor. `1.0` is a no-op; values `> 1.0`
+    /// discourage repetition. Applied over the same history as the additive
+    /// presence/frequency penalties.
+    pub repeat_penalty: f32,
     pub logit_bias: Vec<(usize, f32)>,
 }
 
@@ -1538,9 +1548,11 @@ impl Default for SamplingConfig {
             temperature: 0.0,
             top_k: None,
             top_p: None,
+            min_p: None,
             seed: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            repeat_penalty: 1.0,
             logit_bias: Vec::new(),
         }
     }
@@ -5092,6 +5104,19 @@ impl SamplingConfig {
                 )));
             }
         }
+        if let Some(min_p) = self.min_p {
+            if !min_p.is_finite() || !(0.0..=1.0).contains(&min_p) {
+                return Err(BackendError::RuntimeShapeMismatch(format!(
+                    "min_p must be finite and in [0, 1], got {min_p}"
+                )));
+            }
+        }
+        if !self.repeat_penalty.is_finite() || self.repeat_penalty <= 0.0 {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "repeat_penalty must be finite and greater than zero, got {}",
+                self.repeat_penalty
+            )));
+        }
         if !self.presence_penalty.is_finite() || !(-2.0..=2.0).contains(&self.presence_penalty) {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "presence_penalty must be finite and in [-2, 2], got {}",
@@ -5223,6 +5248,24 @@ fn sample_with_config(
         *weight /= weight_sum;
     }
 
+    if let Some(min_p) = config.min_p.filter(|min_p| *min_p > 0.0) {
+        let max_probability = weighted
+            .iter()
+            .map(|(_, weight)| *weight)
+            .fold(0.0_f32, f32::max);
+        let threshold = min_p * max_probability;
+        weighted.retain(|(_, weight)| *weight >= threshold);
+        let renorm: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
+        if weighted.is_empty() || renorm == 0.0 || !renorm.is_finite() {
+            return Err(BackendError::RuntimeShapeMismatch(
+                "min_p filtering removed all sampler candidates".to_string(),
+            ));
+        }
+        for (_, weight) in &mut weighted {
+            *weight /= renorm;
+        }
+    }
+
     if let Some(top_p) = config.top_p.filter(|top_p| *top_p < 1.0) {
         weighted.sort_by(|(left_idx, left), (right_idx, right)| {
             right.total_cmp(left).then_with(|| left_idx.cmp(right_idx))
@@ -5248,7 +5291,12 @@ fn sample_with_config(
         }
     }
 
-    let draw = seeded_unit_interval(config.seed.unwrap_or(0));
+    // Advance the RNG per decode step: `token_history.len()` is the deterministic
+    // stream position, so each step draws a fresh uniform while a fixed seed still
+    // reproduces the whole sequence token-for-token. (Previously the draw depended
+    // only on the seed, so every step reused one identical value — a degenerate
+    // sampler.)
+    let draw = seeded_unit_interval_at(config.seed.unwrap_or(0), token_history.len() as u64);
     let mut cumulative = 0.0;
     for (idx, probability) in &weighted {
         cumulative += *probability;
@@ -5271,6 +5319,7 @@ fn apply_sampling_adjustments<'a>(
 ) -> Result<std::borrow::Cow<'a, CpuTensor>> {
     if config.presence_penalty == 0.0
         && config.frequency_penalty == 0.0
+        && config.repeat_penalty == 1.0
         && config.logit_bias.is_empty()
     {
         return Ok(std::borrow::Cow::Borrowed(logits));
@@ -5287,7 +5336,10 @@ fn apply_sampling_adjustments<'a>(
         *value += *bias;
     }
 
-    if config.presence_penalty != 0.0 || config.frequency_penalty != 0.0 {
+    if config.presence_penalty != 0.0
+        || config.frequency_penalty != 0.0
+        || config.repeat_penalty != 1.0
+    {
         let mut counts = std::collections::HashMap::<usize, usize>::new();
         for token_id in token_history {
             let token_idx = usize::try_from(*token_id).map_err(|_| {
@@ -5304,6 +5356,16 @@ fn apply_sampling_adjustments<'a>(
                 .data
                 .get_mut(token_idx)
                 .expect("token index was checked against vocabulary size");
+            // Multiplicative repetition penalty first (llama.cpp/HF order): a
+            // positive logit is divided, a negative logit multiplied, so the
+            // token becomes less likely regardless of sign.
+            if config.repeat_penalty != 1.0 {
+                if *value > 0.0 {
+                    *value /= config.repeat_penalty;
+                } else {
+                    *value *= config.repeat_penalty;
+                }
+            }
             if config.presence_penalty != 0.0 {
                 *value -= config.presence_penalty;
             }
@@ -5316,13 +5378,27 @@ fn apply_sampling_adjustments<'a>(
     Ok(std::borrow::Cow::Owned(adjusted))
 }
 
-fn seeded_unit_interval(seed: u64) -> f32 {
-    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+/// SplitMix64 finalizer.
+fn splitmix64(state: u64) -> u64 {
+    let mut z = state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
+    z ^ (z >> 31)
+}
+
+/// Map 64 bits to a uniform in `[0, 1)` using the top 24 bits (f32 mantissa).
+fn unit_interval_from_bits(z: u64) -> f32 {
     let mantissa = (z >> 40) as u32;
     mantissa as f32 / (1u32 << 24) as f32
+}
+
+/// Deterministic uniform draw in `[0, 1)` for decode-stream `position`, seeded by
+/// `seed`. Walking `position` advances a SplitMix64 stream so each decode step
+/// gets a fresh value, while a fixed `seed` still reproduces the entire sequence
+/// token-for-token. Position 0 reproduces the original single-draw behavior.
+fn seeded_unit_interval_at(seed: u64, position: u64) -> f32 {
+    let state = seed.wrapping_add(position.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    unit_interval_from_bits(splitmix64(state))
 }
 
 fn token_index_to_u32(idx: usize) -> Result<u32> {
