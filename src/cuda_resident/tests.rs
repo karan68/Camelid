@@ -1099,6 +1099,170 @@ fn attention_decode_matches_cpu() {
     assert!(close(&got, &expected, 1e-4), "attention diverged");
 }
 
+// GATE OF RECORD for the split-K spec-verify parity fix: the spec-verify kernels
+// (attention_batched / attention_tree_batched, splitk_active=1) must be BYTE-IDENTICAL to
+// whatever plain greedy decode dispatches at that position_count -- split-K above
+// SPLITK_THRESHOLD, G-group at/below it. Deterministic (asserts on the u32 bit-casts, no
+// epsilon and no near-tie luck): FAILS pre-fix (G-group != split-K for every pc > 512) and
+// passes post-fix. Sweeps n_splits steps and both clamp edges. Linear tree only (count==pc,
+// slots[i]==i): the committed path is the only one held to a decode reference.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn splitk_spec_verify_bit_identical() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    if k.attn_coalesced {
+        eprintln!(
+            "skip splitk_spec_verify_bit_identical: CAMELID_ATTN_COALESCED re-associates the \
+             split-K per-position dot, which this emulation does not reproduce; the >512 lossless \
+             guarantee is scoped to the default non-coalesced path."
+        );
+        return;
+    }
+    let n_heads = 8usize;
+    let n_kv = 2usize;
+    let head_dim = 128usize;
+    let max_pos = 4096usize;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut rng = Lcg(20240626);
+    let q: Vec<f32> = (0..n_heads * head_dim).map(|_| rng.next_f32()).collect();
+    let mut cache_k = vec![0f32; n_kv * max_pos * head_dim];
+    let mut cache_v = vec![0f32; n_kv * max_pos * head_dim];
+    for x in cache_k.iter_mut() {
+        *x = rng.next_f32();
+    }
+    for x in cache_v.iter_mut() {
+        *x = rng.next_f32();
+    }
+    let cache_k_bits: Vec<u16> = cache_k
+        .iter()
+        .map(|&x| crate::inference::f32_to_f16_bits(x))
+        .collect();
+    let cache_v_bits: Vec<u16> = cache_v
+        .iter()
+        .map(|&x| crate::inference::f32_to_f16_bits(x))
+        .collect();
+    let dq = k.stream.clone_htod(&q).unwrap();
+    let dk = k.stream.clone_htod(&cache_k_bits).unwrap();
+    let dv = k.stream.clone_htod(&cache_v_bits).unwrap();
+
+    let bits = |v: &[f32]| -> Vec<u32> { v.iter().map(|x| x.to_bits()).collect() };
+    let outlen = n_heads * head_dim;
+    // 512/513: strict-`>` boundary. 768/769, 1024: n_splits = ceil(pc/256) steps.
+    // 3840/3841: clamp(_, SPLITK_MAX=16) saturation edge. 4096: max.
+    let sweep = [512usize, 513, 768, 769, 1024, 2000, 3840, 3841, 4096];
+
+    for &pc in &sweep {
+        let dpos = k.stream.clone_htod(&[(pc - 1) as i32]).unwrap();
+        // Reference = exactly what plain decode dispatches at this position_count (the
+        // `!graph_capture && attn_shared > SPLITK_THRESHOLD` branch in forward_pass).
+        let mut dref = k.stream.alloc_zeros::<f32>(outlen).unwrap();
+        if pc > super::SPLITK_THRESHOLD {
+            let mut sc = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
+            let mut cm = k
+                .stream
+                .alloc_zeros::<f32>(n_heads * super::SPLITK_MAX)
+                .unwrap();
+            let mut ls = k
+                .stream
+                .alloc_zeros::<f32>(n_heads * super::SPLITK_MAX)
+                .unwrap();
+            let mut ac = k
+                .stream
+                .alloc_zeros::<f32>(n_heads * super::SPLITK_MAX * head_dim)
+                .unwrap();
+            super::launch_attention_splitk(
+                &k.stream, &k, &dq, &dk, &dv, &mut dref, &mut sc, &mut cm, &mut ls, &mut ac,
+                n_heads, n_kv, head_dim, &dpos, pc, max_pos, scale,
+            )
+            .unwrap();
+        } else {
+            super::launch_attention(
+                &k.stream,
+                &k.attention,
+                &dq,
+                &dk,
+                &dv,
+                &mut dref,
+                n_heads,
+                n_kv,
+                head_dim,
+                &dpos,
+                pc,
+                max_pos,
+                scale,
+            )
+            .unwrap();
+        }
+        let mut ref_out = vec![0f32; outlen];
+        k.stream.memcpy_dtoh(&dref, &mut ref_out).unwrap();
+
+        // Linear verify: attention_batched, single token at absolute position pc-1, splitk_active=1.
+        let mut dver = k.stream.alloc_zeros::<f32>(outlen).unwrap();
+        super::launch_attention_batched(
+            &k.stream,
+            &k.attention_batched,
+            &dq,
+            &dk,
+            &dv,
+            &mut dver,
+            n_heads,
+            n_kv,
+            head_dim,
+            pc - 1, // base_position => position_count = base + 0 + 1 = pc
+            max_pos,
+            scale,
+            n_heads * head_dim, // q_per_token
+            1,                  // k
+            1,                  // splitk_active
+        )
+        .unwrap();
+        let mut ver_out = vec![0f32; outlen];
+        k.stream.memcpy_dtoh(&dver, &mut ver_out).unwrap();
+
+        // Tree verify: linear single node attending [0, base) + itself (slot base), so count==pc
+        // and slots[i]==i -- bit-identical to the linear/decode path on the committed branch.
+        let mut dtree = k.stream.alloc_zeros::<f32>(outlen).unwrap();
+        let anc: Vec<u32> = vec![1u32]; // node 0: ancestor bit 0 set => attends slot base+0
+        let danc = k.stream.clone_htod(&anc).unwrap();
+        super::launch_attention_tree_batched(
+            &k.stream,
+            &k.attention_tree_batched,
+            &dq,
+            &dk,
+            &dv,
+            &mut dtree,
+            &danc,
+            1, // words
+            n_heads,
+            n_kv,
+            head_dim,
+            pc - 1,
+            max_pos,
+            scale,
+            n_heads * head_dim,
+            1,
+            1,
+        )
+        .unwrap();
+        let mut tree_out = vec![0f32; outlen];
+        k.stream.memcpy_dtoh(&dtree, &mut tree_out).unwrap();
+
+        k.ctx.synchronize().unwrap();
+        assert_eq!(
+            bits(&ref_out),
+            bits(&ver_out),
+            "linear verify != plain decode at pc={pc}"
+        );
+        assert_eq!(
+            bits(&ref_out),
+            bits(&tree_out),
+            "tree verify != plain decode at pc={pc}"
+        );
+    }
+}
+
 // Sliding-window attention parity (gemma4 sliding layers): only the last `window`
 // keys are attended. Same setup as attention_decode_matches_cpu but the CPU ref
 // masks to [start, position_count) with start = position_count - window. Validates
