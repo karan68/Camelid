@@ -1335,11 +1335,29 @@ extern "C" __global__ void attention_batched(
     }
     __syncthreads();
     float inv = 1.0f / s_sum;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
+    // Weighted V - IDENTICAL G-group FP-reassociation to attention_decode so spec-verify logits
+    // are bit-identical to single-token decode (greedy spec losslessness; fixes the decode==batched
+    // reduction-order gap the old sequential sum left). G is the SAME function of the key count and
+    // head_dim the decode launch uses (launch_attention: G = clamp(ceil(pc/head_dim), 1,
+    // 1024/head_dim)); the contiguous p-split and g-order combine match exactly.
+    int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
+    int G = (position_count + head_dim - 1) / head_dim;
+    if (G < 1) G = 1; if (G > max_groups) G = max_groups;
+    float* vpart = shared + head_dim + base_position + k_tokens; // [max_groups * head_dim]
+    for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+        int gid = idx / head_dim, did = idx % head_dim;
+        int p_lo = (int)((long)gid * position_count / G);
+        int p_hi = (int)((long)(gid + 1) * position_count / G);
         float acc = 0.0f;
-        for (int p = 0; p < position_count; p++)
-            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + d]);
-        out[(long)t * q_per_token + (long)head * head_dim + d] = acc;
+        for (int p = p_lo; p < p_hi; p++)
+            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+        vpart[(long)did * G + gid] = acc;
+    }
+    __syncthreads();
+    for (int did = tid; did < head_dim; did += blockDim.x) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
     }
 }
 
@@ -1444,11 +1462,28 @@ extern "C" __global__ void attention_tree_batched(
     }
     __syncthreads();
     float inv = 1.0f / s_sum;
-    for (int d = tid; d < head_dim; d += blockDim.x) {
+    // Weighted V - IDENTICAL G-group FP-reassociation to attention_decode (G from the attended key
+    // count `count`; contiguous split + g-order combine match exactly). On a LINEAR tree
+    // count==position_count and slots[i]==i, so this is bit-identical to attention_batched and to
+    // single-token decode - the spec-verify losslessness anchor.
+    int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
+    int G = (count + head_dim - 1) / head_dim;
+    if (G < 1) G = 1; if (G > max_groups) G = max_groups;
+    float* vpart = (float*)(slots + base_position + k_tokens); // [max_groups * head_dim]
+    for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+        int gid = idx / head_dim, did = idx % head_dim;
+        int i_lo = (int)((long)gid * count / G);
+        int i_hi = (int)((long)(gid + 1) * count / G);
         float acc = 0.0f;
-        for (int i = 0; i < count; i++)
-            acc += (scores[i] * inv) * f16_bits_to_f32(vbase[(long)slots[i] * head_dim + d]);
-        out[(long)t * q_per_token + (long)head * head_dim + d] = acc;
+        for (int i = i_lo; i < i_hi; i++)
+            acc += (scores[i] * inv) * f16_bits_to_f32(vbase[(long)slots[i] * head_dim + did]);
+        vpart[(long)did * G + gid] = acc;
+    }
+    __syncthreads();
+    for (int did = tid; did < head_dim; did += blockDim.x) {
+        float sum = 0.0f;
+        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+        out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
     }
 }
 
@@ -2435,8 +2470,10 @@ pub(crate) fn launch_attention_batched(
     q_per_token: usize,
     k: usize,
 ) -> Result<(), cudarc::driver::DriverError> {
-    // Shared = query (head_dim) + scores (longest prefix = base + k).
-    let shared = ((head_dim + base_position + k) as u32) * 4;
+    // Shared = query (head_dim) + scores (longest prefix = base + k) + weighted-V partials
+    // (max_groups * head_dim, the decode-parity G-group reduction scratch).
+    let max_groups = (1024 / head_dim).max(1);
+    let shared = ((head_dim + base_position + k + max_groups * head_dim) as u32) * 4;
     let cfg = LaunchConfig {
         grid_dim: ((k * n_heads) as u32, 1, 1),
         block_dim: (128, 1, 1),
@@ -2524,9 +2561,11 @@ pub(crate) fn launch_attention_tree_batched(
     q_per_token: usize,
     k: usize,
 ) -> Result<(), cudarc::driver::DriverError> {
-    // Shared = query (head_dim) + scores (<= base + k) + slot indices (<= base + k).
+    // Shared = query (head_dim) + scores (<= base + k) + slot indices (<= base + k) + weighted-V
+    // partials (max_groups * head_dim, the decode-parity G-group reduction scratch).
     // scores are f32 and slots are i32, both 4 bytes ⇒ 2*(base+k) words past head_dim.
-    let shared = ((head_dim + 2 * (base_position + k)) as u32) * 4;
+    let max_groups = (1024 / head_dim).max(1);
+    let shared = ((head_dim + 2 * (base_position + k) + max_groups * head_dim) as u32) * 4;
     let cfg = LaunchConfig {
         grid_dim: ((k * n_heads) as u32, 1, 1),
         block_dim: (128, 1, 1),
