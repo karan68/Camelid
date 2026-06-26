@@ -1160,8 +1160,14 @@ fn splitk_spec_verify_bit_identical() {
         let mut dref = k.stream.alloc_zeros::<f32>(outlen).unwrap();
         if pc > super::SPLITK_THRESHOLD {
             let mut sc = k.stream.alloc_zeros::<f32>(n_heads * max_pos).unwrap();
-            let mut cm = k.stream.alloc_zeros::<f32>(n_heads * super::SPLITK_MAX).unwrap();
-            let mut ls = k.stream.alloc_zeros::<f32>(n_heads * super::SPLITK_MAX).unwrap();
+            let mut cm = k
+                .stream
+                .alloc_zeros::<f32>(n_heads * super::SPLITK_MAX)
+                .unwrap();
+            let mut ls = k
+                .stream
+                .alloc_zeros::<f32>(n_heads * super::SPLITK_MAX)
+                .unwrap();
             let mut ac = k
                 .stream
                 .alloc_zeros::<f32>(n_heads * super::SPLITK_MAX * head_dim)
