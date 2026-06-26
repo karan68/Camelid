@@ -984,9 +984,9 @@ extern "C" __global__ void attention_decode(
     // bits. This is the lever that fixes the O(context) weighted-V collapse at depth
     // (the sequential reduction caps parallelism at head_dim threads). Greedy tokens
     // are verified identical (parity gate first_divergent==-1 vs llama.cpp acd79d603).
-    // CAVEAT: attention_batched (spec-decode verify) is still the sequential reduction;
-    // for spec-decode losslessness it must get the identical reorder so decode==batched
-    // stays exact. Greedy single-token decode (this path / the benchmark) is unaffected.
+    // NOTE: attention_batched / attention_tree_batched (spec-decode verify) now use the IDENTICAL
+    // G-group reorder at or below SPLITK_THRESHOLD, and emulate the split-K reduction above it
+    // (gated by splitk_active), so decode==verify stays bit-exact across the threshold for greedy spec.
     int gid = tid / head_dim;            // 0..G-1
     int did = tid % head_dim;            // 0..head_dim-1
     int p_lo = (int)((long)gid * position_count / G);
@@ -1293,7 +1293,7 @@ extern "C" __global__ void attention_batched(
     const float* __restrict__ q, const unsigned short* __restrict__ cache_k,
     const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
-    int q_per_token, int k_tokens
+    int q_per_token, int k_tokens, int splitk_active
 ) {
     int t = blockIdx.x / n_heads;
     int head = blockIdx.x % n_heads;
@@ -1328,36 +1328,75 @@ extern "C" __global__ void attention_batched(
     __syncthreads();
     for (int p = tid; p < position_count; p += blockDim.x) scores[p] = expf(scores[p] - s_max);
     __syncthreads();
-    if (tid == 0) {
-        float sum = 0.0f;
-        for (int p = 0; p < position_count; p++) sum += scores[p];
-        s_sum = sum;
-    }
-    __syncthreads();
-    float inv = 1.0f / s_sum;
-    // Weighted V - IDENTICAL G-group FP-reassociation to attention_decode so spec-verify logits
-    // are bit-identical to single-token decode (greedy spec losslessness; fixes the decode==batched
-    // reduction-order gap the old sequential sum left). G is the SAME function of the key count and
-    // head_dim the decode launch uses (launch_attention: G = clamp(ceil(pc/head_dim), 1,
-    // 1024/head_dim)); the contiguous p-split and g-order combine match exactly.
-    int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
-    int G = (position_count + head_dim - 1) / head_dim;
-    if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-    float* vpart = shared + head_dim + base_position + k_tokens; // [max_groups * head_dim]
-    for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
-        int gid = idx / head_dim, did = idx % head_dim;
-        int p_lo = (int)((long)gid * position_count / G);
-        int p_hi = (int)((long)(gid + 1) * position_count / G);
-        float acc = 0.0f;
-        for (int p = p_lo; p < p_hi; p++)
-            acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
-        vpart[(long)did * G + gid] = acc;
-    }
-    __syncthreads();
-    for (int did = tid; did < head_dim; did += blockDim.x) {
-        float sum = 0.0f;
-        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
-        out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
+    // Denominator + weighted-V. Spec-verify must match WHICHEVER reduction plain greedy decode
+    // would use for this token's position_count, or a near-tie argmax can flip (spec != greedy).
+    // Above SPLITK_THRESHOLD (512) on the LIVE (non-graph-captured) decode path, plain decode uses
+    // the split-K reduction (launch_attention_splitk); at/below it (and under graph capture) it
+    // uses the G-group attention_decode. `splitk_active` (host = !cuda_graphs_enabled) selects the
+    // regime; the per-token threshold is tested HERE so a verify batch straddling 512 picks the
+    // right path per token (each (t,head) block has its own position_count). Both branches are
+    // block-uniform -> no warp divergence.
+    if (splitk_active && position_count > 512) {   // 512 == SPLITK_THRESHOLD
+        // Split-K EMULATION: bit-identical to attn_sk_partial + attn_sk_combine. n_splits MUST equal
+        // Rust's position_count.div_ceil(256).clamp(2, SPLITK_MAX) (launch_attention_splitk).
+        int n_splits = (position_count + 255) / 256;
+        if (n_splits < 2) n_splits = 2;
+        if (n_splits > 16) n_splits = 16;          // SPLITK_MAX
+        if (tid == 0) {
+            float total = 0.0f;                    // denom: per-chunk fresh-0 p-sum, then sp-order combine
+            for (int sp = 0; sp < n_splits; sp++) {
+                int p_lo = (int)((long)sp * position_count / n_splits);
+                int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+                float ls = 0.0f;
+                for (int p = p_lo; p < p_hi; p++) ls += scores[p];
+                total += ls;
+            }
+            s_sum = total;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            float acc = 0.0f;                      // weighted-V: per-chunk UNNORMALIZED p-sum, sp-order, /s once
+            for (int sp = 0; sp < n_splits; sp++) {
+                int p_lo = (int)((long)sp * position_count / n_splits);
+                int p_hi = (int)((long)(sp + 1) * position_count / n_splits);
+                float a = 0.0f;
+                for (int p = p_lo; p < p_hi; p++)
+                    a += scores[p] * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+                acc += a;
+            }
+            out[(long)t * q_per_token + (long)head * head_dim + did] = acc * inv;
+        }
+    } else {
+        // G-group (<= SPLITK_THRESHOLD, or graph-captured decode): IDENTICAL reorder to
+        // attention_decode (launch_attention: G = clamp(ceil(pc/head_dim), 1, 1024/head_dim));
+        // contiguous p-split + g-order combine match exactly.
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int p = 0; p < position_count; p++) sum += scores[p];
+            s_sum = sum;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
+        int G = (position_count + head_dim - 1) / head_dim;
+        if (G < 1) G = 1; if (G > max_groups) G = max_groups;
+        float* vpart = shared + head_dim + base_position + k_tokens; // [max_groups * head_dim]
+        for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+            int gid = idx / head_dim, did = idx % head_dim;
+            int p_lo = (int)((long)gid * position_count / G);
+            int p_hi = (int)((long)(gid + 1) * position_count / G);
+            float acc = 0.0f;
+            for (int p = p_lo; p < p_hi; p++)
+                acc += (scores[p] * inv) * f16_bits_to_f32(vbase[(long)p * head_dim + did]);
+            vpart[(long)did * G + gid] = acc;
+        }
+        __syncthreads();
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            float sum = 0.0f;
+            for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+            out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
+        }
     }
 }
 
@@ -1406,7 +1445,7 @@ extern "C" __global__ void attention_tree_batched(
     const unsigned short* __restrict__ cache_v, float* __restrict__ out,
     const unsigned int* __restrict__ ancestor_bits, int words,
     int n_heads, int n_kv_heads, int head_dim, int base_position, int max_pos, float scale,
-    int q_per_token, int k_tokens
+    int q_per_token, int k_tokens, int splitk_active
 ) {
     int t = blockIdx.x / n_heads;
     int head = blockIdx.x % n_heads;
@@ -1455,35 +1494,68 @@ extern "C" __global__ void attention_tree_batched(
     __syncthreads();
     for (int i = tid; i < count; i += blockDim.x) scores[i] = expf(scores[i] - s_max);
     __syncthreads();
-    if (tid == 0) {
-        float sum = 0.0f;
-        for (int i = 0; i < count; i++) sum += scores[i];
-        s_sum = sum;
-    }
-    __syncthreads();
-    float inv = 1.0f / s_sum;
-    // Weighted V - IDENTICAL G-group FP-reassociation to attention_decode (G from the attended key
-    // count `count`; contiguous split + g-order combine match exactly). On a LINEAR tree
-    // count==position_count and slots[i]==i, so this is bit-identical to attention_batched and to
-    // single-token decode - the spec-verify losslessness anchor.
-    int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
-    int G = (count + head_dim - 1) / head_dim;
-    if (G < 1) G = 1; if (G > max_groups) G = max_groups;
-    float* vpart = (float*)(slots + base_position + k_tokens); // [max_groups * head_dim]
-    for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
-        int gid = idx / head_dim, did = idx % head_dim;
-        int i_lo = (int)((long)gid * count / G);
-        int i_hi = (int)((long)(gid + 1) * count / G);
-        float acc = 0.0f;
-        for (int i = i_lo; i < i_hi; i++)
-            acc += (scores[i] * inv) * f16_bits_to_f32(vbase[(long)slots[i] * head_dim + did]);
-        vpart[(long)did * G + gid] = acc;
-    }
-    __syncthreads();
-    for (int did = tid; did < head_dim; did += blockDim.x) {
-        float sum = 0.0f;
-        for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
-        out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
+    // Denominator + weighted-V, keyed on the attended-key count `count` (not absolute position).
+    // On a LINEAR tree count==position_count and slots[i]==i, so this matches attention_batched and
+    // single-token decode for the committed path (the only path held to losslessness; branching
+    // nodes are discarded). Split-K emulation above SPLITK_THRESHOLD mirrors plain decode there.
+    if (splitk_active && count > 512) {            // 512 == SPLITK_THRESHOLD
+        int n_splits = (count + 255) / 256;        // == count.div_ceil(256).clamp(2, SPLITK_MAX)
+        if (n_splits < 2) n_splits = 2;
+        if (n_splits > 16) n_splits = 16;
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int i_lo = (int)((long)sp * count / n_splits);
+                int i_hi = (int)((long)(sp + 1) * count / n_splits);
+                float ls = 0.0f;
+                for (int i = i_lo; i < i_hi; i++) ls += scores[i];
+                total += ls;
+            }
+            s_sum = total;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            float acc = 0.0f;
+            for (int sp = 0; sp < n_splits; sp++) {
+                int i_lo = (int)((long)sp * count / n_splits);
+                int i_hi = (int)((long)(sp + 1) * count / n_splits);
+                float a = 0.0f;
+                for (int i = i_lo; i < i_hi; i++)
+                    a += scores[i] * f16_bits_to_f32(vbase[(long)slots[i] * head_dim + did]);
+                acc += a;
+            }
+            out[(long)t * q_per_token + (long)head * head_dim + did] = acc * inv;
+        }
+    } else {
+        // G-group: IDENTICAL reorder to attention_decode (G from `count`; contiguous split +
+        // g-order combine). The losslessness anchor for the committed linear path.
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < count; i++) sum += scores[i];
+            s_sum = sum;
+        }
+        __syncthreads();
+        float inv = 1.0f / s_sum;
+        int max_groups = 1024 / head_dim; if (max_groups < 1) max_groups = 1;
+        int G = (count + head_dim - 1) / head_dim;
+        if (G < 1) G = 1; if (G > max_groups) G = max_groups;
+        float* vpart = (float*)(slots + base_position + k_tokens); // [max_groups * head_dim]
+        for (int idx = tid; idx < G * head_dim; idx += blockDim.x) {
+            int gid = idx / head_dim, did = idx % head_dim;
+            int i_lo = (int)((long)gid * count / G);
+            int i_hi = (int)((long)(gid + 1) * count / G);
+            float acc = 0.0f;
+            for (int i = i_lo; i < i_hi; i++)
+                acc += (scores[i] * inv) * f16_bits_to_f32(vbase[(long)slots[i] * head_dim + did]);
+            vpart[(long)did * G + gid] = acc;
+        }
+        __syncthreads();
+        for (int did = tid; did < head_dim; did += blockDim.x) {
+            float sum = 0.0f;
+            for (int g = 0; g < G; g++) sum += vpart[(long)did * G + g];
+            out[(long)t * q_per_token + (long)head * head_dim + did] = sum;
+        }
     }
 }
 
@@ -2469,6 +2541,7 @@ pub(crate) fn launch_attention_batched(
     scale: f32,
     q_per_token: usize,
     k: usize,
+    splitk_active: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Shared = query (head_dim) + scores (longest prefix = base + k) + weighted-V partials
     // (max_groups * head_dim, the decode-parity G-group reduction scratch).
@@ -2500,7 +2573,8 @@ pub(crate) fn launch_attention_batched(
         .arg(&mp)
         .arg(&scale)
         .arg(&qpt)
-        .arg(&ki);
+        .arg(&ki)
+        .arg(&splitk_active);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -2560,6 +2634,7 @@ pub(crate) fn launch_attention_tree_batched(
     scale: f32,
     q_per_token: usize,
     k: usize,
+    splitk_active: i32,
 ) -> Result<(), cudarc::driver::DriverError> {
     // Shared = query (head_dim) + scores (<= base + k) + slot indices (<= base + k) + weighted-V
     // partials (max_groups * head_dim, the decode-parity G-group reduction scratch).
@@ -2595,7 +2670,8 @@ pub(crate) fn launch_attention_tree_batched(
         .arg(&mp)
         .arg(&scale)
         .arg(&qpt)
-        .arg(&ki);
+        .arg(&ki)
+        .arg(&splitk_active);
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
@@ -2705,6 +2781,22 @@ pub(crate) fn launch_kv_scatter(
 // above it, split-K's n_heads x n_splits grid is needed to fill the SMs.
 const SPLITK_MAX: usize = 16;
 const SPLITK_THRESHOLD: usize = 512;
+
+/// Whether spec-verify must EMULATE the split-K attention reduction to stay token-identical to
+/// plain greedy decode. Mirrors the plain-decode dispatch (`!graph_capture && attn_shared >
+/// SPLITK_THRESHOLD`): on the LIVE (non-graph-captured) decode path, `position_count >
+/// SPLITK_THRESHOLD` runs split-K, so the verify kernels must reproduce its exact chunked reduction
+/// above the threshold. A graph-captured greedy decode skips split-K (uses the G-group
+/// attention_decode), so when CUDA graphs drive greedy decode the verify must STAY G-group. Passed
+/// to the verify kernels as `splitk_active`; the per-token `pc > SPLITK_THRESHOLD` test is done
+/// in-kernel so a verify batch straddling the boundary picks the right path per token.
+///
+/// SCOPE: `CAMELID_ATTN_COALESCED` additionally re-associates split-K's per-position dot (Pass 1
+/// warp-shuffle), which this emulation does NOT reproduce — so the > SPLITK_THRESHOLD lossless
+/// guarantee holds only on the default non-coalesced path. The kernel-parity test asserts that.
+fn splitk_verify_active() -> bool {
+    !cuda_graphs_enabled()
+}
 
 /// Split-K decode attention: grid = n_heads x n_splits (vs one block per head), so the
 /// 30 SMs fill even with 32 heads. Three passes: (1) chunk scores + chunk max, (2) exp
@@ -4993,6 +5085,7 @@ impl CudaResidentDecode {
                 scale,
                 q_width,
                 k,
+                if splitk_verify_active() { 1 } else { 0 },
             )
             .map_err(map)?;
             launch_quantize(
@@ -5312,6 +5405,7 @@ impl CudaResidentDecode {
                 scale,
                 q_width,
                 k,
+                if splitk_verify_active() { 1 } else { 0 },
             )
             .map_err(map)?;
             launch_quantize(
