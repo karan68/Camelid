@@ -152,14 +152,14 @@ pub fn selected_device_ordinal() -> usize {
 
 #[cfg(feature = "cuda")]
 pub use backend::{
-    detect_cuda_device, probe_capability, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
-    try_q8_0_encoded_linear_rows,
+    detect_cuda_device, probe_capability, release_async_pool, try_q8_0_block_linear_row,
+    try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
 pub use stub::{
-    detect_cuda_device, probe_capability, try_q8_0_block_linear_row, try_q8_0_encoded_linear_row,
-    try_q8_0_encoded_linear_rows,
+    detect_cuda_device, probe_capability, release_async_pool, try_q8_0_block_linear_row,
+    try_q8_0_encoded_linear_row, try_q8_0_encoded_linear_rows,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -169,6 +169,9 @@ mod stub {
     pub fn probe_capability() -> Option<CudaCapability> {
         None
     }
+
+    /// No-op without CUDA: there is no async memory pool to trim.
+    pub fn release_async_pool() {}
 
     pub fn detect_cuda_device() -> CudaDeviceInfo {
         CudaDeviceInfo {
@@ -468,6 +471,61 @@ extern "C" __global__ void q8_0_block_linear_row(
             vram_total_bytes: vram_total as u64,
             vram_free_bytes: vram_free as u64,
         })
+    }
+
+    /// Return memory cached in the device's default stream-ordered (async) memory
+    /// pool to the driver. cudarc allocates device buffers via `cuMemAllocAsync`, so
+    /// dropping a `CudaSlice` calls `cuMemFreeAsync`, which returns the bytes to this
+    /// pool rather than to the OS — leaving `cuMemGetInfo` (the free-VRAM probe in
+    /// `probe_capability`) still counting them as used. After dropping a resident
+    /// decode engine we trim the pool to 0 so the freed VRAM becomes visible to the
+    /// probe again; otherwise switching to a larger model under-counts free VRAM and
+    /// wrongly falls back to the CPU decode path. Best-effort: any error (or a host
+    /// without CUDA) is ignored — the caller only loses the reclaim, never correctness.
+    pub fn release_async_pool() {
+        let ordinal = super::selected_device_ordinal();
+        // Retain the primary context so the driver is initialized and the device
+        // handle is valid; held until after the trim. Guard the first call against a
+        // missing driver library (cudarc panics rather than returning Err there).
+        let _ctx = match std::panic::catch_unwind(|| CudaContext::new(ordinal)) {
+            Ok(Ok(ctx)) => ctx,
+            _ => return,
+        };
+        let trace = std::env::var_os("CAMELID_RESIDENT_TRACE").is_some();
+        let free_before = result::mem_get_info().map(|(f, _)| f).unwrap_or(0);
+        // The just-dropped engine released its weight/KV buffers with `cuMemFreeAsync`
+        // (cudarc allocates via `cuMemAllocAsync`), which is STREAM-ORDERED: the pool
+        // cannot hand that memory back — to the driver via trim OR to the next
+        // allocation — until the device has actually retired the frees. Synchronize the
+        // context FIRST, then trim. Without the sync the trim runs before the frees
+        // retire and reclaims nothing (measured: free stays pinned at the old model's
+        // footprint, so the next model's fit probe under-counts and falls back to CPU —
+        // the exact bug this function exists to fix).
+        let _ = result::ctx::synchronize();
+        // SAFETY: `ordinal` indexes a device the driver just reported via the retained
+        // context; the default pool handle is valid for the device's lifetime; and
+        // `trim_to` only releases pool reservations that no live allocation is using,
+        // so it cannot invalidate any outstanding `CudaSlice`.
+        unsafe {
+            let dev = match result::device::get(ordinal as core::ffi::c_int) {
+                Ok(dev) => dev,
+                Err(_) => return,
+            };
+            let pool = match result::device::get_default_mem_pool(dev) {
+                Ok(pool) => pool,
+                Err(_) => return,
+            };
+            let _ = result::mem_pool::trim_to(pool, 0);
+        }
+        if trace {
+            let free_after = result::mem_get_info().map(|(f, _)| f).unwrap_or(0);
+            eprintln!(
+                "[resident-cuda] release_async_pool: free {} MiB -> {} MiB (reclaimed {} MiB)",
+                free_before / (1024 * 1024),
+                free_after / (1024 * 1024),
+                free_after.saturating_sub(free_before) / (1024 * 1024),
+            );
+        }
     }
 
     pub fn detect_cuda_device() -> CudaDeviceInfo {

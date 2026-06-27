@@ -2141,6 +2141,16 @@ impl LlamaInferenceSession {
             .as_ref()
             .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
         if need_build {
+            // Switching/rebuilding the resident engine: free any prior engine and
+            // return its VRAM to the driver BEFORE the new engine's fit probe. cudarc's
+            // cuMemAllocAsync pool keeps a dropped engine's bytes reserved (invisible to
+            // cuMemGetInfo), so without this the new (possibly larger) model under-counts
+            // free VRAM and falls back to the CPU path. No-op on the hot path: this only
+            // runs when a build is actually needed (key change / first build).
+            if guard.is_some() {
+                *guard = None;
+                crate::cuda::release_async_pool();
+            }
             match build_resident_cuda_engine(
                 &weights,
                 0..n_layers,
@@ -2785,6 +2795,14 @@ impl LlamaInferenceSession {
         }
         let build_started = std::time::Instant::now();
         if need_build {
+            // Free any prior resident engine and return its VRAM to the driver before
+            // the new engine's fit probe (see the matching note on the prefill path):
+            // cudarc's async pool otherwise hides the freed bytes from cuMemGetInfo and a
+            // larger model wrongly falls back to CPU. Only runs when a build is needed.
+            if guard.is_some() {
+                *guard = None;
+                crate::cuda::release_async_pool();
+            }
             match build_resident_cuda_engine(
                 &weights,
                 range.clone(),
@@ -9903,6 +9921,12 @@ pub fn reset_resident_caches() {
     *resident_cuda_drafter_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
+    // The engines dropped above returned their VRAM to cudarc's stream-ordered async
+    // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
+    // the next model's resident fit decision measures the real free VRAM — otherwise a
+    // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
+    // unload path exists to prevent).
+    crate::cuda::release_async_pool();
 }
 #[cfg(not(feature = "cuda"))]
 pub fn reset_resident_caches() {}
