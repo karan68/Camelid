@@ -900,6 +900,17 @@ pub struct CpuTensor {
     /// them straight to the `q6k_gemv` kernel (which reads the wire layout directly).
     /// Populated by the Q6_K load path; `None` for non-Q6_K tensors.
     pub q6_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Q2_K super-block wire bytes (84 bytes/super-block, row-major), retained when
+    /// the tensor's `source_type` is `Q2K` so the GPU-resident decode path can feed
+    /// them straight to the `q2k_gemv` kernel (which reads the wire layout directly).
+    /// Populated by the Q2_K load path; `None` for non-Q2_K tensors.
+    pub q2_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Q3_K super-block wire bytes (110 bytes/super-block, row-major), retained when
+    /// the tensor's `source_type` is `Q3K` so the GPU-resident decode path can feed
+    /// them straight to the `q3k_gemv` kernel (which reads the wire layout directly).
+    /// Populated by the Q3_K load path; `None` for non-Q3_K tensors. (Q2_K models mix
+    /// in Q3_K projections — typically attn_output / ffn_down.)
+    pub q3_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     /// Ternary TQ2_0 wire bytes (66 bytes/256-weight block, row-major), retained when
     /// the tensor's `source_type` is `Tq2_0` so the CPU ternary block-dot streams the
     /// quantized weights instead of materialising f32 (a 4B model fully decoded to f32 is
@@ -1058,6 +1069,8 @@ impl Q8_0TensorBlocks {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             data,
         })
@@ -1128,6 +1141,8 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             data,
         })
@@ -1214,6 +1229,8 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             data: Vec::new(),
         })
@@ -1244,6 +1261,8 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
@@ -1269,6 +1288,8 @@ impl CpuTensor {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
@@ -1294,6 +1315,8 @@ impl CpuTensor {
             q8_0_split_file_backing: Some(backings),
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: None,
             data: Vec::new(),
         }
@@ -3297,16 +3320,23 @@ impl TensorStore {
     pub fn load_kquant_wire_linear(&self, name: &str) -> Result<CpuTensor> {
         let desc = self.descriptor(name)?.clone();
         let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
-        let is_kquant = matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K);
+        let is_kquant = matches!(
+            desc.tensor_type,
+            GgufTensorType::Q4K | GgufTensorType::Q6K | GgufTensorType::Q2K | GgufTensorType::Q3K
+        );
         if !is_kquant || shape.dims.len() != 2 {
             return self.load_cpu_f32(name);
         }
         let bytes = self.tensor_bytes(name)?;
         let mut q4_k_wire_bytes = None;
         let mut q6_k_wire_bytes = None;
+        let mut q2_k_wire_bytes = None;
+        let mut q3_k_wire_bytes = None;
         match desc.tensor_type {
             GgufTensorType::Q4K => q4_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
             GgufTensorType::Q6K => q6_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
+            GgufTensorType::Q2K => q2_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
+            GgufTensorType::Q3K => q3_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
             _ => unreachable!(),
         }
         Ok(CpuTensor {
@@ -3324,6 +3354,8 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q6_k_wire_bytes,
+            q2_k_wire_bytes,
+            q3_k_wire_bytes,
             tq2_0_wire_bytes: None,
             data: Vec::new(),
         })
@@ -3354,6 +3386,8 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
             q6_k_wire_bytes: None,
+            q2_k_wire_bytes: None,
+            q3_k_wire_bytes: None,
             tq2_0_wire_bytes: Some(std::sync::Arc::new(bytes.to_vec())),
             data: Vec::new(),
         })
@@ -3500,6 +3534,8 @@ impl TensorStore {
         // bytes directly). The CPU f32 `data` is still decoded below for the CPU path.
         let mut q4_k_wire_bytes = None;
         let mut q6_k_wire_bytes = None;
+        let mut q2_k_wire_bytes = None;
+        let mut q3_k_wire_bytes = None;
         let data = match desc.tensor_type {
             GgufTensorType::F32 => decode_f32_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::F16 => decode_f16_tensor(name, &bytes, expected_elements)?,
@@ -3521,8 +3557,16 @@ impl TensorStore {
             GgufTensorType::Q4_1 => decode_q4_1_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q5_0 => decode_q5_0_tensor(name, &bytes, expected_elements)?,
             GgufTensorType::Q5_1 => decode_q5_1_tensor(name, &bytes, expected_elements)?,
-            GgufTensorType::Q2K => decode_q2_k_tensor(name, &bytes, expected_elements)?,
-            GgufTensorType::Q3K => decode_q3_k_tensor(name, &bytes, expected_elements)?,
+            GgufTensorType::Q2K => {
+                // 84-byte super-block wire layout — fed straight to the resident q2k GEMV.
+                q2_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec()));
+                decode_q2_k_tensor(name, &bytes, expected_elements)?
+            }
+            GgufTensorType::Q3K => {
+                // 110-byte super-block wire layout — fed straight to the resident q3k GEMV.
+                q3_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec()));
+                decode_q3_k_tensor(name, &bytes, expected_elements)?
+            }
             GgufTensorType::Q4K => {
                 // The GGUF bytes ARE the 144-byte super-block wire layout the resident
                 // q4k path repacks; keep them alongside the decoded f32.
@@ -3572,6 +3616,8 @@ impl TensorStore {
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
             q6_k_wire_bytes,
+            q2_k_wire_bytes,
+            q3_k_wire_bytes,
             tq2_0_wire_bytes: None,
             data,
         })

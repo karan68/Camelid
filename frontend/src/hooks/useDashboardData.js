@@ -618,6 +618,39 @@ export function useDashboardData({ showNotice, clearNotice }) {
           reconciledLocalModels = kept
           droppedStale = true
         }
+
+        // Add on-disk GGUFs the saved list does not track yet — e.g. files placed
+        // directly into models/ instead of downloaded through the catalog. Without
+        // this they appear in the backend scan (and the lane view) but cannot be
+        // loaded from the main UI ("Choose a saved local model before loading it").
+        // Matched by filename against existing records so catalog downloads are not
+        // duplicated.
+        const trackedFilenames = new Set(
+          reconciledLocalModels
+            .map((m) =>
+              String(m.model_path || m.hf_filename || '')
+                .split(/[\\/]/)
+                .filter(Boolean)
+                .pop(),
+            )
+            .filter(Boolean),
+        )
+        const additions = []
+        for (const entry of localList.models) {
+          if (!entry?.filename || trackedFilenames.has(entry.filename)) continue
+          const rec = normalizeLocalModelRecord({
+            id: entry.filename,
+            name: entry.filename,
+            model_path: `models/${entry.filename}`,
+            status: 'registered',
+            quant: entry.quantization,
+          })
+          if (rec) additions.push(rec)
+        }
+        if (additions.length) {
+          reconciledLocalModels = [...additions, ...reconciledLocalModels]
+          droppedStale = true
+        }
       }
 
       let activeLocalModels = currentLocalModels
