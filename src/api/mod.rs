@@ -6347,7 +6347,16 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
         let file_backed_q8_linear = lazy_q8_linear
             && desc.tensor_type == GgufTensorType::Q8_0
             && matches!(desc.dimensions.len(), 2 | 3);
-        let f32_bytes = if file_backed_q8_linear {
+        // K-quant 2-D/3-D linears (Q4_K/Q6_K/Q2_K/Q3_K) load via the wire path
+        // (`load_kquant_wire_linear`), retaining only the compact super-block wire
+        // bytes — they never materialize an f32 copy, so they must not be counted
+        // against the f32 budget (otherwise a 4B Q2_K/Q4_K model's ~16 GB f32 estimate
+        // wrongly trips the safety limit even though the resident GPU path uses wire).
+        let wire_resident_kquant = matches!(
+            desc.tensor_type,
+            GgufTensorType::Q4K | GgufTensorType::Q6K | GgufTensorType::Q2K | GgufTensorType::Q3K
+        ) && matches!(desc.dimensions.len(), 2 | 3);
+        let f32_bytes = if file_backed_q8_linear || wire_resident_kquant {
             0
         } else {
             element_count.checked_mul(4).ok_or_else(|| {

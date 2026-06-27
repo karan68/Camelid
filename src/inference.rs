@@ -407,8 +407,13 @@ impl LlamaLoadedWeights {
                 if matches!(desc.tensor_type, GgufTensorType::Tq2_0) && desc.dimensions.len() == 2 {
                     return store.load_tq2_0_wire_linear(name);
                 }
-                if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
-                    && desc.dimensions.len() == 2
+                if matches!(
+                    desc.tensor_type,
+                    GgufTensorType::Q4K
+                        | GgufTensorType::Q6K
+                        | GgufTensorType::Q2K
+                        | GgufTensorType::Q3K
+                ) && desc.dimensions.len() == 2
                 {
                     return store.load_kquant_wire_linear(name);
                 }
@@ -1963,9 +1968,29 @@ impl LlamaInferenceSession {
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
+        // Q2_K residency: 84-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks (the q2k_gemv
+        // kernel reads the wire bytes a super-block at a time). A Q2_K model is mostly
+        // Q2_K projections with a few promoted to Q4_K/Q6_K (the K-quant mix).
+        let is_q2k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q2K)
+                && t.q2_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
+        // Q3_K residency: 110-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks. Q2_K models
+        // mix Q3_K into attn_output / ffn_down, so a resident Q2_K model needs this lane.
+        let is_q3k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q3K)
+                && t.q3_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
         // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
-        // (Q4_K / Q6_K). Q8_0 behavior is byte-identical to before.
-        let is_resident_quant = |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t);
+        // (Q4_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
+        let is_resident_quant =
+            |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t);
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
             .weights
@@ -9997,6 +10022,16 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if t.source_type == Some(GgufTensorType::Q2K) {
+            if let Some(w) = t.q2_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
+        if t.source_type == Some(GgufTensorType::Q3K) {
+            if let Some(w) = t.q3_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
         None
     }
     // The resident GEMV lane a projection dispatches on (drives the upload repack and
@@ -10005,6 +10040,8 @@ fn build_resident_cuda_engine(
         match t.source_type {
             Some(GgufTensorType::Q4K) if t.q4_k_wire_bytes.is_some() => ProjQuant::Q4K,
             Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
+            Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
+            Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
             _ => ProjQuant::Q8_0,
         }
     }
@@ -15883,6 +15920,147 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
         sumf -= dmin * y.d * sumi as f32;
     }
     sumf + sums.iter().sum::<f32>()
+}
+
+/// Q2_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel `ggml_vec_dot_q2_K_q8_K`. Each 84-byte
+/// super-block is scales[16] (low nibble = quant scale, high nibble = min scale,
+/// one pair per 16-value sub-block), qs[64] (2-bit quants), d(f16), dmin(f16).
+/// Unlike Q4_K/Q6_K the reference keeps a SINGLE integer `isum` per super-block, so
+/// each super-block contributes `dall·isum − dmin·summs` (subtraction first) to the
+/// f32 sum, summed in order. The `q2k_gemv` CUDA kernel reproduces this exactly.
+/// Correctness-first scalar (the reference's "no SIMD" generic shape).
+#[allow(dead_code, clippy::needless_range_loop)]
+pub(crate) fn q2_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    const WIRE: usize = 84; // Q2_K super-block: scales[16] + qs[64] + d + dmin (f16)
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let scales = &block[0..16];
+        let qs = &block[16..80];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[80], block[81]]));
+        let dmin = f16_bits_to_f32(u16::from_le_bytes([block[82], block[83]]));
+
+        // mins side: Σ over the 16 sub-blocks of (per-16 activation sum) × min scale
+        let mut summs = 0i32;
+        for j in 0..16 {
+            let bsum: i32 = y.qs[j * 16..(j + 1) * 16].iter().map(|&q| q as i32).sum();
+            summs += bsum * (scales[j] >> 4) as i32;
+        }
+
+        // main side: 2 halves × 4 groups; each group reuses the same 32 qs bytes at
+        // shift 2*group, split into a low (l<16) and high (l>=16) sub-block, each
+        // with its own low-nibble quant scale. q8 advances 32 per group.
+        let mut isum = 0i32;
+        let mut is = 0usize;
+        for k in 0..2 {
+            let mut shift = 0u32;
+            for j in 0..4 {
+                let dlo = (scales[is] & 0xF) as i32;
+                is += 1;
+                let mut isuml = 0i32;
+                for l in 0..16 {
+                    isuml += y.qs[k * 128 + j * 32 + l] as i32
+                        * ((qs[k * 32 + l] >> shift) & 3) as i32;
+                }
+                isum += dlo * isuml;
+                let dhi = (scales[is] & 0xF) as i32;
+                is += 1;
+                let mut isuml2 = 0i32;
+                for l in 0..16 {
+                    isuml2 += y.qs[k * 128 + j * 32 + 16 + l] as i32
+                        * ((qs[k * 32 + 16 + l] >> shift) & 3) as i32;
+                }
+                isum += dhi * isuml2;
+                shift += 2;
+            }
+        }
+
+        let dall = d * y.d;
+        let dminx = dmin * y.d;
+        sumf += dall * isum as f32 - dminx * summs as f32;
+    }
+    sumf
+}
+
+/// Q3_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel `ggml_vec_dot_q3_K_q8_K`. Each 110-byte
+/// super-block is hmask[32] (high bit of each 3-bit quant), qs[64] (low 2 bits),
+/// scales[12] (16 signed 6-bit scales, kmask-packed), d(f16). Q3_K has NO mins: the
+/// 3-bit quant is reconstructed as `((qs>>shift)&3) - (hmask_bit ? 0 : 4)` (centered
+/// to −4..3) and dequantized as `d·(scale−32)·value`. So each super-block contributes
+/// a single `d·isum` (isum = Σ_sb (scale−32)·Σ q8·value), summed in order. The
+/// `q3k_gemv` CUDA kernel reproduces this exactly. Correctness-first scalar.
+#[allow(dead_code, clippy::needless_range_loop)]
+pub(crate) fn q3_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    const WIRE: usize = 110; // Q3_K super-block: hmask[32] + qs[64] + scales[12] + d(f16)
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let scales_raw = &block[96..108];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[108], block[109]]));
+
+        // Expand the 16 signed 6-bit scales (kmask scheme), as Q3KBlock::expanded_scales.
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let mut aux = [
+            u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]),
+            u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]),
+            u32::from_le_bytes([scales_raw[8], scales_raw[9], scales_raw[10], scales_raw[11]]),
+            0u32,
+        ];
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let mut scales = [0i8; 16];
+        for c in 0..4 {
+            let b = aux[c].to_le_bytes();
+            for k in 0..4 {
+                scales[c * 4 + k] = b[k] as i8;
+            }
+        }
+
+        // isum = Σ over the 16 sub-blocks of (scale−32) × Σ q8·value. 2 halves × 4
+        // groups × {low,high}; qs reused per group at shift 2*group; hmask bit advances
+        // per group (1<<(half*4+group)); q8 in natural order.
+        let mut isum = 0i32;
+        let mut sb = 0usize;
+        let mut high_mask = 1u8;
+        for half in 0..2 {
+            let value_base = half * 32;
+            let q8_base = half * 128;
+            let mut shift = 0u32;
+            for g in 0..4 {
+                let sc_lo = scales[sb] as i32 - 32;
+                sb += 1;
+                let mut dot = 0i32;
+                for l in 0..16 {
+                    let hb = if hmask[l] & high_mask != 0 { 0 } else { 4 };
+                    let v = ((qs[value_base + l] >> shift) & 3) as i32 - hb;
+                    dot += y.qs[q8_base + g * 32 + l] as i32 * v;
+                }
+                isum += sc_lo * dot;
+                let sc_hi = scales[sb] as i32 - 32;
+                sb += 1;
+                let mut dot2 = 0i32;
+                for l in 0..16 {
+                    let hb = if hmask[16 + l] & high_mask != 0 { 0 } else { 4 };
+                    let v = ((qs[value_base + 16 + l] >> shift) & 3) as i32 - hb;
+                    dot2 += y.qs[q8_base + g * 32 + 16 + l] as i32 * v;
+                }
+                isum += sc_hi * dot2;
+                shift += 2;
+                high_mask <<= 1;
+            }
+        }
+
+        sumf += d * y.d * isum as f32;
+    }
+    sumf
 }
 
 /// Q5_0×Q8_0 dot of one weight row read straight from the GGUF wire bytes,
