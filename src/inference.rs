@@ -2612,17 +2612,17 @@ impl LlamaInferenceSession {
         Ok(None)
     }
 
-    /// Non-CUDA build: the GPU resident speculative-verify path is unavailable,
-    /// so return `Ok(None)` and let the caller fall back to the CPU chunk verify.
-    /// Lossless either way (the target verify is authoritative).
+    /// Non-CUDA build: route the GPU resident speculative-verify to the Metal seam
+    /// (`verify_drafts_metal`), which runs the batched bit-identical `verify_batch` when the
+    /// resident engine is live and ready, else returns `Ok(None)` so the caller falls back to
+    /// the CPU chunk verify. Lossless either way (the target verify is authoritative).
     #[cfg(not(feature = "cuda"))]
-    #[allow(unused_variables)]
     pub fn verify_drafts_gpu(
         &mut self,
         last_token: u32,
         drafts: &[u32],
     ) -> Result<Option<Vec<u32>>> {
-        Ok(None)
+        self.verify_drafts_metal(last_token, drafts)
     }
 
     #[cfg(not(feature = "cuda"))]
