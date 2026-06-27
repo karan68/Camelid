@@ -151,17 +151,25 @@ function EligibleRow({ entry, busy, onRun }) {
   )
 }
 
-function NotAnchoredRow({ entry }) {
+function NotAnchoredRow({ entry, busy, onUse }) {
   return (
-    <article className="lane-row lane-row--blocked" aria-label={`Not-yet-runnable model ${entry.filename}`}>
+    <article className="lane-row lane-row--blocked" aria-label={`Experimental model ${entry.filename}`}>
       <div className="lane-row-head">
         <div className="lane-row-id">
           <span className="lane-row-name">{entry.filename}</span>
           <span className="lane-row-meta">{metaLine(entry)}</span>
         </div>
-        <EvidenceChip state="unsupported" asText>Combo not yet anchored</EvidenceChip>
+        <EvidenceChip state="unsupported" asText>Experimental — unverified</EvidenceChip>
       </div>
       <p className="lane-row-note">{describeModel(entry)}</p>
+      <p className="lane-row-note">
+        Implemented but not parity-anchored: it loads and runs (GPU-resident when it
+        fits), but its output is not cross-validated against the reference. For
+        experimentation only.
+      </p>
+      <button type="button" className="lane-row-action" onClick={onUse} disabled={busy}>
+        {busy ? 'Loading…' : 'Use for chat (experimental)'}
+      </button>
     </article>
   )
 }
@@ -379,12 +387,17 @@ export function LocalLaneSections({ apiBase = '', capabilities, refreshKey = 0 }
 
       {buckets.not_anchored.length ? (
         <Section
-          title="Not yet runnable"
+          title="Experimental (implemented, unverified)"
           count={buckets.not_anchored.length}
-          subtitle="Combo not anchored — shown for honesty, never presented as compatible."
+          subtitle="Implemented but not parity-anchored — loadable for experimentation, never presented as verified."
         >
           {buckets.not_anchored.map((m) => (
-            <NotAnchoredRow key={m.filename} entry={m} />
+            <NotAnchoredRow
+              key={m.filename}
+              entry={m}
+              busy={usingFilename === m.filename}
+              onUse={() => useModel(m.filename)}
+            />
           ))}
         </Section>
       ) : null}
