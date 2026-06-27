@@ -7189,6 +7189,40 @@ fn encode_rms_norm_f32(
     );
 }
 
+/// Batched RMSNorm over `rows` contiguous f32 rows (`rms_norm_batch_f32`): one 256-thread
+/// group per row, the SAME reduction + `1/sqrt(mean_sq+eps)` as the single-row
+/// `rms_norm_f32`, so row `r`'s output bit-equals a single-token norm of `input[r*width..]`.
+/// `scalar` holds width (u32) @0 then eps (f32) @4.
+#[cfg(target_os = "macos")]
+fn encode_rms_norm_batch(
+    k: &MetalLinearKernel,
+    e: &metal::ComputeCommandEncoderRef,
+    input: &Buffer,
+    weight: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    e.set_compute_pipeline_state(&k.rms_norm_batch_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(output), 0);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Opt-in: with CAMELID_METAL_F32Y also set, weights upload in the raw GGUF 34-byte
 /// f16-scale wire layout (~5.9% fewer weight bytes per token).
 #[cfg(target_os = "macos")]
@@ -7594,6 +7628,7 @@ fn encode_gemma4_ffn(
 /// [head_dim: u32 @0, eps: f32 @4, use_weight: u32 @8]; `weight` may be a dummy when
 /// use_weight is 0.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn encode_rms_norm_per_head(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -7602,11 +7637,16 @@ fn encode_rms_norm_per_head(
     output: &Buffer,
     scalar: &Buffer,
     head_count: usize,
+    // Byte offset applied to the (in-place) input/output buffer so the per-head norm
+    // can run on an arbitrary verify row; the per-head `base = head*head_dim` indexing
+    // is relative to the bound offset, so the arithmetic is unchanged. Default 0 for all
+    // pre-verify callers (no behavior change).
+    row_off: u64,
 ) {
     e.set_compute_pipeline_state(&k.rms_norm_per_head_pipeline);
-    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(0, Some(input), row_off);
     e.set_buffer(1, Some(weight), 0);
-    e.set_buffer(2, Some(output), 0);
+    e.set_buffer(2, Some(output), row_off);
     e.set_buffer(3, Some(scalar), 0);
     e.set_buffer(4, Some(scalar), 4);
     e.set_buffer(5, Some(scalar), 8);
@@ -7774,9 +7814,9 @@ fn encode_gemma4_attention(
 
     encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
     encode_gemma4_matmul(fmt, e, k, &normf, q_w, &query_buf, &q_mm, q_dim);
-    encode_rms_norm_per_head(e, k, &query_buf, &qnorm_w, &qn_buf, &perhead_q, n_heads);
+    encode_rms_norm_per_head(e, k, &query_buf, &qnorm_w, &qn_buf, &perhead_q, n_heads, 0);
     encode_rope(
-        e, k, &qn_buf, &cos_buf, &sin_buf, &rope_q, n_heads, half_rope,
+        e, k, &qn_buf, &cos_buf, &sin_buf, &rope_q, n_heads, half_rope, 0, 0,
     );
     // Owning layers project + cache their own K/V; the trailing cross-shared layers
     // skip all of that and run attention against the source layer's cache
@@ -7794,11 +7834,11 @@ fn encode_gemma4_attention(
         } else {
             &key_buf
         };
-        encode_rms_norm_per_head(e, k, &key_buf, &knorm_w, &kn_buf, &perhead_k, n_kv_heads);
+        encode_rms_norm_per_head(e, k, &key_buf, &knorm_w, &kn_buf, &perhead_k, n_kv_heads, 0);
         // Weightless V-norm: qnorm_w is bound as a dummy (use_weight = 0, never read).
-        encode_rms_norm_per_head(e, k, v_src, &qnorm_w, &vn_buf, &perhead_v, n_kv_heads);
+        encode_rms_norm_per_head(e, k, v_src, &qnorm_w, &vn_buf, &perhead_v, n_kv_heads, 0);
         encode_rope(
-            e, k, &kn_buf, &cos_buf, &sin_buf, &rope_k, n_kv_heads, half_rope,
+            e, k, &kn_buf, &cos_buf, &sin_buf, &rope_k, n_kv_heads, half_rope, 0, 0,
         );
         // Scatter the roped K and normed V into the cache at write_position. f32 cache
         // only: bind the kv16 mirror slots to a placeholder with the write flag at 0.
@@ -7831,6 +7871,8 @@ fn encode_gemma4_attention(
         n_kv_heads,
         head_dim,
         position_count,
+        0,
+        0,
     );
     encode_gemma4_matmul(fmt, e, k, &ctx_buf, o_w, &o_buf, &o_mm, hidden);
     encode_rms_norm_f32(e, k, &o_buf, &postnorm_w, &on_buf, &post_rms_scalar);
@@ -8274,7 +8316,16 @@ fn encode_gemma4_pli(
         *(resid_n.contents() as *mut u32) = ple_total as u32;
     }
     encode_linear_transposed_f32(e, k, h0_buf, proj_buf, ctx_buf, &ctx_scalar, ple_total);
-    encode_rms_norm_per_head(e, k, ctx_buf, projnorm_buf, ctx_n_buf, &perhead, n_layers);
+    encode_rms_norm_per_head(
+        e,
+        k,
+        ctx_buf,
+        projnorm_buf,
+        ctx_n_buf,
+        &perhead,
+        n_layers,
+        0,
+    );
     encode_binary(
         e,
         &k.residual_add_pipeline,
@@ -8671,11 +8722,17 @@ fn encode_rope(
     scalar: &Buffer,
     head_count: usize,
     half_rope: usize,
+    // Byte offset for the (in-place) data buffer, and a shared offset for the cos/sin
+    // tables, so RoPE can run on a single verify row at position `base+i` (cos/sin are
+    // position-major with stride half_rope). All in-kernel indexing is relative to the
+    // bound offsets, so the math is unchanged. Default 0 for all pre-verify callers.
+    data_off: u64,
+    table_off: u64,
 ) {
     e.set_compute_pipeline_state(&k.rope_rotate_pipeline);
-    e.set_buffer(0, Some(data), 0);
-    e.set_buffer(1, Some(cos_t), 0);
-    e.set_buffer(2, Some(sin_t), 0);
+    e.set_buffer(0, Some(data), data_off);
+    e.set_buffer(1, Some(cos_t), table_off);
+    e.set_buffer(2, Some(sin_t), table_off);
     e.set_buffer(3, Some(scalar), 0); // head_count
     e.set_buffer(4, Some(scalar), 4); // head_dim
     e.set_buffer(5, Some(scalar), 8); // half_rope
@@ -8700,6 +8757,12 @@ fn encode_attention(
     n_kv_heads: usize,
     head_dim: usize,
     position_count: usize,
+    // Byte offsets for the query input and the context output buffers, so attention can
+    // run on a single verify row (query/out at row `i`) while the K/V cache is shared.
+    // The kernels index heads relative to the bound offset, so the routing/math are
+    // unchanged. Default 0 for all pre-verify callers (single-token query/out at row 0).
+    query_off: u64,
+    out_off: u64,
 ) {
     // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
     // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
@@ -8738,12 +8801,12 @@ fn encode_attention(
             } else {
                 e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
             }
-            e.set_buffer(0, Some(query), 0);
+            e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(mk), 0);
             e.set_buffer(2, Some(mv), 0);
         } else {
             e.set_compute_pipeline_state(&k.attention_decode_splitk_pipeline);
-            e.set_buffer(0, Some(query), 0);
+            e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
         }
@@ -8771,7 +8834,7 @@ fn encode_attention(
         );
         e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_pipeline);
         e.set_buffer(0, Some(&partials), 0);
-        e.set_buffer(1, Some(out), 0);
+        e.set_buffer(1, Some(out), out_off);
         e.set_buffer(2, Some(scalar), 4); // head_dim
         e.set_buffer(3, Some(&splits_scalar), 0);
         e.dispatch_thread_groups(
@@ -8797,13 +8860,13 @@ fn encode_attention(
         (false, false) => &k.attention_decode_pipeline,
     };
     e.set_compute_pipeline_state(attn_pipeline);
-    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(0, Some(query), query_off);
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(2, Some(values), 0);
     if !v2 {
         e.set_buffer(3, Some(scores), 0);
     }
-    e.set_buffer(4, Some(out), 0);
+    e.set_buffer(4, Some(out), out_off);
     e.set_buffer(5, Some(scalar), 0); // n_heads
     e.set_buffer(6, Some(scalar), 4); // head_dim
     e.set_buffer(7, Some(scalar), 8); // position_count
@@ -9151,6 +9214,7 @@ fn encode_attention_block(
             &query_buf,
             &perhead_scalar,
             n_heads,
+            0,
         );
         encode_rms_norm_per_head(
             e,
@@ -9160,6 +9224,7 @@ fn encode_attention_block(
             &key_buf,
             &perhead_scalar,
             n_kv_heads,
+            0,
         );
     }
     encode_rope(
@@ -9171,6 +9236,8 @@ fn encode_attention_block(
         &rope_q_scalar,
         n_heads,
         half_rope,
+        0,
+        0,
     );
     encode_rope(
         e,
@@ -9181,6 +9248,8 @@ fn encode_attention_block(
         &rope_k_scalar,
         n_kv_heads,
         half_rope,
+        0,
+        0,
     );
     // Write the current token's (roped) K and (raw) V into the cache at `write_position` via
     // a compute scatter, so the whole token stays inside ONE compute command encoder (encoder
@@ -9237,6 +9306,8 @@ fn encode_attention_block(
         n_kv_heads,
         head_dim,
         position_count,
+        0,
+        0,
     );
     if f32y_gemv_enabled() {
         encode_q8_matmul_f32y(e, k, &ctx_buf, o_w_buf, &o_buf, &o_mm_scalar, hidden);
@@ -11173,6 +11244,7 @@ impl ResidentDecodeState {
                         &q_buf,
                         &perhead_qk_scalar,
                         n_tokens * self.n_heads,
+                        0,
                     );
                 }
                 encode_rms_norm_per_head(
@@ -11183,6 +11255,7 @@ impl ResidentDecodeState {
                     &k_buf,
                     &perhead_qk_scalar,
                     n_tokens * self.n_kv_heads,
+                    0,
                 );
                 stage!("2b:qk_norm");
             }
@@ -11665,6 +11738,552 @@ impl ResidentDecodeState {
         }
         self.filled = n_tokens;
         Some(())
+    }
+
+    /// WIN2METAL Phase 3: speculative-verify forward over `k` rows at sequence positions
+    /// `[base_position, base_position + k)`. BIT-IDENTICAL to `k` independent
+    /// `forward_token` decodes at those positions: the input RMSNorm/projections/FFN run as
+    /// the proven byte-exact batched kernels (`rms_norm_batch_f32`, the C0 batched-column
+    /// GEMV `encode_q8_matmul_f32y_batched`, elementwise residual/silu), while per-head
+    /// QK-norm, RoPE, K/V scatter, attention and argmax run the EXACT single-token kernels
+    /// once per row at a row byte-offset (so cos/sin pairing, scatter slot, attention
+    /// v2/split-K routing and argmax tie-break are reproduced verbatim). All `k` K/V are
+    /// scattered into `[base..base+k)` before any attention; row `i` attends over
+    /// `position_count = base+i+1`, so it sees only `[0, base+i]` (its own slot + the prior
+    /// rows), exactly as a standalone decode would. Does NOT advance `filled` — the host
+    /// accept loop sets `filled = base + accepted.len()` and the rejected tail slots are
+    /// overwritten by the next single-token decode. Returns the `k` greedy argmax ids, or
+    /// `None` (lossless fallback) on any unsupported config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Option<Vec<u32>> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            false,
+        )
+        .map(|(preds, _)| preds)
+    }
+
+    /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
+    /// gate compares logits by exact `to_bits`, which a logits bug that doesn't flip the
+    /// argmax would slip past). Test-only: the production lane never pays the logits readback.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_batch_logits(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Option<(Vec<u32>, Vec<f32>)> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            true,
+        )
+    }
+
+    /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
+    const MAX_VERIFY_K: usize = 8;
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_batch_inner(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+        read_logits: bool,
+    ) -> Option<(Vec<u32>, Vec<f32>)> {
+        // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
+        if !(1..=Self::MAX_VERIFY_K).contains(&k) {
+            return None;
+        }
+        if self.kv16 {
+            return None; // f32 KV cache only for Phase 3 (kv16 is a follow-up)
+        }
+        // The new batched GEMV mirrors exactly the f32y + wire + NSG=8 production GEMV; any
+        // other GEMV path would not match it bit-for-bit.
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            return None;
+        }
+        if !self.head_dim.is_multiple_of(32) || self.head_dim > 128 {
+            return None; // v2 / split-K attention precondition
+        }
+        if base_position != self.filled() {
+            return None;
+        }
+        if base_position + k > self.cap {
+            return None;
+        }
+        if layers.len() != self.n_layers || embeddings.len() != k * self.hidden {
+            return None;
+        }
+        if cos_all.len() != sin_all.len() || cos_all.is_empty() || !cos_all.len().is_multiple_of(k)
+        {
+            return None;
+        }
+        let half_rope = cos_all.len() / k;
+        if half_rope * 2 > self.head_dim {
+            return None;
+        }
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let bpr_hidden = self.hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = self.ffn_dim / 32;
+        for l in layers {
+            if l.attn_norm.len() != self.hidden
+                || l.ffn_norm.len() != self.hidden
+                || l.q_weight_blocks.block_count() != q_dim * bpr_hidden
+                || l.k_weight_blocks.block_count() != kv_dim * bpr_hidden
+                || l.v_weight_blocks.block_count() != kv_dim * bpr_hidden
+                || l.o_weight_blocks.block_count() != self.hidden * bpr_q
+                || l.gate_weight_blocks.block_count() != self.ffn_dim * bpr_hidden
+                || l.up_weight_blocks.block_count() != self.ffn_dim * bpr_hidden
+                || l.down_weight_blocks.block_count() != self.hidden * bpr_ffn
+            {
+                return None;
+            }
+        }
+        let vocab = logits.vocab_size;
+        if vocab == 0
+            || logits.final_norm.len() != self.hidden
+            || logits.output_weight_blocks.block_count() != vocab * bpr_hidden
+        {
+            return None;
+        }
+
+        // A pre-committed pending graph (from forward_token's encode-ahead) sits gated on the
+        // serial queue; release it so this command buffer is not ordered behind a graph that
+        // never gets signaled (which would deadlock the wait below).
+        if let Some(stale) = self.pending.take() {
+            self.release_stale(stale);
+        }
+        self.pending_signaled = false;
+        if !self.ensure_capacity(base_position + k) {
+            return None;
+        }
+
+        let kern = metal_linear_kernel()?;
+        let max_positions = self.max_positions;
+        let n_heads = self.n_heads;
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+        let hidden = self.hidden;
+        let ffn_dim = self.ffn_dim;
+        let eps = self.eps;
+        let pairing = u32::from(self.split_half_pairing);
+
+        // ---- Resolve resident weights (wire format; gated on f32y+wire above) ------------
+        let resident: Vec<[Buffer; 7]>;
+        let attn_norm_bufs: Vec<Buffer>;
+        let ffn_norm_bufs: Vec<Buffer>;
+        let qk_norm_bufs: Vec<Option<(Buffer, Buffer)>>;
+        let ow_buf: Buffer;
+        let final_norm_buf: Buffer;
+        {
+            let mut cache = metal_linear_cache().lock().ok()?;
+            let mut wb = |w: &ResidentWeightBytes| match w {
+                ResidentWeightBytes::Blocks36(blocks) => {
+                    Some(cache.q8_wire_weight_buffer(&kern.device, blocks))
+                }
+                ResidentWeightBytes::WirePages(pages) => {
+                    Some(cache.q8_wire_nocopy_buffer(&kern.device, pages))
+                }
+            };
+            resident = layers
+                .iter()
+                .map(|l| {
+                    Some([
+                        wb(&l.q_weight_blocks)?,
+                        wb(&l.k_weight_blocks)?,
+                        wb(&l.v_weight_blocks)?,
+                        wb(&l.o_weight_blocks)?,
+                        wb(&l.gate_weight_blocks)?,
+                        wb(&l.up_weight_blocks)?,
+                        wb(&l.down_weight_blocks)?,
+                    ])
+                })
+                .collect::<Option<Vec<_>>>()?;
+            ow_buf = wb(&logits.output_weight_blocks)?;
+            attn_norm_bufs = layers
+                .iter()
+                .map(|l| cache.weight_buffer(&kern.device, l.attn_norm))
+                .collect();
+            ffn_norm_bufs = layers
+                .iter()
+                .map(|l| cache.weight_buffer(&kern.device, l.ffn_norm))
+                .collect();
+            qk_norm_bufs = layers
+                .iter()
+                .map(|l| match (l.q_norm, l.k_norm) {
+                    (Some(qn), Some(kn)) => Some((
+                        cache.weight_buffer(&kern.device, qn),
+                        cache.weight_buffer(&kern.device, kn),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            final_norm_buf = cache.weight_buffer(&kern.device, logits.final_norm);
+        }
+
+        // ---- Buffers (row-major [token][dim]; token = verify row) -----------------------
+        let nb = |bytes: usize| {
+            kern.device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let act_a = nb(k * hidden * 4);
+        let act_b = nb(k * hidden * 4);
+        let mid = nb(k * hidden * 4);
+        let norm_buf = nb(k * hidden * 4);
+        let q_buf = nb(k * q_dim * 4);
+        let k_buf = nb(k * kv_dim * 4);
+        let v_buf = nb(k * kv_dim * 4);
+        let ctx_buf = nb(k * q_dim * 4);
+        let o_buf = nb(k * hidden * 4);
+        let gate_buf = nb(k * ffn_dim * 4);
+        let up_buf = nb(k * ffn_dim * 4);
+        let silu_buf = nb(k * ffn_dim * 4);
+        let down_buf = nb(k * hidden * 4);
+        let fnorm_buf = nb(k * hidden * 4);
+        let logits_buf = nb(k * vocab * 4);
+        let pred_buf = nb(k * 4);
+        let cos_buf = nb(cos_all.len() * 4);
+        let sin_buf = nb(sin_all.len() * 4);
+        // Attention scores scratch (only read by the non-v2 fallback kernel); size to the
+        // deepest row's position_count = base+k.
+        let scores_buf = nb(n_heads * (base_position + k) * 4);
+        write_buffer_f32(&act_a, embeddings);
+        write_buffer_f32(&cos_buf, cos_all);
+        write_buffer_f32(&sin_buf, sin_all);
+
+        // ---- Scalars --------------------------------------------------------------------
+        let rms_scalar = nb(8); // width (hidden), eps — shared by attn/ffn/final norms
+        let q_gemv = nb(12); // blocks_per_row, rows, [n_rows_in set by helper]
+        let kv_gemv = nb(12);
+        let o_gemv = nb(12);
+        let gateup_gemv = nb(12);
+        let down_gemv = nb(12);
+        let out_gemv = nb(12);
+        let rope_q_scalar = nb(16);
+        let rope_k_scalar = nb(16);
+        let silu_n = nb(4);
+        let resid_n = nb(4);
+        let kv16_write = nb(4);
+        let argmax_count = nb(4);
+        let perhead_qk_scalar = nb(12);
+        unsafe {
+            let p = rms_scalar.contents() as *mut u8;
+            *(p as *mut u32) = hidden as u32;
+            *(p.add(4) as *mut f32) = eps;
+            let set_gemv = |buf: &Buffer, bpr: usize, rows: usize| {
+                let q = buf.contents() as *mut u32;
+                *q = bpr as u32;
+                *q.add(1) = rows as u32;
+            };
+            set_gemv(&q_gemv, bpr_hidden, q_dim);
+            set_gemv(&kv_gemv, bpr_hidden, kv_dim);
+            set_gemv(&o_gemv, bpr_q, hidden);
+            set_gemv(&gateup_gemv, bpr_hidden, ffn_dim);
+            set_gemv(&down_gemv, bpr_ffn, hidden);
+            set_gemv(&out_gemv, bpr_hidden, vocab);
+            let set_rope = |buf: &Buffer, hc: usize| {
+                let r = buf.contents() as *mut u32;
+                *r = hc as u32;
+                *r.add(1) = head_dim as u32;
+                *r.add(2) = half_rope as u32;
+                *r.add(3) = pairing;
+            };
+            set_rope(&rope_q_scalar, n_heads);
+            set_rope(&rope_k_scalar, n_kv_heads);
+            *(silu_n.contents() as *mut u32) = (k * ffn_dim) as u32;
+            *(resid_n.contents() as *mut u32) = (k * hidden) as u32;
+            *(kv16_write.contents() as *mut u32) = 1; // !kv16 -> mirrors are real, dual-write
+            *(argmax_count.contents() as *mut u32) = vocab as u32;
+            let p = perhead_qk_scalar.contents() as *mut u8;
+            *(p as *mut u32) = head_dim as u32;
+            *(p.add(4) as *mut f32) = eps;
+            *(p.add(8) as *mut u32) = 1; // use_weight
+        }
+        // Per-row scatter scalars [head_dim, max_positions, base+i, kv_dim] and per-row
+        // attention scalars (32 bytes) — write_position / position_count vary per row, so
+        // each row gets its own storage (the command buffer reads them at execution time).
+        let scatter_scalars = nb(16 * k);
+        let mut attn_scalars: Vec<Buffer> = Vec::with_capacity(k);
+        for i in 0..k {
+            unsafe {
+                let s = (scatter_scalars.contents() as *mut u8).add(i * 16) as *mut u32;
+                *s = head_dim as u32;
+                *s.add(1) = max_positions as u32;
+                *s.add(2) = (base_position + i) as u32;
+                *s.add(3) = kv_dim as u32;
+            }
+            let a = nb(32);
+            unsafe {
+                let p = a.contents() as *mut u8;
+                *(p as *mut u32) = n_heads as u32;
+                *(p.add(4) as *mut u32) = head_dim as u32;
+                *(p.add(8) as *mut u32) = (base_position + i + 1) as u32; // position_count
+                *(p.add(12) as *mut u32) = (n_heads / n_kv_heads) as u32;
+                *(p.add(16) as *mut f32) = scale;
+                *(p.add(20) as *mut u32) = head_dim as u32; // position stride
+                *(p.add(24) as *mut u32) = (max_positions * head_dim) as u32; // kv-head stride
+                *(p.add(28) as *mut u32) = 0u32; // kv base offset
+            }
+            attn_scalars.push(a);
+        }
+
+        // ---- Encode the whole verify window into one serial compute encoder -------------
+        let mut keep: Vec<Buffer> = Vec::new();
+        let cb = kern.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut from_a = true;
+        for l in 0..layers.len() {
+            let (cur, nxt) = if from_a {
+                (&act_a, &act_b)
+            } else {
+                (&act_b, &act_a)
+            };
+            let w = &resident[l];
+            // --- Attention block ---
+            // 1. input RMSNorm (batched, byte-exact vs single rms_norm_f32 per row)
+            encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+            // 2. Q/K/V projections (batched-column GEMV; column t == single-token row t)
+            encode_q8_matmul_f32y_batched(e, kern, &norm_buf, &w[0], &q_buf, &q_gemv, q_dim, k);
+            encode_q8_matmul_f32y_batched(e, kern, &norm_buf, &w[1], &k_buf, &kv_gemv, kv_dim, k);
+            encode_q8_matmul_f32y_batched(e, kern, &norm_buf, &w[2], &v_buf, &kv_gemv, kv_dim, k);
+            // 3. per-head Q/K-norm (Qwen3) — per row, in place
+            if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
+                for i in 0..k {
+                    encode_rms_norm_per_head(
+                        e,
+                        kern,
+                        &q_buf,
+                        qn_buf,
+                        &q_buf,
+                        &perhead_qk_scalar,
+                        n_heads,
+                        (i * q_dim * 4) as u64,
+                    );
+                    encode_rms_norm_per_head(
+                        e,
+                        kern,
+                        &k_buf,
+                        kn_buf,
+                        &k_buf,
+                        &perhead_qk_scalar,
+                        n_kv_heads,
+                        (i * kv_dim * 4) as u64,
+                    );
+                }
+            }
+            // 4. RoPE — per row (position base+i; cos/sin position-major, stride half_rope)
+            for i in 0..k {
+                encode_rope(
+                    e,
+                    kern,
+                    &q_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &rope_q_scalar,
+                    n_heads,
+                    half_rope,
+                    (i * q_dim * 4) as u64,
+                    (i * half_rope * 4) as u64,
+                );
+                encode_rope(
+                    e,
+                    kern,
+                    &k_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &rope_k_scalar,
+                    n_kv_heads,
+                    half_rope,
+                    (i * kv_dim * 4) as u64,
+                    (i * half_rope * 4) as u64,
+                );
+            }
+            // 5. K/V scatter — per row into slot base+i, dual-writing the f16 mirrors the
+            //    split-K decode attention reads (ALL k before any attention reads).
+            for i in 0..k {
+                e.set_compute_pipeline_state(&kern.kv_scatter_pipeline);
+                e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
+                e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
+                e.set_buffer(2, Some(&self.cache_k[l]), 0);
+                e.set_buffer(3, Some(&self.cache_v[l]), 0);
+                e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
+                e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
+                e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
+                e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
+                e.set_buffer(8, Some(&self.cache_k16[l]), 0);
+                e.set_buffer(9, Some(&self.cache_v16[l]), 0);
+                e.set_buffer(10, Some(&kv16_write), 0);
+                dispatch_1d(e, &kern.kv_scatter_pipeline, kv_dim);
+            }
+            // 6. attention — per row, position_count = base+i+1 (auto-routes v2 vs split-K
+            //    exactly like forward_token at that pc); reads the f16 mirrors.
+            for (i, attn_scalar) in attn_scalars.iter().enumerate() {
+                encode_attention(
+                    e,
+                    kern,
+                    &mut keep,
+                    &q_buf,
+                    &self.cache_k[l],
+                    &self.cache_v[l],
+                    Some((&self.cache_k16[l], &self.cache_v16[l])),
+                    &scores_buf,
+                    &ctx_buf,
+                    attn_scalar,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    base_position + i + 1,
+                    (i * q_dim * 4) as u64,
+                    (i * q_dim * 4) as u64,
+                );
+            }
+            // 7. O projection (batched), 8. attention residual (batched)
+            encode_q8_matmul_f32y_batched(e, kern, &ctx_buf, &w[3], &o_buf, &o_gemv, hidden, k);
+            encode_binary(
+                e,
+                &kern.residual_add_pipeline,
+                cur,
+                &o_buf,
+                &mid,
+                &resid_n,
+                k * hidden,
+            );
+            // --- FFN block (all batched / elementwise) ---
+            encode_rms_norm_batch(kern, e, &mid, &ffn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+            encode_q8_matmul_f32y_batched(
+                e,
+                kern,
+                &norm_buf,
+                &w[4],
+                &gate_buf,
+                &gateup_gemv,
+                ffn_dim,
+                k,
+            );
+            encode_q8_matmul_f32y_batched(
+                e,
+                kern,
+                &norm_buf,
+                &w[5],
+                &up_buf,
+                &gateup_gemv,
+                ffn_dim,
+                k,
+            );
+            encode_binary(
+                e,
+                &kern.silu_mul_pipeline,
+                &gate_buf,
+                &up_buf,
+                &silu_buf,
+                &silu_n,
+                k * ffn_dim,
+            );
+            encode_q8_matmul_f32y_batched(
+                e, kern, &silu_buf, &w[6], &down_buf, &down_gemv, hidden, k,
+            );
+            encode_binary(
+                e,
+                &kern.residual_add_pipeline,
+                &mid,
+                &down_buf,
+                nxt,
+                &resid_n,
+                k * hidden,
+            );
+            from_a = !from_a;
+        }
+        let final_buf = if from_a { &act_a } else { &act_b };
+        // ---- Final stage: norm -> output GEMV -> per-row argmax -------------------------
+        encode_rms_norm_batch(
+            kern,
+            e,
+            final_buf,
+            &final_norm_buf,
+            &fnorm_buf,
+            &rms_scalar,
+            k,
+        );
+        encode_q8_matmul_f32y_batched(
+            e,
+            kern,
+            &fnorm_buf,
+            &ow_buf,
+            &logits_buf,
+            &out_gemv,
+            vocab,
+            k,
+        );
+        for i in 0..k {
+            e.set_compute_pipeline_state(&kern.argmax_f32_greedy_pipeline);
+            e.set_buffer(0, Some(&logits_buf), (i * vocab * 4) as u64);
+            e.set_buffer(1, Some(&pred_buf), (i * 4) as u64);
+            e.set_buffer(2, Some(&argmax_count), 0);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
+        let preds: Vec<u32> = (0..k)
+            .map(|i| unsafe { *(pred_buf.contents() as *const u32).add(i) })
+            .collect();
+        let logits_out = if read_logits {
+            let mut out = vec![0.0f32; k * vocab];
+            read_buffer_f32(&logits_buf, &mut out);
+            out
+        } else {
+            Vec::new()
+        };
+        Some((preds, logits_out))
     }
 
     /// Release a stale pre-committed token graph: it sits on the serial queue gated behind
@@ -17037,6 +17656,270 @@ mod tests {
                 assert!((a - b).abs() < 1.0e-4, "token {t}: {a} != {b}");
             }
         }
+    }
+
+    /// WIN2METAL Phase 3 C2/C3 gate. `verify_batch` over `k` rows at positions
+    /// `[base, base+k)` must be BIT-IDENTICAL — exact u32 `to_bits`, not epsilon — to `k`
+    /// independent `forward_token` decodes seeded with the same KV history. The straddle
+    /// windows cross the split-K routing boundaries: `base=126,k=6` (rows pc 127..132 — the
+    /// first row takes the v2 f32-cache path, the rest the split-K f16-mirror path) and
+    /// `base=510,k=6` (rows pc 511..516, deep split-K with a varying split count). Logits are
+    /// compared by exact bits (an offset/stride bug that doesn't flip the argmax would slip
+    /// past an argmax-only check); the argmax ids are asserted too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_spec_verify_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // Production GEMV stack + tiled/split-K attention. Latch the OnceLock gates ON
+        // before the first read; if a sibling test already latched f32y/wire/nsg8 OFF (a
+        // full --lib run read them earlier), SKIP rather than compare against a different
+        // kernel. A targeted run has no such sibling, so the gates latch on here (and ATTN2
+        // engages the split-K path the straddle windows are designed to exercise).
+        std::env::set_var("CAMELID_METAL_F32Y", "1");
+        std::env::set_var("CAMELID_METAL_WIRE", "1");
+        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        std::env::set_var("CAMELID_METAL_ATTN2", "1");
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP metal_spec_verify_bit_identical: f32y/wire/nsg8 gates inactive (OnceLock \
+                 latched off earlier in this process); run targeted: cargo test --release \
+                 --lib metal_spec_verify_bit_identical"
+            );
+            return;
+        }
+
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 2usize; // group = 2
+        let head_dim = 32usize;
+        let hidden = 128usize;
+        let ffn = 256usize;
+        let vocab = 256usize;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q: mkw(q_dim, bpr_hidden, s + 1),
+                    k: mkw(kv_dim, bpr_hidden, s + 2),
+                    v: mkw(kv_dim, bpr_hidden, s + 3),
+                    o: mkw(hidden, bpr_q, s + 4),
+                    gate: mkw(ffn, bpr_hidden, s + 5),
+                    up: mkw(ffn, bpr_hidden, s + 6),
+                    down: mkw(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                q_norm: None,
+                k_norm: None,
+            })
+            .collect();
+        // Output projection + final norm (the LogitsStage).
+        let final_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.45 + (i as f32 % 4.0) * 0.05)
+            .collect();
+        let out_w = mkw(vocab, bpr_hidden, 777);
+        let make_stage = || LogitsStage {
+            final_norm: &final_norm,
+            output_weight_blocks: ResidentWeightBytes::Blocks36(&out_w),
+            vocab_size: vocab,
+        };
+
+        // Deterministic synthetic K/V seeding the `base` history positions (identical for
+        // both sessions). Layout per layer: [kv_head][base][head_dim].
+        let synth_kv = |base: usize, layer: usize, is_v: bool| -> Vec<f32> {
+            let mut out = vec![0.0f32; n_kv * base * head_dim];
+            for h in 0..n_kv {
+                for p in 0..base {
+                    for d in 0..head_dim {
+                        let idx = (h * base + p) * head_dim + d;
+                        let t = (layer * 7 + h * 13 + p * 3 + d + usize::from(is_v) * 5) as f32;
+                        out[idx] = ((t % 19.0) - 9.0) * 0.05;
+                    }
+                }
+            }
+            out
+        };
+
+        let run = |base: usize, k: usize| {
+            let cap = base + k + 16;
+            let max_positions = cap; // no growth: identical strides in both sessions
+            let mut cos_all = vec![0.0f32; k * half];
+            let mut sin_all = vec![0.0f32; k * half];
+            let mut emb_all = vec![0.0f32; k * hidden];
+            for i in 0..k {
+                for p in 0..half {
+                    let theta = 0.2 + ((base + i) as f32) * 0.05 + p as f32 * 0.1;
+                    cos_all[i * half + p] = theta.cos();
+                    sin_all[i * half + p] = theta.sin();
+                }
+                for j in 0..hidden {
+                    emb_all[i * hidden + j] = (((i + j + base) as f32 % 11.0) - 5.0) * 0.2;
+                }
+            }
+
+            let mk_session = || {
+                let mut s = ResidentDecodeState::new(
+                    n_layers,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    hidden,
+                    ffn,
+                    max_positions,
+                    cap,
+                    eps,
+                    false,
+                )
+                .unwrap();
+                for layer in 0..n_layers {
+                    let ck = synth_kv(base, layer, false);
+                    let cv = synth_kv(base, layer, true);
+                    assert!(s.seed_layer(layer, &ck, &cv, base), "seed_layer");
+                }
+                s.set_filled(base);
+                s
+            };
+
+            // Reference: k sequential forward_token decodes (logits path -> full per-row
+            // logits + CPU argmax with the sampler's first-max tie-break).
+            let mut ref_session = mk_session();
+            let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+            for i in 0..k {
+                let emb = &emb_all[i * hidden..(i + 1) * hidden];
+                let cos_i = &cos_all[i * half..(i + 1) * half];
+                let sin_i = &sin_all[i * half..(i + 1) * half];
+                let out = ref_session
+                    .forward_token(
+                        emb,
+                        &weights,
+                        cos_i,
+                        sin_i,
+                        base + i,
+                        scale,
+                        Some(make_stage()),
+                        None,
+                        0,
+                        None,
+                    )
+                    .expect("reference forward_token");
+                match out {
+                    ResidentTokenOut::Data(v) => {
+                        assert_eq!(v.len(), vocab);
+                        ref_logits.push(v);
+                    }
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            }
+            let ref_argmax: Vec<u32> = ref_logits
+                .iter()
+                .map(|row| {
+                    let mut best = f32::NEG_INFINITY;
+                    let mut best_i = 0u32;
+                    for (j, &v) in row.iter().enumerate() {
+                        if v > best {
+                            best = v;
+                            best_i = j as u32;
+                        }
+                    }
+                    best_i
+                })
+                .collect();
+
+            // Candidate: verify_batch on the identically-seeded session.
+            let mut cand_session = mk_session();
+            let stage = make_stage();
+            let (preds, cand_logits) = cand_session
+                .verify_batch_logits(
+                    &emb_all, &cos_all, &sin_all, &weights, &stage, base, k, scale,
+                )
+                .expect("verify_batch eligible");
+            assert_eq!(preds.len(), k);
+            assert_eq!(cand_logits.len(), k * vocab);
+
+            // Hard gate: exact u32 bit identity for every row/element + argmax id equality.
+            for i in 0..k {
+                let pc = base + i + 1;
+                for v in 0..vocab {
+                    let a = cand_logits[i * vocab + v];
+                    let b = ref_logits[i][v];
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "base={base} k={k} row {i} (pc={pc}) vocab {v}: verify {a} ({:#010x}) \
+                         != forward {b} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits(),
+                    );
+                }
+                assert_eq!(
+                    preds[i], ref_argmax[i],
+                    "base={base} k={k} row {i} (pc={pc}): argmax verify {} != forward {}",
+                    preds[i], ref_argmax[i]
+                );
+            }
+            eprintln!(
+                "metal_spec_verify_bit_identical: base={base} k={k} BIT-IDENTICAL \
+                 (split_k_engaged={})",
+                splitk_attention_enabled() && attn2_enabled()
+            );
+        };
+
+        // C2: straddle the 128 split-K boundary (rows pc in [127..132]).
+        run(126, 6);
+        // C3: deep split-K (rows pc in [511..516], n_splits varies).
+        run(510, 6);
     }
 
     #[cfg(target_os = "macos")]
