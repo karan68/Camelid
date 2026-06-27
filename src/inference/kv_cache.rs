@@ -347,6 +347,35 @@ mod tests {
         assert_eq!(kv_cache_budget_from(None, None), u64::MAX);
     }
 
+    /// On macOS the host RAM probe now returns `Some`, so the no-env path resolves to
+    /// the 80%-of-available RAM branch instead of the off-platform `u64::MAX` unbounded
+    /// fallback — the auto-budget genuinely gates here now. (The per-token byte math and
+    /// refuse-before-allocate tests above are platform-independent and already cover the
+    /// Mac guard path; this pins the policy resolution that changed for Mac.)
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ram_branch_engages_auto_budget() {
+        let ram = crate::gait::host_ram_status();
+        assert!(ram.is_some(), "macOS host_ram_status must report Some");
+        let budget = kv_cache_budget_from(None, ram);
+        assert!(budget > 0, "auto-budget must be a positive byte count");
+        assert!(
+            budget < u64::MAX,
+            "auto-budget must be bounded on Mac, not the off-platform unbounded fallback"
+        );
+        if let Some((total, available)) = ram {
+            assert!(available <= total, "available must not exceed total");
+            assert_eq!(
+                budget,
+                available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100
+            );
+        }
+        // An explicit override still wins verbatim over the live RAM reading.
+        assert_eq!(kv_cache_budget_from(Some("4096"), ram), 4096);
+        // And the live end-to-end resolver agrees (no env set in this test).
+        assert!(resolve_kv_cache_budget_bytes() < u64::MAX);
+    }
+
     #[test]
     fn budget_excluded_from_state_equality() {
         let mut a = LlamaKvCache::new(plan_with(2048, 22, 4, 64)).unwrap();

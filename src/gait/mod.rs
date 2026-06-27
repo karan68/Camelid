@@ -846,7 +846,74 @@ pub fn host_ram_status() -> Option<(u64, u64)> {
     }
 }
 
-#[cfg(not(windows))]
+/// Physical RAM `(total, available)` in bytes on macOS. `total` is `hw.memsize`;
+/// `available` is the reclaimable working set — `(free + inactive)` resident pages ×
+/// the VM page size, i.e. the pages the kernel can hand back without paging out live
+/// data. Counting only `free` would badly understate headroom under the memory
+/// compressor (which deliberately keeps the free pool small), so the cold, reclaimable
+/// `inactive` pages are included; the KV guard's 80% factor then adds further headroom
+/// over this estimate. `None` only on query failure, so the caller proceeds without the
+/// gate rather than blocking.
+#[cfg(target_os = "macos")]
+pub fn host_ram_status() -> Option<(u64, u64)> {
+    // total physical RAM: hw.memsize, the same sysctl Activity Monitor reports.
+    let mut memsize: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let name = std::ffi::CString::new("hw.memsize").expect("static name");
+    // SAFETY: the classic sysctlbyname out-param contract — a u64 sink with its byte
+    // length and no input value; the call only reads/writes `memsize` and `len`.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut memsize as *mut u64 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || memsize == 0 {
+        return None;
+    }
+    // Acquire the host name port once for the process lifetime: mach_host_self() mints a
+    // fresh send right per call that would otherwise need mach_port_deallocate (no libc
+    // binding for that), so caching the one send right keeps this leak-free.
+    static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
+    // `libc::mach_host_self` is deprecated in favor of the `mach2` crate, but that is not
+    // a dependency here and the symbol still resolves to the same libSystem trap; scope
+    // the allow tightly rather than pull in a new crate just for the host port.
+    #[allow(deprecated)]
+    // SAFETY: mach_host_self() is an argument-less trap returning a stable send right to
+    // the unprivileged host name port.
+    let host = *HOST_PORT.get_or_init(|| unsafe { libc::mach_host_self() });
+    // available: (free + inactive) resident pages × VM page size via the Mach VM stats.
+    // SAFETY: a zeroed vm_statistics64 is a valid (all-counts-zero) sink to be overwritten.
+    let mut vm: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+    let mut count = libc::HOST_VM_INFO64_COUNT;
+    // SAFETY: HOST_VM_INFO64 paired with a vm_statistics64 sink and its element count,
+    // exactly as host_statistics64 requires; the call only reads/writes `vm` and `count`.
+    let kr = unsafe {
+        libc::host_statistics64(
+            host,
+            libc::HOST_VM_INFO64,
+            &mut vm as *mut libc::vm_statistics64 as libc::host_info64_t,
+            &mut count,
+        )
+    };
+    if kr != libc::KERN_SUCCESS {
+        return None;
+    }
+    // SAFETY: vm_page_size is a libc extern static — the immutable kernel page size that
+    // the vm_statistics64 page counts are denominated in.
+    let page = unsafe { libc::vm_page_size } as u64;
+    let available = (vm.free_count as u64)
+        .saturating_add(vm.inactive_count as u64)
+        .saturating_mul(page);
+    Some((memsize, available))
+}
+
+/// `None` on the remaining unixes (no portable cheap probe wired up): the caller then
+/// proceeds without the RAM-derived gate, leaving the explicit env override as the gate.
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn host_ram_status() -> Option<(u64, u64)> {
     None
 }
@@ -1764,5 +1831,20 @@ mod gait_safety {
         assert!(!ram_headroom_ok(100 * GIB, 10 * GIB));
         assert!(ram_headroom_ok(8 * GIB, 5 * GIB));
         assert!(!ram_headroom_ok(8 * GIB, 2 * GIB));
+    }
+
+    /// On macOS, `host_ram_status` reports a live physical-RAM reading (total via
+    /// `hw.memsize`, available via the Mach VM statistics) instead of the off-platform
+    /// `None`, so the KV predict-and-abort auto-budget actually engages on this host.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_ram_status_reports_live_physical_ram() {
+        let (total, available) = host_ram_status().expect("macOS must report host RAM");
+        assert!(total > 0, "total physical RAM must be positive");
+        assert!(available > 0, "available physical RAM must be positive");
+        assert!(
+            available <= total,
+            "available {available} must not exceed total {total}"
+        );
     }
 }
