@@ -47,6 +47,8 @@ export default function ChatWorkspace({
   selectedModel,
   selectedModelId,
   setSelectedModelId,
+  activateModel = null,
+  loadingModelId = null,
   models,
   runtime,
   capabilities,
@@ -389,8 +391,16 @@ export default function ChatWorkspace({
                   className="cxcomposer__model-select"
                   aria-label="Choose model for chat"
                   value={selectedPickerModelId}
-                  onChange={(e) => setSelectedModelId(e.target.value)}
-                  disabled={generationActive}
+                  onChange={(e) => {
+                    const id = e.target.value
+                    if (!id) return
+                    // Actually switch: load the chosen model into the runtime (which
+                    // also sets it as selected). Falls back to selection-only if the
+                    // loader wasn't provided.
+                    if (activateModel) activateModel(id)
+                    else setSelectedModelId(id)
+                  }}
+                  disabled={generationActive || Boolean(loadingModelId)}
                 >
                   {!selectedModel && <option value="">Choose model</option>}
                   {runnableModels.length > 0 && (
