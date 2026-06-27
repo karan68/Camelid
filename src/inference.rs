@@ -15960,8 +15960,8 @@ pub(crate) fn q2_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
                 is += 1;
                 let mut isuml = 0i32;
                 for l in 0..16 {
-                    isuml += y.qs[k * 128 + j * 32 + l] as i32
-                        * ((qs[k * 32 + l] >> shift) & 3) as i32;
+                    isuml +=
+                        y.qs[k * 128 + j * 32 + l] as i32 * ((qs[k * 32 + l] >> shift) & 3) as i32;
                 }
                 isum += dlo * isuml;
                 let dhi = (scales[is] & 0xF) as i32;
