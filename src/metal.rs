@@ -39,6 +39,9 @@ struct MetalLinearKernel {
     q8_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
+    #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
+    // consumed by the speculative-verify lane in a later checkpoint
+    q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_gemm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
@@ -1110,6 +1113,100 @@ kernel void q8_0_block_linear_ksplit_f32y_wire_gemm(
                         sumq += wv[i] * yl[t][i];
                     }
                     sumf[row][t] += sumq;
+                }
+            }
+        }
+        for (uint t = 0; t < tn; ++t) {
+            for (uint row = 0; row < NR0; ++row) {
+                if (sg == 0) {
+                    shmem[row * 32 + lane] = 0.0f;
+                }
+                sumf[row][t] = simd_sum(sumf[row][t]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint row = 0; row < NR0; ++row) {
+                if (lane == 0) {
+                    shmem[row * 32 + sg] = sumf[row][t];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+                const float tot = simd_sum(shmem[row * 32 + lane]);
+                if (lane == 0 && sg == 0) {
+                    output[(t0 + t) * rows + r0 + row] = tot;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Byte-exact batched-column mirror of the single-token GEMV
+// `q8_0_block_linear_row_ksplit_f32y_wire_nsg8` (above). It runs the SAME NSG=8
+// reduction over `n_rows_in` INDEPENDENT activation columns (the speculative-verify
+// rows, <= MAX_T), carrying a separate accumulator per column. For each weight block
+// the per-block partial is computed as `sumq = Σ_i wq[i]*y[i]` and ONLY THEN scaled
+// (`sumf += sumq * w_scale`) — w_scale is never folded onto the weight (that reorders
+// the rounding and is what the prefill `wire_gemm` does), so column t equals the
+// single-token GEMV bit-for-bit. Columns never interact: same block ownership
+// (`ib = sg*NQ+ix`, step NSG*NQ=64), same dot order, same two-stage
+// simd_sum -> shmem[row*32+sg] -> simd_sum finalize. y is row-major
+// [token][blocks_per_row*32]; output is token-major [token][rows] so the next GEMM
+// reads [token][dim]. A trailing per-column barrier guards the shared shmem against
+// the next column's zero-out — it changes ordering only, not arithmetic.
+kernel void q8_0_block_linear_ksplit_f32y_wire_nsg8_verify(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_rows_in [[buffer(6)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint MAX_T = 8; // verify columns processed per pass
+    constexpr uint q8_block_bytes = 34;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+
+    for (uint t0 = 0; t0 < n_rows_in; t0 += MAX_T) {
+        const uint tn = min(uint(MAX_T), n_rows_in - t0);
+        float sumf[NR0][MAX_T];
+        for (uint row = 0; row < NR0; ++row) {
+            for (uint t = 0; t < MAX_T; ++t) {
+                sumf[row][t] = 0.0f;
+            }
+        }
+        for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+            float yl[MAX_T][NQ];
+            for (uint t = 0; t < tn; ++t) {
+                device const float* yb = y + (t0 + t) * blocks_per_row * 32 + ib * 32 + il;
+                for (uint i = 0; i < NQ; ++i) {
+                    yl[t][i] = yb[i];
+                }
+            }
+            for (uint row = 0; row < NR0; ++row) {
+                const uint rr = r0 + row;
+                if (rr >= rows) {
+                    break;
+                }
+                device const char* wb = weight_blocks + rr * row_stride + ib * q8_block_bytes;
+                const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+                device const char* wq = wb + 2 + il;
+                for (uint t = 0; t < tn; ++t) {
+                    float sumq = 0.0f;
+                    for (uint i = 0; i < NQ; ++i) {
+                        sumq += float(wq[i]) * yl[t][i];
+                    }
+                    sumf[row][t] += sumq * w_scale;
                 }
             }
         }
@@ -4113,6 +4210,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &q8_0_block_ksplit_f32y_wire_nsg8_function,
                 )
                 .ok()?;
+            let q8_0_block_ksplit_f32y_wire_nsg8_verify_function = library
+                .get_function("q8_0_block_linear_ksplit_f32y_wire_nsg8_verify", None)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &q8_0_block_ksplit_f32y_wire_nsg8_verify_function,
+                )
+                .ok()?;
             let q8_0_block_ksplit_f32y_wire_gemm_function = library
                 .get_function("q8_0_block_linear_ksplit_f32y_wire_gemm", None)
                 .ok()?;
@@ -4148,6 +4253,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
+                q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
                 q8_0_block_ksplit_f32y_wire_gemm_pipeline,
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
@@ -7196,6 +7302,59 @@ fn encode_q8_matmul_f32y(
         },
         metal::MTLSize {
             width: threads_per_tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Batched-column mirror of [`encode_q8_matmul_f32y`]'s production NSG=8 wire GEMV.
+/// Instead of dotting each weight block against one activation vector, it dots it
+/// against all `n_rows_in` activation columns (the speculative-verify rows) before
+/// moving on, so each weight is streamed once for the whole window rather than once
+/// per token. `y` is row-major `[token][blocks_per_row*32]`; `out` is token-major
+/// `[token][rows]` (matching the next GEMM's `[token][dim]` input). The bound kernel
+/// keeps the single-token per-block `sumq` then `*w_scale` ordering and the exact
+/// two-stage reduction, so each output column is BIT-IDENTICAL to the single-token
+/// dispatch (proven by `metal_verify_gemv_batched_bit_identical`). `scalar` must be
+/// at least 12 bytes with `blocks_per_row` @0 and `rows` @4 already written (same as
+/// the single-token caller); the column count `n_rows_in` is written to @8 here.
+// Consumed by the speculative-verify lane (a later checkpoint); for now exercised by
+// the `metal_verify_gemv_batched_bit_identical` unit test, so it reads as dead in a
+// non-test lib build.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn encode_q8_matmul_f32y_batched(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+    n_rows_in: usize,
+) {
+    unsafe {
+        let p = scalar.contents() as *mut u8;
+        *(p.add(8) as *mut u32) = n_rows_in as u32;
+    }
+    e.set_compute_pipeline_state(&k.q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (rows as u64).div_ceil(2),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
             height: 1,
             depth: 1,
         },
@@ -12618,6 +12777,151 @@ mod tests {
             assert!(
                 (actual - expected).abs() < 1.0e-2_f32.max(expected.abs() * 1.0e-5),
                 "row {row}: {actual} != {expected}"
+            );
+        }
+    }
+
+    /// WIN2METAL Phase 3 C0 gate. The speculative-verify lane will run the production
+    /// single-token GEMV (`q8_0_block_linear_row_ksplit_f32y_wire_nsg8`) as a batched
+    /// column sweep over k verify rows. This proves the batched mirror
+    /// (`encode_q8_matmul_f32y_batched`) is BIT-IDENTICAL — exact u32 bit-cast, not
+    /// epsilon — to k independent single-token dispatches. Bit-exactness is the whole
+    /// point: it gates the byte-exact-vs-`forward_token` claim for the lane.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_verify_gemv_batched_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // The reference path is `encode_q8_matmul_f32y`, which only selects the NSG=8
+        // wire kernel when the f32y/wire/nsg8 gates are on. Those are process-wide
+        // OnceLocks; set the env BEFORE the first gate read so they latch on. If a
+        // sibling test in this process already latched them off (e.g. a full --lib
+        // run that read them earlier), SKIP rather than compare against a different
+        // kernel. A targeted run (`--lib metal_verify_gemv_batched_bit_identical`) has
+        // no such sibling, so the gates latch on here.
+        std::env::set_var("CAMELID_METAL_F32Y", "1");
+        std::env::set_var("CAMELID_METAL_WIRE", "1");
+        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP metal_verify_gemv_batched_bit_identical: f32y/wire/nsg8 gates \
+                 inactive (OnceLock latched off earlier in this process); run targeted: \
+                 cargo test --release --lib metal_verify_gemv_batched_bit_identical"
+            );
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let device = &kernel.device;
+
+        // 130 rows (prime: exercises the NR0=2 row tiling tail and the r0+row>=rows
+        // guard) x 7 blocks (K-split stride NSG*NQ=64, so most block slots idle on the
+        // last pass). cols = the projection input dimension.
+        let rows = 130usize;
+        let blocks_per_row = 7usize;
+        let cols = blocks_per_row * 32;
+        const WIRE: usize = 34; // f16 scale (2B) + 32 i8 quants
+
+        // Deterministic wire-format Q8_0 weights (both paths read these exact bytes).
+        let mut weight_wire = vec![0u8; rows * blocks_per_row * WIRE];
+        for row in 0..rows {
+            for block in 0..blocks_per_row {
+                let off = (row * blocks_per_row + block) * WIRE;
+                let scale = 0.5 - row as f32 * 0.003 + block as f32 * 0.013;
+                weight_wire[off..off + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                for lane in 0..32 {
+                    let q = (((row * 53 + block * 29 + lane * 7) % 255) as i32 - 127) as i8;
+                    weight_wire[off + 2 + lane] = q as u8;
+                }
+            }
+        }
+        let w_buf = device.new_buffer(
+            weight_wire.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        write_buffer_u8(&w_buf, &weight_wire);
+
+        // Deterministic activation columns (one per verify row), non-trivial + signed.
+        let max_k = 8usize;
+        let acts: Vec<Vec<f32>> = (0..max_k)
+            .map(|t| {
+                (0..cols)
+                    .map(|i| {
+                        ((((t * 131 + i * 17) % 251) as f32) - 125.0) * 0.013 + t as f32 * 0.0007
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for k in [1usize, 2, 7, 8] {
+            // Reference: k single-token NSG=8 dispatches, one activation each.
+            let mut reference: Vec<Vec<f32>> = Vec::with_capacity(k);
+            for act in acts.iter().take(k) {
+                let y_buf =
+                    device.new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+                write_buffer_f32(&y_buf, act);
+                let out_buf =
+                    device.new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let scalar = device.new_buffer(8, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents() as *mut u32;
+                    *p = blocks_per_row as u32;
+                    *p.add(1) = rows as u32;
+                }
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                encode_q8_matmul_f32y(e, kernel, &y_buf, &w_buf, &out_buf, &scalar, rows);
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let mut out = vec![0.0f32; rows];
+                read_buffer_f32(&out_buf, &mut out);
+                reference.push(out);
+            }
+
+            // Candidate: one batched dispatch over all k columns. y token-major
+            // [k][cols]; out token-major [k][rows].
+            let mut y_flat = vec![0.0f32; k * cols];
+            for (t, act) in acts.iter().take(k).enumerate() {
+                y_flat[t * cols..(t + 1) * cols].copy_from_slice(act);
+            }
+            let y_buf =
+                device.new_buffer((k * cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_f32(&y_buf, &y_flat);
+            let out_buf =
+                device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            // 12-byte scalar: blocks_per_row @0, rows @4 (n_rows_in @8 set by helper).
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = blocks_per_row as u32;
+                *p.add(1) = rows as u32;
+            }
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            encode_q8_matmul_f32y_batched(e, kernel, &y_buf, &w_buf, &out_buf, &scalar, rows, k);
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let mut batched = vec![0.0f32; k * rows];
+            read_buffer_f32(&out_buf, &mut batched);
+
+            // Exact u32 bit identity for every column, every row.
+            for (t, refrow) in reference.iter().enumerate().take(k) {
+                for (r, &b) in refrow.iter().enumerate() {
+                    let a = batched[t * rows + r];
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "k={k} column {t} row {r}: batched {a} ({:#010x}) != \
+                         single-token {b} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits(),
+                    );
+                }
+            }
+            eprintln!(
+                "metal_verify_gemv_batched_bit_identical: k={k} BIT-IDENTICAL ({rows} rows x {blocks_per_row} blocks)"
             );
         }
     }
