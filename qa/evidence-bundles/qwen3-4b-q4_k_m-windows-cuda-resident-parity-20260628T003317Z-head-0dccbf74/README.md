@@ -23,7 +23,7 @@ tied `token_embd`/lm_head are Q6_K (`q6k_gemv`); q/k/o/gate/up are Q4_K (`q4k_ge
 
 ## Comparator
 
-llama.cpp 9632 (`acd79d603`) — confirmed: `C:\Users\timto\llama.cpp` HEAD == `acd79d6`.
+llama.cpp 9632 (`acd79d603`) — confirmed: `local llama.cpp` HEAD == `acd79d6`.
 Driven via `/completion` (ChatML specials parsed) with `-ngl 0 -ctk f32 -ctv f32 -fa off
 --no-repack`, temperature 0, top_k 1, seed 0, `cache_prompt:false`, `return_tokens:true`.
 **CPU-only**: this box's llama.cpp build ships no `ggml-cuda.dll`.

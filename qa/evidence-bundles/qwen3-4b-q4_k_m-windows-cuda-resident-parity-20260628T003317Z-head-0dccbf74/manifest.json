@@ -23,7 +23,7 @@
   "build_profile": "release, lto=fat, codegen-units=1, target-cpu=x86-64-v3, cuda default-on (Windows)",
   "model": {
     "id": "Qwen3 4B Instruct Q4_K_M",
-    "source": "Qwen/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf (local C:\\Users\\timto\\models\\Qwen3-4B-Q4_K_M.gguf)",
+    "source": "Qwen/Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf",
     "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
     "size_bytes": 2497280256,
     "arch": "qwen3",
@@ -34,7 +34,7 @@
   "comparator": {
     "engine": "llama.cpp",
     "version": "9632 (acd79d603)",
-    "source_pin_confirmed": "C:\\Users\\timto\\llama.cpp HEAD == acd79d6",
+    "source_pin_confirmed": "local llama.cpp HEAD == acd79d6",
     "flags": "/completion: temperature 0, top_k 1, seed 0, cache_prompt false, samplers=[top_k], return_tokens true; server -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096",
     "note": "On-disk Windows CPU comparator (CPU-only llama.cpp build on this box; no ggml-cuda.dll). The camelid GPU-resident CUDA decode is compared DIRECTLY against this llama.cpp reference. The GPU==cpu_reference middle leg used for Q8_0 bundles is N/A here: K-quant has no camelid CPU decode path yet (Phase 2), so llama.cpp is the direct reference."
   },

@@ -33,7 +33,7 @@
   "comparator": {
     "engine": "llama.cpp",
     "version": "9632 (acd79d603)",
-    "source_pin_confirmed": "C:\\Users\\timto\\llama.cpp HEAD == acd79d6; llama-bench build acd79d603 (9632)",
+    "source_pin_confirmed": "local llama.cpp HEAD == acd79d6; llama-bench build acd79d603 (9632)",
     "flags": "/completion: temperature 0, top_k 1, seed 0, cache_prompt false, samplers=[top_k], return_tokens true; server -ngl 0 -ctk f32 -ctv f32 -fa off --no-repack -c 4096",
     "note": "CPU-only llama.cpp on this box (no ggml-cuda.dll). camelid GPU-resident CUDA decode compared DIRECTLY to llama.cpp; the GPU==cpu_reference middle leg is N/A (no camelid CPU K-quant path — Phase 2)."
   },
