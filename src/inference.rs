@@ -13457,6 +13457,7 @@ unsafe impl Sync for Q8UnifiedOutPtr {}
 
 /// Core unified tiled kernel. `output` is the 4-row-aligned region [packed_rows, output_width],
 /// row-major; `packed_rows == input_groups * 4`. Bit-identical to the per-row scalar oracle.
+#[allow(clippy::too_many_arguments)]
 fn run_q8_0_unified_prefill_tiled(
     packed_weight: &Q8_0PackedRows4,
     packed_inputs: &[Q8_0PackedRows4Block],
@@ -13483,6 +13484,7 @@ fn run_q8_0_unified_prefill_tiled(
     (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
         // Capture the whole wrapper (Copy + Send + Sync), not the bare `*mut f32` field — Rust
         // 2021 disjoint closure capture would otherwise grab `out.0` and reject the raw pointer.
+        #[allow(clippy::redundant_locals)]
         let out = out;
         let og_start = chunk_idx * gpc;
         let og_end = ((chunk_idx + 1) * gpc).min(output_groups);
@@ -13767,6 +13769,7 @@ unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
 /// Projection wrapper: quantize+pack the activation ONCE (persistent thread-local scratch),
 /// run the unified tiled kernel over the 4-aligned rows, and finish any ragged tail (rows % 4)
 /// through the same per-row scalar path the default lane uses.
+#[allow(clippy::too_many_arguments)]
 fn q8_0_unified_prefill_projection(
     input: &CpuTensor,
     packed: &Q8_0PackedRows4,
