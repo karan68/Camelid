@@ -1887,6 +1887,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_down_vnni_decode_rawptr: false,
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -2798,6 +2799,7 @@ fn q8_attention_consumer_plan(
             ffn_down_vnni_decode_rawptr: false,
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3815,6 +3817,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_vnni_decode_rawptr: false,
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3868,6 +3871,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_vnni_decode_rawptr: false,
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3925,6 +3929,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_vnni_decode_rawptr: false,
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -5320,54 +5325,60 @@ fn q8_unified_owner_prefill_is_bit_identical_to_packed_matmul() {
     let input_width = packed_weight.dim(0).unwrap();
     let output_width = packed_weight.dim(1).unwrap();
 
-    std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER", "all");
-    std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2", "on");
-    let owner_plan = ResolvedRuntimePlan::from_env().unwrap();
-    std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER");
-    std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2");
+    // Test BOTH owner microkernels: v1 AVX2 (vnni="0") and v2 AVX-512 VNNI (vnni="1", which falls
+    // back to AVX2 if the CPU lacks avx512vnni). Each must be byte-identical to the baseline.
+    for vnni in ["0", "1"] {
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER", "all");
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2", "on");
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", vnni);
+        let owner_plan = ResolvedRuntimePlan::from_env().unwrap();
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER");
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2");
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_VNNI");
 
-    // Sweep row counts: 4/8 = exact tile groups, 5/13 = ragged tail, and a couple of roles to
-    // prove the dispatch is role-agnostic under scope=All.
-    for &rows in &[4usize, 5, 8, 13, 16] {
-        for role in ["ffn_down", "linear", "attention_k"] {
-            let input = CpuTensor::from_f32(
-                "owner_prefill_input",
-                vec![rows, input_width],
-                (0..rows * input_width)
-                    .map(|idx| {
-                        ((idx % input_width) as f32 - 9.0) * 0.125
-                            + (idx / input_width) as f32 * 0.0625
-                    })
-                    .collect(),
-            )
-            .unwrap();
+        // Sweep row counts: 4/8 = exact tile groups, 5/13 = ragged tail, and a couple of roles to
+        // prove the dispatch is role-agnostic under scope=All.
+        for &rows in &[4usize, 5, 8, 13, 16] {
+            for role in ["ffn_down", "linear", "attention_k"] {
+                let input = CpuTensor::from_f32(
+                    "owner_prefill_input",
+                    vec![rows, input_width],
+                    (0..rows * input_width)
+                        .map(|idx| {
+                            ((idx % input_width) as f32 - 9.0) * 0.125
+                                + (idx / input_width) as f32 * 0.0625
+                        })
+                        .collect(),
+                )
+                .unwrap();
 
-            let actual = try_q8_matmul_owner_prefill(
-                &input,
-                &packed_weight,
-                "owner_actual",
-                role,
-                &owner_plan,
-            )
-            .unwrap()
-            .unwrap_or_else(|| panic!("owner should cover role={role} rows={rows}"));
-            let expected = try_x86_q8_ffn_down_packed_rows4_matmul_path(
-                &input,
-                &packed_weight,
-                "owner_expected",
-                "ffn_down",
-                &ffn_down_packed_rows4_matmul_plan(true),
-            )
-            .unwrap()
-            .expect("packed rows4 matmul baseline");
+                let actual = try_q8_matmul_owner_prefill(
+                    &input,
+                    &packed_weight,
+                    "owner_actual",
+                    role,
+                    &owner_plan,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("owner should cover role={role} rows={rows}"));
+                let expected = try_x86_q8_ffn_down_packed_rows4_matmul_path(
+                    &input,
+                    &packed_weight,
+                    "owner_expected",
+                    "ffn_down",
+                    &ffn_down_packed_rows4_matmul_plan(true),
+                )
+                .unwrap()
+                .expect("packed rows4 matmul baseline");
 
-            assert_eq!(actual.shape.dims, vec![rows, output_width]);
-            for (idx, (a, b)) in actual.data.iter().zip(&expected.data).enumerate() {
-                assert_eq!(
+                assert_eq!(actual.shape.dims, vec![rows, output_width]);
+                for (idx, (a, b)) in actual.data.iter().zip(&expected.data).enumerate() {
+                    assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
-                    "owner vs packed-matmul bit mismatch at role={role} rows={rows} idx={idx}: {a} vs {b}"
+                    "owner vs packed-matmul bit mismatch at vnni={vnni} role={role} rows={rows} idx={idx}: {a} vs {b}"
                 );
+                }
             }
         }
     }

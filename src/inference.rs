@@ -13463,6 +13463,7 @@ fn run_q8_0_unified_prefill_tiled(
     input_groups: usize,
     output: &mut [f32],
     use_avx2: bool,
+    use_vnni: bool,
     groups_per_chunk: usize,
 ) {
     let output_width = packed_weight.rows;
@@ -13492,11 +13493,12 @@ fn run_q8_0_unified_prefill_tiled(
                 let input_blocks = &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
                 let mut sums = [[0.0_f32; 4]; 4];
                 for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
-                    q8_0_packed_rows4_gemm4_accumulate_block(
+                    q8_0_unified_accumulate(
                         input_block,
                         weight_block,
                         &mut sums,
                         use_avx2,
+                        use_vnni,
                     );
                 }
                 for (ir, row_sums) in sums.iter().enumerate() {
@@ -13516,6 +13518,103 @@ fn run_q8_0_unified_prefill_tiled(
     });
 }
 
+/// Whether the AVX-512 VNNI owner microkernel can run on this CPU.
+#[cfg(target_arch = "x86_64")]
+fn q8_owner_avx512vnni_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn q8_owner_avx512vnni_available() -> bool {
+    false
+}
+
+/// Per-block 4x4 accumulate for the unified owner: AVX-512 VNNI when available (v2), else the
+/// AVX2/scalar microkernel (v1). All three produce a bit-identical i32 dot (integer, order-free),
+/// so the f32 result is byte-identical regardless of which runs.
+#[inline(always)]
+fn q8_0_unified_accumulate(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+    use_avx2: bool,
+    use_vnni: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if use_vnni {
+        // SAFETY: the owner dispatch sets use_vnni only when avx512f/bw/vnni are detected.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(input_block, weight_block, sums);
+        }
+        return;
+    }
+    let _ = use_vnni;
+    q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_block, sums, use_avx2);
+}
+
+/// Bit-exact AVX-512 VNNI 4x4 microkernel for the unified prefill owner. Mirrors the AVX2
+/// `q8_0_packed_rows4_gemm4_accumulate_block_avx2` but replaces maddubs+madd+hadd with a single
+/// `dpbusd` per (chunk-pair, input-lane); the weight band (64 bytes = 2 chunks) is loaded ONCE per
+/// pair and reused across the 4 input lanes. The integer dot is identical to the scalar reference
+/// (associative i32, no overflow for Q8), and the per-block f32 scale order is the same
+/// `((int as f32) * weight_scale) * input_scale` with no FMA, so the output is byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm512_abs_epi8, _mm512_cmplt_epi8_mask, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_mask_mov_epi8, _mm512_set_epi64, _mm512_setzero_si512, _mm512_storeu_si512,
+        _mm512_sub_epi8,
+    };
+    let wq = weight_block.quants.as_ptr();
+    let iq = input_block.quants.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc = [zero; 4];
+    // Two pairs of chunks: pair p covers chunks 2p, 2p+1 = 64 weight bytes (one 512-bit load),
+    // reused across all 4 input lanes.
+    for pair in 0..2usize {
+        let chunk = pair * 2;
+        let weight64 = unsafe { _mm512_loadu_si512(wq.add(chunk * 32).cast()) };
+        let abs_weight = _mm512_abs_epi8(weight64);
+        let neg_weight_mask = _mm512_cmplt_epi8_mask(weight64, zero);
+        for (lane, acc_lane) in acc.iter_mut().enumerate() {
+            // input lane `lane`'s 8 K-values for chunk and chunk+1, broadcast to align with the
+            // 4-output-lane weight layout: [low x4 (chunk) | high x4 (chunk+1)].
+            let low =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let high = unsafe {
+                std::ptr::read_unaligned(iq.add((chunk + 1) * 32 + lane * 8).cast::<i64>())
+            };
+            let input64 = _mm512_set_epi64(high, high, high, high, low, low, low, low);
+            // dpbusd needs an UNSIGNED first operand: use abs(weight) and fold the weight sign into
+            // the (signed) input. Mirrors llama.cpp's Q8 VNNI strategy.
+            let neg_input = _mm512_sub_epi8(zero, input64);
+            let signed_input = _mm512_mask_mov_epi8(input64, neg_weight_mask, neg_input);
+            *acc_lane = _mm512_dpbusd_epi32(*acc_lane, abs_weight, signed_input);
+        }
+    }
+    for (lane, acc_lane) in acc.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums[lane][output_lane] += *dot as f32 * weight_block.scales[output_lane] * input_scale;
+        }
+    }
+}
+
 /// Projection wrapper: quantize+pack the activation ONCE (persistent thread-local scratch),
 /// run the unified tiled kernel over the 4-aligned rows, and finish any ragged tail (rows % 4)
 /// through the same per-row scalar path the default lane uses.
@@ -13525,6 +13624,7 @@ fn q8_0_unified_prefill_projection(
     output_width: usize,
     name: &str,
     use_avx2: bool,
+    use_vnni: bool,
     schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
@@ -13567,6 +13667,7 @@ fn q8_0_unified_prefill_projection(
             input_groups,
             &mut output[..packed_rows * output_width],
             use_avx2,
+            use_vnni,
             schedule.groups_per_chunk,
         );
         // Retain scratch capacity for the next projection (persistent thread-local); do NOT cap
@@ -13650,12 +13751,14 @@ fn try_q8_matmul_owner_prefill(
     {
         return Ok(None);
     }
+    let use_vnni = runtime_plan.q8.q8_matmul_owner_vnni && q8_owner_avx512vnni_available();
     let output = q8_0_unified_prefill_projection(
         input,
         packed,
         output_width,
         name,
         runtime_plan.q8.q8_matmul_owner_avx2,
+        use_vnni,
         runtime_plan.q8_packed_rows4_matmul_schedule,
     )?;
     Ok(Some(output))

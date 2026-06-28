@@ -85,6 +85,10 @@ pub(super) struct Q8RuntimeFlags {
     /// Use the AVX2 4x4 microkernel inside the owner. Defaults ON whenever the owner is on
     /// (avoids the GEMM4 split-flag trap where prefill-on-but-avx2-off ran the slow scalar 4x4).
     pub(super) q8_matmul_owner_avx2: bool,
+    /// Use the AVX-512 VNNI (dpbusd) microkernel inside the owner when the CPU supports it (v2,
+    /// llama's tinyBLAS compute technique). Defaults ON; gated by runtime feature detection at
+    /// dispatch. Set `CAMELID_X86_Q8_MATMUL_OWNER_VNNI=0` to force the AVX2 microkernel (v1).
+    pub(super) q8_matmul_owner_vnni: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +223,9 @@ impl Q8RuntimeFlags {
             q8_matmul_owner: Q8MatmulOwnerScope::from_env(),
             q8_matmul_owner_avx2: q8_0_env_flag_enabled_default_on_fail_closed(
                 "CAMELID_X86_Q8_MATMUL_OWNER_AVX2",
+            ),
+            q8_matmul_owner_vnni: q8_0_env_flag_enabled_default_on_fail_closed(
+                "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
             ),
         }
     }
