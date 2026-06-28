@@ -259,5 +259,12 @@ future Q6_K AVX2 are not expected to close it (cf. Phase 3 prefetch null, Q8 SIM
    decode is bandwidth-bound (rebuild + weight reads dominate). Same pattern as the Q8 gated-SIMD
    regression and the Phase-3 prefetch null. Stays default-off as a parity-proven regression
    guard; receipt `docs/perf-deep-dive/PERF_RECEIPTS/same-host/kquant-phase2-q6k-avx2-llama-vs-scalar-20260628T022001Z.json`.
-2. CPU weight-materialization guard: skip for K-quant linears when the block-dot is enabled (still open).
+2. **CPU weight-materialization guard false-positive — FIXED.** Added
+   `binding_runs_on_cpu_wire_only` (the CPU mirror of `binding_runs_on_resident_gpu`):
+   when the K-quant block-dot is enabled and every linear is a resident-eligible quant, the
+   guard bypasses the f32 budget (these load wire-only and never materialize f32). Verified:
+   serve CPU mode now loads + decodes Qwen3-4B-Q4_K_M WITHOUT the
+   `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES` bypass (previously a 503 estimating ~16 GB).
+   Regression test `cpu_weight_materialization_budget_bypassed_for_kquant_block_dot`.
 3. Linux/macOS greedy-parity confirmation of the now-default-on CPU K-quant path (still open).
+4. Execution-plan disclosure mislabels the resident K-quant lane as `cpu_reference` (still open).

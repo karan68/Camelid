@@ -15557,7 +15557,7 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// `q6_k_wire_row_dot`). Windows greedy parity is proven vs llama.cpp acd79d6
 /// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
 /// documented follow-up.
-fn q4_k_cpu_block_dot_enabled() -> bool {
+pub(crate) fn q4_k_cpu_block_dot_enabled() -> bool {
     q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q4K_DECODE")
 }
 

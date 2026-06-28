@@ -6530,12 +6530,31 @@ fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
     crate::inference::resident_decode_cuda_active() && binding_all_resident_quant_linears(binding)
 }
 
+/// Whether the CPU decode path consumes every linear WIRE-ONLY — and so, like the
+/// resident-GPU case, never materializes the f32 weights the budget guard sizes. True
+/// when the K-quant CPU block-dot is enabled (Q4_K/Q6_K linears stream their wire bytes
+/// via `q4_k`/`q6_k_block_dot`, Q8_0 linears stream their packed blocks) AND every linear
+/// is a resident-eligible quant. Without this, serve CPU mode FALSE-POSITIVES the guard
+/// on K-quant models (estimating the ~16 GB f32 the wire-only path never produces),
+/// because `binding_runs_on_resident_gpu` is false on CPU. K-quant super-blocks are
+/// 256-wide so the block-dot always engages (the 7130 dispatch requires that), matching
+/// the wire-only invariant documented on `binding_all_resident_quant_linears`.
+fn binding_runs_on_cpu_wire_only(binding: &LlamaTensorBinding) -> bool {
+    crate::inference::q4_k_cpu_block_dot_enabled() && binding_all_resident_quant_linears(binding)
+}
+
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
     // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
     // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
     // CPU budget for them — but ONLY them; genuinely CPU-bound large models (or any
     // build/host without the resident GPU path) still hit the guard below.
     if binding_runs_on_resident_gpu(binding) {
+        return Ok(0);
+    }
+    // CPU K-quant block-dot decode is also wire-only (no f32 materialization), so the
+    // same bypass applies on the CPU lane — otherwise a K-quant model that runs fine via
+    // the block-dot is wrongly rejected here. (K-quant conductor Phase 2 follow-up.)
+    if binding_runs_on_cpu_wire_only(binding) {
         return Ok(0);
     }
     let estimated_bytes = estimate_cpu_weight_materialization_bytes(binding)?;
@@ -11955,6 +11974,36 @@ mod tests {
         assert!(err.contains("estimated CPU f32 weight materialization"));
         assert!(err.contains(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV));
         std::env::remove_var(CPU_WEIGHT_MATERIALIZATION_LIMIT_ENV);
+    }
+
+    #[test]
+    fn cpu_weight_materialization_budget_bypassed_for_kquant_block_dot() {
+        // The budget guard must treat a K-quant block-dot model as wire-only (no f32
+        // materialization) on the CPU lane — otherwise serve CPU mode false-positives
+        // on the f32 size it never produces (Phase 2 follow-up). Tested directly on
+        // `binding_runs_on_cpu_wire_only` to avoid the `resident_decode_cuda_active`
+        // GPU-bypass confound on CUDA builds.
+        let _env_guard = crate::test_support::env_lock();
+        let kquant = materialization_binding(false, GgufTensorType::Q4K, vec![256, 256]);
+        let dense_f32 = materialization_binding(false, GgufTensorType::F32, vec![256, 256]);
+
+        std::env::remove_var("CAMELID_X86_Q4K_DECODE"); // block-dot default-on
+        assert!(
+            binding_runs_on_cpu_wire_only(&kquant),
+            "K-quant block-dot model is consumed wire-only on CPU"
+        );
+        assert!(
+            !binding_runs_on_cpu_wire_only(&dense_f32),
+            "an f32 model still materializes -> the guard must apply"
+        );
+
+        std::env::set_var("CAMELID_X86_Q4K_DECODE", "0"); // opt out: no CPU consumer
+        assert!(
+            !binding_runs_on_cpu_wire_only(&kquant),
+            "with the block-dot disabled there is no wire-only CPU consumer"
+        );
+
+        std::env::remove_var("CAMELID_X86_Q4K_DECODE");
     }
 
     #[test]
