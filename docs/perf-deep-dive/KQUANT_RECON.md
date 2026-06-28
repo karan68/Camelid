@@ -107,3 +107,49 @@ download.)
    the two exact rows to Supported in `CAPABILITY_MATRIX.md`.
 
 No row was refuted, so no re-scope is triggered at Phase 0.
+
+---
+
+## Phase 1 outcome (appended) — Qwen3-4B-Q4_K_M CERTIFIED
+
+**Result: `all_pass = true`.** GPU-resident CUDA decode of `Qwen3-4B-Q4_K_M` is token-AND-text-
+identical to llama.cpp `acd79d6` at 1/5/50 generated tokens on all 3 chat prompts (thinking-
+disabled ChatML, greedy), plus cross-engine prompt-token parity. Bundle:
+`qa/evidence-bundles/qwen3-4b-q4_k_m-windows-cuda-resident-parity-20260628T003317Z-head-0dccbf74/`.
+The mixed model drove **both** `q4k_gemv` (Q4_K) and `q6k_gemv` (Q6_K) in one run; the 8-lane
+f32 parity anchor holds end-to-end. The 'primary color' probe (a near-tie excluded from the
+Q8_0 4B headline set) passed here at all token counts.
+
+S2 caveat **resolved**: smoke decode produced coherent output (" Paris. The capital of Germany
+is Berlin…"), 36/36 layers VRAM-resident, 19.44 tok/s median (4.92 GB peak).
+
+### Two findings that reshape Phase 2 / add follow-ups
+
+1. **CPU K-quant decode is BROKEN, not merely slow/scalar.** S5 said K-quant CPU tensors "fall
+   to f32 dequant / scalar." Reality is stronger: with CUDA hidden the model **errors** —
+   `matmul rhs-transposed ... blk.0.attn_q.weight ... no-row-major-data ... data_len=0`. K-quant
+   2-D linears load **wire-only** (`load_kquant_wire_linear`, empty f32 `data`) and there is no
+   CPU arm to read them, so there is no f32 fallback at all. ⇒ **Phase 2 must first give the CPU
+   lane a way to READ K-quant tensors** (dequant-to-f32 fallback and/or the packed matvec), not
+   just a *faster* path. (Silver lining: this same error is positive proof the passing GPU run
+   was genuinely on the GPU.)
+
+2. **The execution-plan disclosure mislabels the K-quant resident lane** (NEW follow-up, not in
+   the conductor). `/api/capabilities` reports `selected_backend=cpu_reference`,
+   `decode_path=safe_cpu_decode`, `quant_type=dense_or_other` ("non-validated row or quant;
+   failing closed to safe path") for the loaded Q4_K_M model — yet `cuda_resident_active=true`
+   and it ran GPU-resident. The planner classifier is Q8_0-centric. Parity-green output, wrong
+   self-disclosure. Fix: teach the classifier to recognize Q4_K/Q6_K dense resident models.
+
+### Speed (honest)
+
+camelid Q4_K_M GPU-resident decode **19.44 tok/s** @ 4.92 GB; llama.cpp Q4_K_M **CPU** tg128
+**12.35 tok/s**. Different backends — NOT a ratio. This box's llama.cpp has no `ggml-cuda.dll`,
+so GPU-vs-GPU is blocked; Qwen3-4B-Q8_0 isn't on disk, so same-model Q8-vs-Q4 is deferred.
+
+### Promotions (doc/ledger only)
+
+`SUPPORT_MATRIX_v0.1.md` + `COMPATIBILITY.md`: added the `Qwen3-4B-Q4_K_M` row as
+GPU-resident-parity-certified exact-row smoke with the caveats above and the bundle cited
+(runtime support-contract recognition marked PENDING pending the disclosure fix). The
+Llama-3.2-3B-Q4_K_M (primary) row remains unstarted — GGUF still needs download.

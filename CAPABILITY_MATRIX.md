@@ -65,6 +65,7 @@ Two `wip` cells are **host-limited, not model-limited**: `context.full_length` o
   - DONE (class C, 3 on-disk rows): prompt/completion/total usage present + arithmetically correct e2e. Receipt minted. (ttft timing still not populated — not claimed.)
 - **`load.quant_breadth`** — (SECONDARY) loadability across additional quants beyond Q8_0
   - Q8_0 supported; broader K-quant decode (Q4_K/Q5_0/Q6_K) gated/experimental (wire_dequant.rs). SECONDARY axis.
+    - **UPDATE (K-quant conductor Phase 1):** **Q4_K_M (mixed Q4_K + Q6_K) is now GPU-resident parity-certified** for `Qwen3-4B-Q4_K_M` — token+text-identical to llama.cpp `acd79d6` at 1/5/50 tokens (`qa/evidence-bundles/qwen3-4b-q4_k_m-windows-cuda-resident-parity-20260628T003317Z-head-0dccbf74/`, `all_pass=true`), running on the in-tree `q4k_gemv`/`q6k_gemv` resident kernels. Exact-row only (this Qwen3-4B GGUF). Still **NOT** done: CPU K-quant decode (none exists — the CPU path errors `data_len=0` on wire-only K-quant tensors; that is Phase 2), the static execution-plan's K-quant disclosure (mislabels the lane `cpu_reference`/`dense_or_other` — follow-up), the Llama-3.2-3B-Q4_K_M row (GGUF not yet downloaded), and Q5_0 / other K-quant files.
 
 ## Notable Phase 0 findings
 
