@@ -636,6 +636,19 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         banner::dim("describe a goal · /tools list tools · /steps budget · /exit quit")
     );
 
+    // Enable subagent orchestration for this session: children share this serve
+    // (same addr → resident model reused) and inherit the same gates. Capped
+    // (concurrency, depth-1) inside the spawn path. Until this call, the
+    // spawn_subagent/check_subagent_status tools are not advertised.
+    super::subagent::configure(super::subagent::SubagentConfig::for_session(
+        addr,
+        session.active_id.clone().unwrap_or_default(),
+        session.active_family(),
+        cfg.max_tokens,
+        cfg.auto_approve,
+        cfg.shell_sandbox,
+    ));
+
     let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);

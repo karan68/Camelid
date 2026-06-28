@@ -21,6 +21,13 @@ pub struct JobObject {
     handle: HANDLE,
 }
 
+// SAFETY: a Windows job-object handle is a process-wide kernel handle, not tied
+// to the thread that created it; create/assign/terminate/close are all valid from
+// any thread. This lets a JobObject be held in the process-global subagent
+// registry (a `Mutex`-guarded static). It is never used concurrently without that
+// lock.
+unsafe impl Send for JobObject {}
+
 impl JobObject {
     /// Create a new unnamed kill-on-close job object.
     pub fn new() -> std::io::Result<Self> {

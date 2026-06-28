@@ -16,6 +16,7 @@
 
 mod agent;
 mod agent_eval;
+mod agent_orchestration;
 mod agent_syscap;
 mod audit;
 mod banner;
@@ -28,6 +29,7 @@ mod palette;
 mod server;
 mod session;
 mod shell_sandbox;
+mod subagent;
 mod theme;
 mod tool_parse;
 mod tools;
@@ -202,6 +204,25 @@ pub struct AgentSyscapOptions {
 /// sealed `camelid.agent-syscap-receipt/v1`.
 pub fn run_agent_syscap_eval(opts: AgentSyscapOptions) -> anyhow::Result<i32> {
     agent_syscap::run(agent_syscap::SyscapConfig {
+        receipt_dir: opts.receipt_dir,
+    })
+}
+
+/// Entry for the hidden `__subagent` worker subcommand: run one scoped agent loop
+/// described by `task_file` and write its result file. Returns 0/1/3.
+pub fn run_subagent_worker(task_file: &std::path::Path) -> anyhow::Result<i32> {
+    subagent::run_worker(task_file)
+}
+
+/// Parsed `camelid agent-orchestration-eval` flags.
+pub struct AgentOrchestrationOptions {
+    pub receipt_dir: PathBuf,
+}
+
+/// Entry for the `agent-orchestration-eval` subcommand: the Phase-2 orchestration
+/// gate (stub round-trip + caps/depth/reaping) → sealed receipt. Returns 0/1/3.
+pub fn run_agent_orchestration_eval(opts: AgentOrchestrationOptions) -> anyhow::Result<i32> {
+    agent_orchestration::run(agent_orchestration::OrchestrationConfig {
         receipt_dir: opts.receipt_dir,
     })
 }

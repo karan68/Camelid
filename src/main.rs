@@ -432,6 +432,22 @@ enum Command {
         #[arg(long, default_value = "qa/agent-syscap")]
         receipt_dir: PathBuf,
     },
+    /// Internal: run ONE scoped subagent task described by a task file and write
+    /// its result file. Spawned by the spawn_subagent tool; not for direct use.
+    #[command(name = "__subagent", hide = true)]
+    Subagent {
+        /// Path to the task_<id>.json written by the parent.
+        #[arg(long)]
+        task_file: PathBuf,
+    },
+    /// Phase-2 subagent-orchestration gate: spawn -> run -> collect a canned
+    /// subagent plus caps/depth/reaping checks, emitting a sealed receipt
+    /// (PASS / FAIL / INCONCLUSIVE). Rung-2 (stub) — promotes nothing.
+    AgentOrchestrationEval {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+    },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
         /// Mode to run: coordinator or worker
@@ -1105,6 +1121,16 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::AgentSyscapEval { receipt_dir } => {
             let code = chat::run_agent_syscap_eval(chat::AgentSyscapOptions { receipt_dir })?;
+            std::process::exit(code);
+        }
+        Command::Subagent { task_file } => {
+            let code = chat::run_subagent_worker(&task_file)?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationEval { receipt_dir } => {
+            let code = chat::run_agent_orchestration_eval(chat::AgentOrchestrationOptions {
+                receipt_dir,
+            })?;
             std::process::exit(code);
         }
         Command::ServeDistributed {
