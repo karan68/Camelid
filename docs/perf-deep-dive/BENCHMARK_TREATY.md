@@ -47,6 +47,13 @@ result is a **Windows-host result** and stays `ubuntu: pending`. Nothing promote
 - **Same-prompt A/B + parity capture:** `docs/perf-deep-dive/scripts/cpu-baseline-medN.mjs`
   (median-of-N, config-A-default vs llama, CUDA-hidden, cache-defeated). Use for camelid-vs-llama
   parity text alongside throughput.
+- **Small in-engine deltas (resolve sub-5% effects through thermal noise):** `camelid
+  bench-owner-sweep` (in-binary) + `docs/perf-deep-dive/scripts/owner-sweep-stats.mjs`. Loads the
+  model ONCE and measures configs **interleaved per round** (the runtime plan is re-read from env
+  per call, so no reload), then does a **paired** per-round comparison with a bootstrap 95% CI. A
+  result counts only if the CI excludes 1.0. This exists because a cross-invocation A/B could NOT
+  resolve a ~3% kernel delta on this box (the same config swung 0.897→1.044 across runs); pairing
+  cancels the slow drift. Use for any sub-5% kernel comparison.
 
 > Methodology bug found & fixed 2026-06-28: an HTTP-harness variant timed `performance.now()` AFTER
 > `await fetch()`, measuring JSON-parse time → absurd "1.18M tok/s". Always start the timer BEFORE

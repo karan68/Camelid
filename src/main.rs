@@ -732,6 +732,34 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
+    /// Hidden: in-process INTERLEAVED owner-microkernel prefill sweep. Loads the model ONCE, then
+    /// rotates owner configs (off / avx2 / vnni4x4 / vnni4x8) round-by-round so every config shares
+    /// the same thermal/clock state, enabling drift-cancelling PAIRED comparison (the fix for the
+    /// noise that made v3 inconclusive). The owner flag is read from env per linear call, so no
+    /// reload is needed between configs. Emits one JSON line per (round, config) to stdout.
+    #[command(hide = true)]
+    BenchOwnerSweep {
+        /// GGUF model path.
+        model: PathBuf,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Tokens to generate per measurement (prefill dominates; keep small).
+        #[arg(long, default_value_t = 1)]
+        max_tokens: usize,
+        /// Measured interleaved rounds (median + paired stats taken across rounds).
+        #[arg(long, default_value_t = 10)]
+        rounds: usize,
+        /// Leading rounds discarded as warmup (reach steady thermal state).
+        #[arg(long, default_value_t = 2)]
+        warmup_rounds: usize,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// GAIT: run the parity-gated calibration tournament for this model on this
     /// machine. Times the supported execution profiles, disqualifies any whose
     /// greedy output diverges, picks the fastest parity-clean one that beats the
@@ -1520,6 +1548,25 @@ async fn main() -> anyhow::Result<()> {
                 temperature,
                 iterations,
                 warmup,
+                threads,
+            )?;
+        }
+        Command::BenchOwnerSweep {
+            model,
+            prompt_file,
+            prompt,
+            max_tokens,
+            rounds,
+            warmup_rounds,
+            threads,
+        } => {
+            run_bench_owner_sweep(
+                model,
+                prompt_file,
+                prompt,
+                max_tokens,
+                rounds,
+                warmup_rounds,
                 threads,
             )?;
         }
@@ -2767,6 +2814,143 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         moe: None,
         gemma4: None,
     })
+}
+
+/// Hardened owner-microkernel prefill measurement: load ONCE, then measure all configs INTERLEAVED
+/// within each round so per-round paired deltas cancel slow thermal/clock drift. Emits raw
+/// per-(round, config) JSONL; paired stats + significance are computed downstream.
+#[allow(clippy::too_many_arguments)]
+fn run_bench_owner_sweep(
+    model: PathBuf,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    max_tokens: usize,
+    rounds: usize,
+    warmup_rounds: usize,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    anyhow::ensure!(rounds >= 1, "--rounds must be at least 1");
+    configure_rayon_threads(threads)?;
+    camelid::capability::HardwareProfile::detect().log();
+
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    // Load once. The owner is selected at runtime (env read per linear call), so a single load
+    // serves every config; the PackedRows4 repack the owner consumes is built at load regardless.
+    let gguf = read_metadata(&model)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    let prompt_tokens = prompt_token_ids.len();
+    anyhow::ensure!(prompt_tokens >= 1, "prompt encoded to zero tokens");
+    let sampler = LlamaSampler::Greedy;
+
+    // Owner keys cleared before each config so "off" is the true default path.
+    let owner_keys = [
+        "CAMELID_X86_Q8_MATMUL_OWNER",
+        "CAMELID_X86_Q8_MATMUL_OWNER_AVX2",
+        "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
+        "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
+    ];
+    let configs: &[(&str, &[(&str, &str)])] = &[
+        ("off", &[]),
+        (
+            "owner_avx2",
+            &[
+                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "0"),
+            ],
+        ),
+        (
+            "owner_vnni4x4",
+            &[
+                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
+            ],
+        ),
+        (
+            "owner_vnni4x8",
+            &[
+                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "1"),
+            ],
+        ),
+    ];
+    let apply = |envs: &[(&str, &str)]| {
+        for k in owner_keys {
+            std::env::remove_var(k);
+        }
+        for (k, v) in envs {
+            std::env::set_var(k, v);
+        }
+    };
+
+    let model_label = model.display().to_string();
+    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let total_rounds = warmup_rounds + rounds;
+    eprintln!(
+        "[bench-owner-sweep] {prompt_tokens} prompt tokens, {} configs, {warmup_rounds} warmup + {rounds} measured rounds interleaved",
+        configs.len()
+    );
+    for round in 0..total_rounds {
+        let measured = round >= warmup_rounds;
+        for (label, envs) in configs {
+            apply(envs);
+            camelid::inference::reset_stage_timings();
+            let run = generate_run(
+                &config,
+                &weights,
+                &tokenizer,
+                &prompt_token_ids,
+                &sampler,
+                max_tokens,
+            )?;
+            if !measured {
+                continue;
+            }
+            let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+            let prefill_tok_s = if run.prefill_ms > 0.0 {
+                prompt_tokens as f64 / (run.prefill_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let decode_tokens = run.generated.len().saturating_sub(1);
+            let decode_tok_s = if run.decode_ms > 0.0 && decode_tokens > 0 {
+                decode_tokens as f64 / (run.decode_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let rec = serde_json::json!({
+                "schema": "camelid.bench-owner-sweep/v1",
+                "round": round - warmup_rounds,
+                "config": label,
+                "model": model_label,
+                "commit": commit,
+                "prompt_tokens": prompt_tokens,
+                "prefill_ms": r3(run.prefill_ms),
+                "prefill_tok_s": r3(prefill_tok_s),
+                "decode_tok_s": r3(decode_tok_s),
+            });
+            println!("{}", serde_json::to_string(&rec)?);
+        }
+    }
+    for k in owner_keys {
+        std::env::remove_var(k);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
