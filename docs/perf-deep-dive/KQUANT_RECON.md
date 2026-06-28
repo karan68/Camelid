@@ -267,4 +267,11 @@ future Q6_K AVX2 are not expected to close it (cf. Phase 3 prefetch null, Q8 SIM
    `CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES` bypass (previously a 503 estimating ~16 GB).
    Regression test `cpu_weight_materialization_budget_bypassed_for_kquant_block_dot`.
 3. Linux/macOS greedy-parity confirmation of the now-default-on CPU K-quant path (still open).
-4. Execution-plan disclosure mislabels the resident K-quant lane as `cpu_reference` (still open).
+4. **Execution-plan disclosure mislabel — FIXED.** `quant_type` now recognizes Q4_K/Q6_K as
+   `Q4_K_M` (was `dense_or_other`), and `select_kquant_plan` labels the lane by what actually
+   runs: `cuda_resident_kquant_runtime` / `kquant_cuda_resident_decode` when CUDA resident drives
+   decode, `cpu_kquant_block_dot` / `kquant_cpu_block_dot_decode` on CPU, and only `cpu_reference`
+   when the block-dot is disabled with no GPU. Descriptive-only (no routing/env change). Verified
+   live: `/api/capabilities` on GPU-resident Qwen3-4B-Q4_K_M reports
+   `selected_backend=cuda_resident_kquant_runtime` (was `cpu_reference`). Test
+   `kquant_plan_labels_resident_and_cpu_block_dot_not_cpu_reference`.
