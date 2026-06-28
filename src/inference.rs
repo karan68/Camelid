@@ -59,7 +59,7 @@ pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, Ll
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_enabled_default_off, q8_0_env_flag_enabled_default_on_fail_closed,
-    Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
+    Q8MatmulOwnerScope, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
 // All remaining callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so
 // this import is unused on other targets.
@@ -6849,6 +6849,14 @@ fn linear_for_role_runtime_with_plan(
         linear_for_role(input, weight, name, rectangular_role)
     } else {
         let name = name.into();
+        // Lane 1: unified tiled Q8_0 prefill GEMM owner (default-off). Role-agnostic — covers
+        // every Q8_0 projection (q/k/v/o, gate/up, ffn_down) in ONE place. Returns None for
+        // decode, non-Q8, or non-PackedRows4 weights, so the default path is unchanged when off.
+        if let Some(output) =
+            try_q8_matmul_owner_prefill(input, weight, &name, rectangular_role, runtime_plan)?
+        {
+            return Ok(output);
+        }
         if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
             input,
             weight,
@@ -13423,6 +13431,234 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
                 },
             );
     }
+}
+
+// ===== Lane 1: unified tiled Q8_0 PREFILL GEMM owner =====
+//
+// A role-agnostic, BIT-EXACT drop-in for the per-projection prefill block-dot. It reuses the
+// proven 4x4 register microkernel `q8_0_packed_rows4_gemm4_accumulate_block` VERBATIM, so every
+// output cell still accumulates `((int as f32) * weight_scale) * input_scale` over ascending
+// blocks with no FMA — byte-identical to the scalar oracle. The ONLY difference vs the (default-
+// off, regressing) ffn_down GEMM4 lane is the loop nest: it parallelizes over OUTPUT-row bands
+// and streams every input group against an L1/L2-resident weight band, so each weight block is
+// read from DRAM ~once instead of once per 4-row input group — the arithmetic-intensity fix for
+// the bandwidth-bound host. Tiling reorders only which cells co-compute, never the per-cell
+// arithmetic sequence, so the result is byte-identical to row-at-a-time for any band size.
+
+/// Raw output pointer shared across rayon tasks. SAFETY: each task writes a DISJOINT set of
+/// (output_row, output_channel) cells — output-group bands are partitioned across tasks and each
+/// task owns its channel range [og*4, og*4+4) exclusively — so no two tasks ever touch the same
+/// cell despite the shared base pointer.
+#[derive(Clone, Copy)]
+struct Q8UnifiedOutPtr(*mut f32);
+// SAFETY: see the disjoint-write invariant on `Q8UnifiedOutPtr`.
+unsafe impl Send for Q8UnifiedOutPtr {}
+unsafe impl Sync for Q8UnifiedOutPtr {}
+
+/// Core unified tiled kernel. `output` is the 4-row-aligned region [packed_rows, output_width],
+/// row-major; `packed_rows == input_groups * 4`. Bit-identical to the per-row scalar oracle.
+fn run_q8_0_unified_prefill_tiled(
+    packed_weight: &Q8_0PackedRows4,
+    packed_inputs: &[Q8_0PackedRows4Block],
+    input_groups: usize,
+    output: &mut [f32],
+    use_avx2: bool,
+    groups_per_chunk: usize,
+) {
+    let output_width = packed_weight.rows;
+    let blocks_per_row = packed_weight.blocks_per_row;
+    debug_assert_eq!(packed_inputs.len(), input_groups * blocks_per_row);
+    debug_assert_eq!(output.len(), input_groups * 4 * output_width);
+    let output_groups = output_width / 4;
+    if output_groups == 0 || input_groups == 0 {
+        return;
+    }
+    let gpc = groups_per_chunk.max(1);
+    let num_chunks = output_groups.div_ceil(gpc);
+    let out = Q8UnifiedOutPtr(output.as_mut_ptr());
+    // Parallelize over chunks of output-row groups. Each chunk keeps its weight band resident
+    // (read once) and sweeps ALL input groups against it.
+    (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
+        // Capture the whole wrapper (Copy + Send + Sync), not the bare `*mut f32` field — Rust
+        // 2021 disjoint closure capture would otherwise grab `out.0` and reject the raw pointer.
+        let out = out;
+        let og_start = chunk_idx * gpc;
+        let og_end = ((chunk_idx + 1) * gpc).min(output_groups);
+        for og in og_start..og_end {
+            let weight_group =
+                &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
+            let col = og * 4;
+            for ig in 0..input_groups {
+                let input_blocks = &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
+                let mut sums = [[0.0_f32; 4]; 4];
+                for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
+                    q8_0_packed_rows4_gemm4_accumulate_block(
+                        input_block,
+                        weight_block,
+                        &mut sums,
+                        use_avx2,
+                    );
+                }
+                for (ir, row_sums) in sums.iter().enumerate() {
+                    let row = ig * 4 + ir;
+                    // SAFETY: cell (row, col..col+4) is unique to this (og, ig, ir); og bands are
+                    // disjoint across tasks, so this write never races another task.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row_sums.as_ptr(),
+                            out.0.add(row * output_width + col),
+                            4,
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Projection wrapper: quantize+pack the activation ONCE (persistent thread-local scratch),
+/// run the unified tiled kernel over the 4-aligned rows, and finish any ragged tail (rows % 4)
+/// through the same per-row scalar path the default lane uses.
+fn q8_0_unified_prefill_projection(
+    input: &CpuTensor,
+    packed: &Q8_0PackedRows4,
+    output_width: usize,
+    name: &str,
+    use_avx2: bool,
+    schedule: Q8PackedRows4MatmulSchedule,
+) -> Result<CpuTensor> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    if blocks_per_row != packed.blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 unified prefill expected {} input blocks per row, got {blocks_per_row}",
+            packed.blocks_per_row
+        )));
+    }
+    if packed.interleave != Q8_0PackedRows4Interleave::I8 || packed.rows != output_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 unified prefill requires matching I8 packed output, got interleave {:?}, packed rows {}, output {}",
+            packed.interleave, packed.rows, output_width
+        )));
+    }
+    q8_0_packed_rows4_output_groups(output_width, "unified prefill projection")?;
+
+    let packed_rows = rows / 4 * 4;
+    if packed_rows == 0 {
+        return q8_0_packed_rows4_matmul_projection(input, packed, output_width, name, schedule);
+    }
+
+    let mut output = vec![0.0_f32; rows * output_width];
+    Q8_0_PREFILL_PACKED_INPUTS.with(|cell| {
+        let mut packed_inputs = cell.borrow_mut();
+        packed_inputs.clear();
+        quantize_pack_q8_0_rows4_i8_direct_into(
+            &input.data[..packed_rows * input_width],
+            packed_rows,
+            input_width,
+            blocks_per_row,
+            &mut packed_inputs,
+        );
+        let input_groups = packed_rows / 4;
+        run_q8_0_unified_prefill_tiled(
+            packed,
+            &packed_inputs,
+            input_groups,
+            &mut output[..packed_rows * output_width],
+            use_avx2,
+            schedule.groups_per_chunk,
+        );
+        // Retain scratch capacity for the next projection (persistent thread-local); do NOT cap
+        // to zero, which would re-allocate the packed-input buffer on every call.
+        packed_inputs.clear();
+    });
+
+    let tail_rows = rows - packed_rows;
+    if tail_rows > 0 {
+        with_q8_0_file_reader_quantized_inputs(|quantized_inputs| {
+            quantized_inputs.clear();
+            quantized_inputs.reserve(tail_rows * blocks_per_row);
+            for row in input.data[packed_rows * input_width..].chunks_exact(input_width) {
+                quantize_q8_0_blocks_into(row, quantized_inputs);
+            }
+            for tail_row in 0..tail_rows {
+                let input_start = tail_row * blocks_per_row;
+                let output_start = (packed_rows + tail_row) * output_width;
+                accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                    &quantized_inputs[input_start..input_start + blocks_per_row],
+                    packed,
+                    Q8_0PackedRows4Interleave::I8,
+                    &mut output[output_start..output_start + output_width],
+                );
+            }
+            Ok(())
+        })?;
+    }
+
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
+}
+
+/// Role-agnostic dispatch for the unified tiled Q8_0 prefill GEMM owner. Returns `Some(out)` to
+/// short-circuit the per-role block-dot when the owner scope covers this role and the projection
+/// is eligible (Q8_0 weight with the load-time PackedRows4/I8 repack, prefill batch rows>=4,
+/// `input_width % 32 == 0`, `output_width % 4 == 0`). Returns `None` for decode (rows<4), non-Q8,
+/// or any non-PackedRows4 weight, so those fall through to the existing default path unchanged.
+fn try_q8_matmul_owner_prefill(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<CpuTensor>> {
+    let scope: Q8MatmulOwnerScope = runtime_plan.q8.q8_matmul_owner;
+    if !scope.covers_role(rectangular_role) {
+        return Ok(None);
+    }
+    if input.rank() != 2 || weight.rank() != 2 {
+        return Ok(None);
+    }
+    let rows = input.dim(0)?;
+    if rows < 4 {
+        return Ok(None); // prefill-only; decode (rows<4) stays on the existing path
+    }
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    if weight.source_type != Some(GgufTensorType::Q8_0) {
+        return Ok(None);
+    }
+    let weight_rows = weight.dim(0)?;
+    let weight_cols = weight.dim(1)?;
+    let output_width = if weight_rows == input_width {
+        weight_cols
+    } else if weight_cols == input_width {
+        weight_rows
+    } else {
+        return Ok(None);
+    };
+    if !output_width.is_multiple_of(4) {
+        return Ok(None);
+    }
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+    {
+        return Ok(None);
+    }
+    let output = q8_0_unified_prefill_projection(
+        input,
+        packed,
+        output_width,
+        name,
+        runtime_plan.q8.q8_matmul_owner_avx2,
+        runtime_plan.q8_packed_rows4_matmul_schedule,
+    )?;
+    Ok(Some(output))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
