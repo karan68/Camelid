@@ -13214,6 +13214,7 @@ fn q8_0_packed_rows4_gemm4_accumulate_block(
 /// a NEON `prfm` two blocks ahead; this gives the x86 decode dot the same option so it
 /// can be measured on a bandwidth-bound host (the Q8 gated-SIMD history says prove the
 /// win on the box before promoting to default).
+#[cfg(target_arch = "x86_64")]
 fn x86_prefetch_enabled() -> bool {
     #[cfg(test)]
     {
@@ -13225,6 +13226,7 @@ fn x86_prefetch_enabled() -> bool {
         *X86_PREFETCH_ENABLED.get_or_init(x86_prefetch_enabled_from_env)
     }
 }
+#[cfg(target_arch = "x86_64")]
 fn x86_prefetch_enabled_from_env() -> bool {
     matches!(
         env::var("CAMELID_X86_PREFETCH").as_deref(),
@@ -15784,6 +15786,7 @@ pub(crate) fn q6_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
 /// `q6_k_dot_avx2` is NOT a substitute: it mirrors the single-accumulator
 /// `q6_k_dot_scalar` order, a different bit pattern.) Default-off until measured —
 /// CPU decode is bandwidth-bound on the dev box, so this is expected to be ~null.
+#[cfg(target_arch = "x86_64")]
 fn q6k_avx2_enabled() -> bool {
     #[cfg(test)]
     {
@@ -15795,6 +15798,7 @@ fn q6k_avx2_enabled() -> bool {
         *Q6K_AVX2_ENABLED.get_or_init(q6k_avx2_enabled_from_env)
     }
 }
+#[cfg(target_arch = "x86_64")]
 fn q6k_avx2_enabled_from_env() -> bool {
     matches!(
         env::var("CAMELID_X86_Q6K_AVX2").as_deref(),
