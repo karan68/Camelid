@@ -312,6 +312,8 @@ pub fn plan_for_model_with_platform(
                 );
             safe_q8_plan()
         }
+    } else if quant_type == "Q4_K_M" {
+        select_kquant_plan(&platform, &mut reasons)
     } else {
         reasons.push("non-validated row or quant; failing closed to safe path".into());
         (
@@ -766,6 +768,68 @@ fn cuda_resident_q8_plan() -> (
     )
 }
 
+/// Plan labels for a mixed K-quant (Q4_K_M = Q4_K + Q6_K) model. K-quant 2-D linears
+/// load WIRE-ONLY and are decoded either by the GPU-resident engine (`q4k_gemv`/
+/// `q6k_gemv`) when CUDA resident decode is driving this process, or by the CPU
+/// block-dot (`q4_k_dot_avx2` + `q6_k_wire_row_dot`) otherwise — neither materializes
+/// f32. Descriptive only (no env_updates): the actual route is chosen at runtime by
+/// `resident_decode_cuda_active()` + `q4_k_cpu_block_dot_enabled()`. This replaces the
+/// old `cpu_reference`/`dense_or_other` mislabel that reported a CPU fallback for a lane
+/// that actually runs GPU-resident (K-quant conductor disclosure fix). Greedy parity vs
+/// llama.cpp is recorded in the `*-q4_k_m-*-parity-*` evidence bundles.
+fn select_kquant_plan(
+    platform: &PlanPlatform,
+    reasons: &mut Vec<String>,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    if platform.cuda_resident_active {
+        reasons.push(
+            "CUDA resident decode active; GPU-resident K-quant engine (q4k_gemv/q6k_gemv) drives decode from wire-only Q4_K/Q6_K blocks"
+                .into(),
+        );
+        (
+            "cuda_resident_kquant_runtime",
+            "cuda_resident_kquant_wire",
+            "kquant_cuda_resident_prefill",
+            "resident_single_shot_prefill",
+            "kquant_cuda_resident_decode",
+            "kquant_cpu_block_dot_reference_path",
+        )
+    } else if crate::inference::q4_k_cpu_block_dot_enabled() {
+        reasons.push(
+            "CPU K-quant block-dot decode (Q4_K AVX2 + Q6_K 8-lane scalar) reads wire-only blocks; no f32 materialization"
+                .into(),
+        );
+        (
+            "cpu_kquant_block_dot",
+            "kquant_wire_block_dot",
+            "cpu_kquant_block_dot_prefill",
+            "always_retained_reference_path",
+            "kquant_cpu_block_dot_decode",
+            "kquant_cpu_block_dot_reference_path",
+        )
+    } else {
+        reasons.push(
+            "K-quant CPU block-dot disabled (CAMELID_X86_Q4K_DECODE=0) and no resident GPU; K-quant linears have no CPU consumer"
+                .into(),
+        );
+        (
+            "cpu_reference",
+            "safe_dense_or_q8_cpu",
+            "safe_cpu_prefill",
+            "always_retained_reference_path",
+            "safe_cpu_decode",
+            "safe_cpu_reference_path",
+        )
+    }
+}
+
 fn requested_profile() -> (ExecutionProfile, String) {
     match env::var("CAMELID_PROFILE").ok() {
         None => (ExecutionProfile::Auto, "profile=auto default".into()),
@@ -861,12 +925,15 @@ fn model_family(row: &str, gguf: &GgufFile) -> String {
 }
 
 fn quant_type(gguf: &GgufFile) -> String {
-    if gguf
-        .tensors
-        .iter()
-        .any(|tensor| tensor.tensor_type == GgufTensorType::Q8_0)
-    {
+    let has = |t: GgufTensorType| gguf.tensors.iter().any(|tensor| tensor.tensor_type == t);
+    if has(GgufTensorType::Q8_0) {
         "Q8_0".into()
+    } else if has(GgufTensorType::Q4K) || has(GgufTensorType::Q6K) {
+        // Mixed K-quant (Q4_K_M = Q4_K + Q6_K). Decoded by the GPU-resident engine
+        // (q4k_gemv/q6k_gemv) or, on CPU, the K-quant block-dot — both consume the
+        // wire-only blocks. Recognized here so the plan stops mislabeling it as the
+        // `dense_or_other` cpu_reference fallback (K-quant conductor disclosure fix).
+        "Q4_K_M".into()
     } else {
         "dense_or_other".into()
     }
@@ -1185,6 +1252,51 @@ mod tests {
             "always_retained_reference_path"
         );
         assert!(!outcome.env_updates.contains_key("CAMELID_MAC_Q8_REPACK"));
+        clear_profile_env();
+    }
+
+    #[test]
+    fn kquant_plan_labels_resident_and_cpu_block_dot_not_cpu_reference() {
+        // Disclosure fix: a Q4_K_M model must NOT be labeled the dense_or_other /
+        // cpu_reference fallback. quant_type is Q4_K_M, and the backend reflects the
+        // real lane: GPU-resident when CUDA drives decode, CPU block-dot otherwise,
+        // and only cpu_reference when the block-dot is explicitly disabled with no GPU.
+        let _guard = env_lock();
+        clear_profile_env();
+        env::remove_var("CAMELID_X86_Q4K_DECODE");
+        let mut gguf = fixture("Qwen3 4B Instruct Q4_K_M");
+        gguf.tensors[0].tensor_type = GgufTensorType::Q4K;
+        let path = PathBuf::from("/tmp/Qwen3-4B-Q4_K_M.gguf");
+
+        let cpu = plan_for_model_with_platform(
+            &path,
+            &gguf,
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(cpu.plan.quant_type, "Q4_K_M");
+        assert_eq!(cpu.plan.selected_backend, "cpu_kquant_block_dot");
+        assert_eq!(cpu.plan.decode_path, "kquant_cpu_block_dot_decode");
+
+        let gpu = plan_for_model_with_platform(
+            &path,
+            &gguf,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(gpu.plan.selected_backend, "cuda_resident_kquant_runtime");
+        assert_eq!(gpu.plan.decode_path, "kquant_cuda_resident_decode");
+        assert!(gpu.plan.cuda_resident_active);
+
+        env::set_var("CAMELID_X86_Q4K_DECODE", "0");
+        let off = plan_for_model_with_platform(
+            &path,
+            &gguf,
+            Some(8),
+            platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(off.plan.selected_backend, "cpu_reference");
+        env::remove_var("CAMELID_X86_Q4K_DECODE");
         clear_profile_env();
     }
 
