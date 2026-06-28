@@ -208,3 +208,47 @@ for a Linux/macOS session:
 
 **Phase 3 net on this host: prefetch landed (default-off, null); huge-pages deferred.** No default
 decode path changed; all output byte-identical.
+
+---
+
+## Phase 2 outcome (appended) — CPU K-quant decode: crash → default-on, certified
+
+Recon overturned the conductor's Phase-2 prior (S5 "no CPU K-quant arm"). The CPU K-quant
+block-dot **already existed and was wired** at the matmul chokepoint
+(`matmul_rhs_transposed_q4_k_block_dot` / `_q6_k_block_dot`, → `q4_k_block_dot_core` /
+`q6_k_block_dot_core`), behind `CAMELID_X86_Q4K_DECODE` — **default-off**. With it off, K-quant
+2-D linears load wire-only and the CPU linear path errors (`data_len=0`, no f32 fallback). So
+Phase 2 was **certify + promote**, not build:
+
+- **Q4_K decode already uses AVX2** (`q4_k_dot_arm` → `q4_k_dot_avx2`, bit-identical to scalar,
+  engaged since avx2 is detected). The conductor's "lift q4_k_dot_avx2" is already done.
+- **Q6_K decode uses the 8-lane scalar** `q6_k_wire_row_dot`. refmath has a `q6_k_dot_avx2`, but
+  it mirrors `q6_k_dot_scalar`'s **single-accumulator** f32 order, whereas the decode oracle uses
+  an **8-lane** order (`sums[8]`, `sums[l]+=d*aux32[l]` per superblock). I proved the 8-lane
+  order is the one that matches llama.cpp, so the existing AVX2 cannot be swapped in without
+  risking parity. **Q6_K AVX2 follow-up:** write an AVX2 kernel bit-identical to the *8-lane*
+  order, then wire it — this is the §2.2 trap exactly. Likely bandwidth-bound/null here.
+
+**Promotion:** `CAMELID_X86_Q4K_DECODE` flipped to **default-on** (opt out with `=0`). It fixes a
+hard crash, not a perf gamble; the GPU-resident lane never reaches this CPU chokepoint, so the
+GPU lane is unaffected. Verified: no-flag CPU decode now works; `=0` still errors (gate intact).
+
+**Certification** (`qa/evidence-bundles/qwen3-4b-q4_k_m-windows-cpu-kquant-decode-parity-20260628T015051Z-head-a86fb46b/`):
+camelid CPU K-quant decode token-AND-text-identical to llama.cpp `acd79d6` CPU on confident
+probes — `The capital of France is` and `def fibonacci(n):` to **depth 50**; `Q: 2+2` to depth 5
+then a benign f32 near-tie. Same bar as the GPU primary bundle.
+
+**Third finding (guard false-positive):** in serve CPU mode the f32 weight-materialization budget
+guard blocks K-quant block-dot models (estimates ~16 GB f32 materialization the wire-only path
+never does, because `binding_runs_on_resident_gpu` is false on CPU). Bypassed for the cert with
+`CAMELID_MAX_CPU_WEIGHT_MATERIALIZATION_BYTES`; `bench-generate` uses a different load path and is
+unaffected. Follow-up: treat K-quant linears as non-materializing when the block-dot is enabled.
+
+**Speed (honest):** camelid CPU K-quant decode ~6.5–7.0 tok/s vs llama.cpp Q4_K_M CPU tg128
+12.35 (~0.55×) — the known ~0.6× CPU tiled-GEMM gap; DRAM-bandwidth-bound, so the AVX2 Q4_K and a
+future Q6_K AVX2 are not expected to close it (cf. Phase 3 prefetch null, Q8 SIMD nulls).
+
+### Phase 2 follow-ups (scoped, not done)
+1. Q6_K AVX2 in the **8-lane order** + bit-identical test + wire into `q6_k_block_dot_core`.
+2. CPU weight-materialization guard: skip for K-quant linears when the block-dot is enabled.
+3. Linux/macOS greedy-parity confirmation of the now-default-on CPU K-quant path.

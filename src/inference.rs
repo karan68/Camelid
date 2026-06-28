@@ -15547,11 +15547,18 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// off (fail-closed): without it, Q4_K 2-D linears have no CPU consumer (their
 /// wire bytes are retained for the GPU resident path), so the gate cannot
 /// regress any working CPU behavior — it only adds one.
+/// CPU K-quant (Q4_K / Q6_K) decode block-dot. **DEFAULT-ON** (opt out with
+/// `CAMELID_X86_Q4K_DECODE=0`). K-quant 2-D linears load WIRE-ONLY (no f32 `data`)
+/// for the resident GPU engine; with this gate off the CPU linear path has no
+/// consumer for them and errors (`no-row-major-data`, data_len=0). The GPU-resident
+/// decode lane never reaches this chokepoint (it runs q4k_gemv/q6k_gemv on-GPU), so
+/// default-on changes ONLY CPU-mode K-quant decode — turning a hard error into
+/// parity-correct output (Q4_K via the AVX2 `q4_k_dot_arm`, Q6_K via the 8-lane
+/// `q6_k_wire_row_dot`). Windows greedy parity is proven vs llama.cpp acd79d6
+/// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
+/// documented follow-up.
 fn q4_k_cpu_block_dot_enabled() -> bool {
-    matches!(
-        std::env::var("CAMELID_X86_Q4K_DECODE").ok().as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes") | Some("enabled")
-    )
+    q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q4K_DECODE")
 }
 
 /// Streaming Q4_K linear: quantise each input row to Q8_K once, then dot it
