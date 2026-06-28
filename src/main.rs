@@ -424,6 +424,14 @@ enum Command {
         #[arg(long, default_value = "qa/agent-eval")]
         receipt_dir: PathBuf,
     },
+    /// Phase-1 Windows system-control gate: exercise run_windows_command +
+    /// inspect_system under the sandbox/approval contract and emit a sealed
+    /// receipt (PASS / FAIL / INCONCLUSIVE). Rung-1 — promotes nothing.
+    AgentSyscapEval {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-syscap")]
+        receipt_dir: PathBuf,
+    },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
         /// Mode to run: coordinator or worker
@@ -1093,6 +1101,10 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 receipt_dir,
             })?;
+            std::process::exit(code);
+        }
+        Command::AgentSyscapEval { receipt_dir } => {
+            let code = chat::run_agent_syscap_eval(chat::AgentSyscapOptions { receipt_dir })?;
             std::process::exit(code);
         }
         Command::ServeDistributed {

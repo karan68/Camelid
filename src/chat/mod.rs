@@ -16,6 +16,7 @@
 
 mod agent;
 mod agent_eval;
+mod agent_syscap;
 mod audit;
 mod banner;
 mod client;
@@ -31,6 +32,8 @@ mod theme;
 mod tool_parse;
 mod tools;
 mod tui;
+#[cfg(windows)]
+mod win_job;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -185,6 +188,20 @@ pub fn run_agent_eval(opts: AgentEvalOptions) -> anyhow::Result<i32> {
         load_timeout: opts.load_timeout,
         max_steps: opts.max_steps,
         max_tokens: opts.max_tokens,
+        receipt_dir: opts.receipt_dir,
+    })
+}
+
+/// Parsed `camelid agent-syscap-eval` flags.
+pub struct AgentSyscapOptions {
+    pub receipt_dir: PathBuf,
+}
+
+/// Entry for the `agent-syscap-eval` subcommand: the Phase-1 Windows
+/// system-control gate. Returns PASS(0) / FAIL(1) / INCONCLUSIVE(3) and emits a
+/// sealed `camelid.agent-syscap-receipt/v1`.
+pub fn run_agent_syscap_eval(opts: AgentSyscapOptions) -> anyhow::Result<i32> {
+    agent_syscap::run(agent_syscap::SyscapConfig {
         receipt_dir: opts.receipt_dir,
     })
 }

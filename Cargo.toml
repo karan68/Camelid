@@ -53,11 +53,15 @@ memmap2 = "0.9"
 # GetSystemInfo (page size) and GetProcessMemoryInfo (peak working set).
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_Power",
     "Win32_System_Registry",
+    # Kill-on-close Job Objects for process-tree teardown of agent-spawned
+    # PowerShell (and, later, subagent) processes — see src/chat/win_job.rs.
+    "Win32_System_JobObjects",
 ] }
 # Windows: CUDA is part of the DEFAULT build (the primary dev host is a CUDA box).
 # cudarc is non-optional here and `build.rs` turns on the `cuda` cfg, so a bare
