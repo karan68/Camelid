@@ -15863,8 +15863,8 @@ unsafe fn q6_k_wire_row_dot_avx2(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 
             let off = j * 16;
             let a16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(aptr.add(off) as *const __m128i));
             let q16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(qptr.add(off) as *const __m128i));
-            let prod = _mm256_mullo_epi16(a16, q16); // 16 i16 products (exact, fit i16)
-            // low 128 = products[0..8], high 128 = products[8..16]
+            // 16 i16 products (exact, fit i16); low 128 = products[0..8], high = [8..16]
+            let prod = _mm256_mullo_epi16(a16, q16);
             let pair = _mm_add_epi16(
                 _mm256_castsi256_si128(prod),
                 _mm256_extracti128_si256(prod, 1),
