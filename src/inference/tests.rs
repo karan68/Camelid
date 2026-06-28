@@ -11062,6 +11062,49 @@ fn q6_k_wire_dot_consistent_with_dequant() {
     );
 }
 
+/// Phase-2 follow-up parity gate: the opt-in AVX2 Q6_K row dot must be BIT-IDENTICAL
+/// to the 8-lane scalar oracle `q6_k_wire_row_dot` (not merely close) — it vectorizes
+/// only the associative integer dot and reproduces the same 8-lane f32 reduction. This
+/// is the proof obligation that lets `CAMELID_X86_Q6K_AVX2` ship without a parity risk.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn q6_k_wire_row_dot_avx2_bit_identical() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        eprintln!("skipping: avx2 not available");
+        return;
+    }
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    const WIRE: usize = super::Q6_K_WIRE_BYTES_PER_BLOCK;
+    for nblk in [1usize, 2, 5, 11] {
+        let mut wire = vec![0u8; nblk * WIRE];
+        for b in wire.iter_mut() {
+            *b = (next() & 0xff) as u8;
+        }
+        let mut blocks = Vec::with_capacity(nblk);
+        for _ in 0..nblk {
+            let mut qs = [0i8; 256];
+            for q in qs.iter_mut() {
+                *q = (next() & 0xff) as u8 as i8;
+            }
+            let d = (next() % 1000) as f32 / 333.0 + 0.001;
+            blocks.push(super::Q8KBlock { d, qs });
+        }
+        let s = super::q6_k_wire_row_dot(&wire, &blocks);
+        let v = unsafe { super::q6_k_wire_row_dot_avx2(&wire, &blocks) };
+        assert_eq!(
+            s.to_bits(),
+            v.to_bits(),
+            "q6_k 8-lane avx2 != scalar at nblk={nblk}: scalar={s} avx2={v}"
+        );
+    }
+}
+
 /// Q4_K: the wire-row dot must agree with an f64 dot of the tensor-layer
 /// dequant (`Q4KBlock::dequantize`, an independent implementation of the same
 /// format) against the dequantized Q8_K activations. The integer kernel and

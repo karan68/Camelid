@@ -248,7 +248,16 @@ unaffected. Follow-up: treat K-quant linears as non-materializing when the block
 12.35 (~0.55×) — the known ~0.6× CPU tiled-GEMM gap; DRAM-bandwidth-bound, so the AVX2 Q4_K and a
 future Q6_K AVX2 are not expected to close it (cf. Phase 3 prefetch null, Q8 SIMD nulls).
 
-### Phase 2 follow-ups (scoped, not done)
-1. Q6_K AVX2 in the **8-lane order** + bit-identical test + wire into `q6_k_block_dot_core`.
-2. CPU weight-materialization guard: skip for K-quant linears when the block-dot is enabled.
-3. Linux/macOS greedy-parity confirmation of the now-default-on CPU K-quant path.
+### Phase 2 follow-ups
+
+1. **Q6_K AVX2 in the 8-lane order — DONE, measured REGRESSION (default-off).** Wrote
+   `q6_k_wire_row_dot_avx2` reproducing the oracle's 8-lane f32 order exactly (vectorizes only
+   the associative integer `aux32[8]`; rebuild + f32 reduction identical), proven bit-for-bit by
+   `q6_k_wire_row_dot_avx2_bit_identical`, wired behind `CAMELID_X86_Q6K_AVX2` (default-off) via
+   `q6_k_wire_row_dot_simd`. Measured on this box: **byte-identical but −21% (6.34 → 5.00 tok/s)**
+   — the autovectorized scalar (x86-64-v3 + AVX-512 build) already beats the hand AVX2, and CPU
+   decode is bandwidth-bound (rebuild + weight reads dominate). Same pattern as the Q8 gated-SIMD
+   regression and the Phase-3 prefetch null. Stays default-off as a parity-proven regression
+   guard; receipt `docs/perf-deep-dive/PERF_RECEIPTS/same-host/kquant-phase2-q6k-avx2-llama-vs-scalar-20260628T022001Z.json`.
+2. CPU weight-materialization guard: skip for K-quant linears when the block-dot is enabled (still open).
+3. Linux/macOS greedy-parity confirmation of the now-default-on CPU K-quant path (still open).

@@ -15486,7 +15486,7 @@ fn accumulate_transposed_linear_row_q6_k(input_row: &[f32], wire: &[u8], output:
     let q8 = quantize_q8_k_blocks(input_row);
     output.par_iter_mut().enumerate().for_each(|(o, slot)| {
         let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-        *slot = q6_k_wire_row_dot(w_row, &q8);
+        *slot = q6_k_wire_row_dot_simd(w_row, &q8);
     });
 }
 
@@ -15530,7 +15530,7 @@ fn matmul_rhs_transposed_q6_k_block_dot(
             let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
             preps
                 .iter()
-                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .map(|q8| q6_k_wire_row_dot_simd(w_row, q8))
                 .collect()
         })
         .collect();
@@ -15673,7 +15673,7 @@ fn q6_k_block_dot_core(
             let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
             preps
                 .iter()
-                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .map(|q8| q6_k_wire_row_dot_simd(w_row, q8))
                 .collect()
         })
         .collect();
@@ -15769,6 +15769,116 @@ pub(crate) fn q6_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
                 aux32[l] += scale * (y.qs[off + 8 + l] as i32) * (a[off + 8 + l] as i32);
             }
         }
+        for l in 0..8 {
+            sums[l] += d * aux32[l] as f32;
+        }
+    }
+    sums.iter().sum()
+}
+
+/// K-quant conductor Phase 2 follow-up: opt-in AVX2 Q6_K row dot
+/// (`CAMELID_X86_Q6K_AVX2`, default-off). BIT-IDENTICAL to [`q6_k_wire_row_dot`]
+/// by construction — it vectorizes ONLY the associative integer `aux32[8]` and
+/// keeps the load-bearing 8-lane f32 reduction (`sums[l] += d * aux32[l]`, then
+/// the left-fold `sums.iter().sum()`) exactly as the scalar oracle. (The refmath
+/// `q6_k_dot_avx2` is NOT a substitute: it mirrors the single-accumulator
+/// `q6_k_dot_scalar` order, a different bit pattern.) Default-off until measured —
+/// CPU decode is bandwidth-bound on the dev box, so this is expected to be ~null.
+fn q6k_avx2_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q6k_avx2_enabled_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        static Q6K_AVX2_ENABLED: OnceLock<bool> = OnceLock::new();
+        *Q6K_AVX2_ENABLED.get_or_init(q6k_avx2_enabled_from_env)
+    }
+}
+fn q6k_avx2_enabled_from_env() -> bool {
+    matches!(
+        env::var("CAMELID_X86_Q6K_AVX2").as_deref(),
+        Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Dispatcher used by the Q6_K CPU decode block-dots: AVX2 when enabled+available,
+/// else the scalar oracle. Both produce identical bits.
+#[inline]
+fn q6_k_wire_row_dot_simd(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if q6k_avx2_enabled() && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 just confirmed present; the kernel is value-identical to
+            // q6_k_wire_row_dot (proven by q6_k_wire_row_dot_avx2_bit_identical).
+            return unsafe { q6_k_wire_row_dot_avx2(weight_wire, input) };
+        }
+    }
+    q6_k_wire_row_dot(weight_wire, input)
+}
+
+/// AVX2 sibling of [`q6_k_wire_row_dot`] — see `q6k_avx2_enabled` for the parity
+/// contract. Vectorizes the per-superblock integer dot into the oracle's 8
+/// position-lanes (`aux32[l]`), exact integers; the 6-bit rebuild and the f32
+/// reduction stay byte-for-byte identical to the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6_k_wire_row_dot_avx2(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+    const WIRE: usize = Q6_K_WIRE_BYTES_PER_BLOCK;
+    let mut sums = [0f32; 8];
+    for (i, y) in input.iter().enumerate() {
+        let base = i * WIRE;
+        let block = &weight_wire[base..base + WIRE];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]])) * y.d;
+
+        // Identical scalar rebuild of the 256 signed 6-bit weights.
+        let mut a = [0i8; Q6_K_VALUES_PER_BLOCK];
+        let (mut ql, mut qh, mut w) = (0usize, 128usize, 0usize);
+        for _ in 0..2 {
+            for l in 0..32 {
+                a[w + l] = (((block[ql + l] & 0xF) as i32 | (((block[qh + l] & 3) as i32) << 4))
+                    - 32) as i8;
+                a[w + l + 32] = (((block[ql + l + 32] & 0xF) as i32
+                    | ((((block[qh + l] >> 2) & 3) as i32) << 4))
+                    - 32) as i8;
+                a[w + l + 64] = (((block[ql + l] >> 4) as i32
+                    | ((((block[qh + l] >> 4) & 3) as i32) << 4))
+                    - 32) as i8;
+                a[w + l + 96] = (((block[ql + l + 32] >> 4) as i32
+                    | ((((block[qh + l] >> 6) & 3) as i32) << 4))
+                    - 32) as i8;
+            }
+            w += 128;
+            ql += 64;
+            qh += 32;
+        }
+
+        // aux32[l] = Σ_j scale_j · (q8[16j+l]·a[16j+l] + q8[16j+8+l]·a[16j+8+l]),
+        // l in 0..8, all exact integers (associative — SIMD lane order is free).
+        let mut acc = _mm256_setzero_si256();
+        let aptr = a.as_ptr();
+        let qptr = y.qs.as_ptr();
+        for j in 0..16 {
+            let off = j * 16;
+            let a16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(aptr.add(off) as *const __m128i));
+            let q16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(qptr.add(off) as *const __m128i));
+            let prod = _mm256_mullo_epi16(a16, q16); // 16 i16 products (exact, fit i16)
+            // low 128 = products[0..8], high 128 = products[8..16]
+            let pair = _mm_add_epi16(
+                _mm256_castsi256_si128(prod),
+                _mm256_extracti128_si256(prod, 1),
+            ); // 8 i16 = prod[l] + prod[l+8]
+            let scaled = _mm256_mullo_epi32(
+                _mm256_cvtepi16_epi32(pair),
+                _mm256_set1_epi32(block[192 + j] as i8 as i32),
+            );
+            acc = _mm256_add_epi32(acc, scaled);
+        }
+        let mut aux32 = [0i32; 8];
+        _mm256_storeu_si256(aux32.as_mut_ptr() as *mut __m256i, acc);
+
+        // Load-bearing 8-lane f32 reduction — identical to the scalar oracle.
         for l in 0..8 {
             sums[l] += d * aux32[l] as f32;
         }
