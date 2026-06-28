@@ -13464,6 +13464,7 @@ fn run_q8_0_unified_prefill_tiled(
     output: &mut [f32],
     use_avx2: bool,
     use_vnni: bool,
+    use_4x8: bool,
     groups_per_chunk: usize,
 ) {
     let output_width = packed_weight.rows;
@@ -13485,7 +13486,46 @@ fn run_q8_0_unified_prefill_tiled(
         let out = out;
         let og_start = chunk_idx * gpc;
         let og_end = ((chunk_idx + 1) * gpc).min(output_groups);
-        for og in og_start..og_end {
+        let mut og = og_start;
+        while og < og_end {
+            // v3: under VNNI, process TWO output groups per input load (4x8 tile) so each streamed
+            // input block serves 8 output lanes; fall back to a single 4x4 group for the odd tail.
+            if use_4x8 && og + 1 < og_end {
+                let weight_a =
+                    &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
+                let weight_b =
+                    &packed_weight.blocks[(og + 1) * blocks_per_row..(og + 2) * blocks_per_row];
+                let col_a = og * 4;
+                let col_b = (og + 1) * 4;
+                for ig in 0..input_groups {
+                    let input_blocks =
+                        &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
+                    let mut sums_a = [[0.0_f32; 4]; 4];
+                    let mut sums_b = [[0.0_f32; 4]; 4];
+                    for ((input_block, wa), wb) in input_blocks.iter().zip(weight_a).zip(weight_b) {
+                        q8_0_unified_accumulate_pair(input_block, wa, wb, &mut sums_a, &mut sums_b);
+                    }
+                    for ir in 0..4 {
+                        let row = ig * 4 + ir;
+                        // SAFETY: cols [col_a..+4] and [col_b..+4] are unique to this (og, ig, ir);
+                        // og bands are disjoint across tasks, so these writes never race.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                sums_a[ir].as_ptr(),
+                                out.0.add(row * output_width + col_a),
+                                4,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                sums_b[ir].as_ptr(),
+                                out.0.add(row * output_width + col_b),
+                                4,
+                            );
+                        }
+                    }
+                }
+                og += 2;
+                continue;
+            }
             let weight_group =
                 &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
             let col = og * 4;
@@ -13514,6 +13554,7 @@ fn run_q8_0_unified_prefill_tiled(
                     }
                 }
             }
+            og += 1;
         }
     });
 }
@@ -13615,6 +13656,114 @@ unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(
     }
 }
 
+/// 4x8 dispatcher (v3): accumulate ONE input group against TWO weight groups, sharing the input
+/// load (VNNI only — wider AVX-512 register tile). Byte-identical to two independent 4x4 groups.
+/// On non-x86 this is never reached at runtime (use_vnni is always false) but must still compile.
+#[inline(always)]
+fn q8_0_unified_accumulate_pair(
+    input_block: &Q8_0PackedRows4Block,
+    weight_a: &Q8_0PackedRows4Block,
+    weight_b: &Q8_0PackedRows4Block,
+    sums_a: &mut [[f32; 4]; 4],
+    sums_b: &mut [[f32; 4]; 4],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: only called from the use_vnni branch, which requires avx512f/bw/vnni.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
+                input_block,
+                weight_a,
+                weight_b,
+                sums_a,
+                sums_b,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_a, sums_a, false);
+        q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_b, sums_b, false);
+    }
+}
+
+/// 4x8 VNNI microkernel (v3): one input group x TWO weight groups (8 output lanes). The input is
+/// loaded ONCE per (chunk-pair, lane) and dpbusd'd against both weight bands, so each streamed
+/// input block serves 8 output lanes instead of 4 (cuts input traffic, raises arithmetic
+/// intensity). Each cell is computed identically to the 4x4 path -> byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
+    input_block: &Q8_0PackedRows4Block,
+    weight_a: &Q8_0PackedRows4Block,
+    weight_b: &Q8_0PackedRows4Block,
+    sums_a: &mut [[f32; 4]; 4],
+    sums_b: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm512_abs_epi8, _mm512_cmplt_epi8_mask, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_mask_mov_epi8, _mm512_set_epi64, _mm512_setzero_si512, _mm512_storeu_si512,
+        _mm512_sub_epi8,
+    };
+    let iq = input_block.quants.as_ptr();
+    let wqa = weight_a.quants.as_ptr();
+    let wqb = weight_b.quants.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc_a = [zero; 4];
+    let mut acc_b = [zero; 4];
+    for pair in 0..2usize {
+        let chunk = pair * 2;
+        let wa = unsafe { _mm512_loadu_si512(wqa.add(chunk * 32).cast()) };
+        let abs_a = _mm512_abs_epi8(wa);
+        let neg_a = _mm512_cmplt_epi8_mask(wa, zero);
+        let wb = unsafe { _mm512_loadu_si512(wqb.add(chunk * 32).cast()) };
+        let abs_b = _mm512_abs_epi8(wb);
+        let neg_b = _mm512_cmplt_epi8_mask(wb, zero);
+        for lane in 0..4usize {
+            let low =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let high = unsafe {
+                std::ptr::read_unaligned(iq.add((chunk + 1) * 32 + lane * 8).cast::<i64>())
+            };
+            let input64 = _mm512_set_epi64(high, high, high, high, low, low, low, low);
+            let neg_input = _mm512_sub_epi8(zero, input64);
+            let si_a = _mm512_mask_mov_epi8(input64, neg_a, neg_input);
+            acc_a[lane] = _mm512_dpbusd_epi32(acc_a[lane], abs_a, si_a);
+            let si_b = _mm512_mask_mov_epi8(input64, neg_b, neg_input);
+            acc_b[lane] = _mm512_dpbusd_epi32(acc_b[lane], abs_b, si_b);
+        }
+    }
+    for (lane, acc_lane) in acc_a.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums_a[lane][output_lane] += *dot as f32 * weight_a.scales[output_lane] * input_scale;
+        }
+    }
+    for (lane, acc_lane) in acc_b.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums_b[lane][output_lane] += *dot as f32 * weight_b.scales[output_lane] * input_scale;
+        }
+    }
+}
+
 /// Projection wrapper: quantize+pack the activation ONCE (persistent thread-local scratch),
 /// run the unified tiled kernel over the 4-aligned rows, and finish any ragged tail (rows % 4)
 /// through the same per-row scalar path the default lane uses.
@@ -13625,6 +13774,7 @@ fn q8_0_unified_prefill_projection(
     name: &str,
     use_avx2: bool,
     use_vnni: bool,
+    use_4x8: bool,
     schedule: Q8PackedRows4MatmulSchedule,
 ) -> Result<CpuTensor> {
     let rows = input.dim(0)?;
@@ -13668,6 +13818,7 @@ fn q8_0_unified_prefill_projection(
             &mut output[..packed_rows * output_width],
             use_avx2,
             use_vnni,
+            use_4x8,
             schedule.groups_per_chunk,
         );
         // Retain scratch capacity for the next projection (persistent thread-local); do NOT cap
@@ -13752,6 +13903,7 @@ fn try_q8_matmul_owner_prefill(
         return Ok(None);
     }
     let use_vnni = runtime_plan.q8.q8_matmul_owner_vnni && q8_owner_avx512vnni_available();
+    let use_4x8 = use_vnni && runtime_plan.q8.q8_matmul_owner_4x8;
     let output = q8_0_unified_prefill_projection(
         input,
         packed,
@@ -13759,6 +13911,7 @@ fn try_q8_matmul_owner_prefill(
         name,
         runtime_plan.q8.q8_matmul_owner_avx2,
         use_vnni,
+        use_4x8,
         runtime_plan.q8_packed_rows4_matmul_schedule,
     )?;
     Ok(Some(output))

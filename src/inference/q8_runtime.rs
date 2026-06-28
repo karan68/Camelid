@@ -89,6 +89,11 @@ pub(super) struct Q8RuntimeFlags {
     /// llama's tinyBLAS compute technique). Defaults ON; gated by runtime feature detection at
     /// dispatch. Set `CAMELID_X86_Q8_MATMUL_OWNER_VNNI=0` to force the AVX2 microkernel (v1).
     pub(super) q8_matmul_owner_vnni: bool,
+    /// Use the wider 4x8 VNNI tile (v3): two output groups per input load. Defaults OFF — measured
+    /// NEUTRAL within noise on the i7-11800H (a ~3% effect drowned by ±10% thermal variance after a
+    /// long bench session). Kept as opt-in (`CAMELID_X86_Q8_MATMUL_OWNER_4X8=1`) for a thermally
+    /// stable host to re-evaluate. When off, the owner uses the proven 4x4 VNNI tile (v2).
+    pub(super) q8_matmul_owner_4x8: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,6 +231,9 @@ impl Q8RuntimeFlags {
             ),
             q8_matmul_owner_vnni: q8_0_env_flag_enabled_default_on_fail_closed(
                 "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
+            ),
+            q8_matmul_owner_4x8: q8_0_env_flag_enabled_default_off(
+                "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
             ),
         }
     }

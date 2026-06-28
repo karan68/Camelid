@@ -1888,6 +1888,7 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
             q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -2800,6 +2801,7 @@ fn q8_attention_consumer_plan(
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
             q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3818,6 +3820,7 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
             q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3872,6 +3875,7 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
             q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3930,6 +3934,7 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             q8_matmul_owner: Q8MatmulOwnerScope::Off,
             q8_matmul_owner_avx2: false,
             q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -5325,16 +5330,18 @@ fn q8_unified_owner_prefill_is_bit_identical_to_packed_matmul() {
     let input_width = packed_weight.dim(0).unwrap();
     let output_width = packed_weight.dim(1).unwrap();
 
-    // Test BOTH owner microkernels: v1 AVX2 (vnni="0") and v2 AVX-512 VNNI (vnni="1", which falls
-    // back to AVX2 if the CPU lacks avx512vnni). Each must be byte-identical to the baseline.
-    for vnni in ["0", "1"] {
+    // Test ALL THREE owner microkernels: AVX2 (v1), 4x4 VNNI (v2), 4x8 VNNI (v3). Each falls back
+    // gracefully if the CPU lacks avx512vnni, and each must be byte-identical to the baseline.
+    for (vnni, x8) in [("0", "0"), ("1", "0"), ("1", "1")] {
         std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER", "all");
         std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2", "on");
         std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", vnni);
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_4X8", x8);
         let owner_plan = ResolvedRuntimePlan::from_env().unwrap();
         std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER");
         std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2");
         std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_VNNI");
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_4X8");
 
         // Sweep row counts: 4/8 = exact tile groups, 5/13 = ragged tail, and a couple of roles to
         // prove the dispatch is role-agnostic under scope=All.
@@ -5376,7 +5383,7 @@ fn q8_unified_owner_prefill_is_bit_identical_to_packed_matmul() {
                     assert_eq!(
                     a.to_bits(),
                     b.to_bits(),
-                    "owner vs packed-matmul bit mismatch at vnni={vnni} role={role} rows={rows} idx={idx}: {a} vs {b}"
+                    "owner vs packed-matmul bit mismatch at vnni={vnni} x8={x8} role={role} rows={rows} idx={idx}: {a} vs {b}"
                 );
                 }
             }
