@@ -151,5 +151,19 @@ so GPU-vs-GPU is blocked; Qwen3-4B-Q8_0 isn't on disk, so same-model Q8-vs-Q4 is
 
 `SUPPORT_MATRIX_v0.1.md` + `COMPATIBILITY.md`: added the `Qwen3-4B-Q4_K_M` row as
 GPU-resident-parity-certified exact-row smoke with the caveats above and the bundle cited
-(runtime support-contract recognition marked PENDING pending the disclosure fix). The
-Llama-3.2-3B-Q4_K_M (primary) row remains unstarted — GGUF still needs download.
+(runtime support-contract recognition marked PENDING pending the disclosure fix).
+
+### Primary — Llama-3.2-3B-Q4_K_M CERTIFIED (confident-probe bar)
+
+Downloaded (SHA `6c1a2b41…`, bartowski GGUF), mix = 168 Q4_K + 29 Q6_K (attn_v / ffn_down /
+tied lm_head Q6_K, tied embeddings). GPU-resident CUDA decode (28/28 layers, 26.60 tok/s, 4.51
+GB) is token-AND-text-identical to llama.cpp `acd79d6` on **5/8 confident probes at 1/5/50** —
+including code completion and a ~3.5k-token long-context lighthouse-logbook continuation, both to
+depth 50. 3 open-ended probes diverge at a benign greedy f32 near-tie (JSON token-0 measured at a
+0.18-logprob fence-vs-brace gap; process/thread @26; thunderstorm @38), coherent output — the
+same documented frontier as the Q8_0 near-tie probes. Certified via a template-agnostic
+raw-prompt harness (`scripts/raw-decode-parity.mjs`) to sidestep the f32-diagnostic prompt-token
+path + Llama-3 BOS/template edge cases; this is a direct decode-kernel proof. Bundle:
+`qa/evidence-bundles/llama-3.2-3b-q4_k_m-windows-cuda-resident-parity-20260628T004547Z-head-bb3c3528/`.
+Same disclosure gap as the secondary. Both Phase-1 rows promoted in `SUPPORT_MATRIX_v0.1.md` +
+`COMPATIBILITY.md`.
