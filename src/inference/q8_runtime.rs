@@ -5,6 +5,45 @@ use crate::Result;
 
 pub(super) const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK_DEFAULT: usize = 8;
 
+/// Lane 1 — scope of the unified tiled Q8_0 PREFILL GEMM owner. `Off` is the shipping
+/// default. The owner is a bit-exact, role-agnostic drop-in for the per-projection prefill
+/// block-dot: it reuses the proven 4x4 register microkernel but flips the loop nest so each
+/// weight band stays L1/L2-resident while every input row streams against it (the
+/// arithmetic-intensity fix for the bandwidth-bound host). Promotion to a non-`Off` default
+/// requires a measured both-host prefill win (Windows + Ubuntu) per the benchmark treaty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Q8MatmulOwnerScope {
+    Off,
+    FfnDown,
+    All,
+}
+
+impl Q8MatmulOwnerScope {
+    fn from_env() -> Self {
+        match env::var("CAMELID_X86_Q8_MATMUL_OWNER") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "all" | "on" | "1" | "true" | "enabled" | "yes" => Self::All,
+                "ffn_down" | "ffn-down" | "ffndown" => Self::FfnDown,
+                _ => Self::Off,
+            },
+            Err(_) => Self::Off,
+        }
+    }
+
+    pub(super) fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// Does the owner cover this rectangular role under the active scope?
+    pub(super) fn covers_role(self, role: &str) -> bool {
+        match self {
+            Self::Off => false,
+            Self::FfnDown => role == "ffn_down",
+            Self::All => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Q8RuntimeFlags {
     pub(super) block_dot: bool,
@@ -41,6 +80,20 @@ pub(super) struct Q8RuntimeFlags {
     pub(super) hybrid_retained: bool,
     pub(super) hybrid_gpu_rows: Option<usize>,
     pub(super) hybrid_gpu_percent: usize,
+    /// Lane 1: unified tiled Q8_0 prefill GEMM owner scope (default `Off`).
+    pub(super) q8_matmul_owner: Q8MatmulOwnerScope,
+    /// Use the AVX2 4x4 microkernel inside the owner. Defaults ON whenever the owner is on
+    /// (avoids the GEMM4 split-flag trap where prefill-on-but-avx2-off ran the slow scalar 4x4).
+    pub(super) q8_matmul_owner_avx2: bool,
+    /// Use the AVX-512 VNNI (dpbusd) microkernel inside the owner when the CPU supports it (v2,
+    /// llama's tinyBLAS compute technique). Defaults ON; gated by runtime feature detection at
+    /// dispatch. Set `CAMELID_X86_Q8_MATMUL_OWNER_VNNI=0` to force the AVX2 microkernel (v1).
+    pub(super) q8_matmul_owner_vnni: bool,
+    /// Use the wider 4x8 VNNI tile (v3): two output groups per input load. Defaults ON — the
+    /// hardened in-process paired sweep (`camelid bench-owner-sweep`) shows a SIGNIFICANT +3.3% (3B)
+    /// / +3.8% (4B) over the 4x4 tile, 7-8/8 rounds, CI excludes 1.0 (the earlier "null" was
+    /// cross-invocation thermal noise, not a real tie). Set `..._4X8=0` to force the 4x4 tile (v2).
+    pub(super) q8_matmul_owner_4x8: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +225,16 @@ impl Q8RuntimeFlags {
                 .filter(|value| *value > 0)
                 .unwrap_or(10)
                 .min(90),
+            q8_matmul_owner: Q8MatmulOwnerScope::from_env(),
+            q8_matmul_owner_avx2: q8_0_env_flag_enabled_default_on_fail_closed(
+                "CAMELID_X86_Q8_MATMUL_OWNER_AVX2",
+            ),
+            q8_matmul_owner_vnni: q8_0_env_flag_enabled_default_on_fail_closed(
+                "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
+            ),
+            q8_matmul_owner_4x8: q8_0_env_flag_enabled_default_on_fail_closed(
+                "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
+            ),
         }
     }
 
@@ -206,7 +269,7 @@ impl Default for Q8PackedRows4MatmulSchedule {
 
 impl Q8PackedRows4MatmulSchedule {
     pub(super) fn from_q8_flags(q8: Q8RuntimeFlags) -> Self {
-        if !q8.any_packed_rows4_matmul_enabled() {
+        if !q8.any_packed_rows4_matmul_enabled() && !q8.q8_matmul_owner.is_on() {
             return Self::default();
         }
         Self {

@@ -59,7 +59,7 @@ pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, Ll
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_enabled_default_off, q8_0_env_flag_enabled_default_on_fail_closed,
-    Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
+    Q8MatmulOwnerScope, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
 // All remaining callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so
 // this import is unused on other targets.
@@ -6849,6 +6849,14 @@ fn linear_for_role_runtime_with_plan(
         linear_for_role(input, weight, name, rectangular_role)
     } else {
         let name = name.into();
+        // Lane 1: unified tiled Q8_0 prefill GEMM owner (default-off). Role-agnostic — covers
+        // every Q8_0 projection (q/k/v/o, gate/up, ffn_down) in ONE place. Returns None for
+        // decode, non-Q8, or non-PackedRows4 weights, so the default path is unchanged when off.
+        if let Some(output) =
+            try_q8_matmul_owner_prefill(input, weight, &name, rectangular_role, runtime_plan)?
+        {
+            return Ok(output);
+        }
         if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
             input,
             weight,
@@ -13423,6 +13431,490 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
                 },
             );
     }
+}
+
+// ===== Lane 1: unified tiled Q8_0 PREFILL GEMM owner =====
+//
+// A role-agnostic, BIT-EXACT drop-in for the per-projection prefill block-dot. It reuses the
+// proven 4x4 register microkernel `q8_0_packed_rows4_gemm4_accumulate_block` VERBATIM, so every
+// output cell still accumulates `((int as f32) * weight_scale) * input_scale` over ascending
+// blocks with no FMA — byte-identical to the scalar oracle. The ONLY difference vs the (default-
+// off, regressing) ffn_down GEMM4 lane is the loop nest: it parallelizes over OUTPUT-row bands
+// and streams every input group against an L1/L2-resident weight band, so each weight block is
+// read from DRAM ~once instead of once per 4-row input group — the arithmetic-intensity fix for
+// the bandwidth-bound host. Tiling reorders only which cells co-compute, never the per-cell
+// arithmetic sequence, so the result is byte-identical to row-at-a-time for any band size.
+
+/// Raw output pointer shared across rayon tasks. SAFETY: each task writes a DISJOINT set of
+/// (output_row, output_channel) cells — output-group bands are partitioned across tasks and each
+/// task owns its channel range [og*4, og*4+4) exclusively — so no two tasks ever touch the same
+/// cell despite the shared base pointer.
+#[derive(Clone, Copy)]
+struct Q8UnifiedOutPtr(*mut f32);
+// SAFETY: see the disjoint-write invariant on `Q8UnifiedOutPtr`.
+unsafe impl Send for Q8UnifiedOutPtr {}
+unsafe impl Sync for Q8UnifiedOutPtr {}
+
+/// Core unified tiled kernel. `output` is the 4-row-aligned region [packed_rows, output_width],
+/// row-major; `packed_rows == input_groups * 4`. Bit-identical to the per-row scalar oracle.
+fn run_q8_0_unified_prefill_tiled(
+    packed_weight: &Q8_0PackedRows4,
+    packed_inputs: &[Q8_0PackedRows4Block],
+    input_groups: usize,
+    output: &mut [f32],
+    use_avx2: bool,
+    use_vnni: bool,
+    use_4x8: bool,
+    groups_per_chunk: usize,
+) {
+    let output_width = packed_weight.rows;
+    let blocks_per_row = packed_weight.blocks_per_row;
+    debug_assert_eq!(packed_inputs.len(), input_groups * blocks_per_row);
+    debug_assert_eq!(output.len(), input_groups * 4 * output_width);
+    let output_groups = output_width / 4;
+    if output_groups == 0 || input_groups == 0 {
+        return;
+    }
+    let gpc = groups_per_chunk.max(1);
+    let num_chunks = output_groups.div_ceil(gpc);
+    let out = Q8UnifiedOutPtr(output.as_mut_ptr());
+    // Parallelize over chunks of output-row groups. Each chunk keeps its weight band resident
+    // (read once) and sweeps ALL input groups against it.
+    (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
+        // Capture the whole wrapper (Copy + Send + Sync), not the bare `*mut f32` field — Rust
+        // 2021 disjoint closure capture would otherwise grab `out.0` and reject the raw pointer.
+        let out = out;
+        let og_start = chunk_idx * gpc;
+        let og_end = ((chunk_idx + 1) * gpc).min(output_groups);
+        let mut og = og_start;
+        while og < og_end {
+            // v3: under VNNI, process TWO output groups per input load (4x8 tile) so each streamed
+            // input block serves 8 output lanes; fall back to a single 4x4 group for the odd tail.
+            if use_4x8 && og + 1 < og_end {
+                let weight_a =
+                    &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
+                let weight_b =
+                    &packed_weight.blocks[(og + 1) * blocks_per_row..(og + 2) * blocks_per_row];
+                let col_a = og * 4;
+                let col_b = (og + 1) * 4;
+                for ig in 0..input_groups {
+                    let input_blocks =
+                        &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
+                    let mut sums_a = [[0.0_f32; 4]; 4];
+                    let mut sums_b = [[0.0_f32; 4]; 4];
+                    for ((input_block, wa), wb) in input_blocks.iter().zip(weight_a).zip(weight_b) {
+                        q8_0_unified_accumulate_pair(input_block, wa, wb, &mut sums_a, &mut sums_b);
+                    }
+                    for ir in 0..4 {
+                        let row = ig * 4 + ir;
+                        // SAFETY: cols [col_a..+4] and [col_b..+4] are unique to this (og, ig, ir);
+                        // og bands are disjoint across tasks, so these writes never race.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                sums_a[ir].as_ptr(),
+                                out.0.add(row * output_width + col_a),
+                                4,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                sums_b[ir].as_ptr(),
+                                out.0.add(row * output_width + col_b),
+                                4,
+                            );
+                        }
+                    }
+                }
+                og += 2;
+                continue;
+            }
+            let weight_group =
+                &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
+            let col = og * 4;
+            for ig in 0..input_groups {
+                let input_blocks = &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
+                let mut sums = [[0.0_f32; 4]; 4];
+                for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
+                    q8_0_unified_accumulate(
+                        input_block,
+                        weight_block,
+                        &mut sums,
+                        use_avx2,
+                        use_vnni,
+                    );
+                }
+                for (ir, row_sums) in sums.iter().enumerate() {
+                    let row = ig * 4 + ir;
+                    // SAFETY: cell (row, col..col+4) is unique to this (og, ig, ir); og bands are
+                    // disjoint across tasks, so this write never races another task.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row_sums.as_ptr(),
+                            out.0.add(row * output_width + col),
+                            4,
+                        );
+                    }
+                }
+            }
+            og += 1;
+        }
+    });
+}
+
+/// Whether the AVX-512 VNNI owner microkernel can run on this CPU.
+#[cfg(target_arch = "x86_64")]
+fn q8_owner_avx512vnni_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn q8_owner_avx512vnni_available() -> bool {
+    false
+}
+
+/// Per-block 4x4 accumulate for the unified owner: AVX-512 VNNI when available (v2), else the
+/// AVX2/scalar microkernel (v1). All three produce a bit-identical i32 dot (integer, order-free),
+/// so the f32 result is byte-identical regardless of which runs.
+#[inline(always)]
+fn q8_0_unified_accumulate(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+    use_avx2: bool,
+    use_vnni: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if use_vnni {
+        // SAFETY: the owner dispatch sets use_vnni only when avx512f/bw/vnni are detected.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(input_block, weight_block, sums);
+        }
+        return;
+    }
+    let _ = use_vnni;
+    q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_block, sums, use_avx2);
+}
+
+/// Bit-exact AVX-512 VNNI 4x4 microkernel for the unified prefill owner. Mirrors the AVX2
+/// `q8_0_packed_rows4_gemm4_accumulate_block_avx2` but replaces maddubs+madd+hadd with a single
+/// `dpbusd` per (chunk-pair, input-lane); the weight band (64 bytes = 2 chunks) is loaded ONCE per
+/// pair and reused across the 4 input lanes. The integer dot is identical to the scalar reference
+/// (associative i32, no overflow for Q8), and the per-block f32 scale order is the same
+/// `((int as f32) * weight_scale) * input_scale` with no FMA, so the output is byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm512_abs_epi8, _mm512_cmplt_epi8_mask, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_mask_mov_epi8, _mm512_set_epi64, _mm512_setzero_si512, _mm512_storeu_si512,
+        _mm512_sub_epi8,
+    };
+    let wq = weight_block.quants.as_ptr();
+    let iq = input_block.quants.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc = [zero; 4];
+    // Two pairs of chunks: pair p covers chunks 2p, 2p+1 = 64 weight bytes (one 512-bit load),
+    // reused across all 4 input lanes.
+    for pair in 0..2usize {
+        let chunk = pair * 2;
+        let weight64 = unsafe { _mm512_loadu_si512(wq.add(chunk * 32).cast()) };
+        let abs_weight = _mm512_abs_epi8(weight64);
+        let neg_weight_mask = _mm512_cmplt_epi8_mask(weight64, zero);
+        for (lane, acc_lane) in acc.iter_mut().enumerate() {
+            // input lane `lane`'s 8 K-values for chunk and chunk+1, broadcast to align with the
+            // 4-output-lane weight layout: [low x4 (chunk) | high x4 (chunk+1)].
+            let low =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let high = unsafe {
+                std::ptr::read_unaligned(iq.add((chunk + 1) * 32 + lane * 8).cast::<i64>())
+            };
+            let input64 = _mm512_set_epi64(high, high, high, high, low, low, low, low);
+            // dpbusd needs an UNSIGNED first operand: use abs(weight) and fold the weight sign into
+            // the (signed) input. Mirrors llama.cpp's Q8 VNNI strategy.
+            let neg_input = _mm512_sub_epi8(zero, input64);
+            let signed_input = _mm512_mask_mov_epi8(input64, neg_weight_mask, neg_input);
+            *acc_lane = _mm512_dpbusd_epi32(*acc_lane, abs_weight, signed_input);
+        }
+    }
+    for (lane, acc_lane) in acc.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums[lane][output_lane] += *dot as f32 * weight_block.scales[output_lane] * input_scale;
+        }
+    }
+}
+
+/// 4x8 dispatcher (v3): accumulate ONE input group against TWO weight groups, sharing the input
+/// load (VNNI only — wider AVX-512 register tile). Byte-identical to two independent 4x4 groups.
+/// On non-x86 this is never reached at runtime (use_vnni is always false) but must still compile.
+#[inline(always)]
+fn q8_0_unified_accumulate_pair(
+    input_block: &Q8_0PackedRows4Block,
+    weight_a: &Q8_0PackedRows4Block,
+    weight_b: &Q8_0PackedRows4Block,
+    sums_a: &mut [[f32; 4]; 4],
+    sums_b: &mut [[f32; 4]; 4],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: only called from the use_vnni branch, which requires avx512f/bw/vnni.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
+                input_block,
+                weight_a,
+                weight_b,
+                sums_a,
+                sums_b,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_a, sums_a, false);
+        q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_b, sums_b, false);
+    }
+}
+
+/// 4x8 VNNI microkernel (v3): one input group x TWO weight groups (8 output lanes). The input is
+/// loaded ONCE per (chunk-pair, lane) and dpbusd'd against both weight bands, so each streamed
+/// input block serves 8 output lanes instead of 4 (cuts input traffic, raises arithmetic
+/// intensity). Each cell is computed identically to the 4x4 path -> byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
+    input_block: &Q8_0PackedRows4Block,
+    weight_a: &Q8_0PackedRows4Block,
+    weight_b: &Q8_0PackedRows4Block,
+    sums_a: &mut [[f32; 4]; 4],
+    sums_b: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm512_abs_epi8, _mm512_cmplt_epi8_mask, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_mask_mov_epi8, _mm512_set_epi64, _mm512_setzero_si512, _mm512_storeu_si512,
+        _mm512_sub_epi8,
+    };
+    let iq = input_block.quants.as_ptr();
+    let wqa = weight_a.quants.as_ptr();
+    let wqb = weight_b.quants.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc_a = [zero; 4];
+    let mut acc_b = [zero; 4];
+    for pair in 0..2usize {
+        let chunk = pair * 2;
+        let wa = unsafe { _mm512_loadu_si512(wqa.add(chunk * 32).cast()) };
+        let abs_a = _mm512_abs_epi8(wa);
+        let neg_a = _mm512_cmplt_epi8_mask(wa, zero);
+        let wb = unsafe { _mm512_loadu_si512(wqb.add(chunk * 32).cast()) };
+        let abs_b = _mm512_abs_epi8(wb);
+        let neg_b = _mm512_cmplt_epi8_mask(wb, zero);
+        for lane in 0..4usize {
+            let low =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let high = unsafe {
+                std::ptr::read_unaligned(iq.add((chunk + 1) * 32 + lane * 8).cast::<i64>())
+            };
+            let input64 = _mm512_set_epi64(high, high, high, high, low, low, low, low);
+            let neg_input = _mm512_sub_epi8(zero, input64);
+            let si_a = _mm512_mask_mov_epi8(input64, neg_a, neg_input);
+            acc_a[lane] = _mm512_dpbusd_epi32(acc_a[lane], abs_a, si_a);
+            let si_b = _mm512_mask_mov_epi8(input64, neg_b, neg_input);
+            acc_b[lane] = _mm512_dpbusd_epi32(acc_b[lane], abs_b, si_b);
+        }
+    }
+    for (lane, acc_lane) in acc_a.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums_a[lane][output_lane] += *dot as f32 * weight_a.scales[output_lane] * input_scale;
+        }
+    }
+    for (lane, acc_lane) in acc_b.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums_b[lane][output_lane] += *dot as f32 * weight_b.scales[output_lane] * input_scale;
+        }
+    }
+}
+
+/// Projection wrapper: quantize+pack the activation ONCE (persistent thread-local scratch),
+/// run the unified tiled kernel over the 4-aligned rows, and finish any ragged tail (rows % 4)
+/// through the same per-row scalar path the default lane uses.
+fn q8_0_unified_prefill_projection(
+    input: &CpuTensor,
+    packed: &Q8_0PackedRows4,
+    output_width: usize,
+    name: &str,
+    use_avx2: bool,
+    use_vnni: bool,
+    use_4x8: bool,
+    schedule: Q8PackedRows4MatmulSchedule,
+) -> Result<CpuTensor> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    if blocks_per_row != packed.blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 unified prefill expected {} input blocks per row, got {blocks_per_row}",
+            packed.blocks_per_row
+        )));
+    }
+    if packed.interleave != Q8_0PackedRows4Interleave::I8 || packed.rows != output_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 unified prefill requires matching I8 packed output, got interleave {:?}, packed rows {}, output {}",
+            packed.interleave, packed.rows, output_width
+        )));
+    }
+    q8_0_packed_rows4_output_groups(output_width, "unified prefill projection")?;
+
+    let packed_rows = rows / 4 * 4;
+    if packed_rows == 0 {
+        return q8_0_packed_rows4_matmul_projection(input, packed, output_width, name, schedule);
+    }
+
+    let mut output = vec![0.0_f32; rows * output_width];
+    Q8_0_PREFILL_PACKED_INPUTS.with(|cell| {
+        let mut packed_inputs = cell.borrow_mut();
+        packed_inputs.clear();
+        quantize_pack_q8_0_rows4_i8_direct_into(
+            &input.data[..packed_rows * input_width],
+            packed_rows,
+            input_width,
+            blocks_per_row,
+            &mut packed_inputs,
+        );
+        let input_groups = packed_rows / 4;
+        run_q8_0_unified_prefill_tiled(
+            packed,
+            &packed_inputs,
+            input_groups,
+            &mut output[..packed_rows * output_width],
+            use_avx2,
+            use_vnni,
+            use_4x8,
+            schedule.groups_per_chunk,
+        );
+        // Retain scratch capacity for the next projection (persistent thread-local); do NOT cap
+        // to zero, which would re-allocate the packed-input buffer on every call.
+        packed_inputs.clear();
+    });
+
+    let tail_rows = rows - packed_rows;
+    if tail_rows > 0 {
+        with_q8_0_file_reader_quantized_inputs(|quantized_inputs| {
+            quantized_inputs.clear();
+            quantized_inputs.reserve(tail_rows * blocks_per_row);
+            for row in input.data[packed_rows * input_width..].chunks_exact(input_width) {
+                quantize_q8_0_blocks_into(row, quantized_inputs);
+            }
+            for tail_row in 0..tail_rows {
+                let input_start = tail_row * blocks_per_row;
+                let output_start = (packed_rows + tail_row) * output_width;
+                accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                    &quantized_inputs[input_start..input_start + blocks_per_row],
+                    packed,
+                    Q8_0PackedRows4Interleave::I8,
+                    &mut output[output_start..output_start + output_width],
+                );
+            }
+            Ok(())
+        })?;
+    }
+
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
+}
+
+/// Role-agnostic dispatch for the unified tiled Q8_0 prefill GEMM owner. Returns `Some(out)` to
+/// short-circuit the per-role block-dot when the owner scope covers this role and the projection
+/// is eligible (Q8_0 weight with the load-time PackedRows4/I8 repack, prefill batch rows>=4,
+/// `input_width % 32 == 0`, `output_width % 4 == 0`). Returns `None` for decode (rows<4), non-Q8,
+/// or any non-PackedRows4 weight, so those fall through to the existing default path unchanged.
+fn try_q8_matmul_owner_prefill(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<CpuTensor>> {
+    let scope: Q8MatmulOwnerScope = runtime_plan.q8.q8_matmul_owner;
+    if !scope.covers_role(rectangular_role) {
+        return Ok(None);
+    }
+    if input.rank() != 2 || weight.rank() != 2 {
+        return Ok(None);
+    }
+    let rows = input.dim(0)?;
+    if rows < 4 {
+        return Ok(None); // prefill-only; decode (rows<4) stays on the existing path
+    }
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    if weight.source_type != Some(GgufTensorType::Q8_0) {
+        return Ok(None);
+    }
+    let weight_rows = weight.dim(0)?;
+    let weight_cols = weight.dim(1)?;
+    let output_width = if weight_rows == input_width {
+        weight_cols
+    } else if weight_cols == input_width {
+        weight_rows
+    } else {
+        return Ok(None);
+    };
+    if !output_width.is_multiple_of(4) {
+        return Ok(None);
+    }
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+    {
+        return Ok(None);
+    }
+    let use_vnni = runtime_plan.q8.q8_matmul_owner_vnni && q8_owner_avx512vnni_available();
+    let use_4x8 = use_vnni && runtime_plan.q8.q8_matmul_owner_4x8;
+    let output = q8_0_unified_prefill_projection(
+        input,
+        packed,
+        output_width,
+        name,
+        runtime_plan.q8.q8_matmul_owner_avx2,
+        use_vnni,
+        use_4x8,
+        runtime_plan.q8_packed_rows4_matmul_schedule,
+    )?;
+    Ok(Some(output))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
