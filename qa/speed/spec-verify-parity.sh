@@ -41,6 +41,22 @@
 #       fallback is a FAILURE, not a pass). LOSSLESS + fired on every gate column → 0.
 #       Any divergence, or a gate column that never exercised verify_batch → non-zero.
 #
+#   metal-tree (THE PHASE 4 GATE — also governs the exit code):
+#       REACHABILITY (honest): the TREE verify (verify_tree_gpu → verify_tree_metal →
+#       verify_batch_tree) is NOT reachable from `serve`. The server speculative loop
+#       (api/mod.rs) only ever calls the LINEAR verify_drafts_gpu; CAMELID_SPEC_TREE is
+#       consulted ONLY by `bench-speculative` (main.rs generate_run_speculative), which
+#       re-enables the resident paths so the Metal resident engine engages. So this lane
+#       drives `bench-speculative` with CAMELID_SPEC_TREE=1 + the SAME resident fast stack
+#       the serve lane uses (CAMELID_SPEC_TREE_GATE=0 so a full tree is drawn every round and
+#       the GPU verify is forced to fire — losslessness is the verify's job either way).
+#       bench-speculative computes its OWN lossless verdict (the speculative token stream vs
+#       THIS build's plain greedy decode, byte-identical) and reports gpu/cpu verify rounds.
+#       GATE: every tree column must be LOSSLESS *and* the GPU tree verify must have fired
+#       (gpu_verify_rounds>0) — a silent CPU fallback or a no-spec-round pass is a FAILURE.
+#       The receipt records the max tree fan-out observed (fan-out>1 ⇒ genuine multi-branch
+#       tree verify + branching KV compaction exercised, not just the single-branch anchor).
+#
 #   bench-speculative reference (INFORMATIONAL ONLY — does NOT gate):
 #       The original bench-speculative linear/tree lanes, kept verbatim. recon §A1/§A2
 #       described these (at base 28f224b) as the CPU chunk-verify fallback that DIVERGES
@@ -63,7 +79,7 @@
 #   BIN=/path/to/camelid MODEL=/path/to.gguf qa/speed/spec-verify-parity.sh
 #   SKIP_CPU_BENCH=1 qa/speed/spec-verify-parity.sh      # Metal gate only
 #
-# Exit code is governed by the Metal resident lane only.
+# Exit code is governed by the Metal resident (linear) lane AND the Phase 4 tree lane.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -83,6 +99,13 @@ CPU_BENCH_TIMEOUT="${CPU_BENCH_TIMEOUT:-180}"
 # matches so verify rounds fire) + the >512-context longctx column (forces the Metal
 # split-K verify path). These are the columns where verify_batch is expected to fire.
 GATE_COLUMNS="${GATE_COLUMNS:-code_completion structured_json repetitive_extraction longctx_splitk}"
+
+# Columns that drive the Phase 4 TREE verify gate. These are the spec-friendly columns where
+# the suffix drafter finds recurrence and proposes branching (fan-out>1) trees, so the GPU tree
+# verify (verify_tree_gpu→verify_tree_metal→verify_batch_tree) fires every round under the
+# ungated full-tree policy. Each must be LOSSLESS with gpu_verify_rounds>0 (see header LANES).
+TREE_COLUMNS="${TREE_COLUMNS:-repetitive_extraction code_completion structured_json}"
+TREE_TIMEOUT="${TREE_TIMEOUT:-240}"   # hard per-column ceiling for the tree bench-speculative run
 
 # --- preflight --------------------------------------------------------------
 [ -x "$BIN" ]           || { echo "[spec-verify-parity] bin not found/executable: $BIN" >&2; exit 2; }
@@ -257,6 +280,72 @@ echo "[metal-lane] baseline server verify traces=$base_traces (expected 0)"
 echo
 
 # ---------------------------------------------------------------------------
+# Metal resident TREE speculative-verify lane (THE PHASE 4 GATE)
+# ---------------------------------------------------------------------------
+# verify_tree_gpu → verify_tree_metal → verify_batch_tree is NOT reachable from `serve`
+# (api/mod.rs's speculative loop only ever calls the LINEAR verify_drafts_gpu; CAMELID_SPEC_TREE
+# is consulted only by `bench-speculative`/generate_run_speculative, which re-enables the
+# resident paths). So this lane drives `bench-speculative` with CAMELID_SPEC_TREE=1 + the SAME
+# resident fast stack the serve lane uses. bench-speculative computes its OWN lossless verdict
+# (spec stream vs this build's plain greedy decode, byte-identical) and reports gpu/cpu verify
+# rounds; this lane GATES on LOSSLESS && gpu_verify_rounds>0 per column.
+echo "== Metal resident TREE speculative-verify lane (Phase 4 GATE) =="
+TREE_TSV="$WORK/tree_lane.tsv"
+: > "$TREE_TSV"
+
+# Run one tree column through bench-speculative with the resident stack + CAMELID_SPEC_TREE=1,
+# under a hard timeout (stock macOS has no GNU `timeout`). The single JSON record lands in $4;
+# stderr (with the [metal-tree-verify] trace) lands in $5.
+run_tree_lane() {
+  local id="$1" pf="$2" ngen="$3" outf="$4" errf="$5"
+  env \
+    CAMELID_METAL_RESIDENT_DECODE=1 \
+    CAMELID_METAL_WIRE=1 \
+    CAMELID_METAL_WIRE_NSG8=1 \
+    CAMELID_METAL_F32Y=1 \
+    CAMELID_METAL_NOCOPY=1 \
+    CAMELID_NO_OPEN=1 \
+    CAMELID_SPEC_TREE=1 \
+    CAMELID_SPEC_TREE_GATE=0 \
+    CAMELID_SPEC_VERIFY_TRACE=1 \
+    "$BIN" bench-speculative "$MODEL" \
+      --drafter "$DRAFTER" --workload "$id" --prompt-file "$pf" \
+      --max-tokens "$ngen" --warmup >"$outf.raw" 2>"$errf" &
+  local bpid=$!
+  ( sleep "$TREE_TIMEOUT"; pkill -9 -P "$bpid" 2>/dev/null; kill -9 "$bpid" 2>/dev/null ) &
+  local watcher=$!
+  wait "$bpid" 2>/dev/null || true
+  kill "$watcher" 2>/dev/null || true
+  grep -E '^[[:space:]]*\{' "$outf.raw" 2>/dev/null | tail -n1 > "$outf" || true
+}
+
+for col in $TREE_COLUMNS; do
+  ngen="$(awk -F'\t' -v c="$col" '$1==c{print $2}' "$WORK/_columns.tsv")"
+  [ -n "$ngen" ] || { echo "[tree-lane] WARN: column '$col' not in prompts.json — skipping" >&2; continue; }
+  run_tree_lane "$col" "$WORK/${col}.txt" "$ngen" "$WORK/${col}.tree.out" "$WORK/${col}.tree.err"
+  json="$(cat "$WORK/${col}.tree.out" 2>/dev/null || true)"
+  # Max tree fan-out observed this column (from the [metal-tree-verify] trace: max_fanout=N).
+  maxfan="$(grep -o 'max_fanout=[0-9]*' "$WORK/${col}.tree.err" 2>/dev/null | sed 's/max_fanout=//' | sort -n | tail -n1)"
+  [ -n "$maxfan" ] || maxfan=0
+  ttraces="$(grep -c '\[metal-tree-verify\]' "$WORK/${col}.tree.err" 2>/dev/null || true)"; ttraces="${ttraces:-0}"
+  if [ -z "$json" ]; then
+    echo "[tree-lane] $col: NO RECORD (timed out at ${TREE_TIMEOUT}s or no output) -> FAIL"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$col" "norecord" "-1" "0" "0" "$maxfan" "$ttraces" >> "$TREE_TSV"
+    continue
+  fi
+  parsed="$(node -e '
+    const r=JSON.parse(process.argv[1]);
+    const div=r.first_divergent_generated_token_index;
+    const verdict=(r.lossless===true && div<0)?"LOSSLESS":"DIVERGE";
+    process.stdout.write([verdict,div,r.gpu_verify_rounds||0,r.cpu_verify_rounds||0].join("\t"));
+  ' "$json")"
+  IFS=$'\t' read -r verdict div gpu_rounds cpu_rounds <<<"$parsed"
+  echo "[tree-lane] $col: $verdict (gpu_verify_rounds=$gpu_rounds cpu_verify_rounds=$cpu_rounds div=$div max_fanout=$maxfan)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$col" "$verdict" "$div" "$gpu_rounds" "$cpu_rounds" "$maxfan" "$ttraces" >> "$TREE_TSV"
+done
+echo
+
+# ---------------------------------------------------------------------------
 # Optional informational CPU-fallback bench lane (§A1) — never gates
 # ---------------------------------------------------------------------------
 CPU_BENCH_TSV="$WORK/cpu_bench.tsv"
@@ -350,7 +439,7 @@ META="$(node -e '
 cat > "$WORK/build_receipt.js" <<'NODE'
 const fs = require("fs");
 const crypto = require("crypto");
-const [, , promptsJson, work, gateCols, metaJson, receiptPath, latestPath, cpuTsv] = process.argv;
+const [, , promptsJson, work, gateCols, metaJson, receiptPath, latestPath, cpuTsv, treeTsv] = process.argv;
 const pack = JSON.parse(fs.readFileSync(promptsJson, "utf8"));
 const ngenOf = Object.fromEntries(pack.columns.map(c => [c.id, c.n_gen]));
 const meta = JSON.parse(metaJson);
@@ -446,7 +535,68 @@ try {
   }
 } catch (_) {}
 
-const gatePass = allLossless && allFired;
+// Phase 4 TREE lane (GATING). Driven via bench-speculative CAMELID_SPEC_TREE=1 — the only
+// reachable path for verify_tree_gpu→verify_tree_metal→verify_batch_tree (serve has no tree
+// branch). Each column must be LOSSLESS (spec stream byte-identical to this build's plain
+// greedy, computed inside bench-speculative) AND the GPU tree verify must have fired
+// (gpu_verify_rounds>0). A silent CPU fallback or a no-spec-round pass is a FAILURE.
+let tree = { status: "absent", gating: true, verdict: "FAIL" };
+let treeGatePass = false;
+try {
+  const lines = fs.readFileSync(treeTsv, "utf8").trim().split("\n").filter(Boolean);
+  if (lines.length) {
+    const rows = lines.map(l => {
+      const [id, verdict, div, gpu_rounds, cpu_rounds, max_fanout, tree_traces] = l.split("\t");
+      const lossless = verdict === "LOSSLESS";
+      const fired = (+gpu_rounds) > 0;
+      return {
+        id,
+        verdict,
+        lossless,
+        first_divergent_index: +div,
+        gpu_verify_rounds: +gpu_rounds,
+        cpu_verify_rounds: +cpu_rounds,
+        max_tree_fanout: +max_fanout,
+        tree_verify_traces: +tree_traces,   // includes the unmeasured warmup run's traces
+        gpu_tree_verify_fired: fired,
+        multi_branch_fanout: (+max_fanout) > 1,
+        gate_pass: lossless && fired,
+      };
+    });
+    const treeAllLossless = rows.every(r => r.lossless);
+    const treeAllFired = rows.every(r => r.gpu_tree_verify_fired);
+    const maxFanout = rows.reduce((a, r) => Math.max(a, r.max_tree_fanout), 0);
+    treeGatePass = treeAllLossless && treeAllFired;
+    tree = {
+      status: "gating",
+      gating: true,
+      verdict: treeGatePass ? "LOSSLESS" : "FAIL",
+      reachability: "verify_tree_gpu is NOT reachable from `serve`: the server speculative loop " +
+        "(api/mod.rs) only calls the LINEAR verify_drafts_gpu, and CAMELID_SPEC_TREE is consulted " +
+        "only by `bench-speculative` (main.rs generate_run_speculative). This lane therefore drives " +
+        "bench-speculative with CAMELID_SPEC_TREE=1 (CAMELID_SPEC_TREE_GATE=0, full tree every round) " +
+        "+ the resident fast stack; bench-speculative computes the lossless verdict against this " +
+        "build's own plain greedy stream.",
+      spec_env: {
+        CAMELID_SPEC_TREE: "1",
+        CAMELID_SPEC_TREE_GATE: "0",
+        CAMELID_SPEC_GPU: "(n/a — bench-speculative engages the resident path directly)",
+        CAMELID_METAL_RESIDENT_DECODE: "1",
+        CAMELID_METAL_WIRE: "1",
+        CAMELID_METAL_WIRE_NSG8: "1",
+        CAMELID_METAL_F32Y: "1",
+        CAMELID_METAL_NOCOPY: "1",
+      },
+      all_columns_lossless: treeAllLossless,
+      all_columns_gpu_tree_verify_fired: treeAllFired,
+      max_tree_fanout_observed: maxFanout,
+      multi_branch_fanout_fired: maxFanout > 1,   // fan-out>1 ⇒ branching verify + KV compaction exercised
+      columns: rows,
+    };
+  }
+} catch (_) {}
+
+const gatePass = allLossless && allFired && treeGatePass;
 const totalRounds = columns.reduce((a, c) => a + c.verify_rounds, 0);
 const receipt = {
   schema: "camelid.spec-verify/v1",
@@ -474,13 +624,16 @@ const receipt = {
     spec_request: "default greedy (no sampling params), speculation ON",
     baseline_server_verify_traces: meta.baseline_server_traces,
   },
+  overall_verdict: gatePass ? "LOSSLESS" : "FAIL",   // governs the exit code: linear AND tree lanes
   gate: {
-    verdict: gatePass ? "LOSSLESS" : "FAIL",
+    // Linear lane (Phase 3 metal-resident verify_batch via serve).
+    verdict: (allLossless && allFired) ? "LOSSLESS" : "FAIL",
     all_columns_lossless: allLossless,
     all_columns_verify_fired: allFired,
     total_verify_rounds: totalRounds,
     columns: cols.length,
   },
+  tree,   // Phase 4 tree lane (verify_tree_metal/verify_batch_tree via bench-speculative)
   columns,
   cpu_fallback_bench: cpu,
 };
@@ -505,23 +658,43 @@ for (const c of columns) {
   }
 }
 console.error("");
+console.error("== Metal resident TREE lane verdict (Phase 4) ==");
+if (tree.status !== "gating") {
+  console.error("  TREE LANE PRODUCED NO RECORDS — FAIL (verify_tree_metal never observed)");
+} else {
+  for (const r of tree.columns) {
+    const id = r.id.padEnd(22);
+    const verdict = r.lossless ? "LOSSLESS" : "DIVERGE ";
+    const fired = r.gpu_tree_verify_fired
+      ? `tree verify fired (gpu_rounds=${r.gpu_verify_rounds}, cpu_rounds=${r.cpu_verify_rounds}, max_fanout=${r.max_tree_fanout}${r.multi_branch_fanout ? " MULTI-BRANCH" : " single-branch"})`
+      : "tree verify DID NOT FIRE on GPU (silent CPU fallback / no spec round)";
+    console.error(`  ${id} ${verdict}  ${fired}`);
+  }
+  console.error(`  max tree fan-out observed across columns: ${tree.max_tree_fanout_observed}` +
+                (tree.multi_branch_fanout_fired ? " (genuine multi-branch fan-out exercised)" : " (single-branch only — verify_tree_metal still exercised & lossless)"));
+}
+console.error("");
 console.error(`receipt: ${receiptPath}`);
 process.exit(gatePass ? 0 : 1);
 NODE
 
 set +e
 node "$WORK/build_receipt.js" \
-  "$PROMPTS_JSON" "$WORK" "$GATE_COLUMNS" "$META" "$RECEIPT" "$RECEIPT_LATEST" "$CPU_BENCH_TSV"
+  "$PROMPTS_JSON" "$WORK" "$GATE_COLUMNS" "$META" "$RECEIPT" "$RECEIPT_LATEST" "$CPU_BENCH_TSV" "$TREE_TSV"
 GATE_RC=$?
 set -e
 
 echo
 if [ "$GATE_RC" -eq 0 ]; then
   echo "PASS: Metal resident speculative-verify is LOSSLESS (byte-identical to plain greedy) on"
-  echo "      every gate column, and verify_batch demonstrably fired on each. CPU-fallback bench"
-  echo "      lane (if run) is informational only (§A1) and did NOT affect this result."
+  echo "      every gate column for BOTH lanes — the Phase 3 LINEAR verify_batch (via serve) and"
+  echo "      the Phase 4 TREE verify_batch_tree (via bench-speculative) — and the GPU verify"
+  echo "      demonstrably fired on each (linear: verify_batch; tree: verify_tree_metal, with"
+  echo "      genuine multi-branch fan-out). CPU-fallback bench lane (if run) is informational"
+  echo "      only (§A1) and did NOT affect this result."
 else
-  echo "FAIL: the Metal resident speculative-verify gate did not pass — a gate column either"
-  echo "      diverged from plain greedy or never exercised verify_batch (see verdict above)."
+  echo "FAIL: a speculative-verify gate lane did not pass — a gate column either diverged from"
+  echo "      plain greedy or never exercised the GPU verify (linear verify_batch or the Phase 4"
+  echo "      tree verify_tree_metal). See the per-lane verdict above."
 fi
 exit "$GATE_RC"

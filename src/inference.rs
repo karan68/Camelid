@@ -2602,14 +2602,17 @@ impl LlamaInferenceSession {
         Ok(Some(emitted))
     }
 
-    /// Non-CUDA build: tree verify is unavailable, fall back to the caller's normal step.
+    /// Non-CUDA build: route the GPU resident tree speculative-verify to the Metal seam
+    /// (`verify_tree_metal`), which runs the batched bit-identical `verify_batch_tree` when the
+    /// resident engine is live and ready, else returns `Ok(None)` so the caller takes a normal
+    /// step. Lossless either way (the target verify is authoritative — every emitted token is the
+    /// model's own greedy argmax along the accepted path).
     #[cfg(not(feature = "cuda"))]
-    #[allow(unused_variables)]
     pub fn verify_tree_gpu(
         &mut self,
         tree: &crate::inference::spec_tree::TokenTree,
     ) -> Result<Option<Vec<u32>>> {
-        Ok(None)
+        self.verify_tree_metal(tree)
     }
 
     /// Non-CUDA build: route the GPU resident speculative-verify to the Metal seam
