@@ -167,3 +167,44 @@ path + Llama-3 BOS/template edge cases; this is a direct decode-kernel proof. Bu
 `qa/evidence-bundles/llama-3.2-3b-q4_k_m-windows-cuda-resident-parity-20260628T004547Z-head-bb3c3528/`.
 Same disclosure gap as the secondary. Both Phase-1 rows promoted in `SUPPORT_MATRIX_v0.1.md` +
 `COMPATIBILITY.md`.
+
+---
+
+## Phase 3 outcome (appended) — memory-hint experiments
+
+Prior recon refined two of the conductor's Phase-3 priors:
+- `wire_mmap.rs` **already** issues `MADV_SEQUENTIAL` + `MADV_WILLNEED` (so only `MADV_HUGEPAGE`
+  was missing), and the x86 **prefill** matmul path already prefetches
+  (`q8_0_packed_rows4_prefetch_block`). The gap was the x86 **decode** dot
+  (`q8_0_packed_rows4_dot`), which had a macOS NEON `prfm` but no x86 prefetch.
+
+### x86 weight-stream prefetch — DONE, measured NULL (default-off)
+
+Added `CAMELID_X86_PREFETCH` (default-off) to `q8_0_packed_rows4_dot`'s x86 decode arm
+(two packed blocks ahead, mirroring the macOS NEON `prfm`). Result on this box (Llama-3.2-3B-Q8_0,
+CPU decode, CUDA hidden):
+- **Byte-identical**: `output_token_ids` SHA-256 `297fc9f8dcc1` for every iteration, flag OFF and
+  ON (memory hint → Class A by construction, confirmed).
+- **Speed NULL**: 6.46 → 6.41 tok/s median (−0.8%, within noise; marginally slower).
+- **Why**: CPU decode is DRAM-bandwidth-bound (~20 GB/s achieved of ~51 GB/s peak); the HW
+  prefetcher already covers the sequential stream. Consistent with the GAIT prefetch null.
+- **Decision**: flag stays default-off (regression guard), NOT promoted. Receipt:
+  `docs/perf-deep-dive/PERF_RECEIPTS/same-host/kquant-phase3-x86-prefetch-llama32-3b-q8-20260628T012312Z.json`.
+
+### Huge pages (`MADV_HUGEPAGE`) — DEFERRED to a Linux host (not shipped here)
+
+Not implemented on this branch because it is **unverifiable on this Windows box**: the hint
+belongs in the `#[cfg(unix)]` `WireMmap` path, which Windows never compiles (Windows uses the
+`memmap2` `GgufWireMmap`, which exposes no `madvise`). Shipping `#[cfg(unix)]` code I cannot
+compile or measure here violates "default-off until measured on THIS host." Exact intended change
+for a Linux/macOS session:
+
+> In the `#[cfg(unix)]` `WireMmap::open` (after the successful `libc::mmap`, alongside the
+> existing sequential/willneed advice), gate `libc::madvise(ptr, mapped_len, libc::MADV_HUGEPAGE)`
+> behind `CAMELID_MMAP_HUGEPAGE` (default-off). Apply at map time so all weight mmaps benefit
+> regardless of caller (today `advise_willneed` is only wired into `gemma4_runtime.rs`). Measure
+> achieved GB/s on a Linux host with THP available; fold to default only if robust. Windows large
+> pages (`MEM_LARGE_PAGES` + `SeLockMemoryPrivilege`) remain a separate, larger lift — deferred.
+
+**Phase 3 net on this host: prefetch landed (default-off, null); huge-pages deferred.** No default
+decode path changed; all output byte-identical.

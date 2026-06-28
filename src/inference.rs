@@ -13208,6 +13208,30 @@ fn q8_0_packed_rows4_gemm4_accumulate_block(
     }
 }
 
+/// Phase 3 (K-quant conductor): opt-in software prefetch of the weight stream ahead
+/// of the x86 packed decode dot. Default-off (`CAMELID_X86_PREFETCH`). Memory hint
+/// only — byte-identical output by construction. The macOS/aarch64 dot already issues
+/// a NEON `prfm` two blocks ahead; this gives the x86 decode dot the same option so it
+/// can be measured on a bandwidth-bound host (the Q8 gated-SIMD history says prove the
+/// win on the box before promoting to default).
+fn x86_prefetch_enabled() -> bool {
+    #[cfg(test)]
+    {
+        x86_prefetch_enabled_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        static X86_PREFETCH_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_PREFETCH_ENABLED.get_or_init(x86_prefetch_enabled_from_env)
+    }
+}
+fn x86_prefetch_enabled_from_env() -> bool {
+    matches!(
+        env::var("CAMELID_X86_PREFETCH").as_deref(),
+        Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 #[inline(always)]
 fn q8_0_packed_rows4_prefetch_block(block: &Q8_0PackedRows4Block) {
     #[cfg(target_arch = "x86")]
@@ -18639,6 +18663,20 @@ fn q8_0_packed_rows4_dot(
                         ptr = in(reg) next_block.quants.as_ptr(),
                         options(nostack, preserves_flags, readonly)
                     );
+                }
+            }
+        }
+        // Phase 3: opt-in x86 weight-stream prefetch, two packed blocks ahead — the
+        // x86 mirror of the macOS NEON `prfm` above. Default-off; a memory hint only,
+        // so the decoded values are byte-identical regardless of the flag.
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            not(all(target_os = "macos", target_arch = "aarch64"))
+        ))]
+        {
+            if x86_prefetch_enabled() {
+                if let Some(next_block) = packed_blocks.get(idx + 2) {
+                    q8_0_packed_rows4_prefetch_block(next_block);
                 }
             }
         }
