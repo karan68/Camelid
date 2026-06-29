@@ -593,7 +593,9 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         workdir: root.to_path_buf(),
         max_steps,
         auto_approve: task.auto_approve,
+        yolo: false,
         allow_net: false,
+        allow_fs: false,
         shell_timeout: Duration::from_secs(60),
         max_tokens,
         temperature: 0.0,
@@ -603,8 +605,10 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
     // The parent's approval posture, with the production fail-closed honoured:
     // resolve_policy refuses blanket auto-approve under CAMELID_PRODUCTION, so a
     // child can never silently run write/network there.
+    // Subagents are never --yolo (the unattended exec auto-approve is parent-only);
+    // a child stays scoped + its NonInteractiveApprover denies any confirm-tier.
     let mut policy =
-        agent::resolve_policy(task.auto_approve, agent::is_production()).unwrap_or_default();
+        agent::resolve_policy(task.auto_approve, false, agent::is_production()).unwrap_or_default();
     let mut history = vec![
         AgentMsg::System(agent::system_prompt(&sandbox, &tools)),
         AgentMsg::User(task.goal.clone()),

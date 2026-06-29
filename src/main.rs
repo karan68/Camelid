@@ -373,13 +373,24 @@ enum Command {
         /// Max agent steps (tool-call rounds) per goal.
         #[arg(long, default_value_t = 25)]
         max_steps: usize,
-        /// Agent: run write/exec/network tools WITHOUT prompting (sandbox still
-        /// enforced). Prints a warning; not recommended.
+        /// Agent: run write/network tools WITHOUT prompting (exec tools stay
+        /// gated; sandbox still enforced). Prints a warning; not recommended.
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
+        /// Agent: UNATTENDED — auto-approve EVERYTHING including exec tools
+        /// (shell, GUI input, run_windows_command, spawn_subagent) so the agent
+        /// runs a whole task without prompting. Bounded by --max-steps and /stop.
+        /// Refused under CAMELID_PRODUCTION. Powerful + dangerous; opt-in.
+        #[arg(long, default_value_t = false)]
+        yolo: bool,
         /// Agent: offer the network tool (`http_fetch`). Off by default.
         #[arg(long, default_value_t = false)]
         allow_net: bool,
+        /// Agent: let the file tools read/write anywhere on disk (computer
+        /// control), not just under --workdir. Still approval-gated. Off by
+        /// default (file tools are confined to the workspace root).
+        #[arg(long, default_value_t = false)]
+        allow_fs: bool,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -455,6 +466,22 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8181")]
         addr: SocketAddr,
         /// Seconds to wait for the model to load before reporting INCONCLUSIVE.
+        #[arg(long, default_value_t = 120)]
+        load_timeout: u64,
+    },
+    /// Rung-4: measure concurrent vs sequential subagent wall-clock (I/O-bound;
+    /// add --model for the inference-bound workload) and emit a sealed receipt.
+    AgentOrchestrationBench {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+        /// Optional GGUF: also measure the inference-bound workload.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Server to attach to / spawn on.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load.
         #[arg(long, default_value_t = 120)]
         load_timeout: u64,
     },
@@ -1079,7 +1106,9 @@ async fn main() -> anyhow::Result<()> {
             workdir,
             max_steps,
             auto_approve,
+            yolo,
             allow_net,
+            allow_fs,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -1101,7 +1130,9 @@ async fn main() -> anyhow::Result<()> {
                 workdir,
                 max_steps,
                 auto_approve,
+                yolo,
                 allow_net,
+                allow_fs,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,
@@ -1144,6 +1175,20 @@ async fn main() -> anyhow::Result<()> {
             load_timeout,
         } => {
             let code = chat::run_agent_orchestration_eval(chat::AgentOrchestrationOptions {
+                receipt_dir,
+                model,
+                addr,
+                load_timeout,
+            })?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationBench {
+            receipt_dir,
+            model,
+            addr,
+            load_timeout,
+        } => {
+            let code = chat::run_agent_orchestration_bench(chat::AgentOrchestrationBenchOptions {
                 receipt_dir,
                 model,
                 addr,
