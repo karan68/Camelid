@@ -159,6 +159,55 @@ fn f32_row_dot(row: &[u8], x: &[f32]) -> f32 {
         .sum()
 }
 
+impl RawMat {
+    /// Batched [`par_matvec`]: one output vector per input in `xs`, reading each
+    /// weight row ONCE and dotting it against every input — so the resident weights
+    /// are streamed once for the whole batch instead of once per input. A 9B forward
+    /// reads ~9 GB of weights, which dominates per token; amortizing that read across
+    /// all prompt positions is what makes prompt prefill fast. Bit-identical to
+    /// calling `par_matvec` on each input separately (same per-element arithmetic and
+    /// accumulation order — the row dot is unchanged; only the batching differs).
+    fn par_matmul(&self, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        let m = xs.len();
+        let out_f = self.out_features;
+        let rb = self.row_bytes();
+        // flat[r*m + p] = dot(row_r, xs[p]); par over rows so each row is read once.
+        let flat: Vec<f32> = match self.tt {
+            GgufTensorType::Q8_0 => (0..out_f)
+                .into_par_iter()
+                .flat_map_iter(|r| {
+                    let row = &self.bytes[r * rb..(r + 1) * rb];
+                    xs.iter().map(move |x| q8_0_row_dot(row, x))
+                })
+                .collect(),
+            GgufTensorType::F32 => (0..out_f)
+                .into_par_iter()
+                .flat_map_iter(|r| {
+                    let row = &self.bytes[r * rb..(r + 1) * rb];
+                    xs.iter().map(move |x| f32_row_dot(row, x))
+                })
+                .collect(),
+            _ => {
+                // Fallback (never hit for the Q8_0+F32 qwen35 model): per-input matvec.
+                let mut out = Vec::with_capacity(m);
+                for x in xs {
+                    out.push(self.par_matvec(x, "matmul")?);
+                }
+                return Ok(out);
+            }
+        };
+        // Transpose flat[r*m + p] -> out[p][r].
+        let mut out = vec![vec![0.0f32; out_f]; m];
+        for r in 0..out_f {
+            let base = r * m;
+            for (p, op) in out.iter_mut().enumerate() {
+                op[r] = flat[base + p];
+            }
+        }
+        Ok(out)
+    }
+}
+
 struct Layer {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
@@ -987,13 +1036,127 @@ impl RunnableModel {
     /// [`generate_qwen35`]: RunnableModel::generate_qwen35
     fn forward_logits_qwen35(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
-        let mut cache = Qwen35Cache::new(rt, self.n_layers);
-        let mut logits = Vec::new();
-        let last_pos = tokens.len() - 1;
-        for (pos, &tok) in tokens.iter().enumerate() {
-            logits = self.decode_token_qwen35(tok, pos, &mut cache, pos == last_pos)?;
-        }
+        let _ = rt;
+        let (_cache, logits) = self.prefill_qwen35(tokens)?;
         Ok(logits)
+    }
+
+    /// Batched prompt prefill: process ALL prompt positions through the stack, reading
+    /// each weight once per layer (`par_matmul`) instead of once per token — the
+    /// memory-bandwidth amortization that makes the prompt fast. Builds `cache` (KV for
+    /// full-attn layers; conv + recurrent state for SSM layers) identically to running
+    /// `decode_token_qwen35` over the prompt — causal attention means each position
+    /// only depends on earlier ones, so batching by layer is bit-identical to the
+    /// per-token order — and returns the LAST position's logits.
+    fn prefill_qwen35(&self, prompt: &[u32]) -> Result<(Qwen35Cache, Vec<f32>)> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let m = prompt.len();
+        let mut cache = Qwen35Cache::new(rt, self.n_layers);
+        let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(m);
+        for &tok in prompt {
+            let t = tok as usize;
+            if t >= self.vocab {
+                return Err(BackendError::InvalidTensorData(format!(
+                    "token id {t} >= vocab {}",
+                    self.vocab
+                )));
+            }
+            hidden.push(self.token_embd.dequant_row(t, "token_embd")?);
+        }
+
+        for (li, layer) in rt.layers.iter().enumerate() {
+            let xn: Vec<Vec<f32>> = hidden
+                .iter()
+                .map(|h| rms_norm(h, &layer.attn_norm, self.eps))
+                .collect();
+            let mix: Vec<Vec<f32>> = match &layer.kind {
+                Qwen35Kind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let qg = wq.par_matmul(&xn)?;
+                    let k = wk.par_matmul(&xn)?;
+                    let v = wv.par_matmul(&xn)?;
+                    let mut attn_outs = Vec::with_capacity(m);
+                    for p in 0..m {
+                        attn_outs.push(self.qwen35_attn_compute(
+                            q_norm, k_norm, &qg[p], &k[p], &v[p], p, li, &mut cache,
+                        ));
+                    }
+                    wo.par_matmul(&attn_outs)?
+                }
+                Qwen35Kind::Ssm {
+                    wqkv,
+                    wqkv_gate,
+                    conv1d,
+                    dt_bias,
+                    a,
+                    beta,
+                    alpha,
+                    ssm_norm,
+                    ssm_out,
+                } => {
+                    let qkv = wqkv.par_matmul(&xn)?;
+                    let z = wqkv_gate.par_matmul(&xn)?;
+                    let beta_raw = beta.par_matmul(&xn)?;
+                    let alpha_raw = alpha.par_matmul(&xn)?;
+                    let mut finals = Vec::with_capacity(m);
+                    for p in 0..m {
+                        finals.push(self.qwen35_ssm_compute(
+                            rt,
+                            conv1d,
+                            dt_bias,
+                            a,
+                            ssm_norm,
+                            li,
+                            &qkv[p],
+                            &z[p],
+                            &beta_raw[p],
+                            &alpha_raw[p],
+                            &mut cache,
+                        ));
+                    }
+                    ssm_out.par_matmul(&finals)?
+                }
+            };
+            for (h, mp) in hidden.iter_mut().zip(mix.iter()) {
+                for (hv, mv) in h.iter_mut().zip(mp.iter()) {
+                    *hv += *mv;
+                }
+            }
+
+            // FFN (SwiGLU), batched, pre-normed by post_attention_norm.
+            let xn2: Vec<Vec<f32>> = hidden
+                .iter()
+                .map(|h| rms_norm(h, &layer.post_attn_norm, self.eps))
+                .collect();
+            let g = layer.ffn_gate.par_matmul(&xn2)?;
+            let u = layer.ffn_up.par_matmul(&xn2)?;
+            let act: Vec<Vec<f32>> = g
+                .iter()
+                .zip(u.iter())
+                .map(|(gp, up)| {
+                    gp.iter()
+                        .zip(up.iter())
+                        .map(|(&gv, &uv)| silu(gv) * uv)
+                        .collect()
+                })
+                .collect();
+            let d = layer.ffn_down.par_matmul(&act)?;
+            for (h, dp) in hidden.iter_mut().zip(d.iter()) {
+                for (hv, dv) in h.iter_mut().zip(dp.iter()) {
+                    *hv += *dv;
+                }
+            }
+        }
+
+        let normed = rms_norm(&hidden[m - 1], &self.output_norm, self.eps);
+        let logits = self.output.par_matvec(&normed, "output")?;
+        Ok((cache, logits))
     }
 
     /// Greedy decode for qwen35: prefill the prompt position-by-position into the
@@ -1002,15 +1165,9 @@ impl RunnableModel {
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
-        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
-        let mut cache = Qwen35Cache::new(rt, self.n_layers);
-        let mut last = Vec::new();
-        let last_pos = prompt.len() - 1;
-        // Prefill: advance the cache for every prompt token, but only the last
-        // position needs logits (the LM head is skipped for the rest).
-        for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.decode_token_qwen35(tok, pos, &mut cache, pos == last_pos)?;
-        }
+        // Batched prefill of the whole prompt (weights read once per layer), then
+        // per-token greedy decode from the resulting cache.
+        let (mut cache, last) = self.prefill_qwen35(prompt)?;
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
         let mut next = argmax(&last);
@@ -1115,8 +1272,10 @@ impl RunnableModel {
         self.output.par_matvec(&normed, "output")
     }
 
-    /// Qwen3.5 full-attention layer: fused query+gate projection, q/k RMSNorm,
-    /// partial NEOX RoPE, GQA causal attention over the cache, sigmoid output gate.
+    /// Qwen3.5 full-attention layer (per-token): project Q+gate / K / V, then the
+    /// shared [`qwen35_attn_compute`], then the output projection.
+    ///
+    /// [`qwen35_attn_compute`]: RunnableModel::qwen35_attn_compute
     #[allow(clippy::too_many_arguments)]
     fn qwen35_full_attn(
         &self,
@@ -1131,13 +1290,36 @@ impl RunnableModel {
         pos: usize,
         cache: &mut Qwen35Cache,
     ) -> Result<Vec<f32>> {
+        let qg = wq.par_matvec(xn, &name(li, "attn_q"))?;
+        let k = wk.par_matvec(xn, &name(li, "attn_k"))?;
+        let v = wv.par_matvec(xn, &name(li, "attn_v"))?;
+        let attn_out = self.qwen35_attn_compute(q_norm, k_norm, &qg, &k, &v, pos, li, cache);
+        wo.par_matvec(&attn_out, &name(li, "attn_output"))
+    }
+
+    /// The per-position full-attention compute (shared by the per-token and batched
+    /// prefill paths): split fused Q+gate, q/k RMSNorm, partial NEOX RoPE, append K/V
+    /// to the cache, GQA causal attention over positions `0..=pos`, sigmoid output
+    /// gate. `qg`/`k_in`/`v_in` are the already-computed projections for this
+    /// position; returns the gated attention context (before the output projection).
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_attn_compute(
+        &self,
+        q_norm: &[f32],
+        k_norm: &[f32],
+        qg: &[f32],
+        k_in: &[f32],
+        v_in: &[f32],
+        pos: usize,
+        li: usize,
+        cache: &mut Qwen35Cache,
+    ) -> Vec<f32> {
         let hd = self.head_dim;
         let n_head = self.n_heads;
         let n_kv = self.n_kv_heads;
         let group = n_head / n_kv;
 
         // Fused Q+gate: [query(hd) | gate(hd)] interleaved per head.
-        let qg = wq.par_matvec(xn, &name(li, "attn_q"))?;
         let mut q = vec![0.0f32; n_head * hd];
         let mut gate = vec![0.0f32; n_head * hd];
         for h in 0..n_head {
@@ -1147,8 +1329,7 @@ impl RunnableModel {
         }
         norm_heads(&mut q, n_head, hd, q_norm, self.eps);
 
-        let mut k = wk.par_matvec(xn, &name(li, "attn_k"))?;
-        let v = wv.par_matvec(xn, &name(li, "attn_v"))?;
+        let mut k = k_in.to_vec();
         norm_heads(&mut k, n_kv, hd, k_norm, self.eps);
 
         // Partial NEOX RoPE: rotates the first rope_dim (64) of each 256-wide head.
@@ -1156,7 +1337,7 @@ impl RunnableModel {
         self.apply_rope(&mut k, n_kv, pos, self.rope_base);
 
         cache.k[li].extend_from_slice(&k);
-        cache.v[li].extend_from_slice(&v);
+        cache.v[li].extend_from_slice(v_in);
         let ck = &cache.k[li];
         let cv = &cache.v[li];
         let kv_dim = n_kv * hd;
@@ -1196,7 +1377,7 @@ impl RunnableModel {
         for (a, gt) in attn_out.iter_mut().zip(gate.iter()) {
             *a *= sigmoid(*gt);
         }
-        wo.par_matvec(&attn_out, &name(li, "attn_output"))
+        attn_out
     }
 
     /// Qwen3.5 gated-delta-net (SSM) layer — the autoregressive recurrence.
@@ -1226,6 +1407,36 @@ impl RunnableModel {
             ),
             Qwen35Kind::Full { .. } => unreachable!("qwen35_ssm called on a full-attention layer"),
         };
+        let qkv = wqkv.par_matvec(xn, &name(li, "attn_qkv"))?;
+        let z = wqkv_gate.par_matvec(xn, &name(li, "attn_gate"))?;
+        let beta_raw = beta_m.par_matvec(xn, &name(li, "ssm_beta"))?;
+        let alpha_raw = alpha_m.par_matvec(xn, &name(li, "ssm_alpha"))?;
+        let final_out = self.qwen35_ssm_compute(
+            rt, conv1d, dt_bias, a, ssm_norm, li, &qkv, &z, &beta_raw, &alpha_raw, cache,
+        );
+        ssm_out.par_matvec(&final_out, &name(li, "ssm_out"))
+    }
+
+    /// The per-position gated-delta-net (SSM) compute, shared by the per-token and
+    /// batched prefill paths: β/decay gates, causal conv1d+SiLU, L2-normed q/k, the
+    /// gated delta-rule recurrence (mutating the per-head state in `cache`), and the
+    /// gated RMSNorm. Inputs are this position's already-computed projections; returns
+    /// the value-dim vector before the `ssm_out` projection.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_ssm_compute(
+        &self,
+        rt: &Qwen35Runtime,
+        conv1d: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        ssm_norm: &[f32],
+        li: usize,
+        qkv: &[f32],
+        z: &[f32],
+        beta_raw: &[f32],
+        alpha_raw: &[f32],
+        cache: &mut Qwen35Cache,
+    ) -> Vec<f32> {
         let d_state = rt.d_state;
         let nk = rt.num_k_heads;
         let nv = rt.num_v_heads;
@@ -1235,10 +1446,6 @@ impl RunnableModel {
         let d_conv = rt.d_conv;
         let cm1 = d_conv - 1;
 
-        let qkv = wqkv.par_matvec(xn, &name(li, "attn_qkv"))?;
-        let z = wqkv_gate.par_matvec(xn, &name(li, "attn_gate"))?;
-        let beta_raw = beta_m.par_matvec(xn, &name(li, "ssm_beta"))?;
-        let alpha_raw = alpha_m.par_matvec(xn, &name(li, "ssm_alpha"))?;
         let mut beta = vec![0.0f32; nv];
         let mut glog = vec![0.0f32; nv];
         for h in 0..nv {
@@ -1331,7 +1538,7 @@ impl RunnableModel {
                 final_out[h * hv + j] = normed[j] * silu(zh[j]);
             }
         }
-        ssm_out.par_matvec(&final_out, &name(li, "ssm_out"))
+        final_out
     }
 }
 
