@@ -66,6 +66,11 @@ windows-sys = { version = "0.59", features = [
     # renderers so colors and glyphs render like macOS/Linux — see
     # src/chat/win_console.rs.
     "Win32_System_Console",
+    # GUI control (computer-control agent): synthesize keyboard/mouse input via
+    # SendInput, position the cursor, and read screen metrics — see
+    # src/chat/win_input.rs.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # Windows: CUDA is part of the DEFAULT build (the primary dev host is a CUDA box).
 # cudarc is non-optional here and `build.rs` turns on the `cuda` cfg, so a bare

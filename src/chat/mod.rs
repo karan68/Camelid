@@ -39,6 +39,8 @@ mod tui;
 #[cfg(windows)]
 mod win_console;
 #[cfg(windows)]
+mod win_input;
+#[cfg(windows)]
 mod win_job;
 
 use std::io::IsTerminal;
