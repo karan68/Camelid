@@ -307,11 +307,16 @@ impl Client {
         &self,
         request: &Value,
     ) -> anyhow::Result<(String, Option<u32>, Option<u32>)> {
+        // Read deadline for a non-streaming completion. A fast model answers in
+        // seconds; this is only a ceiling, hit by the slow pure-f32 runnable oracle
+        // lane (e.g. a 9B qwen35 prefilling a long tool prompt at ~1s/token), where a
+        // turn can take many minutes. 30 min keeps those turns from tripping the
+        // timeout without masking a genuinely hung server indefinitely.
         let (status, body) = self.request(
             "POST",
             "/v1/chat/completions",
             Some(request),
-            Duration::from_secs(600),
+            Duration::from_secs(1800),
         )?;
         if status != 200 {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
