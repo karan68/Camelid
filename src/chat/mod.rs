@@ -19,6 +19,7 @@ mod agent_bench;
 mod agent_eval;
 mod agent_orchestration;
 mod agent_syscap;
+mod agent_tui;
 mod audit;
 mod banner;
 mod client;
@@ -150,7 +151,14 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
         };
-        return agent::run_agent(&mut session, opts.addr, cfg);
+        // Full-screen TUI agent on a real terminal (default); the line renderer
+        // is the fallback for --plain, pipes, and non-TTY runs (smoke/tests).
+        let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        return if interactive && !opts.plain {
+            agent_tui::run(&mut session, opts.addr, cfg)
+        } else {
+            agent::run_agent(&mut session, opts.addr, cfg)
+        };
     }
 
     // Full-screen TUI when we have a real terminal on both ends and the user did
