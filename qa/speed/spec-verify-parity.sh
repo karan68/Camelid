@@ -686,11 +686,20 @@ set -e
 
 echo
 if [ "$GATE_RC" -eq 0 ]; then
+  # Honest fan-out claim: only assert "multi-branch" if the receipt recorded fan-out>1 this run
+  # (the drafter may produce only single-branch trees on a given run; the multi-branch +
+  # KV-compaction proof is the unit gate metal_tree_verify_bit_identical, always exercised there).
+  TREE_FANOUT="$(node -e 'try{const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(r.tree&&r.tree.multi_branch_fanout_fired?"multi":"single")}catch(e){process.stdout.write("single")}' "$RECEIPT_LATEST" 2>/dev/null || echo single)"
+  if [ "$TREE_FANOUT" = "multi" ]; then
+    TREE_NOTE="with genuine multi-branch fan-out this run"
+  else
+    TREE_NOTE="single-branch trees this run — multi-branch+compaction proven by the unit gate metal_tree_verify_bit_identical"
+  fi
   echo "PASS: Metal resident speculative-verify is LOSSLESS (byte-identical to plain greedy) on"
   echo "      every gate column for BOTH lanes — the Phase 3 LINEAR verify_batch (via serve) and"
   echo "      the Phase 4 TREE verify_batch_tree (via bench-speculative) — and the GPU verify"
-  echo "      demonstrably fired on each (linear: verify_batch; tree: verify_tree_metal, with"
-  echo "      genuine multi-branch fan-out). CPU-fallback bench lane (if run) is informational"
+  echo "      demonstrably fired on each (linear: verify_batch; tree: verify_tree_metal,"
+  echo "      $TREE_NOTE). CPU-fallback bench lane (if run) is informational"
   echo "      only (§A1) and did NOT affect this result."
 else
   echo "FAIL: a speculative-verify gate lane did not pass — a gate column either diverged from"

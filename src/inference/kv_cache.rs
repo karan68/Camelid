@@ -355,6 +355,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_ram_branch_engages_auto_budget() {
+        // resolve_kv_cache_budget_bytes() below does a libc getenv; serialize it against every
+        // other env-mutating test (ENV_LOCK) so the read can't race a concurrent set_var on the
+        // shared `environ` under parallel `cargo test`. (See the review's phase1 F1/F2.)
+        let _env = crate::test_support::env_lock();
         let ram = crate::gait::host_ram_status();
         assert!(ram.is_some(), "macOS host_ram_status must report Some");
         let budget = kv_cache_budget_from(None, ram);

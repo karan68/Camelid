@@ -1149,7 +1149,9 @@ kernel void q8_0_block_linear_ksplit_f32y_wire_gemm(
 // Byte-exact batched-column mirror of the single-token GEMV
 // `q8_0_block_linear_row_ksplit_f32y_wire_nsg8` (above). It runs the SAME NSG=8
 // reduction over `n_rows_in` INDEPENDENT activation columns (the speculative-verify
-// rows, <= MAX_T), carrying a separate accumulator per column. For each weight block
+// rows, up to TREE_MAX_NODES=16 for the tree path — the outer `for t0 .. += MAX_T`
+// loop tiles them MAX_T(8) columns per pass, so do NOT assume n_rows_in <= MAX_T),
+// carrying a separate accumulator per column. For each weight block
 // the per-block partial is computed as `sumq = Σ_i wq[i]*y[i]` and ONLY THEN scaled
 // (`sumf += sumq * w_scale`) — w_scale is never folded onto the weight (that reorders
 // the rounding and is what the prefill `wire_gemm` does), so column t equals the
@@ -12400,6 +12402,20 @@ impl ResidentDecodeState {
         if self.kv16 {
             return None; // f32 KV cache only for Phase 3 (kv16 is a follow-up)
         }
+        // The tree split-K attention (encode_attention_tree) is mirror-only — there is no f32
+        // split-K *tree* kernel. The CAMELID_METAL_ATTN_SPLITK_KV16=0 opt-out forces forward_token
+        // and the LINEAR verify (encode_attention) onto the f32 split-K reads, so a tree verify
+        // reading the f16 mirrors instead would diverge from plain greedy (NOT lossless). Fail
+        // closed to the lossless single-token/CPU fallback rather than emit a non-lossless tree
+        // verify. The linear path honors the env in encode_attention, so it is unaffected and
+        // stays byte-exact; only the tree lane needs this guard. (Mirror predicate matches the
+        // `use_mirrors` test in encode_attention.)
+        if tree.is_some()
+            && std::env::var("CAMELID_METAL_ATTN_SPLITK_KV16")
+                .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        {
+            return None;
+        }
         // The new batched GEMV mirrors exactly the f32y + wire + NSG=8 production GEMV; any
         // other GEMV path would not match it bit-for-bit.
         if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
@@ -18487,11 +18503,22 @@ mod tests {
         std::env::set_var("CAMELID_METAL_WIRE", "1");
         std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
         std::env::set_var("CAMELID_METAL_ATTN2", "1");
-        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+        // Require the split-K attention path (ATTN2 + split-K) too, so the straddle-126 / deep-510
+        // windows genuinely exercise the split-K verify kernels instead of silently falling to the
+        // v2 path when a sibling latched attn2/split-K OFF first. SKIP loudly otherwise — the
+        // targeted run (qa/speed/verify-gates.sh, --test-threads=1) is the enforced proof lane; a
+        // green --all-targets does NOT by itself exercise these byte-exact gates.
+        if !(f32y_gemv_enabled()
+            && wire_weights_enabled()
+            && wire_nsg8_enabled()
+            && attn2_enabled()
+            && splitk_attention_enabled())
+        {
             eprintln!(
-                "SKIP metal_spec_verify_bit_identical: f32y/wire/nsg8 gates inactive (OnceLock \
-                 latched off earlier in this process); run targeted: cargo test --release \
-                 --lib metal_spec_verify_bit_identical"
+                "SKIP metal_spec_verify_bit_identical: f32y/wire/nsg8/attn2/split-K gates inactive \
+                 (OnceLock latched off earlier in this process); run targeted: \
+                 qa/speed/verify-gates.sh (or cargo test --release --lib \
+                 metal_spec_verify_bit_identical)"
             );
             return;
         }
@@ -18750,11 +18777,20 @@ mod tests {
         std::env::set_var("CAMELID_METAL_WIRE", "1");
         std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
         std::env::set_var("CAMELID_METAL_ATTN2", "1");
-        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+        // Require the split-K attention path too (see metal_spec_verify_bit_identical) so the
+        // linear-anchor straddle-126 / deep-510 windows really exercise split-K; SKIP loudly
+        // otherwise. Targeted proof lane: qa/speed/verify-gates.sh (--test-threads=1).
+        if !(f32y_gemv_enabled()
+            && wire_weights_enabled()
+            && wire_nsg8_enabled()
+            && attn2_enabled()
+            && splitk_attention_enabled())
+        {
             eprintln!(
-                "SKIP metal_tree_verify_bit_identical: f32y/wire/nsg8 gates inactive (OnceLock \
-                 latched off earlier in this process); run targeted: cargo test --release \
-                 --lib metal_tree_verify_bit_identical"
+                "SKIP metal_tree_verify_bit_identical: f32y/wire/nsg8/attn2/split-K gates inactive \
+                 (OnceLock latched off earlier in this process); run targeted: \
+                 qa/speed/verify-gates.sh (or cargo test --release --lib \
+                 metal_tree_verify_bit_identical)"
             );
             return;
         }

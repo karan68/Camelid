@@ -876,7 +876,8 @@ pub fn host_ram_status() -> Option<(u64, u64)> {
     }
     // Acquire the host name port once for the process lifetime: mach_host_self() mints a
     // fresh send right per call that would otherwise need mach_port_deallocate (no libc
-    // binding for that), so caching the one send right keeps this leak-free.
+    // binding for that), so caching the one send right bounds it to a single
+    // process-lifetime retain (no per-call leak — not zero retains).
     static HOST_PORT: std::sync::OnceLock<libc::mach_port_t> = std::sync::OnceLock::new();
     // `libc::mach_host_self` is deprecated in favor of the `mach2` crate, but that is not
     // a dependency here and the symbol still resolves to the same libSystem trap; scope
