@@ -217,13 +217,20 @@ pub fn run_subagent_worker(task_file: &std::path::Path) -> anyhow::Result<i32> {
 /// Parsed `camelid agent-orchestration-eval` flags.
 pub struct AgentOrchestrationOptions {
     pub receipt_dir: PathBuf,
+    pub model: Option<PathBuf>,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
 }
 
-/// Entry for the `agent-orchestration-eval` subcommand: the Phase-2 orchestration
-/// gate (stub round-trip + caps/depth/reaping) → sealed receipt. Returns 0/1/3.
+/// Entry for the `agent-orchestration-eval` subcommand: the orchestration gate.
+/// Without `--model` it runs the canned rung-2 mechanics battery; with `--model`
+/// it runs the rung-3 real-model round-trip. Returns 0/1/3.
 pub fn run_agent_orchestration_eval(opts: AgentOrchestrationOptions) -> anyhow::Result<i32> {
     agent_orchestration::run(agent_orchestration::OrchestrationConfig {
         receipt_dir: opts.receipt_dir,
+        model: opts.model,
+        addr: opts.addr,
+        load_timeout: opts.load_timeout,
     })
 }
 

@@ -271,6 +271,16 @@ fn spawn_inner(
     let dir = subagent_dir(root);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
+    // Eval hook: force a deterministic canned subagent for a tool-driven spawn
+    // (CAMELID_SUBAGENT_FORCE_CANNED). Used ONLY by the rung-3 real-model eval to
+    // isolate the model's orchestration-driving from subagent inference. Unset in
+    // production, and a model cannot set process env, so this is inert there.
+    let canned = canned.or_else(|| {
+        std::env::var("CAMELID_SUBAGENT_FORCE_CANNED")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|a| (a, 0))
+    });
     let (canned_answer, canned_sleep_ms) = match canned {
         Some((answer, sleep_ms)) => (Some(answer), Some(sleep_ms)),
         None => (None, None),
