@@ -373,13 +373,24 @@ enum Command {
         /// Max agent steps (tool-call rounds) per goal.
         #[arg(long, default_value_t = 25)]
         max_steps: usize,
-        /// Agent: run write/exec/network tools WITHOUT prompting (sandbox still
-        /// enforced). Prints a warning; not recommended.
+        /// Agent: run write/network tools WITHOUT prompting (exec tools stay
+        /// gated; sandbox still enforced). Prints a warning; not recommended.
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
+        /// Agent: UNATTENDED — auto-approve EVERYTHING including exec tools
+        /// (shell, GUI input, run_windows_command, spawn_subagent) so the agent
+        /// runs a whole task without prompting. Bounded by --max-steps and /stop.
+        /// Refused under CAMELID_PRODUCTION. Powerful + dangerous; opt-in.
+        #[arg(long, default_value_t = false)]
+        yolo: bool,
         /// Agent: offer the network tool (`http_fetch`). Off by default.
         #[arg(long, default_value_t = false)]
         allow_net: bool,
+        /// Agent: let the file tools read/write anywhere on disk (computer
+        /// control), not just under --workdir. Still approval-gated. Off by
+        /// default (file tools are confined to the workspace root).
+        #[arg(long, default_value_t = false)]
+        allow_fs: bool,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -423,6 +434,56 @@ enum Command {
         /// Directory for the receipt artifact.
         #[arg(long, default_value = "qa/agent-eval")]
         receipt_dir: PathBuf,
+    },
+    /// Phase-1 Windows system-control gate: exercise run_windows_command +
+    /// inspect_system under the sandbox/approval contract and emit a sealed
+    /// receipt (PASS / FAIL / INCONCLUSIVE). Rung-1 — promotes nothing.
+    AgentSyscapEval {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-syscap")]
+        receipt_dir: PathBuf,
+    },
+    /// Internal: run ONE scoped subagent task described by a task file and write
+    /// its result file. Spawned by the spawn_subagent tool; not for direct use.
+    #[command(name = "__subagent", hide = true)]
+    Subagent {
+        /// Path to the task_<id>.json written by the parent.
+        #[arg(long)]
+        task_file: PathBuf,
+    },
+    /// Phase-2 subagent-orchestration gate: spawn -> run -> collect a canned
+    /// subagent plus caps/depth/reaping checks, emitting a sealed receipt
+    /// (PASS / FAIL / INCONCLUSIVE). Rung-2 (stub) — promotes nothing.
+    AgentOrchestrationEval {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+        /// Optional GGUF: run the rung-3 REAL-model round-trip instead of the
+        /// canned rung-2 mechanics battery.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Server to attach to / spawn on (rung-3).
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load before reporting INCONCLUSIVE.
+        #[arg(long, default_value_t = 120)]
+        load_timeout: u64,
+    },
+    /// Rung-4: measure concurrent vs sequential subagent wall-clock (I/O-bound;
+    /// add --model for the inference-bound workload) and emit a sealed receipt.
+    AgentOrchestrationBench {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+        /// Optional GGUF: also measure the inference-bound workload.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Server to attach to / spawn on.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load.
+        #[arg(long, default_value_t = 120)]
+        load_timeout: u64,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -732,6 +793,34 @@ enum Command {
         #[arg(long, env = "CAMELID_DETERMINISTIC", default_value_t = false)]
         deterministic: bool,
     },
+    /// Hidden: in-process INTERLEAVED owner-microkernel prefill sweep. Loads the model ONCE, then
+    /// rotates owner configs (off / avx2 / vnni4x4 / vnni4x8) round-by-round so every config shares
+    /// the same thermal/clock state, enabling drift-cancelling PAIRED comparison (the fix for the
+    /// noise that made v3 inconclusive). The owner flag is read from env per linear call, so no
+    /// reload is needed between configs. Emits one JSON line per (round, config) to stdout.
+    #[command(hide = true)]
+    BenchOwnerSweep {
+        /// GGUF model path.
+        model: PathBuf,
+        /// Read the prompt from this UTF-8 file. Takes precedence over --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Inline prompt text (used when --prompt-file is absent).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Tokens to generate per measurement (prefill dominates; keep small).
+        #[arg(long, default_value_t = 1)]
+        max_tokens: usize,
+        /// Measured interleaved rounds (median + paired stats taken across rounds).
+        #[arg(long, default_value_t = 10)]
+        rounds: usize,
+        /// Leading rounds discarded as warmup (reach steady thermal state).
+        #[arg(long, default_value_t = 2)]
+        warmup_rounds: usize,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// GAIT: run the parity-gated calibration tournament for this model on this
     /// machine. Times the supported execution profiles, disqualifies any whose
     /// greedy output diverges, picks the fastest parity-clean one that beats the
@@ -1017,7 +1106,9 @@ async fn main() -> anyhow::Result<()> {
             workdir,
             max_steps,
             auto_approve,
+            yolo,
             allow_net,
+            allow_fs,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -1039,7 +1130,9 @@ async fn main() -> anyhow::Result<()> {
                 workdir,
                 max_steps,
                 auto_approve,
+                yolo,
                 allow_net,
+                allow_fs,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,
@@ -1064,6 +1157,42 @@ async fn main() -> anyhow::Result<()> {
                 max_steps,
                 max_tokens,
                 receipt_dir,
+            })?;
+            std::process::exit(code);
+        }
+        Command::AgentSyscapEval { receipt_dir } => {
+            let code = chat::run_agent_syscap_eval(chat::AgentSyscapOptions { receipt_dir })?;
+            std::process::exit(code);
+        }
+        Command::Subagent { task_file } => {
+            let code = chat::run_subagent_worker(&task_file)?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationEval {
+            receipt_dir,
+            model,
+            addr,
+            load_timeout,
+        } => {
+            let code = chat::run_agent_orchestration_eval(chat::AgentOrchestrationOptions {
+                receipt_dir,
+                model,
+                addr,
+                load_timeout,
+            })?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationBench {
+            receipt_dir,
+            model,
+            addr,
+            load_timeout,
+        } => {
+            let code = chat::run_agent_orchestration_bench(chat::AgentOrchestrationBenchOptions {
+                receipt_dir,
+                model,
+                addr,
+                load_timeout,
             })?;
             std::process::exit(code);
         }
@@ -1520,6 +1649,25 @@ async fn main() -> anyhow::Result<()> {
                 temperature,
                 iterations,
                 warmup,
+                threads,
+            )?;
+        }
+        Command::BenchOwnerSweep {
+            model,
+            prompt_file,
+            prompt,
+            max_tokens,
+            rounds,
+            warmup_rounds,
+            threads,
+        } => {
+            run_bench_owner_sweep(
+                model,
+                prompt_file,
+                prompt,
+                max_tokens,
+                rounds,
+                warmup_rounds,
                 threads,
             )?;
         }
@@ -2767,6 +2915,143 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         moe: None,
         gemma4: None,
     })
+}
+
+/// Hardened owner-microkernel prefill measurement: load ONCE, then measure all configs INTERLEAVED
+/// within each round so per-round paired deltas cancel slow thermal/clock drift. Emits raw
+/// per-(round, config) JSONL; paired stats + significance are computed downstream.
+#[allow(clippy::too_many_arguments)]
+fn run_bench_owner_sweep(
+    model: PathBuf,
+    prompt_file: Option<PathBuf>,
+    prompt: Option<String>,
+    max_tokens: usize,
+    rounds: usize,
+    warmup_rounds: usize,
+    threads: Option<usize>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
+    anyhow::ensure!(rounds >= 1, "--rounds must be at least 1");
+    configure_rayon_threads(threads)?;
+    camelid::capability::HardwareProfile::detect().log();
+
+    let prompt_text = match (&prompt_file, &prompt) {
+        (Some(path), _) => std::fs::read_to_string(path)?,
+        (None, Some(text)) => text.clone(),
+        (None, None) => anyhow::bail!("provide --prompt-file <path> or --prompt <text>"),
+    };
+
+    // Load once. The owner is selected at runtime (env read per linear call), so a single load
+    // serves every config; the PackedRows4 repack the owner consumes is built at load regardless.
+    let gguf = read_metadata(&model)?;
+    let plan_outcome = camelid::execution_plan::plan_for_model(&model, &gguf, threads);
+    camelid::execution_plan::PlannerEnv::capture().apply(&plan_outcome.env_updates);
+    let config = LlamaModelConfig::from_gguf(&gguf)?;
+    let binding = LlamaTensorBinding::bind(&gguf, &config)?;
+    let store = TensorStore::open(&model, &gguf);
+    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let weights = Arc::new(LlamaLoadedWeights::load(&store, &binding, None)?);
+
+    let prompt_token_ids = tokenizer.encode(&prompt_text, true, false)?;
+    let prompt_tokens = prompt_token_ids.len();
+    anyhow::ensure!(prompt_tokens >= 1, "prompt encoded to zero tokens");
+    let sampler = LlamaSampler::Greedy;
+
+    // Owner keys cleared before each config so "off" is the true default path.
+    let owner_keys = [
+        "CAMELID_X86_Q8_MATMUL_OWNER",
+        "CAMELID_X86_Q8_MATMUL_OWNER_AVX2",
+        "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
+        "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
+    ];
+    let configs: &[(&str, &[(&str, &str)])] = &[
+        ("off", &[]),
+        (
+            "owner_avx2",
+            &[
+                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "0"),
+            ],
+        ),
+        (
+            "owner_vnni4x4",
+            &[
+                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "0"),
+            ],
+        ),
+        (
+            "owner_vnni4x8",
+            &[
+                ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
+                ("CAMELID_X86_Q8_MATMUL_OWNER_4X8", "1"),
+            ],
+        ),
+    ];
+    let apply = |envs: &[(&str, &str)]| {
+        for k in owner_keys {
+            std::env::remove_var(k);
+        }
+        for (k, v) in envs {
+            std::env::set_var(k, v);
+        }
+    };
+
+    let model_label = model.display().to_string();
+    let commit = std::env::var("CAMELID_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    let total_rounds = warmup_rounds + rounds;
+    eprintln!(
+        "[bench-owner-sweep] {prompt_tokens} prompt tokens, {} configs, {warmup_rounds} warmup + {rounds} measured rounds interleaved",
+        configs.len()
+    );
+    for round in 0..total_rounds {
+        let measured = round >= warmup_rounds;
+        for (label, envs) in configs {
+            apply(envs);
+            camelid::inference::reset_stage_timings();
+            let run = generate_run(
+                &config,
+                &weights,
+                &tokenizer,
+                &prompt_token_ids,
+                &sampler,
+                max_tokens,
+            )?;
+            if !measured {
+                continue;
+            }
+            let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+            let prefill_tok_s = if run.prefill_ms > 0.0 {
+                prompt_tokens as f64 / (run.prefill_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let decode_tokens = run.generated.len().saturating_sub(1);
+            let decode_tok_s = if run.decode_ms > 0.0 && decode_tokens > 0 {
+                decode_tokens as f64 / (run.decode_ms / 1000.0)
+            } else {
+                0.0
+            };
+            let rec = serde_json::json!({
+                "schema": "camelid.bench-owner-sweep/v1",
+                "round": round - warmup_rounds,
+                "config": label,
+                "model": model_label,
+                "commit": commit,
+                "prompt_tokens": prompt_tokens,
+                "prefill_ms": r3(run.prefill_ms),
+                "prefill_tok_s": r3(prefill_tok_s),
+                "decode_tok_s": r3(decode_tok_s),
+            });
+            println!("{}", serde_json::to_string(&rec)?);
+        }
+    }
+    for k in owner_keys {
+        std::env::remove_var(k);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

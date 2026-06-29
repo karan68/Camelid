@@ -258,6 +258,8 @@ function App() {
               selectedModel={selectedModel}
               selectedModelId={selectedModelId}
               setSelectedModelId={setSelectedModelId}
+              activateModel={activateModel}
+              loadingModelId={loadingModelId}
               models={models}
               runtime={runtime}
               capabilities={dashboard?.capabilities}

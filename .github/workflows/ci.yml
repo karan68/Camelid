@@ -5,8 +5,121 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+    inputs:
+      os:
+        description: 'OS legs to run: comma-separated (linux,macos,windows) or "all"'
+        required: false
+        default: 'all'
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # OS-matrix planner. Computes which of the three OS legs to run, so a single-OS
+  # push stays green without disabling cross-OS CI for everyone else.
+  #
+  # DEFAULT (no selector anywhere): the full ubuntu+macos+windows matrix runs,
+  # exactly as before — nothing is hidden unless you opt in.
+  #
+  # OPT IN to a subset by tagging the commit message (or PR title / PR label),
+  # any of these forms (case-insensitive):
+  #   [ci-os: windows]              -> windows leg only
+  #   [ci-os: macos,linux]          -> macos + linux, skip windows
+  #   [windows-only] / [win-only]   -> windows leg only
+  #   [macos-only]   / [mac-only]   -> macos leg only
+  #   [linux-only]                  -> linux leg only
+  # Or trigger manually (workflow_dispatch) and set the `os` input.
+  #
+  # An unrecognized / typo'd selector falls back to the FULL matrix (fail-safe
+  # toward more coverage, never toward silently skipping a platform).
+  # ---------------------------------------------------------------------------
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run_linux: ${{ steps.plan.outputs.run_linux }}
+      run_macos: ${{ steps.plan.outputs.run_macos }}
+      run_windows: ${{ steps.plan.outputs.run_windows }}
+    steps:
+      - name: Plan OS matrix
+        id: plan
+        # Inputs are passed via env (NOT interpolated into the script body) so a
+        # crafted commit message / PR title cannot inject shell.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_OS: ${{ github.event.inputs.os }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          # Pick the selector source. Manual dispatch input wins; otherwise scan
+          # the commit message + PR title + PR labels (any may carry the tag).
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${DISPATCH_OS:-}" ]; then
+            sel="${DISPATCH_OS}"
+          else
+            scan="$(printf '%s %s %s' "${COMMIT_MSG:-}" "${PR_TITLE:-}" "${PR_LABELS:-}" \
+                    | tr '[:upper:]' '[:lower:]')"
+            want=""
+            # [ci-os: ...] explicit (supports a comma/space list inside the brackets)
+            case "$scan" in
+              *'[ci-os:'*)
+                want="$(printf '%s' "$scan" \
+                  | sed -n 's/.*\[ci-os:[[:space:]]*\([a-z, ]*\)\].*/\1/p')"
+                ;;
+            esac
+            # Shorthand single-OS tags
+            case "$scan" in *'[windows-only]'*|*'[win-only]'*)  want="$want windows";; esac
+            case "$scan" in *'[macos-only]'*|*'[mac-only]'*|*'[osx-only]'*) want="$want macos";; esac
+            case "$scan" in *'[linux-only]'*)                   want="$want linux";;   esac
+            sel="$want"
+          fi
+
+          # Normalize separators to spaces, lower-case.
+          sel="$(printf '%s' "$sel" | tr ',' ' ' | tr '[:upper:]' '[:lower:]')"
+
+          run_linux=false; run_macos=false; run_windows=false
+          for tok in $sel; do
+            case "$tok" in
+              linux|ubuntu)        run_linux=true;;
+              macos|mac|osx|apple) run_macos=true;;
+              windows|win)         run_windows=true;;
+              all)                 run_linux=true; run_macos=true; run_windows=true;;
+            esac
+          done
+
+          # Nothing matched -> full matrix (the safe default).
+          if [ "$run_linux" = false ] && [ "$run_macos" = false ] && [ "$run_windows" = false ]; then
+            run_linux=true; run_macos=true; run_windows=true
+          fi
+
+          # Build matrix.include[], preserving the original per-OS feature flags:
+          #   ubuntu  -> --all-features (also builds+lints the opt-in CUDA path)
+          #   macos   -> default       (Metal lane; no cudarc)
+          #   windows -> default       (CUDA is already the default build there)
+          inc=""
+          [ "$run_linux"   = true ] && inc="$inc {\"os\":\"ubuntu-latest\",\"features\":\"--all-features\"},"
+          [ "$run_macos"   = true ] && inc="$inc {\"os\":\"macos-latest\",\"features\":\"\"},"
+          [ "$run_windows" = true ] && inc="$inc {\"os\":\"windows-latest\",\"features\":\"\"},"
+          inc="${inc%,}"
+          matrix="{\"include\":[ $inc ]}"
+
+          {
+            echo "matrix=$matrix"
+            echo "run_linux=$run_linux"
+            echo "run_macos=$run_macos"
+            echo "run_windows=$run_windows"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### CI OS matrix"
+            echo ""
+            echo "| leg | run |"
+            echo "| --- | --- |"
+            echo "| ubuntu-latest  | $run_linux |"
+            echo "| macos-latest   | $run_macos |"
+            echo "| windows-latest | $run_windows |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   public-scrub:
     runs-on: ubuntu-latest
     steps:
@@ -42,31 +155,28 @@ jobs:
           ! grep -n -E '^(## Current Status|As of 2026-05-22, Camelid is useful but deliberately narrow:|- \\*\\*(Working product surface|Supported exact rows|Next row|Blocked row|Performance posture):\\*\\*)' README.md
 
   rust:
-    needs: public-scrub
+    needs: [public-scrub, setup]
     strategy:
       fail-fast: false
-      matrix:
-        # macos-latest is Apple Silicon, so it compiles and lints the
-        # cfg(target_os = "macos") Metal path that ubuntu never sees. The Metal
-        # tests self-skip when no GPU device is reported by the runner.
-        # windows-latest (MSVC) is a first-class CPU target: it builds the
-        # Windows file-I/O / mmap path (src/platform_fs.rs, the memmap2 wire
-        # mapping) and runs the same exact-row gates as the other hosts.
-        #
-        # `features` is per-OS. CUDA is the DEFAULT build on Windows only (build.rs
-        # injects the `cuda` cfg and cudarc is a non-optional Windows dep), so the
-        # plain default build on windows-latest already exercises the GPU backend.
-        # On Linux CUDA is opt-in, so ubuntu-latest uses --all-features to also build
-        # and lint it (cudarc dynamic-loads — no CUDA SDK needed, and the GPU tests
-        # self-skip without a device). macOS has no cudarc (its GPU lane is Metal), so
-        # it uses the default feature set. GPU parity is validated on a CUDA host.
-        include:
-          - os: ubuntu-latest
-            features: --all-features
-          - os: macos-latest
-            features: ''
-          - os: windows-latest
-            features: ''
+      # Matrix is computed by the `setup` job. Each include entry carries `os`
+      # and per-OS `features` (see the planner above). The default selection is
+      # the full ubuntu+macos+windows set, identical to the previous static matrix:
+      #
+      # macos-latest is Apple Silicon, so it compiles and lints the
+      # cfg(target_os = "macos") Metal path that ubuntu never sees. The Metal
+      # tests self-skip when no GPU device is reported by the runner.
+      # windows-latest (MSVC) is a first-class CPU target: it builds the
+      # Windows file-I/O / mmap path (src/platform_fs.rs, the memmap2 wire
+      # mapping) and runs the same exact-row gates as the other hosts.
+      #
+      # CUDA is the DEFAULT build on Windows only (build.rs injects the `cuda`
+      # cfg and cudarc is a non-optional Windows dep), so the plain default build
+      # on windows-latest already exercises the GPU backend. On Linux CUDA is
+      # opt-in, so ubuntu-latest uses --all-features to also build and lint it
+      # (cudarc dynamic-loads — no CUDA SDK needed, GPU tests self-skip without a
+      # device). macOS has no cudarc (its GPU lane is Metal), so it uses the
+      # default feature set. GPU parity is validated on a CUDA host.
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -100,8 +210,12 @@ jobs:
   # web UI lives in camelid.exe, which this job does not build. The base tauri.conf.json
   # declares no sidecar resources (those are in the bundle-only overlay), so the crate builds
   # on a fresh checkout with no sidecar staged.
+  #
+  # Skipped when windows is not in the selected OS set (e.g. a [macos-only] / [linux-only]
+  # push). A skipped job is reported green, and ci-gate treats it as a pass.
   desktop:
-    needs: public-scrub
+    needs: [public-scrub, setup]
+    if: needs.setup.outputs.run_windows == 'true'
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -172,3 +286,32 @@ jobs:
 
       - name: Frontend integration smoke
         run: npm run smoke:integration
+
+  # ---------------------------------------------------------------------------
+  # Single aggregate gate. Make THIS the only required status check in branch
+  # protection (see the note in the PR/commit). It runs on every event and
+  # passes when every upstream job either succeeded or was intentionally skipped
+  # (single-OS scoping), and fails if any job that actually ran failed/cancelled.
+  #
+  # Why: when an OS leg is skipped, its own status context never reports, and a
+  # required-but-missing context blocks merges forever. Requiring ci-gate instead
+  # gives one stable context whatever the selected OS set.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    needs: [setup, public-scrub, rust, desktop, validation-scripts, frontend]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require no failed job (skips allowed)
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          echo "Upstream job results: ${RESULTS}"
+          for r in ${RESULTS}; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::A required CI job concluded with '$r'"; exit 1 ;;
+            esac
+          done
+          echo "All required jobs passed (skipped legs allowed)."

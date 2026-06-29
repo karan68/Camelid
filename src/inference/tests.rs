@@ -1885,6 +1885,10 @@ fn q8_0_hot_path_uses_resolved_plan_not_current_env() {
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
+            q8_matmul_owner: Q8MatmulOwnerScope::Off,
+            q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -2794,6 +2798,10 @@ fn q8_attention_consumer_plan(
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
+            q8_matmul_owner: Q8MatmulOwnerScope::Off,
+            q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3809,6 +3817,10 @@ fn ffn_down_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
+            q8_matmul_owner: Q8MatmulOwnerScope::Off,
+            q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3860,6 +3872,10 @@ fn ffn_down_packed_rows4_matmul_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
+            q8_matmul_owner: Q8MatmulOwnerScope::Off,
+            q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -3915,6 +3931,10 @@ fn ffn_gate_up_consumer_plan(enabled: bool) -> ResolvedRuntimePlan {
             ffn_down_single_owner: false,
             ffn_down_vnni_decode: false,
             ffn_down_vnni_decode_rawptr: false,
+            q8_matmul_owner: Q8MatmulOwnerScope::Off,
+            q8_matmul_owner_avx2: false,
+            q8_matmul_owner_vnni: false,
+            q8_matmul_owner_4x8: false,
             metal: false,
             cuda: false,
             metal_retained: false,
@@ -5292,6 +5312,83 @@ fn q8_ffn_down_gemm4_prefill_matches_runtime_packed_matmul_with_tail() {
 
     assert_eq!(actual.shape.dims, vec![rows, output_width]);
     assert_slice_close_with_tolerance(&actual.data, &expected.data, 5e-4);
+}
+
+/// Lane 1: the unified tiled prefill owner must be BIT-IDENTICAL (to_bits, zero ULP) to the
+/// trusted packed-rows4 matmul baseline across tile-aligned AND ragged-tail row counts, and for
+/// any role under scope=All (the kernel is role-agnostic). Tighter than the 5e-4 the GEMM4 tests
+/// use, because the owner is a token-identical (bit_exact) prefill drop-in, not argmax_stable.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn q8_unified_owner_prefill_is_bit_identical_to_packed_matmul() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return;
+    }
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    let (_decode_input, packed_weight, _decode_expected) = runtime_packed_ffn_down_case();
+    let input_width = packed_weight.dim(0).unwrap();
+    let output_width = packed_weight.dim(1).unwrap();
+
+    // Test ALL THREE owner microkernels: AVX2 (v1), 4x4 VNNI (v2), 4x8 VNNI (v3). Each falls back
+    // gracefully if the CPU lacks avx512vnni, and each must be byte-identical to the baseline.
+    for (vnni, x8) in [("0", "0"), ("1", "0"), ("1", "1")] {
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER", "all");
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2", "on");
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", vnni);
+        std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER_4X8", x8);
+        let owner_plan = ResolvedRuntimePlan::from_env().unwrap();
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER");
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_AVX2");
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_VNNI");
+        std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER_4X8");
+
+        // Sweep row counts: 4/8 = exact tile groups, 5/13 = ragged tail, and a couple of roles to
+        // prove the dispatch is role-agnostic under scope=All.
+        for &rows in &[4usize, 5, 8, 13, 16] {
+            for role in ["ffn_down", "linear", "attention_k"] {
+                let input = CpuTensor::from_f32(
+                    "owner_prefill_input",
+                    vec![rows, input_width],
+                    (0..rows * input_width)
+                        .map(|idx| {
+                            ((idx % input_width) as f32 - 9.0) * 0.125
+                                + (idx / input_width) as f32 * 0.0625
+                        })
+                        .collect(),
+                )
+                .unwrap();
+
+                let actual = try_q8_matmul_owner_prefill(
+                    &input,
+                    &packed_weight,
+                    "owner_actual",
+                    role,
+                    &owner_plan,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("owner should cover role={role} rows={rows}"));
+                let expected = try_x86_q8_ffn_down_packed_rows4_matmul_path(
+                    &input,
+                    &packed_weight,
+                    "owner_expected",
+                    "ffn_down",
+                    &ffn_down_packed_rows4_matmul_plan(true),
+                )
+                .unwrap()
+                .expect("packed rows4 matmul baseline");
+
+                assert_eq!(actual.shape.dims, vec![rows, output_width]);
+                for (idx, (a, b)) in actual.data.iter().zip(&expected.data).enumerate() {
+                    assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "owner vs packed-matmul bit mismatch at vnni={vnni} x8={x8} role={role} rows={rows} idx={idx}: {a} vs {b}"
+                );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -11060,6 +11157,49 @@ fn q6_k_wire_dot_consistent_with_dequant() {
         (dot - reference).abs() <= reference.abs() * 1e-5 + 1e-4,
         "q6_k dot {dot} vs dequant reference {reference}"
     );
+}
+
+/// Phase-2 follow-up parity gate: the opt-in AVX2 Q6_K row dot must be BIT-IDENTICAL
+/// to the 8-lane scalar oracle `q6_k_wire_row_dot` (not merely close) — it vectorizes
+/// only the associative integer dot and reproduces the same 8-lane f32 reduction. This
+/// is the proof obligation that lets `CAMELID_X86_Q6K_AVX2` ship without a parity risk.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn q6_k_wire_row_dot_avx2_bit_identical() {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        eprintln!("skipping: avx2 not available");
+        return;
+    }
+    let mut state: u64 = 0x1234_5678_9abc_def0;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    const WIRE: usize = super::Q6_K_WIRE_BYTES_PER_BLOCK;
+    for nblk in [1usize, 2, 5, 11] {
+        let mut wire = vec![0u8; nblk * WIRE];
+        for b in wire.iter_mut() {
+            *b = (next() & 0xff) as u8;
+        }
+        let mut blocks = Vec::with_capacity(nblk);
+        for _ in 0..nblk {
+            let mut qs = [0i8; 256];
+            for q in qs.iter_mut() {
+                *q = (next() & 0xff) as u8 as i8;
+            }
+            let d = (next() % 1000) as f32 / 333.0 + 0.001;
+            blocks.push(super::Q8KBlock { d, qs });
+        }
+        let s = super::q6_k_wire_row_dot(&wire, &blocks);
+        let v = unsafe { super::q6_k_wire_row_dot_avx2(&wire, &blocks) };
+        assert_eq!(
+            s.to_bits(),
+            v.to_bits(),
+            "q6_k 8-lane avx2 != scalar at nblk={nblk}: scalar={s} avx2={v}"
+        );
+    }
 }
 
 /// Q4_K: the wire-row dot must agree with an f64 dot of the tensor-layer

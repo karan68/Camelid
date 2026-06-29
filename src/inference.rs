@@ -59,7 +59,7 @@ pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, Ll
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_enabled_default_off, q8_0_env_flag_enabled_default_on_fail_closed,
-    Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
+    Q8MatmulOwnerScope, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
 // All remaining callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so
 // this import is unused on other targets.
@@ -407,8 +407,13 @@ impl LlamaLoadedWeights {
                 if matches!(desc.tensor_type, GgufTensorType::Tq2_0) && desc.dimensions.len() == 2 {
                     return store.load_tq2_0_wire_linear(name);
                 }
-                if matches!(desc.tensor_type, GgufTensorType::Q4K | GgufTensorType::Q6K)
-                    && desc.dimensions.len() == 2
+                if matches!(
+                    desc.tensor_type,
+                    GgufTensorType::Q4K
+                        | GgufTensorType::Q6K
+                        | GgufTensorType::Q2K
+                        | GgufTensorType::Q3K
+                ) && desc.dimensions.len() == 2
                 {
                     return store.load_kquant_wire_linear(name);
                 }
@@ -1963,9 +1968,29 @@ impl LlamaInferenceSession {
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
+        // Q2_K residency: 84-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks (the q2k_gemv
+        // kernel reads the wire bytes a super-block at a time). A Q2_K model is mostly
+        // Q2_K projections with a few promoted to Q4_K/Q6_K (the K-quant mix).
+        let is_q2k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q2K)
+                && t.q2_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
+        // Q3_K residency: 110-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks. Q2_K models
+        // mix Q3_K into attn_output / ffn_down, so a resident Q2_K model needs this lane.
+        let is_q3k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q3K)
+                && t.q3_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
         // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
-        // (Q4_K / Q6_K). Q8_0 behavior is byte-identical to before.
-        let is_resident_quant = |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t);
+        // (Q4_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
+        let is_resident_quant =
+            |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t);
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
             .weights
@@ -2141,6 +2166,16 @@ impl LlamaInferenceSession {
             .as_ref()
             .is_none_or(|slot| slot.key != key || !slot.engine.weights_ready());
         if need_build {
+            // Switching/rebuilding the resident engine: free any prior engine and
+            // return its VRAM to the driver BEFORE the new engine's fit probe. cudarc's
+            // cuMemAllocAsync pool keeps a dropped engine's bytes reserved (invisible to
+            // cuMemGetInfo), so without this the new (possibly larger) model under-counts
+            // free VRAM and falls back to the CPU path. No-op on the hot path: this only
+            // runs when a build is actually needed (key change / first build).
+            if guard.is_some() {
+                *guard = None;
+                crate::cuda::release_async_pool();
+            }
             match build_resident_cuda_engine(
                 &weights,
                 0..n_layers,
@@ -2788,6 +2823,14 @@ impl LlamaInferenceSession {
         }
         let build_started = std::time::Instant::now();
         if need_build {
+            // Free any prior resident engine and return its VRAM to the driver before
+            // the new engine's fit probe (see the matching note on the prefill path):
+            // cudarc's async pool otherwise hides the freed bytes from cuMemGetInfo and a
+            // larger model wrongly falls back to CPU. Only runs when a build is needed.
+            if guard.is_some() {
+                *guard = None;
+                crate::cuda::release_async_pool();
+            }
             match build_resident_cuda_engine(
                 &weights,
                 range.clone(),
@@ -6809,6 +6852,14 @@ fn linear_for_role_runtime_with_plan(
         linear_for_role(input, weight, name, rectangular_role)
     } else {
         let name = name.into();
+        // Lane 1: unified tiled Q8_0 prefill GEMM owner (default-off). Role-agnostic — covers
+        // every Q8_0 projection (q/k/v/o, gate/up, ffn_down) in ONE place. Returns None for
+        // decode, non-Q8, or non-PackedRows4 weights, so the default path is unchanged when off.
+        if let Some(output) =
+            try_q8_matmul_owner_prefill(input, weight, &name, rectangular_role, runtime_plan)?
+        {
+            return Ok(output);
+        }
         if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
             input,
             weight,
@@ -9906,6 +9957,12 @@ pub fn reset_resident_caches() {
     *resident_cuda_drafter_cache()
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = None;
+    // The engines dropped above returned their VRAM to cudarc's stream-ordered async
+    // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
+    // the next model's resident fit decision measures the real free VRAM — otherwise a
+    // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
+    // unload path exists to prevent).
+    crate::cuda::release_async_pool();
 }
 #[cfg(not(feature = "cuda"))]
 pub fn reset_resident_caches() {}
@@ -9976,6 +10033,16 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if t.source_type == Some(GgufTensorType::Q2K) {
+            if let Some(w) = t.q2_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
+        if t.source_type == Some(GgufTensorType::Q3K) {
+            if let Some(w) = t.q3_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
         None
     }
     // The resident GEMV lane a projection dispatches on (drives the upload repack and
@@ -9984,6 +10051,8 @@ fn build_resident_cuda_engine(
         match t.source_type {
             Some(GgufTensorType::Q4K) if t.q4_k_wire_bytes.is_some() => ProjQuant::Q4K,
             Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
+            Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
+            Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
             _ => ProjQuant::Q8_0,
         }
     }
@@ -13211,6 +13280,32 @@ fn q8_0_packed_rows4_gemm4_accumulate_block(
     }
 }
 
+/// Phase 3 (K-quant conductor): opt-in software prefetch of the weight stream ahead
+/// of the x86 packed decode dot. Default-off (`CAMELID_X86_PREFETCH`). Memory hint
+/// only — byte-identical output by construction. The macOS/aarch64 dot already issues
+/// a NEON `prfm` two blocks ahead; this gives the x86 decode dot the same option so it
+/// can be measured on a bandwidth-bound host (the Q8 gated-SIMD history says prove the
+/// win on the box before promoting to default).
+#[cfg(target_arch = "x86_64")]
+fn x86_prefetch_enabled() -> bool {
+    #[cfg(test)]
+    {
+        x86_prefetch_enabled_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        static X86_PREFETCH_ENABLED: OnceLock<bool> = OnceLock::new();
+        *X86_PREFETCH_ENABLED.get_or_init(x86_prefetch_enabled_from_env)
+    }
+}
+#[cfg(target_arch = "x86_64")]
+fn x86_prefetch_enabled_from_env() -> bool {
+    matches!(
+        env::var("CAMELID_X86_PREFETCH").as_deref(),
+        Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
 #[inline(always)]
 fn q8_0_packed_rows4_prefetch_block(block: &Q8_0PackedRows4Block) {
     #[cfg(target_arch = "x86")]
@@ -13339,6 +13434,493 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
                 },
             );
     }
+}
+
+// ===== Lane 1: unified tiled Q8_0 PREFILL GEMM owner =====
+//
+// A role-agnostic, BIT-EXACT drop-in for the per-projection prefill block-dot. It reuses the
+// proven 4x4 register microkernel `q8_0_packed_rows4_gemm4_accumulate_block` VERBATIM, so every
+// output cell still accumulates `((int as f32) * weight_scale) * input_scale` over ascending
+// blocks with no FMA — byte-identical to the scalar oracle. The ONLY difference vs the (default-
+// off, regressing) ffn_down GEMM4 lane is the loop nest: it parallelizes over OUTPUT-row bands
+// and streams every input group against an L1/L2-resident weight band, so each weight block is
+// read from DRAM ~once instead of once per 4-row input group — the arithmetic-intensity fix for
+// the bandwidth-bound host. Tiling reorders only which cells co-compute, never the per-cell
+// arithmetic sequence, so the result is byte-identical to row-at-a-time for any band size.
+
+/// Raw output pointer shared across rayon tasks. SAFETY: each task writes a DISJOINT set of
+/// (output_row, output_channel) cells — output-group bands are partitioned across tasks and each
+/// task owns its channel range [og*4, og*4+4) exclusively — so no two tasks ever touch the same
+/// cell despite the shared base pointer.
+#[derive(Clone, Copy)]
+struct Q8UnifiedOutPtr(*mut f32);
+// SAFETY: see the disjoint-write invariant on `Q8UnifiedOutPtr`.
+unsafe impl Send for Q8UnifiedOutPtr {}
+unsafe impl Sync for Q8UnifiedOutPtr {}
+
+/// Core unified tiled kernel. `output` is the 4-row-aligned region [packed_rows, output_width],
+/// row-major; `packed_rows == input_groups * 4`. Bit-identical to the per-row scalar oracle.
+#[allow(clippy::too_many_arguments)]
+fn run_q8_0_unified_prefill_tiled(
+    packed_weight: &Q8_0PackedRows4,
+    packed_inputs: &[Q8_0PackedRows4Block],
+    input_groups: usize,
+    output: &mut [f32],
+    use_avx2: bool,
+    use_vnni: bool,
+    use_4x8: bool,
+    groups_per_chunk: usize,
+) {
+    let output_width = packed_weight.rows;
+    let blocks_per_row = packed_weight.blocks_per_row;
+    debug_assert_eq!(packed_inputs.len(), input_groups * blocks_per_row);
+    debug_assert_eq!(output.len(), input_groups * 4 * output_width);
+    let output_groups = output_width / 4;
+    if output_groups == 0 || input_groups == 0 {
+        return;
+    }
+    let gpc = groups_per_chunk.max(1);
+    let num_chunks = output_groups.div_ceil(gpc);
+    let out = Q8UnifiedOutPtr(output.as_mut_ptr());
+    // Parallelize over chunks of output-row groups. Each chunk keeps its weight band resident
+    // (read once) and sweeps ALL input groups against it.
+    (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
+        // Capture the whole wrapper (Copy + Send + Sync), not the bare `*mut f32` field — Rust
+        // 2021 disjoint closure capture would otherwise grab `out.0` and reject the raw pointer.
+        #[allow(clippy::redundant_locals)]
+        let out = out;
+        let og_start = chunk_idx * gpc;
+        let og_end = ((chunk_idx + 1) * gpc).min(output_groups);
+        let mut og = og_start;
+        while og < og_end {
+            // v3: under VNNI, process TWO output groups per input load (4x8 tile) so each streamed
+            // input block serves 8 output lanes; fall back to a single 4x4 group for the odd tail.
+            if use_4x8 && og + 1 < og_end {
+                let weight_a =
+                    &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
+                let weight_b =
+                    &packed_weight.blocks[(og + 1) * blocks_per_row..(og + 2) * blocks_per_row];
+                let col_a = og * 4;
+                let col_b = (og + 1) * 4;
+                for ig in 0..input_groups {
+                    let input_blocks =
+                        &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
+                    let mut sums_a = [[0.0_f32; 4]; 4];
+                    let mut sums_b = [[0.0_f32; 4]; 4];
+                    for ((input_block, wa), wb) in input_blocks.iter().zip(weight_a).zip(weight_b) {
+                        q8_0_unified_accumulate_pair(input_block, wa, wb, &mut sums_a, &mut sums_b);
+                    }
+                    for ir in 0..4 {
+                        let row = ig * 4 + ir;
+                        // SAFETY: cols [col_a..+4] and [col_b..+4] are unique to this (og, ig, ir);
+                        // og bands are disjoint across tasks, so these writes never race.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                sums_a[ir].as_ptr(),
+                                out.0.add(row * output_width + col_a),
+                                4,
+                            );
+                            std::ptr::copy_nonoverlapping(
+                                sums_b[ir].as_ptr(),
+                                out.0.add(row * output_width + col_b),
+                                4,
+                            );
+                        }
+                    }
+                }
+                og += 2;
+                continue;
+            }
+            let weight_group =
+                &packed_weight.blocks[og * blocks_per_row..(og + 1) * blocks_per_row];
+            let col = og * 4;
+            for ig in 0..input_groups {
+                let input_blocks = &packed_inputs[ig * blocks_per_row..(ig + 1) * blocks_per_row];
+                let mut sums = [[0.0_f32; 4]; 4];
+                for (input_block, weight_block) in input_blocks.iter().zip(weight_group) {
+                    q8_0_unified_accumulate(
+                        input_block,
+                        weight_block,
+                        &mut sums,
+                        use_avx2,
+                        use_vnni,
+                    );
+                }
+                for (ir, row_sums) in sums.iter().enumerate() {
+                    let row = ig * 4 + ir;
+                    // SAFETY: cell (row, col..col+4) is unique to this (og, ig, ir); og bands are
+                    // disjoint across tasks, so this write never races another task.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row_sums.as_ptr(),
+                            out.0.add(row * output_width + col),
+                            4,
+                        );
+                    }
+                }
+            }
+            og += 1;
+        }
+    });
+}
+
+/// Whether the AVX-512 VNNI owner microkernel can run on this CPU.
+#[cfg(target_arch = "x86_64")]
+fn q8_owner_avx512vnni_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn q8_owner_avx512vnni_available() -> bool {
+    false
+}
+
+/// Per-block 4x4 accumulate for the unified owner: AVX-512 VNNI when available (v2), else the
+/// AVX2/scalar microkernel (v1). All three produce a bit-identical i32 dot (integer, order-free),
+/// so the f32 result is byte-identical regardless of which runs.
+#[inline(always)]
+fn q8_0_unified_accumulate(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+    use_avx2: bool,
+    use_vnni: bool,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if use_vnni {
+        // SAFETY: the owner dispatch sets use_vnni only when avx512f/bw/vnni are detected.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(input_block, weight_block, sums);
+        }
+        return;
+    }
+    let _ = use_vnni;
+    q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_block, sums, use_avx2);
+}
+
+/// Bit-exact AVX-512 VNNI 4x4 microkernel for the unified prefill owner. Mirrors the AVX2
+/// `q8_0_packed_rows4_gemm4_accumulate_block_avx2` but replaces maddubs+madd+hadd with a single
+/// `dpbusd` per (chunk-pair, input-lane); the weight band (64 bytes = 2 chunks) is loaded ONCE per
+/// pair and reused across the 4 input lanes. The integer dot is identical to the scalar reference
+/// (associative i32, no overflow for Q8), and the per-block f32 scale order is the same
+/// `((int as f32) * weight_scale) * input_scale` with no FMA, so the output is byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(
+    input_block: &Q8_0PackedRows4Block,
+    weight_block: &Q8_0PackedRows4Block,
+    sums: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm512_abs_epi8, _mm512_cmplt_epi8_mask, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_mask_mov_epi8, _mm512_set_epi64, _mm512_setzero_si512, _mm512_storeu_si512,
+        _mm512_sub_epi8,
+    };
+    let wq = weight_block.quants.as_ptr();
+    let iq = input_block.quants.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc = [zero; 4];
+    // Two pairs of chunks: pair p covers chunks 2p, 2p+1 = 64 weight bytes (one 512-bit load),
+    // reused across all 4 input lanes.
+    for pair in 0..2usize {
+        let chunk = pair * 2;
+        let weight64 = unsafe { _mm512_loadu_si512(wq.add(chunk * 32).cast()) };
+        let abs_weight = _mm512_abs_epi8(weight64);
+        let neg_weight_mask = _mm512_cmplt_epi8_mask(weight64, zero);
+        for (lane, acc_lane) in acc.iter_mut().enumerate() {
+            // input lane `lane`'s 8 K-values for chunk and chunk+1, broadcast to align with the
+            // 4-output-lane weight layout: [low x4 (chunk) | high x4 (chunk+1)].
+            let low =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let high = unsafe {
+                std::ptr::read_unaligned(iq.add((chunk + 1) * 32 + lane * 8).cast::<i64>())
+            };
+            let input64 = _mm512_set_epi64(high, high, high, high, low, low, low, low);
+            // dpbusd needs an UNSIGNED first operand: use abs(weight) and fold the weight sign into
+            // the (signed) input. Mirrors llama.cpp's Q8 VNNI strategy.
+            let neg_input = _mm512_sub_epi8(zero, input64);
+            let signed_input = _mm512_mask_mov_epi8(input64, neg_weight_mask, neg_input);
+            *acc_lane = _mm512_dpbusd_epi32(*acc_lane, abs_weight, signed_input);
+        }
+    }
+    for (lane, acc_lane) in acc.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums[lane][output_lane] += *dot as f32 * weight_block.scales[output_lane] * input_scale;
+        }
+    }
+}
+
+/// 4x8 dispatcher (v3): accumulate ONE input group against TWO weight groups, sharing the input
+/// load (VNNI only — wider AVX-512 register tile). Byte-identical to two independent 4x4 groups.
+/// On non-x86 this is never reached at runtime (use_vnni is always false) but must still compile.
+#[inline(always)]
+fn q8_0_unified_accumulate_pair(
+    input_block: &Q8_0PackedRows4Block,
+    weight_a: &Q8_0PackedRows4Block,
+    weight_b: &Q8_0PackedRows4Block,
+    sums_a: &mut [[f32; 4]; 4],
+    sums_b: &mut [[f32; 4]; 4],
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: only called from the use_vnni branch, which requires avx512f/bw/vnni.
+        unsafe {
+            q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
+                input_block,
+                weight_a,
+                weight_b,
+                sums_a,
+                sums_b,
+            );
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_a, sums_a, false);
+        q8_0_packed_rows4_gemm4_accumulate_block(input_block, weight_b, sums_b, false);
+    }
+}
+
+/// 4x8 VNNI microkernel (v3): one input group x TWO weight groups (8 output lanes). The input is
+/// loaded ONCE per (chunk-pair, lane) and dpbusd'd against both weight bands, so each streamed
+/// input block serves 8 output lanes instead of 4 (cuts input traffic, raises arithmetic
+/// intensity). Each cell is computed identically to the 4x4 path -> byte-identical.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni_4x8(
+    input_block: &Q8_0PackedRows4Block,
+    weight_a: &Q8_0PackedRows4Block,
+    weight_b: &Q8_0PackedRows4Block,
+    sums_a: &mut [[f32; 4]; 4],
+    sums_b: &mut [[f32; 4]; 4],
+) {
+    use std::arch::x86_64::{
+        _mm512_abs_epi8, _mm512_cmplt_epi8_mask, _mm512_dpbusd_epi32, _mm512_loadu_si512,
+        _mm512_mask_mov_epi8, _mm512_set_epi64, _mm512_setzero_si512, _mm512_storeu_si512,
+        _mm512_sub_epi8,
+    };
+    let iq = input_block.quants.as_ptr();
+    let wqa = weight_a.quants.as_ptr();
+    let wqb = weight_b.quants.as_ptr();
+    let zero = _mm512_setzero_si512();
+    let mut acc_a = [zero; 4];
+    let mut acc_b = [zero; 4];
+    for pair in 0..2usize {
+        let chunk = pair * 2;
+        let wa = unsafe { _mm512_loadu_si512(wqa.add(chunk * 32).cast()) };
+        let abs_a = _mm512_abs_epi8(wa);
+        let neg_a = _mm512_cmplt_epi8_mask(wa, zero);
+        let wb = unsafe { _mm512_loadu_si512(wqb.add(chunk * 32).cast()) };
+        let abs_b = _mm512_abs_epi8(wb);
+        let neg_b = _mm512_cmplt_epi8_mask(wb, zero);
+        for lane in 0..4usize {
+            let low =
+                unsafe { std::ptr::read_unaligned(iq.add(chunk * 32 + lane * 8).cast::<i64>()) };
+            let high = unsafe {
+                std::ptr::read_unaligned(iq.add((chunk + 1) * 32 + lane * 8).cast::<i64>())
+            };
+            let input64 = _mm512_set_epi64(high, high, high, high, low, low, low, low);
+            let neg_input = _mm512_sub_epi8(zero, input64);
+            let si_a = _mm512_mask_mov_epi8(input64, neg_a, neg_input);
+            acc_a[lane] = _mm512_dpbusd_epi32(acc_a[lane], abs_a, si_a);
+            let si_b = _mm512_mask_mov_epi8(input64, neg_b, neg_input);
+            acc_b[lane] = _mm512_dpbusd_epi32(acc_b[lane], abs_b, si_b);
+        }
+    }
+    for (lane, acc_lane) in acc_a.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums_a[lane][output_lane] += *dot as f32 * weight_a.scales[output_lane] * input_scale;
+        }
+    }
+    for (lane, acc_lane) in acc_b.iter().enumerate() {
+        let mut lanes = [0_i32; 16];
+        unsafe { _mm512_storeu_si512(lanes.as_mut_ptr().cast(), *acc_lane) };
+        let input_scale = input_block.scales[lane];
+        let dots = [
+            lanes[0] + lanes[1] + lanes[8] + lanes[9],
+            lanes[2] + lanes[3] + lanes[10] + lanes[11],
+            lanes[4] + lanes[5] + lanes[12] + lanes[13],
+            lanes[6] + lanes[7] + lanes[14] + lanes[15],
+        ];
+        for (output_lane, dot) in dots.iter().enumerate() {
+            sums_b[lane][output_lane] += *dot as f32 * weight_b.scales[output_lane] * input_scale;
+        }
+    }
+}
+
+/// Projection wrapper: quantize+pack the activation ONCE (persistent thread-local scratch),
+/// run the unified tiled kernel over the 4-aligned rows, and finish any ragged tail (rows % 4)
+/// through the same per-row scalar path the default lane uses.
+#[allow(clippy::too_many_arguments)]
+fn q8_0_unified_prefill_projection(
+    input: &CpuTensor,
+    packed: &Q8_0PackedRows4,
+    output_width: usize,
+    name: &str,
+    use_avx2: bool,
+    use_vnni: bool,
+    use_4x8: bool,
+    schedule: Q8PackedRows4MatmulSchedule,
+) -> Result<CpuTensor> {
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    if blocks_per_row != packed.blocks_per_row {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 unified prefill expected {} input blocks per row, got {blocks_per_row}",
+            packed.blocks_per_row
+        )));
+    }
+    if packed.interleave != Q8_0PackedRows4Interleave::I8 || packed.rows != output_width {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q8_0 unified prefill requires matching I8 packed output, got interleave {:?}, packed rows {}, output {}",
+            packed.interleave, packed.rows, output_width
+        )));
+    }
+    q8_0_packed_rows4_output_groups(output_width, "unified prefill projection")?;
+
+    let packed_rows = rows / 4 * 4;
+    if packed_rows == 0 {
+        return q8_0_packed_rows4_matmul_projection(input, packed, output_width, name, schedule);
+    }
+
+    let mut output = vec![0.0_f32; rows * output_width];
+    Q8_0_PREFILL_PACKED_INPUTS.with(|cell| {
+        let mut packed_inputs = cell.borrow_mut();
+        packed_inputs.clear();
+        quantize_pack_q8_0_rows4_i8_direct_into(
+            &input.data[..packed_rows * input_width],
+            packed_rows,
+            input_width,
+            blocks_per_row,
+            &mut packed_inputs,
+        );
+        let input_groups = packed_rows / 4;
+        run_q8_0_unified_prefill_tiled(
+            packed,
+            &packed_inputs,
+            input_groups,
+            &mut output[..packed_rows * output_width],
+            use_avx2,
+            use_vnni,
+            use_4x8,
+            schedule.groups_per_chunk,
+        );
+        // Retain scratch capacity for the next projection (persistent thread-local); do NOT cap
+        // to zero, which would re-allocate the packed-input buffer on every call.
+        packed_inputs.clear();
+    });
+
+    let tail_rows = rows - packed_rows;
+    if tail_rows > 0 {
+        with_q8_0_file_reader_quantized_inputs(|quantized_inputs| {
+            quantized_inputs.clear();
+            quantized_inputs.reserve(tail_rows * blocks_per_row);
+            for row in input.data[packed_rows * input_width..].chunks_exact(input_width) {
+                quantize_q8_0_blocks_into(row, quantized_inputs);
+            }
+            for tail_row in 0..tail_rows {
+                let input_start = tail_row * blocks_per_row;
+                let output_start = (packed_rows + tail_row) * output_width;
+                accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                    &quantized_inputs[input_start..input_start + blocks_per_row],
+                    packed,
+                    Q8_0PackedRows4Interleave::I8,
+                    &mut output[output_start..output_start + output_width],
+                );
+            }
+            Ok(())
+        })?;
+    }
+
+    CpuTensor::from_f32(name, vec![rows, output_width], output)
+}
+
+/// Role-agnostic dispatch for the unified tiled Q8_0 prefill GEMM owner. Returns `Some(out)` to
+/// short-circuit the per-role block-dot when the owner scope covers this role and the projection
+/// is eligible (Q8_0 weight with the load-time PackedRows4/I8 repack, prefill batch rows>=4,
+/// `input_width % 32 == 0`, `output_width % 4 == 0`). Returns `None` for decode (rows<4), non-Q8,
+/// or any non-PackedRows4 weight, so those fall through to the existing default path unchanged.
+fn try_q8_matmul_owner_prefill(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: &str,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<Option<CpuTensor>> {
+    let scope: Q8MatmulOwnerScope = runtime_plan.q8.q8_matmul_owner;
+    if !scope.covers_role(rectangular_role) {
+        return Ok(None);
+    }
+    if input.rank() != 2 || weight.rank() != 2 {
+        return Ok(None);
+    }
+    let rows = input.dim(0)?;
+    if rows < 4 {
+        return Ok(None); // prefill-only; decode (rows<4) stays on the existing path
+    }
+    let input_width = input.dim(1)?;
+    if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
+        return Ok(None);
+    }
+    if weight.source_type != Some(GgufTensorType::Q8_0) {
+        return Ok(None);
+    }
+    let weight_rows = weight.dim(0)?;
+    let weight_cols = weight.dim(1)?;
+    let output_width = if weight_rows == input_width {
+        weight_cols
+    } else if weight_cols == input_width {
+        weight_rows
+    } else {
+        return Ok(None);
+    };
+    if !output_width.is_multiple_of(4) {
+        return Ok(None);
+    }
+    let Some(Q8_0RuntimeStorage::PackedRows4(packed)) = weight.q8_0_runtime_storage.as_ref() else {
+        return Ok(None);
+    };
+    if packed.interleave != Q8_0PackedRows4Interleave::I8
+        || packed.rows != output_width
+        || packed.blocks_per_row != input_width / Q8_0_BLOCK_VALUES
+    {
+        return Ok(None);
+    }
+    let use_vnni = runtime_plan.q8.q8_matmul_owner_vnni && q8_owner_avx512vnni_available();
+    let use_4x8 = use_vnni && runtime_plan.q8.q8_matmul_owner_4x8;
+    let output = q8_0_unified_prefill_projection(
+        input,
+        packed,
+        output_width,
+        name,
+        runtime_plan.q8.q8_matmul_owner_avx2,
+        use_vnni,
+        use_4x8,
+        runtime_plan.q8_packed_rows4_matmul_schedule,
+    )?;
+    Ok(Some(output))
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -15465,7 +16047,7 @@ fn accumulate_transposed_linear_row_q6_k(input_row: &[f32], wire: &[u8], output:
     let q8 = quantize_q8_k_blocks(input_row);
     output.par_iter_mut().enumerate().for_each(|(o, slot)| {
         let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-        *slot = q6_k_wire_row_dot(w_row, &q8);
+        *slot = q6_k_wire_row_dot_simd(w_row, &q8);
     });
 }
 
@@ -15509,7 +16091,7 @@ fn matmul_rhs_transposed_q6_k_block_dot(
             let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
             preps
                 .iter()
-                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .map(|q8| q6_k_wire_row_dot_simd(w_row, q8))
                 .collect()
         })
         .collect();
@@ -15526,11 +16108,18 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// off (fail-closed): without it, Q4_K 2-D linears have no CPU consumer (their
 /// wire bytes are retained for the GPU resident path), so the gate cannot
 /// regress any working CPU behavior — it only adds one.
-fn q4_k_cpu_block_dot_enabled() -> bool {
-    matches!(
-        std::env::var("CAMELID_X86_Q4K_DECODE").ok().as_deref(),
-        Some("1") | Some("on") | Some("true") | Some("yes") | Some("enabled")
-    )
+/// CPU K-quant (Q4_K / Q6_K) decode block-dot. **DEFAULT-ON** (opt out with
+/// `CAMELID_X86_Q4K_DECODE=0`). K-quant 2-D linears load WIRE-ONLY (no f32 `data`)
+/// for the resident GPU engine; with this gate off the CPU linear path has no
+/// consumer for them and errors (`no-row-major-data`, data_len=0). The GPU-resident
+/// decode lane never reaches this chokepoint (it runs q4k_gemv/q6k_gemv on-GPU), so
+/// default-on changes ONLY CPU-mode K-quant decode — turning a hard error into
+/// parity-correct output (Q4_K via the AVX2 `q4_k_dot_arm`, Q6_K via the 8-lane
+/// `q6_k_wire_row_dot`). Windows greedy parity is proven vs llama.cpp acd79d6
+/// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
+/// documented follow-up.
+pub(crate) fn q4_k_cpu_block_dot_enabled() -> bool {
+    q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q4K_DECODE")
 }
 
 /// Streaming Q4_K linear: quantise each input row to Q8_K once, then dot it
@@ -15645,7 +16234,7 @@ fn q6_k_block_dot_core(
             let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
             preps
                 .iter()
-                .map(|q8| q6_k_wire_row_dot(w_row, q8))
+                .map(|q8| q6_k_wire_row_dot_simd(w_row, q8))
                 .collect()
         })
         .collect();
@@ -15741,6 +16330,118 @@ pub(crate) fn q6_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
                 aux32[l] += scale * (y.qs[off + 8 + l] as i32) * (a[off + 8 + l] as i32);
             }
         }
+        for l in 0..8 {
+            sums[l] += d * aux32[l] as f32;
+        }
+    }
+    sums.iter().sum()
+}
+
+/// K-quant conductor Phase 2 follow-up: opt-in AVX2 Q6_K row dot
+/// (`CAMELID_X86_Q6K_AVX2`, default-off). BIT-IDENTICAL to [`q6_k_wire_row_dot`]
+/// by construction — it vectorizes ONLY the associative integer `aux32[8]` and
+/// keeps the load-bearing 8-lane f32 reduction (`sums[l] += d * aux32[l]`, then
+/// the left-fold `sums.iter().sum()`) exactly as the scalar oracle. (The refmath
+/// `q6_k_dot_avx2` is NOT a substitute: it mirrors the single-accumulator
+/// `q6_k_dot_scalar` order, a different bit pattern.) Default-off until measured —
+/// CPU decode is bandwidth-bound on the dev box, so this is expected to be ~null.
+#[cfg(target_arch = "x86_64")]
+fn q6k_avx2_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q6k_avx2_enabled_from_env()
+    }
+    #[cfg(not(test))]
+    {
+        static Q6K_AVX2_ENABLED: OnceLock<bool> = OnceLock::new();
+        *Q6K_AVX2_ENABLED.get_or_init(q6k_avx2_enabled_from_env)
+    }
+}
+#[cfg(target_arch = "x86_64")]
+fn q6k_avx2_enabled_from_env() -> bool {
+    matches!(
+        env::var("CAMELID_X86_Q6K_AVX2").as_deref(),
+        Ok("on") | Ok("ON") | Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+/// Dispatcher used by the Q6_K CPU decode block-dots: AVX2 when enabled+available,
+/// else the scalar oracle. Both produce identical bits.
+#[inline]
+fn q6_k_wire_row_dot_simd(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if q6k_avx2_enabled() && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 just confirmed present; the kernel is value-identical to
+            // q6_k_wire_row_dot (proven by q6_k_wire_row_dot_avx2_bit_identical).
+            return unsafe { q6_k_wire_row_dot_avx2(weight_wire, input) };
+        }
+    }
+    q6_k_wire_row_dot(weight_wire, input)
+}
+
+/// AVX2 sibling of [`q6_k_wire_row_dot`] — see `q6k_avx2_enabled` for the parity
+/// contract. Vectorizes the per-superblock integer dot into the oracle's 8
+/// position-lanes (`aux32[l]`), exact integers; the 6-bit rebuild and the f32
+/// reduction stay byte-for-byte identical to the scalar path.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6_k_wire_row_dot_avx2(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    use std::arch::x86_64::*;
+    const WIRE: usize = Q6_K_WIRE_BYTES_PER_BLOCK;
+    let mut sums = [0f32; 8];
+    for (i, y) in input.iter().enumerate() {
+        let base = i * WIRE;
+        let block = &weight_wire[base..base + WIRE];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]])) * y.d;
+
+        // Identical scalar rebuild of the 256 signed 6-bit weights.
+        let mut a = [0i8; Q6_K_VALUES_PER_BLOCK];
+        let (mut ql, mut qh, mut w) = (0usize, 128usize, 0usize);
+        for _ in 0..2 {
+            for l in 0..32 {
+                a[w + l] = (((block[ql + l] & 0xF) as i32 | (((block[qh + l] & 3) as i32) << 4))
+                    - 32) as i8;
+                a[w + l + 32] = (((block[ql + l + 32] & 0xF) as i32
+                    | ((((block[qh + l] >> 2) & 3) as i32) << 4))
+                    - 32) as i8;
+                a[w + l + 64] = (((block[ql + l] >> 4) as i32
+                    | ((((block[qh + l] >> 4) & 3) as i32) << 4))
+                    - 32) as i8;
+                a[w + l + 96] = (((block[ql + l + 32] >> 4) as i32
+                    | ((((block[qh + l] >> 6) & 3) as i32) << 4))
+                    - 32) as i8;
+            }
+            w += 128;
+            ql += 64;
+            qh += 32;
+        }
+
+        // aux32[l] = Σ_j scale_j · (q8[16j+l]·a[16j+l] + q8[16j+8+l]·a[16j+8+l]),
+        // l in 0..8, all exact integers (associative — SIMD lane order is free).
+        let mut acc = _mm256_setzero_si256();
+        let aptr = a.as_ptr();
+        let qptr = y.qs.as_ptr();
+        for j in 0..16 {
+            let off = j * 16;
+            let a16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(aptr.add(off) as *const __m128i));
+            let q16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(qptr.add(off) as *const __m128i));
+            // 16 i16 products (exact, fit i16); low 128 = products[0..8], high = [8..16]
+            let prod = _mm256_mullo_epi16(a16, q16);
+            let pair = _mm_add_epi16(
+                _mm256_castsi256_si128(prod),
+                _mm256_extracti128_si256(prod, 1),
+            ); // 8 i16 = prod[l] + prod[l+8]
+            let scaled = _mm256_mullo_epi32(
+                _mm256_cvtepi16_epi32(pair),
+                _mm256_set1_epi32(block[192 + j] as i8 as i32),
+            );
+            acc = _mm256_add_epi32(acc, scaled);
+        }
+        let mut aux32 = [0i32; 8];
+        _mm256_storeu_si256(aux32.as_mut_ptr() as *mut __m256i, acc);
+
+        // Load-bearing 8-lane f32 reduction — identical to the scalar oracle.
         for l in 0..8 {
             sums[l] += d * aux32[l] as f32;
         }
@@ -15862,6 +16563,147 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
         sumf -= dmin * y.d * sumi as f32;
     }
     sumf + sums.iter().sum::<f32>()
+}
+
+/// Q2_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel `ggml_vec_dot_q2_K_q8_K`. Each 84-byte
+/// super-block is scales[16] (low nibble = quant scale, high nibble = min scale,
+/// one pair per 16-value sub-block), qs[64] (2-bit quants), d(f16), dmin(f16).
+/// Unlike Q4_K/Q6_K the reference keeps a SINGLE integer `isum` per super-block, so
+/// each super-block contributes `dall·isum − dmin·summs` (subtraction first) to the
+/// f32 sum, summed in order. The `q2k_gemv` CUDA kernel reproduces this exactly.
+/// Correctness-first scalar (the reference's "no SIMD" generic shape).
+#[allow(dead_code, clippy::needless_range_loop)]
+pub(crate) fn q2_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    const WIRE: usize = 84; // Q2_K super-block: scales[16] + qs[64] + d + dmin (f16)
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let scales = &block[0..16];
+        let qs = &block[16..80];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[80], block[81]]));
+        let dmin = f16_bits_to_f32(u16::from_le_bytes([block[82], block[83]]));
+
+        // mins side: Σ over the 16 sub-blocks of (per-16 activation sum) × min scale
+        let mut summs = 0i32;
+        for j in 0..16 {
+            let bsum: i32 = y.qs[j * 16..(j + 1) * 16].iter().map(|&q| q as i32).sum();
+            summs += bsum * (scales[j] >> 4) as i32;
+        }
+
+        // main side: 2 halves × 4 groups; each group reuses the same 32 qs bytes at
+        // shift 2*group, split into a low (l<16) and high (l>=16) sub-block, each
+        // with its own low-nibble quant scale. q8 advances 32 per group.
+        let mut isum = 0i32;
+        let mut is = 0usize;
+        for k in 0..2 {
+            let mut shift = 0u32;
+            for j in 0..4 {
+                let dlo = (scales[is] & 0xF) as i32;
+                is += 1;
+                let mut isuml = 0i32;
+                for l in 0..16 {
+                    isuml +=
+                        y.qs[k * 128 + j * 32 + l] as i32 * ((qs[k * 32 + l] >> shift) & 3) as i32;
+                }
+                isum += dlo * isuml;
+                let dhi = (scales[is] & 0xF) as i32;
+                is += 1;
+                let mut isuml2 = 0i32;
+                for l in 0..16 {
+                    isuml2 += y.qs[k * 128 + j * 32 + 16 + l] as i32
+                        * ((qs[k * 32 + 16 + l] >> shift) & 3) as i32;
+                }
+                isum += dhi * isuml2;
+                shift += 2;
+            }
+        }
+
+        let dall = d * y.d;
+        let dminx = dmin * y.d;
+        sumf += dall * isum as f32 - dminx * summs as f32;
+    }
+    sumf
+}
+
+/// Q3_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel `ggml_vec_dot_q3_K_q8_K`. Each 110-byte
+/// super-block is hmask[32] (high bit of each 3-bit quant), qs[64] (low 2 bits),
+/// scales[12] (16 signed 6-bit scales, kmask-packed), d(f16). Q3_K has NO mins: the
+/// 3-bit quant is reconstructed as `((qs>>shift)&3) - (hmask_bit ? 0 : 4)` (centered
+/// to −4..3) and dequantized as `d·(scale−32)·value`. So each super-block contributes
+/// a single `d·isum` (isum = Σ_sb (scale−32)·Σ q8·value), summed in order. The
+/// `q3k_gemv` CUDA kernel reproduces this exactly. Correctness-first scalar.
+#[allow(dead_code, clippy::needless_range_loop)]
+pub(crate) fn q3_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    const WIRE: usize = 110; // Q3_K super-block: hmask[32] + qs[64] + scales[12] + d(f16)
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let hmask = &block[0..32];
+        let qs = &block[32..96];
+        let scales_raw = &block[96..108];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[108], block[109]]));
+
+        // Expand the 16 signed 6-bit scales (kmask scheme), as Q3KBlock::expanded_scales.
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let mut aux = [
+            u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]),
+            u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]),
+            u32::from_le_bytes([scales_raw[8], scales_raw[9], scales_raw[10], scales_raw[11]]),
+            0u32,
+        ];
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let mut scales = [0i8; 16];
+        for c in 0..4 {
+            let b = aux[c].to_le_bytes();
+            for k in 0..4 {
+                scales[c * 4 + k] = b[k] as i8;
+            }
+        }
+
+        // isum = Σ over the 16 sub-blocks of (scale−32) × Σ q8·value. 2 halves × 4
+        // groups × {low,high}; qs reused per group at shift 2*group; hmask bit advances
+        // per group (1<<(half*4+group)); q8 in natural order.
+        let mut isum = 0i32;
+        let mut sb = 0usize;
+        let mut high_mask = 1u8;
+        for half in 0..2 {
+            let value_base = half * 32;
+            let q8_base = half * 128;
+            let mut shift = 0u32;
+            for g in 0..4 {
+                let sc_lo = scales[sb] as i32 - 32;
+                sb += 1;
+                let mut dot = 0i32;
+                for l in 0..16 {
+                    let hb = if hmask[l] & high_mask != 0 { 0 } else { 4 };
+                    let v = ((qs[value_base + l] >> shift) & 3) as i32 - hb;
+                    dot += y.qs[q8_base + g * 32 + l] as i32 * v;
+                }
+                isum += sc_lo * dot;
+                let sc_hi = scales[sb] as i32 - 32;
+                sb += 1;
+                let mut dot2 = 0i32;
+                for l in 0..16 {
+                    let hb = if hmask[16 + l] & high_mask != 0 { 0 } else { 4 };
+                    let v = ((qs[value_base + 16 + l] >> shift) & 3) as i32 - hb;
+                    dot2 += y.qs[q8_base + g * 32 + 16 + l] as i32 * v;
+                }
+                isum += sc_hi * dot2;
+                shift += 2;
+                high_mask <<= 1;
+            }
+        }
+
+        sumf += d * y.d * isum as f32;
+    }
+    sumf
 }
 
 /// Q5_0×Q8_0 dot of one weight row read straight from the GGUF wire bytes,
@@ -18642,6 +19484,20 @@ fn q8_0_packed_rows4_dot(
                         ptr = in(reg) next_block.quants.as_ptr(),
                         options(nostack, preserves_flags, readonly)
                     );
+                }
+            }
+        }
+        // Phase 3: opt-in x86 weight-stream prefetch, two packed blocks ahead — the
+        // x86 mirror of the macOS NEON `prfm` above. Default-off; a memory hint only,
+        // so the decoded values are byte-identical regardless of the flag.
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            not(all(target_os = "macos", target_arch = "aarch64"))
+        ))]
+        {
+            if x86_prefetch_enabled() {
+                if let Some(next_block) = packed_blocks.get(idx + 2) {
+                    q8_0_packed_rows4_prefetch_block(next_block);
                 }
             }
         }

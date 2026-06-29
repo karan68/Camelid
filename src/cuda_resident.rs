@@ -701,6 +701,201 @@ extern "C" __global__ void q6k_gemv(
     }
 }
 
+// ---- Q2_K GEMV: one warp per output row, fused dequant + integer dot ---------
+// Bit-identical reproduction of the CPU oracle `q2_k_wire_row_dot`
+// (ggml_vec_dot_q2_K_q8_K generic shape). The activation is Q8_K (256-wide
+// blocks). Weights are read STRAIGHT from the 84-byte GGUF wire super-block:
+// scales[16] (each byte: low nibble = quant scale, high nibble = min scale),
+// qs[64] (2-bit quants), d(f16), dmin(f16). Unlike q4k/q6k, the reference keeps a
+// SINGLE integer accumulator `isum` per super-block (no 8-lane f32 split), so the
+// per-super-block term is just `dall*isum - dmin*summs`, summed over super-blocks
+// IN ORDER. Each lane owns whole super-blocks and stashes (isum, summs) in shared;
+// lane 0 replays the ordered f32 reduction so the result matches the oracle.
+//
+// PARITY ANCHOR: isum and summs are integers (exact, order-free). Lane 0 forms
+// `dall*(float)isum - dmin*(float)summs` per super-block (subtraction first, the
+// oracle's `dall*isum - dmin*summs`) and accumulates left-to-right — the only
+// f32-order-sensitive step, reproduced exactly.
+extern "C" __global__ void q2k_gemv(
+    const float* __restrict__ input_scales,         // n_sb f32 (Q8_K d per superblock)
+    const signed char* __restrict__ input_quants,   // n_sb*256 i8 (Q8_K quants)
+    const unsigned char* __restrict__ weight_bytes, // RAW 84-byte Q2_K wire, row-major
+    int rows, int n_sb, float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem2[];
+    signed char* s_iq = (signed char*)smem2;                 // n_sb*256 i8 staged input
+    float* s_is = (float*)(smem2 + (long)n_sb * 256);        // n_sb f32 staged scales
+    // per-warp scratch: 2 ints (isum, summs) per superblock.
+    int* acc = (int*)(smem2 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*2 int
+    int tid = threadIdx.x;
+    for (int i = tid; i < n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // n_sb*256 bytes as ints
+    for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const int WIRE = 84;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myacc = acc + (long)warp * n_sb * 2;
+    if (row < rows) {
+        long row_sb0 = (long)row * n_sb;
+        for (int b = lane; b < n_sb; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            const signed char* y256 = s_iq + (long)b * 256;  // staged activation
+            const unsigned char* sc = blk;          // scales[16]
+            const unsigned char* qs = blk + 16;     // qs[64] (2-bit quants)
+            // Mins side: per-16 activation sums (bsums) times the high-nibble min
+            // scale of each sub-block, summed over the 16 sub-blocks (oracle order).
+            int summs = 0;
+            for (int j = 0; j < 16; j++) {
+                int bsum = 0;
+                for (int l = 0; l < 16; l++) bsum += (int)y256[j * 16 + l];
+                summs += bsum * (int)(sc[j] >> 4);
+            }
+            // Main side: 2 halves x 4 groups; each group reuses the same 32 qs bytes
+            // at shift 2*group, split into a low (l<16) and high (l>=16) sub-block,
+            // each with its own low-nibble quant scale. q8 advances 32 per group.
+            int isum = 0;
+            int is = 0;
+            for (int k = 0; k < 2; k++) {
+                int shift = 0;
+                for (int j = 0; j < 4; j++) {
+                    int dlo = (int)(sc[is++] & 0xF);
+                    int isuml = 0;
+                    for (int l = 0; l < 16; l++)
+                        isuml += (int)y256[k * 128 + j * 32 + l]
+                               * (int)((qs[k * 32 + l] >> shift) & 3);
+                    isum += dlo * isuml;
+                    int dhi = (int)(sc[is++] & 0xF);
+                    isuml = 0;
+                    for (int l = 0; l < 16; l++)
+                        isuml += (int)y256[k * 128 + j * 32 + 16 + l]
+                               * (int)((qs[k * 32 + 16 + l] >> shift) & 3);
+                    isum += dhi * isuml;
+                    shift += 2;
+                }
+            }
+            myacc[b * 2 + 0] = isum;
+            myacc[b * 2 + 1] = summs;
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        long row_sb0 = (long)row * n_sb;
+        float sumf = 0.0f;
+        for (int b = 0; b < n_sb; b++) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            float d = f16_bits_to_f32((unsigned short)blk[80] | ((unsigned short)blk[81] << 8));
+            float dmin = f16_bits_to_f32((unsigned short)blk[82] | ((unsigned short)blk[83] << 8));
+            float dact = s_is[b];
+            float dall = d * dact;
+            float dminx = dmin * dact;
+            sumf += dall * (float)myacc[b * 2 + 0] - dminx * (float)myacc[b * 2 + 1];
+        }
+        output[row] = residual ? (output[row] + sumf) : sumf;
+    }
+}
+
+// ---- Q3_K GEMV: one warp per output row, fused dequant + integer dot ---------
+// Bit-identical reproduction of the CPU oracle `q3_k_wire_row_dot`
+// (ggml_vec_dot_q3_K_q8_K). 110-byte wire: hmask[32] (high bit of each 3-bit
+// quant), qs[64] (low 2 bits), scales[12] (16 signed 6-bit scales, kmask-packed),
+// d(f16). NO mins: the 3-bit quant is `((qs>>shift)&3) - (hmask_bit ? 0 : 4)` and
+// dequant = d*(scale-32)*value. Each super-block contributes a single d*isum
+// (isum = Σ_sb (scale-32)*Σ q8*value), summed IN ORDER. Each lane owns whole
+// super-blocks and stashes isum (1 int); lane 0 replays the ordered f32 reduction.
+extern "C" __global__ void q3k_gemv(
+    const float* __restrict__ input_scales,
+    const signed char* __restrict__ input_quants,
+    const unsigned char* __restrict__ weight_bytes, // RAW 110-byte Q3_K wire, row-major
+    int rows, int n_sb, float* __restrict__ output, int residual
+) {
+    extern __shared__ unsigned char smem3[];
+    signed char* s_iq = (signed char*)smem3;                 // n_sb*256 i8 staged input
+    float* s_is = (float*)(smem3 + (long)n_sb * 256);        // n_sb f32 staged scales
+    int* acc = (int*)(smem3 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*1 int
+    int tid = threadIdx.x;
+    for (int i = tid; i < n_sb * 64; i += blockDim.x)
+        ((int*)s_iq)[i] = ((const int*)input_quants)[i];
+    for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
+    __syncthreads();
+
+    const int WIRE = 110;
+    const unsigned int KMASK1 = 0x03030303u, KMASK2 = 0x0f0f0f0fu;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warps_per_block = blockDim.x >> 5;
+    int row = blockIdx.x * warps_per_block + warp;
+    int* myacc = acc + (long)warp * n_sb;
+    if (row < rows) {
+        long row_sb0 = (long)row * n_sb;
+        for (int b = lane; b < n_sb; b += 32) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            const signed char* y256 = s_iq + (long)b * 256;
+            const unsigned char* hmask = blk;          // hmask[32]
+            const unsigned char* qs = blk + 32;        // qs[64]
+            const unsigned char* sr = blk + 96;        // scales[12]
+            // Expand the 16 signed 6-bit scales (kmask scheme).
+            unsigned int a0 = (unsigned int)sr[0] | ((unsigned int)sr[1] << 8) | ((unsigned int)sr[2] << 16) | ((unsigned int)sr[3] << 24);
+            unsigned int a1 = (unsigned int)sr[4] | ((unsigned int)sr[5] << 8) | ((unsigned int)sr[6] << 16) | ((unsigned int)sr[7] << 24);
+            unsigned int a2 = (unsigned int)sr[8] | ((unsigned int)sr[9] << 8) | ((unsigned int)sr[10] << 16) | ((unsigned int)sr[11] << 24);
+            unsigned int tmp = a2;
+            unsigned int e2 = ((a0 >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+            unsigned int e3 = ((a1 >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+            unsigned int e0 = (a0 & KMASK2) | ((tmp & KMASK1) << 4);
+            unsigned int e1 = (a1 & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+            signed char sc[16];
+            sc[0]=(signed char)(e0&0xff); sc[1]=(signed char)((e0>>8)&0xff); sc[2]=(signed char)((e0>>16)&0xff); sc[3]=(signed char)((e0>>24)&0xff);
+            sc[4]=(signed char)(e1&0xff); sc[5]=(signed char)((e1>>8)&0xff); sc[6]=(signed char)((e1>>16)&0xff); sc[7]=(signed char)((e1>>24)&0xff);
+            sc[8]=(signed char)(e2&0xff); sc[9]=(signed char)((e2>>8)&0xff); sc[10]=(signed char)((e2>>16)&0xff); sc[11]=(signed char)((e2>>24)&0xff);
+            sc[12]=(signed char)(e3&0xff); sc[13]=(signed char)((e3>>8)&0xff); sc[14]=(signed char)((e3>>16)&0xff); sc[15]=(signed char)((e3>>24)&0xff);
+            int isum = 0;
+            int sb = 0;
+            unsigned int high_mask = 1u;
+            for (int half = 0; half < 2; half++) {
+                int value_base = half * 32;
+                int q8_base = half * 128;
+                int shift = 0;
+                for (int g = 0; g < 4; g++) {
+                    int sc_lo = (int)sc[sb] - 32; sb++;
+                    int dot = 0;
+                    for (int l = 0; l < 16; l++) {
+                        int hb = (hmask[l] & high_mask) ? 0 : 4;
+                        int v = (int)((qs[value_base + l] >> shift) & 3) - hb;
+                        dot += (int)y256[q8_base + g * 32 + l] * v;
+                    }
+                    isum += sc_lo * dot;
+                    int sc_hi = (int)sc[sb] - 32; sb++;
+                    int dot2 = 0;
+                    for (int l = 0; l < 16; l++) {
+                        int hb = (hmask[16 + l] & high_mask) ? 0 : 4;
+                        int v = (int)((qs[value_base + 16 + l] >> shift) & 3) - hb;
+                        dot2 += (int)y256[q8_base + g * 32 + 16 + l] * v;
+                    }
+                    isum += sc_hi * dot2;
+                    shift += 2;
+                    high_mask <<= 1;
+                }
+            }
+            myacc[b] = isum;
+        }
+    }
+    __syncwarp();
+    if (row < rows && lane == 0) {
+        long row_sb0 = (long)row * n_sb;
+        float sumf = 0.0f;
+        for (int b = 0; b < n_sb; b++) {
+            const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
+            float d = f16_bits_to_f32((unsigned short)blk[108] | ((unsigned short)blk[109] << 8));
+            float dact = s_is[b];
+            sumf += d * dact * (float)myacc[b];
+        }
+        output[row] = residual ? (output[row] + sumf) : sumf;
+    }
+}
+
 // ---- Fused SiLU-gate * up + Q8_0 quantize (F3) ------------------------------
 // One thread per 32-block: compute silu(gate)*up for the block's 32 elements (bit-
 // identical to silu_mul) and quantize them (bit-identical to quantize_q8_0), straight
@@ -1782,6 +1977,8 @@ pub struct CudaResidentKernels {
     pub(crate) q4_1_gemv: CudaFunction,
     pub(crate) q4k_gemv: CudaFunction,
     pub(crate) q6k_gemv: CudaFunction,
+    pub(crate) q2k_gemv: CudaFunction,
+    pub(crate) q3k_gemv: CudaFunction,
     pub(crate) quantize_q8k: CudaFunction,
     pub(crate) rms_norm_quantize_q8k: CudaFunction,
     pub(crate) silu_mul_quantize_q8k: CudaFunction,
@@ -1846,6 +2043,8 @@ impl CudaResidentKernels {
             q4_1_gemv: f("q4_1_gemv")?,
             q4k_gemv: f("q4k_gemv")?,
             q6k_gemv: f("q6k_gemv")?,
+            q2k_gemv: f("q2k_gemv")?,
+            q3k_gemv: f("q3k_gemv")?,
             quantize_q8k: f("quantize_q8k")?,
             rms_norm_quantize_q8k: f("rms_norm_quantize_q8k")?,
             silu_mul_quantize_q8k: f("silu_mul_quantize_q8k")?,
@@ -1916,7 +2115,7 @@ fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
 fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
     match q {
         ProjQuant::Q8_0 => repack_q8_soa(bytes),
-        ProjQuant::Q4K | ProjQuant::Q6K => bytes.to_vec(),
+        ProjQuant::Q4K | ProjQuant::Q6K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
     }
 }
 
@@ -2139,6 +2338,82 @@ pub(crate) fn launch_q6k_gemv(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+/// Q2_K GEMV launch: same warp-per-row geometry as `launch_q6k_gemv`. Input is
+/// Q8_K (`n_sb` f32 scales + `n_sb*256` i8 quants); weight is the RAW 84-byte
+/// Q2_K wire bytes (no SoA repack). Shared holds the staged Q8_K input vector
+/// (`n_sb*256` i8 + `n_sb` f32) shared by all warps, then each warp's per-super-block
+/// 2-int scratch (isum, summs) for lane 0's ordered f32 reduction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_q2k_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    n_sb: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let n_sb_u = n_sb as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input: n_sb*256 i8 + n_sb*4 f32; per-warp scratch: n_sb*2 i32.
+        shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 2 * 4,
+    };
+    let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Q3_K GEMV launch: same warp-per-row geometry as `launch_q2k_gemv`. Input is
+/// Q8_K (`n_sb` f32 scales + `n_sb*256` i8 quants); weight is the RAW 110-byte
+/// Q3_K wire bytes (no SoA repack). Shared holds the staged Q8_K input vector plus
+/// each warp's per-super-block 1-int scratch (isum) for lane 0's ordered f32
+/// reduction (Q3_K has no mins term).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_q3k_gemv(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    in_scales: &CudaSlice<f32>,
+    in_quants: &CudaSlice<i8>,
+    weight: &CudaView<u8>,
+    rows: usize,
+    n_sb: usize,
+    out: &mut CudaSlice<f32>,
+    residual: i32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let warps_per_block = block / 32;
+    let n_sb_u = n_sb as u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((rows as u32).div_ceil(warps_per_block), 1, 1),
+        block_dim: (block, 1, 1),
+        // staged input: n_sb*256 i8 + n_sb*4 f32; per-warp scratch: n_sb*1 i32.
+        shared_mem_bytes: n_sb_u * 256 + n_sb_u * 4 + warps_per_block * n_sb_u * 4,
+    };
+    let (r, nb) = (rows as i32, n_sb as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(in_scales)
+        .arg(in_quants)
+        .arg(weight)
+        .arg(&r)
+        .arg(&nb)
+        .arg(out)
+        .arg(&residual);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 /// Q4_0 GEMV launch: same warp-per-row geometry as `launch_gemv` (q8). Input is
 /// Q8_0 (`blocks_per_row` f32 scales + `blocks_per_row*32` i8 quants); weight is the
 /// RAW 18-byte Q4_0 wire bytes (no SoA repack). Shared holds the staged Q8_0 input
@@ -2271,6 +2546,28 @@ fn dispatch_gemv(
         ProjQuant::Q6K => launch_q6k_gemv(
             s,
             &kern.q6k_gemv,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            out,
+            residual,
+        ),
+        ProjQuant::Q2K => launch_q2k_gemv(
+            s,
+            &kern.q2k_gemv,
+            q8k_scales,
+            q8k_quants,
+            weight,
+            rows,
+            cols / 256,
+            out,
+            residual,
+        ),
+        ProjQuant::Q3K => launch_q3k_gemv(
+            s,
+            &kern.q3k_gemv,
             q8k_scales,
             q8k_quants,
             weight,
@@ -3175,12 +3472,17 @@ pub enum ProjQuant {
     Q8_0,
     Q4K,
     Q6K,
+    Q2K,
+    Q3K,
 }
 
 impl ProjQuant {
     /// Whether the GEMV reads a Q8_K activation (true for the K-quant lanes).
     fn needs_q8k(self) -> bool {
-        matches!(self, ProjQuant::Q4K | ProjQuant::Q6K)
+        matches!(
+            self,
+            ProjQuant::Q4K | ProjQuant::Q6K | ProjQuant::Q2K | ProjQuant::Q3K
+        )
     }
 }
 

@@ -42,14 +42,14 @@ pub enum EvalOutcome {
 }
 
 impl EvalOutcome {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             EvalOutcome::Pass => "PASS",
             EvalOutcome::Fail => "FAIL",
             EvalOutcome::Inconclusive => "INCONCLUSIVE",
         }
     }
-    fn exit(self) -> i32 {
+    pub fn exit(self) -> i32 {
         match self {
             EvalOutcome::Pass => EXIT_PASS,
             EvalOutcome::Fail => EXIT_FAIL,
@@ -239,7 +239,9 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             workdir: work.clone(),
             max_steps: cfg.max_steps,
             auto_approve: true,
+            yolo: false,
             allow_net: false,
+            allow_fs: false,
             shell_timeout: Duration::from_secs(20),
             max_tokens: cfg.max_tokens,
             temperature: 0.0,
