@@ -16,6 +16,8 @@
 
 mod agent;
 mod agent_eval;
+mod agent_orchestration;
+mod agent_syscap;
 mod audit;
 mod banner;
 mod client;
@@ -27,10 +29,13 @@ mod palette;
 mod server;
 mod session;
 mod shell_sandbox;
+mod subagent;
 mod theme;
 mod tool_parse;
 mod tools;
 mod tui;
+#[cfg(windows)]
+mod win_job;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -186,6 +191,46 @@ pub fn run_agent_eval(opts: AgentEvalOptions) -> anyhow::Result<i32> {
         max_steps: opts.max_steps,
         max_tokens: opts.max_tokens,
         receipt_dir: opts.receipt_dir,
+    })
+}
+
+/// Parsed `camelid agent-syscap-eval` flags.
+pub struct AgentSyscapOptions {
+    pub receipt_dir: PathBuf,
+}
+
+/// Entry for the `agent-syscap-eval` subcommand: the Phase-1 Windows
+/// system-control gate. Returns PASS(0) / FAIL(1) / INCONCLUSIVE(3) and emits a
+/// sealed `camelid.agent-syscap-receipt/v1`.
+pub fn run_agent_syscap_eval(opts: AgentSyscapOptions) -> anyhow::Result<i32> {
+    agent_syscap::run(agent_syscap::SyscapConfig {
+        receipt_dir: opts.receipt_dir,
+    })
+}
+
+/// Entry for the hidden `__subagent` worker subcommand: run one scoped agent loop
+/// described by `task_file` and write its result file. Returns 0/1/3.
+pub fn run_subagent_worker(task_file: &std::path::Path) -> anyhow::Result<i32> {
+    subagent::run_worker(task_file)
+}
+
+/// Parsed `camelid agent-orchestration-eval` flags.
+pub struct AgentOrchestrationOptions {
+    pub receipt_dir: PathBuf,
+    pub model: Option<PathBuf>,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
+}
+
+/// Entry for the `agent-orchestration-eval` subcommand: the orchestration gate.
+/// Without `--model` it runs the canned rung-2 mechanics battery; with `--model`
+/// it runs the rung-3 real-model round-trip. Returns 0/1/3.
+pub fn run_agent_orchestration_eval(opts: AgentOrchestrationOptions) -> anyhow::Result<i32> {
+    agent_orchestration::run(agent_orchestration::OrchestrationConfig {
+        receipt_dir: opts.receipt_dir,
+        model: opts.model,
+        addr: opts.addr,
+        load_timeout: opts.load_timeout,
     })
 }
 

@@ -147,6 +147,33 @@ pub fn resolve_policy(auto_approve: bool, production: bool) -> Result<Policy, St
 /// Consecutive identical (tool + args) calls before the loop gives up.
 const REPEAT_LIMIT: usize = 3;
 
+/// Result-aware no-progress guard. Records the outcome for a call signature and
+/// returns true once that exact call has produced the SAME result on
+/// REPEAT_LIMIT consecutive attempts (genuinely stuck — e.g. re-reading the same
+/// file). A call whose result keeps changing — e.g. polling
+/// `check_subagent_status` while a subagent runs (running → completed) — resets
+/// the counter and is never flagged, so legitimate polling is not cut off.
+fn note_no_progress(
+    counts: &mut HashMap<String, (usize, String)>,
+    signature: &str,
+    outcome: &ToolOutcome,
+) -> bool {
+    let entry = counts
+        .entry(signature.to_string())
+        .or_insert((0, String::new()));
+    if entry.0 > 0 && entry.1 == outcome.text() {
+        entry.0 += 1;
+    } else {
+        entry.0 = 1;
+        entry.1 = outcome.text().to_string();
+    }
+    entry.0 >= REPEAT_LIMIT
+}
+
+fn repeat_notice(name: &str) -> String {
+    format!("stopping: `{name}` repeated {REPEAT_LIMIT}× with the same result and no progress")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     driver: &mut dyn ModelDriver,
@@ -159,7 +186,9 @@ pub fn run_loop(
     history: &mut Vec<AgentMsg>,
 ) -> LoopEnd {
     let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
-    let mut call_counts: HashMap<String, usize> = HashMap::new();
+    // Per-call (count, last_result): the no-progress guard is result-aware (see
+    // `note_no_progress`).
+    let mut call_counts: HashMap<String, (usize, String)> = HashMap::new();
     let mut ran: BTreeMap<String, usize> = BTreeMap::new();
 
     for _ in 0..cfg.max_steps {
@@ -187,19 +216,7 @@ pub fn run_loop(
                         reporter.notice("aborted");
                         return LoopEnd::Aborted;
                     }
-                    // Stop a model that keeps emitting the same (failing) call
-                    // instead of burning the whole step budget on it.
                     let signature = format!("{}::{}", call.name, call.args);
-                    let seen = call_counts.entry(signature).or_insert(0);
-                    *seen += 1;
-                    if *seen >= REPEAT_LIMIT {
-                        reporter.notice(&format!(
-                            "stopping: `{}` was attempted {REPEAT_LIMIT} times with the same \
-                             arguments and no progress",
-                            call.name
-                        ));
-                        return LoopEnd::Repeated;
-                    }
                     *ran.entry(call.name.clone()).or_insert(0) += 1;
                     // Validate against schema + sandbox. A bad/unknown/escape call
                     // becomes a tool-error result the model can recover from.
@@ -209,10 +226,16 @@ pub fn run_loop(
                             reporter.tool_call(&format!("{}(?)", call.name));
                             let outcome = ToolOutcome::Err(e);
                             reporter.tool_result(&call.name, &outcome);
+                            let stuck = note_no_progress(&mut call_counts, &signature, &outcome);
+                            let stop = stuck.then(|| repeat_notice(&call.name));
                             history.push(AgentMsg::ToolResult {
                                 name: call.name,
                                 outcome,
                             });
+                            if let Some(msg) = stop {
+                                reporter.notice(&msg);
+                                return LoopEnd::Repeated;
+                            }
                             continue;
                         }
                     };
@@ -253,11 +276,21 @@ pub fn run_loop(
                             execute_audited(&action, sandbox, tier, &call.args, cfg.audit.as_ref())
                         }
                     };
-                    reporter.tool_result(action.tool_name(), &outcome);
+                    let name = action.tool_name();
+                    reporter.tool_result(name, &outcome);
+                    // Result-aware no-progress guard: stop only if the SAME call has
+                    // returned the SAME result REPEAT_LIMIT times in a row. A call
+                    // whose result keeps changing — e.g. polling
+                    // check_subagent_status until a subagent finishes — is progress.
+                    let stuck = note_no_progress(&mut call_counts, &signature, &outcome);
                     history.push(AgentMsg::ToolResult {
-                        name: action.tool_name().to_string(),
+                        name: name.to_string(),
                         outcome,
                     });
+                    if stuck {
+                        reporter.notice(&repeat_notice(name));
+                        return LoopEnd::Repeated;
+                    }
                 }
             }
         }
@@ -376,11 +409,11 @@ impl ModelDriver for LiveDriver {
     fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
         let tool_defs = tools_to_json(tools);
         // First try with a standalone system role (Llama 3.x etc. — unchanged).
-        let text = match self
+        let turn = match self
             .client
-            .chat_blocking(&self.request(history, &tool_defs, false))
+            .chat_turn(&self.request(history, &tool_defs, false))
         {
-            Ok((text, _, _)) => text,
+            Ok(turn) => turn,
             Err(err) => {
                 let msg = err.to_string();
                 // Some chat templates (Mistral v0.3, Gemma) reject a standalone
@@ -393,19 +426,34 @@ impl ModelDriver for LiveDriver {
                     || msg.contains("chat template")
                 {
                     self.client
-                        .chat_blocking(&self.request(history, &tool_defs, true))
+                        .chat_turn(&self.request(history, &tool_defs, true))
                         .map_err(|e| e.to_string())?
-                        .0
                 } else {
                     return Err(msg);
                 }
             }
         };
-        let calls = super::tool_parse::parse(&text, &self.family);
-        if calls.is_empty() {
-            Ok(ModelStep::Text(text))
-        } else {
+        // Prefer the server's STRUCTURED tool_calls (OpenAI shape): the server
+        // parses the model's tool call and EMPTIES `content`, so reading only the
+        // text would miss every call. Fall back to family-specific text parsing
+        // for any path that instead carries the call inside `content`.
+        if !turn.tool_calls.is_empty() {
+            let calls = turn
+                .tool_calls
+                .into_iter()
+                .map(|tc| ToolCall {
+                    name: tc.name,
+                    args: serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({})),
+                })
+                .collect();
             Ok(ModelStep::Calls(calls))
+        } else {
+            let calls = super::tool_parse::parse(&turn.content, &self.family);
+            if calls.is_empty() {
+                Ok(ModelStep::Text(turn.content))
+            } else {
+                Ok(ModelStep::Calls(calls))
+            }
         }
     }
 }
@@ -636,6 +684,19 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
         banner::dim("describe a goal · /tools list tools · /steps budget · /exit quit")
     );
 
+    // Enable subagent orchestration for this session: children share this serve
+    // (same addr → resident model reused) and inherit the same gates. Capped
+    // (concurrency, depth-1) inside the spawn path. Until this call, the
+    // spawn_subagent/check_subagent_status tools are not advertised.
+    super::subagent::configure(super::subagent::SubagentConfig::for_session(
+        addr,
+        session.active_id.clone().unwrap_or_default(),
+        session.active_family(),
+        cfg.max_tokens,
+        cfg.auto_approve,
+        cfg.shell_sandbox,
+    ));
+
     let tools = tools::specs(cfg.allow_net, sandbox.shell_mode());
     let mut rl = rustyline::DefaultEditor::new()?;
     let mut driver = LiveDriver::new(session, cfg.max_tokens, cfg.temperature);
@@ -682,9 +743,16 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
-                        "help" => {
-                            println!("{}", banner::dim("type a goal; /tools /steps /stop /exit"))
-                        }
+                        // List this session's subagents (live + finished). Their
+                        // output is untrusted data, surfaced compact + truncated.
+                        "subagents" => println!(
+                            "{}",
+                            banner::dim(&super::subagent::list_summary(sandbox.root()))
+                        ),
+                        "help" => println!(
+                            "{}",
+                            banner::dim("type a goal; /tools /steps /subagents /stop /exit")
+                        ),
                         "stop" => println!("{}", banner::dim("nothing running")),
                         other => println!("{}", banner::dim(&format!("unknown command /{other}"))),
                     }
@@ -919,8 +987,27 @@ mod tests {
             &mut history,
         );
         assert_eq!(end, LoopEnd::Repeated);
-        // Stopped at the repeat limit (3), not the 25-step cap.
-        assert!(reporter.results.len() < 3);
+        // Stopped at the repeat limit (same call, same result REPEAT_LIMIT times),
+        // not the 25-step cap.
+        assert!(reporter.results.len() <= REPEAT_LIMIT);
+    }
+
+    #[test]
+    fn no_progress_guard_is_result_aware() {
+        let running = ToolOutcome::Ok("running".to_string());
+        let completed = ToolOutcome::Ok("completed".to_string());
+        // Same call but a CHANGING result (polling running → completed) is
+        // progress and is never flagged.
+        let mut poll = HashMap::new();
+        assert!(!note_no_progress(&mut poll, "check::x", &running));
+        assert!(!note_no_progress(&mut poll, "check::x", &running));
+        assert!(!note_no_progress(&mut poll, "check::x", &completed));
+        assert!(!note_no_progress(&mut poll, "check::x", &running));
+        // Same call AND same result REPEAT_LIMIT times in a row → stuck.
+        let mut stuck = HashMap::new();
+        assert!(!note_no_progress(&mut stuck, "read::y", &running));
+        assert!(!note_no_progress(&mut stuck, "read::y", &running));
+        assert!(note_no_progress(&mut stuck, "read::y", &running));
     }
 
     #[test]
