@@ -9,6 +9,14 @@ use crate::metal;
 
 pub(super) type ResidentDecodeState = metal::ResidentDecodeState;
 
+/// Maximum speculative-verify window (`[last_token, drafts...]`), mirroring the CUDA host's
+/// `MAX_VERIFY_K`. `k = drafts.len() + 1 <= MAX_VERIFY_K`.
+// Used only by the non-cuda Metal verify seam (verify_drafts_metal / verify_tree_metal), whose
+// callers are `#[cfg(not(feature = "cuda"))]` — so on a cuda build (Windows default / Linux
+// --all-features) this is genuinely unused; allow it rather than trip clippy `-D dead_code`.
+#[allow(dead_code)]
+pub(super) const MAX_VERIFY_K: usize = 8;
+
 /// The resident stack's view of one weight's bytes: page-aligned wire pages when
 /// the fast-load path attached them (the GPU wraps them in place), else the
 /// materialized 36-byte CPU blocks.
@@ -311,5 +319,313 @@ impl super::LlamaInferenceSession {
                 CpuTensor::from_f32("resident_hidden", vec![1, hidden], out)?,
             ))),
         }
+    }
+
+    /// macOS speculative-verify seam: verify a batch of draft tokens against the resident
+    /// Metal engine in ONE batched forward (`metal::ResidentDecodeState::verify_batch`,
+    /// bit-identical to `k` single-token decodes) and return the accepted prefix (the longest
+    /// run the model confirms plus the bonus token at the first mismatch). Mirrors the CUDA
+    /// `verify_drafts_gpu` host orchestration over `self.resident_decode`. Returns `Ok(None)`
+    /// (caller takes a normal step / CPU chunk-verify) whenever the engine isn't ready exactly
+    /// at the current KV position or the config is unsupported — lossless either way, since the
+    /// target verify is authoritative and `accepted` is exactly what greedy decode would emit.
+    #[cfg(target_os = "macos")]
+    pub(super) fn verify_drafts_metal(
+        &mut self,
+        last_token: u32,
+        drafts: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
+        if drafts.is_empty() || self.resident_paths_disabled || !resident_decode_metal_enabled() {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        let k = drafts.len() + 1;
+        if k > MAX_VERIFY_K
+            || position + k > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(None);
+        }
+        // The engine must already hold this sequence with KV materialized exactly to `position`
+        // (mid-decode). Otherwise route the caller to its lossless CPU fallback, which seeds /
+        // rebuilds the engine on a normal step.
+        if self
+            .resident_decode
+            .as_ref()
+            .is_none_or(|s| s.filled() != position)
+        {
+            return Ok(None);
+        }
+
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let vocab = dims.vocab_size;
+        // `verify_batch` runs the whole decode stack + logits; a pipeline-sharded node owns only
+        // a layer subrange (no logits stage), so it falls back to the CPU verify.
+        if weights.layer_range.is_some() {
+            return Ok(None);
+        }
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // Inputs `[last_token, drafts...]` land at positions `[position, position+k)`.
+        let mut inputs = Vec::with_capacity(k);
+        inputs.push(last_token);
+        inputs.extend_from_slice(drafts);
+        let embeddings = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&inputs, "token_embedding_spec_verify")?;
+
+        // Per-position RoPE tables (position `base+i`), flattened position-major.
+        let mut cos_all = Vec::with_capacity(k * head_dim);
+        let mut sin_all = Vec::with_capacity(k * head_dim);
+        for i in 0..k {
+            match rope::resident_decode_rope_tables(
+                position + i,
+                head_dim,
+                &self.config,
+                weights.rope_freqs.as_ref(),
+            )? {
+                Some(t) => {
+                    cos_all.extend_from_slice(&t.cos);
+                    sin_all.extend_from_slice(&t.sin);
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|l| metal::ResidentLayerWeights {
+                attn_norm: &l.attention_norm.data,
+                ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                q_weight_blocks: resident_weight_bytes(&l.attention_q),
+                k_weight_blocks: resident_weight_bytes(&l.attention_k),
+                v_weight_blocks: resident_weight_bytes(&l.attention_v),
+                o_weight_blocks: resident_weight_bytes(&l.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+            })
+            .collect();
+        let logits_stage = metal::LogitsStage {
+            final_norm: &weights.output_norm.data,
+            output_weight_blocks: resident_weight_bytes(weights.output_projection()),
+            vocab_size: vocab,
+        };
+
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident session present (readiness checked above)");
+        let predicted = match session.verify_batch(
+            &embeddings.data,
+            &cos_all,
+            &sin_all,
+            &layer_views,
+            &logits_stage,
+            position,
+            k,
+            scale,
+        ) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Accept the longest prefix of drafts the model confirms, plus the bonus token at the
+        // first mismatch (`predicted[0]` is always taken). Identical accept rule to the CUDA arm.
+        let acc = crate::inference::speculative::accepted_draft_prefix(
+            drafts,
+            &predicted[..drafts.len()],
+        );
+        let emitted = predicted[..=acc].to_vec();
+        let new_position = position + emitted.len();
+        session.set_filled(new_position);
+        self.kv_cache.position = new_position;
+        if std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some() {
+            eprintln!(
+                "[metal-spec-verify] base={position} k={k} accepted={acc} emitted_len={}",
+                emitted.len()
+            );
+        }
+        Ok(Some(emitted))
+    }
+
+    /// macOS speculative-verify seam (TREE variant): verify a draft TOKEN TREE against the
+    /// resident Metal engine in ONE batched forward (`metal::ResidentDecodeState::verify_batch_tree`,
+    /// bit-identical to `verify_batch` on a single-branch tree) and return the accepted longest
+    /// path — every emitted token is the target's own greedy argmax along that path
+    /// (`accept_longest_path`). Mirrors the CUDA `verify_tree_gpu` host orchestration over
+    /// `self.resident_decode`. Returns `Ok(None)` (caller takes a normal step) whenever the engine
+    /// isn't ready exactly at the current KV position or the config is unsupported — lossless
+    /// either way, since the target verify is authoritative.
+    #[cfg(target_os = "macos")]
+    pub(super) fn verify_tree_metal(
+        &mut self,
+        tree: &spec_tree::TokenTree,
+    ) -> Result<Option<Vec<u32>>> {
+        use spec_tree::TREE_MAX_NODES;
+        if self.resident_paths_disabled || !resident_decode_metal_enabled() {
+            return Ok(None);
+        }
+        let n = tree.nodes();
+        if n == 0 {
+            return Ok(None);
+        }
+        let position = self.kv_cache.position;
+        // Each node lands at slot base+BFS-idx; the committed path is at most `n` tokens.
+        // Bound by the cache and the node cap (mirrors the cuda host).
+        if n > TREE_MAX_NODES
+            || position + n > self.kv_cache.plan.max_sequence_length
+            || !self.resident_decode_eligible(true)?
+        {
+            return Ok(None);
+        }
+        // The engine must already hold this sequence with KV materialized exactly to `position`
+        // (mid-decode). Otherwise route the caller to its lossless fallback / normal step.
+        if self
+            .resident_decode
+            .as_ref()
+            .is_none_or(|s| s.filled() != position)
+        {
+            return Ok(None);
+        }
+
+        let weights = Arc::clone(&self.weights);
+        let dims = DenseLlamaDims::from_config(&self.config)?;
+        let head_dim = dims.head_dim;
+        let vocab = dims.vocab_size;
+        // `verify_batch_tree` runs the whole decode stack + logits; a pipeline-sharded node owns
+        // only a layer subrange (no logits stage), so it falls back to a normal step.
+        if weights.layer_range.is_some() {
+            return Ok(None);
+        }
+        let scale = attention_score_scale_value(head_dim, diagnostic_attention_score_scale()?);
+
+        // Embeddings in BFS (node) order: node 0 is the anchor, nodes 1.. the drafts.
+        let embeddings = self
+            .weights
+            .token_embedding
+            .embedding_lookup(&tree.tokens, "token_embedding_tree_verify")?;
+
+        // Per-node RoPE tables at position `base + node_depth[i]` (flattened node-major).
+        let node_depth = tree.node_depth();
+        let mut cos_all = Vec::with_capacity(n * head_dim);
+        let mut sin_all = Vec::with_capacity(n * head_dim);
+        for &d in &node_depth {
+            match rope::resident_decode_rope_tables(
+                position + d as usize,
+                head_dim,
+                &self.config,
+                weights.rope_freqs.as_ref(),
+            )? {
+                Some(t) => {
+                    cos_all.extend_from_slice(&t.cos);
+                    sin_all.extend_from_slice(&t.sin);
+                }
+                _ => return Ok(None),
+            }
+        }
+        let node_kvslot = tree.node_kvslot(position);
+        let (ancestor_bits, words) = tree.ancestor_bitset();
+
+        let layer_views: Vec<metal::ResidentLayerWeights> = weights
+            .layers
+            .iter()
+            .map(|l| metal::ResidentLayerWeights {
+                attn_norm: &l.attention_norm.data,
+                ffn_norm: &l.ffn_norm.data,
+                q_norm: l.attention_q_norm.as_ref().map(|t| t.data.as_slice()),
+                k_norm: l.attention_k_norm.as_ref().map(|t| t.data.as_slice()),
+                q_weight_blocks: resident_weight_bytes(&l.attention_q),
+                k_weight_blocks: resident_weight_bytes(&l.attention_k),
+                v_weight_blocks: resident_weight_bytes(&l.attention_v),
+                o_weight_blocks: resident_weight_bytes(&l.attention_output),
+                gate_weight_blocks: resident_weight_bytes(&l.ffn_gate),
+                up_weight_blocks: resident_weight_bytes(&l.ffn_up),
+                down_weight_blocks: resident_weight_bytes(&l.ffn_down),
+            })
+            .collect();
+        let logits_stage = metal::LogitsStage {
+            final_norm: &weights.output_norm.data,
+            output_weight_blocks: resident_weight_bytes(weights.output_projection()),
+            vocab_size: vocab,
+        };
+
+        let session = self
+            .resident_decode
+            .as_mut()
+            .expect("resident session present (readiness checked above)");
+        let predicted = match session.verify_batch_tree(
+            &embeddings.data,
+            &cos_all,
+            &sin_all,
+            &layer_views,
+            &logits_stage,
+            &node_kvslot,
+            &ancestor_bits,
+            words,
+            position,
+            n,
+            scale,
+        ) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Host accept: longest greedy-exact path through the tree, then COMPACT the accepted
+        // path's KV into contiguous slots base..base+L-1 so the cache matches a linear decode of
+        // that path (no-op for a single-branch tree). Identical accept rule to the CUDA arm.
+        let (emitted, leaf) = tree.accept_longest_path(&predicted);
+        let path = tree.path_to(leaf); // includes the anchor (node 0); root first
+        session.compact_tree_kv_path(&path, position).map_err(|e| {
+            BackendError::RuntimeShapeMismatch(format!("tree KV compaction failed: {e}"))
+        })?;
+        let new_position = position + emitted.len();
+        session.set_filled(new_position);
+        self.kv_cache.position = new_position;
+        if std::env::var_os("CAMELID_SPEC_VERIFY_TRACE").is_some() {
+            // Max fan-out = the most children any node has (1 == single-branch / linear).
+            let mut child_count = vec![0u32; n];
+            for i in 1..n {
+                let p = tree.parent[i];
+                if p >= 0 {
+                    child_count[p as usize] += 1;
+                }
+            }
+            let max_fanout = child_count.iter().copied().max().unwrap_or(0);
+            eprintln!(
+                "[metal-tree-verify] base={position} n={n} emitted_len={} max_fanout={max_fanout}",
+                emitted.len()
+            );
+        }
+        Ok(Some(emitted))
+    }
+
+    /// Non-macOS build: the Metal resident speculative-verify path is unavailable, so return
+    /// `Ok(None)` and let the caller fall back to the CPU chunk verify (lossless either way).
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)] // unused on cuda builds: the caller is #[cfg(not(feature = "cuda"))]
+    pub(super) fn verify_drafts_metal(
+        &mut self,
+        _last_token: u32,
+        _drafts: &[u32],
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
+    }
+
+    /// Non-macOS build: the Metal resident tree-verify path is unavailable — return `Ok(None)`
+    /// so the caller takes a normal step (lossless either way).
+    #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)] // unused on cuda builds: the caller is #[cfg(not(feature = "cuda"))]
+    pub(super) fn verify_tree_metal(
+        &mut self,
+        _tree: &spec_tree::TokenTree,
+    ) -> Result<Option<Vec<u32>>> {
+        Ok(None)
     }
 }
