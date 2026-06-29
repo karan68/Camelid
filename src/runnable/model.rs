@@ -20,6 +20,8 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+use rayon::prelude::*;
+
 use crate::error::{BackendError, Result};
 use crate::gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType};
 use crate::model::LlamaModelConfig;
@@ -95,6 +97,22 @@ impl RawMat {
             in_features: self.in_features,
             out_features: len,
         }
+    }
+
+    /// Row-parallel matvec: `y[r] = dot(dequant_row(r), x)`, computed across rows
+    /// with rayon. **Bit-identical** to `dequant_all(name)?.matvec(x)` — each row's
+    /// dot product is sequential (sum order unchanged) and only the independent rows
+    /// run in parallel — but ~Nx faster and lower peak memory (no whole-matrix f32
+    /// allocation; each row is dequantized, dotted, and dropped). Used by the qwen35
+    /// path so the agent loop runs at usable speed without perturbing parity. Q8_0
+    /// rows are a whole number of quant blocks, so a per-row dequant equals the
+    /// corresponding slice of a whole-matrix dequant.
+    fn par_matvec(&self, x: &[f32], name: &str) -> Result<Vec<f32>> {
+        debug_assert_eq!(x.len(), self.in_features);
+        (0..self.out_features)
+            .into_par_iter()
+            .map(|r| Ok(dot(&self.dequant_row(r, name)?, x)))
+            .collect()
     }
 }
 
@@ -998,30 +1016,25 @@ impl RunnableModel {
             // FFN (SwiGLU), pre-normed by post_attention_norm; residual base is the
             // post-attention hidden state (matches qwen35.cpp ffn_residual).
             let xn2 = rms_norm(&hidden, &layer.post_attn_norm, self.eps);
-            let g = layer
-                .ffn_gate
-                .dequant_all(&name(li, "ffn_gate"))?
-                .matvec(&xn2);
-            let u = layer.ffn_up.dequant_all(&name(li, "ffn_up"))?.matvec(&xn2);
+            let g = layer.ffn_gate.par_matvec(&xn2, &name(li, "ffn_gate"))?;
+            let u = layer.ffn_up.par_matvec(&xn2, &name(li, "ffn_up"))?;
             let mut act = vec![0.0f32; g.len()];
             for i in 0..g.len() {
                 act[i] = silu(g[i]) * u[i];
             }
-            let d = layer
-                .ffn_down
-                .dequant_all(&name(li, "ffn_down"))?
-                .matvec(&act);
+            let d = layer.ffn_down.par_matvec(&act, &name(li, "ffn_down"))?;
             for (h, dv) in hidden.iter_mut().zip(d.iter()) {
                 *h += *dv;
             }
         }
 
+        // Final norm + LM head (row-parallel: the 248k-row output projection is the
+        // single biggest per-token cost; bit-identical to the sequential loop).
         let normed = rms_norm(&hidden, &self.output_norm, self.eps);
-        let mut logits = vec![0.0f32; self.vocab];
-        for (tk, lt) in logits.iter_mut().enumerate() {
-            let row = self.output.dequant_row(tk, "output")?;
-            *lt = dot(&row, &normed);
-        }
+        let logits = (0..self.vocab)
+            .into_par_iter()
+            .map(|tk| Ok(dot(&self.output.dequant_row(tk, "output")?, &normed)))
+            .collect::<Result<Vec<f32>>>()?;
         Ok(logits)
     }
 
@@ -1047,7 +1060,7 @@ impl RunnableModel {
         let group = n_head / n_kv;
 
         // Fused Q+gate: [query(hd) | gate(hd)] interleaved per head.
-        let qg = wq.dequant_all(&name(li, "attn_q"))?.matvec(xn);
+        let qg = wq.par_matvec(xn, &name(li, "attn_q"))?;
         let mut q = vec![0.0f32; n_head * hd];
         let mut gate = vec![0.0f32; n_head * hd];
         for h in 0..n_head {
@@ -1057,8 +1070,8 @@ impl RunnableModel {
         }
         norm_heads(&mut q, n_head, hd, q_norm, self.eps);
 
-        let mut k = wk.dequant_all(&name(li, "attn_k"))?.matvec(xn);
-        let v = wv.dequant_all(&name(li, "attn_v"))?.matvec(xn);
+        let mut k = wk.par_matvec(xn, &name(li, "attn_k"))?;
+        let v = wv.par_matvec(xn, &name(li, "attn_v"))?;
         norm_heads(&mut k, n_kv, hd, k_norm, self.eps);
 
         // Partial NEOX RoPE: rotates the first rope_dim (64) of each 256-wide head.
@@ -1106,7 +1119,7 @@ impl RunnableModel {
         for (a, gt) in attn_out.iter_mut().zip(gate.iter()) {
             *a *= sigmoid(*gt);
         }
-        Ok(wo.dequant_all(&name(li, "attn_output"))?.matvec(&attn_out))
+        wo.par_matvec(&attn_out, &name(li, "attn_output"))
     }
 
     /// Qwen3.5 gated-delta-net (SSM) layer — the autoregressive recurrence.
@@ -1145,10 +1158,10 @@ impl RunnableModel {
         let d_conv = rt.d_conv;
         let cm1 = d_conv - 1;
 
-        let qkv = wqkv.dequant_all(&name(li, "attn_qkv"))?.matvec(xn);
-        let z = wqkv_gate.dequant_all(&name(li, "attn_gate"))?.matvec(xn);
-        let beta_raw = beta_m.dequant_all(&name(li, "ssm_beta"))?.matvec(xn);
-        let alpha_raw = alpha_m.dequant_all(&name(li, "ssm_alpha"))?.matvec(xn);
+        let qkv = wqkv.par_matvec(xn, &name(li, "attn_qkv"))?;
+        let z = wqkv_gate.par_matvec(xn, &name(li, "attn_gate"))?;
+        let beta_raw = beta_m.par_matvec(xn, &name(li, "ssm_beta"))?;
+        let alpha_raw = alpha_m.par_matvec(xn, &name(li, "ssm_alpha"))?;
         let mut beta = vec![0.0f32; nv];
         let mut glog = vec![0.0f32; nv];
         for h in 0..nv {
@@ -1241,9 +1254,7 @@ impl RunnableModel {
                 final_out[h * hv + j] = normed[j] * silu(zh[j]);
             }
         }
-        Ok(ssm_out
-            .dequant_all(&name(li, "ssm_out"))?
-            .matvec(&final_out))
+        ssm_out.par_matvec(&final_out, &name(li, "ssm_out"))
     }
 }
 

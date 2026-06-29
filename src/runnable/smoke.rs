@@ -414,4 +414,83 @@ mod tests {
         eprintln!("=== ORNITH qwen35 G-LOAD ===\nPROMPT:\n{text}\n--- GEN ({GEN_TOKENS} tok) ---\n{out}\nTOKENS: {generated:?}\nlogit_range=[{lo:.2},{hi:.2}]");
         check_not_degenerate(&generated).expect("coherent, non-degenerate generation");
     }
+
+    /// Phase-3 parity helper: dump the rendered chat prompt + its qwen35 prompt token
+    /// IDs (tokenizer-only, no weights → fast). Feed these exact IDs to the llama.cpp
+    /// oracle so the parity comparison isolates the model forward from tokenization.
+    /// Ignored: needs `CAMELID_ORNITH_GGUF`. Run `--release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the Ornith qwen35 GGUF metadata; set CAMELID_ORNITH_GGUF"]
+    fn ornith_qwen35_prompt_tokens() {
+        let path = std::env::var("CAMELID_ORNITH_GGUF")
+            .expect("set CAMELID_ORNITH_GGUF to the Ornith-1.0-9B Q8_0 GGUF path");
+        let gguf = read_metadata(&path).expect("read gguf metadata");
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let (text, add_special, parse_special) = build_prompt(&tok);
+        let prompt = tok
+            .encode(&text, add_special, parse_special)
+            .expect("encode prompt");
+        // Machine-parseable lines for the parity harness to scrape.
+        eprintln!(
+            "RENDERED_PROMPT_JSON={}",
+            serde_json::to_string(&text).unwrap()
+        );
+        eprintln!(
+            "PROMPT_TOKENS_JSON={}",
+            serde_json::to_string(&prompt).unwrap()
+        );
+        eprintln!(
+            "ADD_SPECIAL={add_special} PARSE_SPECIAL={parse_special} N_PROMPT={}",
+            prompt.len()
+        );
+    }
+
+    /// Phase-3 parity helper A (fast, tokenizer-only): tokenize each prompt in the
+    /// JSON-array env `CAMELID_PARITY_PROMPTS` with raw-completion conventions
+    /// (add_special=true, parse_special=false) and print the token-id arrays. Feed
+    /// these identical arrays to BOTH the llama.cpp oracle and camelid so the parity
+    /// comparison isolates the model forward.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (+ CAMELID_PARITY_PROMPTS)"]
+    fn ornith_qwen35_tokenize_set() {
+        let path = std::env::var("CAMELID_ORNITH_GGUF").expect("set CAMELID_ORNITH_GGUF");
+        let prompts: Vec<String> = serde_json::from_str(
+            &std::env::var("CAMELID_PARITY_PROMPTS")
+                .unwrap_or_else(|_| "[\"What is the capital of France?\"]".into()),
+        )
+        .expect("CAMELID_PARITY_PROMPTS must be a JSON array of strings");
+        let gguf = read_metadata(&path).expect("read gguf");
+        let tok = Tokenizer::from_gguf(&gguf).expect("tokenizer");
+        for (i, p) in prompts.iter().enumerate() {
+            let ids = tok.encode(p, true, false).expect("encode");
+            eprintln!(
+                "TOKSET[{i}] PROMPT={} TOKENS={}",
+                serde_json::to_string(p).unwrap(),
+                serde_json::to_string(&ids).unwrap()
+            );
+        }
+    }
+
+    /// Phase-3 parity helper B (slow, full forward): for each token-id array in the
+    /// JSON env `CAMELID_PARITY_TOKENS` (array of arrays of u32), greedy-decode
+    /// `CAMELID_PARITY_NPREDICT` (default 20) tokens and print the generated ids.
+    /// Run AFTER the llama-server oracle is shut down (both models can't fit RAM).
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF + CAMELID_PARITY_TOKENS (run with oracle server OFF)"]
+    fn ornith_qwen35_parity_gen() {
+        let path = std::env::var("CAMELID_ORNITH_GGUF").expect("set CAMELID_ORNITH_GGUF");
+        let token_sets: Vec<Vec<u32>> = serde_json::from_str(
+            &std::env::var("CAMELID_PARITY_TOKENS").expect("set CAMELID_PARITY_TOKENS"),
+        )
+        .expect("CAMELID_PARITY_TOKENS must be a JSON array of u32 arrays");
+        let n_predict: usize = std::env::var("CAMELID_PARITY_NPREDICT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        for (i, prompt) in token_sets.iter().enumerate() {
+            let gen = model.generate(prompt, n_predict).expect("greedy decode");
+            eprintln!("PARITY_GEN[{i}] {}", serde_json::to_string(&gen).unwrap());
+        }
+    }
 }

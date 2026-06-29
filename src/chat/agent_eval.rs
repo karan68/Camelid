@@ -370,7 +370,12 @@ fn family_for(gguf: &std::path::Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if name.contains("qwen") {
+    // Ornith / qwen35 emit the custom `<function=…>` XML tool format, which routes
+    // to `parse_ornith`. Check before "qwen" (the model is Qwen3.5-derived but its
+    // tool grammar differs from Qwen2/Qwen3 JSON-in-`<tool_call>`).
+    if name.contains("ornith") || name.contains("qwen35") || name.contains("qwen3.5") {
+        "ornith".into()
+    } else if name.contains("qwen") {
         "qwen".into()
     } else if name.contains("mistral") {
         "mistral".into()
