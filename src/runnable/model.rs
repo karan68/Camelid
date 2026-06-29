@@ -132,11 +132,27 @@ impl RawMat {
     }
 }
 
-/// Fused Q8_0-row · f32 dot. Bit-identical to dequantizing the row then dotting:
-/// per element `f = scale * (q as f32)` (matching `decode_q8_0_tensor`) accumulated
-/// in block/element order into one f32 — no intermediate Vec. `row` is a whole
-/// number of 34-byte Q8_0 blocks (f16 scale + 32 i8).
+/// Fused Q8_0-row · f32 dot. On x86_64 with AVX2+FMA this dispatches to a vectorized
+/// kernel; otherwise the scalar fallback. The two reductions differ by sub-ULP f32
+/// rounding (8-wide FMA accumulators + one horizontal sum vs a sequential scalar
+/// sum), and neither is bit-identical to llama.cpp's q8×q8 path anyway — the
+/// activations here are f32, never quantized. Parity is greedy-token (argmax) match,
+/// robust to these differences; the 4-prompt parity test (`ornith_qwen35_parity_gen`)
+/// is the empirical gate. `row` is a whole number of 34-byte Q8_0 blocks (f16 scale
+/// + 32 i8); `x.len()` equals the row's element count (a multiple of 32).
 fn q8_0_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by the runtime AVX2+FMA feature check above.
+            return unsafe { q8_0_row_dot_avx2(row, x) };
+        }
+    }
+    q8_0_row_dot_scalar(row, x)
+}
+
+#[inline]
+fn q8_0_row_dot_scalar(row: &[u8], x: &[f32]) -> f32 {
     let mut acc = 0.0f32;
     let mut xi = 0usize;
     for block in row.chunks_exact(34) {
@@ -148,6 +164,42 @@ fn q8_0_row_dot(row: &[u8], x: &[f32]) -> f32 {
         }
     }
     acc
+}
+
+/// AVX2+FMA Q8_0-row · f32 dot. Per 32-element block: broadcast the f16 scale, then
+/// four groups of 8 (i8 → i32 → f32) multiplied by the f32 activations and
+/// FMA-accumulated; one horizontal sum of the 8 lanes at the end.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q8_0_row_dot_avx2(row: &[u8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_ps();
+    let mut xi = 0usize;
+    let xptr = x.as_ptr();
+    for block in row.chunks_exact(34) {
+        let scale = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let scale8 = _mm256_set1_ps(scale);
+        let qptr = block.as_ptr().add(2) as *const i8;
+        let mut g = 0usize;
+        while g < 32 {
+            // 8 i8 -> 8 i32 -> 8 f32
+            let q8 = _mm_loadl_epi64(qptr.add(g) as *const __m128i);
+            let qf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8));
+            let xv = _mm256_loadu_ps(xptr.add(xi + g));
+            // acc += scale * (q_f32 * x)
+            let p = _mm256_mul_ps(qf, xv);
+            acc = _mm256_fmadd_ps(scale8, p, acc);
+            g += 8;
+        }
+        xi += 32;
+    }
+    // horizontal sum of the 8 accumulator lanes
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s4 = _mm_add_ps(lo, hi);
+    let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x55));
+    _mm_cvtss_f32(s1)
 }
 
 /// Fused F32-row · f32 dot (no intermediate Vec). Bit-identical to
