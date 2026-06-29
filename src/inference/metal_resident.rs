@@ -11,6 +11,10 @@ pub(super) type ResidentDecodeState = metal::ResidentDecodeState;
 
 /// Maximum speculative-verify window (`[last_token, drafts...]`), mirroring the CUDA host's
 /// `MAX_VERIFY_K`. `k = drafts.len() + 1 <= MAX_VERIFY_K`.
+// Used only by the non-cuda Metal verify seam (verify_drafts_metal / verify_tree_metal), whose
+// callers are `#[cfg(not(feature = "cuda"))]` — so on a cuda build (Windows default / Linux
+// --all-features) this is genuinely unused; allow it rather than trip clippy `-D dead_code`.
+#[allow(dead_code)]
 pub(super) const MAX_VERIFY_K: usize = 8;
 
 /// The resident stack's view of one weight's bytes: page-aligned wire pages when
@@ -605,6 +609,7 @@ impl super::LlamaInferenceSession {
     /// Non-macOS build: the Metal resident speculative-verify path is unavailable, so return
     /// `Ok(None)` and let the caller fall back to the CPU chunk verify (lossless either way).
     #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)] // unused on cuda builds: the caller is #[cfg(not(feature = "cuda"))]
     pub(super) fn verify_drafts_metal(
         &mut self,
         _last_token: u32,
@@ -616,6 +621,7 @@ impl super::LlamaInferenceSession {
     /// Non-macOS build: the Metal resident tree-verify path is unavailable — return `Ok(None)`
     /// so the caller takes a normal step (lossless either way).
     #[cfg(not(target_os = "macos"))]
+    #[allow(dead_code)] // unused on cuda builds: the caller is #[cfg(not(feature = "cuda"))]
     pub(super) fn verify_tree_metal(
         &mut self,
         _tree: &spec_tree::TokenTree,
