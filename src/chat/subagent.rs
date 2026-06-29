@@ -369,6 +369,56 @@ pub fn status(root: &Path, subtask_id: &str) -> Result<String, String> {
     }
 }
 
+/// A compact, truncated listing of this session's subagents — live (from the
+/// registry) and finished (from result files on disk) — for the `/subagents`
+/// command. The child statuses/answers it surfaces are UNTRUSTED data.
+pub fn list_summary(root: &Path) -> String {
+    const MAX_LISTED: usize = 40;
+    reap_locked(&mut lock_registry());
+
+    let mut lines: Vec<String> = Vec::new();
+    {
+        let state = lock_registry();
+        for c in &state.children {
+            lines.push(format!(
+                "  {} — running ({:.0}s)",
+                c.subtask_id,
+                c.started.elapsed().as_secs_f64()
+            ));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(subagent_dir(root)) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name
+                .strip_prefix("result_")
+                .and_then(|s| s.strip_suffix(".json"))
+            {
+                let status = std::fs::read_to_string(e.path())
+                    .ok()
+                    .and_then(|t| serde_json::from_str::<SubagentResult>(&t).ok())
+                    .map(|r| r.status)
+                    .unwrap_or_else(|| "malformed".to_string());
+                lines.push(format!("  {id} — {status}"));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return "no subagents".to_string();
+    }
+    lines.sort();
+    lines.dedup();
+    let shown = lines.len().min(MAX_LISTED);
+    let mut out = format!(
+        "subagents (untrusted child output):\n{}",
+        lines[..shown].join("\n")
+    );
+    if lines.len() > shown {
+        out.push_str(&format!("\n  …and {} more", lines.len() - shown));
+    }
+    out
+}
+
 /// Reap children that finished or exceeded their timeout. A timed-out child is
 /// terminated (process tree on Windows) and recorded INCONCLUSIVE; one that
 /// vanished without a result is recorded failed. Removes them from the live set.
@@ -691,6 +741,31 @@ mod tests {
         // test, so only assert the validation path here).
         let dir = tempfile::tempdir().unwrap();
         assert!(spawn(dir.path(), "bad id", "goal").is_err());
+    }
+
+    #[test]
+    fn list_summary_lists_finished_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(subagent_dir(root)).unwrap();
+        let res = SubagentResult {
+            subtask_id: "job-1".to_string(),
+            status: "completed".to_string(),
+            answer: "hi".to_string(),
+            tool_calls: vec![],
+            note: "n".to_string(),
+        };
+        std::fs::write(
+            result_path(root, "job-1"),
+            serde_json::to_string(&res).unwrap(),
+        )
+        .unwrap();
+        let out = list_summary(root);
+        assert!(out.contains("job-1") && out.contains("completed"), "{out}");
+        assert!(out.contains("untrusted"), "{out}");
+        // A root with no subagents dir → "no subagents".
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(list_summary(empty.path()), "no subagents");
     }
 
     #[test]

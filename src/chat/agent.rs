@@ -695,9 +695,16 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
                             "{}",
                             banner::dim(&format!("step budget: {} per goal", cfg.max_steps))
                         ),
-                        "help" => {
-                            println!("{}", banner::dim("type a goal; /tools /steps /stop /exit"))
-                        }
+                        // List this session's subagents (live + finished). Their
+                        // output is untrusted data, surfaced compact + truncated.
+                        "subagents" => println!(
+                            "{}",
+                            banner::dim(&super::subagent::list_summary(sandbox.root()))
+                        ),
+                        "help" => println!(
+                            "{}",
+                            banner::dim("type a goal; /tools /steps /subagents /stop /exit")
+                        ),
                         "stop" => println!("{}", banner::dim("nothing running")),
                         other => println!("{}", banner::dim(&format!("unknown command /{other}"))),
                     }
