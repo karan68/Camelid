@@ -376,11 +376,11 @@ impl ModelDriver for LiveDriver {
     fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
         let tool_defs = tools_to_json(tools);
         // First try with a standalone system role (Llama 3.x etc. — unchanged).
-        let text = match self
+        let turn = match self
             .client
-            .chat_blocking(&self.request(history, &tool_defs, false))
+            .chat_turn(&self.request(history, &tool_defs, false))
         {
-            Ok((text, _, _)) => text,
+            Ok(turn) => turn,
             Err(err) => {
                 let msg = err.to_string();
                 // Some chat templates (Mistral v0.3, Gemma) reject a standalone
@@ -393,19 +393,34 @@ impl ModelDriver for LiveDriver {
                     || msg.contains("chat template")
                 {
                     self.client
-                        .chat_blocking(&self.request(history, &tool_defs, true))
+                        .chat_turn(&self.request(history, &tool_defs, true))
                         .map_err(|e| e.to_string())?
-                        .0
                 } else {
                     return Err(msg);
                 }
             }
         };
-        let calls = super::tool_parse::parse(&text, &self.family);
-        if calls.is_empty() {
-            Ok(ModelStep::Text(text))
-        } else {
+        // Prefer the server's STRUCTURED tool_calls (OpenAI shape): the server
+        // parses the model's tool call and EMPTIES `content`, so reading only the
+        // text would miss every call. Fall back to family-specific text parsing
+        // for any path that instead carries the call inside `content`.
+        if !turn.tool_calls.is_empty() {
+            let calls = turn
+                .tool_calls
+                .into_iter()
+                .map(|tc| ToolCall {
+                    name: tc.name,
+                    args: serde_json::from_str(&tc.arguments).unwrap_or_else(|_| json!({})),
+                })
+                .collect();
             Ok(ModelStep::Calls(calls))
+        } else {
+            let calls = super::tool_parse::parse(&turn.content, &self.family);
+            if calls.is_empty() {
+                Ok(ModelStep::Text(turn.content))
+            } else {
+                Ok(ModelStep::Calls(calls))
+            }
         }
     }
 }
