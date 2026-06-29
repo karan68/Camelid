@@ -109,11 +109,54 @@ impl RawMat {
     /// corresponding slice of a whole-matrix dequant.
     fn par_matvec(&self, x: &[f32], name: &str) -> Result<Vec<f32>> {
         debug_assert_eq!(x.len(), self.in_features);
-        (0..self.out_features)
-            .into_par_iter()
-            .map(|r| Ok(dot(&self.dequant_row(r, name)?, x)))
-            .collect()
+        let rb = self.row_bytes();
+        match self.tt {
+            // Fused, allocation-free dot for the two formats this model uses (Q8_0
+            // weights + F32 norms-as-matrices never reach here, but F32 rows can).
+            // Bit-identical to `dequant_row(r)` + `dot`: each element is the same
+            // `scale*(q as f32)` (Q8_0) / `from_le_bytes` (F32) and the f32
+            // accumulation order is unchanged — only the per-row Vec alloc is gone.
+            GgufTensorType::Q8_0 => Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| q8_0_row_dot(&self.bytes[r * rb..(r + 1) * rb], x))
+                .collect()),
+            GgufTensorType::F32 => Ok((0..self.out_features)
+                .into_par_iter()
+                .map(|r| f32_row_dot(&self.bytes[r * rb..(r + 1) * rb], x))
+                .collect()),
+            _ => (0..self.out_features)
+                .into_par_iter()
+                .map(|r| Ok(dot(&self.dequant_row(r, name)?, x)))
+                .collect(),
+        }
     }
+}
+
+/// Fused Q8_0-row · f32 dot. Bit-identical to dequantizing the row then dotting:
+/// per element `f = scale * (q as f32)` (matching `decode_q8_0_tensor`) accumulated
+/// in block/element order into one f32 — no intermediate Vec. `row` is a whole
+/// number of 34-byte Q8_0 blocks (f16 scale + 32 i8).
+fn q8_0_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    let mut xi = 0usize;
+    for block in row.chunks_exact(34) {
+        let scale = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for &qb in &block[2..34] {
+            let f = scale * f32::from(qb as i8);
+            acc += f * x[xi];
+            xi += 1;
+        }
+    }
+    acc
+}
+
+/// Fused F32-row · f32 dot (no intermediate Vec). Bit-identical to
+/// `dequantize_f32` + `dot`.
+fn f32_row_dot(row: &[u8], x: &[f32]) -> f32 {
+    row.chunks_exact(4)
+        .zip(x.iter())
+        .map(|(c, &xi)| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi)
+        .sum()
 }
 
 struct Layer {
@@ -946,8 +989,9 @@ impl RunnableModel {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let mut cache = Qwen35Cache::new(rt, self.n_layers);
         let mut logits = Vec::new();
+        let last_pos = tokens.len() - 1;
         for (pos, &tok) in tokens.iter().enumerate() {
-            logits = self.decode_token_qwen35(tok, pos, &mut cache)?;
+            logits = self.decode_token_qwen35(tok, pos, &mut cache, pos == last_pos)?;
         }
         Ok(logits)
     }
@@ -961,8 +1005,11 @@ impl RunnableModel {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let mut cache = Qwen35Cache::new(rt, self.n_layers);
         let mut last = Vec::new();
+        let last_pos = prompt.len() - 1;
+        // Prefill: advance the cache for every prompt token, but only the last
+        // position needs logits (the LM head is skipped for the rest).
         for (pos, &tok) in prompt.iter().enumerate() {
-            last = self.decode_token_qwen35(tok, pos, &mut cache)?;
+            last = self.decode_token_qwen35(tok, pos, &mut cache, pos == last_pos)?;
         }
         let mut out = Vec::with_capacity(max_new);
         let mut pos = prompt.len();
@@ -975,7 +1022,7 @@ impl RunnableModel {
             }
             out.push(next);
             if i + 1 < max_new {
-                let logits = self.decode_token_qwen35(next, pos, &mut cache)?;
+                let logits = self.decode_token_qwen35(next, pos, &mut cache, true)?;
                 pos += 1;
                 next = argmax(&logits);
             }
@@ -1005,12 +1052,16 @@ impl RunnableModel {
     }
 
     /// One token through the full qwen35 stack at absolute `pos`, mutating `cache`.
-    /// Returns next-token logits.
+    /// Returns next-token logits when `need_logits`, else an empty Vec (the cache is
+    /// still advanced). Skipping the 248k-row LM head for the non-final prompt-prefill
+    /// positions — whose logits are discarded — is a large prefill speedup and changes
+    /// nothing about the kept logits.
     fn decode_token_qwen35(
         &self,
         token: u32,
         pos: usize,
         cache: &mut Qwen35Cache,
+        need_logits: bool,
     ) -> Result<Vec<f32>> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let t = token as usize;
@@ -1054,14 +1105,14 @@ impl RunnableModel {
             }
         }
 
-        // Final norm + LM head (row-parallel: the 248k-row output projection is the
-        // single biggest per-token cost; bit-identical to the sequential loop).
+        // Non-final prefill positions don't need logits — skip the LM head entirely.
+        if !need_logits {
+            return Ok(Vec::new());
+        }
+        // Final norm + LM head (fused row-parallel; bit-identical to the sequential
+        // loop). The 248k-row output projection is the single biggest decode cost.
         let normed = rms_norm(&hidden, &self.output_norm, self.eps);
-        let logits = (0..self.vocab)
-            .into_par_iter()
-            .map(|tk| Ok(dot(&self.output.dequant_row(tk, "output")?, &normed)))
-            .collect::<Result<Vec<f32>>>()?;
-        Ok(logits)
+        self.output.par_matvec(&normed, "output")
     }
 
     /// Qwen3.5 full-attention layer: fused query+gate projection, q/k RMSNorm,
