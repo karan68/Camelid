@@ -368,4 +368,50 @@ mod tests {
         let gen: Vec<u32> = (100..130).collect();
         assert!(check_not_degenerate(&gen).is_ok());
     }
+
+    /// Phase-1 G-LOAD coherence bring-up for a not-yet-anchored architecture
+    /// (Ornith / `qwen35`). Loads the GGUF, renders its chat template, greedy-decodes
+    /// 24 tokens, and asserts the output is coherent (finite logits, non-degenerate).
+    /// This is a COHERENCE check, NOT a parity claim — it deliberately bypasses the
+    /// `is_oracle_qualified` smoke guard (qwen35 is anchored only after Phase-3
+    /// parity). Ignored by default: needs the 9.5 GB Q8_0 file via
+    /// `CAMELID_ORNITH_GGUF`. Run with `--release -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the ~9.5GB Ornith qwen35 Q8_0 GGUF; set CAMELID_ORNITH_GGUF"]
+    fn ornith_qwen35_coherence_bringup() {
+        let path = std::env::var("CAMELID_ORNITH_GGUF")
+            .expect("set CAMELID_ORNITH_GGUF to the Ornith-1.0-9B Q8_0 GGUF path");
+        let gguf = read_metadata(&path).expect("read gguf metadata");
+        assert_eq!(
+            gguf.architecture(),
+            Some("qwen35"),
+            "expected a qwen35 GGUF"
+        );
+        let model = RunnableModel::load(&path).expect("load qwen35 runnable model");
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+
+        let (text, add_special, parse_special) = build_prompt(&tok);
+        let prompt = tok
+            .encode(&text, add_special, parse_special)
+            .expect("encode prompt");
+        assert!(!prompt.is_empty(), "prompt tokenized to nothing");
+
+        // Sanity: finite, in-range logits at the prompt's last position.
+        let logits = model.forward_logits(&prompt).expect("forward prompt");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "non-finite logits — arch/loader bug"
+        );
+        let lo = logits.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            lo > -SANE_LOGIT_ABS && hi < SANE_LOGIT_ABS,
+            "logit range [{lo:.1},{hi:.1}] out of sane bounds — likely a math bug"
+        );
+
+        let generated = model.generate(&prompt, GEN_TOKENS).expect("greedy decode");
+        let out = tok.decode(&generated, true).unwrap_or_default();
+        eprintln!("=== ORNITH qwen35 G-LOAD ===\nPROMPT:\n{text}\n--- GEN ({GEN_TOKENS} tok) ---\n{out}\nTOKENS: {generated:?}\nlogit_range=[{lo:.2},{hi:.2}]");
+        check_not_degenerate(&generated).expect("coherent, non-degenerate generation");
+    }
 }

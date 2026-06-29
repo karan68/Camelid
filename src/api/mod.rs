@@ -13769,6 +13769,7 @@ mod tests {
             attention_key_length: None,
             moe: None,
             gemma4: None,
+            qwen35: None,
         }
     }
 

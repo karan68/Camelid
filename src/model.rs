@@ -44,6 +44,11 @@ pub struct LlamaModelConfig {
     /// RoPE bases, sliding-window pattern, KV-sharing depth, Per-Layer-Embedding
     /// width, and final logit soft-cap that a Llama-shaped config cannot express.
     pub gemma4: Option<Gemma4Metadata>,
+    /// Qwen3.5 (`general.architecture = "qwen35"`) hybrid linear-attention metadata.
+    /// `None` for every other architecture. Holds the gated-delta-net (SSM) dims and
+    /// the per-layer recurrent/full-attention schedule that a dense Llama config
+    /// cannot express. See [`Qwen35Metadata`].
+    pub qwen35: Option<Qwen35Metadata>,
 }
 
 /// Whether `architecture` is one of the dense-decoder families Camelid actually
@@ -55,7 +60,16 @@ pub struct LlamaModelConfig {
 pub fn is_implemented_architecture(architecture: &str) -> bool {
     matches!(
         architecture,
-        "llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3" | "gemma4" | "phi3" | "lfm2"
+        "llama"
+            | "mistral"
+            | "qwen2"
+            | "qwen3"
+            | "qwen35"
+            | "smollm3"
+            | "gemma3"
+            | "gemma4"
+            | "phi3"
+            | "lfm2"
     )
 }
 
@@ -63,8 +77,8 @@ impl LlamaModelConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = match gguf.architecture() {
             Some(
-                architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "smollm3" | "gemma3"
-                | "gemma4" | "phi3" | "lfm2"),
+                architecture @ ("llama" | "mistral" | "qwen2" | "qwen3" | "qwen35" | "smollm3"
+                | "gemma3" | "gemma4" | "phi3" | "lfm2"),
             ) => architecture,
             // Gemma 4 MTP/assistant drafter heads ship as a distinct architecture.
             // The tensor map parses (q-only attention layers, per-layer
@@ -119,6 +133,7 @@ impl LlamaModelConfig {
 
         let moe = MixtralMoeMetadata::from_gguf(gguf, architecture);
         let gemma4 = Gemma4Metadata::from_gguf(gguf, architecture);
+        let qwen35 = Qwen35Metadata::from_gguf(gguf, architecture);
 
         let attention_head_count = required_u32(
             gguf,
@@ -197,9 +212,13 @@ impl LlamaModelConfig {
             // Qwen3-1.7B Q8_0. Other unpermuted archs (qwen2/gemma3/phi3/…) very
             // likely need this too but are out of scope and unverified, so we
             // only flip it for the proven row here.
-            rope_neox_pairing: architecture == "qwen3",
+            // qwen35 full-attention layers are also unpermuted (NEOX split-half),
+            // with partial RoPE over the first `rope.dimension_count` (64) of the
+            // 256-wide head — handled in the runnable qwen35 path.
+            rope_neox_pairing: architecture == "qwen3" || architecture == "qwen35",
             moe,
             gemma4,
+            qwen35,
         })
     }
 }
@@ -588,6 +607,71 @@ mod gemma4_tests {
         // multiple of six.
         let odd = gemma4_sliding_schedule(40);
         assert_eq!(odd.last(), Some(&false));
+    }
+}
+
+/// Qwen3.5 (`general.architecture = "qwen35"`) hybrid linear-attention metadata.
+///
+/// Qwen3.5 alternates **gated-delta-net (SSM / linear-attention)** layers with
+/// standard **full-attention** layers on a `full_attention_interval` schedule
+/// (layer `i` is recurrent iff `(i+1) % interval != 0`). The SSM layers carry a
+/// distinct tensor set (`attn_qkv`/`attn_gate`/`ssm_*`) and run a per-head
+/// recurrent state instead of K/V attention; this struct captures the SSM dims and
+/// the per-layer schedule that a dense Llama config cannot represent. Parsed from
+/// the `qwen35.*` GGUF keys. None of this drives the optimized lane; only the
+/// runnable lane's `qwen35` path consumes it.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Qwen35Metadata {
+    /// Causal conv1d kernel width — GGUF `ssm.conv_kernel` (4).
+    pub ssm_d_conv: u32,
+    /// SSM inner size = `num_v_heads * head_v_dim` — GGUF `ssm.inner_size` (4096).
+    pub ssm_d_inner: u32,
+    /// Per-head state dim (= head_k_dim = head_v_dim) — GGUF `ssm.state_size` (128).
+    pub ssm_d_state: u32,
+    /// Number of value/delta heads — GGUF `ssm.time_step_rank` (32).
+    pub ssm_dt_rank: u32,
+    /// Number of key/query heads (groups) — GGUF `ssm.group_count` (16).
+    pub ssm_n_group: u32,
+    /// Full-attention cadence — GGUF `full_attention_interval` (4).
+    pub full_attention_interval: u32,
+    /// Per-layer schedule: `true` = recurrent (SSM/linear-attn), `false` = full
+    /// attention. The explicit `attention.recurrent_layers` bool array (when it
+    /// covers every layer) overrides the interval rule; otherwise derived from it.
+    pub layer_is_recurrent: Vec<bool>,
+}
+
+impl Qwen35Metadata {
+    pub fn from_gguf(gguf: &GgufFile, architecture: &str) -> Option<Self> {
+        if architecture != "qwen35" {
+            return None;
+        }
+        let key = |suffix: &str| architecture_key(architecture, suffix);
+        let block_count = gguf.metadata_u32(&key("block_count")).unwrap_or(0);
+        let full_attention_interval = gguf
+            .metadata_u32(&key("full_attention_interval"))
+            .unwrap_or(4)
+            .max(1);
+        let layer_is_recurrent =
+            match gguf.metadata_array_bools_optional(&key("attention.recurrent_layers")) {
+                Ok(Some(arr)) if arr.len() == block_count as usize => arr,
+                _ => (0..block_count)
+                    .map(|i| (i + 1) % full_attention_interval != 0)
+                    .collect(),
+            };
+        Some(Self {
+            ssm_d_conv: gguf.metadata_u32(&key("ssm.conv_kernel")).unwrap_or(4),
+            ssm_d_inner: gguf.metadata_u32(&key("ssm.inner_size")).unwrap_or(0),
+            ssm_d_state: gguf.metadata_u32(&key("ssm.state_size")).unwrap_or(0),
+            ssm_dt_rank: gguf.metadata_u32(&key("ssm.time_step_rank")).unwrap_or(0),
+            ssm_n_group: gguf.metadata_u32(&key("ssm.group_count")).unwrap_or(0),
+            full_attention_interval,
+            layer_is_recurrent,
+        })
+    }
+
+    /// True if decoder layer `idx` is a recurrent (SSM / linear-attention) layer.
+    pub fn is_recurrent_layer(&self, idx: usize) -> bool {
+        self.layer_is_recurrent.get(idx).copied().unwrap_or(false)
     }
 }
 

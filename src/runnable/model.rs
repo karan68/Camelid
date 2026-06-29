@@ -163,6 +163,11 @@ pub struct RunnableModel {
     output: RawMat,     // logits projection; tied models reuse token_embd
     output_norm: Vec<f32>,
     layers: Vec<Layer>,
+    /// Qwen3.5 (Ornith) hybrid gated-delta-net runtime. `Some` only for the
+    /// `qwen35` architecture, whose layers do not fit the generic `Layer` (SSM
+    /// layers have no K/V attention). When set, the forward path is routed to the
+    /// dedicated `*_qwen35` methods and `layers` is empty. See [`Qwen35Runtime`].
+    qwen35: Option<Qwen35Runtime>,
 }
 
 impl RunnableModel {
@@ -242,6 +247,106 @@ impl RunnableModel {
             }
         };
         let output_norm = load_vec(&mut f, "output_norm.weight")?;
+
+        // Qwen3.5 (Ornith): hybrid gated-delta-net. Layers do not fit the generic
+        // dense `Layer` (recurrent/SSM layers carry no K/V projections), so build a
+        // dedicated runtime here and route the forward pass to the `*_qwen35` path.
+        if arch == "qwen35" {
+            let meta = cfg.qwen35.as_ref().ok_or_else(|| {
+                BackendError::InvalidModelMetadata("qwen35 metadata missing from config".into())
+            })?;
+            let d_state = meta.ssm_d_state as usize;
+            let num_k_heads = meta.ssm_n_group as usize;
+            let num_v_heads = meta.ssm_dt_rank as usize;
+            let d_inner = meta.ssm_d_inner as usize;
+            let d_conv = meta.ssm_d_conv as usize;
+            if num_v_heads == 0 || num_k_heads == 0 || d_state == 0 || d_conv == 0 {
+                return Err(BackendError::InvalidModelMetadata(
+                    "qwen35: degenerate ssm dims (state/group/rank/conv must be non-zero)".into(),
+                ));
+            }
+            let head_v_dim = d_inner / num_v_heads;
+            let key_dim = d_state * num_k_heads;
+            let value_dim = head_v_dim * num_v_heads;
+            let conv_dim = 2 * key_dim + value_dim;
+
+            let mut q35_layers = Vec::with_capacity(n_layers);
+            for l in 0..n_layers {
+                let p = |t: &str| format!("blk.{l}.{t}.weight");
+                let attn_norm = load_vec(&mut f, &p("attn_norm"))?;
+                let post_attn_norm = load_vec(&mut f, &p("post_attention_norm"))?;
+                let ffn_gate = load_raw(&mut f, &p("ffn_gate"))?;
+                let ffn_up = load_raw(&mut f, &p("ffn_up"))?;
+                let ffn_down = load_raw(&mut f, &p("ffn_down"))?;
+                let kind = if meta.is_recurrent_layer(l) {
+                    Qwen35Kind::Ssm {
+                        wqkv: load_raw(&mut f, &p("attn_qkv"))?,
+                        wqkv_gate: load_raw(&mut f, &p("attn_gate"))?,
+                        // ssm_conv1d.weight is F32 [d_conv, conv_dim]; load flat:
+                        // flat[c*d_conv + i] = kernel[tap=i, channel=c].
+                        conv1d: load_vec(&mut f, &p("ssm_conv1d"))?,
+                        // ssm_dt carries a `.bias` suffix; ssm_a carries NO suffix.
+                        dt_bias: load_vec(&mut f, &format!("blk.{l}.ssm_dt.bias"))?,
+                        a: load_vec(&mut f, &format!("blk.{l}.ssm_a"))?,
+                        beta: load_raw(&mut f, &p("ssm_beta"))?,
+                        alpha: load_raw(&mut f, &p("ssm_alpha"))?,
+                        ssm_norm: load_vec(&mut f, &p("ssm_norm"))?,
+                        ssm_out: load_raw(&mut f, &p("ssm_out"))?,
+                    }
+                } else {
+                    Qwen35Kind::Full {
+                        wq: load_raw(&mut f, &p("attn_q"))?, // fused query + output gate
+                        wk: load_raw(&mut f, &p("attn_k"))?,
+                        wv: load_raw(&mut f, &p("attn_v"))?,
+                        wo: load_raw(&mut f, &p("attn_output"))?,
+                        q_norm: load_vec(&mut f, &p("attn_q_norm"))?,
+                        k_norm: load_vec(&mut f, &p("attn_k_norm"))?,
+                    }
+                };
+                q35_layers.push(Qwen35Layer {
+                    attn_norm,
+                    post_attn_norm,
+                    ffn_gate,
+                    ffn_up,
+                    ffn_down,
+                    kind,
+                });
+            }
+
+            return Ok(Self {
+                architecture: arch,
+                d_model,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope_dim,
+                rope_base,
+                eps: cfg.rms_norm_epsilon,
+                vocab,
+                rope_neox: true, // NEOX split-half, partial over rope_dim (64) of head_dim (256)
+                n_layers,
+                layer_rope_base: vec![rope_base; n_layers],
+                embed_scale: None,
+                ffn_gelu: false,
+                final_logit_softcap: None,
+                attn_logit_softcap: None,
+                token_embd,
+                output,
+                output_norm,
+                layers: Vec::new(),
+                qwen35: Some(Qwen35Runtime {
+                    layers: q35_layers,
+                    d_conv,
+                    d_state,
+                    num_k_heads,
+                    num_v_heads,
+                    head_v_dim,
+                    key_dim,
+                    value_dim,
+                    conv_dim,
+                }),
+            });
+        }
 
         let q_dim = n_heads * head_dim;
         let kv_dim = n_kv_heads * head_dim;
@@ -347,6 +452,7 @@ impl RunnableModel {
             output,
             output_norm,
             layers,
+            qwen35: None,
         })
     }
 
@@ -357,6 +463,9 @@ impl RunnableModel {
             return Err(BackendError::InvalidTensorData(
                 "empty token sequence".into(),
             ));
+        }
+        if self.qwen35.is_some() {
+            return self.forward_logits_qwen35(tokens);
         }
         let seq = tokens.len();
         let dm = self.d_model;
@@ -413,6 +522,9 @@ impl RunnableModel {
     pub fn generate(&self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
         if prompt.is_empty() {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        if self.qwen35.is_some() {
+            return self.generate_qwen35(prompt, max_new);
         }
         let mut cache = KvCache::new(self.n_layers);
         let mut last = Vec::new();
@@ -705,6 +817,461 @@ impl RunnableModel {
                 vec[b] = x0 * sin + x1 * cos;
             }
         }
+    }
+}
+
+// ===================================================================================
+// Qwen3.5 (Ornith) — hybrid gated-delta-net (linear attention) + full attention lane.
+//
+// Faithful re-implementation of llama.cpp's `qwen35` graph (arch string "qwen35",
+// `src/models/qwen35.cpp` + `delta-net-base.cpp`) in pure f32 for the runnable lane.
+// The runnable lane decodes one token at a time, so the gated-delta-net AUTOREGRESSIVE
+// recurrence covers both prefill and decode (the batched "chunking" path is never
+// needed). Each layer is either:
+//   * a recurrent (SSM) layer  — conv1d + SiLU → L2-normed q/k, raw v → per-head gated
+//     delta-rule state recurrence → gated RMSNorm → out-projection; OR
+//   * a full-attention layer   — fused query+gate projection, q/k RMSNorm, partial NEOX
+//     RoPE (64 of 256 dims), GQA causal attention, sigmoid output gate, out-projection.
+// Both share a standard pre-norm 2-norm block (attn_norm pre-mix, post_attention_norm
+// pre-FFN, SwiGLU FFN), each with its own residual.
+// ===================================================================================
+
+/// One Qwen3.5 layer's mixing sub-block: either full attention or a gated-delta-net
+/// (SSM) recurrence. The surrounding norms + FFN live on [`Qwen35Layer`].
+enum Qwen35Kind {
+    Full {
+        /// Fused query + output gate: out-features = `head_dim * n_head * 2`,
+        /// interleaved per head ([query(head_dim) | gate(head_dim)] × n_head).
+        wq: RawMat,
+        wk: RawMat,
+        wv: RawMat,
+        wo: RawMat,
+        q_norm: Vec<f32>, // per-head RMSNorm weight [head_dim]
+        k_norm: Vec<f32>,
+    },
+    Ssm {
+        wqkv: RawMat,      // out = conv_dim = 2*key_dim + value_dim (mixed q|k|v)
+        wqkv_gate: RawMat, // out = value_dim (the output gate `z`)
+        /// ggml `ssm_conv1d.weight` [d_conv, conv_dim], flat: `[c*d_conv + tap]`.
+        conv1d: Vec<f32>,
+        dt_bias: Vec<f32>,  // [num_v_heads] (ssm_dt.bias)
+        a: Vec<f32>,        // [num_v_heads] = -exp(A_log) (ssm_a, no .weight suffix)
+        beta: RawMat,       // out = num_v_heads
+        alpha: RawMat,      // out = num_v_heads
+        ssm_norm: Vec<f32>, // gated RMSNorm weight [head_v_dim]
+        ssm_out: RawMat,    // in = value_dim, out = n_embd
+    },
+}
+
+struct Qwen35Layer {
+    attn_norm: Vec<f32>,      // pre-mix RMSNorm
+    post_attn_norm: Vec<f32>, // pre-FFN RMSNorm (GGUF `post_attention_norm`)
+    ffn_gate: RawMat,
+    ffn_up: RawMat,
+    ffn_down: RawMat,
+    kind: Qwen35Kind,
+}
+
+/// Parsed Qwen3.5 runtime: per-layer weights + the gated-delta-net dims.
+struct Qwen35Runtime {
+    layers: Vec<Qwen35Layer>,
+    d_conv: usize,      // causal conv kernel width (4)
+    d_state: usize,     // per-head state dim = head_k_dim = head_v_dim (128)
+    num_k_heads: usize, // key/query heads / groups (16)
+    num_v_heads: usize, // value/delta heads (32)
+    head_v_dim: usize,  // d_inner / num_v_heads (= d_state, 128)
+    key_dim: usize,     // d_state * num_k_heads (2048)
+    value_dim: usize,   // head_v_dim * num_v_heads (= d_inner, 4096)
+    conv_dim: usize,    // 2*key_dim + value_dim (8192)
+}
+
+/// Per-layer incremental state for qwen35 decode. Full-attention layers grow a
+/// standard K/V cache; SSM layers keep a causal-conv ring buffer and the recurrent
+/// per-head state matrix (`num_v_heads` × `d_state` × `d_state`).
+struct Qwen35Cache {
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
+    /// Conv ring buffer per SSM layer: `(d_conv-1) * conv_dim`, layout
+    /// `[c*(d_conv-1) + t]`, `t=0` oldest. Empty for full-attention layers.
+    conv: Vec<Vec<f32>>,
+    /// Recurrent state per SSM layer: `num_v_heads * d_state * d_state`, per head a
+    /// `d_state×d_state` matrix `S[i*d_state + j]` with `i`=key, `j`=value. Empty
+    /// for full-attention layers.
+    state: Vec<Vec<f32>>,
+}
+
+impl Qwen35Cache {
+    fn new(rt: &Qwen35Runtime, n_layers: usize) -> Self {
+        let mut conv = vec![Vec::new(); n_layers];
+        let mut state = vec![Vec::new(); n_layers];
+        for (li, layer) in rt.layers.iter().enumerate() {
+            if matches!(layer.kind, Qwen35Kind::Ssm { .. }) {
+                conv[li] = vec![0.0f32; (rt.d_conv - 1) * rt.conv_dim];
+                state[li] = vec![0.0f32; rt.num_v_heads * rt.d_state * rt.d_state];
+            }
+        }
+        Self {
+            k: vec![Vec::new(); n_layers],
+            v: vec![Vec::new(); n_layers],
+            conv,
+            state,
+        }
+    }
+}
+
+impl RunnableModel {
+    /// Stateless whole-sequence forward for the smoke gate: scan all positions and
+    /// return the last position's logits. Mirrors [`generate_qwen35`] step-for-step.
+    ///
+    /// [`generate_qwen35`]: RunnableModel::generate_qwen35
+    fn forward_logits_qwen35(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let mut cache = Qwen35Cache::new(rt, self.n_layers);
+        let mut logits = Vec::new();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            logits = self.decode_token_qwen35(tok, pos, &mut cache)?;
+        }
+        Ok(logits)
+    }
+
+    /// Greedy decode for qwen35: prefill the prompt position-by-position into the
+    /// hybrid cache, then argmax-extend. Bit-identical to [`forward_logits_qwen35`]
+    /// for the shared prefix (same per-token math, same accumulation order).
+    ///
+    /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
+    fn generate_qwen35(&self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let mut cache = Qwen35Cache::new(rt, self.n_layers);
+        let mut last = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            last = self.decode_token_qwen35(tok, pos, &mut cache)?;
+        }
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        let mut next = argmax(&last);
+        for i in 0..max_new {
+            out.push(next);
+            if i + 1 < max_new {
+                let logits = self.decode_token_qwen35(next, pos, &mut cache)?;
+                pos += 1;
+                next = argmax(&logits);
+            }
+        }
+        Ok(out)
+    }
+
+    /// One token through the full qwen35 stack at absolute `pos`, mutating `cache`.
+    /// Returns next-token logits.
+    fn decode_token_qwen35(
+        &self,
+        token: u32,
+        pos: usize,
+        cache: &mut Qwen35Cache,
+    ) -> Result<Vec<f32>> {
+        let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
+        let t = token as usize;
+        if t >= self.vocab {
+            return Err(BackendError::InvalidTensorData(format!(
+                "token id {t} >= vocab {}",
+                self.vocab
+            )));
+        }
+        let mut hidden = self.token_embd.dequant_row(t, "token_embd")?;
+
+        for (li, layer) in rt.layers.iter().enumerate() {
+            let xn = rms_norm(&hidden, &layer.attn_norm, self.eps);
+            let mix = match &layer.kind {
+                Qwen35Kind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => self.qwen35_full_attn(li, wq, wk, wv, wo, q_norm, k_norm, &xn, pos, cache)?,
+                Qwen35Kind::Ssm { .. } => self.qwen35_ssm(rt, layer, li, &xn, cache)?,
+            };
+            for (h, m) in hidden.iter_mut().zip(mix.iter()) {
+                *h += *m;
+            }
+
+            // FFN (SwiGLU), pre-normed by post_attention_norm; residual base is the
+            // post-attention hidden state (matches qwen35.cpp ffn_residual).
+            let xn2 = rms_norm(&hidden, &layer.post_attn_norm, self.eps);
+            let g = layer
+                .ffn_gate
+                .dequant_all(&name(li, "ffn_gate"))?
+                .matvec(&xn2);
+            let u = layer.ffn_up.dequant_all(&name(li, "ffn_up"))?.matvec(&xn2);
+            let mut act = vec![0.0f32; g.len()];
+            for i in 0..g.len() {
+                act[i] = silu(g[i]) * u[i];
+            }
+            let d = layer
+                .ffn_down
+                .dequant_all(&name(li, "ffn_down"))?
+                .matvec(&act);
+            for (h, dv) in hidden.iter_mut().zip(d.iter()) {
+                *h += *dv;
+            }
+        }
+
+        let normed = rms_norm(&hidden, &self.output_norm, self.eps);
+        let mut logits = vec![0.0f32; self.vocab];
+        for (tk, lt) in logits.iter_mut().enumerate() {
+            let row = self.output.dequant_row(tk, "output")?;
+            *lt = dot(&row, &normed);
+        }
+        Ok(logits)
+    }
+
+    /// Qwen3.5 full-attention layer: fused query+gate projection, q/k RMSNorm,
+    /// partial NEOX RoPE, GQA causal attention over the cache, sigmoid output gate.
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_full_attn(
+        &self,
+        li: usize,
+        wq: &RawMat,
+        wk: &RawMat,
+        wv: &RawMat,
+        wo: &RawMat,
+        q_norm: &[f32],
+        k_norm: &[f32],
+        xn: &[f32],
+        pos: usize,
+        cache: &mut Qwen35Cache,
+    ) -> Result<Vec<f32>> {
+        let hd = self.head_dim;
+        let n_head = self.n_heads;
+        let n_kv = self.n_kv_heads;
+        let group = n_head / n_kv;
+
+        // Fused Q+gate: [query(hd) | gate(hd)] interleaved per head.
+        let qg = wq.dequant_all(&name(li, "attn_q"))?.matvec(xn);
+        let mut q = vec![0.0f32; n_head * hd];
+        let mut gate = vec![0.0f32; n_head * hd];
+        for h in 0..n_head {
+            let b = h * hd * 2;
+            q[h * hd..(h + 1) * hd].copy_from_slice(&qg[b..b + hd]);
+            gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[b + hd..b + 2 * hd]);
+        }
+        norm_heads(&mut q, n_head, hd, q_norm, self.eps);
+
+        let mut k = wk.dequant_all(&name(li, "attn_k"))?.matvec(xn);
+        let v = wv.dequant_all(&name(li, "attn_v"))?.matvec(xn);
+        norm_heads(&mut k, n_kv, hd, k_norm, self.eps);
+
+        // Partial NEOX RoPE: rotates the first rope_dim (64) of each 256-wide head.
+        self.apply_rope(&mut q, n_head, pos, self.rope_base);
+        self.apply_rope(&mut k, n_kv, pos, self.rope_base);
+
+        cache.k[li].extend_from_slice(&k);
+        cache.v[li].extend_from_slice(&v);
+        let ck = &cache.k[li];
+        let cv = &cache.v[li];
+        let kv_dim = n_kv * hd;
+        let n_pos = pos + 1;
+        let scale = 1.0 / (hd as f32).sqrt();
+
+        let mut attn_out = vec![0.0f32; n_head * hd];
+        for h in 0..n_head {
+            let kvh = h / group;
+            let qh = &q[h * hd..(h + 1) * hd];
+            let mut scores = vec![0.0f32; n_pos];
+            let mut mx = f32::NEG_INFINITY;
+            for (j, sj) in scores.iter_mut().enumerate() {
+                let kh = &ck[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                let s = dot(qh, kh) * scale;
+                *sj = s;
+                if s > mx {
+                    mx = s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - mx).exp();
+                sum += *s;
+            }
+            let oh = &mut attn_out[h * hd..(h + 1) * hd];
+            for (j, s) in scores.iter().enumerate() {
+                let w = *s / sum;
+                let vh = &cv[j * kv_dim + kvh * hd..j * kv_dim + (kvh + 1) * hd];
+                for d in 0..hd {
+                    oh[d] += w * vh[d];
+                }
+            }
+        }
+
+        // Sigmoid output gate (the second half of the fused Q projection).
+        for (a, gt) in attn_out.iter_mut().zip(gate.iter()) {
+            *a *= sigmoid(*gt);
+        }
+        Ok(wo.dequant_all(&name(li, "attn_output"))?.matvec(&attn_out))
+    }
+
+    /// Qwen3.5 gated-delta-net (SSM) layer — the autoregressive recurrence.
+    fn qwen35_ssm(
+        &self,
+        rt: &Qwen35Runtime,
+        layer: &Qwen35Layer,
+        li: usize,
+        xn: &[f32],
+        cache: &mut Qwen35Cache,
+    ) -> Result<Vec<f32>> {
+        let (wqkv, wqkv_gate, conv1d, dt_bias, a, beta_m, alpha_m, ssm_norm, ssm_out) = match &layer
+            .kind
+        {
+            Qwen35Kind::Ssm {
+                wqkv,
+                wqkv_gate,
+                conv1d,
+                dt_bias,
+                a,
+                beta,
+                alpha,
+                ssm_norm,
+                ssm_out,
+            } => (
+                wqkv, wqkv_gate, conv1d, dt_bias, a, beta, alpha, ssm_norm, ssm_out,
+            ),
+            Qwen35Kind::Full { .. } => unreachable!("qwen35_ssm called on a full-attention layer"),
+        };
+        let d_state = rt.d_state;
+        let nk = rt.num_k_heads;
+        let nv = rt.num_v_heads;
+        let hv = rt.head_v_dim;
+        let key_dim = rt.key_dim;
+        let conv_dim = rt.conv_dim;
+        let d_conv = rt.d_conv;
+        let cm1 = d_conv - 1;
+
+        let qkv = wqkv.dequant_all(&name(li, "attn_qkv"))?.matvec(xn);
+        let z = wqkv_gate.dequant_all(&name(li, "attn_gate"))?.matvec(xn);
+        let beta_raw = beta_m.dequant_all(&name(li, "ssm_beta"))?.matvec(xn);
+        let alpha_raw = alpha_m.dequant_all(&name(li, "ssm_alpha"))?.matvec(xn);
+        let mut beta = vec![0.0f32; nv];
+        let mut glog = vec![0.0f32; nv];
+        for h in 0..nv {
+            beta[h] = sigmoid(beta_raw[h]);
+            // gate = softplus(alpha + dt_bias) * a, where a = -exp(A_log) (so glog <= 0).
+            glog[h] = softplus(alpha_raw[h] + dt_bias[h]) * a[h];
+        }
+
+        // Causal depthwise conv1d (kernel d_conv) over conv_dim channels, then SiLU.
+        // Window per channel = [state_0(oldest) .. state_{d_conv-2}, current].
+        let conv_state = &mut cache.conv[li];
+        let mut conv_out = vec![0.0f32; conv_dim];
+        for c in 0..conv_dim {
+            let mut acc = 0.0f32;
+            for t in 0..cm1 {
+                acc += conv1d[c * d_conv + t] * conv_state[c * cm1 + t];
+            }
+            acc += conv1d[c * d_conv + cm1] * qkv[c];
+            conv_out[c] = silu(acc);
+            // shift ring buffer left, append current input
+            for t in 0..cm1.saturating_sub(1) {
+                conv_state[c * cm1 + t] = conv_state[c * cm1 + t + 1];
+            }
+            conv_state[c * cm1 + (cm1 - 1)] = qkv[c];
+        }
+
+        // Split conv output: q(key_dim) | k(key_dim) | v(value_dim).
+        let mut q_conv = conv_out[0..key_dim].to_vec();
+        let mut k_conv = conv_out[key_dim..2 * key_dim].to_vec();
+        let v_conv = &conv_out[2 * key_dim..];
+        // L2-normalize each k-head for q and k (per 128-vector); v is not normalized.
+        for hk in 0..nk {
+            l2_norm_inplace(&mut q_conv[hk * d_state..(hk + 1) * d_state], self.eps);
+            l2_norm_inplace(&mut k_conv[hk * d_state..(hk + 1) * d_state], self.eps);
+        }
+        let qscale = 1.0 / (d_state as f32).sqrt();
+
+        let mut final_out = vec![0.0f32; rt.value_dim];
+        let mut sk = vec![0.0f32; d_state];
+        let mut dvec = vec![0.0f32; d_state];
+        let mut o = vec![0.0f32; d_state];
+        for h in 0..nv {
+            // GQA: value head h reads key/query head (h % num_k_heads) (ggml tile-repeat).
+            let hk = h % nk;
+            let qh = &q_conv[hk * d_state..(hk + 1) * d_state];
+            let kh = &k_conv[hk * d_state..(hk + 1) * d_state];
+            let vh = &v_conv[h * hv..(h + 1) * hv];
+            let st = &mut cache.state[li][h * d_state * d_state..(h + 1) * d_state * d_state];
+
+            // decay: S *= exp(g_log)
+            let g = glog[h].exp();
+            for s in st.iter_mut() {
+                *s *= g;
+            }
+            // sk[j] = Σ_i S[i,j]·k[i]   (contract key index i)
+            sk.iter_mut().for_each(|x| *x = 0.0);
+            for i in 0..d_state {
+                let ki = kh[i];
+                let row = &st[i * d_state..(i + 1) * d_state];
+                for j in 0..d_state {
+                    sk[j] += row[j] * ki;
+                }
+            }
+            // d[j] = (v[j] − sk[j])·β
+            let bh = beta[h];
+            for j in 0..d_state {
+                dvec[j] = (vh[j] - sk[j]) * bh;
+            }
+            // rank-1 update: S[i,j] += k[i]·d[j]
+            for i in 0..d_state {
+                let ki = kh[i];
+                let row = &mut st[i * d_state..(i + 1) * d_state];
+                for j in 0..d_state {
+                    row[j] += ki * dvec[j];
+                }
+            }
+            // o[j] = Σ_i S[i,j]·(q[i]·qscale)   (reads the updated state)
+            o.iter_mut().for_each(|x| *x = 0.0);
+            for i in 0..d_state {
+                let qi = qh[i] * qscale;
+                let row = &st[i * d_state..(i + 1) * d_state];
+                for j in 0..d_state {
+                    o[j] += row[j] * qi;
+                }
+            }
+            // gated RMSNorm: RMSNorm(o, ssm_norm) · SiLU(z_head)
+            let normed = rms_norm(&o, ssm_norm, self.eps);
+            let zh = &z[h * hv..(h + 1) * hv];
+            for j in 0..hv {
+                final_out[h * hv + j] = normed[j] * silu(zh[j]);
+            }
+        }
+        Ok(ssm_out
+            .dequant_all(&name(li, "ssm_out"))?
+            .matvec(&final_out))
+    }
+}
+
+/// L2 normalize `x` in place: `x / max(sqrt(Σx²), eps)` — matches ggml `ggml_l2_norm`
+/// (double-precision sum, `fmax` with eps, no weight).
+fn l2_norm_inplace(x: &mut [f32], eps: f32) {
+    let ss: f64 = x.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+    let scale = 1.0f32 / (ss as f32).sqrt().max(eps);
+    for v in x.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// SiLU / swish: `x · sigmoid(x)`.
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// Numerically-stable softplus, matching ggml `ggml_compute_softplus_f32`.
+fn softplus(x: f32) -> f32 {
+    if x > 20.0 {
+        x
+    } else {
+        (1.0 + x.exp()).ln()
     }
 }
 
