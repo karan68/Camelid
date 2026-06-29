@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 
 use super::audit::{self, AuditEvent, AuditSink};
 use super::banner;
-use super::client::Client;
+use super::client::{Client, StreamEnd};
 use super::session::{Session, CANCEL};
 use super::shell_sandbox::{self, ShellSandbox};
 use super::tools::{self, Action, ApprovalTier, Sandbox, ToolCall, ToolOutcome, ToolSpec};
@@ -363,6 +363,9 @@ pub fn system_prompt(sandbox: &Sandbox, tools: &[ToolSpec]) -> String {
 
 // --- live model driver (Hybrid: tools via the server template; parse here) ---
 
+/// A live-token sink: called with each model output delta as it streams (TUI).
+pub type DeltaSink = Box<dyn FnMut(&str) + Send>;
+
 /// Drives the loop with a real model over the chat API. Tool definitions are
 /// sent so the server renders them through the model's own chat template; the
 /// model's output is parsed here into tool calls (family-specific, Phase 1).
@@ -372,6 +375,12 @@ pub struct LiveDriver {
     family: String,
     max_tokens: u32,
     temperature: f32,
+    /// Optional live-token sink. When set (the TUI), `step` streams the model's
+    /// output via `chat_stream`, forwards each delta here, and parses tool calls
+    /// from the accumulated raw content (`tool_parse`, every family). When `None`
+    /// (eval, orchestration, subagent, the line agent), `step` makes the blocking
+    /// call and reads the server's structured `tool_calls` — unchanged behavior.
+    on_delta: Option<DeltaSink>,
 }
 
 impl LiveDriver {
@@ -383,6 +392,7 @@ impl LiveDriver {
             family: session.active_family(),
             max_tokens,
             temperature,
+            on_delta: None,
         }
     }
 
@@ -401,17 +411,29 @@ impl LiveDriver {
             family,
             max_tokens,
             temperature,
+            on_delta: None,
         }
+    }
+
+    /// Install (or clear) the live-token sink. Set by the TUI before each goal so
+    /// model output streams into the redraw loop; cleared elsewhere (blocking).
+    pub fn set_delta_sink(&mut self, sink: Option<DeltaSink>) {
+        self.on_delta = sink;
     }
 }
 
 impl ModelDriver for LiveDriver {
     fn step(&mut self, history: &[AgentMsg], tools: &[ToolSpec]) -> Result<ModelStep, String> {
         let tool_defs = tools_to_json(tools);
+        // TUI lane: stream the model's output live, then parse tool calls from the
+        // accumulated raw content (the structured-tool_calls path is non-streaming).
+        if self.on_delta.is_some() {
+            return self.step_streamed(history, &tool_defs);
+        }
         // First try with a standalone system role (Llama 3.x etc. — unchanged).
         let turn = match self
             .client
-            .chat_turn(&self.request(history, &tool_defs, false))
+            .chat_turn(&self.request(history, &tool_defs, false, false))
         {
             Ok(turn) => turn,
             Err(err) => {
@@ -420,13 +442,9 @@ impl ModelDriver for LiveDriver {
                 // system role — retry with the system prompt folded into the
                 // first user turn. This only fires when the template complains,
                 // so models that accept a system role are unaffected.
-                if msg.contains("roles must alternate")
-                    || msg.contains("System role")
-                    || msg.contains("system role")
-                    || msg.contains("chat template")
-                {
+                if is_template_error(&msg) {
                     self.client
-                        .chat_turn(&self.request(history, &tool_defs, true))
+                        .chat_turn(&self.request(history, &tool_defs, true, false))
                         .map_err(|e| e.to_string())?
                 } else {
                     return Err(msg);
@@ -459,16 +477,91 @@ impl ModelDriver for LiveDriver {
 }
 
 impl LiveDriver {
-    fn request(&self, history: &[AgentMsg], tool_defs: &[Value], fold_system: bool) -> Value {
+    fn request(
+        &self,
+        history: &[AgentMsg],
+        tool_defs: &[Value],
+        fold_system: bool,
+        stream: bool,
+    ) -> Value {
         json!({
             "model": self.model_id,
             "messages": history_to_messages(history, fold_system),
             "tools": tool_defs,
-            "stream": false,
+            "stream": stream,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
         })
     }
+
+    /// Streaming step (TUI lane): stream the model's raw output, forwarding each
+    /// delta to the installed sink, then parse tool calls from the full content.
+    /// The structured `tool_calls` field is non-streaming, so this path relies on
+    /// `tool_parse` — which covers every supported family — exactly like the
+    /// blocking path's content fallback.
+    fn step_streamed(
+        &mut self,
+        history: &[AgentMsg],
+        tool_defs: &[Value],
+    ) -> Result<ModelStep, String> {
+        // Take the sink out so the streaming closure borrows a local, not `self`.
+        let mut sink = self.on_delta.take();
+        let outcome = self
+            .stream_into(history, tool_defs, false, &mut sink)
+            .or_else(|err| {
+                if is_template_error(&err) {
+                    self.stream_into(history, tool_defs, true, &mut sink)
+                } else {
+                    Err(err)
+                }
+            });
+        self.on_delta = sink; // restore for the next step
+        let (end, content) = outcome?;
+        if end == StreamEnd::Cancelled {
+            // run_loop re-checks the cancel flag right after step and aborts; the
+            // partial text is discarded there.
+            return Ok(ModelStep::Text(content));
+        }
+        let calls = super::tool_parse::parse(&content, &self.family);
+        Ok(if calls.is_empty() {
+            ModelStep::Text(content)
+        } else {
+            ModelStep::Calls(calls)
+        })
+    }
+
+    /// One streaming attempt: accumulate the content while forwarding each delta to
+    /// `sink`. Returns how the stream ended plus the full accumulated content.
+    fn stream_into(
+        &self,
+        history: &[AgentMsg],
+        tool_defs: &[Value],
+        fold_system: bool,
+        sink: &mut Option<DeltaSink>,
+    ) -> Result<(StreamEnd, String), String> {
+        let req = self.request(history, tool_defs, fold_system, true);
+        let mut content = String::new();
+        let (end, _deltas) = self
+            .client
+            .chat_stream(&req, &CANCEL, |d| {
+                content.push_str(d);
+                if let Some(cb) = sink.as_mut() {
+                    cb(d);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok((end, content))
+    }
+}
+
+/// True when a chat-template error means "this template rejects a standalone
+/// system role" — the cue to retry with the system prompt folded into the first
+/// user turn (Mistral v0.3, Gemma).
+fn is_template_error(msg: &str) -> bool {
+    msg.contains("roles must alternate")
+        || msg.contains("System role")
+        || msg.contains("system role")
+        || msg.contains("chat template")
 }
 
 /// Convert agent history to OpenAI-style chat messages (tool results carried as

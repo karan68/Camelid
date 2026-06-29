@@ -71,6 +71,8 @@ enum Entry {
 
 /// Events from the worker thread to the redraw loop.
 enum Ev {
+    /// A live token delta from the model (streamed into the `live` buffer).
+    Delta(String),
     Model(String),
     ToolCall(String),
     ToolResult {
@@ -228,6 +230,9 @@ struct App<'a> {
     frame: u64,
 
     transcript: Vec<Entry>,
+    /// The in-progress model output, streamed token-by-token; committed to an
+    /// `Entry::Model` (final answer) or discarded (it was a tool call) at step end.
+    live: String,
     engine: Option<Box<Engine>>,
     rx: Option<Receiver<Ev>>,
     running: bool,
@@ -267,6 +272,7 @@ impl<'a> App<'a> {
             status: "describe a goal · /tools /steps /subagents /stop · F1 help".into(),
             frame: 0,
             transcript: Vec::new(),
+            live: String::new(),
             engine: Some(engine),
             rx: None,
             running: false,
@@ -340,8 +346,22 @@ impl<'a> App<'a> {
 
     fn handle_ev(&mut self, ev: Ev) {
         match ev {
-            Ev::Model(t) => self.push(Entry::Model(t)),
-            Ev::ToolCall(l) => self.push(Entry::ToolCall(l)),
+            Ev::Delta(d) => {
+                self.live.push_str(&d);
+                if self.follow {
+                    self.scroll = usize::MAX;
+                }
+            }
+            Ev::Model(t) => {
+                self.live.clear();
+                self.push(Entry::Model(t));
+            }
+            Ev::ToolCall(l) => {
+                // The live buffer held this step's raw tool-call syntax — drop it
+                // and show the clean call line instead.
+                self.live.clear();
+                self.push(Entry::ToolCall(l));
+            }
             Ev::ToolResult { ok, body } => self.push(Entry::ToolResult { ok, body }),
             Ev::Notice(t) => self.push(Entry::Notice(t)),
             Ev::NeedApproval {
@@ -360,6 +380,7 @@ impl<'a> App<'a> {
                 self.running = false;
                 self.rx = None;
                 self.approval = None;
+                self.live.clear();
                 self.push(Entry::Notice(end_label(end).to_string()));
                 self.status = "describe a goal · /tools /steps /subagents · F1 help".into();
             }
@@ -411,6 +432,11 @@ impl<'a> App<'a> {
             let mut history = vec![AgentMsg::System(system), AgentMsg::User(goal)];
             let mut reporter = ChannelReporter { tx: tx.clone() };
             let mut approver = ChannelApprover { tx: tx.clone() };
+            // Stream the model's tokens live into the redraw loop's `live` buffer.
+            let delta_tx = tx.clone();
+            engine.driver.set_delta_sink(Some(Box::new(move |d: &str| {
+                let _ = delta_tx.send(Ev::Delta(d.to_string()));
+            })));
             let end = agent::run_loop(
                 &mut engine.driver,
                 &mut approver,
@@ -421,6 +447,7 @@ impl<'a> App<'a> {
                 &mut engine.policy,
                 &mut history,
             );
+            engine.driver.set_delta_sink(None);
             let _ = tx.send(Ev::Done {
                 end,
                 engine: Box::new(engine),
@@ -786,12 +813,25 @@ impl<'a> App<'a> {
                 }
             }
         }
-        if self.running && self.approval.is_none() {
-            let spin = SPINNER[(self.frame as usize) % SPINNER.len()];
-            out.push(Line::from(Span::styled(
-                format!("{spin} thinking…"),
-                Style::default().fg(th.primary()),
-            )));
+        if self.running {
+            // The model's output streams here token-by-token until the step ends
+            // (committed to an Entry::Model, or cleared if it was a tool call).
+            if !self.live.is_empty() {
+                out.push(header("▸ agent", th.primary()));
+                out.extend(markdown::render(&self.live, width, th));
+            }
+            if self.approval.is_none() {
+                let spin = SPINNER[(self.frame as usize) % SPINNER.len()];
+                let label = if self.live.is_empty() {
+                    "thinking…"
+                } else {
+                    "…"
+                };
+                out.push(Line::from(Span::styled(
+                    format!("{spin} {label}"),
+                    Style::default().fg(th.primary()),
+                )));
+            }
         }
         out
     }
