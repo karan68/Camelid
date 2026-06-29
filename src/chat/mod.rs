@@ -76,6 +76,9 @@ pub struct ChatOptions {
     pub max_steps: usize,
     pub auto_approve: bool,
     pub allow_net: bool,
+    /// `--allow-fs`: agent file tools may read/write anywhere on disk (still
+    /// approval-gated), not just under the workspace root.
+    pub allow_fs: bool,
     pub shell_timeout: u64,
     /// Opt-in thinking mode (`chat --enable-thinking`): the model emits its own
     /// `<think>…</think>` reasoning. NOT parity-locked (leading-trace lane only).
@@ -145,6 +148,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             max_steps: opts.max_steps,
             auto_approve: opts.auto_approve,
             allow_net: opts.allow_net,
+            allow_fs: opts.allow_fs,
             shell_timeout: std::time::Duration::from_secs(opts.shell_timeout),
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,

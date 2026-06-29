@@ -594,6 +594,7 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         max_steps,
         auto_approve: task.auto_approve,
         allow_net: false,
+        allow_fs: false,
         shell_timeout: Duration::from_secs(60),
         max_tokens,
         temperature: 0.0,

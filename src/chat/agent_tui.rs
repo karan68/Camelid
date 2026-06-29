@@ -170,7 +170,8 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         }
     };
     let sandbox = Sandbox::new(&cfg.workdir, cfg.allow_net, cfg.shell_timeout)?
-        .with_shell_mode(cfg.shell_sandbox);
+        .with_shell_mode(cfg.shell_sandbox)
+        .with_fs_unrestricted(cfg.allow_fs);
 
     // Enable subagent orchestration (children share this serve + inherit gates).
     super::subagent::configure(super::subagent::SubagentConfig::for_session(
@@ -217,6 +218,7 @@ struct App<'a> {
     max_steps: usize,
     shell_mode: ShellSandbox,
     allow_net: bool,
+    allow_fs: bool,
     auto_approve: bool,
     tool_count: usize,
 
@@ -250,6 +252,7 @@ impl<'a> App<'a> {
         let workspace = engine.sandbox.root().display().to_string();
         let shell_mode = engine.cfg.shell_sandbox;
         let allow_net = engine.cfg.allow_net;
+        let allow_fs = engine.cfg.allow_fs;
         let auto_approve = engine.cfg.auto_approve;
         let max_steps = engine.cfg.max_steps;
         let tool_count = super::tools::specs(allow_net, engine.sandbox.shell_mode()).len();
@@ -261,6 +264,7 @@ impl<'a> App<'a> {
             max_steps,
             shell_mode,
             allow_net,
+            allow_fs,
             auto_approve,
             tool_count,
             input: String::new(),
@@ -922,6 +926,15 @@ impl<'a> App<'a> {
             kv("steps", &self.max_steps.to_string(), th),
             kv("tools", &self.tool_count.to_string(), th),
             kv("run_shell", shell, th),
+            kv(
+                "files",
+                if self.allow_fs {
+                    "full disk"
+                } else {
+                    "workspace"
+                },
+                th,
+            ),
             kv("network", if self.allow_net { "on" } else { "off" }, th),
             kv(
                 "approve",

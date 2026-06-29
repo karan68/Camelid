@@ -380,6 +380,11 @@ enum Command {
         /// Agent: offer the network tool (`http_fetch`). Off by default.
         #[arg(long, default_value_t = false)]
         allow_net: bool,
+        /// Agent: let the file tools read/write anywhere on disk (computer
+        /// control), not just under --workdir. Still approval-gated. Off by
+        /// default (file tools are confined to the workspace root).
+        #[arg(long, default_value_t = false)]
+        allow_fs: bool,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -1096,6 +1101,7 @@ async fn main() -> anyhow::Result<()> {
             max_steps,
             auto_approve,
             allow_net,
+            allow_fs,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -1118,6 +1124,7 @@ async fn main() -> anyhow::Result<()> {
                 max_steps,
                 auto_approve,
                 allow_net,
+                allow_fs,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,

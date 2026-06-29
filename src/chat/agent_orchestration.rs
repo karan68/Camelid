@@ -506,6 +506,7 @@ fn run_real_model_battery(
         max_steps: 8,
         auto_approve: true,
         allow_net: false,
+        allow_fs: false,
         shell_timeout: Duration::from_secs(60),
         max_tokens: 128,
         temperature: 0.0,

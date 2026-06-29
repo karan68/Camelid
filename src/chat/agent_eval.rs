@@ -240,6 +240,7 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             max_steps: cfg.max_steps,
             auto_approve: true,
             allow_net: false,
+            allow_fs: false,
             shell_timeout: Duration::from_secs(20),
             max_tokens: cfg.max_tokens,
             temperature: 0.0,

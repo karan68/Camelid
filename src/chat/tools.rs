@@ -186,6 +186,11 @@ pub struct Sandbox {
     /// OS-level confinement mode for `run_shell` (Task 1). Defaults to
     /// [`ShellSandbox::Sandboxed`]; production sets it from `--shell-sandbox`.
     shell_mode: ShellSandbox,
+    /// When true (`--allow-fs`), the file tools may read/write anywhere on disk,
+    /// not just under `root` — for a computer-control agent. The approval gate
+    /// still prompts on every write/exec, so it is opt-in + gated, not a free
+    /// pass. `root` remains the base for *relative* paths. Default false (jailed).
+    fs_unrestricted: bool,
 }
 
 const MAX_READ_BYTES: usize = 64 * 1024;
@@ -208,6 +213,7 @@ impl Sandbox {
             allow_net,
             shell_timeout,
             shell_mode: ShellSandbox::default(),
+            fs_unrestricted: false,
         })
     }
 
@@ -215,6 +221,18 @@ impl Sandbox {
     pub fn with_shell_mode(mut self, mode: ShellSandbox) -> Self {
         self.shell_mode = mode;
         self
+    }
+
+    /// Allow the file tools to operate anywhere on disk (`--allow-fs`), not just
+    /// under the root. The approval gate still applies. Default off (jailed).
+    pub fn with_fs_unrestricted(mut self, on: bool) -> Self {
+        self.fs_unrestricted = on;
+        self
+    }
+
+    /// Whether the file tools may reach outside the workspace root.
+    pub fn fs_unrestricted(&self) -> bool {
+        self.fs_unrestricted
     }
 
     pub fn shell_mode(&self) -> ShellSandbox {
@@ -253,11 +271,12 @@ impl Sandbox {
                 .map_err(|e| format!("cannot access parent of {raw}: {e}"))?;
             parent_canon.join(file)
         };
-        if canon == self.root || canon.starts_with(&self.root) {
+        if self.fs_unrestricted || canon == self.root || canon.starts_with(&self.root) {
             Ok(canon)
         } else {
             Err(format!(
-                "path {raw} escapes the sandbox root {}",
+                "path {raw} escapes the sandbox root {} (pass --allow-fs to let the agent \
+                 read/write anywhere on disk)",
                 self.root.display()
             ))
         }
@@ -1294,6 +1313,32 @@ mod tests {
         // absolute outside-root is refused too
         let err2 = validate(&call("read_file", json!({"path":"/etc/passwd"})), &sb).unwrap_err();
         assert!(err2.contains("escapes") || err2.contains("cannot access"));
+    }
+
+    #[test]
+    fn fs_unrestricted_allows_writes_outside_the_root() {
+        // The default sandbox jails to its root; --allow-fs lifts that so a
+        // computer-control agent can write to e.g. the Desktop. The approval gate
+        // (tested elsewhere) is the remaining backstop.
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap(); // a sibling dir, outside root
+        let target = outside.path().join("note.txt");
+        let raw = target.to_str().unwrap();
+
+        // Jailed: the outside path escapes.
+        let jailed = sandbox(root.path());
+        assert!(jailed.resolve(raw, false).unwrap_err().contains("escapes"));
+
+        // Unrestricted: the same absolute path resolves and the write lands.
+        let free = sandbox(root.path()).with_fs_unrestricted(true);
+        assert!(free.fs_unrestricted());
+        let action = validate(
+            &call("write_file", json!({"path": raw, "content": "hi"})),
+            &free,
+        )
+        .unwrap();
+        assert!(matches!(action.execute(&free), ToolOutcome::Ok(_)));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "hi");
     }
 
     #[test]
