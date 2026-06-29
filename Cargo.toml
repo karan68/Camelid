@@ -62,6 +62,10 @@ windows-sys = { version = "0.59", features = [
     # Kill-on-close Job Objects for process-tree teardown of agent-spawned
     # PowerShell (and, later, subagent) processes — see src/chat/win_job.rs.
     "Win32_System_JobObjects",
+    # Enable ANSI escape processing + a UTF-8 code page for the inline/agent line
+    # renderers so colors and glyphs render like macOS/Linux — see
+    # src/chat/win_console.rs.
+    "Win32_System_Console",
 ] }
 # Windows: CUDA is part of the DEFAULT build (the primary dev host is a CUDA box).
 # cudarc is non-optional here and `build.rs` turns on the `cuda` cfg, so a bare

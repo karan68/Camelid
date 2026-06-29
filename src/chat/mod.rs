@@ -36,6 +36,8 @@ mod tool_parse;
 mod tools;
 mod tui;
 #[cfg(windows)]
+mod win_console;
+#[cfg(windows)]
 mod win_job;
 
 use std::io::IsTerminal;
@@ -88,6 +90,7 @@ pub struct ChatOptions {
 /// non-zero for the typed unsupported-state backstop) so the caller can exit
 /// after this function's `ServerHandle` has torn down any spawned server.
 pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
+    init_terminal();
     install_sigint_handler();
 
     let client = Client::new(opts.addr);
@@ -266,3 +269,14 @@ fn install_sigint_handler() {
         libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
     }
 }
+
+/// Prepare the terminal for the line-mode renderers (inline + agent). On Windows
+/// this enables ANSI escape processing and a UTF-8 code page so colors and glyphs
+/// render the way they do on macOS/Linux; the full-screen TUI already gets this
+/// from crossterm. A no-op on Unix, where terminals handle ANSI + UTF-8 natively.
+#[cfg(windows)]
+fn init_terminal() {
+    win_console::init();
+}
+#[cfg(not(windows))]
+fn init_terminal() {}
