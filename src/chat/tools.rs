@@ -1393,12 +1393,30 @@ mod tests {
         assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("marker.txt")));
     }
 
-    // The default (sandboxed) mode is not kernel-enforceable off Linux, so
-    // run_shell must refuse to run rather than execute unconfined. This is the
-    // fail-closed behavior exercised on the Windows dev box.
-    #[cfg(not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    // On Windows the default (sandboxed) mode is enforced natively (cwd-pin +
+    // hard timeout, no seccomp) — run_shell MUST run here, gated by approval. This
+    // is the behavior exercised on the Windows dev box.
+    #[cfg(windows)]
+    #[test]
+    fn sandboxed_run_shell_runs_native_on_windows() {
+        use super::ShellSandbox;
+        let dir = tempfile::tempdir().unwrap();
+        let sb = sandbox(dir.path()); // default = Sandboxed
+        assert_eq!(sb.shell_mode(), ShellSandbox::Sandboxed);
+        let a = validate(&call("run_shell", json!({"command":"echo hi"})), &sb).unwrap();
+        assert_eq!(a.risk(), Risk::Exec);
+        let out = a.execute(&sb);
+        assert!(matches!(out, ToolOutcome::Ok(ref s) if s.contains("hi")));
+    }
+
+    // On other unenforceable hosts (macOS, unsupported arch), the default mode is
+    // not kernel-enforceable, so run_shell must refuse rather than run unconfined.
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        windows
     )))]
     #[test]
     fn sandboxed_run_shell_fails_closed_off_linux() {

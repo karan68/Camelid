@@ -15,12 +15,16 @@
 //! - [`ShellSandbox::Unrestricted`] — explicit opt-in; the command runs
 //!   cwd-pinned + timed but otherwise unconfined. Logs a startup warning.
 //!
-//! **Fail closed.** Sandboxed mode is only honored where the kernel can enforce
-//! it (Linux with seccomp available, on a supported arch). Anywhere else —
-//! Windows, macOS, a Linux kernel without `CONFIG_SECCOMP`, an unsupported arch —
-//! sandboxed mode **refuses to run the tool** rather than silently downgrading to
-//! unrestricted. The enforced layers are reported, not faked (see
-//! [`EnforcedShell`]); the UI shows what the kernel actually applied.
+//! **Fail closed (with a native-Windows path).** Sandboxed mode applies *kernel*
+//! enforcement (seccomp + uid-drop + rlimits) only on Linux/supported-arch. On
+//! **Windows** — which has no seccomp — it applies the confinement Windows
+//! actually offers (cwd-pin + the hard wall-clock timeout), gated by the approval
+//! policy, and reports **exactly** that (never a faked seccomp/uid-drop claim);
+//! this matches the `run_windows_command` model. Anywhere else still unenforceable
+//! — macOS, a Linux kernel without `CONFIG_SECCOMP`, an unsupported arch —
+//! sandboxed mode **refuses to run the tool** rather than silently downgrading.
+//! The enforced layers are reported, not faked (see [`EnforcedShell`]); the UI
+//! shows what was actually applied.
 //!
 //! ## Platform-verification status
 //!
@@ -408,17 +412,38 @@ fn configure_sandboxed(builder: &mut Command, root: &Path) -> Result<EnforcedShe
     linux::configure(builder, root)
 }
 
-#[cfg(not(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "aarch64")
+// Windows: there is no seccomp, but cwd-pin + the parent's hard wall-clock timeout
+// ARE the native confinement (the same model `run_windows_command` uses), with the
+// approval gate as the real backstop. Run with exactly that and report it honestly
+// — this is NOT a faked sandbox; it never claims seccomp/uid-drop.
+#[cfg(windows)]
+fn configure_sandboxed(builder: &mut Command, root: &Path) -> Result<EnforcedShell, String> {
+    builder.current_dir(root);
+    Ok(EnforcedShell {
+        mode: ShellSandbox::Sandboxed,
+        layers: vec!["cwd-pin", "wall-timeout"],
+        note: Some(
+            "Windows-native: no seccomp/uid-drop (Windows has no seccomp); cwd-pinned + \
+             hard-timed, gated by the approval policy"
+                .to_string(),
+        ),
+    })
+}
+
+// macOS and other unenforceable hosts: still fail closed (no validated native
+// confinement is wired here). Refuse rather than silently run unconfined.
+#[cfg(not(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    windows
 )))]
 fn configure_sandboxed(_builder: &mut Command, _root: &Path) -> Result<EnforcedShell, String> {
-    // Fail closed: no kernel mechanism to enforce the sandbox here. Refuse rather
-    // than silently running unconfined.
     Err(format!(
         "sandboxed run_shell is not enforceable on this platform ({} / {}): it requires Linux \
-         seccomp on x86_64 or aarch64. Refusing to run run_shell. Use --shell-sandbox \
-         unrestricted to opt out (not recommended), or --shell-sandbox disabled to remove the \
+         seccomp on x86_64/aarch64 (or Windows-native confinement). Refusing to run run_shell. \
+         Use --shell-sandbox unrestricted to opt out, or --shell-sandbox disabled to remove the \
          tool.",
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -462,12 +487,30 @@ mod tests {
         assert!(e.layers.contains(&"wall-timeout"));
     }
 
-    // On a non-Linux (or unsupported-arch) host, sandboxed mode must FAIL CLOSED —
-    // it must not silently run unconfined. This is the behavior exercised on the
-    // Windows dev box.
-    #[cfg(not(all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
+    // On Windows, sandboxed mode is enforced natively (cwd-pin + wall-timeout, no
+    // seccomp) and must SUCCEED — run_shell has to work here, reporting exactly
+    // what was applied. This is the behavior exercised on the Windows dev box.
+    #[cfg(windows)]
+    #[test]
+    fn sandboxed_is_windows_native_not_failed_closed() {
+        let mut c = Command::new("cmd");
+        let e = configure_command(&mut c, Path::new("."), ShellSandbox::Sandboxed).unwrap();
+        assert_eq!(e.mode, ShellSandbox::Sandboxed);
+        assert!(e.layers.contains(&"cwd-pin"));
+        assert!(e.layers.contains(&"wall-timeout"));
+        assert!(!e.layers.contains(&"seccomp")); // never claim a sandbox we don't have
+        assert!(e.note.as_deref().unwrap_or("").contains("Windows-native"));
+        assert!(describe_sandboxed(Path::new(".")).is_ok());
+    }
+
+    // On other unenforceable hosts (macOS, unsupported arch), sandboxed mode must
+    // FAIL CLOSED — it must not silently run unconfined.
+    #[cfg(not(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        windows
     )))]
     #[test]
     fn sandboxed_fails_closed_off_linux() {
