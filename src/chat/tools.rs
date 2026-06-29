@@ -95,6 +95,10 @@ pub struct ApprovalPolicy {
     /// `--auto-approve`: promote every `Confirm` tier to `Auto`, EXCEPT exec-risk
     /// tools (e.g. `run_shell`), which stay gated unless explicitly overridden.
     auto_all: bool,
+    /// `--yolo` (unattended): also promote EXEC-risk tools (run_shell,
+    /// run_windows_command, GUI input, spawn_subagent) to `Auto`. Strictly
+    /// stronger than `auto_all`; refused under production by `resolve_policy`.
+    auto_exec: bool,
     /// Session grants from the interactive `a` ("always allow this tool") choice.
     grants: std::collections::HashSet<String>,
 }
@@ -104,6 +108,15 @@ impl ApprovalPolicy {
     /// *after* the production check has passed (see `agent::resolve_policy`).
     pub fn set_auto_all(&mut self, on: bool) {
         self.auto_all = on;
+    }
+
+    /// Enable unattended mode (`--yolo`): auto-approve EXEC tools too. Implies
+    /// `auto_all`. Set only after the production check has passed.
+    pub fn set_auto_exec(&mut self, on: bool) {
+        self.auto_exec = on;
+        if on {
+            self.auto_all = on;
+        }
     }
 
     /// Pin a tool to an explicit tier (config override). Wins over `auto_all`, so
@@ -139,7 +152,10 @@ impl ApprovalPolicy {
             return t;
         }
         let base = action.risk().default_tier();
-        if self.auto_all && base == ApprovalTier::Confirm && action.risk() != Risk::Exec {
+        // auto_all promotes Confirm→Auto but spares Exec — unless auto_exec
+        // (--yolo) is set, which promotes Exec too (unattended computer control).
+        let exec_ok = action.risk() != Risk::Exec || self.auto_exec;
+        if self.auto_all && base == ApprovalTier::Confirm && exec_ok {
             ApprovalTier::Auto
         } else {
             base

@@ -162,7 +162,7 @@ pub fn run(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> anyhow:
         return Ok(2);
     }
     // Approval policy: --auto-approve is refused (fail closed) under production.
-    let policy = match agent::resolve_policy(cfg.auto_approve, agent::is_production()) {
+    let policy = match agent::resolve_policy(cfg.auto_approve, cfg.yolo, agent::is_production()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -220,6 +220,7 @@ struct App<'a> {
     allow_net: bool,
     allow_fs: bool,
     auto_approve: bool,
+    yolo: bool,
     tool_count: usize,
 
     input: String,
@@ -254,6 +255,7 @@ impl<'a> App<'a> {
         let allow_net = engine.cfg.allow_net;
         let allow_fs = engine.cfg.allow_fs;
         let auto_approve = engine.cfg.auto_approve;
+        let yolo = engine.cfg.yolo;
         let max_steps = engine.cfg.max_steps;
         let tool_count = super::tools::specs(allow_net, engine.sandbox.shell_mode()).len();
         App {
@@ -266,6 +268,7 @@ impl<'a> App<'a> {
             allow_net,
             allow_fs,
             auto_approve,
+            yolo,
             tool_count,
             input: String::new(),
             cursor: 0,
@@ -938,7 +941,13 @@ impl<'a> App<'a> {
             kv("network", if self.allow_net { "on" } else { "off" }, th),
             kv(
                 "approve",
-                if self.auto_approve { "auto" } else { "prompt" },
+                if self.yolo {
+                    "UNATTENDED"
+                } else if self.auto_approve {
+                    "auto (exec gated)"
+                } else {
+                    "prompt"
+                },
                 th,
             ),
             Line::from(""),

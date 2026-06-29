@@ -29,6 +29,10 @@ pub struct AgentConfig {
     pub workdir: PathBuf,
     pub max_steps: usize,
     pub auto_approve: bool,
+    /// `--yolo` (unattended): auto-approve EXEC tools too (shell, GUI,
+    /// run_windows_command, spawn_subagent) so the agent runs a whole task without
+    /// prompting. Refused under production. Default false.
+    pub yolo: bool,
     pub allow_net: bool,
     /// `--allow-fs`: let the file tools read/write anywhere on disk (computer
     /// control), not just under `workdir`. Still approval-gated. Default false.
@@ -129,18 +133,22 @@ pub fn is_production() -> bool {
 /// returned error and not run. Outside production it is allowed but the caller
 /// is expected to emit a prominent warning. `run_shell` (exec risk) stays gated
 /// even with auto-approve on (see [`tools::ApprovalPolicy::tier_for`]).
-pub fn resolve_policy(auto_approve: bool, production: bool) -> Result<Policy, String> {
-    if auto_approve && production {
+pub fn resolve_policy(auto_approve: bool, yolo: bool, production: bool) -> Result<Policy, String> {
+    if (auto_approve || yolo) && production {
         return Err(
-            "refusing --auto-approve: CAMELID_PRODUCTION is set. Auto-approval runs \
-             write/network tools without confirmation and must not be used in a production \
-             deployment. Unset CAMELID_PRODUCTION or drop --auto-approve."
+            "refusing --auto-approve/--yolo: CAMELID_PRODUCTION is set. Auto-approval runs \
+             write/network (and, with --yolo, EXEC) tools without confirmation and must not be \
+             used in a production deployment. Unset CAMELID_PRODUCTION or drop the flag."
                 .to_string(),
         );
     }
     let mut policy = Policy::default();
     if auto_approve {
         policy.set_auto_all(true);
+    }
+    // --yolo (unattended): also auto-approve EXEC tools. Implies auto_all.
+    if yolo {
+        policy.set_auto_exec(true);
     }
     Ok(policy)
 }
@@ -721,7 +729,7 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
     // Resolve the approval policy before any UI. `--auto-approve` is refused
     // (fail closed) when CAMELID_PRODUCTION is set, so a production deployment
     // can never silently run write/network tools without confirmation.
-    let mut policy = match resolve_policy(cfg.auto_approve, is_production()) {
+    let mut policy = match resolve_policy(cfg.auto_approve, cfg.yolo, is_production()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -744,12 +752,21 @@ pub fn run_agent(session: &mut Session, addr: SocketAddr, cfg: AgentConfig) -> a
             )
         )
     );
-    if cfg.auto_approve {
+    if cfg.yolo {
+        println!(
+            "{}",
+            banner::dim(
+                "⚠ --yolo UNATTENDED: ALL tools — including shell, GUI input, and \
+                 run_windows_command — run WITHOUT prompting. Bounded only by the step budget \
+                 and Ctrl-C/stop. Sandbox/--allow-fs scope still applies."
+            )
+        );
+    } else if cfg.auto_approve {
         println!(
             "{}",
             banner::dim(
                 "⚠ --auto-approve: write/network tools run WITHOUT prompting (sandbox still \
-                 enforced; run_shell stays gated)"
+                 enforced; exec tools stay gated)"
             )
         );
     }
@@ -958,6 +975,7 @@ mod tests {
             workdir: dir.to_path_buf(),
             max_steps: 10,
             auto_approve: auto,
+            yolo: false,
             allow_net: false,
             allow_fs: false,
             shell_timeout: Duration::from_secs(5),
@@ -1237,18 +1255,37 @@ mod tests {
     #[test]
     fn auto_approve_refused_under_production() {
         // Fail closed: --auto-approve under CAMELID_PRODUCTION is rejected.
-        assert!(resolve_policy(true, true).is_err());
+        assert!(resolve_policy(true, false, true).is_err());
+        // --yolo (unattended) under production is rejected too.
+        assert!(resolve_policy(false, true, true).is_err());
         // Allowed off-production (the caller warns loudly).
-        assert!(resolve_policy(true, false).is_ok());
+        assert!(resolve_policy(true, false, false).is_ok());
+        assert!(resolve_policy(false, true, false).is_ok());
         // No auto-approve → fine even in production.
-        assert!(resolve_policy(false, true).is_ok());
+        assert!(resolve_policy(false, false, true).is_ok());
+    }
+
+    #[test]
+    fn yolo_promotes_exec_tools_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
+        let policy = resolve_policy(false, true, false).unwrap(); // --yolo (unattended)
+        let shell = tools::validate(&tc("run_shell", json!({"command":"echo hi"})), &sb).unwrap();
+        let write = tools::validate(
+            &tc("write_file", json!({"path":"a.txt","content":"x"})),
+            &sb,
+        )
+        .unwrap();
+        // Unattended: BOTH write AND exec auto-run with no prompt.
+        assert_eq!(policy.tier_for(&shell), ApprovalTier::Auto);
+        assert_eq!(policy.tier_for(&write), ApprovalTier::Auto);
     }
 
     #[test]
     fn auto_all_promotes_writes_but_never_run_shell() {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path(), false, Duration::from_secs(5)).unwrap();
-        let mut policy = resolve_policy(true, false).unwrap(); // auto_all on
+        let mut policy = resolve_policy(true, false, false).unwrap(); // auto_all on (not yolo)
         let write = tools::validate(
             &tc("write_file", json!({"path":"a.txt","content":"x"})),
             &sb,

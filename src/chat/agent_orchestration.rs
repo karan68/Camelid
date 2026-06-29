@@ -505,6 +505,7 @@ fn run_real_model_battery(
         workdir: work.clone(),
         max_steps: 8,
         auto_approve: true,
+        yolo: false,
         allow_net: false,
         allow_fs: false,
         shell_timeout: Duration::from_secs(60),

@@ -373,10 +373,16 @@ enum Command {
         /// Max agent steps (tool-call rounds) per goal.
         #[arg(long, default_value_t = 25)]
         max_steps: usize,
-        /// Agent: run write/exec/network tools WITHOUT prompting (sandbox still
-        /// enforced). Prints a warning; not recommended.
+        /// Agent: run write/network tools WITHOUT prompting (exec tools stay
+        /// gated; sandbox still enforced). Prints a warning; not recommended.
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
+        /// Agent: UNATTENDED — auto-approve EVERYTHING including exec tools
+        /// (shell, GUI input, run_windows_command, spawn_subagent) so the agent
+        /// runs a whole task without prompting. Bounded by --max-steps and /stop.
+        /// Refused under CAMELID_PRODUCTION. Powerful + dangerous; opt-in.
+        #[arg(long, default_value_t = false)]
+        yolo: bool,
         /// Agent: offer the network tool (`http_fetch`). Off by default.
         #[arg(long, default_value_t = false)]
         allow_net: bool,
@@ -1100,6 +1106,7 @@ async fn main() -> anyhow::Result<()> {
             workdir,
             max_steps,
             auto_approve,
+            yolo,
             allow_net,
             allow_fs,
             shell_timeout,
@@ -1123,6 +1130,7 @@ async fn main() -> anyhow::Result<()> {
                 workdir,
                 max_steps,
                 auto_approve,
+                yolo,
                 allow_net,
                 allow_fs,
                 shell_timeout,

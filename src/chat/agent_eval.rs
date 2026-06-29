@@ -239,6 +239,7 @@ pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
             workdir: work.clone(),
             max_steps: cfg.max_steps,
             auto_approve: true,
+            yolo: false,
             allow_net: false,
             allow_fs: false,
             shell_timeout: Duration::from_secs(20),

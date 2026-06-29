@@ -77,6 +77,9 @@ pub struct ChatOptions {
     pub workdir: Option<PathBuf>,
     pub max_steps: usize,
     pub auto_approve: bool,
+    /// `--yolo` (unattended): auto-approve EXEC tools too so the agent runs a
+    /// whole task without prompting. Refused under production.
+    pub yolo: bool,
     pub allow_net: bool,
     /// `--allow-fs`: agent file tools may read/write anywhere on disk (still
     /// approval-gated), not just under the workspace root.
@@ -149,6 +152,7 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             workdir: opts.workdir.unwrap_or_else(|| PathBuf::from(".")),
             max_steps: opts.max_steps,
             auto_approve: opts.auto_approve,
+            yolo: opts.yolo,
             allow_net: opts.allow_net,
             allow_fs: opts.allow_fs,
             shell_timeout: std::time::Duration::from_secs(opts.shell_timeout),
