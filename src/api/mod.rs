@@ -11907,6 +11907,11 @@ mod tests {
                 "qwen3_4b_instruct_q8_0",
                 "qwen3_8b_instruct_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
+                // Ornith-1.0-9B (qwen35 hybrid gated-delta-net) runnable serve lane:
+                // exact-row serve smoke + greedy token-identical parity vs llama.cpp
+                // acd79d6 (4 prompts) + tool_capable via 3 agent-eval PASS receipts.
+                // Short-chat/agent smoke only; no bounded-context/perf/full support.
+                "Ornith 1.0 9B",
             ])
         );
 
