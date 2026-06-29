@@ -21,6 +21,8 @@ use super::subagent;
 use super::win_input;
 #[cfg(windows)]
 use super::win_job::JobObject;
+#[cfg(windows)]
+use super::win_uia;
 
 /// Risk class — drives the approval gate (Phase 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,7 +462,44 @@ pub fn specs(allow_net: bool, shell_mode: ShellSandbox) -> Vec<ToolSpec> {
                     "double":{"type":"boolean","description":"Double-click when true"}
                 }}),
             });
+            // UI Automation click + screenshot (Phase 2). ui_inspect (read-only) is
+            // registered below, outside the exec gate.
+            tools.push(ToolSpec {
+                name: "ui_click",
+                description: "Windows only: click a UI control BY NAME using UI Automation \
+                              (invokes it, or clicks its center). Pass `window` (a title \
+                              substring) to target a specific app, else the foreground window. \
+                              Prefer this over raw mouse_click. Exec tier — gated.",
+                risk: Risk::Exec,
+                params: json!({"type":"object","properties":{
+                    "name":{"type":"string","description":"The control's accessible name, e.g. \"Save\""},
+                    "window":{"type":"string","description":"Optional: target window title substring"}
+                },"required":["name"]}),
+            });
+            tools.push(ToolSpec {
+                name: "screenshot",
+                description: "Windows only: capture the primary screen to a PNG file (for the \
+                              operator/logging — the model cannot read pixels). Optional `path`; \
+                              defaults to screenshot.png in the workspace. Exec tier — gated.",
+                risk: Risk::Exec,
+                params: json!({"type":"object","properties":{
+                    "path":{"type":"string","description":"Optional PNG output path (default screenshot.png)"}
+                }}),
+            });
         }
+        // Read-only UI Automation inspection: dump a window's accessibility tree
+        // as text so the (text-only) model can SEE controls + their positions.
+        tools.push(ToolSpec {
+            name: "ui_inspect",
+            description: "Windows only (read-only): list the UI Automation controls of a window \
+                          as text — control type, accessible name, and on-screen position. Pass \
+                          `window` (a title substring) to target an app, else the foreground \
+                          window. Use this to SEE the UI, then ui_click by name.",
+            risk: Risk::Read,
+            params: json!({"type":"object","properties":{
+                "window":{"type":"string","description":"Optional: target window title substring"}
+            }}),
+        });
         tools.push(ToolSpec {
             name: "inspect_system",
             description: "Windows only: read host state (read-only). query_type is one of \
@@ -601,6 +640,24 @@ pub enum Action {
         button: String,
         double: bool,
     },
+    /// Windows-only UI Automation: read a window's accessibility tree as text
+    /// (read-only — the model's "eyes").
+    #[cfg_attr(not(windows), allow(dead_code))]
+    UiInspect {
+        window: Option<String>,
+    },
+    /// Windows-only UI Automation: invoke/click a control by name (the model's
+    /// "hands"). Execution → Exec tier, gated.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    UiClick {
+        window: Option<String>,
+        name: String,
+    },
+    /// Windows-only: capture the screen to a PNG at `path`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Screenshot {
+        path: PathBuf,
+    },
 }
 
 impl Action {
@@ -614,9 +671,13 @@ impl Action {
             | Action::TypeText { .. }
             | Action::PressKeys { .. }
             | Action::MouseMove { .. }
-            | Action::MouseClick { .. } => Risk::Exec,
+            | Action::MouseClick { .. }
+            | Action::UiClick { .. }
+            | Action::Screenshot { .. } => Risk::Exec,
             Action::HttpFetch { .. } => Risk::Network,
-            Action::InspectSystem { .. } | Action::CheckSubagentStatus { .. } => Risk::Read,
+            Action::InspectSystem { .. }
+            | Action::CheckSubagentStatus { .. }
+            | Action::UiInspect { .. } => Risk::Read,
         }
     }
 
@@ -637,6 +698,9 @@ impl Action {
             Action::PressKeys { .. } => "press_keys",
             Action::MouseMove { .. } => "mouse_move",
             Action::MouseClick { .. } => "mouse_click",
+            Action::UiInspect { .. } => "ui_inspect",
+            Action::UiClick { .. } => "ui_click",
+            Action::Screenshot { .. } => "screenshot",
         }
     }
 
@@ -685,6 +749,15 @@ impl Action {
                     if *double { " x2" } else { "" }
                 )
             }
+            Action::UiInspect { window } => match window {
+                Some(w) => format!("ui_inspect({w:?})"),
+                None => "ui_inspect(foreground)".to_string(),
+            },
+            Action::UiClick { window, name } => match window {
+                Some(w) => format!("ui_click({name:?} in {w:?})"),
+                None => format!("ui_click({name:?})"),
+            },
+            Action::Screenshot { path } => format!("screenshot({})", sandbox.rel(path)),
         }
     }
 
@@ -773,6 +846,9 @@ impl Action {
                 button,
                 double,
             } => gui_click(*x, *y, button, *double),
+            Action::UiInspect { window } => uia_inspect(window.as_deref()),
+            Action::UiClick { window, name } => uia_click(window.as_deref(), name),
+            Action::Screenshot { path } => uia_screenshot(path),
         }
     }
 }
@@ -1017,6 +1093,63 @@ pub fn validate(call: &ToolCall, sandbox: &Sandbox) -> Result<Action, String> {
                     y,
                     button,
                     double,
+                })
+            }
+        }
+        "ui_inspect" => {
+            #[cfg(not(windows))]
+            {
+                Err("ui_inspect is only available on Windows".into())
+            }
+            #[cfg(windows)]
+            {
+                let window = args
+                    .get("window")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty());
+                Ok(Action::UiInspect { window })
+            }
+        }
+        "ui_click" => {
+            #[cfg(not(windows))]
+            {
+                Err("ui_click is only available on Windows".into())
+            }
+            #[cfg(windows)]
+            {
+                if sandbox.shell_mode() == ShellSandbox::Disabled {
+                    return Err("ui_click is disabled (exec execution is off)".into());
+                }
+                let name = str_arg("name")?;
+                if name.trim().is_empty() {
+                    return Err("ui_click requires a non-empty `name`".into());
+                }
+                let window = args
+                    .get("window")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .filter(|s| !s.trim().is_empty());
+                Ok(Action::UiClick { window, name })
+            }
+        }
+        "screenshot" => {
+            #[cfg(not(windows))]
+            {
+                Err("screenshot is only available on Windows".into())
+            }
+            #[cfg(windows)]
+            {
+                if sandbox.shell_mode() == ShellSandbox::Disabled {
+                    return Err("screenshot is disabled (exec execution is off)".into());
+                }
+                let raw = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("screenshot.png");
+                Ok(Action::Screenshot {
+                    path: sandbox.resolve(raw, false)?,
                 })
             }
         }
@@ -1534,6 +1667,46 @@ fn gui_click(_x: Option<i32>, _y: Option<i32>, _button: &str, _double: bool) -> 
     ToolOutcome::Err("mouse_click is only available on Windows".into())
 }
 
+// --- UI Automation + screenshot (Phase 2; Windows) ------------------------
+
+#[cfg(windows)]
+fn uia_inspect(window: Option<&str>) -> ToolOutcome {
+    match win_uia::inspect(window) {
+        Ok(s) if s.trim().is_empty() => ToolOutcome::Ok("(no UI elements found)".into()),
+        Ok(s) => ToolOutcome::Ok(clip(&s)),
+        Err(e) => ToolOutcome::Err(e),
+    }
+}
+
+#[cfg(windows)]
+fn uia_click(window: Option<&str>, name: &str) -> ToolOutcome {
+    match win_uia::click(window, name) {
+        Ok(s) => ToolOutcome::Ok(s),
+        Err(e) => ToolOutcome::Err(e),
+    }
+}
+
+#[cfg(windows)]
+fn uia_screenshot(path: &Path) -> ToolOutcome {
+    match win_uia::screenshot(path) {
+        Ok(s) => ToolOutcome::Ok(s),
+        Err(e) => ToolOutcome::Err(e),
+    }
+}
+
+#[cfg(not(windows))]
+fn uia_inspect(_window: Option<&str>) -> ToolOutcome {
+    ToolOutcome::Err("ui_inspect is only available on Windows".into())
+}
+#[cfg(not(windows))]
+fn uia_click(_window: Option<&str>, _name: &str) -> ToolOutcome {
+    ToolOutcome::Err("ui_click is only available on Windows".into())
+}
+#[cfg(not(windows))]
+fn uia_screenshot(_path: &Path) -> ToolOutcome {
+    ToolOutcome::Err("screenshot is only available on Windows".into())
+}
+
 // --- helpers --------------------------------------------------------------
 
 fn clip(s: &str) -> String {
@@ -1780,25 +1953,39 @@ mod tests {
         let s = specs(false, ShellSandbox::Sandboxed);
         let has_rwc = s.iter().any(|t| t.name == "run_windows_command");
         let has_inspect = s.iter().any(|t| t.name == "inspect_system");
-        let gui = ["type_text", "press_keys", "mouse_move", "mouse_click"];
+        // Exec-tier GUI + UIA-action tools; ui_inspect is read-only (always on).
+        let gui = [
+            "type_text",
+            "press_keys",
+            "mouse_move",
+            "mouse_click",
+            "ui_click",
+            "screenshot",
+        ];
         if cfg!(windows) {
             assert!(has_rwc && has_inspect);
-            // GUI input tools are advertised on Windows, all Exec tier.
+            // GUI/UIA action tools are advertised on Windows, all Exec tier.
             for name in gui {
                 assert!(
                     s.iter().any(|t| t.name == name && t.risk == Risk::Exec),
                     "{name} should be an advertised Exec tool"
                 );
             }
-            // The exec kill-switch (`disabled`) removes run_windows_command AND the
-            // GUI input tools, but keeps the read-only inspect_system.
+            // ui_inspect is read-only and always offered.
+            assert!(s
+                .iter()
+                .any(|t| t.name == "ui_inspect" && t.risk == Risk::Read));
+            // The exec kill-switch (`disabled`) removes the Exec GUI/UIA tools and
+            // run_windows_command, but keeps the read-only inspect_system + ui_inspect.
             let off = specs(false, ShellSandbox::Disabled);
             assert!(off.iter().all(|t| t.name != "run_windows_command"));
             assert!(off.iter().all(|t| !gui.contains(&t.name)));
             assert!(off.iter().any(|t| t.name == "inspect_system"));
+            assert!(off.iter().any(|t| t.name == "ui_inspect"));
         } else {
             assert!(!has_rwc && !has_inspect);
             assert!(s.iter().all(|t| !gui.contains(&t.name)));
+            assert!(s.iter().all(|t| t.name != "ui_inspect"));
         }
     }
 

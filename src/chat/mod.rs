@@ -42,6 +42,8 @@ mod win_console;
 mod win_input;
 #[cfg(windows)]
 mod win_job;
+#[cfg(windows)]
+mod win_uia;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
