@@ -39,6 +39,9 @@ struct MetalLinearKernel {
     q8_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q4_0_block_ksplit_f32y_wire_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_nsg8_pipeline: ComputePipelineState,
+    #[allow(dead_code)] // batched-column verify GEMV; exercised by the C0 unit test,
+    // consumed by the speculative-verify lane in a later checkpoint
+    q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline: ComputePipelineState,
     q8_0_block_ksplit_f32y_wire_gemm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_pipeline: ComputePipelineState,
     q8_0_block_wire_mm_f16o_pipeline: ComputePipelineState,
@@ -84,6 +87,11 @@ struct MetalLinearKernel {
     #[allow(dead_code)] // stage-bandwidth probe variant; exercised by the depth-probe test
     attention_splitk_kv16_stageonly_pipeline: ComputePipelineState,
     attention_decode_splitk_merge_pipeline: ComputePipelineState,
+    // WIN2METAL Phase 4 — TREE-verify attention clones (slot-indirected draft tail).
+    attention_decode_f32_tree_pipeline: ComputePipelineState,
+    attention_decode_v2_tree_pipeline: ComputePipelineState,
+    attention_decode_splitk_kv16_tree_pipeline: ComputePipelineState,
+    attention_decode_splitk_kv16_direct_tree_pipeline: ComputePipelineState,
     embed_row_gather_q8_wire_pipeline: ComputePipelineState,
     active_command_buffer: Mutex<Option<metal::CommandBuffer>>,
     /// Recycled per-token scratch buffers keyed by power-of-two byte class. The resident
@@ -1110,6 +1118,100 @@ kernel void q8_0_block_linear_ksplit_f32y_wire_gemm(
                         sumq += wv[i] * yl[t][i];
                     }
                     sumf[row][t] += sumq;
+                }
+            }
+        }
+        for (uint t = 0; t < tn; ++t) {
+            for (uint row = 0; row < NR0; ++row) {
+                if (sg == 0) {
+                    shmem[row * 32 + lane] = 0.0f;
+                }
+                sumf[row][t] = simd_sum(sumf[row][t]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint row = 0; row < NR0; ++row) {
+                if (lane == 0) {
+                    shmem[row * 32 + sg] = sumf[row][t];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint row = 0; row < NR0 && r0 + row < rows; ++row) {
+                const float tot = simd_sum(shmem[row * 32 + lane]);
+                if (lane == 0 && sg == 0) {
+                    output[(t0 + t) * rows + r0 + row] = tot;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// Byte-exact batched-column mirror of the single-token GEMV
+// `q8_0_block_linear_row_ksplit_f32y_wire_nsg8` (above). It runs the SAME NSG=8
+// reduction over `n_rows_in` INDEPENDENT activation columns (the speculative-verify
+// rows, <= MAX_T), carrying a separate accumulator per column. For each weight block
+// the per-block partial is computed as `sumq = Σ_i wq[i]*y[i]` and ONLY THEN scaled
+// (`sumf += sumq * w_scale`) — w_scale is never folded onto the weight (that reorders
+// the rounding and is what the prefill `wire_gemm` does), so column t equals the
+// single-token GEMV bit-for-bit. Columns never interact: same block ownership
+// (`ib = sg*NQ+ix`, step NSG*NQ=64), same dot order, same two-stage
+// simd_sum -> shmem[row*32+sg] -> simd_sum finalize. y is row-major
+// [token][blocks_per_row*32]; output is token-major [token][rows] so the next GEMM
+// reads [token][dim]. A trailing per-column barrier guards the shared shmem against
+// the next column's zero-out — it changes ordering only, not arithmetic.
+kernel void q8_0_block_linear_ksplit_f32y_wire_nsg8_verify(
+    device const float* y [[buffer(0)]],
+    device const char* weight_blocks [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& blocks_per_row [[buffer(4)]],
+    constant uint& rows [[buffer(5)]],
+    constant uint& n_rows_in [[buffer(6)]],
+    threadgroup float* shmem [[threadgroup(0)]],
+    uint tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 8;
+    constexpr uint NR0 = 2;
+    constexpr uint NQ = 8;
+    constexpr uint MAX_T = 8; // verify columns processed per pass
+    constexpr uint q8_block_bytes = 34;
+    const uint r0 = tg * NR0;
+    const uint row_stride = blocks_per_row * q8_block_bytes;
+
+    const uint ix = lane / 4;
+    const uint il = (lane % 4) * NQ;
+
+    for (uint t0 = 0; t0 < n_rows_in; t0 += MAX_T) {
+        const uint tn = min(uint(MAX_T), n_rows_in - t0);
+        float sumf[NR0][MAX_T];
+        for (uint row = 0; row < NR0; ++row) {
+            for (uint t = 0; t < MAX_T; ++t) {
+                sumf[row][t] = 0.0f;
+            }
+        }
+        for (uint ib = sg * NQ + ix; ib < blocks_per_row; ib += NSG * NQ) {
+            float yl[MAX_T][NQ];
+            for (uint t = 0; t < tn; ++t) {
+                device const float* yb = y + (t0 + t) * blocks_per_row * 32 + ib * 32 + il;
+                for (uint i = 0; i < NQ; ++i) {
+                    yl[t][i] = yb[i];
+                }
+            }
+            for (uint row = 0; row < NR0; ++row) {
+                const uint rr = r0 + row;
+                if (rr >= rows) {
+                    break;
+                }
+                device const char* wb = weight_blocks + rr * row_stride + ib * q8_block_bytes;
+                const float w_scale = float(*reinterpret_cast<device const half*>(wb));
+                device const char* wq = wb + 2 + il;
+                for (uint t = 0; t < tn; ++t) {
+                    float sumq = 0.0f;
+                    for (uint i = 0; i < NQ; ++i) {
+                        sumq += float(wq[i]) * yl[t][i];
+                    }
+                    sumf[row][t] += sumq * w_scale;
                 }
             }
         }
@@ -3777,6 +3879,368 @@ kernel void embed_row_gather_q8_wire(
     const float scale = float(*reinterpret_cast<device const half*>(wb));
     out[gid] = float(wb[2 + (gid % 32)]) * scale;
 }
+
+// ---------------------------------------------------------------------------
+// WIN2METAL Phase 4 — TREE speculative-verify attention kernels.
+//
+// Each is a line-for-line clone of the decode-attention kernel the LINEAR verify
+// path routes to, plus a transparent slot indirection on the draft tail. Two new
+// params: `tail_slots` (per-node ancestor draft cache slots, increasing order,
+// length tail_count) at buffer(14) and `base` (the contiguous prefix length) at
+// buffer(15). Every cache-position deref `p`/`a` becomes
+//     uint slot = (a < base) ? a : tail_slots[a - base];
+// then indexes `kv_base + slot*position_stride + d`. position_count == count ==
+// base + tail_count. The split-K chunk boundaries (n_splits over [0,count)) and
+// every reduction stay IDENTICAL to the cloned kernel, so a LINEAR tree — where
+// node i has ancestor slots [base..base+i] so slot==a for every a — produces the
+// exact same instruction stream / float order / split boundaries as the linear
+// kernel ⇒ bit-identical. Only the ≤TREE_MAX_NODES draft tail is gathered; the
+// huge [0,base) prefix stays direct (no threadgroup-memory blow-up).
+//
+// NOTE: buffer(13) is already n_splits in the split-K kernels, so the tree params
+// uniformly take buffer(14)/(15) across all four variants.
+// ---------------------------------------------------------------------------
+
+// Tree clone of attention_decode_f32 (universal one-simdgroup-per-head fallback).
+kernel void attention_decode_f32_tree(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* scores [[buffer(3)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const uint* tail_slots [[buffer(14)]],
+    constant uint& base [[buffer(15)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (head >= n_heads) return;
+    uint kv_head = head / group;
+    uint q_base = head * head_dim;
+    uint kv_base = kv_base_offset + kv_head * kv_head_stride;
+    uint score_base = head * position_count;
+
+    float local_max = -INFINITY;
+    for (uint p = lane; p < position_count; p += 32) {
+        uint slot = (p < base) ? p : tail_slots[p - base];
+        uint k_base = kv_base + slot * position_stride;
+        float s = 0.0;
+        for (uint d = 0; d < head_dim; ++d) {
+            s += query[q_base + d] * keys[k_base + d];
+        }
+        s *= scale;
+        scores[score_base + p] = s;
+        local_max = max(local_max, s);
+    }
+    float max_score = simd_max(local_max);
+
+    float local_sum = 0.0;
+    for (uint p = lane; p < position_count; p += 32) {
+        float e = exp(scores[score_base + p] - max_score);
+        scores[score_base + p] = e;
+        local_sum += e;
+    }
+    float inv = 1.0 / simd_sum(local_sum);
+
+    threadgroup_barrier(mem_flags::mem_device);
+
+    for (uint d = lane; d < head_dim; d += 32) {
+        float acc = 0.0;
+        for (uint p = 0; p < position_count; ++p) {
+            uint slot = (p < base) ? p : tail_slots[p - base];
+            acc += scores[score_base + p] * inv * values[kv_base + slot * position_stride + d];
+        }
+        output[q_base + d] = acc;
+    }
+}
+
+// Tree clone of attention_decode_v2_f32 (the pc<128 tiled path).
+kernel void attention_decode_v2_tree(
+    device const float* query [[buffer(0)]],
+    device const float* keys [[buffer(1)]],
+    device const float* values [[buffer(2)]],
+    device float* output [[buffer(4)]],
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    device const uint* tail_slots [[buffer(14)]],
+    constant uint& base [[buffer(15)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint NSG = 4;
+    constexpr uint MAX_DPL = 4; // head_dim <= 128 -> at most 4 dims per lane
+    if (head >= n_heads) return;
+    const uint dpl = head_dim / 32;
+    const uint q_base = head * head_dim;
+    const uint kv_base = kv_base_offset + (head / group) * kv_head_stride;
+
+    float q[MAX_DPL];
+    for (uint i = 0; i < dpl; ++i) {
+        q[i] = query[q_base + lane + i * 32] * scale;
+    }
+
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (uint p = sg; p < position_count; p += NSG) {
+        uint slot = (p < base) ? p : tail_slots[p - base];
+        device const float* kr = keys + kv_base + slot * position_stride;
+        float s = 0.0;
+        for (uint i = 0; i < dpl; ++i) {
+            s += q[i] * kr[lane + i * 32];
+        }
+        s = simd_sum(s);
+        float m_new = max(m, s);
+        float w = exp(s - m_new);
+        float corr = exp(m - m_new);
+        device const float* vr = values + kv_base + slot * position_stride;
+        for (uint i = 0; i < dpl; ++i) {
+            acc[i] = acc[i] * corr + w * vr[lane + i * 32];
+        }
+        l = l * corr + w;
+        m = m_new;
+    }
+
+    threadgroup float sh_m[NSG];
+    threadgroup float sh_l[NSG];
+    threadgroup float sh_acc[NSG * 128];
+    if (lane == 0) {
+        sh_m[sg] = m;
+        sh_l[sg] = l;
+    }
+    for (uint i = 0; i < dpl; ++i) {
+        sh_acc[sg * 128 + lane + i * 32] = acc[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float m_tot = max(max(sh_m[0], sh_m[1]), max(sh_m[2], sh_m[3]));
+        float l_tot = 0.0;
+        float w[NSG];
+        for (uint i = 0; i < NSG; ++i) {
+            w[i] = exp(sh_m[i] - m_tot);
+            l_tot += sh_l[i] * w[i];
+        }
+        float inv = 1.0 / l_tot;
+        for (uint i = 0; i < dpl; ++i) {
+            uint d = lane + i * 32;
+            float o = 0.0;
+            for (uint g2 = 0; g2 < NSG; ++g2) {
+                o += sh_acc[g2 * 128 + d] * w[g2];
+            }
+            output[q_base + d] = o * inv;
+        }
+    }
+}
+
+// Tree clone of attention_decode_splitk_kv16 (the staged depth path, head_dim != 128).
+// The original's local `base` (a K/V byte offset) is renamed `koff` to free the name
+// for the prefix-length param.
+kernel void attention_decode_splitk_kv16_tree(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]], // [n_heads][n_splits][head_dim + 2]
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_splits [[buffer(13)]],
+    device const uint* tail_slots [[buffer(14)]],
+    constant uint& base [[buffer(15)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    constexpr uint PT = 16;
+    constexpr uint MAX_DPL = 4;
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint dpl = head_dim / 32;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float q[MAX_DPL];
+    if (active) {
+        for (uint i = 0; i < dpl; ++i) {
+            q[i] = query[qh * head_dim + lane + i * 32] * scale;
+        }
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[MAX_DPL] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    threadgroup half4 k_s4[PT * 32];
+    threadgroup half4 v_s4[PT * 32];
+    threadgroup half* k_s = reinterpret_cast<threadgroup half*>(k_s4);
+    threadgroup half* v_s = reinterpret_cast<threadgroup half*>(v_s4);
+    const uint tid = sg * 32 + lane;
+    for (uint pt = p0; pt < p1; pt += PT) {
+        const uint count = min(PT, p1 - pt);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint idx4 = tid; idx4 < (count * head_dim) / 4; idx4 += 128) {
+            const uint e4 = idx4 * 4;
+            const uint p = e4 / head_dim;
+            const uint d = e4 % head_dim;
+            const uint pos = pt + p;
+            const uint slot = (pos < base) ? pos : tail_slots[pos - base];
+            const uint koff = kv_base + slot * position_stride + d;
+            k_s4[idx4] = *reinterpret_cast<device const half4*>(keys + koff);
+            v_s4[idx4] = *reinterpret_cast<device const half4*>(values + koff);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            for (uint j0 = 0; j0 < count; j0 += 4) {
+                float s4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    const uint j = j0 + jj;
+                    if (j < count) {
+                        float s = 0.0f;
+                        for (uint i = 0; i < dpl; ++i) {
+                            s += q[i] * float(k_s[j * head_dim + lane + i * 32]);
+                        }
+                        s4[jj] = simd_sum(s);
+                    } else {
+                        s4[jj] = -INFINITY;
+                    }
+                }
+                const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+                const float m_new = max(m, m4);
+                const float corr = exp(m - m_new);
+                float w4[4];
+                for (uint jj = 0; jj < 4; ++jj) {
+                    w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+                }
+                for (uint i = 0; i < dpl; ++i) {
+                    float a = acc[i] * corr;
+                    for (uint jj = 0; jj < 4; ++jj) {
+                        if (j0 + jj < count) {
+                            a += w4[jj] * float(v_s[(j0 + jj) * head_dim + lane + i * 32]);
+                        }
+                    }
+                    acc[i] = a;
+                }
+                l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+                m = m_new;
+            }
+        }
+    }
+    if (active) {
+        device float* dst = partials + ((ulong)qh * n_splits + split) * (head_dim + 2);
+        for (uint i = 0; i < dpl; ++i) {
+            dst[lane + i * 32] = acc[i];
+        }
+        if (lane == 0) {
+            dst[head_dim] = m;
+            dst[head_dim + 1] = l;
+        }
+    }
+}
+
+// Tree clone of attention_decode_splitk_kv16_direct (head_dim == 128).
+kernel void attention_decode_splitk_kv16_direct_tree(
+    device const float* query [[buffer(0)]],
+    device const half* keys [[buffer(1)]],
+    device const half* values [[buffer(2)]],
+    device float* partials [[buffer(3)]], // [n_heads][n_splits][head_dim + 2]
+    constant uint& n_heads [[buffer(5)]],
+    constant uint& head_dim [[buffer(6)]],
+    constant uint& position_count [[buffer(7)]],
+    constant uint& group [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    constant uint& position_stride [[buffer(10)]],
+    constant uint& kv_head_stride [[buffer(11)]],
+    constant uint& kv_base_offset [[buffer(12)]],
+    constant uint& n_splits [[buffer(13)]],
+    device const uint* tail_slots [[buffer(14)]],
+    constant uint& base [[buffer(15)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    const uint kvh = tg.x;
+    const uint split = tg.y;
+    const uint kv_base = kv_base_offset + kvh * kv_head_stride;
+    const uint chunk = (position_count + n_splits - 1) / n_splits;
+    const uint p0 = min(split * chunk, position_count);
+    const uint p1 = min(p0 + chunk, position_count);
+
+    const uint qh = kvh * group + sg;
+    const bool active = sg < group && qh < n_heads;
+    float4 q4 = float4(0.0f);
+    if (active) {
+        q4 = *reinterpret_cast<device const float4*>(query + qh * 128 + lane * 4) * scale;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+    float4 acc = float4(0.0f);
+    if (active) {
+        for (uint j0 = p0; j0 < p1; j0 += 4) {
+            float s4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const uint slot = (j < base) ? j : tail_slots[j - base];
+                    const half4 k4 = *reinterpret_cast<device const half4*>(
+                        keys + kv_base + slot * position_stride + lane * 4);
+                    s4[jj] = simd_sum(dot(float4(k4), q4));
+                } else {
+                    s4[jj] = -INFINITY;
+                }
+            }
+            const float m4 = max(max(s4[0], s4[1]), max(s4[2], s4[3]));
+            const float m_new = max(m, m4);
+            const float corr = exp(m - m_new);
+            float w4[4];
+            for (uint jj = 0; jj < 4; ++jj) {
+                w4[jj] = (s4[jj] == -INFINITY) ? 0.0f : exp(s4[jj] - m_new);
+            }
+            acc *= corr;
+            for (uint jj = 0; jj < 4; ++jj) {
+                const uint j = j0 + jj;
+                if (j < p1) {
+                    const uint slot = (j < base) ? j : tail_slots[j - base];
+                    const half4 v4 = *reinterpret_cast<device const half4*>(
+                        values + kv_base + slot * position_stride + lane * 4);
+                    acc += w4[jj] * float4(v4);
+                }
+            }
+            l = l * corr + w4[0] + w4[1] + w4[2] + w4[3];
+            m = m_new;
+        }
+        device float* dst = partials + ((ulong)qh * n_splits + split) * (128 + 2);
+        dst[lane * 4] = acc.x;
+        dst[lane * 4 + 1] = acc.y;
+        dst[lane * 4 + 2] = acc.z;
+        dst[lane * 4 + 3] = acc.w;
+        if (lane == 0) {
+            dst[128] = m;
+            dst[129] = l;
+        }
+    }
+}
 "#;
 
 #[cfg(target_os = "macos")]
@@ -4026,6 +4490,35 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
             let attention_decode_splitk_merge_pipeline = device
                 .new_compute_pipeline_state_with_function(&attention_decode_splitk_merge_function)
                 .ok()?;
+            // WIN2METAL Phase 4 — TREE-verify attention clones.
+            let attention_decode_f32_tree_function = elementwise_library
+                .get_function("attention_decode_f32_tree", None)
+                .ok()?;
+            let attention_decode_f32_tree_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_f32_tree_function)
+                .ok()?;
+            let attention_decode_v2_tree_function = elementwise_library
+                .get_function("attention_decode_v2_tree", None)
+                .ok()?;
+            let attention_decode_v2_tree_pipeline = device
+                .new_compute_pipeline_state_with_function(&attention_decode_v2_tree_function)
+                .ok()?;
+            let attention_decode_splitk_kv16_tree_function = elementwise_library
+                .get_function("attention_decode_splitk_kv16_tree", None)
+                .ok()?;
+            let attention_decode_splitk_kv16_tree_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &attention_decode_splitk_kv16_tree_function,
+                )
+                .ok()?;
+            let attention_decode_splitk_kv16_direct_tree_function = elementwise_library
+                .get_function("attention_decode_splitk_kv16_direct_tree", None)
+                .ok()?;
+            let attention_decode_splitk_kv16_direct_tree_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &attention_decode_splitk_kv16_direct_tree_function,
+                )
+                .ok()?;
             let argmax_f32_greedy_function = elementwise_library
                 .get_function("argmax_f32_greedy", None)
                 .ok()?;
@@ -4113,6 +4606,14 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                     &q8_0_block_ksplit_f32y_wire_nsg8_function,
                 )
                 .ok()?;
+            let q8_0_block_ksplit_f32y_wire_nsg8_verify_function = library
+                .get_function("q8_0_block_linear_ksplit_f32y_wire_nsg8_verify", None)
+                .ok()?;
+            let q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline = device
+                .new_compute_pipeline_state_with_function(
+                    &q8_0_block_ksplit_f32y_wire_nsg8_verify_function,
+                )
+                .ok()?;
             let q8_0_block_ksplit_f32y_wire_gemm_function = library
                 .get_function("q8_0_block_linear_ksplit_f32y_wire_gemm", None)
                 .ok()?;
@@ -4148,6 +4649,7 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 q8_0_block_ksplit_f32y_wire_pipeline,
                 q4_0_block_ksplit_f32y_wire_pipeline,
                 q8_0_block_ksplit_f32y_wire_nsg8_pipeline,
+                q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline,
                 q8_0_block_ksplit_f32y_wire_gemm_pipeline,
                 q8_0_block_wire_mm_pipeline,
                 q8_0_block_wire_mm_f16o_pipeline,
@@ -4191,6 +4693,10 @@ fn metal_linear_kernel() -> Option<&'static MetalLinearKernel> {
                 attention_decode_splitk_kv16_direct_pipeline,
                 attention_splitk_kv16_stageonly_pipeline,
                 attention_decode_splitk_merge_pipeline,
+                attention_decode_f32_tree_pipeline,
+                attention_decode_v2_tree_pipeline,
+                attention_decode_splitk_kv16_tree_pipeline,
+                attention_decode_splitk_kv16_direct_tree_pipeline,
                 embed_row_gather_q8_wire_pipeline,
                 active_command_buffer: Mutex::new(None),
                 scratch_pool: Mutex::new(HashMap::new()),
@@ -7083,6 +7589,40 @@ fn encode_rms_norm_f32(
     );
 }
 
+/// Batched RMSNorm over `rows` contiguous f32 rows (`rms_norm_batch_f32`): one 256-thread
+/// group per row, the SAME reduction + `1/sqrt(mean_sq+eps)` as the single-row
+/// `rms_norm_f32`, so row `r`'s output bit-equals a single-token norm of `input[r*width..]`.
+/// `scalar` holds width (u32) @0 then eps (f32) @4.
+#[cfg(target_os = "macos")]
+fn encode_rms_norm_batch(
+    k: &MetalLinearKernel,
+    e: &metal::ComputeCommandEncoderRef,
+    input: &Buffer,
+    weight: &Buffer,
+    output: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+) {
+    e.set_compute_pipeline_state(&k.rms_norm_batch_pipeline);
+    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(1, Some(weight), 0);
+    e.set_buffer(2, Some(output), 0);
+    e.set_buffer(3, Some(scalar), 0);
+    e.set_buffer(4, Some(scalar), 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: rows as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
 /// Opt-in: with CAMELID_METAL_F32Y also set, weights upload in the raw GGUF 34-byte
 /// f16-scale wire layout (~5.9% fewer weight bytes per token).
 #[cfg(target_os = "macos")]
@@ -7196,6 +7736,59 @@ fn encode_q8_matmul_f32y(
         },
         metal::MTLSize {
             width: threads_per_tg,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Batched-column mirror of [`encode_q8_matmul_f32y`]'s production NSG=8 wire GEMV.
+/// Instead of dotting each weight block against one activation vector, it dots it
+/// against all `n_rows_in` activation columns (the speculative-verify rows) before
+/// moving on, so each weight is streamed once for the whole window rather than once
+/// per token. `y` is row-major `[token][blocks_per_row*32]`; `out` is token-major
+/// `[token][rows]` (matching the next GEMM's `[token][dim]` input). The bound kernel
+/// keeps the single-token per-block `sumq` then `*w_scale` ordering and the exact
+/// two-stage reduction, so each output column is BIT-IDENTICAL to the single-token
+/// dispatch (proven by `metal_verify_gemv_batched_bit_identical`). `scalar` must be
+/// at least 12 bytes with `blocks_per_row` @0 and `rows` @4 already written (same as
+/// the single-token caller); the column count `n_rows_in` is written to @8 here.
+// Consumed by the speculative-verify lane (a later checkpoint); for now exercised by
+// the `metal_verify_gemv_batched_bit_identical` unit test, so it reads as dead in a
+// non-test lib build.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+fn encode_q8_matmul_f32y_batched(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    y: &Buffer,
+    weight: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    rows: usize,
+    n_rows_in: usize,
+) {
+    unsafe {
+        let p = scalar.contents() as *mut u8;
+        *(p.add(8) as *mut u32) = n_rows_in as u32;
+    }
+    e.set_compute_pipeline_state(&k.q8_0_block_ksplit_f32y_wire_nsg8_verify_pipeline);
+    e.set_buffer(0, Some(y), 0);
+    e.set_buffer(2, Some(weight), 0);
+    e.set_buffer(3, Some(out), 0);
+    e.set_buffer(4, Some(scalar), 0);
+    e.set_buffer(5, Some(scalar), 4);
+    e.set_buffer(6, Some(scalar), 8);
+    e.set_threadgroup_memory_length(0, 2 * 32 * 4);
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: (rows as u64).div_ceil(2),
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: 256,
             height: 1,
             depth: 1,
         },
@@ -7435,6 +8028,7 @@ fn encode_gemma4_ffn(
 /// [head_dim: u32 @0, eps: f32 @4, use_weight: u32 @8]; `weight` may be a dummy when
 /// use_weight is 0.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 fn encode_rms_norm_per_head(
     e: &metal::ComputeCommandEncoderRef,
     k: &MetalLinearKernel,
@@ -7443,11 +8037,16 @@ fn encode_rms_norm_per_head(
     output: &Buffer,
     scalar: &Buffer,
     head_count: usize,
+    // Byte offset applied to the (in-place) input/output buffer so the per-head norm
+    // can run on an arbitrary verify row; the per-head `base = head*head_dim` indexing
+    // is relative to the bound offset, so the arithmetic is unchanged. Default 0 for all
+    // pre-verify callers (no behavior change).
+    row_off: u64,
 ) {
     e.set_compute_pipeline_state(&k.rms_norm_per_head_pipeline);
-    e.set_buffer(0, Some(input), 0);
+    e.set_buffer(0, Some(input), row_off);
     e.set_buffer(1, Some(weight), 0);
-    e.set_buffer(2, Some(output), 0);
+    e.set_buffer(2, Some(output), row_off);
     e.set_buffer(3, Some(scalar), 0);
     e.set_buffer(4, Some(scalar), 4);
     e.set_buffer(5, Some(scalar), 8);
@@ -7615,9 +8214,9 @@ fn encode_gemma4_attention(
 
     encode_rms_norm_f32(e, k, in_buf, &norm_w, &normf, &rms_scalar);
     encode_gemma4_matmul(fmt, e, k, &normf, q_w, &query_buf, &q_mm, q_dim);
-    encode_rms_norm_per_head(e, k, &query_buf, &qnorm_w, &qn_buf, &perhead_q, n_heads);
+    encode_rms_norm_per_head(e, k, &query_buf, &qnorm_w, &qn_buf, &perhead_q, n_heads, 0);
     encode_rope(
-        e, k, &qn_buf, &cos_buf, &sin_buf, &rope_q, n_heads, half_rope,
+        e, k, &qn_buf, &cos_buf, &sin_buf, &rope_q, n_heads, half_rope, 0, 0,
     );
     // Owning layers project + cache their own K/V; the trailing cross-shared layers
     // skip all of that and run attention against the source layer's cache
@@ -7635,11 +8234,11 @@ fn encode_gemma4_attention(
         } else {
             &key_buf
         };
-        encode_rms_norm_per_head(e, k, &key_buf, &knorm_w, &kn_buf, &perhead_k, n_kv_heads);
+        encode_rms_norm_per_head(e, k, &key_buf, &knorm_w, &kn_buf, &perhead_k, n_kv_heads, 0);
         // Weightless V-norm: qnorm_w is bound as a dummy (use_weight = 0, never read).
-        encode_rms_norm_per_head(e, k, v_src, &qnorm_w, &vn_buf, &perhead_v, n_kv_heads);
+        encode_rms_norm_per_head(e, k, v_src, &qnorm_w, &vn_buf, &perhead_v, n_kv_heads, 0);
         encode_rope(
-            e, k, &kn_buf, &cos_buf, &sin_buf, &rope_k, n_kv_heads, half_rope,
+            e, k, &kn_buf, &cos_buf, &sin_buf, &rope_k, n_kv_heads, half_rope, 0, 0,
         );
         // Scatter the roped K and normed V into the cache at write_position. f32 cache
         // only: bind the kv16 mirror slots to a placeholder with the write flag at 0.
@@ -7672,6 +8271,8 @@ fn encode_gemma4_attention(
         n_kv_heads,
         head_dim,
         position_count,
+        0,
+        0,
     );
     encode_gemma4_matmul(fmt, e, k, &ctx_buf, o_w, &o_buf, &o_mm, hidden);
     encode_rms_norm_f32(e, k, &o_buf, &postnorm_w, &on_buf, &post_rms_scalar);
@@ -8115,7 +8716,16 @@ fn encode_gemma4_pli(
         *(resid_n.contents() as *mut u32) = ple_total as u32;
     }
     encode_linear_transposed_f32(e, k, h0_buf, proj_buf, ctx_buf, &ctx_scalar, ple_total);
-    encode_rms_norm_per_head(e, k, ctx_buf, projnorm_buf, ctx_n_buf, &perhead, n_layers);
+    encode_rms_norm_per_head(
+        e,
+        k,
+        ctx_buf,
+        projnorm_buf,
+        ctx_n_buf,
+        &perhead,
+        n_layers,
+        0,
+    );
     encode_binary(
         e,
         &k.residual_add_pipeline,
@@ -8512,11 +9122,17 @@ fn encode_rope(
     scalar: &Buffer,
     head_count: usize,
     half_rope: usize,
+    // Byte offset for the (in-place) data buffer, and a shared offset for the cos/sin
+    // tables, so RoPE can run on a single verify row at position `base+i` (cos/sin are
+    // position-major with stride half_rope). All in-kernel indexing is relative to the
+    // bound offsets, so the math is unchanged. Default 0 for all pre-verify callers.
+    data_off: u64,
+    table_off: u64,
 ) {
     e.set_compute_pipeline_state(&k.rope_rotate_pipeline);
-    e.set_buffer(0, Some(data), 0);
-    e.set_buffer(1, Some(cos_t), 0);
-    e.set_buffer(2, Some(sin_t), 0);
+    e.set_buffer(0, Some(data), data_off);
+    e.set_buffer(1, Some(cos_t), table_off);
+    e.set_buffer(2, Some(sin_t), table_off);
     e.set_buffer(3, Some(scalar), 0); // head_count
     e.set_buffer(4, Some(scalar), 4); // head_dim
     e.set_buffer(5, Some(scalar), 8); // half_rope
@@ -8541,6 +9157,12 @@ fn encode_attention(
     n_kv_heads: usize,
     head_dim: usize,
     position_count: usize,
+    // Byte offsets for the query input and the context output buffers, so attention can
+    // run on a single verify row (query/out at row `i`) while the K/V cache is shared.
+    // The kernels index heads relative to the bound offset, so the routing/math are
+    // unchanged. Default 0 for all pre-verify callers (single-token query/out at row 0).
+    query_off: u64,
+    out_off: u64,
 ) {
     // Tiled kernel (4 simdgroups/head, online softmax, no scores buffer) when enabled and
     // the head geometry allows; otherwise the one-simdgroup-per-head fallback.
@@ -8579,12 +9201,12 @@ fn encode_attention(
             } else {
                 e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_pipeline);
             }
-            e.set_buffer(0, Some(query), 0);
+            e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(mk), 0);
             e.set_buffer(2, Some(mv), 0);
         } else {
             e.set_compute_pipeline_state(&k.attention_decode_splitk_pipeline);
-            e.set_buffer(0, Some(query), 0);
+            e.set_buffer(0, Some(query), query_off);
             e.set_buffer(1, Some(keys), 0);
             e.set_buffer(2, Some(values), 0);
         }
@@ -8612,7 +9234,7 @@ fn encode_attention(
         );
         e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_pipeline);
         e.set_buffer(0, Some(&partials), 0);
-        e.set_buffer(1, Some(out), 0);
+        e.set_buffer(1, Some(out), out_off);
         e.set_buffer(2, Some(scalar), 4); // head_dim
         e.set_buffer(3, Some(&splits_scalar), 0);
         e.dispatch_thread_groups(
@@ -8638,13 +9260,13 @@ fn encode_attention(
         (false, false) => &k.attention_decode_pipeline,
     };
     e.set_compute_pipeline_state(attn_pipeline);
-    e.set_buffer(0, Some(query), 0);
+    e.set_buffer(0, Some(query), query_off);
     e.set_buffer(1, Some(keys), 0);
     e.set_buffer(2, Some(values), 0);
     if !v2 {
         e.set_buffer(3, Some(scores), 0);
     }
-    e.set_buffer(4, Some(out), 0);
+    e.set_buffer(4, Some(out), out_off);
     e.set_buffer(5, Some(scalar), 0); // n_heads
     e.set_buffer(6, Some(scalar), 4); // head_dim
     e.set_buffer(7, Some(scalar), 8); // position_count
@@ -8653,6 +9275,149 @@ fn encode_attention(
     e.set_buffer(10, Some(scalar), 20); // position_stride
     e.set_buffer(11, Some(scalar), 24); // kv_head_stride
     e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+    e.dispatch_thread_groups(
+        metal::MTLSize {
+            width: n_heads as u64,
+            height: 1,
+            depth: 1,
+        },
+        metal::MTLSize {
+            width: if v2 { 128 } else { 32 },
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// WIN2METAL Phase 4 — tree twin of `encode_attention`. Routes (v2 / split-K kv16 /
+/// split-K kv16 direct / f32) EXACTLY like `encode_attention` at the same `position_count`,
+/// but dispatches the `*_tree` pipelines and binds the per-node `tail_slots` buffer at
+/// buffer(14) and the prefix-length `base` at buffer(15). For a LINEAR tree (`tail_slots ==
+/// [base..base+i]`) the slot indirection is the identity, so this is byte-identical to
+/// `encode_attention`.
+///
+/// `tail_slots_buf` holds this node's ancestor draft cache slots (increasing, length
+/// `position_count - base`); `base_buf` holds `base` as a single u32. The split-K branch is
+/// mirror-only (the f32 split-K opt-out kernel is not cloned): it always reads the f16
+/// mirrors when present, matching the linear path under the default (mirror) config.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn encode_attention_tree(
+    e: &metal::ComputeCommandEncoderRef,
+    k: &MetalLinearKernel,
+    keep: &mut Vec<Buffer>,
+    query: &Buffer,
+    keys: &Buffer,
+    values: &Buffer,
+    kv16_mirrors: Option<(&Buffer, &Buffer)>,
+    scores: &Buffer,
+    out: &Buffer,
+    scalar: &Buffer,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    position_count: usize,
+    query_off: u64,
+    out_off: u64,
+    base_buf: &Buffer,
+    tail_slots_buf: &Buffer,
+) {
+    let v2 = attn2_enabled() && head_dim.is_multiple_of(32) && head_dim <= 128;
+    let group = n_heads.checked_div(n_kv_heads).unwrap_or(0);
+    let splitk = v2
+        && !kv16_enabled()
+        && splitk_attention_enabled()
+        && (1..=4).contains(&group)
+        && position_count >= 128;
+    if splitk {
+        let n_splits = position_count.div_ceil(64).clamp(2, 64);
+        let partials = pool_get(k, (n_heads * n_splits * (head_dim + 2) * 4) as u64);
+        let splits_scalar = pool_get(k, 4);
+        unsafe {
+            *(splits_scalar.contents() as *mut u32) = n_splits as u32;
+        }
+        // Tree split-K is mirror-only: read the f16 mirrors whenever present (the f32
+        // split-K kernel has no tree clone). Under the default config the linear path
+        // also reads the mirrors, so the two stay byte-identical.
+        let (mk, mv) = kv16_mirrors.expect("tree split-K requires f16 mirrors");
+        if head_dim == 128 {
+            e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_direct_tree_pipeline);
+        } else {
+            e.set_compute_pipeline_state(&k.attention_decode_splitk_kv16_tree_pipeline);
+        }
+        e.set_buffer(0, Some(query), query_off);
+        e.set_buffer(1, Some(mk), 0);
+        e.set_buffer(2, Some(mv), 0);
+        e.set_buffer(3, Some(&partials), 0);
+        e.set_buffer(5, Some(scalar), 0); // n_heads
+        e.set_buffer(6, Some(scalar), 4); // head_dim
+        e.set_buffer(7, Some(scalar), 8); // position_count
+        e.set_buffer(8, Some(scalar), 12); // group
+        e.set_buffer(9, Some(scalar), 16); // scale (f32)
+        e.set_buffer(10, Some(scalar), 20); // position_stride
+        e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+        e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+        e.set_buffer(13, Some(&splits_scalar), 0);
+        e.set_buffer(14, Some(tail_slots_buf), 0);
+        e.set_buffer(15, Some(base_buf), 0);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_kv_heads as u64,
+                height: n_splits as u64,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        // The merge kernel is slot-agnostic (operates on partials) — reuse it verbatim.
+        e.set_compute_pipeline_state(&k.attention_decode_splitk_merge_pipeline);
+        e.set_buffer(0, Some(&partials), 0);
+        e.set_buffer(1, Some(out), out_off);
+        e.set_buffer(2, Some(scalar), 4); // head_dim
+        e.set_buffer(3, Some(&splits_scalar), 0);
+        e.dispatch_thread_groups(
+            metal::MTLSize {
+                width: n_heads as u64,
+                height: 1,
+                depth: 1,
+            },
+            metal::MTLSize {
+                width: 128,
+                height: 1,
+                depth: 1,
+            },
+        );
+        keep.push(partials);
+        keep.push(splits_scalar);
+        return;
+    }
+    // Non-split path: v2 tiled (no scores buffer) or the f32 one-simdgroup fallback.
+    let attn_pipeline = if v2 {
+        &k.attention_decode_v2_tree_pipeline
+    } else {
+        &k.attention_decode_f32_tree_pipeline
+    };
+    e.set_compute_pipeline_state(attn_pipeline);
+    e.set_buffer(0, Some(query), query_off);
+    e.set_buffer(1, Some(keys), 0);
+    e.set_buffer(2, Some(values), 0);
+    if !v2 {
+        e.set_buffer(3, Some(scores), 0);
+    }
+    e.set_buffer(4, Some(out), out_off);
+    e.set_buffer(5, Some(scalar), 0); // n_heads
+    e.set_buffer(6, Some(scalar), 4); // head_dim
+    e.set_buffer(7, Some(scalar), 8); // position_count
+    e.set_buffer(8, Some(scalar), 12); // group
+    e.set_buffer(9, Some(scalar), 16); // scale (f32)
+    e.set_buffer(10, Some(scalar), 20); // position_stride
+    e.set_buffer(11, Some(scalar), 24); // kv_head_stride
+    e.set_buffer(12, Some(scalar), 28); // kv_base_offset
+    e.set_buffer(14, Some(tail_slots_buf), 0);
+    e.set_buffer(15, Some(base_buf), 0);
     e.dispatch_thread_groups(
         metal::MTLSize {
             width: n_heads as u64,
@@ -8992,6 +9757,7 @@ fn encode_attention_block(
             &query_buf,
             &perhead_scalar,
             n_heads,
+            0,
         );
         encode_rms_norm_per_head(
             e,
@@ -9001,6 +9767,7 @@ fn encode_attention_block(
             &key_buf,
             &perhead_scalar,
             n_kv_heads,
+            0,
         );
     }
     encode_rope(
@@ -9012,6 +9779,8 @@ fn encode_attention_block(
         &rope_q_scalar,
         n_heads,
         half_rope,
+        0,
+        0,
     );
     encode_rope(
         e,
@@ -9022,6 +9791,8 @@ fn encode_attention_block(
         &rope_k_scalar,
         n_kv_heads,
         half_rope,
+        0,
+        0,
     );
     // Write the current token's (roped) K and (raw) V into the cache at `write_position` via
     // a compute scatter, so the whole token stays inside ONE compute command encoder (encoder
@@ -9078,6 +9849,8 @@ fn encode_attention_block(
         n_kv_heads,
         head_dim,
         position_count,
+        0,
+        0,
     );
     if f32y_gemv_enabled() {
         encode_q8_matmul_f32y(e, k, &ctx_buf, o_w_buf, &o_buf, &o_mm_scalar, hidden);
@@ -9831,6 +10604,20 @@ struct PreparedToken {
     /// Scratch buffers the encoded graph references; kept alive until completion.
     _keep: Vec<Buffer>,
     encode_us: u128,
+}
+
+/// WIN2METAL Phase 4 — tree-attention descriptor handed to the (otherwise shared)
+/// `verify_batch_inner`. `None` ⇒ today's contiguous linear verify (byte-unchanged).
+/// `Some` ⇒ each node attends `prefix [0, base)` ∪ its ancestor draft slots.
+#[cfg(target_os = "macos")]
+struct TreeAttn {
+    /// Contiguous committed-history prefix length (`base_position`). Slots `[0, base)`
+    /// are all-ancestor, so the kernels read them directly (no indirection).
+    base: usize,
+    /// Per-node ancestor draft cache slots (absolute, increasing, INCLUDING self), built
+    /// from the ancestor bitset. `tail_slots[i].len()` is the node's `tail_count`; its
+    /// attention `position_count` is `base + tail_count`.
+    tail_slots: Vec<Vec<u32>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -11014,6 +11801,7 @@ impl ResidentDecodeState {
                         &q_buf,
                         &perhead_qk_scalar,
                         n_tokens * self.n_heads,
+                        0,
                     );
                 }
                 encode_rms_norm_per_head(
@@ -11024,6 +11812,7 @@ impl ResidentDecodeState {
                     &k_buf,
                     &perhead_qk_scalar,
                     n_tokens * self.n_kv_heads,
+                    0,
                 );
                 stage!("2b:qk_norm");
             }
@@ -11506,6 +12295,801 @@ impl ResidentDecodeState {
         }
         self.filled = n_tokens;
         Some(())
+    }
+
+    /// WIN2METAL Phase 3: speculative-verify forward over `k` rows at sequence positions
+    /// `[base_position, base_position + k)`. BIT-IDENTICAL to `k` independent
+    /// `forward_token` decodes at those positions: the input RMSNorm/projections/FFN run as
+    /// the proven byte-exact batched kernels (`rms_norm_batch_f32`, the C0 batched-column
+    /// GEMV `encode_q8_matmul_f32y_batched`, elementwise residual/silu), while per-head
+    /// QK-norm, RoPE, K/V scatter, attention and argmax run the EXACT single-token kernels
+    /// once per row at a row byte-offset (so cos/sin pairing, scatter slot, attention
+    /// v2/split-K routing and argmax tie-break are reproduced verbatim). All `k` K/V are
+    /// scattered into `[base..base+k)` before any attention; row `i` attends over
+    /// `position_count = base+i+1`, so it sees only `[0, base+i]` (its own slot + the prior
+    /// rows), exactly as a standalone decode would. Does NOT advance `filled` — the host
+    /// accept loop sets `filled = base + accepted.len()` and the rejected tail slots are
+    /// overwritten by the next single-token decode. Returns the `k` greedy argmax ids, or
+    /// `None` (lossless fallback) on any unsupported config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Option<Vec<u32>> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            false,
+            None,
+        )
+        .map(|(preds, _)| preds)
+    }
+
+    /// `verify_batch` that also reads back the `k * vocab` pre-argmax logits (the byte-exact
+    /// gate compares logits by exact `to_bits`, which a logits bug that doesn't flip the
+    /// argmax would slip past). Test-only: the production lane never pays the logits readback.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_batch_logits(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+    ) -> Option<(Vec<u32>, Vec<f32>)> {
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            k,
+            scale,
+            true,
+            None,
+        )
+    }
+
+    /// Maximum verify window (mirrors the CUDA host's `MAX_VERIFY_K`).
+    const MAX_VERIFY_K: usize = 8;
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_batch_inner(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        base_position: usize,
+        k: usize,
+        scale: f32,
+        read_logits: bool,
+        tree: Option<&TreeAttn>,
+    ) -> Option<(Vec<u32>, Vec<f32>)> {
+        // ---- Eligibility gate (return None -> caller falls back, lossless) --------------
+        // The tree path widens the node cap to TREE_MAX_NODES (a tree of N nodes has at most
+        // depth N-1); the linear path keeps the MAX_VERIFY_K window. `None`-tree callers see
+        // the original bound, so the linear path is byte-unchanged.
+        let k_cap = if tree.is_some() {
+            crate::inference::spec_tree::TREE_MAX_NODES
+        } else {
+            Self::MAX_VERIFY_K
+        };
+        if !(1..=k_cap).contains(&k) {
+            return None;
+        }
+        if self.kv16 {
+            return None; // f32 KV cache only for Phase 3 (kv16 is a follow-up)
+        }
+        // The new batched GEMV mirrors exactly the f32y + wire + NSG=8 production GEMV; any
+        // other GEMV path would not match it bit-for-bit.
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            return None;
+        }
+        if !self.head_dim.is_multiple_of(32) || self.head_dim > 128 {
+            return None; // v2 / split-K attention precondition
+        }
+        if base_position != self.filled() {
+            return None;
+        }
+        if base_position + k > self.cap {
+            return None;
+        }
+        if layers.len() != self.n_layers || embeddings.len() != k * self.hidden {
+            return None;
+        }
+        if cos_all.len() != sin_all.len() || cos_all.is_empty() || !cos_all.len().is_multiple_of(k)
+        {
+            return None;
+        }
+        let half_rope = cos_all.len() / k;
+        if half_rope * 2 > self.head_dim {
+            return None;
+        }
+        let q_dim = self.n_heads * self.head_dim;
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        let bpr_hidden = self.hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = self.ffn_dim / 32;
+        for l in layers {
+            if l.attn_norm.len() != self.hidden
+                || l.ffn_norm.len() != self.hidden
+                || l.q_weight_blocks.block_count() != q_dim * bpr_hidden
+                || l.k_weight_blocks.block_count() != kv_dim * bpr_hidden
+                || l.v_weight_blocks.block_count() != kv_dim * bpr_hidden
+                || l.o_weight_blocks.block_count() != self.hidden * bpr_q
+                || l.gate_weight_blocks.block_count() != self.ffn_dim * bpr_hidden
+                || l.up_weight_blocks.block_count() != self.ffn_dim * bpr_hidden
+                || l.down_weight_blocks.block_count() != self.hidden * bpr_ffn
+            {
+                return None;
+            }
+        }
+        let vocab = logits.vocab_size;
+        if vocab == 0
+            || logits.final_norm.len() != self.hidden
+            || logits.output_weight_blocks.block_count() != vocab * bpr_hidden
+        {
+            return None;
+        }
+
+        // A pre-committed pending graph (from forward_token's encode-ahead) sits gated on the
+        // serial queue; release it so this command buffer is not ordered behind a graph that
+        // never gets signaled (which would deadlock the wait below).
+        if let Some(stale) = self.pending.take() {
+            self.release_stale(stale);
+        }
+        self.pending_signaled = false;
+        if !self.ensure_capacity(base_position + k) {
+            return None;
+        }
+
+        let kern = metal_linear_kernel()?;
+        let max_positions = self.max_positions;
+        let n_heads = self.n_heads;
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+        let hidden = self.hidden;
+        let ffn_dim = self.ffn_dim;
+        let eps = self.eps;
+        let pairing = u32::from(self.split_half_pairing);
+
+        // ---- Resolve resident weights (wire format; gated on f32y+wire above) ------------
+        let resident: Vec<[Buffer; 7]>;
+        let attn_norm_bufs: Vec<Buffer>;
+        let ffn_norm_bufs: Vec<Buffer>;
+        let qk_norm_bufs: Vec<Option<(Buffer, Buffer)>>;
+        let ow_buf: Buffer;
+        let final_norm_buf: Buffer;
+        {
+            let mut cache = metal_linear_cache().lock().ok()?;
+            let mut wb = |w: &ResidentWeightBytes| match w {
+                ResidentWeightBytes::Blocks36(blocks) => {
+                    Some(cache.q8_wire_weight_buffer(&kern.device, blocks))
+                }
+                ResidentWeightBytes::WirePages(pages) => {
+                    Some(cache.q8_wire_nocopy_buffer(&kern.device, pages))
+                }
+            };
+            resident = layers
+                .iter()
+                .map(|l| {
+                    Some([
+                        wb(&l.q_weight_blocks)?,
+                        wb(&l.k_weight_blocks)?,
+                        wb(&l.v_weight_blocks)?,
+                        wb(&l.o_weight_blocks)?,
+                        wb(&l.gate_weight_blocks)?,
+                        wb(&l.up_weight_blocks)?,
+                        wb(&l.down_weight_blocks)?,
+                    ])
+                })
+                .collect::<Option<Vec<_>>>()?;
+            ow_buf = wb(&logits.output_weight_blocks)?;
+            attn_norm_bufs = layers
+                .iter()
+                .map(|l| cache.weight_buffer(&kern.device, l.attn_norm))
+                .collect();
+            ffn_norm_bufs = layers
+                .iter()
+                .map(|l| cache.weight_buffer(&kern.device, l.ffn_norm))
+                .collect();
+            qk_norm_bufs = layers
+                .iter()
+                .map(|l| match (l.q_norm, l.k_norm) {
+                    (Some(qn), Some(kn)) => Some((
+                        cache.weight_buffer(&kern.device, qn),
+                        cache.weight_buffer(&kern.device, kn),
+                    )),
+                    _ => None,
+                })
+                .collect();
+            final_norm_buf = cache.weight_buffer(&kern.device, logits.final_norm);
+        }
+
+        // ---- Buffers (row-major [token][dim]; token = verify row) -----------------------
+        let nb = |bytes: usize| {
+            kern.device
+                .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+        };
+        let act_a = nb(k * hidden * 4);
+        let act_b = nb(k * hidden * 4);
+        let mid = nb(k * hidden * 4);
+        let norm_buf = nb(k * hidden * 4);
+        let q_buf = nb(k * q_dim * 4);
+        let k_buf = nb(k * kv_dim * 4);
+        let v_buf = nb(k * kv_dim * 4);
+        let ctx_buf = nb(k * q_dim * 4);
+        let o_buf = nb(k * hidden * 4);
+        let gate_buf = nb(k * ffn_dim * 4);
+        let up_buf = nb(k * ffn_dim * 4);
+        let silu_buf = nb(k * ffn_dim * 4);
+        let down_buf = nb(k * hidden * 4);
+        let fnorm_buf = nb(k * hidden * 4);
+        let logits_buf = nb(k * vocab * 4);
+        let pred_buf = nb(k * 4);
+        let cos_buf = nb(cos_all.len() * 4);
+        let sin_buf = nb(sin_all.len() * 4);
+        // Attention scores scratch (only read by the non-v2 fallback kernel); size to the
+        // deepest row's position_count = base+k.
+        let scores_buf = nb(n_heads * (base_position + k) * 4);
+        write_buffer_f32(&act_a, embeddings);
+        write_buffer_f32(&cos_buf, cos_all);
+        write_buffer_f32(&sin_buf, sin_all);
+
+        // ---- Scalars --------------------------------------------------------------------
+        let rms_scalar = nb(8); // width (hidden), eps — shared by attn/ffn/final norms
+        let q_gemv = nb(12); // blocks_per_row, rows, [n_rows_in set by helper]
+        let kv_gemv = nb(12);
+        let o_gemv = nb(12);
+        let gateup_gemv = nb(12);
+        let down_gemv = nb(12);
+        let out_gemv = nb(12);
+        let rope_q_scalar = nb(16);
+        let rope_k_scalar = nb(16);
+        let silu_n = nb(4);
+        let resid_n = nb(4);
+        let kv16_write = nb(4);
+        let argmax_count = nb(4);
+        let perhead_qk_scalar = nb(12);
+        unsafe {
+            let p = rms_scalar.contents() as *mut u8;
+            *(p as *mut u32) = hidden as u32;
+            *(p.add(4) as *mut f32) = eps;
+            let set_gemv = |buf: &Buffer, bpr: usize, rows: usize| {
+                let q = buf.contents() as *mut u32;
+                *q = bpr as u32;
+                *q.add(1) = rows as u32;
+            };
+            set_gemv(&q_gemv, bpr_hidden, q_dim);
+            set_gemv(&kv_gemv, bpr_hidden, kv_dim);
+            set_gemv(&o_gemv, bpr_q, hidden);
+            set_gemv(&gateup_gemv, bpr_hidden, ffn_dim);
+            set_gemv(&down_gemv, bpr_ffn, hidden);
+            set_gemv(&out_gemv, bpr_hidden, vocab);
+            let set_rope = |buf: &Buffer, hc: usize| {
+                let r = buf.contents() as *mut u32;
+                *r = hc as u32;
+                *r.add(1) = head_dim as u32;
+                *r.add(2) = half_rope as u32;
+                *r.add(3) = pairing;
+            };
+            set_rope(&rope_q_scalar, n_heads);
+            set_rope(&rope_k_scalar, n_kv_heads);
+            *(silu_n.contents() as *mut u32) = (k * ffn_dim) as u32;
+            *(resid_n.contents() as *mut u32) = (k * hidden) as u32;
+            *(kv16_write.contents() as *mut u32) = 1; // !kv16 -> mirrors are real, dual-write
+            *(argmax_count.contents() as *mut u32) = vocab as u32;
+            let p = perhead_qk_scalar.contents() as *mut u8;
+            *(p as *mut u32) = head_dim as u32;
+            *(p.add(4) as *mut f32) = eps;
+            *(p.add(8) as *mut u32) = 1; // use_weight
+        }
+        // Per-row scatter scalars [head_dim, max_positions, base+i, kv_dim] and per-row
+        // attention scalars (32 bytes) — write_position / position_count vary per row, so
+        // each row gets its own storage (the command buffer reads them at execution time).
+        let scatter_scalars = nb(16 * k);
+        let mut attn_scalars: Vec<Buffer> = Vec::with_capacity(k);
+        for i in 0..k {
+            unsafe {
+                let s = (scatter_scalars.contents() as *mut u8).add(i * 16) as *mut u32;
+                *s = head_dim as u32;
+                *s.add(1) = max_positions as u32;
+                *s.add(2) = (base_position + i) as u32;
+                *s.add(3) = kv_dim as u32;
+            }
+            // position_count: linear row i covers prefix+self = base+i+1; a tree node covers
+            // prefix + its ancestor drafts (incl. self) = base + tail_count.
+            let pc_i = match tree {
+                Some(t) => t.base + t.tail_slots[i].len(),
+                None => base_position + i + 1,
+            };
+            let a = nb(32);
+            unsafe {
+                let p = a.contents() as *mut u8;
+                *(p as *mut u32) = n_heads as u32;
+                *(p.add(4) as *mut u32) = head_dim as u32;
+                *(p.add(8) as *mut u32) = pc_i as u32; // position_count
+                *(p.add(12) as *mut u32) = (n_heads / n_kv_heads) as u32;
+                *(p.add(16) as *mut f32) = scale;
+                *(p.add(20) as *mut u32) = head_dim as u32; // position stride
+                *(p.add(24) as *mut u32) = (max_positions * head_dim) as u32; // kv-head stride
+                *(p.add(28) as *mut u32) = 0u32; // kv base offset
+            }
+            attn_scalars.push(a);
+        }
+
+        // ---- Per-node tree-attention buffers (tree path only) ---------------------------
+        // `base` (the contiguous prefix length) is shared; each node gets its own
+        // `tail_slots` buffer (its ancestor draft cache slots, increasing). The linear path
+        // leaves these empty and dispatches the unchanged `encode_attention`.
+        let (tree_base_buf, tree_tail_bufs): (Option<Buffer>, Vec<Buffer>) = if let Some(t) = tree {
+            let bb = nb(4);
+            unsafe {
+                *(bb.contents() as *mut u32) = t.base as u32;
+            }
+            let bufs: Vec<Buffer> = (0..k)
+                .map(|i| {
+                    let slots = &t.tail_slots[i];
+                    let buf = nb(slots.len().max(1) * 4);
+                    unsafe {
+                        let p = buf.contents() as *mut u32;
+                        for (j, &s) in slots.iter().enumerate() {
+                            *p.add(j) = s;
+                        }
+                    }
+                    buf
+                })
+                .collect();
+            (Some(bb), bufs)
+        } else {
+            (None, Vec::new())
+        };
+
+        // ---- Encode the whole verify window into one serial compute encoder -------------
+        let mut keep: Vec<Buffer> = Vec::new();
+        let cb = kern.queue.new_command_buffer();
+        let e = cb.new_compute_command_encoder();
+        let mut from_a = true;
+        for l in 0..layers.len() {
+            let (cur, nxt) = if from_a {
+                (&act_a, &act_b)
+            } else {
+                (&act_b, &act_a)
+            };
+            let w = &resident[l];
+            // --- Attention block ---
+            // 1. input RMSNorm (batched, byte-exact vs single rms_norm_f32 per row)
+            encode_rms_norm_batch(kern, e, cur, &attn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+            // 2. Q/K/V projections (batched-column GEMV; column t == single-token row t)
+            encode_q8_matmul_f32y_batched(e, kern, &norm_buf, &w[0], &q_buf, &q_gemv, q_dim, k);
+            encode_q8_matmul_f32y_batched(e, kern, &norm_buf, &w[1], &k_buf, &kv_gemv, kv_dim, k);
+            encode_q8_matmul_f32y_batched(e, kern, &norm_buf, &w[2], &v_buf, &kv_gemv, kv_dim, k);
+            // 3. per-head Q/K-norm (Qwen3) — per row, in place
+            if let Some((qn_buf, kn_buf)) = &qk_norm_bufs[l] {
+                for i in 0..k {
+                    encode_rms_norm_per_head(
+                        e,
+                        kern,
+                        &q_buf,
+                        qn_buf,
+                        &q_buf,
+                        &perhead_qk_scalar,
+                        n_heads,
+                        (i * q_dim * 4) as u64,
+                    );
+                    encode_rms_norm_per_head(
+                        e,
+                        kern,
+                        &k_buf,
+                        kn_buf,
+                        &k_buf,
+                        &perhead_qk_scalar,
+                        n_kv_heads,
+                        (i * kv_dim * 4) as u64,
+                    );
+                }
+            }
+            // 4. RoPE — per row (position base+i; cos/sin position-major, stride half_rope)
+            for i in 0..k {
+                encode_rope(
+                    e,
+                    kern,
+                    &q_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &rope_q_scalar,
+                    n_heads,
+                    half_rope,
+                    (i * q_dim * 4) as u64,
+                    (i * half_rope * 4) as u64,
+                );
+                encode_rope(
+                    e,
+                    kern,
+                    &k_buf,
+                    &cos_buf,
+                    &sin_buf,
+                    &rope_k_scalar,
+                    n_kv_heads,
+                    half_rope,
+                    (i * kv_dim * 4) as u64,
+                    (i * half_rope * 4) as u64,
+                );
+            }
+            // 5. K/V scatter — per row into slot base+i, dual-writing the f16 mirrors the
+            //    split-K decode attention reads (ALL k before any attention reads).
+            for i in 0..k {
+                e.set_compute_pipeline_state(&kern.kv_scatter_pipeline);
+                e.set_buffer(0, Some(&k_buf), (i * kv_dim * 4) as u64);
+                e.set_buffer(1, Some(&v_buf), (i * kv_dim * 4) as u64);
+                e.set_buffer(2, Some(&self.cache_k[l]), 0);
+                e.set_buffer(3, Some(&self.cache_v[l]), 0);
+                e.set_buffer(4, Some(&scatter_scalars), (i * 16) as u64);
+                e.set_buffer(5, Some(&scatter_scalars), (i * 16 + 4) as u64);
+                e.set_buffer(6, Some(&scatter_scalars), (i * 16 + 8) as u64);
+                e.set_buffer(7, Some(&scatter_scalars), (i * 16 + 12) as u64);
+                e.set_buffer(8, Some(&self.cache_k16[l]), 0);
+                e.set_buffer(9, Some(&self.cache_v16[l]), 0);
+                e.set_buffer(10, Some(&kv16_write), 0);
+                dispatch_1d(e, &kern.kv_scatter_pipeline, kv_dim);
+            }
+            // 6. attention — per row. position_count auto-routes v2 vs split-K exactly like
+            //    forward_token at that pc; reads the f16 mirrors. The None (linear) path
+            //    dispatches the unchanged `encode_attention` (pc = base+i+1); the tree path
+            //    dispatches the slot-indirected `encode_attention_tree` (pc = base+tail_count)
+            //    with this node's ancestor draft slots.
+            for (i, attn_scalar) in attn_scalars.iter().enumerate() {
+                match tree {
+                    None => encode_attention(
+                        e,
+                        kern,
+                        &mut keep,
+                        &q_buf,
+                        &self.cache_k[l],
+                        &self.cache_v[l],
+                        Some((&self.cache_k16[l], &self.cache_v16[l])),
+                        &scores_buf,
+                        &ctx_buf,
+                        attn_scalar,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        base_position + i + 1,
+                        (i * q_dim * 4) as u64,
+                        (i * q_dim * 4) as u64,
+                    ),
+                    Some(t) => encode_attention_tree(
+                        e,
+                        kern,
+                        &mut keep,
+                        &q_buf,
+                        &self.cache_k[l],
+                        &self.cache_v[l],
+                        Some((&self.cache_k16[l], &self.cache_v16[l])),
+                        &scores_buf,
+                        &ctx_buf,
+                        attn_scalar,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        t.base + t.tail_slots[i].len(),
+                        (i * q_dim * 4) as u64,
+                        (i * q_dim * 4) as u64,
+                        tree_base_buf.as_ref().expect("tree base buffer present"),
+                        &tree_tail_bufs[i],
+                    ),
+                }
+            }
+            // 7. O projection (batched), 8. attention residual (batched)
+            encode_q8_matmul_f32y_batched(e, kern, &ctx_buf, &w[3], &o_buf, &o_gemv, hidden, k);
+            encode_binary(
+                e,
+                &kern.residual_add_pipeline,
+                cur,
+                &o_buf,
+                &mid,
+                &resid_n,
+                k * hidden,
+            );
+            // --- FFN block (all batched / elementwise) ---
+            encode_rms_norm_batch(kern, e, &mid, &ffn_norm_bufs[l], &norm_buf, &rms_scalar, k);
+            encode_q8_matmul_f32y_batched(
+                e,
+                kern,
+                &norm_buf,
+                &w[4],
+                &gate_buf,
+                &gateup_gemv,
+                ffn_dim,
+                k,
+            );
+            encode_q8_matmul_f32y_batched(
+                e,
+                kern,
+                &norm_buf,
+                &w[5],
+                &up_buf,
+                &gateup_gemv,
+                ffn_dim,
+                k,
+            );
+            encode_binary(
+                e,
+                &kern.silu_mul_pipeline,
+                &gate_buf,
+                &up_buf,
+                &silu_buf,
+                &silu_n,
+                k * ffn_dim,
+            );
+            encode_q8_matmul_f32y_batched(
+                e, kern, &silu_buf, &w[6], &down_buf, &down_gemv, hidden, k,
+            );
+            encode_binary(
+                e,
+                &kern.residual_add_pipeline,
+                &mid,
+                &down_buf,
+                nxt,
+                &resid_n,
+                k * hidden,
+            );
+            from_a = !from_a;
+        }
+        let final_buf = if from_a { &act_a } else { &act_b };
+        // ---- Final stage: norm -> output GEMV -> per-row argmax -------------------------
+        encode_rms_norm_batch(
+            kern,
+            e,
+            final_buf,
+            &final_norm_buf,
+            &fnorm_buf,
+            &rms_scalar,
+            k,
+        );
+        encode_q8_matmul_f32y_batched(
+            e,
+            kern,
+            &fnorm_buf,
+            &ow_buf,
+            &logits_buf,
+            &out_gemv,
+            vocab,
+            k,
+        );
+        for i in 0..k {
+            e.set_compute_pipeline_state(&kern.argmax_f32_greedy_pipeline);
+            e.set_buffer(0, Some(&logits_buf), (i * vocab * 4) as u64);
+            e.set_buffer(1, Some(&pred_buf), (i * 4) as u64);
+            e.set_buffer(2, Some(&argmax_count), 0);
+            e.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 1024,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        e.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        // Note: `filled` is intentionally NOT advanced — the host accept loop sets it.
+        let preds: Vec<u32> = (0..k)
+            .map(|i| unsafe { *(pred_buf.contents() as *const u32).add(i) })
+            .collect();
+        let logits_out = if read_logits {
+            let mut out = vec![0.0f32; k * vocab];
+            read_buffer_f32(&logits_buf, &mut out);
+            out
+        } else {
+            Vec::new()
+        };
+        Some((preds, logits_out))
+    }
+
+    /// WIN2METAL Phase 4 — TREE speculative verify. Batched forward over the `n` BFS-ordered
+    /// nodes of a draft tree: each node attends `prefix [0, base_position)` ∪ its ancestor
+    /// draft slots (the rest of the pass — RoPE / norms / GEMV / K/V scatter / argmax — is
+    /// reused unchanged from the linear `verify_batch`). Returns one greedy argmax per node
+    /// (`predicted[i]` = the target's next-token after node `i`), or `None` on any
+    /// unsupported config (caller falls back, lossless).
+    ///
+    /// A LINEAR tree drives the slot indirection to the identity, so this is byte-identical
+    /// to `verify_batch` (proven by `metal_tree_verify_bit_identical`).
+    ///
+    /// - `embeddings`: `n*hidden`, BFS node order (already looked up).
+    /// - `cos_all`/`sin_all`: per-NODE RoPE tables at position `base_position + depth[i]`.
+    /// - `node_kvslot[i]` must equal `base_position + i` (the scatter target, BFS order).
+    /// - `(ancestor_bits, words)` is `TokenTree::ancestor_bitset()`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_batch_tree(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+    ) -> Option<Vec<u32>> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            n,
+            scale,
+            false,
+            Some(&tree),
+        )
+        .map(|(preds, _)| preds)
+    }
+
+    /// `verify_batch_tree` that also reads back the `n * vocab` pre-argmax logits (the gate
+    /// compares logits by exact `to_bits`). Test-only.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_batch_tree_logits(
+        &mut self,
+        embeddings: &[f32],
+        cos_all: &[f32],
+        sin_all: &[f32],
+        layers: &[ResidentLayerWeights],
+        logits: &LogitsStage,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+        scale: f32,
+    ) -> Option<(Vec<u32>, Vec<f32>)> {
+        let tree = self.build_tree_attn(node_kvslot, ancestor_bits, words, base_position, n)?;
+        self.verify_batch_inner(
+            embeddings,
+            cos_all,
+            sin_all,
+            layers,
+            logits,
+            base_position,
+            n,
+            scale,
+            true,
+            Some(&tree),
+        )
+    }
+
+    /// Build the per-node `TreeAttn` descriptor from the ancestor bitset. For node `i`, scan
+    /// bits `0..n`; a set bit `j` (an ancestor-or-self) contributes cache slot
+    /// `base_position + j`, collected in increasing `j` so the kernel's split-K boundaries
+    /// match the linear path. Validates the shared invariants; returns `None` on any mismatch.
+    fn build_tree_attn(
+        &self,
+        node_kvslot: &[i32],
+        ancestor_bits: &[u32],
+        words: usize,
+        base_position: usize,
+        n: usize,
+    ) -> Option<TreeAttn> {
+        if n == 0 || words != n.div_ceil(32) || ancestor_bits.len() != n * words {
+            return None;
+        }
+        if node_kvslot.len() != n {
+            return None;
+        }
+        // Scatter target is reused unchanged: node i -> slot base+i (BFS order).
+        for (i, &slot) in node_kvslot.iter().enumerate() {
+            if slot != (base_position + i) as i32 {
+                return None;
+            }
+        }
+        let mut tail_slots: Vec<Vec<u32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut slots: Vec<u32> = Vec::new();
+            for j in 0..n {
+                let word = ancestor_bits[i * words + j / 32];
+                if (word >> (j % 32)) & 1 == 1 {
+                    slots.push((base_position + j) as u32);
+                }
+            }
+            // A node must at least attend itself (bit i set); a malformed bitset is unsupported.
+            if slots.is_empty() {
+                return None;
+            }
+            tail_slots.push(slots);
+        }
+        Some(TreeAttn {
+            base: base_position,
+            tail_slots,
+        })
+    }
+
+    /// WIN2METAL Phase 4 — compact the accepted tree path's K/V into the contiguous slots
+    /// `[base, base + path.len())`, so subsequent linear decode/attention reads it as an
+    /// ordinary history. `path` is `TokenTree::path_to(leaf)` (root-first BFS node indices,
+    /// `path[r] >= r`). For each rank `r` with `path[r] != r`, copies the `head_dim` row of
+    /// slot `base + path[r]` into slot `base + r` for EVERY layer and kv_head, in BOTH the
+    /// f32 cache and the f16 mirrors (subsequent decode reads both). Exploits unified memory:
+    /// a direct `contents()` memcpy, no device round-trip. A linear path `[0..L-1]` is a
+    /// no-op (the byte-identity anchor — a linear tree leaves the cache exactly as a linear
+    /// decode would).
+    pub fn compact_tree_kv_path(&mut self, path: &[usize], base: usize) -> Result<(), String> {
+        let head_dim = self.head_dim;
+        let max_positions = self.max_positions;
+        let n_kv = self.n_kv_heads;
+        let row = head_dim; // elements per (kv_head, slot) row
+        for (r, &src_node) in path.iter().enumerate() {
+            if src_node == r {
+                continue; // already in place (incl. every rank of a linear path)
+            }
+            // CUDA invariant: path[r] >= r, so the source slot is never an earlier write's
+            // destination — the in-place gather is order-independent.
+            let dst_slot = base + r;
+            let src_slot = base + src_node;
+            if dst_slot >= max_positions || src_slot >= max_positions {
+                return Err(format!(
+                    "compact_tree_kv_path: slot out of range (src {src_slot}, dst {dst_slot}, \
+                     max_positions {max_positions})"
+                ));
+            }
+            for l in 0..self.n_layers {
+                unsafe {
+                    let kp = self.cache_k[l].contents() as *mut f32;
+                    let vp = self.cache_v[l].contents() as *mut f32;
+                    for h in 0..n_kv {
+                        let src_off = (h * max_positions + src_slot) * head_dim;
+                        let dst_off = (h * max_positions + dst_slot) * head_dim;
+                        std::ptr::copy_nonoverlapping(kp.add(src_off), kp.add(dst_off), row);
+                        std::ptr::copy_nonoverlapping(vp.add(src_off), vp.add(dst_off), row);
+                    }
+                }
+                // f16 mirrors (empty in kv16-primary mode, where the primary caches are half).
+                if !self.cache_k16.is_empty() {
+                    unsafe {
+                        let kp = self.cache_k16[l].contents() as *mut u16;
+                        let vp = self.cache_v16[l].contents() as *mut u16;
+                        for h in 0..n_kv {
+                            let src_off = (h * max_positions + src_slot) * head_dim;
+                            let dst_off = (h * max_positions + dst_slot) * head_dim;
+                            std::ptr::copy_nonoverlapping(kp.add(src_off), kp.add(dst_off), row);
+                            std::ptr::copy_nonoverlapping(vp.add(src_off), vp.add(dst_off), row);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Release a stale pre-committed token graph: it sits on the serial queue gated behind
@@ -12618,6 +14202,151 @@ mod tests {
             assert!(
                 (actual - expected).abs() < 1.0e-2_f32.max(expected.abs() * 1.0e-5),
                 "row {row}: {actual} != {expected}"
+            );
+        }
+    }
+
+    /// WIN2METAL Phase 3 C0 gate. The speculative-verify lane will run the production
+    /// single-token GEMV (`q8_0_block_linear_row_ksplit_f32y_wire_nsg8`) as a batched
+    /// column sweep over k verify rows. This proves the batched mirror
+    /// (`encode_q8_matmul_f32y_batched`) is BIT-IDENTICAL — exact u32 bit-cast, not
+    /// epsilon — to k independent single-token dispatches. Bit-exactness is the whole
+    /// point: it gates the byte-exact-vs-`forward_token` claim for the lane.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_verify_gemv_batched_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // The reference path is `encode_q8_matmul_f32y`, which only selects the NSG=8
+        // wire kernel when the f32y/wire/nsg8 gates are on. Those are process-wide
+        // OnceLocks; set the env BEFORE the first gate read so they latch on. If a
+        // sibling test in this process already latched them off (e.g. a full --lib
+        // run that read them earlier), SKIP rather than compare against a different
+        // kernel. A targeted run (`--lib metal_verify_gemv_batched_bit_identical`) has
+        // no such sibling, so the gates latch on here.
+        std::env::set_var("CAMELID_METAL_F32Y", "1");
+        std::env::set_var("CAMELID_METAL_WIRE", "1");
+        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP metal_verify_gemv_batched_bit_identical: f32y/wire/nsg8 gates \
+                 inactive (OnceLock latched off earlier in this process); run targeted: \
+                 cargo test --release --lib metal_verify_gemv_batched_bit_identical"
+            );
+            return;
+        }
+        let kernel = metal_linear_kernel().expect("metal kernel available");
+        let device = &kernel.device;
+
+        // 130 rows (prime: exercises the NR0=2 row tiling tail and the r0+row>=rows
+        // guard) x 7 blocks (K-split stride NSG*NQ=64, so most block slots idle on the
+        // last pass). cols = the projection input dimension.
+        let rows = 130usize;
+        let blocks_per_row = 7usize;
+        let cols = blocks_per_row * 32;
+        const WIRE: usize = 34; // f16 scale (2B) + 32 i8 quants
+
+        // Deterministic wire-format Q8_0 weights (both paths read these exact bytes).
+        let mut weight_wire = vec![0u8; rows * blocks_per_row * WIRE];
+        for row in 0..rows {
+            for block in 0..blocks_per_row {
+                let off = (row * blocks_per_row + block) * WIRE;
+                let scale = 0.5 - row as f32 * 0.003 + block as f32 * 0.013;
+                weight_wire[off..off + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
+                for lane in 0..32 {
+                    let q = (((row * 53 + block * 29 + lane * 7) % 255) as i32 - 127) as i8;
+                    weight_wire[off + 2 + lane] = q as u8;
+                }
+            }
+        }
+        let w_buf = device.new_buffer(
+            weight_wire.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        write_buffer_u8(&w_buf, &weight_wire);
+
+        // Deterministic activation columns (one per verify row), non-trivial + signed.
+        let max_k = 8usize;
+        let acts: Vec<Vec<f32>> = (0..max_k)
+            .map(|t| {
+                (0..cols)
+                    .map(|i| {
+                        ((((t * 131 + i * 17) % 251) as f32) - 125.0) * 0.013 + t as f32 * 0.0007
+                    })
+                    .collect()
+            })
+            .collect();
+
+        for k in [1usize, 2, 7, 8] {
+            // Reference: k single-token NSG=8 dispatches, one activation each.
+            let mut reference: Vec<Vec<f32>> = Vec::with_capacity(k);
+            for act in acts.iter().take(k) {
+                let y_buf =
+                    device.new_buffer((cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+                write_buffer_f32(&y_buf, act);
+                let out_buf =
+                    device.new_buffer((rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+                let scalar = device.new_buffer(8, MTLResourceOptions::StorageModeShared);
+                unsafe {
+                    let p = scalar.contents() as *mut u32;
+                    *p = blocks_per_row as u32;
+                    *p.add(1) = rows as u32;
+                }
+                let cb = kernel.queue.new_command_buffer();
+                let e = cb.new_compute_command_encoder();
+                encode_q8_matmul_f32y(e, kernel, &y_buf, &w_buf, &out_buf, &scalar, rows);
+                e.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let mut out = vec![0.0f32; rows];
+                read_buffer_f32(&out_buf, &mut out);
+                reference.push(out);
+            }
+
+            // Candidate: one batched dispatch over all k columns. y token-major
+            // [k][cols]; out token-major [k][rows].
+            let mut y_flat = vec![0.0f32; k * cols];
+            for (t, act) in acts.iter().take(k).enumerate() {
+                y_flat[t * cols..(t + 1) * cols].copy_from_slice(act);
+            }
+            let y_buf =
+                device.new_buffer((k * cols * 4) as u64, MTLResourceOptions::StorageModeShared);
+            write_buffer_f32(&y_buf, &y_flat);
+            let out_buf =
+                device.new_buffer((k * rows * 4) as u64, MTLResourceOptions::StorageModeShared);
+            // 12-byte scalar: blocks_per_row @0, rows @4 (n_rows_in @8 set by helper).
+            let scalar = device.new_buffer(12, MTLResourceOptions::StorageModeShared);
+            unsafe {
+                let p = scalar.contents() as *mut u32;
+                *p = blocks_per_row as u32;
+                *p.add(1) = rows as u32;
+            }
+            let cb = kernel.queue.new_command_buffer();
+            let e = cb.new_compute_command_encoder();
+            encode_q8_matmul_f32y_batched(e, kernel, &y_buf, &w_buf, &out_buf, &scalar, rows, k);
+            e.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let mut batched = vec![0.0f32; k * rows];
+            read_buffer_f32(&out_buf, &mut batched);
+
+            // Exact u32 bit identity for every column, every row.
+            for (t, refrow) in reference.iter().enumerate().take(k) {
+                for (r, &b) in refrow.iter().enumerate() {
+                    let a = batched[t * rows + r];
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "k={k} column {t} row {r}: batched {a} ({:#010x}) != \
+                         single-token {b} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits(),
+                    );
+                }
+            }
+            eprintln!(
+                "metal_verify_gemv_batched_bit_identical: k={k} BIT-IDENTICAL ({rows} rows x {blocks_per_row} blocks)"
             );
         }
     }
@@ -16733,6 +18462,721 @@ mod tests {
                 assert!((a - b).abs() < 1.0e-4, "token {t}: {a} != {b}");
             }
         }
+    }
+
+    /// WIN2METAL Phase 3 C2/C3 gate. `verify_batch` over `k` rows at positions
+    /// `[base, base+k)` must be BIT-IDENTICAL — exact u32 `to_bits`, not epsilon — to `k`
+    /// independent `forward_token` decodes seeded with the same KV history. The straddle
+    /// windows cross the split-K routing boundaries: `base=126,k=6` (rows pc 127..132 — the
+    /// first row takes the v2 f32-cache path, the rest the split-K f16-mirror path) and
+    /// `base=510,k=6` (rows pc 511..516, deep split-K with a varying split count). Logits are
+    /// compared by exact bits (an offset/stride bug that doesn't flip the argmax would slip
+    /// past an argmax-only check); the argmax ids are asserted too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_spec_verify_bit_identical() {
+        if !detect_metal_device().available {
+            return;
+        }
+        // Production GEMV stack + tiled/split-K attention. Latch the OnceLock gates ON
+        // before the first read; if a sibling test already latched f32y/wire/nsg8 OFF (a
+        // full --lib run read them earlier), SKIP rather than compare against a different
+        // kernel. A targeted run has no such sibling, so the gates latch on here (and ATTN2
+        // engages the split-K path the straddle windows are designed to exercise).
+        std::env::set_var("CAMELID_METAL_F32Y", "1");
+        std::env::set_var("CAMELID_METAL_WIRE", "1");
+        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        std::env::set_var("CAMELID_METAL_ATTN2", "1");
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP metal_spec_verify_bit_identical: f32y/wire/nsg8 gates inactive (OnceLock \
+                 latched off earlier in this process); run targeted: cargo test --release \
+                 --lib metal_spec_verify_bit_identical"
+            );
+            return;
+        }
+
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 2usize; // group = 2
+        let head_dim = 32usize;
+        let hidden = 128usize;
+        let ffn = 256usize;
+        let vocab = 256usize;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q: mkw(q_dim, bpr_hidden, s + 1),
+                    k: mkw(kv_dim, bpr_hidden, s + 2),
+                    v: mkw(kv_dim, bpr_hidden, s + 3),
+                    o: mkw(hidden, bpr_q, s + 4),
+                    gate: mkw(ffn, bpr_hidden, s + 5),
+                    up: mkw(ffn, bpr_hidden, s + 6),
+                    down: mkw(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                q_norm: None,
+                k_norm: None,
+            })
+            .collect();
+        // Output projection + final norm (the LogitsStage).
+        let final_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.45 + (i as f32 % 4.0) * 0.05)
+            .collect();
+        let out_w = mkw(vocab, bpr_hidden, 777);
+        let make_stage = || LogitsStage {
+            final_norm: &final_norm,
+            output_weight_blocks: ResidentWeightBytes::Blocks36(&out_w),
+            vocab_size: vocab,
+        };
+
+        // Deterministic synthetic K/V seeding the `base` history positions (identical for
+        // both sessions). Layout per layer: [kv_head][base][head_dim].
+        let synth_kv = |base: usize, layer: usize, is_v: bool| -> Vec<f32> {
+            let mut out = vec![0.0f32; n_kv * base * head_dim];
+            for h in 0..n_kv {
+                for p in 0..base {
+                    for d in 0..head_dim {
+                        let idx = (h * base + p) * head_dim + d;
+                        let t = (layer * 7 + h * 13 + p * 3 + d + usize::from(is_v) * 5) as f32;
+                        out[idx] = ((t % 19.0) - 9.0) * 0.05;
+                    }
+                }
+            }
+            out
+        };
+
+        let run = |base: usize, k: usize| {
+            let cap = base + k + 16;
+            let max_positions = cap; // no growth: identical strides in both sessions
+            let mut cos_all = vec![0.0f32; k * half];
+            let mut sin_all = vec![0.0f32; k * half];
+            let mut emb_all = vec![0.0f32; k * hidden];
+            for i in 0..k {
+                for p in 0..half {
+                    let theta = 0.2 + ((base + i) as f32) * 0.05 + p as f32 * 0.1;
+                    cos_all[i * half + p] = theta.cos();
+                    sin_all[i * half + p] = theta.sin();
+                }
+                for j in 0..hidden {
+                    emb_all[i * hidden + j] = (((i + j + base) as f32 % 11.0) - 5.0) * 0.2;
+                }
+            }
+
+            let mk_session = || {
+                let mut s = ResidentDecodeState::new(
+                    n_layers,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    hidden,
+                    ffn,
+                    max_positions,
+                    cap,
+                    eps,
+                    false,
+                )
+                .unwrap();
+                for layer in 0..n_layers {
+                    let ck = synth_kv(base, layer, false);
+                    let cv = synth_kv(base, layer, true);
+                    assert!(s.seed_layer(layer, &ck, &cv, base), "seed_layer");
+                }
+                s.set_filled(base);
+                s
+            };
+
+            // Reference: k sequential forward_token decodes (logits path -> full per-row
+            // logits + CPU argmax with the sampler's first-max tie-break).
+            let mut ref_session = mk_session();
+            let mut ref_logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+            for i in 0..k {
+                let emb = &emb_all[i * hidden..(i + 1) * hidden];
+                let cos_i = &cos_all[i * half..(i + 1) * half];
+                let sin_i = &sin_all[i * half..(i + 1) * half];
+                let out = ref_session
+                    .forward_token(
+                        emb,
+                        &weights,
+                        cos_i,
+                        sin_i,
+                        base + i,
+                        scale,
+                        Some(make_stage()),
+                        None,
+                        0,
+                        None,
+                    )
+                    .expect("reference forward_token");
+                match out {
+                    ResidentTokenOut::Data(v) => {
+                        assert_eq!(v.len(), vocab);
+                        ref_logits.push(v);
+                    }
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                }
+            }
+            let ref_argmax: Vec<u32> = ref_logits
+                .iter()
+                .map(|row| {
+                    let mut best = f32::NEG_INFINITY;
+                    let mut best_i = 0u32;
+                    for (j, &v) in row.iter().enumerate() {
+                        if v > best {
+                            best = v;
+                            best_i = j as u32;
+                        }
+                    }
+                    best_i
+                })
+                .collect();
+
+            // Candidate: verify_batch on the identically-seeded session.
+            let mut cand_session = mk_session();
+            let stage = make_stage();
+            let (preds, cand_logits) = cand_session
+                .verify_batch_logits(
+                    &emb_all, &cos_all, &sin_all, &weights, &stage, base, k, scale,
+                )
+                .expect("verify_batch eligible");
+            assert_eq!(preds.len(), k);
+            assert_eq!(cand_logits.len(), k * vocab);
+
+            // Hard gate: exact u32 bit identity for every row/element + argmax id equality.
+            for i in 0..k {
+                let pc = base + i + 1;
+                for v in 0..vocab {
+                    let a = cand_logits[i * vocab + v];
+                    let b = ref_logits[i][v];
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "base={base} k={k} row {i} (pc={pc}) vocab {v}: verify {a} ({:#010x}) \
+                         != forward {b} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits(),
+                    );
+                }
+                assert_eq!(
+                    preds[i], ref_argmax[i],
+                    "base={base} k={k} row {i} (pc={pc}): argmax verify {} != forward {}",
+                    preds[i], ref_argmax[i]
+                );
+            }
+            eprintln!(
+                "metal_spec_verify_bit_identical: base={base} k={k} BIT-IDENTICAL \
+                 (split_k_engaged={})",
+                splitk_attention_enabled() && attn2_enabled()
+            );
+        };
+
+        // C2: straddle the 128 split-K boundary (rows pc in [127..132]).
+        run(126, 6);
+        // C3: deep split-K (rows pc in [511..516], n_splits varies).
+        run(510, 6);
+    }
+
+    /// WIN2METAL Phase 4 gate. The slot-indirected TREE verify path must reproduce the
+    /// Phase-3 linear verify byte-for-byte on a single-branch tree (the ANCHOR), and on a
+    /// genuinely branching tree the accepted-path KV after compaction must equal an
+    /// independent linear `forward_token` decode of that path (byte-identical), with every
+    /// emitted token == the reference greedy argmax (Parity-class A).
+    ///
+    /// Same synthetic 2-layer / 4-head / group-2 / head_dim-32 / vocab-256 model and seeded
+    /// `base` history as `metal_spec_verify_bit_identical`. The LINEAR anchor straddles the
+    /// split-K boundary at base 126 AND deep split-K at base 510 (both mandatory).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_tree_verify_bit_identical() {
+        use crate::inference::spec_tree::TokenTree;
+        if !detect_metal_device().available {
+            return;
+        }
+        // Latch the production GEMV + tiled/split-K attention gates ON before the first read
+        // (identical to the linear gate); SKIP if a sibling latched them off earlier.
+        std::env::set_var("CAMELID_METAL_F32Y", "1");
+        std::env::set_var("CAMELID_METAL_WIRE", "1");
+        std::env::set_var("CAMELID_METAL_WIRE_NSG8", "1");
+        std::env::set_var("CAMELID_METAL_ATTN2", "1");
+        if !(f32y_gemv_enabled() && wire_weights_enabled() && wire_nsg8_enabled()) {
+            eprintln!(
+                "SKIP metal_tree_verify_bit_identical: f32y/wire/nsg8 gates inactive (OnceLock \
+                 latched off earlier in this process); run targeted: cargo test --release \
+                 --lib metal_tree_verify_bit_identical"
+            );
+            return;
+        }
+
+        let n_layers = 2usize;
+        let n_heads = 4usize;
+        let n_kv = 2usize; // group = 2
+        let head_dim = 32usize;
+        let hidden = 128usize;
+        let ffn = 256usize;
+        let vocab = 256usize;
+        let eps = 1.0e-5f32;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let half = head_dim / 2;
+        let bpr_hidden = hidden / 32;
+        let bpr_q = q_dim / 32;
+        let bpr_ffn = ffn / 32;
+        let mkw = |rows: usize, bpr: usize, seed: usize| {
+            let mut w: Vec<u8> = Vec::new();
+            for r in 0..rows {
+                for b in 0..bpr {
+                    let s = 0.05 + ((r * bpr + b + seed) as f32 % 7.0) * 0.01;
+                    w.extend_from_slice(&s.to_le_bytes());
+                    for l in 0..32 {
+                        w.push((((r * 5 + b * 3 + l + seed) as i32 % 17) - 8) as i8 as u8);
+                    }
+                }
+            }
+            w
+        };
+        struct LW {
+            attn_norm: Vec<f32>,
+            ffn_norm: Vec<f32>,
+            q: Vec<u8>,
+            k: Vec<u8>,
+            v: Vec<u8>,
+            o: Vec<u8>,
+            gate: Vec<u8>,
+            up: Vec<u8>,
+            down: Vec<u8>,
+        }
+        let data: Vec<LW> = (0..n_layers)
+            .map(|li| {
+                let s = li * 100;
+                LW {
+                    attn_norm: (0..hidden)
+                        .map(|i| 0.5 + ((i + li) as f32 % 3.0) * 0.1)
+                        .collect(),
+                    ffn_norm: (0..hidden)
+                        .map(|i| 0.4 + ((i + li) as f32 % 5.0) * 0.07)
+                        .collect(),
+                    q: mkw(q_dim, bpr_hidden, s + 1),
+                    k: mkw(kv_dim, bpr_hidden, s + 2),
+                    v: mkw(kv_dim, bpr_hidden, s + 3),
+                    o: mkw(hidden, bpr_q, s + 4),
+                    gate: mkw(ffn, bpr_hidden, s + 5),
+                    up: mkw(ffn, bpr_hidden, s + 6),
+                    down: mkw(hidden, bpr_ffn, s + 7),
+                }
+            })
+            .collect();
+        let weights: Vec<ResidentLayerWeights> = data
+            .iter()
+            .map(|d| ResidentLayerWeights {
+                attn_norm: &d.attn_norm,
+                ffn_norm: &d.ffn_norm,
+                q_weight_blocks: ResidentWeightBytes::Blocks36(&d.q),
+                k_weight_blocks: ResidentWeightBytes::Blocks36(&d.k),
+                v_weight_blocks: ResidentWeightBytes::Blocks36(&d.v),
+                o_weight_blocks: ResidentWeightBytes::Blocks36(&d.o),
+                gate_weight_blocks: ResidentWeightBytes::Blocks36(&d.gate),
+                up_weight_blocks: ResidentWeightBytes::Blocks36(&d.up),
+                down_weight_blocks: ResidentWeightBytes::Blocks36(&d.down),
+                q_norm: None,
+                k_norm: None,
+            })
+            .collect();
+        let final_norm: Vec<f32> = (0..hidden)
+            .map(|i| 0.45 + (i as f32 % 4.0) * 0.05)
+            .collect();
+        let out_w = mkw(vocab, bpr_hidden, 777);
+        let make_stage = || LogitsStage {
+            final_norm: &final_norm,
+            output_weight_blocks: ResidentWeightBytes::Blocks36(&out_w),
+            vocab_size: vocab,
+        };
+        let synth_kv = |base: usize, layer: usize, is_v: bool| -> Vec<f32> {
+            let mut out = vec![0.0f32; n_kv * base * head_dim];
+            for h in 0..n_kv {
+                for p in 0..base {
+                    for d in 0..head_dim {
+                        let idx = (h * base + p) * head_dim + d;
+                        let t = (layer * 7 + h * 13 + p * 3 + d + usize::from(is_v) * 5) as f32;
+                        out[idx] = ((t % 19.0) - 9.0) * 0.05;
+                    }
+                }
+            }
+            out
+        };
+        // Absolute-position RoPE table entry and per-node embedding — shared by the tree pass
+        // and the reference so node `x` at position `pos` is identical in both.
+        let cos_at =
+            |pos: usize, p: usize| -> f32 { (0.2 + (pos as f32) * 0.05 + p as f32 * 0.1).cos() };
+        let sin_at =
+            |pos: usize, p: usize| -> f32 { (0.2 + (pos as f32) * 0.05 + p as f32 * 0.1).sin() };
+        let emb_of = |node: usize, j: usize| -> f32 { (((node + j) as f32 % 11.0) - 5.0) * 0.2 };
+
+        // ---------- LINEAR ANCHOR: tree verify == linear verify, bit-for-bit ----------
+        let linear_anchor = |base: usize| {
+            let k = 6usize; // 6 nodes (anchor + 5 drafts) — straddles the split-K boundary
+            let cap = base + k + 16;
+            let max_positions = cap;
+            // Per-row tables at position base+i (a linear tree has depth[i] == i).
+            let mut cos_all = vec![0.0f32; k * half];
+            let mut sin_all = vec![0.0f32; k * half];
+            let mut emb_all = vec![0.0f32; k * hidden];
+            for i in 0..k {
+                for p in 0..half {
+                    cos_all[i * half + p] = cos_at(base + i, p);
+                    sin_all[i * half + p] = sin_at(base + i, p);
+                }
+                for j in 0..hidden {
+                    emb_all[i * hidden + j] = emb_of(i, j);
+                }
+            }
+            let mk_session = || {
+                let mut s = ResidentDecodeState::new(
+                    n_layers,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    hidden,
+                    ffn,
+                    max_positions,
+                    cap,
+                    eps,
+                    false,
+                )
+                .unwrap();
+                for layer in 0..n_layers {
+                    let ck = synth_kv(base, layer, false);
+                    let cv = synth_kv(base, layer, true);
+                    assert!(s.seed_layer(layer, &ck, &cv, base), "seed_layer");
+                }
+                s.set_filled(base);
+                s
+            };
+
+            // Reference: the proven Phase-3 linear verify.
+            let mut lin_session = mk_session();
+            let stage = make_stage();
+            let (lin_preds, lin_logits) = lin_session
+                .verify_batch_logits(
+                    &emb_all, &cos_all, &sin_all, &weights, &stage, base, k, scale,
+                )
+                .expect("verify_batch eligible");
+
+            // Candidate: the TREE verify on a single-branch (linear) tree. Token ids are
+            // irrelevant to the forward pass (only the structure drives ancestor_bits /
+            // node_kvslot), so any chain of k nodes works.
+            let drafts: Vec<u32> = (1..k as u32).collect();
+            let tree = TokenTree::linear(0, &drafts);
+            assert_eq!(tree.nodes(), k);
+            let node_kvslot = tree.node_kvslot(base);
+            let (ancestor_bits, words) = tree.ancestor_bitset();
+            let mut tree_session = mk_session();
+            let stage = make_stage();
+            let (tree_preds, tree_logits) = tree_session
+                .verify_batch_tree_logits(
+                    &emb_all,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    k,
+                    scale,
+                )
+                .expect("verify_batch_tree eligible");
+
+            assert_eq!(tree_preds.len(), k);
+            assert_eq!(tree_logits.len(), k * vocab);
+            for i in 0..k {
+                let pc = base + i + 1;
+                for v in 0..vocab {
+                    let a = tree_logits[i * vocab + v];
+                    let b = lin_logits[i * vocab + v];
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "LINEAR base={base} node {i} (pc={pc}) vocab {v}: tree {a} ({:#010x}) != \
+                         linear {b} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits(),
+                    );
+                }
+                assert_eq!(
+                    tree_preds[i], lin_preds[i],
+                    "LINEAR base={base} node {i} (pc={pc}): argmax tree {} != linear {}",
+                    tree_preds[i], lin_preds[i]
+                );
+            }
+            eprintln!("metal_tree_verify_bit_identical: LINEAR base={base} k={k} BIT-IDENTICAL");
+        };
+        linear_anchor(126); // straddle the split-K boundary (pc 127..132)
+        linear_anchor(510); // deep split-K (pc 511..516)
+
+        // ---------- BRANCHING: compaction == linear decode + Parity-class A ----------
+        // Tree (BFS):     0
+        //                / \
+        //               1   2
+        //              /   / \
+        //             3   4   5
+        let branching = |base: usize| {
+            let parent = [-1i32, 0, 0, 1, 2, 2];
+            let depth = [0u16, 1, 1, 2, 2, 2];
+            let n = 6usize;
+            let cap = base + n + 16;
+            let max_positions = cap;
+            // Per-NODE tables at position base+depth[i]; per-node embeddings.
+            let node_pos: Vec<usize> = (0..n).map(|i| base + depth[i] as usize).collect();
+            let mut cos_all = vec![0.0f32; n * half];
+            let mut sin_all = vec![0.0f32; n * half];
+            let mut emb_node = vec![0.0f32; n * hidden];
+            for i in 0..n {
+                for p in 0..half {
+                    cos_all[i * half + p] = cos_at(node_pos[i], p);
+                    sin_all[i * half + p] = sin_at(node_pos[i], p);
+                }
+                for j in 0..hidden {
+                    emb_node[i * hidden + j] = emb_of(i, j);
+                }
+            }
+            let mk_session = || {
+                let mut s = ResidentDecodeState::new(
+                    n_layers,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    hidden,
+                    ffn,
+                    max_positions,
+                    cap,
+                    eps,
+                    false,
+                )
+                .unwrap();
+                for layer in 0..n_layers {
+                    let ck = synth_kv(base, layer, false);
+                    let cv = synth_kv(base, layer, true);
+                    assert!(s.seed_layer(layer, &ck, &cv, base), "seed_layer");
+                }
+                s.set_filled(base);
+                s
+            };
+
+            // Provisional tree (tokens set after we see `predicted`, to force a real branch).
+            let provisional = TokenTree {
+                tokens: vec![0, 0, 0, 0, 0, 0],
+                parent: parent.to_vec(),
+                depth: depth.to_vec(),
+            };
+            let node_kvslot = provisional.node_kvslot(base);
+            let (ancestor_bits, words) = provisional.ancestor_bitset();
+
+            let mut tree_session = mk_session();
+            let stage = make_stage();
+            let predicted = tree_session
+                .verify_batch_tree(
+                    &emb_node,
+                    &cos_all,
+                    &sin_all,
+                    &weights,
+                    &stage,
+                    &node_kvslot,
+                    &ancestor_bits,
+                    words,
+                    base,
+                    n,
+                    scale,
+                )
+                .expect("verify_batch_tree eligible");
+            assert_eq!(predicted.len(), n);
+
+            // Craft tokens so accept_longest_path follows the right branch 0 -> 2 -> 5 (a
+            // genuine reorder: path[1]=2!=1 and path[2]=5!=2, so compaction does real work).
+            // accept picks the FIRST child (index order) whose token == predicted[parent], so
+            // make node 1 / node 4 mismatch and node 2 / node 5 match.
+            let mut tokens = vec![7u32, 0, 0, 3, 0, 0];
+            tokens[1] = (predicted[0] + 1) % vocab as u32; // sibling of node 2: must NOT match
+            tokens[2] = predicted[0]; // accepted child of root
+            tokens[4] = (predicted[2] + 1) % vocab as u32; // sibling of node 5: must NOT match
+            tokens[5] = predicted[2]; // accepted child of node 2
+            let tree = TokenTree {
+                tokens,
+                parent: parent.to_vec(),
+                depth: depth.to_vec(),
+            };
+            let (emitted, leaf) = tree.accept_longest_path(&predicted);
+            assert_eq!(leaf, 5, "branch should accept down to node 5");
+            let path = tree.path_to(leaf);
+            assert_eq!(path, vec![0, 2, 5], "accepted path");
+            assert_eq!(
+                emitted,
+                vec![predicted[0], predicted[2], predicted[5]],
+                "emitted == target argmax along the accepted path"
+            );
+
+            // Compact the accepted path into contiguous slots [base, base+3).
+            tree_session
+                .compact_tree_kv_path(&path, base)
+                .expect("compact");
+
+            // Independent reference: a fresh session that linearly decodes the path tokens
+            // (nodes 0, 2, 5) at positions base, base+1, base+2.
+            let mut ref_session = mk_session();
+            let mut ref_argmax = vec![0u32; path.len()];
+            for (r, &node) in path.iter().enumerate() {
+                let pos = base + r; // == node_pos[node] since depth[node] == r
+                let emb = &emb_node[node * hidden..(node + 1) * hidden];
+                let cos_i = &cos_all[node * half..(node + 1) * half];
+                let sin_i = &sin_all[node * half..(node + 1) * half];
+                let out = ref_session
+                    .forward_token(
+                        emb,
+                        &weights,
+                        cos_i,
+                        sin_i,
+                        pos,
+                        scale,
+                        Some(make_stage()),
+                        None,
+                        0,
+                        None,
+                    )
+                    .expect("reference forward_token");
+                let v = match out {
+                    ResidentTokenOut::Data(v) => v,
+                    ResidentTokenOut::Sampled(_) => panic!("unexpected sampled output"),
+                };
+                assert_eq!(v.len(), vocab);
+                let mut best = f32::NEG_INFINITY;
+                let mut best_i = 0u32;
+                for (j, &x) in v.iter().enumerate() {
+                    if x > best {
+                        best = x;
+                        best_i = j as u32;
+                    }
+                }
+                ref_argmax[r] = best_i;
+            }
+
+            // (a) Compacted accepted-path KV == the linear decode's KV, byte-for-byte, in both
+            //     the f32 caches and the f16 mirrors.
+            let read_row =
+                |s: &ResidentDecodeState, kbuf: bool, f16: bool, l: usize, slot: usize| {
+                    let mut k_out = vec![0u32; n_kv * head_dim];
+                    unsafe {
+                        if f16 {
+                            let buf = if kbuf {
+                                &s.cache_k16[l]
+                            } else {
+                                &s.cache_v16[l]
+                            };
+                            let p = buf.contents() as *const u16;
+                            for h in 0..n_kv {
+                                let off = (h * max_positions + slot) * head_dim;
+                                for d in 0..head_dim {
+                                    k_out[h * head_dim + d] = *p.add(off + d) as u32;
+                                }
+                            }
+                        } else {
+                            let buf = if kbuf { &s.cache_k[l] } else { &s.cache_v[l] };
+                            let p = buf.contents() as *const f32;
+                            for h in 0..n_kv {
+                                let off = (h * max_positions + slot) * head_dim;
+                                for d in 0..head_dim {
+                                    k_out[h * head_dim + d] = (*p.add(off + d)).to_bits();
+                                }
+                            }
+                        }
+                    }
+                    k_out
+                };
+            for l in 0..n_layers {
+                for r in 0..path.len() {
+                    let slot = base + r;
+                    for kbuf in [true, false] {
+                        for f16 in [false, true] {
+                            let a = read_row(&tree_session, kbuf, f16, l, slot);
+                            let b = read_row(&ref_session, kbuf, f16, l, slot);
+                            assert_eq!(
+                                a, b,
+                                "BRANCH base={base} layer {l} slot {slot} (rank {r}) \
+                                 kbuf={kbuf} f16={f16}: compacted KV != linear-decode KV"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // (b) Parity-class A: the tree's argmax at each accepted node == the reference
+            //     greedy argmax along the path.
+            for (r, &node) in path.iter().enumerate() {
+                assert_eq!(
+                    predicted[node], ref_argmax[r],
+                    "BRANCH base={base} class-A: tree predicted[node {node}] {} != reference \
+                     argmax[rank {r}] {}",
+                    predicted[node], ref_argmax[r]
+                );
+            }
+            eprintln!(
+                "metal_tree_verify_bit_identical: BRANCH base={base} path={path:?} \
+                 compaction==linear-decode + class-A PASS"
+            );
+        };
+        branching(126);
     }
 
     #[cfg(target_os = "macos")]
