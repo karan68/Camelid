@@ -102,7 +102,7 @@ fn snippet(s: &str) -> String {
     format!("{}…", &s[..end])
 }
 
-fn hostname() -> Option<String> {
+pub(super) fn hostname() -> Option<String> {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
@@ -190,7 +190,7 @@ pub fn run(cfg: OrchestrationConfig) -> anyhow::Result<i32> {
 }
 
 /// Poll a subagent until it leaves the `running` state (or the deadline passes).
-fn poll_to_terminal(root: &Path, id: &str, max: Duration) -> String {
+pub(super) fn poll_to_terminal(root: &Path, id: &str, max: Duration) -> String {
     let deadline = Instant::now() + max;
     loop {
         let s = subagent::status(root, id).unwrap_or_else(|e| format!("status: error\n{e}"));
@@ -338,7 +338,7 @@ fn run_battery() -> (EvalOutcome, Vec<CaseResult>, String) {
     )
 }
 
-fn family_for(model: &Path) -> String {
+pub(super) fn family_for(model: &Path) -> String {
     let name = model
         .file_name()
         .and_then(|n| n.to_str())

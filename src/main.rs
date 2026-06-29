@@ -458,6 +458,22 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         load_timeout: u64,
     },
+    /// Rung-4: measure concurrent vs sequential subagent wall-clock (I/O-bound;
+    /// add --model for the inference-bound workload) and emit a sealed receipt.
+    AgentOrchestrationBench {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+        /// Optional GGUF: also measure the inference-bound workload.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Server to attach to / spawn on.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load.
+        #[arg(long, default_value_t = 120)]
+        load_timeout: u64,
+    },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
         /// Mode to run: coordinator or worker
@@ -1144,6 +1160,20 @@ async fn main() -> anyhow::Result<()> {
             load_timeout,
         } => {
             let code = chat::run_agent_orchestration_eval(chat::AgentOrchestrationOptions {
+                receipt_dir,
+                model,
+                addr,
+                load_timeout,
+            })?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationBench {
+            receipt_dir,
+            model,
+            addr,
+            load_timeout,
+        } => {
+            let code = chat::run_agent_orchestration_bench(chat::AgentOrchestrationBenchOptions {
                 receipt_dir,
                 model,
                 addr,

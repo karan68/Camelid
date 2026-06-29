@@ -15,6 +15,7 @@
 //! See `DECISIONS.md` D6 and `RECON_CHAT.md`.
 
 mod agent;
+mod agent_bench;
 mod agent_eval;
 mod agent_orchestration;
 mod agent_syscap;
@@ -227,6 +228,25 @@ pub struct AgentOrchestrationOptions {
 /// it runs the rung-3 real-model round-trip. Returns 0/1/3.
 pub fn run_agent_orchestration_eval(opts: AgentOrchestrationOptions) -> anyhow::Result<i32> {
     agent_orchestration::run(agent_orchestration::OrchestrationConfig {
+        receipt_dir: opts.receipt_dir,
+        model: opts.model,
+        addr: opts.addr,
+        load_timeout: opts.load_timeout,
+    })
+}
+
+/// Parsed `camelid agent-orchestration-bench` flags.
+pub struct AgentOrchestrationBenchOptions {
+    pub receipt_dir: PathBuf,
+    pub model: Option<PathBuf>,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
+}
+
+/// Entry for the `agent-orchestration-bench` subcommand: the rung-4 wall-clock
+/// measurement (concurrent vs sequential subagents) → sealed bench receipt.
+pub fn run_agent_orchestration_bench(opts: AgentOrchestrationBenchOptions) -> anyhow::Result<i32> {
+    agent_bench::run(agent_bench::BenchConfig {
         receipt_dir: opts.receipt_dir,
         model: opts.model,
         addr: opts.addr,
