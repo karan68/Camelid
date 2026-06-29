@@ -1,7 +1,7 @@
 {
   "schema": "camelid.agent-orchestration-receipt/v1",
-  "receipt_id": "a8a5a2c58866c4e9f6c3ee0f5806fe25c064e039f8bdef69511dee36180a5da5",
-  "created_unix": 1782690752,
+  "receipt_id": "2fc635febd5328f8f767639fe02ecbbfbe49ca8d77225b3d1971492a6070210d",
+  "created_unix": 1782692210,
   "feature": "subagent-orchestration: spawn_subagent + check_subagent_status (stub round-trip + caps/depth/reaping)",
   "outcome": "PASS",
   "host": {

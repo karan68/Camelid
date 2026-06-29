@@ -33,6 +33,13 @@ const DEFAULT_CONCURRENCY: usize = 2;
 const DEFAULT_DEPTH_LIMIT: usize = 1;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+// Worker-side hard caps. The worker treats its task file as UNTRUSTED data
+// (defense-in-depth: the parent validated it, but a hand-crafted file must not
+// run unbounded or traverse on write), so it re-validates and clamps.
+const MAX_WORKER_STEPS: usize = 30;
+const MAX_WORKER_TOKENS: u32 = 4096;
+const MAX_WORKER_DEPTH: usize = 8;
+
 /// Env var carrying a child's spawn-tree depth (0 = top-level agent).
 pub const DEPTH_ENV: &str = "CAMELID_SUBAGENT_DEPTH";
 
@@ -502,6 +509,21 @@ fn write_terminal_result(entry: &ChildEntry, status: &str, note: &str) {
 pub fn run_worker(task_file: &Path) -> anyhow::Result<i32> {
     let text = std::fs::read_to_string(task_file)?;
     let task: TaskSpec = serde_json::from_str(&text)?;
+
+    // Defense-in-depth: the task file is untrusted. subtask_id is a filename
+    // component of the result path, so re-validate it — a hand-crafted task file
+    // must not traverse on write. Bound the depth too (in case the env/file was
+    // tampered) before doing any work.
+    if !valid_subtask_id(&task.subtask_id) {
+        anyhow::bail!("worker refused: invalid subtask_id {:?}", task.subtask_id);
+    }
+    if task.depth > MAX_WORKER_DEPTH {
+        anyhow::bail!(
+            "worker refused: depth {} exceeds ceiling {MAX_WORKER_DEPTH}",
+            task.depth
+        );
+    }
+
     let result = execute_task(&task);
 
     let dir = task_file.parent().unwrap_or_else(|| Path::new("."));
@@ -509,6 +531,9 @@ pub fn run_worker(task_file: &Path) -> anyhow::Result<i32> {
     let mut j = serde_json::to_string_pretty(&result)?;
     j.push('\n');
     write_result_atomic(&rpath, &j);
+
+    // Consume the task file (cleanup); the result file remains for polling.
+    let _ = std::fs::remove_file(task_file);
 
     Ok(match result.status.as_str() {
         "completed" => 0,
@@ -536,6 +561,10 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
         .shell_mode
         .parse::<super::shell_sandbox::ShellSandbox>()
         .unwrap_or(super::shell_sandbox::ShellSandbox::Sandboxed);
+    // Clamp the loop budget — a crafted/buggy task file can't make a child loop
+    // or generate unbounded.
+    let max_steps = task.max_steps.clamp(1, MAX_WORKER_STEPS);
+    let max_tokens = task.max_tokens.clamp(1, MAX_WORKER_TOKENS);
     let root = Path::new(&task.workdir);
     let sandbox = match Sandbox::new(root, false, Duration::from_secs(60)) {
         Ok(s) => s.with_shell_mode(shell_mode),
@@ -552,11 +581,11 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
     let cancel = AtomicBool::new(false);
     let cfg = agent::AgentConfig {
         workdir: root.to_path_buf(),
-        max_steps: task.max_steps,
+        max_steps,
         auto_approve: task.auto_approve,
         allow_net: false,
         shell_timeout: Duration::from_secs(60),
-        max_tokens: task.max_tokens,
+        max_tokens,
         temperature: 0.0,
         audit: Box::new(super::audit::NoopSink),
         shell_sandbox: shell_mode,
@@ -599,7 +628,7 @@ fn execute_task(task: &TaskSpec) -> SubagentResult {
             client,
             task.model_id.clone(),
             task.family.clone(),
-            task.max_tokens,
+            max_tokens,
             0.0,
         );
         agent::run_loop(
@@ -766,6 +795,63 @@ mod tests {
         // A root with no subagents dir → "no subagents".
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(list_summary(empty.path()), "no subagents");
+    }
+
+    fn canned_task(root: &Path, id: &str) -> TaskSpec {
+        TaskSpec {
+            subtask_id: id.to_string(),
+            goal: "g".to_string(),
+            addr: "127.0.0.1:8181".to_string(),
+            model_id: "x".to_string(),
+            family: "llama".to_string(),
+            workdir: root.display().to_string(),
+            max_steps: 4,
+            max_tokens: 64,
+            depth: 1,
+            auto_approve: false,
+            shell_mode: "sandboxed".to_string(),
+            canned_answer: Some("WORKER-OK".to_string()),
+            canned_sleep_ms: None,
+        }
+    }
+
+    #[test]
+    fn worker_canned_roundtrip_writes_result_and_consumes_task() {
+        // The canned worker runs the loop IN-PROCESS (no subprocess), so this is
+        // real end-to-end coverage of run_worker.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(subagent_dir(root)).unwrap();
+        let tpath = task_path(root, "wt-1");
+        std::fs::write(
+            &tpath,
+            serde_json::to_string(&canned_task(root, "wt-1")).unwrap(),
+        )
+        .unwrap();
+
+        let code = run_worker(&tpath).unwrap();
+        assert_eq!(code, 0);
+        let res: SubagentResult =
+            serde_json::from_str(&std::fs::read_to_string(result_path(root, "wt-1")).unwrap())
+                .unwrap();
+        assert_eq!(res.status, "completed");
+        assert!(res.answer.contains("WORKER-OK"), "{}", res.answer);
+        assert!(res.tool_calls.iter().any(|c| c.contains("list_dir")));
+        assert!(!tpath.exists(), "task file should be consumed");
+    }
+
+    #[test]
+    fn worker_refuses_invalid_subtask_id_in_task_file() {
+        // Defense-in-depth: a hand-crafted task file with a traversing subtask_id
+        // is refused before any work or write.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(subagent_dir(root)).unwrap();
+        let mut task = canned_task(root, "placeholder");
+        task.subtask_id = "../evil".to_string();
+        let tpath = subagent_dir(root).join("task_evil.json");
+        std::fs::write(&tpath, serde_json::to_string(&task).unwrap()).unwrap();
+        assert!(run_worker(&tpath).is_err());
     }
 
     #[test]
