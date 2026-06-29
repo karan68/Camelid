@@ -542,7 +542,7 @@ impl RunnableModel {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
-            return self.generate_qwen35(prompt, max_new);
+            return self.generate_qwen35(prompt, max_new, &[]);
         }
         let mut cache = KvCache::new(self.n_layers);
         let mut last = Vec::new();
@@ -957,7 +957,7 @@ impl RunnableModel {
     /// for the shared prefix (same per-token math, same accumulation order).
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
-    fn generate_qwen35(&self, prompt: &[u32], max_new: usize) -> Result<Vec<u32>> {
+    fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let mut cache = Qwen35Cache::new(rt, self.n_layers);
         let mut last = Vec::new();
@@ -968,6 +968,11 @@ impl RunnableModel {
         let mut pos = prompt.len();
         let mut next = argmax(&last);
         for i in 0..max_new {
+            // A stop token (EOS / `<|im_end|>` / EOG) ends the turn — and is NOT
+            // appended, matching llama.cpp's served output (the stop is consumed).
+            if stop.contains(&next) {
+                break;
+            }
             out.push(next);
             if i + 1 < max_new {
                 let logits = self.decode_token_qwen35(next, pos, &mut cache)?;
@@ -976,6 +981,27 @@ impl RunnableModel {
             }
         }
         Ok(out)
+    }
+
+    /// Greedy decode that stops at the first token in `stop` (EOS / `<|im_end|>` /
+    /// EOG) — for the serve path, so a turn ends instead of always emitting `max_new`
+    /// tokens. The stop token is consumed, not returned. With an empty `stop` this is
+    /// identical to [`generate`]. qwen35 only; other arches fall back to [`generate`].
+    ///
+    /// [`generate`]: RunnableModel::generate
+    pub fn generate_stopping(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+    ) -> Result<Vec<u32>> {
+        if prompt.is_empty() {
+            return Err(BackendError::InvalidTensorData("empty prompt".into()));
+        }
+        if self.qwen35.is_some() {
+            return self.generate_qwen35(prompt, max_new, stop);
+        }
+        self.generate(prompt, max_new)
     }
 
     /// One token through the full qwen35 stack at absolute `pos`, mutating `cache`.
