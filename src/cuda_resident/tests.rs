@@ -2682,3 +2682,246 @@ fn q6k_gemv_matches_oracle() {
         "q6k_gemv diverged from q6_k_wire_row_dot oracle (worst rel {worst:.3e})"
     );
 }
+
+// ---- qwen35 (Ornith) gated-delta-net SSM kernels ---------------------------
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn ssm_l2_norm_per_head_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let nk = 4usize;
+    let hd = 128usize;
+    let eps = 1e-6f32;
+    let mut rng = Lcg(11);
+    let buf: Vec<f32> = (0..nk * hd).map(|_| rng.next_f32()).collect();
+    // CPU: double-precision sum, fmax(eps) — matches l2_norm_inplace.
+    let mut expected = buf.clone();
+    for h in 0..nk {
+        let s = &mut expected[h * hd..(h + 1) * hd];
+        let ss: f64 = s.iter().map(|v| (*v as f64) * (*v as f64)).sum();
+        let scale = 1.0f32 / (ss as f32).sqrt().max(eps);
+        for v in s.iter_mut() {
+            *v *= scale;
+        }
+    }
+    let mut dbuf = k.stream.clone_htod(&buf).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (nk as u32, 1, 1),
+        block_dim: (hd as u32, 1, 1),
+        shared_mem_bytes: (hd as u32) * 4,
+    };
+    let hdi = hd as i32;
+    let mut b = k.stream.launch_builder(&k.ssm_l2_norm_per_head);
+    b.arg(&mut dbuf).arg(&hdi).arg(&eps);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got = vec![0f32; nk * hd];
+    k.stream.memcpy_dtoh(&dbuf, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(
+        close(&got, &expected, 2e-3),
+        "ssm_l2_norm_per_head diverged"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn ssm_conv1d_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let conv_dim = 256usize;
+    let d_conv = 4usize;
+    let cm1 = d_conv - 1;
+    let mut rng = Lcg(23);
+    let w: Vec<f32> = (0..conv_dim * d_conv).map(|_| rng.next_f32()).collect();
+    let x: Vec<f32> = (0..conv_dim).map(|_| rng.next_f32()).collect();
+    let st0: Vec<f32> = (0..conv_dim * cm1).map(|_| rng.next_f32()).collect();
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    // CPU reference (matches qwen35_ssm_compute conv loop).
+    let mut exp_out = vec![0f32; conv_dim];
+    let mut exp_st = st0.clone();
+    for c in 0..conv_dim {
+        let mut acc = 0.0f32;
+        for t in 0..cm1 {
+            acc += w[c * d_conv + t] * exp_st[c * cm1 + t];
+        }
+        acc += w[c * d_conv + cm1] * x[c];
+        exp_out[c] = silu(acc);
+        for t in 0..cm1 - 1 {
+            exp_st[c * cm1 + t] = exp_st[c * cm1 + t + 1];
+        }
+        exp_st[c * cm1 + (cm1 - 1)] = x[c];
+    }
+    let dw = k.stream.clone_htod(&w).unwrap();
+    let dx = k.stream.clone_htod(&x).unwrap();
+    let mut dst = k.stream.clone_htod(&st0).unwrap();
+    let mut dout = k.stream.alloc_zeros::<f32>(conv_dim).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (conv_dim.div_ceil(128) as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let cdi = conv_dim as i32;
+    let dci = d_conv as i32;
+    let mut b = k.stream.launch_builder(&k.ssm_conv1d);
+    b.arg(&dw)
+        .arg(&dx)
+        .arg(&mut dst)
+        .arg(&mut dout)
+        .arg(&cdi)
+        .arg(&dci);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got_out = vec![0f32; conv_dim];
+    let mut got_st = vec![0f32; conv_dim * cm1];
+    k.stream.memcpy_dtoh(&dout, &mut got_out).unwrap();
+    k.stream.memcpy_dtoh(&dst, &mut got_st).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got_out, &exp_out, 2e-3), "ssm_conv1d out diverged");
+    assert!(
+        close(&got_st, &exp_st, 2e-3),
+        "ssm_conv1d ring-state diverged"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn ssm_delta_rule_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let ds = 128usize;
+    let nk = 16usize;
+    let nv = 32usize;
+    let eps = 1e-6f32;
+    let mut rng = Lcg(0x5511);
+    let state0: Vec<f32> = (0..nv * ds * ds).map(|_| rng.next_f32()).collect();
+    let kc: Vec<f32> = (0..nk * ds).map(|_| rng.next_f32()).collect();
+    let qc: Vec<f32> = (0..nk * ds).map(|_| rng.next_f32()).collect();
+    let vc: Vec<f32> = (0..nv * ds).map(|_| rng.next_f32()).collect();
+    let z: Vec<f32> = (0..nv * ds).map(|_| rng.next_f32()).collect();
+    let beta: Vec<f32> = (0..nv).map(|_| rng.next_f32() * 0.5 + 0.5).collect(); // (0,1)
+    let glog: Vec<f32> = (0..nv)
+        .map(|_| -(rng.next_f32() * 0.5 + 0.5) * 0.1)
+        .collect(); // <= 0
+    let norm: Vec<f32> = (0..ds).map(|_| rng.next_f32() * 0.5 + 1.0).collect();
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    // CPU reference (matches qwen35_ssm_compute recurrence + gated RMSNorm).
+    let mut exp_state = state0.clone();
+    let mut exp_out = vec![0f32; nv * ds];
+    let qscale = 1.0f32 / (ds as f32).sqrt();
+    for h in 0..nv {
+        let hk = h % nk;
+        let g = glog[h].exp();
+        let bh = beta[h];
+        let st = &mut exp_state[h * ds * ds..(h + 1) * ds * ds];
+        for s in st.iter_mut() {
+            *s *= g;
+        }
+        let mut sk = vec![0f32; ds];
+        for i in 0..ds {
+            let ki = kc[hk * ds + i];
+            for j in 0..ds {
+                sk[j] += st[i * ds + j] * ki;
+            }
+        }
+        let mut dvec = vec![0f32; ds];
+        for j in 0..ds {
+            dvec[j] = (vc[h * ds + j] - sk[j]) * bh;
+        }
+        for i in 0..ds {
+            let ki = kc[hk * ds + i];
+            for j in 0..ds {
+                st[i * ds + j] += ki * dvec[j];
+            }
+        }
+        let mut o = vec![0f32; ds];
+        for i in 0..ds {
+            let qi = qc[hk * ds + i] * qscale;
+            for j in 0..ds {
+                o[j] += st[i * ds + j] * qi;
+            }
+        }
+        let ss: f32 = o.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / ds as f32 + eps).sqrt();
+        for j in 0..ds {
+            exp_out[h * ds + j] = (o[j] * inv * norm[j]) * silu(z[h * ds + j]);
+        }
+    }
+    let mut dstate = k.stream.clone_htod(&state0).unwrap();
+    let dk = k.stream.clone_htod(&kc).unwrap();
+    let dq = k.stream.clone_htod(&qc).unwrap();
+    let dv = k.stream.clone_htod(&vc).unwrap();
+    let dz = k.stream.clone_htod(&z).unwrap();
+    let dbeta = k.stream.clone_htod(&beta).unwrap();
+    let dglog = k.stream.clone_htod(&glog).unwrap();
+    let dnorm = k.stream.clone_htod(&norm).unwrap();
+    let mut dout = k.stream.alloc_zeros::<f32>(nv * ds).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (nv as u32, 1, 1),
+        block_dim: (ds as u32, 1, 1),
+        shared_mem_bytes: (3 * ds as u32) * 4,
+    };
+    let dsi = ds as i32;
+    let nki = nk as i32;
+    let mut b = k.stream.launch_builder(&k.ssm_delta_rule);
+    b.arg(&mut dstate)
+        .arg(&dk)
+        .arg(&dq)
+        .arg(&dv)
+        .arg(&dz)
+        .arg(&dbeta)
+        .arg(&dglog)
+        .arg(&dnorm)
+        .arg(&mut dout)
+        .arg(&dsi)
+        .arg(&nki)
+        .arg(&eps);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got_out = vec![0f32; nv * ds];
+    let mut got_state = vec![0f32; nv * ds * ds];
+    k.stream.memcpy_dtoh(&dout, &mut got_out).unwrap();
+    k.stream.memcpy_dtoh(&dstate, &mut got_state).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(
+        close(&got_out, &exp_out, 3e-3),
+        "ssm_delta_rule output diverged"
+    );
+    assert!(
+        close(&got_state, &exp_state, 3e-3),
+        "ssm_delta_rule carried state diverged"
+    );
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn sigmoid_mul_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n = 512usize;
+    let mut rng = Lcg(77);
+    let out0: Vec<f32> = (0..n).map(|_| rng.next_f32()).collect();
+    let gate: Vec<f32> = (0..n).map(|_| rng.next_f32() * 4.0).collect();
+    let expected: Vec<f32> = out0
+        .iter()
+        .zip(&gate)
+        .map(|(o, g)| o * (1.0 / (1.0 + (-g).exp())))
+        .collect();
+    let mut dout = k.stream.clone_htod(&out0).unwrap();
+    let dgate = k.stream.clone_htod(&gate).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let ni = n as i32;
+    let mut b = k.stream.launch_builder(&k.sigmoid_mul);
+    b.arg(&mut dout).arg(&dgate).arg(&ni);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got = vec![0f32; n];
+    k.stream.memcpy_dtoh(&dout, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got, &expected, 2e-3), "sigmoid_mul diverged");
+}

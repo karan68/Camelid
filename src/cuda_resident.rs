@@ -1957,6 +1957,138 @@ extern "C" __global__ void attn_sk_combine(
         out[(long)head * head_dim + d] = a * s_inv;
     }
 }
+
+// =====================================================================
+// qwen35 (Ornith) hybrid gated-delta-net (SSM) kernels.
+// Mirror the CPU reference in src/runnable/model.rs::qwen35_ssm_compute,
+// preserving its arithmetic AND summation order so greedy-token parity holds.
+// =====================================================================
+
+// ---- Per-head L2 normalize (q/k in SSM layers) -----------------------------
+// In-place: buf[head*head_dim + i] /= max(sqrt(sum x^2), eps). One block per head.
+// Matches CPU l2_norm_inplace: DOUBLE-precision sum of squares, cast to f32, sqrt,
+// then fmax(eps). The per-element apply is parallel.
+extern "C" __global__ void ssm_l2_norm_per_head(
+    float* __restrict__ buf, int head_dim, float eps
+) {
+    extern __shared__ float xs[];
+    __shared__ float s_scale;
+    int head = blockIdx.x;
+    int tid = threadIdx.x;
+    long base = (long)head * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) xs[i] = buf[base + i];
+    __syncthreads();
+    if (tid == 0) {
+        double ss = 0.0;
+        for (int i = 0; i < head_dim; i++) { double v = (double)xs[i]; ss += v * v; }
+        float denom = sqrtf((float)ss);
+        if (denom < eps) denom = eps;
+        s_scale = 1.0f / denom;
+    }
+    __syncthreads();
+    float scale = s_scale;
+    for (int i = tid; i < head_dim; i += blockDim.x) buf[base + i] = xs[i] * scale;
+}
+
+// ---- Causal depthwise conv1d (kernel d_conv) + SiLU ------------------------
+// One thread per channel c. window = [ring_state(oldest..newest), current x[c]];
+// acc = sum_t w[c,t]*state[c,t] + w[c,d_conv-1]*x[c]; out = silu(acc); then the
+// ring buffer shifts left and appends x[c]. Bit-identical to the CPU conv loop.
+extern "C" __global__ void ssm_conv1d(
+    const float* __restrict__ conv_w,    // [conv_dim * d_conv]
+    const float* __restrict__ x,         // [conv_dim] current input
+    float* __restrict__ conv_state,      // [conv_dim * (d_conv-1)] ring, updated
+    float* __restrict__ conv_out,        // [conv_dim] output (post-SiLU)
+    int conv_dim, int d_conv
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    int cm1 = d_conv - 1;
+    const float* w = conv_w + (long)c * d_conv;
+    float* st = conv_state + (long)c * cm1;
+    float xc = x[c];
+    float acc = 0.0f;
+    for (int t = 0; t < cm1; t++) acc += w[t] * st[t];
+    acc += w[cm1] * xc;
+    conv_out[c] = acc / (1.0f + expf(-acc));   // SiLU
+    for (int t = 0; t < cm1 - 1; t++) st[t] = st[t + 1];
+    st[cm1 - 1] = xc;
+}
+
+// ---- Gated delta-rule recurrence (one decode step) + gated RMSNorm ---------
+// One block per value-head (gridDim.x = nv), blockDim.x = d_state (== head_v_dim).
+// Thread j owns column j of the [d_state x d_state] state S (row-major [i*d_state+j]).
+//   decay:  S[i,j] *= exp(glog[h])
+//   sk[j]   = sum_i S[i,j]*k[i]                 (fused with decay, i-order)
+//   d[j]    = (v[j] - sk[j]) * beta[h]
+//   S[i,j] += k[i]*d[j];  o[j] = sum_i S[i,j]*(q[i]*qscale)   (fused, i-order)
+//   gated RMSNorm: out = RMSNorm(o, ssm_norm) * SiLU(z)       (j-order serial sum)
+// k_conv/q_conv are L2-normed; GQA tile-repeat key head = h % nk. beta is already
+// sigmoid'd; glog is pre-exp. Bit-identical order to the CPU reference.
+extern "C" __global__ void ssm_delta_rule(
+    float* __restrict__ state,           // [nv*d_state*d_state], updated in place
+    const float* __restrict__ k_conv,    // [nk*d_state]
+    const float* __restrict__ q_conv,    // [nk*d_state]
+    const float* __restrict__ v_conv,    // [nv*d_state]
+    const float* __restrict__ z,         // [nv*d_state]
+    const float* __restrict__ beta,      // [nv] (post-sigmoid)
+    const float* __restrict__ glog,      // [nv] (pre-exp)
+    const float* __restrict__ ssm_norm,  // [d_state]
+    float* __restrict__ out,             // [nv*d_state]
+    int d_state, int nk, float eps
+) {
+    int h = blockIdx.x;
+    int j = threadIdx.x;                 // 0..d_state-1
+    int hk = h % nk;
+    extern __shared__ float sh[];
+    float* sk_ = sh;                     // [d_state] k head
+    float* sq_ = sh + d_state;           // [d_state] q head
+    float* so_ = sh + 2 * d_state;       // [d_state] o scratch
+    sk_[j] = k_conv[(long)hk * d_state + j];
+    sq_[j] = q_conv[(long)hk * d_state + j];
+    __syncthreads();
+    float* St = state + (long)h * d_state * d_state;
+    float g = expf(glog[h]);
+    float bh = beta[h];
+    float qscale = 1.0f / sqrtf((float)d_state);
+    float skj = 0.0f;
+    for (int i = 0; i < d_state; i++) {
+        float s = St[(long)i * d_state + j] * g;
+        St[(long)i * d_state + j] = s;
+        skj += s * sk_[i];
+    }
+    float dj = (v_conv[(long)h * d_state + j] - skj) * bh;
+    float oj = 0.0f;
+    for (int i = 0; i < d_state; i++) {
+        float s = St[(long)i * d_state + j] + sk_[i] * dj;
+        St[(long)i * d_state + j] = s;
+        oj += s * (sq_[i] * qscale);
+    }
+    so_[j] = oj;
+    __syncthreads();
+    __shared__ float s_scale;
+    if (j == 0) {
+        float sum = 0.0f;
+        for (int t = 0; t < d_state; t++) sum += so_[t] * so_[t];
+        s_scale = 1.0f / sqrtf(sum / (float)d_state + eps);
+    }
+    __syncthreads();
+    float normed = so_[j] * s_scale * ssm_norm[j];
+    float zj = z[(long)h * d_state + j];
+    float silu_z = zj / (1.0f + expf(-zj));
+    out[(long)h * d_state + j] = normed * silu_z;
+}
+
+// ---- Sigmoid output gate (qwen35 full-attention) ---------------------------
+// out[i] *= sigmoid(gate[i]). One thread per element.
+extern "C" __global__ void sigmoid_mul(
+    float* __restrict__ out, const float* __restrict__ gate, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gv = gate[i];
+    out[i] *= 1.0f / (1.0f + expf(-gv));
+}
 "#;
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -2007,6 +2139,11 @@ pub struct CudaResidentKernels {
     pub(crate) attn_sk_scores_coalesced: CudaFunction,
     pub(crate) attn_sk_partial: CudaFunction,
     pub(crate) attn_sk_combine: CudaFunction,
+    // qwen35 (Ornith) gated-delta-net SSM kernels.
+    pub(crate) ssm_l2_norm_per_head: CudaFunction,
+    pub(crate) ssm_conv1d: CudaFunction,
+    pub(crate) ssm_delta_rule: CudaFunction,
+    pub(crate) sigmoid_mul: CudaFunction,
     /// Env-gated (CAMELID_ATTN_COALESCED) dispatch of the coalesced K-dot in
     /// split-K pass 1. Read ONCE at construction; default OFF so the shipped
     /// path stays byte-identical.
@@ -2073,6 +2210,10 @@ impl CudaResidentKernels {
             attn_sk_scores_coalesced: f("attn_sk_scores_coalesced")?,
             attn_sk_partial: f("attn_sk_partial")?,
             attn_sk_combine: f("attn_sk_combine")?,
+            ssm_l2_norm_per_head: f("ssm_l2_norm_per_head")?,
+            ssm_conv1d: f("ssm_conv1d")?,
+            ssm_delta_rule: f("ssm_delta_rule")?,
+            sigmoid_mul: f("sigmoid_mul")?,
             attn_coalesced: std::env::var("CAMELID_ATTN_COALESCED")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
