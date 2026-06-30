@@ -2691,4 +2691,47 @@ mod gpu_ssm_layer_tests {
         }
         eprintln!("qwen35_gpu_greedy: PASS (8-tok GPU==CPU, run-twice stable)");
     }
+
+    /// Decode tok/s benchmark, GPU resident lane vs CPU runnable lane, same Q4_K_M
+    /// model. Two-point timing ((t_hi - t_lo) over (n_hi - n_lo) generated tokens)
+    /// cancels the per-call prompt prefill + model-load + GPU build, leaving the
+    /// steady-state per-token decode rate. Needs CAMELID_ORNITH_GGUF = the Q4_K_M.
+    #[test]
+    #[ignore = "tok/s benchmark — needs CAMELID_ORNITH_GGUF (Q4_K_M) + a CUDA device"]
+    fn qwen35_gpu_vs_cpu_tokps() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let (n_lo, n_hi) = (16usize, 64usize);
+        let secs = |gpu: bool, n: usize| -> f64 {
+            let t = std::time::Instant::now();
+            let r = if gpu {
+                model.generate_qwen35_cuda(&prompt, n, &[])
+            } else {
+                model.generate_qwen35_cpu(&prompt, n, &[])
+            };
+            r.expect("generate");
+            t.elapsed().as_secs_f64()
+        };
+        // GPU: warm (lazy-build + 5.24 GB upload), then two timed runs.
+        let _ = model.generate_qwen35_cuda(&prompt, 4, &[]);
+        let g_lo = secs(true, n_lo);
+        let g_hi = secs(true, n_hi);
+        let gpu_tokps = (n_hi - n_lo) as f64 / (g_hi - g_lo);
+        // CPU: two timed runs.
+        let c_lo = secs(false, n_lo);
+        let c_hi = secs(false, n_hi);
+        let cpu_tokps = (n_hi - n_lo) as f64 / (c_hi - c_lo);
+        eprintln!(
+            "qwen35 DECODE tok/s (Q4_K_M): GPU={gpu_tokps:.2}  CPU={cpu_tokps:.2}  \
+             speedup={:.2}x  [GPU {g_lo:.1}s@{n_lo} -> {g_hi:.1}s@{n_hi}; \
+             CPU {c_lo:.1}s@{n_lo} -> {c_hi:.1}s@{n_hi}]",
+            gpu_tokps / cpu_tokps
+        );
+    }
 }
