@@ -357,6 +357,12 @@ pub struct RunnableModel {
     /// layers have no K/V attention). When set, the forward path is routed to the
     /// dedicated `*_qwen35` methods and `layers` is empty. See [`Qwen35Runtime`].
     qwen35: Option<Qwen35Runtime>,
+    /// Lazily-built GPU resident decode engine for the qwen35 lane, gated by
+    /// `CAMELID_QWEN35_CUDA=1`. `Mutex` gives the `&mut` the per-token forward needs
+    /// while `generate_*` take `&self`; built on first use and reused, with the SSM/conv
+    /// recurrent state reset at the start of every generate. `None` until first use.
+    #[cfg(feature = "cuda")]
+    cuda: std::sync::Mutex<Option<crate::cuda_resident::CudaResidentDecode>>,
 }
 
 impl RunnableModel {
@@ -534,6 +540,8 @@ impl RunnableModel {
                     value_dim,
                     conv_dim,
                 }),
+                #[cfg(feature = "cuda")]
+                cuda: std::sync::Mutex::new(None),
             });
         }
 
@@ -642,6 +650,8 @@ impl RunnableModel {
             output_norm,
             layers,
             qwen35: None,
+            #[cfg(feature = "cuda")]
+            cuda: std::sync::Mutex::new(None),
         })
     }
 
@@ -1243,7 +1253,33 @@ impl RunnableModel {
     /// for the shared prefix (same per-token math, same accumulation order).
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
+    /// qwen35 greedy decode. Routes to the GPU resident lane when `CAMELID_QWEN35_CUDA=1`
+    /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
+    /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            if std::env::var("CAMELID_QWEN35_CUDA")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                match self.generate_qwen35_cuda(prompt, max_new, stop) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        eprintln!("[qwen35] CUDA lane failed ({e}); falling back to CPU");
+                    }
+                }
+            }
+        }
+        self.generate_qwen35_cpu(prompt, max_new, stop)
+    }
+
+    fn generate_qwen35_cpu(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+    ) -> Result<Vec<u32>> {
         // Batched prefill of the whole prompt (weights read once per layer), then
         // per-token greedy decode from the resulting cache.
         let (mut cache, last) = self.prefill_qwen35(prompt)?;
@@ -1261,6 +1297,78 @@ impl RunnableModel {
                 let logits = self.decode_token_qwen35(next, pos, &mut cache, true)?;
                 pos += 1;
                 next = argmax(&logits);
+            }
+        }
+        Ok(out)
+    }
+
+    /// GPU resident greedy decode for qwen35. Builds the engine on first use (cached in
+    /// `self.cuda`), resets the recurrent SSM/conv state, then prefills the prompt and
+    /// greedily decodes via `forward_token`. Token-parity with the CPU lane (not
+    /// bit-identical: int8 activation quant + FP-reassociated attention).
+    #[cfg(feature = "cuda")]
+    fn generate_qwen35_cuda(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+    ) -> Result<Vec<u32>> {
+        // KV cache is dense over all 32 layers (131072 bytes/pos) on top of the 5.24 GB
+        // Q4_K_M, so the context window is VRAM-bound on a 6 GB card (sparse KV for the 8
+        // full-attn layers is the P7 lift). Default 2048 fits; override for bigger cards.
+        let max_pos: usize = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2048);
+        let mut guard = self
+            .cuda
+            .lock()
+            .map_err(|_| BackendError::InvalidTensorData("qwen35 cuda mutex poisoned".into()))?;
+        if guard.is_none() {
+            let e = self
+                .build_qwen35_resident(max_pos)
+                .map_err(BackendError::InvalidTensorData)?;
+            *guard = Some(e);
+        }
+        let engine = guard.as_mut().unwrap();
+        // CRITICAL: the SSM/conv recurrent state persists across generate calls; reset it
+        // at the start of every call or the 2nd+ prompt decodes on stale state.
+        engine
+            .reset_qwen35_state()
+            .map_err(BackendError::InvalidTensorData)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        // Prefill: only the final prompt token needs logits.
+        let mut next = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let emb = self.token_embd.dequant_row(tok as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(i, self.rope_base, self.rope_dim);
+            let last = i == prompt.len() - 1;
+            let out = engine
+                .forward_token(&emb, &cos, &sin, i, scale, last)
+                .map_err(BackendError::InvalidTensorData)?;
+            if last {
+                next = out.ok_or_else(|| {
+                    BackendError::InvalidTensorData("no logits on final prompt token".into())
+                })?;
+            }
+        }
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        for i in 0..max_new {
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if i + 1 < max_new {
+                let emb = self.token_embd.dequant_row(next as usize, "token_embd")?;
+                let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+                next = engine
+                    .forward_token(&emb, &cos, &sin, pos, scale, true)
+                    .map_err(BackendError::InvalidTensorData)?
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData("no logits on decode step".into())
+                    })?;
+                pos += 1;
             }
         }
         Ok(out)
@@ -1758,8 +1866,8 @@ fn qwen35_rope_tables(pos: usize, rope_base: f32, rope_dim: usize) -> (Vec<f32>,
 impl RunnableModel {
     /// Build a GPU resident decode engine for this qwen35 (Ornith) model: upload every
     /// layer (SSM or full-attn) + the LM head, mirroring the proven per-layer GPU
-    /// sequences. Q8_0 only (the certified Ornith Q8 row); widens 34->36 byte blocks.
-    #[allow(dead_code)] // called by the GPU test + the M4 generate_qwen35_cuda driver (next).
+    /// sequences. Maps each tensor's quant per-tensor (Q8_0 widened 34->36; Q4_K/Q6_K
+    /// raw passthrough), so both the Q8_0 and the 6 GB-fitting Q4_K_M rows build.
     pub(crate) fn build_qwen35_resident(
         &self,
         max_pos: usize,
@@ -2536,5 +2644,51 @@ mod gpu_ssm_layer_tests {
         }
         eprintln!("qwen35_gpu_single_token: cpu={cpu_tok} gpu={gpu_tok}");
         assert_eq!(gpu_tok, cpu_tok, "GPU next-token argmax != CPU runnable");
+    }
+
+    /// End-to-end qwen35 GPU greedy decode vs the CPU runnable lane (point
+    /// CAMELID_ORNITH_GGUF at the 5.24 GB Q4_K_M so it fits 6 GB VRAM). Also a run-twice
+    /// check: the second GPU call reuses the cached engine, so identical streams prove
+    /// reset_qwen35_state() actually clears the recurrent SSM/conv state.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (point at Q4_K_M) + a CUDA device"]
+    fn qwen35_gpu_greedy_matches_cpu() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        // "What is the capital of France?" prompt tokens.
+        let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let n = 8usize;
+        let cpu = model.generate_qwen35_cpu(&prompt, n, &[]).expect("cpu gen");
+        let gpu = model
+            .generate_qwen35_cuda(&prompt, n, &[])
+            .expect("gpu gen");
+        // run-twice reuses the cached engine -> validates reset_qwen35_state.
+        let gpu2 = model
+            .generate_qwen35_cuda(&prompt, n, &[])
+            .expect("gpu gen 2");
+        eprintln!("cpu ={cpu:?}");
+        eprintln!("gpu ={gpu:?}");
+        eprintln!("gpu2={gpu2:?}");
+        assert_eq!(
+            gpu, gpu2,
+            "qwen35 CUDA run-twice differs — SSM state not reset"
+        );
+        assert_eq!(gpu, cpu, "qwen35 CUDA greedy != CPU runnable");
+        // Coherence sanity: decode a 16-token GPU continuation.
+        if let Ok(gguf) = read_metadata(&path) {
+            if let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&gguf) {
+                let ids16 = model
+                    .generate_qwen35_cuda(&prompt, 16, &[])
+                    .expect("gpu 16-tok");
+                let text = tok.decode(&ids16, true).unwrap_or_default();
+                eprintln!("qwen35 GPU 16-tok decode: {text}");
+            }
+        }
+        eprintln!("qwen35_gpu_greedy: PASS (8-tok GPU==CPU, run-twice stable)");
     }
 }
