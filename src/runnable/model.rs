@@ -1313,13 +1313,14 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
     ) -> Result<Vec<u32>> {
-        // KV cache is dense over all 32 layers (131072 bytes/pos) on top of the 5.24 GB
-        // Q4_K_M, so the context window is VRAM-bound on a 6 GB card (sparse KV for the 8
-        // full-attn layers is the P7 lift). Default 2048 fits; override for bigger cards.
+        // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
+        // layers don't attend — see build_qwen35_resident::sparsify_kv), so KV is ~4x
+        // smaller than dense and 8192 positions fit alongside the 5.24 GB Q4_K_M on a 6 GB
+        // card (~5.8 GB resident). Default 8192; override (e.g. higher on bigger cards).
         let max_pos: usize = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(2048);
+            .unwrap_or(8192);
         let mut guard = self
             .cuda
             .lock()
@@ -1911,6 +1912,18 @@ impl RunnableModel {
             rt.value_dim,
             rt.conv_dim,
         )?;
+        // Sparse KV: only the 8 full-attention layers attend; the 24 SSM layers never
+        // touch KV (the SSM forward arm skips kv_scatter/attention). new() over-allocated
+        // dense KV for all 32 layers, so free the SSM layers' buffers NOW — before any
+        // weights are resident — and trim the async pool so the freed VRAM is reused by
+        // the weights. With ~4x less KV, max_pos fits ~4x higher in the 6 GB card.
+        let keep_full: Vec<bool> = rt
+            .layers
+            .iter()
+            .map(|l| matches!(l.kind, Qwen35Kind::Full { .. }))
+            .collect();
+        e.sparsify_kv(&keep_full)?;
+        crate::cuda::release_async_pool();
         for layer in &rt.layers {
             match &layer.kind {
                 Qwen35Kind::Full {
@@ -2732,6 +2745,81 @@ mod gpu_ssm_layer_tests {
              speedup={:.2}x  [GPU {g_lo:.1}s@{n_lo} -> {g_hi:.1}s@{n_hi}; \
              CPU {c_lo:.1}s@{n_lo} -> {c_hi:.1}s@{n_hi}]",
             gpu_tokps / cpu_tokps
+        );
+    }
+
+    /// Sparse-KV long-context proof: build the resident engine at max_pos=8192 (which
+    /// ONLY fits the 6 GB card because sparsify_kv frees the 24 SSM layers' KV — dense KV
+    /// at 8192 is ~1 GB on top of the 5.24 GB Q4_K_M = OOM), prefill a >2048-token prompt
+    /// (beyond the old dense cap, so the full-attn layers' KV is actually addressed past
+    /// 2048), and decode a few tokens. Succeeding (no OOM, in-range tokens) proves sparse
+    /// KV both fits and works. Point CAMELID_ORNITH_GGUF at the Q4_K_M.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (point at Q4_K_M) + a CUDA device"]
+    fn qwen35_gpu_long_context_fits() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        let max_pos = 8192usize; // only fits with sparse KV
+        let mut e = match model.build_qwen35_resident(max_pos) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("build_qwen35_resident({max_pos}) failed (OOM => sparse KV not applied?): {err}");
+                panic!("long-context build failed: {err}");
+            }
+        };
+        e.reset_qwen35_state().unwrap();
+        let scale = 1.0f32 / (model.head_dim as f32).sqrt();
+        // A >2048-token prompt: repeat a short base until past the old dense cap.
+        let base: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let mut prompt: Vec<u32> = Vec::new();
+        while prompt.len() < 2100 {
+            prompt.extend_from_slice(&base);
+        }
+        let plen = prompt.len();
+        assert!(
+            plen > 2048,
+            "prompt must exceed the old 2048 cap (got {plen})"
+        );
+        let mut next = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let emb = model
+                .token_embd
+                .dequant_row(tok as usize, "token_embd")
+                .expect("embd");
+            let (cos, sin) = super::qwen35_rope_tables(i, model.rope_base, model.rope_dim);
+            let last = i == plen - 1;
+            let out = e
+                .forward_token(&emb, &cos, &sin, i, scale, last)
+                .expect("gpu forward_token (long-ctx prefill)");
+            if last {
+                next = out.expect("logits on final prompt token");
+            }
+        }
+        let mut decoded = vec![next];
+        for step in 0..4 {
+            let pos = plen + step;
+            let emb = model
+                .token_embd
+                .dequant_row(next as usize, "token_embd")
+                .expect("embd");
+            let (cos, sin) = super::qwen35_rope_tables(pos, model.rope_base, model.rope_dim);
+            next = e
+                .forward_token(&emb, &cos, &sin, pos, scale, true)
+                .expect("gpu forward_token (long-ctx decode)")
+                .expect("logits");
+            decoded.push(next);
+        }
+        eprintln!(
+            "qwen35_gpu_long_context: prefilled {plen} tokens at max_pos={max_pos}, decoded {decoded:?}"
+        );
+        assert!(
+            decoded.iter().all(|&t| (t as usize) < model.vocab),
+            "decoded token out of range"
         );
     }
 }

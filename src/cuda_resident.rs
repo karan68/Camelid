@@ -4501,6 +4501,32 @@ impl CudaResidentDecode {
         Ok(())
     }
 
+    /// qwen35 SPARSE KV: free the KV cache buffer of every NON-attending (SSM) layer,
+    /// replacing it with a 1-element placeholder. Only the full-attention layers
+    /// (`keep_full[li] == true`) keep a real `kv_width*max_pos` buffer. `new()` allocated
+    /// dense KV for all `n_layers` (shared with every arch); this is called by the qwen35
+    /// builder AFTER `new()` but BEFORE the weight uploads — while no weights are resident
+    /// yet — so the freed dense KV (the caller then `release_async_pool()`s it back to the
+    /// device) is reused by the 5+ GB of weights. With only 8/32 layers attending, KV
+    /// shrinks ~4x, letting `max_pos` go ~4x higher in the same VRAM. The SSM placeholders
+    /// are never read: the SSM forward arm skips kv_scatter/attention, and the qwen35
+    /// driver only uses `forward_token` (never seed_layer/read_kv_layer). Absolute `li`
+    /// indexing is preserved (the Vecs stay length `n_layers`).
+    pub fn sparsify_kv(&mut self, keep_full: &[bool]) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        for li in 0..self.n_layers {
+            if !keep_full.get(li).copied().unwrap_or(false) {
+                self.cache_k[li] = s
+                    .alloc_zeros::<u16>(1)
+                    .map_err(|e| format!("kv placeholder: {e}"))?;
+                self.cache_v[li] = s
+                    .alloc_zeros::<u16>(1)
+                    .map_err(|e| format!("kv placeholder: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Zero every qwen35 SSM recurrent state + conv ring buffer and reset `filled`.
     /// MUST be called at the start of each generation — the SSM state persists across
     /// tokens AND across generate calls, so skipping this decodes turn 2 on stale state.
