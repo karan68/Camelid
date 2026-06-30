@@ -2024,4 +2024,305 @@ mod gpu_ssm_layer_tests {
         );
         eprintln!("qwen35_ssm_layer_gpu: PASS (worst rel {worst:.3e})");
     }
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (Q8) + a CUDA device"]
+    fn qwen35_full_attn_layer_gpu_matches_cpu() {
+        use crate::cuda_resident::{
+            launch_attention, launch_kv_scatter, launch_rms_norm_per_head, launch_rope,
+        };
+        let path = match std::env::var("CAMELID_ORNITH_GGUF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Ok(k) = CudaResidentKernels::new() else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        let rt = model.qwen35.as_ref().expect("qwen35 runtime");
+        let li = 3usize; // layer 3 is full-attention ((3+1) % 4 == 0)
+        let layer = &rt.layers[li];
+        let (wq, wk, wv, wo, q_norm, k_norm) = match &layer.kind {
+            Qwen35Kind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+            } => (wq, wk, wv, wo, q_norm, k_norm),
+            _ => panic!("layer {li} is not full-attention"),
+        };
+        for m in [wq, wk, wv, wo] {
+            assert_eq!(
+                m.tt,
+                GgufTensorType::Q8_0,
+                "test assumes a Q8_0 Ornith GGUF"
+            );
+        }
+
+        let hidden_dim = model.d_model; // 4096
+        let eps = model.eps; // 1e-6
+        let n_head = model.n_heads; // 16
+        let n_kv = model.n_kv_heads; // 4
+        let hd = model.head_dim; // 256
+        let rope_dim = model.rope_dim; // 64
+        let rope_base = model.rope_base; // 1e7
+        let pairing = if model.rope_neox { 1i32 } else { 0i32 };
+        let q_width = n_head * hd; // 4096
+        let kv_width = n_kv * hd; // 1024
+        let half = rope_dim / 2; // 32 rope pairs
+        let hb = hidden_dim / 32; // 128 input blocks per projection row
+        let qb = q_width / 32; // 128 blocks for the wo input (attn-out)
+        let scale = 1.0f32 / (hd as f32).sqrt(); // 1/sqrt(256) = 0.0625
+        let n_steps = 6usize;
+        let max_pos = 8usize;
+        assert!(n_steps <= max_pos);
+
+        // Deterministic pseudo-random hidden activations, one DISTINCT vector per
+        // position (distinct K/V per step => a genuinely non-uniform softmax at pos>0,
+        // which is what exercises GQA / q-k-norm / RoPE / scale; pos=0 alone is
+        // degenerate: a single key makes softmax==1 and the output == V regardless).
+        let mut seed = 0x1234_5678u64;
+        let mut nextf = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let hiddens: Vec<Vec<f32>> = (0..n_steps)
+            .map(|_| (0..hidden_dim).map(|_| nextf()).collect())
+            .collect();
+
+        // ---- GPU: upload Q8_0 weights once (SoA-repacked, 34->36 widened) ----
+        let s = &k.stream;
+        let up = |m: &RawMat| s.clone_htod(&repack_q8_soa(&widen_q8(&m.bytes))).unwrap();
+        let d_wq = up(wq);
+        let d_wk = up(wk);
+        let d_wv = up(wv);
+        let d_wo = up(wo);
+        let d_qn = s.clone_htod(q_norm).unwrap();
+        let d_kn = s.clone_htod(k_norm).unwrap();
+        let d_attn_norm = s.clone_htod(&layer.attn_norm).unwrap();
+
+        // device scratch (reused across positions)
+        let mut d_hidden = s.alloc_zeros::<f32>(hidden_dim).unwrap();
+        let mut in_q = s.alloc_zeros::<i8>(hidden_dim).unwrap();
+        let mut in_s = s.alloc_zeros::<f32>(hb).unwrap();
+        let mut d_qgate = s.alloc_zeros::<f32>(2 * q_width).unwrap(); // fused [q|gate]
+        let mut d_q = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut d_gate = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut d_k = s.alloc_zeros::<f32>(kv_width).unwrap();
+        let mut d_v = s.alloc_zeros::<f32>(kv_width).unwrap();
+        let mut d_attn = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut mix_q = s.alloc_zeros::<i8>(q_width).unwrap();
+        let mut mix_s = s.alloc_zeros::<f32>(qb).unwrap();
+        let mut d_mix = s.alloc_zeros::<f32>(hidden_dim).unwrap();
+
+        // persistent KV cache (f16 bits, layout [kv_head][position][head_dim]) +
+        // device position + per-pair RoPE tables.
+        let mut cache_k = s.alloc_zeros::<u16>(kv_width * max_pos).unwrap();
+        let mut cache_v = s.alloc_zeros::<u16>(kv_width * max_pos).unwrap();
+        let mut d_pos = s.alloc_zeros::<i32>(1).unwrap();
+        let mut d_cos = s.alloc_zeros::<f32>(half).unwrap();
+        let mut d_sin = s.alloc_zeros::<f32>(half).unwrap();
+
+        // CPU reference cache (grows per position; only the full-attn layer li used).
+        let mut cache = Qwen35Cache::new(rt, rt.layers.len());
+
+        let mut worst_all = 0.0f32;
+        for p in 0..n_steps {
+            let hidden = &hiddens[p];
+
+            // ---- CPU reference: the FULL layer attention mix (incl. wo); also grows
+            // cache.k/v[li] exactly as the GPU scatter does. qwen35_full_attn internally
+            // calls qwen35_attn_compute then wo.par_matvec — so we compare the post-wo
+            // mix on both sides (the GPU pipeline below also ends in wo). ----
+            let xn = rms_norm(hidden, &layer.attn_norm, eps);
+            let cpu_mix = model
+                .qwen35_full_attn(li, wq, wk, wv, wo, q_norm, k_norm, &xn, p, &mut cache)
+                .expect("cpu full attn");
+
+            // ---- GPU forward for this position ----
+            // RoPE cos/sin for absolute position p (computed in f32 on the host, exactly
+            // like apply_rope's per-pair freqs, then uploaded -> GPU RoPE is bit-identical).
+            let mut cosv = vec![0f32; half];
+            let mut sinv = vec![0f32; half];
+            for i in 0..half {
+                let freq = 1.0f32 / rope_base.powf(2.0 * i as f32 / rope_dim as f32);
+                let (si, ci) = (p as f32 * freq).sin_cos();
+                cosv[i] = ci;
+                sinv[i] = si;
+            }
+            s.memcpy_htod(&cosv, &mut d_cos).unwrap();
+            s.memcpy_htod(&sinv, &mut d_sin).unwrap();
+            s.memcpy_htod(&[p as i32], &mut d_pos).unwrap();
+            s.memcpy_htod(hidden.as_slice(), &mut d_hidden).unwrap();
+
+            // attn-norm + quantize the hidden -> in_q / in_s
+            launch_rmsnorm_quantize(
+                s,
+                &k.rms_norm_quantize,
+                &d_hidden,
+                &d_attn_norm,
+                &mut in_q,
+                &mut in_s,
+                hidden_dim,
+                eps,
+            )
+            .unwrap();
+
+            // fused query+gate projection: wq rows = 2*q_width = 8192
+            launch_gemv(
+                s,
+                &k.gemv,
+                &in_s,
+                &in_q,
+                &d_wq.slice(0..d_wq.len()),
+                2 * q_width,
+                hb,
+                &mut d_qgate,
+            )
+            .unwrap();
+            // K / V projections (kv_width = 1024 rows each)
+            launch_gemv(
+                s,
+                &k.gemv,
+                &in_s,
+                &in_q,
+                &d_wk.slice(0..d_wk.len()),
+                kv_width,
+                hb,
+                &mut d_k,
+            )
+            .unwrap();
+            launch_gemv(
+                s,
+                &k.gemv,
+                &in_s,
+                &in_q,
+                &d_wv.slice(0..d_wv.len()),
+                kv_width,
+                hb,
+                &mut d_v,
+            )
+            .unwrap();
+
+            // deinterleave fused [query(hd)|gate(hd)] x n_head -> contiguous d_q / d_gate
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: ((q_width as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (nh, hdi) = (n_head as i32, hd as i32);
+                let mut b = s.launch_builder(&k.deinterleave_qgate);
+                b.arg(&d_qgate)
+                    .arg(&mut d_q)
+                    .arg(&mut d_gate)
+                    .arg(&nh)
+                    .arg(&hdi);
+                unsafe { b.launch(cfg).unwrap() };
+            }
+
+            // QK per-head RMSNorm (BEFORE RoPE), shared weight across heads
+            launch_rms_norm_per_head(s, &k.rms_norm_per_head, &mut d_q, &d_qn, n_head, hd, eps)
+                .unwrap();
+            launch_rms_norm_per_head(s, &k.rms_norm_per_head, &mut d_k, &d_kn, n_kv, hd, eps)
+                .unwrap();
+
+            // partial NEOX RoPE on Q (n_head heads) and K (n_kv heads)
+            launch_rope(
+                s, &k.rope, &mut d_q, &d_cos, &d_sin, n_head, hd, rope_dim, pairing,
+            )
+            .unwrap();
+            launch_rope(
+                s, &k.rope, &mut d_k, &d_cos, &d_sin, n_kv, hd, rope_dim, pairing,
+            )
+            .unwrap();
+
+            // scatter K (post-norm, post-rope) and V (RAW) into the cache at position p
+            launch_kv_scatter(
+                s,
+                &k.kv_scatter,
+                &d_k,
+                &mut cache_k,
+                &d_pos,
+                n_kv,
+                hd,
+                max_pos,
+            )
+            .unwrap();
+            launch_kv_scatter(
+                s,
+                &k.kv_scatter,
+                &d_v,
+                &mut cache_v,
+                &d_pos,
+                n_kv,
+                hd,
+                max_pos,
+            )
+            .unwrap();
+
+            // GQA causal attention over positions 0..=p
+            let n_pos = p + 1;
+            launch_attention(
+                s,
+                &k.attention,
+                &d_q,
+                &cache_k,
+                &cache_v,
+                &mut d_attn,
+                n_head,
+                n_kv,
+                hd,
+                &d_pos,
+                n_pos,
+                max_pos,
+                scale,
+            )
+            .unwrap();
+
+            // sigmoid output gate: attn[i] *= sigmoid(gate[i])
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: ((q_width as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let n_i = q_width as i32;
+                let mut b = s.launch_builder(&k.sigmoid_mul);
+                b.arg(&mut d_attn).arg(&d_gate).arg(&n_i);
+                unsafe { b.launch(cfg).unwrap() };
+            }
+
+            // quantize the gated attn-out, then the O projection -> d_mix
+            launch_quantize(s, &k.quantize, &d_attn, &mut mix_q, &mut mix_s, qb).unwrap();
+            launch_gemv(
+                s,
+                &k.gemv,
+                &mix_s,
+                &mix_q,
+                &d_wo.slice(0..d_wo.len()),
+                hidden_dim,
+                qb,
+                &mut d_mix,
+            )
+            .unwrap();
+
+            let mut got = vec![0f32; hidden_dim];
+            s.memcpy_dtoh(&d_mix, &mut got).unwrap();
+            k.ctx.synchronize().unwrap();
+            let (_ok, worst) = rel_close(&got, &cpu_mix, 1e-2);
+            if worst > worst_all {
+                worst_all = worst;
+            }
+            eprintln!("qwen35_full_attn pos {p}: worst rel {worst:.3e}");
+        }
+        assert!(
+            worst_all < 1e-2,
+            "qwen35 full-attn layer GPU vs CPU diverged (worst rel {worst_all:.3e})"
+        );
+        eprintln!("qwen35_full_attn_layer_gpu: PASS (worst rel {worst_all:.3e})");
+    }
 }
