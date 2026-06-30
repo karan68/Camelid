@@ -3686,6 +3686,67 @@ struct ResidentLayer {
     /// right GEMV kernel + activation quantizer per tensor. All `Q8_0` for a plain
     /// Q8_0 model (path stays byte-identical).
     quants: LayerQuants,
+    /// Which qwen35 (Ornith) mixer this layer runs. `Full` for every non-qwen35 model
+    /// (the existing attention path, byte-identical) and for qwen35's sparse
+    /// full-attention layers; `Ssm` for qwen35's gated-delta-net layers, whose mixer
+    /// replaces attention with the recurrent SSM compute. See [`forward_pass`].
+    #[allow(dead_code)] // read by the SSM forward branch (wired next).
+    kind: LayerKind,
+}
+
+/// qwen35 layer mixer discriminant on [`ResidentLayer`]. Default `Full` keeps every
+/// existing architecture on the unchanged attention path.
+#[allow(dead_code)] // `Ssm` is constructed by the qwen35 builder + read by `forward_pass` (wired next).
+enum LayerKind {
+    Full,
+    Ssm(Box<SsmResident>),
+}
+
+/// Resident VRAM weights + persistent runtime state for one qwen35 gated-delta-net
+/// (SSM) layer. Mirrors `Qwen35Kind::Ssm` / `Qwen35Cache` (src/runnable/model.rs): the
+/// 5 projections are repacked per their quant lane like the dense path, the 4 small
+/// tensors stay f32, and `conv_state` + `state` persist across tokens (never reset).
+#[allow(dead_code)] // fields read by the SSM forward branch (wired next).
+struct SsmResident {
+    wqkv: CudaSlice<u8>,      // hidden -> conv_dim
+    wqkv_gate: CudaSlice<u8>, // hidden -> value_dim (z gate)
+    beta: CudaSlice<u8>,      // hidden -> num_v_heads
+    alpha: CudaSlice<u8>,     // hidden -> num_v_heads
+    ssm_out: CudaSlice<u8>,   // value_dim -> hidden
+    /// Per-projection quant lane (wqkv, wqkv_gate, beta, alpha, ssm_out).
+    quants: [ProjQuant; 5],
+    conv1d: CudaSlice<f32>, // [conv_dim * d_conv], channel-major [c*d_conv + tap]
+    dt_bias: CudaSlice<f32>, // [num_v_heads]
+    a: CudaSlice<f32>,      // [num_v_heads]
+    ssm_norm: CudaSlice<f32>, // [d_state]
+    /// Causal-conv ring buffer [conv_dim * (d_conv-1)] — persists across tokens.
+    conv_state: CudaSlice<f32>,
+    /// Recurrent per-head state [num_v_heads * d_state * d_state] — persists across tokens.
+    state: CudaSlice<f32>,
+}
+
+/// qwen35 gated-delta-net dimensions + the per-token SSM/full scratch, allocated by the
+/// qwen35 builder. `None` on `CudaResidentDecode` for every other architecture, so no
+/// extra VRAM and no path change for non-qwen35 models.
+#[allow(dead_code)] // read by the SSM forward branch + builder (wired next).
+struct Qwen35Gpu {
+    d_state: usize,
+    d_conv: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_v_dim: usize,
+    key_dim: usize,
+    value_dim: usize,
+    conv_dim: usize,
+    // per-token scratch (reused across layers)
+    d_qkv: CudaSlice<f32>,       // conv_dim  (wqkv output / conv input)
+    d_conv_out: CudaSlice<f32>,  // conv_dim  (post-conv, sliced into q|k|v)
+    d_z: CudaSlice<f32>,         // value_dim (wqkv_gate output)
+    d_beta: CudaSlice<f32>,      // num_v_heads (post-sigmoid)
+    d_glog: CudaSlice<f32>,      // num_v_heads (pre-exp)
+    d_ssm_mix: CudaSlice<f32>,   // value_dim (delta-rule output, before ssm_out)
+    d_qgate: CudaSlice<f32>,     // 2*q_width (full-attn fused query+gate projection)
+    d_gate_attn: CudaSlice<f32>, // q_width (deinterleaved attention gate)
 }
 
 /// A captured CUDA graph, wrapped to be `Send`. cudarc does not mark `CudaGraph`
@@ -3780,6 +3841,11 @@ pub struct CudaResidentDecode {
     /// Shared GPU scratch for offloaded layers (None when every layer is resident).
     /// Allocated by `enable_offload_scratch` when the build decides to offload.
     offload: Option<OffloadState>,
+    /// qwen35 (Ornith) gated-delta-net dims + SSM/full per-token scratch. `None` for
+    /// every other architecture (no extra VRAM, no path change). Set by the qwen35
+    /// resident builder.
+    #[allow(dead_code)] // read by the SSM forward branch + builder (wired next).
+    qwen35: Option<Qwen35Gpu>,
 }
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
@@ -3934,6 +4000,7 @@ impl CudaResidentDecode {
             verify_scratch: None,
             tree_scratch: None,
             offload: None,
+            qwen35: None,
             k,
         })
     }
@@ -4023,6 +4090,7 @@ impl CudaResidentDecode {
                 k_norm: k_norm_gpu,
                 offloaded: None,
                 quants,
+                kind: LayerKind::Full,
             });
             return Ok(());
         }
@@ -4070,6 +4138,7 @@ impl CudaResidentDecode {
             k_norm: k_norm_gpu,
             offloaded: Some(OffloadedLayer { host: pinned, off }),
             quants,
+            kind: LayerKind::Full,
         });
         Ok(())
     }
