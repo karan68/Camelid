@@ -2271,6 +2271,26 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 /// (`n_blocks` f32). Quants-first keeps every block's 32 i8 16-byte aligned so
 /// the kernel can issue `int4` loads. Done once per weight at upload; the values
 /// are unchanged, only their arrangement.
+/// Widen Q8_0 GGUF wire blocks (34 bytes: f16 scale + 32 i8) to the 36-byte layout
+/// (f32 scale + 32 i8) that [`repack_q8_soa`] expects. The runnable lane holds Q8_0
+/// weights as raw 34-byte GGUF blocks; the resident GEMV reads 36-byte (f32-scale)
+/// blocks, so the qwen35 builder widens before repacking.
+// Used by build_qwen35_resident (model.rs) — dead in a lib-only build until the M4
+// generate_qwen35_cuda driver calls the builder from lib code (next).
+#[allow(dead_code)]
+pub(crate) fn widen_q8(bytes: &[u8]) -> Vec<u8> {
+    let nb = bytes.len() / 34;
+    let mut out = Vec::with_capacity(nb * 36);
+    for b in 0..nb {
+        let base = b * 34;
+        let scale =
+            crate::tensor::f16_bits_to_f32(u16::from_le_bytes([bytes[base], bytes[base + 1]]));
+        out.extend_from_slice(&scale.to_le_bytes());
+        out.extend_from_slice(&bytes[base + 2..base + 34]);
+    }
+    out
+}
+
 pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
     let n = bytes.len() / 36;
     let mut out = vec![0u8; n * 32 + n * 4];
@@ -3221,6 +3241,174 @@ pub(crate) fn launch_rms_norm_per_head(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+// ---- qwen35 (Ornith) SSM + full-attn launch helpers ------------------------
+// Single source of truth for the qwen35-specific kernel launches; the parity tests
+// in runnable/model.rs proved these exact configs (bit-identical SSM layer, 6e-3
+// full-attn layer), and forward_pass calls the SAME helpers.
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_gates(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    beta_raw: &CudaSlice<f32>,
+    alpha_raw: &CudaSlice<f32>,
+    dt_bias: &CudaSlice<f32>,
+    a: &CudaSlice<f32>,
+    beta_out: &mut CudaSlice<f32>,
+    glog_out: &mut CudaSlice<f32>,
+    nv: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (nv as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nvi = nv as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(beta_raw)
+        .arg(alpha_raw)
+        .arg(dt_bias)
+        .arg(a)
+        .arg(beta_out)
+        .arg(glog_out)
+        .arg(&nvi);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_conv1d(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    conv_w: &CudaSlice<f32>,
+    x: &CudaSlice<f32>,
+    conv_state: &mut CudaSlice<f32>,
+    conv_out: &mut CudaSlice<f32>,
+    conv_dim: usize,
+    d_conv: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((conv_dim as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (cdi, dci) = (conv_dim as i32, d_conv as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(conv_w)
+        .arg(x)
+        .arg(conv_state)
+        .arg(conv_out)
+        .arg(&cdi)
+        .arg(&dci);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Per-head L2 norm in place over `buf[offset .. offset + head_count*head_dim]`.
+pub(crate) fn launch_ssm_l2_norm_per_head(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    buf: &mut CudaSlice<f32>,
+    offset: usize,
+    head_count: usize,
+    head_dim: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (head_count as u32, 1, 1),
+        block_dim: (head_dim as u32, 1, 1),
+        shared_mem_bytes: (head_dim as u32) * 4,
+    };
+    let dsi = head_dim as i32;
+    let mut view = buf.slice_mut(offset..offset + head_count * head_dim);
+    let mut b = s.launch_builder(f);
+    b.arg(&mut view).arg(&dsi).arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Gated delta-rule + gated RMSNorm. `conv_out` holds [q(key_dim)|k(key_dim)|v(value_dim)]
+/// (q/k already L2-normed); the kernel arg order is `state, k_conv, q_conv, v_conv`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_ssm_delta_rule(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    state: &mut CudaSlice<f32>,
+    conv_out: &CudaSlice<f32>,
+    key_dim: usize,
+    value_dim: usize,
+    z: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    glog: &CudaSlice<f32>,
+    ssm_norm: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    d_state: usize,
+    nk: usize,
+    nv: usize,
+    eps: f32,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (nv as u32, 1, 1),
+        block_dim: (d_state as u32, 1, 1),
+        shared_mem_bytes: (3 * d_state as u32) * 4,
+    };
+    let (dsi, nki) = (d_state as i32, nk as i32);
+    let qv = conv_out.slice(0..key_dim);
+    let kv = conv_out.slice(key_dim..2 * key_dim);
+    let vv = conv_out.slice(2 * key_dim..2 * key_dim + value_dim);
+    let mut b = s.launch_builder(f);
+    b.arg(state)
+        .arg(&kv)
+        .arg(&qv)
+        .arg(&vv)
+        .arg(z)
+        .arg(beta)
+        .arg(glog)
+        .arg(ssm_norm)
+        .arg(out)
+        .arg(&dsi)
+        .arg(&nki)
+        .arg(&eps);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Split the fused per-head [query(head_dim)|gate(head_dim)] x n_heads into q / gate.
+pub(crate) fn launch_deinterleave_qgate(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    qg: &CudaSlice<f32>,
+    q_out: &mut CudaSlice<f32>,
+    gate_out: &mut CudaSlice<f32>,
+    n_heads: usize,
+    head_dim: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: (((n_heads * head_dim) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nh, hdi) = (n_heads as i32, head_dim as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(qg).arg(q_out).arg(gate_out).arg(&nh).arg(&hdi);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// `out[i] *= sigmoid(gate[i])` (qwen35 full-attention output gate).
+pub(crate) fn launch_sigmoid_mul(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    out: &mut CudaSlice<f32>,
+    gate: &CudaSlice<f32>,
+    n: usize,
+) -> Result<(), cudarc::driver::DriverError> {
+    let cfg = LaunchConfig {
+        grid_dim: ((n as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let ni = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(out).arg(gate).arg(&ni);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_kv_scatter(
     s: &Arc<CudaStream>,
@@ -3719,10 +3907,10 @@ struct SsmResident {
     dt_bias: CudaSlice<f32>, // [num_v_heads]
     a: CudaSlice<f32>,      // [num_v_heads]
     ssm_norm: CudaSlice<f32>, // [d_state]
-    /// Causal-conv ring buffer [conv_dim * (d_conv-1)] — persists across tokens.
-    conv_state: CudaSlice<f32>,
-    /// Recurrent per-head state [num_v_heads * d_state * d_state] — persists across tokens.
-    state: CudaSlice<f32>,
+                            // NOTE: the persistent conv ring buffer + recurrent state live in engine-level
+                            // `ssm_conv_state` / `ssm_state` Vecs (indexed by layer), NOT here — so the SSM
+                            // forward can borrow the state mutably while borrowing this layer's `ssm_norm`
+                            // immutably (disjoint engine fields). See `CudaResidentDecode`.
 }
 
 /// qwen35 gated-delta-net dimensions + the per-token SSM/full scratch, allocated by the
@@ -3844,8 +4032,15 @@ pub struct CudaResidentDecode {
     /// qwen35 (Ornith) gated-delta-net dims + SSM/full per-token scratch. `None` for
     /// every other architecture (no extra VRAM, no path change). Set by the qwen35
     /// resident builder.
-    #[allow(dead_code)] // read by the SSM forward branch + builder (wired next).
     qwen35: Option<Qwen35Gpu>,
+    /// qwen35 SSM causal-conv ring buffers, per layer (`[conv_dim*(d_conv-1)]`); a
+    /// 1-element placeholder for Full layers. Empty for non-qwen35 models. Persists
+    /// across tokens — zeroed by `reset_qwen35_state` at the start of each generation.
+    ssm_conv_state: Vec<CudaSlice<f32>>,
+    /// qwen35 SSM recurrent per-head state, per layer (`[num_v_heads*d_state*d_state]`);
+    /// 1-element placeholder for Full layers. Empty for non-qwen35. Persists across
+    /// tokens — zeroed by `reset_qwen35_state`.
+    ssm_state: Vec<CudaSlice<f32>>,
 }
 
 /// Max tokens verified per speculative round. The batched GEMM keeps the ordered
@@ -4001,6 +4196,8 @@ impl CudaResidentDecode {
             tree_scratch: None,
             offload: None,
             qwen35: None,
+            ssm_conv_state: Vec::new(),
+            ssm_state: Vec::new(),
             k,
         })
     }
@@ -4251,6 +4448,171 @@ impl CudaResidentDecode {
         if output_quant.needs_q8k() {
             self.uses_kquant = true;
         }
+        Ok(())
+    }
+
+    /// qwen35 (Ornith): attach the gated-delta-net dims and allocate the per-token
+    /// SSM/full scratch. `head_v_dim` == `d_state` for Ornith.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_qwen35(
+        &mut self,
+        d_state: usize,
+        d_conv: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_v_dim: usize,
+        key_dim: usize,
+        value_dim: usize,
+        conv_dim: usize,
+    ) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        let af = |n: usize| -> Result<CudaSlice<f32>, String> {
+            s.alloc_zeros::<f32>(n).map_err(|e| format!("alloc: {e}"))
+        };
+        self.qwen35 = Some(Qwen35Gpu {
+            d_state,
+            d_conv,
+            num_k_heads,
+            num_v_heads,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_dim,
+            d_qkv: af(conv_dim)?,
+            d_conv_out: af(conv_dim)?,
+            d_z: af(value_dim)?,
+            d_beta: af(num_v_heads)?,
+            d_glog: af(num_v_heads)?,
+            d_ssm_mix: af(value_dim)?,
+            d_qgate: af(2 * self.q_width)?,
+            d_gate_attn: af(self.q_width)?,
+        });
+        Ok(())
+    }
+
+    /// Keep the per-layer `ssm_conv_state`/`ssm_state` Vecs length-synced with `layers`
+    /// for a Full (non-SSM) qwen35 layer: a never-read 1-element placeholder.
+    pub fn push_ssm_placeholders(&mut self) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        self.ssm_conv_state
+            .push(s.alloc_zeros::<f32>(1).map_err(|e| format!("alloc: {e}"))?);
+        self.ssm_state
+            .push(s.alloc_zeros::<f32>(1).map_err(|e| format!("alloc: {e}"))?);
+        Ok(())
+    }
+
+    /// Zero every qwen35 SSM recurrent state + conv ring buffer and reset `filled`.
+    /// MUST be called at the start of each generation — the SSM state persists across
+    /// tokens AND across generate calls, so skipping this decodes turn 2 on stale state.
+    pub fn reset_qwen35_state(&mut self) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        for buf in self
+            .ssm_conv_state
+            .iter_mut()
+            .chain(self.ssm_state.iter_mut())
+        {
+            if buf.len() > 1 {
+                let zeros = vec![0.0f32; buf.len()];
+                s.memcpy_htod(&zeros, buf)
+                    .map_err(|e| format!("reset htod: {e}"))?;
+            }
+        }
+        self.filled = 0;
+        Ok(())
+    }
+
+    /// Upload one qwen35 gated-delta-net (SSM) layer plus its persistent conv ring and
+    /// recurrent state. Q8_0 weight bytes must already be the 36-byte (f32-scale)
+    /// layout (`widen_q8`); K-quant bytes are raw GGUF super-blocks. `quants` order is
+    /// wqkv, wqkv_gate, beta, alpha, ssm_out; `ffn_quants` is gate, up, down.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_layer_ssm_qwen35(
+        &mut self,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+        attn_norm: &[f32],
+        ffn_norm: &[f32],
+        wqkv: &[u8],
+        wqkv_gate: &[u8],
+        beta: &[u8],
+        alpha: &[u8],
+        ssm_out: &[u8],
+        conv1d: &[f32],
+        dt_bias: &[f32],
+        a: &[f32],
+        ssm_norm: &[f32],
+        ssm_quants: [ProjQuant; 5],
+        ffn_quants: [ProjQuant; 3],
+        conv_dim: usize,
+        d_conv: usize,
+        nv: usize,
+        d_state: usize,
+    ) -> Result<(), String> {
+        let s = self.k.stream.clone();
+        let up_u8 = |b: &[u8], q: ProjQuant| -> Result<CudaSlice<u8>, String> {
+            s.clone_htod(&repack_for_lane(b, q))
+                .map_err(|e| format!("htod: {e}"))
+        };
+        let up_f = |b: &[f32]| -> Result<CudaSlice<f32>, String> {
+            s.clone_htod(b).map_err(|e| format!("htod: {e}"))
+        };
+        let ph = || s.clone_htod(&[0u8]).map_err(|e| format!("htod: {e}"));
+        let ssm = SsmResident {
+            wqkv: up_u8(wqkv, ssm_quants[0])?,
+            wqkv_gate: up_u8(wqkv_gate, ssm_quants[1])?,
+            beta: up_u8(beta, ssm_quants[2])?,
+            alpha: up_u8(alpha, ssm_quants[3])?,
+            ssm_out: up_u8(ssm_out, ssm_quants[4])?,
+            quants: ssm_quants,
+            conv1d: up_f(conv1d)?,
+            dt_bias: up_f(dt_bias)?,
+            a: up_f(a)?,
+            ssm_norm: up_f(ssm_norm)?,
+        };
+        let gate_g = up_u8(gate, ffn_quants[0])?;
+        let up_g = up_u8(up, ffn_quants[1])?;
+        let down_g = up_u8(down, ffn_quants[2])?;
+        let attn_norm_g = up_f(attn_norm)?;
+        let ffn_norm_g = up_f(ffn_norm)?;
+        // layer.quants drives the shared attn-norm+quantize (cols 0..3 = the SSM
+        // activation consumers) and the FFN (cols 4..6 = gate/up/down).
+        let quants = [
+            ssm_quants[0],
+            ssm_quants[1],
+            ssm_quants[2],
+            ssm_quants[3],
+            ffn_quants[0],
+            ffn_quants[1],
+            ffn_quants[2],
+        ];
+        if quants.iter().any(|q| q.needs_q8k()) {
+            self.uses_kquant = true;
+        }
+        self.layers.push(ResidentLayer {
+            q: ph()?,
+            k: ph()?,
+            v: ph()?,
+            o: ph()?,
+            gate: gate_g,
+            up: up_g,
+            down: down_g,
+            attn_norm: attn_norm_g,
+            ffn_norm: ffn_norm_g,
+            q_norm: None,
+            k_norm: None,
+            offloaded: None,
+            quants,
+            kind: LayerKind::Ssm(Box::new(ssm)),
+        });
+        self.ssm_conv_state.push(
+            s.alloc_zeros::<f32>(conv_dim * (d_conv - 1))
+                .map_err(|e| format!("alloc: {e}"))?,
+        );
+        self.ssm_state.push(
+            s.alloc_zeros::<f32>(nv * d_state * d_state)
+                .map_err(|e| format!("alloc: {e}"))?,
+        );
         Ok(())
     }
 
@@ -4588,240 +4950,454 @@ impl CudaResidentDecode {
                 )
                 .map_err(map)?;
             }
-            // Q,K,V
-            dispatch_gemv(
-                &s,
-                &self.k,
-                lq[0],
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &self.d_q8k_scales,
-                &self.d_q8k_quants,
-                &wq,
-                self.q_width,
-                self.hidden,
-                &mut self.d_q,
-                0,
-            )
-            .map_err(map)?;
-            dispatch_gemv(
-                &s,
-                &self.k,
-                lq[1],
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &self.d_q8k_scales,
-                &self.d_q8k_quants,
-                &wk,
-                self.kv_width,
-                self.hidden,
-                &mut self.d_k,
-                0,
-            )
-            .map_err(map)?;
-            dispatch_gemv(
-                &s,
-                &self.k,
-                lq[2],
-                &self.d_in_scales,
-                &self.d_in_quants,
-                &self.d_q8k_scales,
-                &self.d_q8k_quants,
-                &wv,
-                self.kv_width,
-                self.hidden,
-                &mut self.d_v,
-                0,
-            )
-            .map_err(map)?;
-            // Qwen3 QK-norm: per-head RMSNorm on Q and K after projection, before RoPE
-            if let (Some(ref qn), Some(ref kn)) = (&self.layers[li].q_norm, &self.layers[li].k_norm)
-            {
-                launch_rms_norm_per_head(
-                    &s,
-                    &self.k.rms_norm_per_head,
-                    &mut self.d_q,
-                    qn,
-                    self.n_heads,
-                    self.head_dim,
-                    self.eps,
-                )
-                .map_err(map)?;
-                launch_rms_norm_per_head(
-                    &s,
-                    &self.k.rms_norm_per_head,
-                    &mut self.d_k,
-                    kn,
-                    self.n_kv_heads,
-                    self.head_dim,
-                    self.eps,
-                )
-                .map_err(map)?;
-            }
-            // RoPE on Q and K
-            let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
-            launch_rope(
-                &s,
-                &self.k.rope,
-                &mut self.d_q,
-                &self.d_cos,
-                &self.d_sin,
-                self.n_heads,
-                self.head_dim,
-                self.rope_dim,
-                pairing,
-            )
-            .map_err(map)?;
-            launch_rope(
-                &s,
-                &self.k.rope,
-                &mut self.d_k,
-                &self.d_cos,
-                &self.d_sin,
-                self.n_kv_heads,
-                self.head_dim,
-                self.rope_dim,
-                pairing,
-            )
-            .map_err(map)?;
-            // KV write
-            launch_kv_scatter(
-                &s,
-                &self.k.kv_scatter,
-                &self.d_k,
-                &mut self.cache_k[li],
-                &self.d_position,
-                self.n_kv_heads,
-                self.head_dim,
-                self.max_pos,
-            )
-            .map_err(map)?;
-            launch_kv_scatter(
-                &s,
-                &self.k.kv_scatter,
-                &self.d_v,
-                &mut self.cache_v[li],
-                &self.d_position,
-                self.n_kv_heads,
-                self.head_dim,
-                self.max_pos,
-            )
-            .map_err(map)?;
-            // attention. At depth, split-K (grid n_heads x n_splits) fills the SMs that
-            // the one-block-per-head launch leaves idle; below SPLITK_THRESHOLD the single
-            // kernel is cheaper (one launch, no scratch). Both are token-parity to the same
-            // reference. Split-K is skipped during graph capture (split count is ctx-dependent).
-            if !graph_capture && attn_shared > SPLITK_THRESHOLD {
-                launch_attention_splitk(
-                    &s,
-                    &self.k,
-                    &self.d_q,
-                    &self.cache_k[li],
-                    &self.cache_v[li],
-                    &mut self.d_attn,
-                    &mut self.d_sk_scores,
-                    &mut self.d_sk_chunkmax,
-                    &mut self.d_sk_lsum,
-                    &mut self.d_sk_acc,
-                    self.n_heads,
-                    self.n_kv_heads,
-                    self.head_dim,
-                    &self.d_position,
-                    attn_shared,
-                    self.max_pos,
-                    scale,
-                )
-                .map_err(map)?;
-            } else {
-                launch_attention(
-                    &s,
-                    &self.k.attention,
-                    &self.d_q,
-                    &self.cache_k[li],
-                    &self.cache_v[li],
-                    &mut self.d_attn,
-                    self.n_heads,
-                    self.n_kv_heads,
-                    self.head_dim,
-                    &self.d_position,
-                    attn_shared,
-                    self.max_pos,
-                    scale,
-                )
-                .map_err(map)?;
-            }
-            // O projection + residual. Input is the attention output (q_width wide):
-            // quantize it to the format the O lane reads, then project + add residual.
-            if lq[3] == ProjQuant::Q8_0 {
-                launch_quantize(
-                    &s,
-                    &self.k.quantize,
-                    &self.d_attn,
-                    &mut self.d_in_quants,
-                    &mut self.d_in_scales,
-                    qb,
-                )
-                .map_err(map)?;
-                if fused {
-                    launch_gemv_residual(
+            // qwen35 hybrid: SSM layers replace the whole attention mixer; full-attn
+            // layers run the existing path plus a fused query+gate split and a sigmoid
+            // output gate. Both kinds share the attn-norm+quantize above and the FFN below.
+            match &self.layers[li].kind {
+                LayerKind::Full => {
+                    // Q,K,V  (qwen35 full-attn: wq is the fused [query|gate] projection -> 2*q_width)
+                    if let Some(q) = self.qwen35.as_mut() {
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            lq[0],
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &wq,
+                            2 * self.q_width,
+                            self.hidden,
+                            &mut q.d_qgate,
+                            0,
+                        )
+                        .map_err(map)?;
+                        launch_deinterleave_qgate(
+                            &s,
+                            &self.k.deinterleave_qgate,
+                            &q.d_qgate,
+                            &mut self.d_q,
+                            &mut q.d_gate_attn,
+                            self.n_heads,
+                            self.head_dim,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            lq[0],
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &wq,
+                            self.q_width,
+                            self.hidden,
+                            &mut self.d_q,
+                            0,
+                        )
+                        .map_err(map)?;
+                    }
+                    dispatch_gemv(
                         &s,
-                        &self.k.gemv,
+                        &self.k,
+                        lq[1],
                         &self.d_in_scales,
                         &self.d_in_quants,
-                        &wo,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &wk,
+                        self.kv_width,
                         self.hidden,
-                        qb,
-                        &mut self.d_hidden,
+                        &mut self.d_k,
+                        0,
                     )
                     .map_err(map)?;
-                } else {
-                    launch_gemv(
+                    dispatch_gemv(
                         &s,
-                        &self.k.gemv,
+                        &self.k,
+                        lq[2],
                         &self.d_in_scales,
                         &self.d_in_quants,
-                        &wo,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &wv,
+                        self.kv_width,
                         self.hidden,
-                        qb,
-                        &mut self.d_proj,
+                        &mut self.d_v,
+                        0,
                     )
                     .map_err(map)?;
-                    launch_residual(
+                    // Qwen3 QK-norm: per-head RMSNorm on Q and K after projection, before RoPE
+                    if let (Some(ref qn), Some(ref kn)) =
+                        (&self.layers[li].q_norm, &self.layers[li].k_norm)
+                    {
+                        launch_rms_norm_per_head(
+                            &s,
+                            &self.k.rms_norm_per_head,
+                            &mut self.d_q,
+                            qn,
+                            self.n_heads,
+                            self.head_dim,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                        launch_rms_norm_per_head(
+                            &s,
+                            &self.k.rms_norm_per_head,
+                            &mut self.d_k,
+                            kn,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            self.eps,
+                        )
+                        .map_err(map)?;
+                    }
+                    // RoPE on Q and K
+                    let pairing = if self.split_half_pairing { 1i32 } else { 0i32 };
+                    launch_rope(
                         &s,
-                        &self.k.residual_add,
-                        &mut self.d_hidden,
-                        &self.d_proj,
+                        &self.k.rope,
+                        &mut self.d_q,
+                        &self.d_cos,
+                        &self.d_sin,
+                        self.n_heads,
+                        self.head_dim,
+                        self.rope_dim,
+                        pairing,
+                    )
+                    .map_err(map)?;
+                    launch_rope(
+                        &s,
+                        &self.k.rope,
+                        &mut self.d_k,
+                        &self.d_cos,
+                        &self.d_sin,
+                        self.n_kv_heads,
+                        self.head_dim,
+                        self.rope_dim,
+                        pairing,
+                    )
+                    .map_err(map)?;
+                    // KV write
+                    launch_kv_scatter(
+                        &s,
+                        &self.k.kv_scatter,
+                        &self.d_k,
+                        &mut self.cache_k[li],
+                        &self.d_position,
+                        self.n_kv_heads,
+                        self.head_dim,
+                        self.max_pos,
+                    )
+                    .map_err(map)?;
+                    launch_kv_scatter(
+                        &s,
+                        &self.k.kv_scatter,
+                        &self.d_v,
+                        &mut self.cache_v[li],
+                        &self.d_position,
+                        self.n_kv_heads,
+                        self.head_dim,
+                        self.max_pos,
+                    )
+                    .map_err(map)?;
+                    // attention. At depth, split-K (grid n_heads x n_splits) fills the SMs that
+                    // the one-block-per-head launch leaves idle; below SPLITK_THRESHOLD the single
+                    // kernel is cheaper (one launch, no scratch). Both are token-parity to the same
+                    // reference. Split-K is skipped during graph capture (split count is ctx-dependent).
+                    if !graph_capture && attn_shared > SPLITK_THRESHOLD {
+                        launch_attention_splitk(
+                            &s,
+                            &self.k,
+                            &self.d_q,
+                            &self.cache_k[li],
+                            &self.cache_v[li],
+                            &mut self.d_attn,
+                            &mut self.d_sk_scores,
+                            &mut self.d_sk_chunkmax,
+                            &mut self.d_sk_lsum,
+                            &mut self.d_sk_acc,
+                            self.n_heads,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            &self.d_position,
+                            attn_shared,
+                            self.max_pos,
+                            scale,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_attention(
+                            &s,
+                            &self.k.attention,
+                            &self.d_q,
+                            &self.cache_k[li],
+                            &self.cache_v[li],
+                            &mut self.d_attn,
+                            self.n_heads,
+                            self.n_kv_heads,
+                            self.head_dim,
+                            &self.d_position,
+                            attn_shared,
+                            self.max_pos,
+                            scale,
+                        )
+                        .map_err(map)?;
+                    }
+                    // qwen35 full-attention sigmoid output gate: attn[i] *= sigmoid(gate[i]).
+                    if let Some(q) = self.qwen35.as_ref() {
+                        launch_sigmoid_mul(
+                            &s,
+                            &self.k.sigmoid_mul,
+                            &mut self.d_attn,
+                            &q.d_gate_attn,
+                            self.q_width,
+                        )
+                        .map_err(map)?;
+                    }
+                    // O projection + residual. Input is the attention output (q_width wide):
+                    // quantize it to the format the O lane reads, then project + add residual.
+                    if lq[3] == ProjQuant::Q8_0 {
+                        launch_quantize(
+                            &s,
+                            &self.k.quantize,
+                            &self.d_attn,
+                            &mut self.d_in_quants,
+                            &mut self.d_in_scales,
+                            qb,
+                        )
+                        .map_err(map)?;
+                        if fused {
+                            launch_gemv_residual(
+                                &s,
+                                &self.k.gemv,
+                                &self.d_in_scales,
+                                &self.d_in_quants,
+                                &wo,
+                                self.hidden,
+                                qb,
+                                &mut self.d_hidden,
+                            )
+                            .map_err(map)?;
+                        } else {
+                            launch_gemv(
+                                &s,
+                                &self.k.gemv,
+                                &self.d_in_scales,
+                                &self.d_in_quants,
+                                &wo,
+                                self.hidden,
+                                qb,
+                                &mut self.d_proj,
+                            )
+                            .map_err(map)?;
+                            launch_residual(
+                                &s,
+                                &self.k.residual_add,
+                                &mut self.d_hidden,
+                                &self.d_proj,
+                                self.hidden,
+                            )
+                            .map_err(map)?;
+                        }
+                    } else {
+                        // K-quant O lane: Q8_K activation, fused-residual GEMV (bit-identical
+                        // to gemv + residual_add — the kernel's residual arg adds onto d_hidden).
+                        launch_quantize_q8k(
+                            &s,
+                            &self.k.quantize_q8k,
+                            &self.d_attn,
+                            &mut self.d_q8k_quants,
+                            &mut self.d_q8k_scales,
+                            self.q_width / 256,
+                        )
+                        .map_err(map)?;
+                        dispatch_gemv(
+                            &s,
+                            &self.k,
+                            lq[3],
+                            &self.d_in_scales,
+                            &self.d_in_quants,
+                            &self.d_q8k_scales,
+                            &self.d_q8k_quants,
+                            &wo,
+                            self.hidden,
+                            self.q_width,
+                            &mut self.d_hidden,
+                            1,
+                        )
+                        .map_err(map)?;
+                    }
+                }
+                LayerKind::Ssm(ssm) => {
+                    // The shared attn-norm+quantize above produced the Q8 activation in
+                    // d_in_*. Run the proven SSM mixer (== runnable qwen35_ssm_compute):
+                    // wqkv/wqkv_gate/beta/alpha gemv -> gates -> conv1d -> l2norm q/k ->
+                    // delta-rule -> ssm_out gemv (+= residual). beta_raw/alpha_raw reuse the
+                    // idle attention scratch d_k/d_v (kv_width >= num_v_heads).
+                    let (ds, nk, nv, key_dim, value_dim, conv_dim, d_conv) = {
+                        let g = self.qwen35.as_ref().unwrap();
+                        (
+                            g.d_state,
+                            g.num_k_heads,
+                            g.num_v_heads,
+                            g.key_dim,
+                            g.value_dim,
+                            g.conv_dim,
+                            g.d_conv,
+                        )
+                    };
+                    let sq = ssm.quants;
+                    let q = self.qwen35.as_mut().unwrap();
+                    dispatch_gemv(
+                        &s,
+                        &self.k,
+                        sq[0],
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &ssm.wqkv.as_view(),
+                        conv_dim,
                         self.hidden,
+                        &mut q.d_qkv,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemv(
+                        &s,
+                        &self.k,
+                        sq[1],
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &ssm.wqkv_gate.as_view(),
+                        value_dim,
+                        self.hidden,
+                        &mut q.d_z,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemv(
+                        &s,
+                        &self.k,
+                        sq[2],
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &ssm.beta.as_view(),
+                        nv,
+                        self.hidden,
+                        &mut self.d_k,
+                        0,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemv(
+                        &s,
+                        &self.k,
+                        sq[3],
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &ssm.alpha.as_view(),
+                        nv,
+                        self.hidden,
+                        &mut self.d_v,
+                        0,
+                    )
+                    .map_err(map)?;
+                    launch_ssm_gates(
+                        &s,
+                        &self.k.ssm_gates,
+                        &self.d_k,
+                        &self.d_v,
+                        &ssm.dt_bias,
+                        &ssm.a,
+                        &mut q.d_beta,
+                        &mut q.d_glog,
+                        nv,
+                    )
+                    .map_err(map)?;
+                    launch_ssm_conv1d(
+                        &s,
+                        &self.k.ssm_conv1d,
+                        &ssm.conv1d,
+                        &q.d_qkv,
+                        &mut self.ssm_conv_state[li],
+                        &mut q.d_conv_out,
+                        conv_dim,
+                        d_conv,
+                    )
+                    .map_err(map)?;
+                    launch_ssm_l2_norm_per_head(
+                        &s,
+                        &self.k.ssm_l2_norm_per_head,
+                        &mut q.d_conv_out,
+                        0,
+                        nk,
+                        ds,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                    launch_ssm_l2_norm_per_head(
+                        &s,
+                        &self.k.ssm_l2_norm_per_head,
+                        &mut q.d_conv_out,
+                        key_dim,
+                        nk,
+                        ds,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                    launch_ssm_delta_rule(
+                        &s,
+                        &self.k.ssm_delta_rule,
+                        &mut self.ssm_state[li],
+                        &q.d_conv_out,
+                        key_dim,
+                        value_dim,
+                        &q.d_z,
+                        &q.d_beta,
+                        &q.d_glog,
+                        &ssm.ssm_norm,
+                        &mut q.d_ssm_mix,
+                        ds,
+                        nk,
+                        nv,
+                        self.eps,
+                    )
+                    .map_err(map)?;
+                    // ssm_out projection + residual into d_hidden.
+                    launch_quantize(
+                        &s,
+                        &self.k.quantize,
+                        &q.d_ssm_mix,
+                        &mut self.d_in_quants,
+                        &mut self.d_in_scales,
+                        value_dim / 32,
+                    )
+                    .map_err(map)?;
+                    dispatch_gemv(
+                        &s,
+                        &self.k,
+                        sq[4],
+                        &self.d_in_scales,
+                        &self.d_in_quants,
+                        &self.d_q8k_scales,
+                        &self.d_q8k_quants,
+                        &ssm.ssm_out.as_view(),
+                        self.hidden,
+                        value_dim,
+                        &mut self.d_hidden,
+                        1,
                     )
                     .map_err(map)?;
                 }
-            } else {
-                // K-quant O lane: Q8_K activation, fused-residual GEMV (bit-identical
-                // to gemv + residual_add — the kernel's residual arg adds onto d_hidden).
-                launch_quantize_q8k(
-                    &s,
-                    &self.k.quantize_q8k,
-                    &self.d_attn,
-                    &mut self.d_q8k_quants,
-                    &mut self.d_q8k_scales,
-                    self.q_width / 256,
-                )
-                .map_err(map)?;
-                dispatch_gemv(
-                    &s,
-                    &self.k,
-                    lq[3],
-                    &self.d_in_scales,
-                    &self.d_in_quants,
-                    &self.d_q8k_scales,
-                    &self.d_q8k_quants,
-                    &wo,
-                    self.hidden,
-                    self.q_width,
-                    &mut self.d_hidden,
-                    1,
-                )
-                .map_err(map)?;
             }
             // ffn norm + gate/up + silu + down + residual. gate/up consume the ffn-norm
             // activation; down consumes the silu(gate)*up activation. Each is produced in
@@ -5111,7 +5687,10 @@ impl CudaResidentDecode {
         // Greedy decode: replay the captured CUDA graph when enabled (one launch for
         // the whole ~600-kernel token), else the per-launch path. Both are byte-exact:
         // the graph records the identical kernels reading the same device buffers.
-        if cuda_graphs_enabled() {
+        // qwen35 (Ornith) hybrid SSM is force-serial: the captured graph freezes
+        // attention launch config and does not model the per-token recurrent SSM state
+        // mutation, so qwen35 always runs the per-launch forward_pass.
+        if cuda_graphs_enabled() && self.qwen35.is_none() {
             return self
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
                 .map(Some);
