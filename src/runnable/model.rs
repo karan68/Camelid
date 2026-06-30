@@ -1766,13 +1766,19 @@ impl RunnableModel {
     ) -> std::result::Result<crate::cuda_resident::CudaResidentDecode, String> {
         use crate::cuda_resident::{widen_q8, CudaResidentDecode, ProjQuant};
         let rt = self.qwen35.as_ref().ok_or("not a qwen35 model")?;
-        let q8 = ProjQuant::Q8_0;
         let ffn_dim = rt.layers[0].ffn_gate.out_features;
-        let w = |m: &RawMat| -> std::result::Result<Vec<u8>, String> {
-            if m.tt != GgufTensorType::Q8_0 {
-                return Err(format!("qwen35 CUDA lane needs Q8_0, got {:?}", m.tt));
+        // Per-tensor quant: Q8_0 weights are widened 34->36 (set_*'s repack_for_lane
+        // then runs repack_q8_soa); K-quant (Q4_K/Q6_K) bytes pass through raw (the
+        // q4k/q6k GEMV kernels expand them on the fly). Returns (repack-ready bytes, lane).
+        let prep = |m: &RawMat| -> std::result::Result<(Vec<u8>, ProjQuant), String> {
+            match m.tt {
+                GgufTensorType::Q8_0 => Ok((widen_q8(&m.bytes), ProjQuant::Q8_0)),
+                GgufTensorType::Q4K => Ok((m.bytes.clone(), ProjQuant::Q4K)),
+                GgufTensorType::Q6K => Ok((m.bytes.clone(), ProjQuant::Q6K)),
+                other => Err(format!(
+                    "qwen35 CUDA lane: unsupported projection quant {other:?}"
+                )),
             }
-            Ok(widen_q8(&m.bytes))
         };
         let mut e = CudaResidentDecode::new(
             self.n_layers,
@@ -1807,20 +1813,27 @@ impl RunnableModel {
                     q_norm,
                     k_norm,
                 } => {
+                    let (bq, qq) = prep(wq)?;
+                    let (bk, qk) = prep(wk)?;
+                    let (bv, qv) = prep(wv)?;
+                    let (bo, qo) = prep(wo)?;
+                    let (bg, qg) = prep(&layer.ffn_gate)?;
+                    let (bu, qu) = prep(&layer.ffn_up)?;
+                    let (bd, qd) = prep(&layer.ffn_down)?;
                     e.set_layer_located(
-                        &w(wq)?,
-                        &w(wk)?,
-                        &w(wv)?,
-                        &w(wo)?,
-                        &w(&layer.ffn_gate)?,
-                        &w(&layer.ffn_up)?,
-                        &w(&layer.ffn_down)?,
+                        &bq,
+                        &bk,
+                        &bv,
+                        &bo,
+                        &bg,
+                        &bu,
+                        &bd,
                         &layer.attn_norm,
                         &layer.post_attn_norm,
                         Some(q_norm.as_slice()),
                         Some(k_norm.as_slice()),
                         true,
-                        [q8; 7],
+                        [qq, qk, qv, qo, qg, qu, qd],
                     )?;
                     e.push_ssm_placeholders()?;
                 }
@@ -1835,23 +1848,31 @@ impl RunnableModel {
                     ssm_norm,
                     ssm_out,
                 } => {
+                    let (bg, qg) = prep(&layer.ffn_gate)?;
+                    let (bu, qu) = prep(&layer.ffn_up)?;
+                    let (bd, qd) = prep(&layer.ffn_down)?;
+                    let (bqkv, qqkv) = prep(wqkv)?;
+                    let (bgate, qgate) = prep(wqkv_gate)?;
+                    let (bbeta, qbeta) = prep(beta)?;
+                    let (balpha, qalpha) = prep(alpha)?;
+                    let (bout, qout) = prep(ssm_out)?;
                     e.set_layer_ssm_qwen35(
-                        &w(&layer.ffn_gate)?,
-                        &w(&layer.ffn_up)?,
-                        &w(&layer.ffn_down)?,
+                        &bg,
+                        &bu,
+                        &bd,
                         &layer.attn_norm,
                         &layer.post_attn_norm,
-                        &w(wqkv)?,
-                        &w(wqkv_gate)?,
-                        &w(beta)?,
-                        &w(alpha)?,
-                        &w(ssm_out)?,
+                        &bqkv,
+                        &bgate,
+                        &bbeta,
+                        &balpha,
+                        &bout,
                         conv1d,
                         dt_bias,
                         a,
                         ssm_norm,
-                        [q8; 5],
-                        [q8; 3],
+                        [qqkv, qgate, qbeta, qalpha, qout],
+                        [qg, qu, qd],
                         rt.conv_dim,
                         rt.d_conv,
                         rt.num_v_heads,
@@ -1860,7 +1881,8 @@ impl RunnableModel {
                 }
             }
         }
-        e.set_output(&self.output_norm, &w(&self.output)?, q8)?;
+        let (bout, qout) = prep(&self.output)?;
+        e.set_output(&self.output_norm, &bout, qout)?;
         Ok(e)
     }
 }

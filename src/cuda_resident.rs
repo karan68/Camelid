@@ -4900,8 +4900,17 @@ impl CudaResidentDecode {
             // unfused path, byte-identical) when any consumer is Q8_0, and the Q8_K
             // activation when any consumer is a K-quant lane. For an all-Q8_0 layer only
             // the Q8_0 branch runs, so the legacy path is unchanged.
-            let attn_need_q8_0 = [lq[0], lq[1], lq[2]].contains(&ProjQuant::Q8_0);
-            let attn_need_q8k = [lq[0], lq[1], lq[2]].iter().any(|q| q.needs_q8k());
+            // The attn-norm activation feeds 3 consumers for a Full layer (q/k/v) but 4
+            // for a qwen35 SSM layer (wqkv/wqkv_gate/beta/alpha — all read d_in_*/d_q8k_*),
+            // so widen the consumer span to lq[0..4] for SSM. (O-proj lq[3] of a Full
+            // layer consumes the attention output, quantized separately — not here.)
+            let n_attn_consumers = if matches!(&self.layers[li].kind, LayerKind::Ssm(_)) {
+                4
+            } else {
+                3
+            };
+            let attn_need_q8_0 = lq[..n_attn_consumers].contains(&ProjQuant::Q8_0);
+            let attn_need_q8k = lq[..n_attn_consumers].iter().any(|q| q.needs_q8k());
             if attn_need_q8_0 {
                 if fused {
                     launch_rmsnorm_quantize(
@@ -5372,16 +5381,30 @@ impl CudaResidentDecode {
                         self.eps,
                     )
                     .map_err(map)?;
-                    // ssm_out projection + residual into d_hidden.
-                    launch_quantize(
-                        &s,
-                        &self.k.quantize,
-                        &q.d_ssm_mix,
-                        &mut self.d_in_quants,
-                        &mut self.d_in_scales,
-                        value_dim / 32,
-                    )
-                    .map_err(map)?;
+                    // ssm_out projection + residual into d_hidden. Quantize the SSM mix to
+                    // the activation format ssm_out's lane reads: Q8_K for a K-quant
+                    // (Q4_K/Q6_K) ssm_out, Q8_0 otherwise.
+                    if sq[4].needs_q8k() {
+                        launch_quantize_q8k(
+                            &s,
+                            &self.k.quantize_q8k,
+                            &q.d_ssm_mix,
+                            &mut self.d_q8k_quants,
+                            &mut self.d_q8k_scales,
+                            value_dim / 256,
+                        )
+                        .map_err(map)?;
+                    } else {
+                        launch_quantize(
+                            &s,
+                            &self.k.quantize,
+                            &q.d_ssm_mix,
+                            &mut self.d_in_quants,
+                            &mut self.d_in_scales,
+                            value_dim / 32,
+                        )
+                        .map_err(map)?;
+                    }
                     dispatch_gemv(
                         &s,
                         &self.k,
