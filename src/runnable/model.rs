@@ -2130,6 +2130,9 @@ mod gpu_ssm_layer_tests {
         let mut cache = Qwen35Cache::new(rt, rt.layers.len());
 
         let mut worst_all = 0.0f32;
+        // `p` is the absolute position (used in RoPE tables, kv_scatter, d_pos) as well
+        // as the index into `hiddens`, so a plain range loop is clearest here.
+        #[allow(clippy::needless_range_loop)]
         for p in 0..n_steps {
             let hidden = &hiddens[p];
 
