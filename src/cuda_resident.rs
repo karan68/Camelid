@@ -2271,7 +2271,7 @@ use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 /// (`n_blocks` f32). Quants-first keeps every block's 32 i8 16-byte aligned so
 /// the kernel can issue `int4` loads. Done once per weight at upload; the values
 /// are unchanged, only their arrangement.
-fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
+pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
     let n = bytes.len() / 36;
     let mut out = vec![0u8; n * 32 + n * 4];
     let (quants, scales) = out.split_at_mut(n * 32);

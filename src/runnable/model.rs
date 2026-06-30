@@ -1734,3 +1734,294 @@ fn read_tensor_bytes(f: &mut File, d: &GgufTensorDescriptor, name: &str) -> Resu
     })?;
     Ok(bytes)
 }
+
+/// GPU single-SSM-layer parity: upload layer 0's REAL Ornith SSM weights and run the
+/// whole GPU forward (rmsnorm+quantize -> q8 gemv x4 -> SSM kernel chain -> ssm_out
+/// gemv), comparing the layer `mix` to the CPU `qwen35_ssm`. Proves the gemv-from-real-
+/// weights path composes with the proven SSM chain — the mechanism the resident
+/// forward_pass SSM branch will use. Q8_0 weights (34-byte GGUF blocks widened to the
+/// 36-byte f32-scale layout repack_q8_soa expects).
+#[cfg(test)]
+mod gpu_ssm_layer_tests {
+    use super::*;
+    use crate::cuda_resident::{
+        launch_gemv, launch_quantize, launch_rmsnorm_quantize, repack_q8_soa, CudaResidentKernels,
+    };
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    fn widen_q8(bytes: &[u8]) -> Vec<u8> {
+        let nb = bytes.len() / 34;
+        let mut out = Vec::with_capacity(nb * 36);
+        for b in 0..nb {
+            let base = b * 34;
+            let scale =
+                crate::tensor::f16_bits_to_f32(u16::from_le_bytes([bytes[base], bytes[base + 1]]));
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&bytes[base + 2..base + 34]);
+        }
+        out
+    }
+
+    fn rel_close(a: &[f32], b: &[f32], tol: f32) -> (bool, f32) {
+        let mut worst = 0.0f32;
+        for (x, y) in a.iter().zip(b) {
+            let d = (x - y).abs() / y.abs().max(1.0);
+            if d > worst {
+                worst = d;
+            }
+        }
+        (worst < tol, worst)
+    }
+
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (Q8) + a CUDA device"]
+    fn qwen35_ssm_layer_gpu_matches_cpu() {
+        let path = match std::env::var("CAMELID_ORNITH_GGUF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Ok(k) = CudaResidentKernels::new() else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        let rt = model.qwen35.as_ref().expect("qwen35 runtime");
+        let li = 0usize; // layer 0 is SSM ((0+1)%4 != 0)
+        let layer = &rt.layers[li];
+        let (wqkv, wqkv_gate, conv1d, dt_bias, a_vec, beta_m, alpha_m, ssm_norm, ssm_out) =
+            match &layer.kind {
+                Qwen35Kind::Ssm {
+                    wqkv,
+                    wqkv_gate,
+                    conv1d,
+                    dt_bias,
+                    a,
+                    beta,
+                    alpha,
+                    ssm_norm,
+                    ssm_out,
+                } => (
+                    wqkv, wqkv_gate, conv1d, dt_bias, a, beta, alpha, ssm_norm, ssm_out,
+                ),
+                _ => panic!("layer 0 is not SSM"),
+            };
+        for m in [wqkv, wqkv_gate, beta_m, alpha_m, ssm_out] {
+            assert_eq!(
+                m.tt,
+                GgufTensorType::Q8_0,
+                "test assumes a Q8_0 Ornith GGUF"
+            );
+        }
+        let hidden_dim = model.d_model;
+        let eps = model.eps;
+        let (ds, nk, nv) = (rt.d_state, rt.num_k_heads, rt.num_v_heads);
+        let (key_dim, value_dim, conv_dim, d_conv) =
+            (rt.key_dim, rt.value_dim, rt.conv_dim, rt.d_conv);
+
+        // Deterministic pseudo-random hidden activation.
+        let mut seed = 0x1234_5678u64;
+        let mut nextf = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let hidden: Vec<f32> = (0..hidden_dim).map(|_| nextf()).collect();
+
+        // ---- CPU reference: the layer mix from qwen35_ssm ----
+        let mut cache = Qwen35Cache::new(rt, rt.layers.len());
+        let xn = rms_norm(&hidden, &layer.attn_norm, eps);
+        let cpu_mix = model
+            .qwen35_ssm(rt, layer, li, &xn, &mut cache)
+            .expect("cpu ssm");
+
+        // ---- GPU forward ----
+        let s = &k.stream;
+        let up = |m: &RawMat| s.clone_htod(&repack_q8_soa(&widen_q8(&m.bytes))).unwrap();
+        let d_wqkv = up(wqkv);
+        let d_wqkv_gate = up(wqkv_gate);
+        let d_beta_w = up(beta_m);
+        let d_alpha_w = up(alpha_m);
+        let d_ssm_out = up(ssm_out);
+        let d_conv1d = s.clone_htod(conv1d).unwrap();
+        let d_dt = s.clone_htod(dt_bias).unwrap();
+        let d_a = s.clone_htod(a_vec).unwrap();
+        let d_norm = s.clone_htod(ssm_norm).unwrap();
+        let d_attn_norm = s.clone_htod(&layer.attn_norm).unwrap();
+        let d_hidden = s.clone_htod(&hidden).unwrap();
+
+        let hb = hidden_dim / 32;
+        let vb = value_dim / 32;
+        let mut in_q = s.alloc_zeros::<i8>(hidden_dim).unwrap();
+        let mut in_s = s.alloc_zeros::<f32>(hb).unwrap();
+        let mut d_qkv = s.alloc_zeros::<f32>(conv_dim).unwrap();
+        let mut d_z = s.alloc_zeros::<f32>(value_dim).unwrap();
+        let mut d_br = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_ar = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_beta = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_glog = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_conv_out = s.alloc_zeros::<f32>(conv_dim).unwrap();
+        let mut d_ssm_mix = s.alloc_zeros::<f32>(value_dim).unwrap();
+        let mut d_conv_state = s.alloc_zeros::<f32>(conv_dim * (d_conv - 1)).unwrap();
+        let mut d_state = s.alloc_zeros::<f32>(nv * ds * ds).unwrap();
+        let mut mix_q = s.alloc_zeros::<i8>(value_dim).unwrap();
+        let mut mix_s = s.alloc_zeros::<f32>(vb).unwrap();
+        let mut d_mix = s.alloc_zeros::<f32>(hidden_dim).unwrap();
+
+        // attn rmsnorm + quantize the hidden
+        launch_rmsnorm_quantize(
+            s,
+            &k.rms_norm_quantize,
+            &d_hidden,
+            &d_attn_norm,
+            &mut in_q,
+            &mut in_s,
+            hidden_dim,
+            eps,
+        )
+        .unwrap();
+        // projections (Q8_0 q8_gemv): wqkv -> qkv, wqkv_gate -> z, beta -> br, alpha -> ar
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_wqkv.slice(0..d_wqkv.len()),
+            conv_dim,
+            hb,
+            &mut d_qkv,
+        )
+        .unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_wqkv_gate.slice(0..d_wqkv_gate.len()),
+            value_dim,
+            hb,
+            &mut d_z,
+        )
+        .unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_beta_w.slice(0..d_beta_w.len()),
+            nv,
+            hb,
+            &mut d_br,
+        )
+        .unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_alpha_w.slice(0..d_alpha_w.len()),
+            nv,
+            hb,
+            &mut d_ar,
+        )
+        .unwrap();
+
+        let nvi = nv as i32;
+        let dsi = ds as i32;
+        let nki = nk as i32;
+        // gates
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (nv as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = s.launch_builder(&k.ssm_gates);
+            b.arg(&d_br)
+                .arg(&d_ar)
+                .arg(&d_dt)
+                .arg(&d_a)
+                .arg(&mut d_beta)
+                .arg(&mut d_glog)
+                .arg(&nvi);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // conv1d
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (conv_dim.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let cdi = conv_dim as i32;
+            let dci = d_conv as i32;
+            let mut b = s.launch_builder(&k.ssm_conv1d);
+            b.arg(&d_conv1d)
+                .arg(&d_qkv)
+                .arg(&mut d_conv_state)
+                .arg(&mut d_conv_out)
+                .arg(&cdi)
+                .arg(&dci);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // l2norm q (0..key_dim) and k (key_dim..2*key_dim)
+        for lo in [0usize, key_dim] {
+            let cfg = LaunchConfig {
+                grid_dim: (nk as u32, 1, 1),
+                block_dim: (ds as u32, 1, 1),
+                shared_mem_bytes: (ds as u32) * 4,
+            };
+            let mut view = d_conv_out.slice_mut(lo..lo + key_dim);
+            let mut b = s.launch_builder(&k.ssm_l2_norm_per_head);
+            b.arg(&mut view).arg(&dsi).arg(&eps);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // delta rule
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (nv as u32, 1, 1),
+                block_dim: (ds as u32, 1, 1),
+                shared_mem_bytes: (3 * ds as u32) * 4,
+            };
+            let qv = d_conv_out.slice(0..key_dim);
+            let kv = d_conv_out.slice(key_dim..2 * key_dim);
+            let vv = d_conv_out.slice(2 * key_dim..2 * key_dim + value_dim);
+            let mut b = s.launch_builder(&k.ssm_delta_rule);
+            b.arg(&mut d_state)
+                .arg(&kv)
+                .arg(&qv)
+                .arg(&vv)
+                .arg(&d_z)
+                .arg(&d_beta)
+                .arg(&d_glog)
+                .arg(&d_norm)
+                .arg(&mut d_ssm_mix)
+                .arg(&dsi)
+                .arg(&nki)
+                .arg(&eps);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // quantize the SSM mix, then ssm_out projection (Q8_0 gemv) -> d_mix
+        launch_quantize(s, &k.quantize, &d_ssm_mix, &mut mix_q, &mut mix_s, vb).unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &mix_s,
+            &mix_q,
+            &d_ssm_out.slice(0..d_ssm_out.len()),
+            hidden_dim,
+            vb,
+            &mut d_mix,
+        )
+        .unwrap();
+
+        let mut got = vec![0f32; hidden_dim];
+        s.memcpy_dtoh(&d_mix, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+        let (ok, worst) = rel_close(&got, &cpu_mix, 1e-2);
+        assert!(
+            ok,
+            "qwen35 SSM layer GPU vs CPU diverged (worst rel {worst:.3e})"
+        );
+        eprintln!("qwen35_ssm_layer_gpu: PASS (worst rel {worst:.3e})");
+    }
+}
