@@ -15,7 +15,11 @@
 //! See `DECISIONS.md` D6 and `RECON_CHAT.md`.
 
 mod agent;
+mod agent_bench;
 mod agent_eval;
+mod agent_orchestration;
+mod agent_syscap;
+mod agent_tui;
 mod audit;
 mod banner;
 mod client;
@@ -27,10 +31,19 @@ mod palette;
 mod server;
 mod session;
 mod shell_sandbox;
+mod subagent;
 mod theme;
 mod tool_parse;
 mod tools;
 mod tui;
+#[cfg(windows)]
+mod win_console;
+#[cfg(windows)]
+mod win_input;
+#[cfg(windows)]
+mod win_job;
+#[cfg(windows)]
+mod win_uia;
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -66,7 +79,13 @@ pub struct ChatOptions {
     pub workdir: Option<PathBuf>,
     pub max_steps: usize,
     pub auto_approve: bool,
+    /// `--yolo` (unattended): auto-approve EXEC tools too so the agent runs a
+    /// whole task without prompting. Refused under production.
+    pub yolo: bool,
     pub allow_net: bool,
+    /// `--allow-fs`: agent file tools may read/write anywhere on disk (still
+    /// approval-gated), not just under the workspace root.
+    pub allow_fs: bool,
     pub shell_timeout: u64,
     /// Opt-in thinking mode (`chat --enable-thinking`): the model emits its own
     /// `<think>…</think>` reasoning. NOT parity-locked (leading-trace lane only).
@@ -82,6 +101,7 @@ pub struct ChatOptions {
 /// non-zero for the typed unsupported-state backstop) so the caller can exit
 /// after this function's `ServerHandle` has torn down any spawned server.
 pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
+    init_terminal();
     install_sigint_handler();
 
     let client = Client::new(opts.addr);
@@ -134,14 +154,23 @@ pub fn run_chat(opts: ChatOptions) -> anyhow::Result<i32> {
             workdir: opts.workdir.unwrap_or_else(|| PathBuf::from(".")),
             max_steps: opts.max_steps,
             auto_approve: opts.auto_approve,
+            yolo: opts.yolo,
             allow_net: opts.allow_net,
+            allow_fs: opts.allow_fs,
             shell_timeout: std::time::Duration::from_secs(opts.shell_timeout),
             max_tokens: opts.max_tokens,
             temperature: opts.temperature,
             audit: audit::sink_from_config(opts.audit_webhook.as_deref()),
             shell_sandbox,
         };
-        return agent::run_agent(&mut session, opts.addr, cfg);
+        // Full-screen TUI agent on a real terminal (default); the line renderer
+        // is the fallback for --plain, pipes, and non-TTY runs (smoke/tests).
+        let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        return if interactive && !opts.plain {
+            agent_tui::run(&mut session, opts.addr, cfg)
+        } else {
+            agent::run_agent(&mut session, opts.addr, cfg)
+        };
     }
 
     // Full-screen TUI when we have a real terminal on both ends and the user did
@@ -189,6 +218,65 @@ pub fn run_agent_eval(opts: AgentEvalOptions) -> anyhow::Result<i32> {
     })
 }
 
+/// Parsed `camelid agent-syscap-eval` flags.
+pub struct AgentSyscapOptions {
+    pub receipt_dir: PathBuf,
+}
+
+/// Entry for the `agent-syscap-eval` subcommand: the Phase-1 Windows
+/// system-control gate. Returns PASS(0) / FAIL(1) / INCONCLUSIVE(3) and emits a
+/// sealed `camelid.agent-syscap-receipt/v1`.
+pub fn run_agent_syscap_eval(opts: AgentSyscapOptions) -> anyhow::Result<i32> {
+    agent_syscap::run(agent_syscap::SyscapConfig {
+        receipt_dir: opts.receipt_dir,
+    })
+}
+
+/// Entry for the hidden `__subagent` worker subcommand: run one scoped agent loop
+/// described by `task_file` and write its result file. Returns 0/1/3.
+pub fn run_subagent_worker(task_file: &std::path::Path) -> anyhow::Result<i32> {
+    subagent::run_worker(task_file)
+}
+
+/// Parsed `camelid agent-orchestration-eval` flags.
+pub struct AgentOrchestrationOptions {
+    pub receipt_dir: PathBuf,
+    pub model: Option<PathBuf>,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
+}
+
+/// Entry for the `agent-orchestration-eval` subcommand: the orchestration gate.
+/// Without `--model` it runs the canned rung-2 mechanics battery; with `--model`
+/// it runs the rung-3 real-model round-trip. Returns 0/1/3.
+pub fn run_agent_orchestration_eval(opts: AgentOrchestrationOptions) -> anyhow::Result<i32> {
+    agent_orchestration::run(agent_orchestration::OrchestrationConfig {
+        receipt_dir: opts.receipt_dir,
+        model: opts.model,
+        addr: opts.addr,
+        load_timeout: opts.load_timeout,
+    })
+}
+
+/// Parsed `camelid agent-orchestration-bench` flags.
+pub struct AgentOrchestrationBenchOptions {
+    pub receipt_dir: PathBuf,
+    pub model: Option<PathBuf>,
+    pub addr: SocketAddr,
+    pub load_timeout: u64,
+}
+
+/// Entry for the `agent-orchestration-bench` subcommand: the rung-4 wall-clock
+/// measurement (concurrent vs sequential subagents) → sealed bench receipt.
+pub fn run_agent_orchestration_bench(opts: AgentOrchestrationBenchOptions) -> anyhow::Result<i32> {
+    agent_bench::run(agent_bench::BenchConfig {
+        receipt_dir: opts.receipt_dir,
+        model: opts.model,
+        addr: opts.addr,
+        load_timeout: opts.load_timeout,
+    })
+}
+
 extern "C" fn on_sigint(_signal: libc::c_int) {
     session::CANCEL.store(true, Ordering::SeqCst);
 }
@@ -201,3 +289,14 @@ fn install_sigint_handler() {
         libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
     }
 }
+
+/// Prepare the terminal for the line-mode renderers (inline + agent). On Windows
+/// this enables ANSI escape processing and a UTF-8 code page so colors and glyphs
+/// render the way they do on macOS/Linux; the full-screen TUI already gets this
+/// from crossterm. A no-op on Unix, where terminals handle ANSI + UTF-8 natively.
+#[cfg(windows)]
+fn init_terminal() {
+    win_console::init();
+}
+#[cfg(not(windows))]
+fn init_terminal() {}

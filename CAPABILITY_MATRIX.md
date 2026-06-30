@@ -37,6 +37,40 @@ Two `wip` cells are **host-limited, not model-limited**: `context.full_length` o
 
 `*` Llama 3 8B column is provisional (GGUF not on disk). Oracle classes: **D**=deterministic parity (vs llama.cpp), **I**=invariant, **C**=contract/OpenAI-shape, **B**=behavioral battery.
 
+## macOS / Metal Matrix (WIN2METAL Phase 2 · Bucket A)
+
+Validated: 2026-06-26 · Platform: **macOS (Apple M4, 16 GB)**, backend **Metal (GPU-resident decode + prefill)** · Oracle: llama.cpp `9632` (`acd79d603`, **Metal**) · Binary: **frozen base `28f224b`** (`camelid v0.1.7-92-g28f224b`, `/Volumes/Untitled/camelid-base-28f224b`) — **validation only, no `src/` changes**.
+
+Per-cell vocabulary for this platform (conductor §5 + the WIN2METAL honesty rule): `done → <receipt>` = re-validated on Metal with a `camelid.capability-receipt/v1` under `macos/receipts/`; `host-limited` = the row cannot be exercised on this 16 GB Metal box (a clean limit, **not** a pass and **not** a model gap); `gap` = a real Metal-specific failure (**none found**); `n/a` = the model genuinely cannot (template/metadata-intrinsic, platform-independent).
+
+| Capability | Oracle | Llama 3.2 1B (Metal) | Llama 3.2 3B (Metal) | TinyLlama | Llama 3 8B |
+| --- | :---: | :---: | :---: | :---: | :---: |
+| `gen.n_choices` | C | done | done | host-limited | host-limited |
+| `gen.stream_usage` | C | done | done | host-limited | host-limited |
+| `gen.length_stop` | D/C | done | done | host-limited | host-limited |
+| `sampling.full_set` | I | done | done | host-limited | host-limited |
+| `sampling.seed_determinism` | I | done | done | host-limited | host-limited |
+| `logprobs.top_logprobs` | D | done | done | host-limited | host-limited |
+| `chat.system_multiturn` | D | done | done | host-limited | host-limited |
+| `tools.function_calling` | B | done | done | n/a | n/a |
+| `structured.json_grammar` | B | done | done | host-limited | host-limited |
+| `context.full_length` | D | host-limited | host-limited | host-limited | host-limited |
+| `context.rope_scaling` | D | done | done | n/a | n/a |
+| `observ.usage_timing` | C | done | done | host-limited | host-limited |
+| `load.quant_breadth` | D | — | — | — | — |
+
+**Mac cell tally (the 2 on-disk rows):** **22 `done`** (11 capabilities × {1B, 3B}), each backed by a Metal `camelid.capability-receipt/v1` under `qa/capability/macos/receipts/`. No cross-row inheritance. **0 `gap`** — nothing regressed on the Metal backend.
+
+**Why TinyLlama / 8B are `host-limited` here:** the TinyLlama GGUF is not on this Mac's disk and Llama 3 8B Q8_0 OOMs at 16 GB — neither is a model limit, just this host. Their `tools.function_calling` and `context.rope_scaling` cells stay `n/a` because that is **model-intrinsic** (no tool branch / no rope scaling), true regardless of platform. `context.full_length` is `host-limited` on **every** row: the trained 131072 context materializes a KV cache beyond safe RAM on 16 GB (not a model limit). `load.quant_breadth` (—) is the secondary axis, not exercised in Bucket A.
+
+**Key Metal findings (honest):**
+- **logprobs watch item → PASS (no gap).** Under the GPU-resident Metal decode (`mac_logprobs_out/<row>/serve.log`: `[resident-dispatch] metal_enabled=true`, per-step `[resident] gpu_busy` lines), requesting logprobs **forces the full-vocab LogitsStage** (`ResidentTokenOut::Data`) rather than the GPU-sample shortcut (`ResidentTokenOut::Sampled`, token-id only): the response carries real ranked `top_logprobs` (5 alternatives) and the temp=0 greedy invariant holds on Metal (chosen == `top_logprobs[0]`, all ≤ 0, sorted descending) on **both** rows; chat `logprobs.content[]` + completions `logprobs.{tokens,token_logprobs,top_logprobs,text_offset}` both populated; `logprobs+stream` → typed 400, `logprobs+n>1` → fail-closed. (Values not asserted bit-exact — the cross-impl f32 reduction-order frontier.)
+- **`context.rope_scaling` Metal caveat (recorded, not papered over).** Both Mac runs mirror the salvaged 1B invocation (`--target-tokens 8400 --verify-mode reference-only`), which tokenizes to **5813 tokens — WITHIN the original 8192 window**, so the **`> 8192` extension regime was not reached on Metal** (it remains as-validated on the Windows rows). The byte-exact match vs llama.cpp Metal (`first_divergent_token_index=-1`, 8 generated tokens) still confirms Camelid applies the GGUF's baked `rope_freqs.weight` (llama3 NTK-by-parts) scaling identically to the oracle across all 5813 positions, plus whole-context KV correctness — hence `done`, with this caveat carried in each receipt.
+- **`chat.system_multiturn`** is byte-exact vs llama.cpp Metal on the pinned prompt (`first_divergent_token_index=-1`, answer "Tokyo."); the only template diff is the oracle's live-date system preamble (camelid 53 vs llama 73 tokens) — an intended, non-deterministic cross-engine difference, same posture as Windows.
+- **`tools.function_calling`** drives on Metal for both rows (structured `tool_calls`, `finish_reason=tool_calls`, `tool_choice:"none"` suppresses). 3B arguments are semantically correct; 1B is structurally valid but semantically imperfect (a model limitation, not the parser) — identical split to Windows.
+
+Mac artifacts: per-row manifests `qa/capability/macos/capability-manifest.<row>.json`; receipts `qa/capability/macos/receipts/capability-receipt.<cap>.<row>.json` (22); raw evidence `qa/capability/mac_{smoke,tools,json,logprobs,sm,ctx}_out/<row>/`; checksums folded into `qa/capability/SHA256SUMS`.
+
 ## Per-capability notes (Camelid-side state & the work)
 
 - **`gen.n_choices`** — Multi-choice n>1 independent generations (decoder/API)

@@ -3019,7 +3019,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
             ModelCompatibilityTarget {
                 id: "qwen3_4b_instruct_q8_0",
-                tool_capable: false,
+                tool_capable: true,
                 family: "qwen3",
                 quantization: "Q8_0",
                 status: "supported_exact_row_smoke",

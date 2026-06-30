@@ -373,13 +373,24 @@ enum Command {
         /// Max agent steps (tool-call rounds) per goal.
         #[arg(long, default_value_t = 25)]
         max_steps: usize,
-        /// Agent: run write/exec/network tools WITHOUT prompting (sandbox still
-        /// enforced). Prints a warning; not recommended.
+        /// Agent: run write/network tools WITHOUT prompting (exec tools stay
+        /// gated; sandbox still enforced). Prints a warning; not recommended.
         #[arg(long, default_value_t = false)]
         auto_approve: bool,
+        /// Agent: UNATTENDED — auto-approve EVERYTHING including exec tools
+        /// (shell, GUI input, run_windows_command, spawn_subagent) so the agent
+        /// runs a whole task without prompting. Bounded by --max-steps and /stop.
+        /// Refused under CAMELID_PRODUCTION. Powerful + dangerous; opt-in.
+        #[arg(long, default_value_t = false)]
+        yolo: bool,
         /// Agent: offer the network tool (`http_fetch`). Off by default.
         #[arg(long, default_value_t = false)]
         allow_net: bool,
+        /// Agent: let the file tools read/write anywhere on disk (computer
+        /// control), not just under --workdir. Still approval-gated. Off by
+        /// default (file tools are confined to the workspace root).
+        #[arg(long, default_value_t = false)]
+        allow_fs: bool,
         /// Agent: shell-command timeout in seconds.
         #[arg(long, default_value_t = 30)]
         shell_timeout: u64,
@@ -423,6 +434,56 @@ enum Command {
         /// Directory for the receipt artifact.
         #[arg(long, default_value = "qa/agent-eval")]
         receipt_dir: PathBuf,
+    },
+    /// Phase-1 Windows system-control gate: exercise run_windows_command +
+    /// inspect_system under the sandbox/approval contract and emit a sealed
+    /// receipt (PASS / FAIL / INCONCLUSIVE). Rung-1 — promotes nothing.
+    AgentSyscapEval {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-syscap")]
+        receipt_dir: PathBuf,
+    },
+    /// Internal: run ONE scoped subagent task described by a task file and write
+    /// its result file. Spawned by the spawn_subagent tool; not for direct use.
+    #[command(name = "__subagent", hide = true)]
+    Subagent {
+        /// Path to the task_<id>.json written by the parent.
+        #[arg(long)]
+        task_file: PathBuf,
+    },
+    /// Phase-2 subagent-orchestration gate: spawn -> run -> collect a canned
+    /// subagent plus caps/depth/reaping checks, emitting a sealed receipt
+    /// (PASS / FAIL / INCONCLUSIVE). Rung-2 (stub) — promotes nothing.
+    AgentOrchestrationEval {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+        /// Optional GGUF: run the rung-3 REAL-model round-trip instead of the
+        /// canned rung-2 mechanics battery.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Server to attach to / spawn on (rung-3).
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load before reporting INCONCLUSIVE.
+        #[arg(long, default_value_t = 120)]
+        load_timeout: u64,
+    },
+    /// Rung-4: measure concurrent vs sequential subagent wall-clock (I/O-bound;
+    /// add --model for the inference-bound workload) and emit a sealed receipt.
+    AgentOrchestrationBench {
+        /// Directory for the receipt artifact.
+        #[arg(long, default_value = "qa/agent-orchestration")]
+        receipt_dir: PathBuf,
+        /// Optional GGUF: also measure the inference-bound workload.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Server to attach to / spawn on.
+        #[arg(long, default_value = "127.0.0.1:8181")]
+        addr: SocketAddr,
+        /// Seconds to wait for the model to load.
+        #[arg(long, default_value_t = 120)]
+        load_timeout: u64,
     },
     /// Start the distributed HTTP API server or TCP Worker.
     ServeDistributed {
@@ -1045,7 +1106,9 @@ async fn main() -> anyhow::Result<()> {
             workdir,
             max_steps,
             auto_approve,
+            yolo,
             allow_net,
+            allow_fs,
             shell_timeout,
             enable_thinking,
             audit_webhook,
@@ -1067,7 +1130,9 @@ async fn main() -> anyhow::Result<()> {
                 workdir,
                 max_steps,
                 auto_approve,
+                yolo,
                 allow_net,
+                allow_fs,
                 shell_timeout,
                 enable_thinking,
                 audit_webhook,
@@ -1092,6 +1157,42 @@ async fn main() -> anyhow::Result<()> {
                 max_steps,
                 max_tokens,
                 receipt_dir,
+            })?;
+            std::process::exit(code);
+        }
+        Command::AgentSyscapEval { receipt_dir } => {
+            let code = chat::run_agent_syscap_eval(chat::AgentSyscapOptions { receipt_dir })?;
+            std::process::exit(code);
+        }
+        Command::Subagent { task_file } => {
+            let code = chat::run_subagent_worker(&task_file)?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationEval {
+            receipt_dir,
+            model,
+            addr,
+            load_timeout,
+        } => {
+            let code = chat::run_agent_orchestration_eval(chat::AgentOrchestrationOptions {
+                receipt_dir,
+                model,
+                addr,
+                load_timeout,
+            })?;
+            std::process::exit(code);
+        }
+        Command::AgentOrchestrationBench {
+            receipt_dir,
+            model,
+            addr,
+            load_timeout,
+        } => {
+            let code = chat::run_agent_orchestration_bench(chat::AgentOrchestrationBenchOptions {
+                receipt_dir,
+                model,
+                addr,
+                load_timeout,
             })?;
             std::process::exit(code);
         }
@@ -4923,17 +5024,29 @@ fn apply_spec_decode_env(
     });
     if let Some(mode) = mode {
         std::env::set_var("CAMELID_SPEC_DECODE", mode);
-        // Speculative verification needs CPU-resident packed Q8 weights; the
-        // Metal-resident execution plan deliberately keeps CPU-side weights
-        // file-backed (the GPU owns the resident copy), which makes verify
-        // rounds pay a file-speed weight pass each. A spec-enabled server
-        // therefore runs the validated CPU repack plan.
-        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
-        std::env::set_var("CAMELID_METAL_RESIDENT_PREFILL", "0");
-        tracing::info!(
-            "speculative decoding enabled; selecting the CPU execution plan \
-             (Metal resident paths disabled server-wide)"
+        // GPU speculative verify (CAMELID_SPEC_GPU=1) runs the batched `verify_batch` on the
+        // target's resident engine, which owns the weights — so keep the Metal resident paths
+        // ON for it. Without GPU verify the CPU chunk verify needs CPU-resident packed Q8
+        // weights, but the Metal-resident plan deliberately keeps CPU-side weights file-backed
+        // (the GPU owns the resident copy), so each verify round would pay a file-speed weight
+        // pass — fall back to the validated CPU repack plan in that case only.
+        let spec_gpu = matches!(
+            std::env::var("CAMELID_SPEC_GPU").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
         );
+        if !spec_gpu {
+            std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+            std::env::set_var("CAMELID_METAL_RESIDENT_PREFILL", "0");
+            tracing::info!(
+                "speculative decoding enabled; selecting the CPU execution plan \
+                 (Metal resident paths disabled server-wide)"
+            );
+        } else {
+            tracing::info!(
+                "speculative decoding enabled with GPU verify (CAMELID_SPEC_GPU=1); \
+                 keeping the resident decode engine for the batched verify"
+            );
+        }
     }
     if let Some(path) = spec_draft_model {
         std::env::set_var("CAMELID_SPEC_DRAFT_MODEL", path);

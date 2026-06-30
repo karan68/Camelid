@@ -300,18 +300,14 @@ impl Client {
         Ok((end, deltas))
     }
 
-    /// `POST /v1/chat/completions` with `stream=false`. Returns
-    /// `(assistant_text, prompt_tokens, completion_tokens)` from the response
-    /// `usage` block.
-    pub fn chat_blocking(
-        &self,
-        request: &Value,
-    ) -> anyhow::Result<(String, Option<u32>, Option<u32>)> {
-        // Read deadline for a non-streaming completion. A fast model answers in
-        // seconds; this is only a ceiling, hit by the slow pure-f32 runnable oracle
-        // lane (e.g. a 9B qwen35 prefilling a long tool prompt at ~1s/token), where a
-        // turn can take many minutes. 30 min keeps those turns from tripping the
-        // timeout without masking a genuinely hung server indefinitely.
+    /// POST a chat request and return the full assistant turn: text content PLUS
+    /// any structured `tool_calls` (OpenAI shape). The server emits structured
+    /// tool calls and EMPTIES `content` on a tool call, so an agent loop MUST read
+    /// `tool_calls` here — reading only the text loses every tool call.
+    pub fn chat_turn(&self, request: &Value) -> anyhow::Result<ChatTurn> {
+        // Read deadline: a fast model answers in seconds; the 30-min ceiling is only
+        // hit by the slow pure-f32 runnable oracle lane (e.g. a 9B qwen35 prefilling a
+        // long tool prompt at ~1s/token), without masking a genuinely hung server.
         let (status, body) = self.request(
             "POST",
             "/v1/chat/completions",
@@ -321,20 +317,76 @@ impl Client {
         if status != 200 {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));
         }
-        let text = body
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let prompt = body
-            .pointer("/usage/prompt_tokens")
-            .and_then(Value::as_u64)
-            .map(|n| n as u32);
-        let completion = body
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64)
-            .map(|n| n as u32);
-        Ok((text, prompt, completion))
+        Ok(parse_chat_turn(&body))
+    }
+
+    /// Text-only convenience over [`chat_turn`] for the plain chat UI (which never
+    /// supplies tools, so `content` always carries the answer).
+    pub fn chat_blocking(
+        &self,
+        request: &Value,
+    ) -> anyhow::Result<(String, Option<u32>, Option<u32>)> {
+        let turn = self.chat_turn(request)?;
+        Ok((turn.content, turn.prompt_tokens, turn.completion_tokens))
+    }
+}
+
+/// One assistant turn from `/v1/chat/completions`.
+pub struct ChatTurn {
+    pub content: String,
+    /// Structured tool calls (OpenAI shape); `content` is empty when this is set.
+    pub tool_calls: Vec<ToolCallOut>,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+}
+
+/// One structured tool call (OpenAI shape): a name + a JSON-encoded args string.
+pub struct ToolCallOut {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Extract the assistant turn (content + structured tool calls + token counts)
+/// from a `/v1/chat/completions` response body.
+fn parse_chat_turn(body: &Value) -> ChatTurn {
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let tool_calls = body
+        .pointer("/choices/0/message/tool_calls")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tc| {
+                    let name = tc
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)?
+                        .to_string();
+                    let arguments = tc
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}")
+                        .to_string();
+                    Some(ToolCallOut { name, arguments })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let prompt_tokens = body
+        .pointer("/usage/prompt_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let completion_tokens = body
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    ChatTurn {
+        content,
+        tool_calls,
+        prompt_tokens,
+        completion_tokens,
     }
 }
 
@@ -681,6 +733,38 @@ fn decode_chunked(mut raw: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_chat_turn_reads_structured_tool_calls() {
+        // The server empties `content` and emits a structured tool_calls array
+        // when the model calls a tool. The agent loop must read it from here.
+        let body = json!({
+            "choices": [{ "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "1", "type": "function",
+                    "function": { "name": "read_file", "arguments": "{\"path\":\"notes.txt\"}" }
+                }]
+            }}],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 7 }
+        });
+        let turn = parse_chat_turn(&body);
+        assert!(turn.content.is_empty());
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "read_file");
+        assert!(turn.tool_calls[0].arguments.contains("notes.txt"));
+        assert_eq!(turn.completion_tokens, Some(7));
+    }
+
+    #[test]
+    fn parse_chat_turn_reads_plain_content() {
+        let body = json!({"choices":[{"message":{"role":"assistant","content":"hello"}}]});
+        let turn = parse_chat_turn(&body);
+        assert_eq!(turn.content, "hello");
+        assert!(turn.tool_calls.is_empty());
+    }
 
     /// Decode a chunked SSE body delivered in several arbitrary socket reads and
     /// confirm the `data:` deltas come out intact and in order, ending at
