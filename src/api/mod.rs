@@ -1668,8 +1668,16 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         "none"
     };
     // The gemma4 runtime (Q8-resident) is ready as soon as it is loaded; the Llama
-    // f32-budget check does not apply to it.
-    let generation_ready = gemma4_available || model.is_some_and(loaded_model_generation_ready);
+    // f32-budget check does not apply to it. Likewise, a model served by the runnable
+    // lane (CAMELID_RUNNABLE_SERVE + a runnable-served arch, e.g. qwen35/Ornith) is
+    // generation-ready once loaded — the runnable serve runtime is built lazily on the
+    // first chat, so gate on "runnable-serve enabled + runnable arch + loaded" rather
+    // than the lazy runtime map (otherwise chat stays locked until you chat → deadlock).
+    let runnable_serve_ready = runnable_serve_enabled()
+        && model.is_some_and(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()));
+    let generation_ready = gemma4_available
+        || runnable_serve_ready
+        || model.is_some_and(loaded_model_generation_ready);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
