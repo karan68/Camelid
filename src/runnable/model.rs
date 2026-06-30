@@ -116,10 +116,17 @@ impl RawMat {
             // Bit-identical to `dequant_row(r)` + `dot`: each element is the same
             // `scale*(q as f32)` (Q8_0) / `from_le_bytes` (F32) and the f32
             // accumulation order is unchanged — only the per-row Vec alloc is gone.
-            GgufTensorType::Q8_0 => Ok((0..self.out_features)
-                .into_par_iter()
-                .map(|r| q8_0_row_dot(&self.bytes[r * rb..(r + 1) * rb], x))
-                .collect()),
+            GgufTensorType::Q8_0 => {
+                // Quantize the f32 activation to Q8 ONCE and reuse it across every
+                // weight row, so each row is an integer maddubs reduction (int8×int8)
+                // rather than i8→f32 + f32-FMA. The quantize is O(in); the matmul it
+                // feeds is O(out·in), so the cost is negligible.
+                let xq = crate::inference::quantize_q8_0_blocks(x);
+                Ok((0..self.out_features)
+                    .into_par_iter()
+                    .map(|r| q8_0_wire_dot(&self.bytes[r * rb..(r + 1) * rb], &xq))
+                    .collect())
+            }
             GgufTensorType::F32 => Ok((0..self.out_features)
                 .into_par_iter()
                 .map(|r| f32_row_dot(&self.bytes[r * rb..(r + 1) * rb], x))
@@ -132,74 +139,84 @@ impl RawMat {
     }
 }
 
-/// Fused Q8_0-row · f32 dot. On x86_64 with AVX2+FMA this dispatches to a vectorized
-/// kernel; otherwise the scalar fallback. The two reductions differ by sub-ULP f32
-/// rounding (8-wide FMA accumulators + one horizontal sum vs a sequential scalar
-/// sum), and neither is bit-identical to llama.cpp's q8×q8 path anyway — the
-/// activations here are f32, never quantized. Parity is greedy-token (argmax) match,
-/// robust to these differences; the 4-prompt parity test (`ornith_qwen35_parity_gen`)
-/// is the empirical gate. `row` is a whole number of 34-byte Q8_0 blocks (f16 scale
-/// + 32 i8); `x.len()` equals the row's element count (a multiple of 32).
-fn q8_0_row_dot(row: &[u8], x: &[f32]) -> f32 {
+/// Fused Q8_0-row · Q8-quantized-activation dot — the int8×int8 kernel the optimized
+/// inference lane uses. The caller quantizes the f32 activation **once** per matvec
+/// (`quantize_q8_0_blocks`) and reuses the blocks across every weight row; each row is
+/// then an integer maddubs reduction (i8×i8 → i16 → i32) instead of the prior
+/// i8→f32-convert + f32-FMA. On x86_64+AVX2 this dispatches to a vectorized maddubs
+/// kernel byte-for-byte equal to the optimized lane's `q8_0_dot_rows_avx2`; otherwise
+/// the shared scalar/NEON reference (`crate::inference::q8_0_wire_row_dot`). Quantizing
+/// the activation makes this numerically *closer* to llama.cpp's own q8×q8 path (which
+/// also quantizes activations) than the prior f32-activation dot was — parity stays
+/// greedy-token (argmax) and is re-certified by `ornith_qwen35_parity_gen`. `row` is a
+/// whole number of 34-byte Q8_0 blocks (f16 scale + 32 i8); `xq` holds the matching
+/// block count (`x.len() / 32`).
+fn q8_0_wire_dot(row: &[u8], xq: &[crate::tensor::Q8_0Block]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            // SAFETY: guarded by the runtime AVX2+FMA feature check above.
-            return unsafe { q8_0_row_dot_avx2(row, x) };
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime AVX2 feature check above.
+            return unsafe { q8_0_wire_dot_avx2(row, xq) };
         }
     }
-    q8_0_row_dot_scalar(row, x)
+    crate::inference::q8_0_wire_row_dot(row, xq)
 }
 
-#[inline]
-fn q8_0_row_dot_scalar(row: &[u8], x: &[f32]) -> f32 {
-    let mut acc = 0.0f32;
-    let mut xi = 0usize;
-    for block in row.chunks_exact(34) {
-        let scale = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        for &qb in &block[2..34] {
-            let f = scale * f32::from(qb as i8);
-            acc += f * x[xi];
-            xi += 1;
-        }
-    }
-    acc
-}
-
-/// AVX2+FMA Q8_0-row · f32 dot. Per 32-element block: broadcast the f16 scale, then
-/// four groups of 8 (i8 → i32 → f32) multiplied by the f32 activations and
-/// FMA-accumulated; one horizontal sum of the 8 lanes at the end.
+/// AVX2 int8×int8 maddubs dot of a wire-format Q8_0 weight row against quantized
+/// activation blocks. Mirrors the optimized lane's `q8_0_dot_rows_avx2` exactly — same
+/// `i8::MIN` overflow guard (maddubs' first operand is unsigned, so `i8::MIN` would
+/// wrap), same sign trick, same in-register horizontal sum — but loads the 32 weight
+/// i8 straight from the wire bytes (contiguous at `base + 2`, after the f16 scale)
+/// rather than a decoded `Q8_0Block`, so no resident weight decode is needed.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn q8_0_row_dot_avx2(row: &[u8], x: &[f32]) -> f32 {
+#[target_feature(enable = "avx2")]
+unsafe fn q8_0_wire_dot_avx2(row: &[u8], input: &[crate::tensor::Q8_0Block]) -> f32 {
     use std::arch::x86_64::*;
-    let mut acc = _mm256_setzero_ps();
-    let mut xi = 0usize;
-    let xptr = x.as_ptr();
-    for block in row.chunks_exact(34) {
-        let scale = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        let scale8 = _mm256_set1_ps(scale);
-        let qptr = block.as_ptr().add(2) as *const i8;
-        let mut g = 0usize;
-        while g < 32 {
-            // 8 i8 -> 8 i32 -> 8 f32
-            let q8 = _mm_loadl_epi64(qptr.add(g) as *const __m128i);
-            let qf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q8));
-            let xv = _mm256_loadu_ps(xptr.add(xi + g));
-            // acc += scale * (q_f32 * x)
-            let p = _mm256_mul_ps(qf, xv);
-            acc = _mm256_fmadd_ps(scale8, p, acc);
-            g += 8;
-        }
-        xi += 32;
+    const WIRE: usize = 34;
+    let ones = _mm256_set1_epi16(1);
+    let min_i8 = _mm256_set1_epi8(i8::MIN);
+    let rptr = row.as_ptr();
+    let mut total_sum = 0.0_f32;
+    for (b, i_block) in input.iter().enumerate() {
+        let base = b * WIRE;
+        let scale = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([row[base], row[base + 1]]));
+        let wptr = rptr.add(base + 2);
+        let weight_i8 = _mm256_loadu_si256(wptr.cast());
+        let input_i8 = _mm256_loadu_si256(i_block.quants.as_ptr().cast());
+
+        let has_min_i8 = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(weight_i8, min_i8))
+            | _mm256_movemask_epi8(_mm256_cmpeq_epi8(input_i8, min_i8)))
+            != 0;
+
+        let acc = if has_min_i8 {
+            // i8::MIN can't be the |weight| operand of maddubs (it's unsigned); widen.
+            let mut acc = _mm256_setzero_si256();
+            for offset in [0usize, 16] {
+                let weight_half = _mm_loadu_si128(wptr.add(offset).cast());
+                let input_half = _mm_loadu_si128(i_block.quants.as_ptr().add(offset).cast());
+                let products = _mm256_mullo_epi16(
+                    _mm256_cvtepi8_epi16(weight_half),
+                    _mm256_cvtepi8_epi16(input_half),
+                );
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(products, ones));
+            }
+            acc
+        } else {
+            let abs_weight = _mm256_sign_epi8(weight_i8, weight_i8);
+            let signed_input = _mm256_sign_epi8(input_i8, weight_i8);
+            _mm256_madd_epi16(_mm256_maddubs_epi16(abs_weight, signed_input), ones)
+        };
+
+        let sum128 = _mm_add_epi32(
+            _mm256_castsi256_si128(acc),
+            _mm256_extracti128_si256(acc, 1),
+        );
+        let sum64 = _mm_add_epi32(sum128, _mm_shuffle_epi32(sum128, 0x4E));
+        let sum32 = _mm_add_epi32(sum64, _mm_shuffle_epi32(sum64, 0xB1));
+        let block_sum = _mm_cvtsi128_si32(sum32);
+        total_sum += block_sum as f32 * scale * i_block.scale;
     }
-    // horizontal sum of the 8 accumulator lanes
-    let lo = _mm256_castps256_ps128(acc);
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let s4 = _mm_add_ps(lo, hi);
-    let s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-    let s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 0x55));
-    _mm_cvtss_f32(s1)
+    total_sum
 }
 
 /// Fused F32-row · f32 dot (no intermediate Vec). Bit-identical to
@@ -225,13 +242,23 @@ impl RawMat {
         let rb = self.row_bytes();
         // flat[r*m + p] = dot(row_r, xs[p]); par over rows so each row is read once.
         let flat: Vec<f32> = match self.tt {
-            GgufTensorType::Q8_0 => (0..out_f)
-                .into_par_iter()
-                .flat_map_iter(|r| {
-                    let row = &self.bytes[r * rb..(r + 1) * rb];
-                    xs.iter().map(move |x| q8_0_row_dot(row, x))
-                })
-                .collect(),
+            GgufTensorType::Q8_0 => {
+                // Quantize each batched activation to Q8 ONCE (outside the per-row
+                // parallel loop), then every row reads the resident weight once and
+                // int8×int8-dots it against all positions — weights streamed once for
+                // the whole batch, activation quantization amortized across all rows.
+                let xqs: Vec<Vec<crate::tensor::Q8_0Block>> = xs
+                    .iter()
+                    .map(|x| crate::inference::quantize_q8_0_blocks(x))
+                    .collect();
+                (0..out_f)
+                    .into_par_iter()
+                    .flat_map_iter(|r| {
+                        let row = &self.bytes[r * rb..(r + 1) * rb];
+                        xqs.iter().map(move |xq| q8_0_wire_dot(row, xq))
+                    })
+                    .collect()
+            }
             GgufTensorType::F32 => (0..out_f)
                 .into_par_iter()
                 .flat_map_iter(|r| {

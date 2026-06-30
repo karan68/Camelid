@@ -38,13 +38,28 @@ validated at 24 tokens (G-LOAD). Coverage: factual, code, English completion, ar
   head-repeat, state orientation, partial NEOX mRoPE (text-collapse), and gated attention
   are bit-correct against the reference.
 
-## Speed (bit-exact rayon row-parallel matvec)
+## Speed (bit-exact rayon row-parallel matvec → int8×int8 maddubs)
 
 The qwen35 runnable path was made row-parallel (`RawMat::par_matvec`, rayon): each output
 element is an independent dot, so per-element sum order is unchanged → **bit-identical**
-(this very 4/4 result was produced by the parallel path, matching the oracle). Effect:
+(the original 4/4 result was produced by the parallel path, matching the oracle). Effect:
 **~30 s/token → ~2.2 s/token (~13×)** on this box, which makes the agent loop feasible
 without perturbing parity. The generic (non-qwen35) runnable lane is untouched.
+
+**Update 2026-06-29 — int8×int8 maddubs kernel (optimized-lane port).** The Q8_0 matmul
+backend (`RawMat::par_matvec`/`par_matmul`) was switched from the int8×f32 dot
+(i8→f32-convert + f32-FMA) to the optimized inference lane's **int8×int8 maddubs** path:
+the f32 activation is quantized to Q8 **once** per matvec (`quantize_q8_0_blocks`) and
+reused across every weight row, which is then an integer maddubs reduction
+(`q8_0_wire_dot_avx2`, byte-for-byte equal to `inference.rs::q8_0_dot_rows_avx2` but
+sourcing the weight i8 straight from the wire bytes — no resident weight decode). Because
+llama.cpp's own Q8_0 path **also** quantizes activations to Q8, this moved camelid
+*closer* to the oracle's arithmetic, and parity is **re-certified 4/4 token-identical** to
+the exact reference IDs above (`ornith_qwen35_parity_gen`, prompt token-ID arrays
+`[[3710,369,279,6511,314,9338,30],[727,73111,1393,1590],[760,13600,314,3882,369],[2427,310,4097,25,220,16,11,220,17,11,220,18,11]]`,
+`n_predict=20`, this build). Effect on this box: **load + 80 generated tokens in 48.7 s ≈
+~0.3 s/token decode** (~31 GB/s, i.e. at the memory-bandwidth ceiling for a 9.5 GB Q8
+model — further CPU speedup needs a smaller quant, not a faster kernel).
 
 ## Known deviation (carried from G-LOAD)
 
