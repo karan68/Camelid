@@ -2925,3 +2925,93 @@ fn sigmoid_mul_matches_cpu() {
     k.ctx.synchronize().unwrap();
     assert!(close(&got, &expected, 2e-3), "sigmoid_mul diverged");
 }
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn ssm_gates_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let nv = 32usize;
+    let mut rng = Lcg(31);
+    let beta_raw: Vec<f32> = (0..nv).map(|_| rng.next_f32() * 3.0).collect();
+    let alpha_raw: Vec<f32> = (0..nv).map(|_| rng.next_f32() * 3.0).collect();
+    let dt_bias: Vec<f32> = (0..nv).map(|_| rng.next_f32()).collect();
+    let a: Vec<f32> = (0..nv).map(|_| -(rng.next_f32() * 0.5 + 0.5)).collect(); // a = -exp(.) <= 0
+    let softplus = |x: f32| if x > 20.0 { x } else { (1.0 + x.exp()).ln() };
+    let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+    let exp_beta: Vec<f32> = beta_raw.iter().map(|&v| sigmoid(v)).collect();
+    let exp_glog: Vec<f32> = (0..nv)
+        .map(|h| softplus(alpha_raw[h] + dt_bias[h]) * a[h])
+        .collect();
+    let dbr = k.stream.clone_htod(&beta_raw).unwrap();
+    let dar = k.stream.clone_htod(&alpha_raw).unwrap();
+    let ddt = k.stream.clone_htod(&dt_bias).unwrap();
+    let da = k.stream.clone_htod(&a).unwrap();
+    let mut dbeta = k.stream.alloc_zeros::<f32>(nv).unwrap();
+    let mut dglog = k.stream.alloc_zeros::<f32>(nv).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (nv as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nvi = nv as i32;
+    let mut b = k.stream.launch_builder(&k.ssm_gates);
+    b.arg(&dbr)
+        .arg(&dar)
+        .arg(&ddt)
+        .arg(&da)
+        .arg(&mut dbeta)
+        .arg(&mut dglog)
+        .arg(&nvi);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got_beta = vec![0f32; nv];
+    let mut got_glog = vec![0f32; nv];
+    k.stream.memcpy_dtoh(&dbeta, &mut got_beta).unwrap();
+    k.stream.memcpy_dtoh(&dglog, &mut got_glog).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got_beta, &exp_beta, 2e-3), "ssm_gates beta diverged");
+    assert!(close(&got_glog, &exp_glog, 2e-3), "ssm_gates glog diverged");
+}
+
+#[test]
+#[ignore = "requires a CUDA device"]
+fn deinterleave_qgate_matches_cpu() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let n_heads = 16usize;
+    let hd = 256usize;
+    let mut rng = Lcg(91);
+    let qg: Vec<f32> = (0..n_heads * 2 * hd).map(|_| rng.next_f32()).collect();
+    let mut exp_q = vec![0f32; n_heads * hd];
+    let mut exp_gate = vec![0f32; n_heads * hd];
+    for h in 0..n_heads {
+        let b = h * hd * 2;
+        exp_q[h * hd..(h + 1) * hd].copy_from_slice(&qg[b..b + hd]);
+        exp_gate[h * hd..(h + 1) * hd].copy_from_slice(&qg[b + hd..b + 2 * hd]);
+    }
+    let dqg = k.stream.clone_htod(&qg).unwrap();
+    let mut dq = k.stream.alloc_zeros::<f32>(n_heads * hd).unwrap();
+    let mut dgate = k.stream.alloc_zeros::<f32>(n_heads * hd).unwrap();
+    let cfg = LaunchConfig {
+        grid_dim: ((n_heads * hd).div_ceil(256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let nh = n_heads as i32;
+    let hdi = hd as i32;
+    let mut b = k.stream.launch_builder(&k.deinterleave_qgate);
+    b.arg(&dqg).arg(&mut dq).arg(&mut dgate).arg(&nh).arg(&hdi);
+    unsafe { b.launch(cfg).unwrap() };
+    let mut got_q = vec![0f32; n_heads * hd];
+    let mut got_gate = vec![0f32; n_heads * hd];
+    k.stream.memcpy_dtoh(&dq, &mut got_q).unwrap();
+    k.stream.memcpy_dtoh(&dgate, &mut got_gate).unwrap();
+    k.ctx.synchronize().unwrap();
+    assert!(close(&got_q, &exp_q, 1e-6), "deinterleave_qgate q diverged");
+    assert!(
+        close(&got_gate, &exp_gate, 1e-6),
+        "deinterleave_qgate gate diverged"
+    );
+}

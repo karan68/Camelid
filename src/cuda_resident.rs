@@ -2089,6 +2089,38 @@ extern "C" __global__ void sigmoid_mul(
     float gv = gate[i];
     out[i] *= 1.0f / (1.0f + expf(-gv));
 }
+
+// ---- SSM gates: beta = sigmoid(beta_raw); glog = softplus(alpha_raw+dt_bias)*a -
+// One thread per value-head (nv). Feeds ssm_delta_rule (beta post-sigmoid, glog
+// pre-exp). softplus matches the CPU's (1+exp(x)).ln() with the x>20 passthrough.
+extern "C" __global__ void ssm_gates(
+    const float* __restrict__ beta_raw, const float* __restrict__ alpha_raw,
+    const float* __restrict__ dt_bias, const float* __restrict__ a,
+    float* __restrict__ beta_out, float* __restrict__ glog_out, int nv
+) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= nv) return;
+    beta_out[h] = 1.0f / (1.0f + expf(-beta_raw[h]));
+    float x = alpha_raw[h] + dt_bias[h];
+    float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+    glog_out[h] = sp * a[h];
+}
+
+// ---- Deinterleave fused per-head [query(hd) | gate(hd)] x n_heads ----------
+// qg is [n_heads * 2 * head_dim]; split into contiguous q_out / gate_out
+// [n_heads*head_dim] (qwen35 full-attention fused query+output-gate projection).
+extern "C" __global__ void deinterleave_qgate(
+    const float* __restrict__ qg, float* __restrict__ q_out,
+    float* __restrict__ gate_out, int n_heads, int head_dim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_heads * head_dim) return;
+    int head = idx / head_dim;
+    int d = idx % head_dim;
+    long src = (long)head * 2 * head_dim;
+    q_out[idx] = qg[src + d];
+    gate_out[idx] = qg[src + head_dim + d];
+}
 "#;
 
 /// Compiled kernel set + a CUDA context/stream, used to run resident-decode
@@ -2144,6 +2176,8 @@ pub struct CudaResidentKernels {
     pub(crate) ssm_conv1d: CudaFunction,
     pub(crate) ssm_delta_rule: CudaFunction,
     pub(crate) sigmoid_mul: CudaFunction,
+    pub(crate) ssm_gates: CudaFunction,
+    pub(crate) deinterleave_qgate: CudaFunction,
     /// Env-gated (CAMELID_ATTN_COALESCED) dispatch of the coalesced K-dot in
     /// split-K pass 1. Read ONCE at construction; default OFF so the shipped
     /// path stays byte-identical.
@@ -2214,6 +2248,8 @@ impl CudaResidentKernels {
             ssm_conv1d: f("ssm_conv1d")?,
             ssm_delta_rule: f("ssm_delta_rule")?,
             sigmoid_mul: f("sigmoid_mul")?,
+            ssm_gates: f("ssm_gates")?,
+            deinterleave_qgate: f("deinterleave_qgate")?,
             attn_coalesced: std::env::var("CAMELID_ATTN_COALESCED")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
