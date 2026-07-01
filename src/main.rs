@@ -571,6 +571,15 @@ enum Command {
         #[arg(long, default_value_t = 24)]
         max_tokens: usize,
     },
+    /// Generate with the CUDA-resident Gemma 4 lane (dev harness for the SSER build).
+    #[cfg(feature = "cuda")]
+    Gemma4CudaGenerate {
+        path: PathBuf,
+        #[arg(long, default_value = "The capital of France is")]
+        prompt: String,
+        #[arg(long, default_value_t = 24)]
+        max_tokens: usize,
+    },
     /// Generate text with a Gemma 4 model on the GPU (resident decode; macOS/Metal).
     Gemma4GenerateGpu {
         path: PathBuf,
@@ -1406,6 +1415,65 @@ async fn main() -> anyhow::Result<()> {
                 ids.len() as f32 / gen
             );
             eprintln!("[gemma4] token_ids: {ids:?}");
+            println!("{prompt}{out}");
+        }
+        #[cfg(feature = "cuda")]
+        Command::Gemma4CudaGenerate {
+            path,
+            prompt,
+            max_tokens,
+        } => {
+            eprintln!("[gemma4-cuda] loading resident {}...", path.display());
+            let t0 = std::time::Instant::now();
+            let mut runtime =
+                camelid::gemma4_runtime::Gemma4CudaResident::load(&path, 4096)?;
+            eprintln!(
+                "[gemma4-cuda] resident loaded in {:.1}s; generating {max_tokens} tokens...",
+                t0.elapsed().as_secs_f32()
+            );
+            let t1 = std::time::Instant::now();
+            let (out, ids, per_token) = runtime.generate_greedy_timed(&prompt, max_tokens)?;
+            let gen = t1.elapsed().as_secs_f32();
+            eprintln!(
+                "[gemma4-cuda] generated in {gen:.1}s ({:.2} tok/s overall incl. prefill)",
+                ids.len() as f32 / gen
+            );
+            // Warm-up curve: mean tok/s over successive 8-token windows of decode-only
+            // wall time (excludes prefill). With the SSER cache ON this should accelerate
+            // as the hot experts populate VRAM.
+            if !per_token.is_empty() {
+                let win = 8usize;
+                eprint!("[gemma4-cuda] warm-up curve (tok/s per {win}-tok window):");
+                let mut i = 0;
+                while i < per_token.len() {
+                    let end = (i + win).min(per_token.len());
+                    let secs: f64 = per_token[i..end].iter().sum();
+                    let n = (end - i) as f64;
+                    eprint!(" [{}-{}]={:.2}", i, end - 1, if secs > 0.0 { n / secs } else { 0.0 });
+                    i = end;
+                }
+                eprintln!();
+                // Steady-state: decode-only tok/s over the SECOND HALF of the tokens
+                // (past warm-up) — the honest cache-warm rate.
+                let half = per_token.len() / 2;
+                let steady: f64 = per_token[half..].iter().sum();
+                let sn = (per_token.len() - half) as f64;
+                let decode_all: f64 = per_token.iter().sum();
+                eprintln!(
+                    "[gemma4-cuda] decode-only: {:.2} tok/s all, {:.2} tok/s steady (2nd half, {} tok)",
+                    per_token.len() as f64 / decode_all.max(1e-9),
+                    sn / steady.max(1e-9),
+                    per_token.len() - half,
+                );
+            }
+            if let Some((hits, misses, resident, cap)) = runtime.sser_stats() {
+                let total = hits + misses;
+                eprintln!(
+                    "[gemma4-cuda] SSER cache: {hits} hits / {misses} misses = {:.1}% hit-rate; {resident}/{cap} experts resident",
+                    if total > 0 { 100.0 * hits as f64 / total as f64 } else { 0.0 }
+                );
+            }
+            eprintln!("[gemma4-cuda] token_ids: {ids:?}");
             println!("{prompt}{out}");
         }
         Command::Gemma4GenerateGpu {

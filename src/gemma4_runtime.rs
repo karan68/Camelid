@@ -1108,6 +1108,98 @@ impl Gemma4Runtime {
         Ok(logits_rows)
     }
 
+    /// Compute the full two-branch FFN output for a MoE (A4B/26B) layer.
+    ///
+    /// `li` is the LOCAL layer index (must have `self.layers[li].moe.is_some()`);
+    /// `attn_out` is the post-attention residual (the current hidden state before
+    /// the FFN). Returns `ffn_out`, the composed dense+expert result that the
+    /// caller ADDS to the residual (`h += ffn_out`).
+    ///
+    /// This is the single source of truth for the MoE FFN math: the CPU forward
+    /// loop calls it for MoE layers, and the CUDA-resident lane reuses it to run
+    /// the (bit-exact) FFN on the CPU while attention stays on the GPU. Keeping the
+    /// math in one place means the two runtimes cannot diverge on the FFN.
+    pub(crate) fn moe_layer_ffn(&self, li: usize, attn_out: &[f32]) -> Vec<f32> {
+        let hidden = self.config.embedding_length as usize;
+        let eps = self.config.rms_norm_epsilon;
+        let l = self.first_layer + li;
+        let ffn_dim = self.g.ffn_length_at(l) as usize;
+        let lw = &self.layers[li];
+        let moe = lw
+            .moe
+            .as_ref()
+            .expect("moe_layer_ffn called on a non-MoE layer");
+
+        // Dense "shared expert" MLP branch: ffn_norm -> parallel GeGLU -> down.
+        let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
+        let xnq = quantize_q8_0_blocks(&xn);
+        let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
+        let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| gelu_tanh(*g) * u)
+            .collect();
+        let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
+        // Dense branch keeps its own post-norm (post_norm_1).
+        let mlp = rms_norm(&mlp, Some(&moe.post_norm_1), eps);
+
+        // Router runs on attn_out with its OWN weightless norm, scaled by
+        // 1/sqrt(n_embd), then the elementwise gate_inp_scale.
+        let mut r = rms_norm(attn_out, None, eps);
+        let inv = 1.0f32 / (hidden as f32).sqrt();
+        for (rv, sv) in r.iter_mut().zip(&moe.gate_inp_scale) {
+            *rv = *rv * inv * sv;
+        }
+        let logits = f32_matvec(&moe.gate_inp, hidden, moe.n_expert, &r);
+        // softmax over all experts, then top-k by probability.
+        let maxl = logits.iter().cloned().fold(f32::MIN, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let mut idx: Vec<usize> = (0..moe.n_expert).collect();
+        idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b)));
+        idx.truncate(moe.n_expert_used);
+        if std::env::var_os("CAMELID_GEMMA4_ROUTE_TRACE").is_some() {
+            eprintln!("[route] l={l} e={idx:?}");
+        }
+        // sum-normalize the selected weights (clamped), w_scale=1.
+        let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+        wsum = wsum.max(6.103_515e-5);
+
+        let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
+        let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
+        let two_nff = 2 * moe.n_ff_exp;
+        let mut moe_acc = vec![0f32; hidden];
+        for &e in &idx {
+            let w = probs[e] / wsum;
+            // fused gate‖up for expert e: rows e*2nff .. +2nff, in_dim=n_embd.
+            let gate_up = moe
+                .gate_up_exps
+                .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q);
+            let hexp: Vec<f32> = (0..moe.n_ff_exp)
+                .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + moe.n_ff_exp])
+                .collect();
+            let hexp_q = quantize_q8_0_blocks(&hexp);
+            // down for expert e: rows e*n_embd .. +n_embd, in_dim=n_ff_exp.
+            let y = moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q);
+            let scale = moe.down_exps_scale[e] * w;
+            for (a, yv) in moe_acc.iter_mut().zip(&y) {
+                *a += yv * scale;
+            }
+        }
+        let cur_moe = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
+
+        // combine the two branches, then the shared post_ffw_norm.
+        let mut combined = mlp;
+        for (c, m) in combined.iter_mut().zip(&cur_moe) {
+            *c += m;
+        }
+        rms_norm(&combined, Some(&lw.post_ffw_norm), eps)
+    }
+
     /// One token's forward over the locally-loaded layer range.
     ///
     /// `h_in` is the hidden state arriving from the upstream shard (`None` on
@@ -1327,82 +1419,23 @@ impl Gemma4Runtime {
             }
             attn_us += t_layer.elapsed().as_micros() as u64;
             let t_ffn = std::time::Instant::now();
-            // Dense "shared expert" MLP branch (also the whole FFN on dense rows):
-            // ffn_norm -> parallel GeGLU -> down. On dense rows this is followed
-            // directly by post_ffw_norm + residual; on MoE rows it gets its own
-            // post_norm_1 and is summed with the expert branch first.
-            let xn = rms_norm(&h, Some(&lw.ffn_norm), eps);
-            let xnq = quantize_q8_0_blocks(&xn);
-            let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
-            let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
-            let act: Vec<f32> = gate
-                .iter()
-                .zip(&up)
-                .map(|(g, u)| gelu_tanh(*g) * u)
-                .collect();
-            let mut mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
-
-            let ffn_out = if let Some(moe) = lw.moe.as_ref() {
-                // attn_out is the current `h` (post-attention residual) — every
-                // branch reads it, so snapshot before any write.
-                let attn_out = &h;
-                // Dense branch keeps its own post-norm (post_norm_1).
-                mlp = rms_norm(&mlp, Some(&moe.post_norm_1), eps);
-
-                // Router runs on attn_out with its OWN weightless norm, scaled by
-                // 1/sqrt(n_embd), then the elementwise gate_inp_scale.
-                let mut r = rms_norm(attn_out, None, eps);
-                let inv = 1.0f32 / (hidden as f32).sqrt();
-                for (rv, sv) in r.iter_mut().zip(&moe.gate_inp_scale) {
-                    *rv = *rv * inv * sv;
-                }
-                let logits = f32_matvec(&moe.gate_inp, hidden, moe.n_expert, &r);
-                // softmax over all experts, then top-k by probability.
-                let maxl = logits.iter().cloned().fold(f32::MIN, f32::max);
-                let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-                let sum: f32 = probs.iter().sum();
-                for p in probs.iter_mut() {
-                    *p /= sum;
-                }
-                let mut idx: Vec<usize> = (0..moe.n_expert).collect();
-                idx.sort_unstable_by(|&a, &b| {
-                    probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b))
-                });
-                idx.truncate(moe.n_expert_used);
-                // sum-normalize the selected weights (clamped), w_scale=1.
-                let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
-                wsum = wsum.max(6.103_515e-5);
-
-                let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
-                let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
-                let two_nff = 2 * moe.n_ff_exp;
-                let mut moe_acc = vec![0f32; hidden];
-                for &e in &idx {
-                    let w = probs[e] / wsum;
-                    // fused gate‖up for expert e: rows e*2nff .. +2nff, in_dim=n_embd.
-                    let gate_up = moe
-                        .gate_up_exps
-                        .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q);
-                    let hexp: Vec<f32> = (0..moe.n_ff_exp)
-                        .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + moe.n_ff_exp])
-                        .collect();
-                    let hexp_q = quantize_q8_0_blocks(&hexp);
-                    // down for expert e: rows e*n_embd .. +n_embd, in_dim=n_ff_exp.
-                    let y = moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q);
-                    let scale = moe.down_exps_scale[e] * w;
-                    for (a, yv) in moe_acc.iter_mut().zip(&y) {
-                        *a += yv * scale;
-                    }
-                }
-                let cur_moe = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
-
-                // combine the two branches, then the shared post_ffw_norm.
-                let mut combined = mlp;
-                for (c, m) in combined.iter_mut().zip(&cur_moe) {
-                    *c += m;
-                }
-                rms_norm(&combined, Some(&lw.post_ffw_norm), eps)
+            // FFN. MoE (A4B/26B) rows run the two-branch dense+expert block via
+            // the shared `moe_layer_ffn` helper (single source of truth, also used
+            // by the CUDA-resident lane); dense rows run just the shared-expert MLP:
+            // ffn_norm -> parallel GeGLU -> down -> post_ffw_norm.
+            let ffn_out = if lw.moe.is_some() {
+                self.moe_layer_ffn(li, &h)
             } else {
+                let xn = rms_norm(&h, Some(&lw.ffn_norm), eps);
+                let xnq = quantize_q8_0_blocks(&xn);
+                let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
+                let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+                let act: Vec<f32> = gate
+                    .iter()
+                    .zip(&up)
+                    .map(|(g, u)| gelu_tanh(*g) * u)
+                    .collect();
+                let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
                 rms_norm(&mlp, Some(&lw.post_ffw_norm), eps)
             };
             for (a, b) in h.iter_mut().zip(&ffn_out) {
@@ -2324,6 +2357,69 @@ struct Gemma4PleCtxDev {
     embed_scale: f32,
 }
 
+/// One cached MoE expert's two Q4_0 weight slices, resident on the GPU. `gate_up`
+/// is the fused gate‖up rows (`2*n_ff_exp × hidden`) and `down` is the down rows
+/// (`hidden × n_ff_exp`) — the exact byte ranges `moe_layer_ffn`'s CPU path reads
+/// from the mmap for this expert. `last_used` is the LRU recency stamp.
+#[cfg(feature = "cuda")]
+struct SserExpertDev {
+    gate_up: cudarc::driver::CudaSlice<u8>,
+    down: cudarc::driver::CudaSlice<u8>,
+    last_used: u64,
+}
+
+/// SSER (self-specializing expert residency) VRAM cache: a per-(layer,expert) LRU
+/// of Q4_0 expert weight slices. A single user's session fires a skewed, stable
+/// subset of the experts; keeping the hot ones resident lets their two GEMVs run on
+/// the GPU (336 GB/s) instead of the CPU (the ~187 ms/token MoE wall). Gated behind
+/// `CAMELID_SSER_CACHE` (off = M1 all-CPU MoE); capacity `CAMELID_SSER_CACHE_EXPERTS`
+/// (#experts). Eviction is LRU on miss-when-full. Bit-exact: the GPU `q4_0_gemv` is
+/// proven bit-identical to the CPU `q4_0_wire_row_dot` the cache-miss path uses.
+#[cfg(feature = "cuda")]
+struct SserCache {
+    entries: std::collections::HashMap<(u16, u16), SserExpertDev>,
+    capacity: usize,
+    clock: u64,
+    // Diagnostics (per-generate; reset by the harness before each run).
+    hits: u64,
+    misses: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl SserCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            capacity: capacity.max(1),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Mark `key` most-recently-used and return true if resident.
+    fn touch(&mut self, key: (u16, u16)) -> bool {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(e) = self.entries.get_mut(&key) {
+            e.last_used = clock;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Evict the least-recently-used entry if at capacity (called before an insert).
+    fn evict_if_full(&mut self) {
+        if self.entries.len() < self.capacity {
+            return;
+        }
+        if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, e)| e.last_used) {
+            self.entries.remove(&victim);
+        }
+    }
+}
+
 /// CUDA gemma4 decode engine (Windows/NVIDIA). Wraps a CPU-loaded [`Gemma4Runtime`]
 /// for weights/config/tokenizer and runs the per-token forward through the shared
 /// `crate::cuda_resident` kernels. Layer projection weights are streamed from the
@@ -2406,6 +2502,14 @@ pub struct Gemma4CudaResident {
     d_ple_gated2: cudarc::driver::CudaSlice<f32>,
     d_ple_proj: cudarc::driver::CudaSlice<f32>,
     d_ple_normed: cudarc::driver::CudaSlice<f32>,
+    // SSER (M2): per-(layer,expert) VRAM LRU of Q4_0 expert slices. `None` when
+    // `CAMELID_SSER_CACHE` is unset (M1 all-CPU MoE). Wrapped in a `RefCell` so the
+    // cached FFN can mutate the LRU/counters through a shared `&self` — the per-token
+    // forward loop holds long-lived immutable borrows of `self.kernels`/`self.cpu`
+    // that a `&mut self` MoE call would conflict with. Device scratch for the expert
+    // GEMVs is allocated locally per call (batch-1 tiny GEMVs are launch-bound, so the
+    // alloc is negligible and it keeps the hot path `&self`).
+    sser: Option<std::cell::RefCell<SserCache>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -2631,6 +2735,42 @@ impl Gemma4CudaResident {
 
         let alloc_f = |n: usize| s.alloc_zeros::<f32>(n.max(1));
         let alloc_i = |n: usize| s.alloc_zeros::<i8>(n.max(1));
+        // SSER (M2): enable the per-(layer,expert) VRAM cache only when the model has
+        // MoE layers AND the flag is set. Capacity defaults to ~1000 experts (the
+        // measured hot set); each cached expert is ~2*n_ff_exp*(hidden/32)*18 +
+        // hidden*(n_ff_exp/32)*18 bytes of Q4_0 wire (~3.3 MB on the 26B), so ~1000
+        // experts ≈ ~3.3 GB — under the ~3.6 GB free after the resident set. Tunable
+        // via CAMELID_SSER_CACHE_EXPERTS.
+        let first_moe = cpu.layers.iter().find_map(|lw| lw.moe.as_ref());
+        let sser = if let (Some(moe), true) =
+            (first_moe, std::env::var_os("CAMELID_SSER_CACHE").is_some())
+        {
+            // Per-expert VRAM cost: the two Q4_0 slices this expert's GEMVs read.
+            // gate_up = 2*n_ff_exp rows of hidden values; down = hidden rows of
+            // n_ff_exp values; Q4_0 packs 32 values per 18-byte block.
+            const WB: usize = crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+            let two_nff = 2 * moe.n_ff_exp;
+            let per_expert_bytes = two_nff * (hidden / 32) * WB + hidden * (moe.n_ff_exp / 32) * WB;
+            // Budget: keep the cache under ~80% of the free VRAM after the resident set
+            // (leaving headroom for the per-token scratch + the KV cache growth).
+            let (free, _total) = cudarc::driver::result::mem_get_info().unwrap_or((0, 0));
+            let budget = (free as f64 * 0.80) as usize;
+            let fit_cap = budget.checked_div(per_expert_bytes).unwrap_or(0);
+            let req_cap = std::env::var("CAMELID_SSER_CACHE_EXPERTS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1000);
+            // Honor the smaller of the requested capacity and what free VRAM allows.
+            let cap = req_cap.min(fit_cap).max(1);
+            eprintln!(
+                "[sser] expert-residency cache ON: capacity {cap} experts ({} MiB each; requested {req_cap}, VRAM-fit {fit_cap}; {} MiB free)",
+                per_expert_bytes / (1024 * 1024),
+                free / (1024 * 1024),
+            );
+            Some(SserCache::new(cap))
+        } else {
+            None
+        };
         let me = Self {
             norms,
             lweights,
@@ -2674,6 +2814,7 @@ impl Gemma4CudaResident {
             d_ple_gated2: alloc_f(ple_dim).map_err(cu)?,
             d_ple_proj: alloc_f(hidden).map_err(cu)?,
             d_ple_normed: alloc_f(hidden).map_err(cu)?,
+            sser: sser.map(std::cell::RefCell::new),
             plan,
             kernels,
             cap_stream,
@@ -2681,6 +2822,15 @@ impl Gemma4CudaResident {
             gpu_ple_ctx,
             cpu,
         };
+        // Every device slice above was allocated + zeroed (`alloc_zeros`) on the DEFAULT
+        // stream (`kernels.stream`), but the per-token forward runs on `cap_stream`. With
+        // event-tracking disabled during load there is no automatic cross-stream ordering,
+        // so the first forward's uploads on `cap_stream` (e.g. the RoPE cos/sin table) can
+        // race the still-in-flight load-time memsets on the default stream — which then
+        // clobber the just-uploaded values with zeros (observed: cos=0 at position 0 →
+        // K zeroed → wrong tokens). Drain the default stream here so all load-time zeroing
+        // is complete before any cap_stream work begins.
+        me.kernels.stream.synchronize().map_err(cu)?;
         // Re-enable cudarc's auto event-tracking now that every gemma4 device slice is
         // allocated. Those slices were created while it was off, so they carry no
         // CudaEvents and the decode-graph capture stays clean; restoring it here keeps
@@ -2696,6 +2846,240 @@ impl Gemma4CudaResident {
 
     pub fn layer_plan(&self) -> &[crate::model::Gemma4LayerPlan] {
         &self.plan
+    }
+
+    /// SSER cache diagnostics: `(hits, misses, resident_experts, capacity)`.
+    /// `None` when the cache is disabled (`CAMELID_SSER_CACHE` unset).
+    pub fn sser_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        self.sser.as_ref().map(|c| {
+            let c = c.borrow();
+            (c.hits, c.misses, c.entries.len(), c.capacity)
+        })
+    }
+
+    /// Reset the SSER hit/miss counters (keeps resident weights). Lets the harness
+    /// separate warm-up misses from steady-state hit-rate. No-op when disabled.
+    pub fn sser_reset_counters(&self) {
+        if let Some(c) = self.sser.as_ref() {
+            let mut c = c.borrow_mut();
+            c.hits = 0;
+            c.misses = 0;
+        }
+    }
+
+    /// SSER (M2) MoE FFN: bit-parallel twin of `Gemma4Runtime::moe_layer_ffn`, but
+    /// each selected expert's two GEMVs run on the GPU when the (layer,expert) is
+    /// cached in VRAM, else on the CPU (+ promote into the cache). The dense
+    /// "shared expert" branch, the router, and every norm run on the CPU exactly as
+    /// M1 — only the 8 expert GEMVs move. `attn_out` is the post-attention residual
+    /// (already copied device->host by the caller). Returns the FFN output to add to
+    /// the residual (same contract as `moe_layer_ffn`).
+    ///
+    /// Parity: the GPU `q4_0_gemv` is bit-identical to the CPU `q4_0_wire_row_dot`
+    /// the miss path uses (proven in `q4_0_gemv_matches_oracle`), and the GPU GeGLU
+    /// (`geglu_mul`) matches `gelu_tanh` within the accepted f16-KV/tanhf floor — so
+    /// cached and uncached experts produce the same content tokens as M1.
+    #[allow(clippy::too_many_lines)]
+    fn moe_layer_ffn_cached(&self, li: usize, attn_out: &[f32]) -> Result<Vec<f32>> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        let s = self.cap_stream.clone();
+        let k = &self.kernels;
+        let hidden = self.hidden;
+        let eps = self.eps;
+        let cpu = &self.cpu;
+        let lw = &cpu.layers[li];
+        let l = cpu.first_layer + li;
+        let ffn_dim = cpu.g.ffn_length_at(l) as usize;
+        let moe = lw
+            .moe
+            .as_ref()
+            .expect("moe_layer_ffn_cached called on a non-MoE layer");
+        let sser = self
+            .sser
+            .as_ref()
+            .expect("moe_layer_ffn_cached requires the SSER cache");
+
+        // --- Dense "shared expert" MLP branch (CPU, identical to moe_layer_ffn). ---
+        let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
+        let xnq = quantize_q8_0_blocks(&xn);
+        let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
+        let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
+        let act: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(g, u)| gelu_tanh(*g) * u)
+            .collect();
+        let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
+        let mlp = rms_norm(&mlp, Some(&moe.post_norm_1), eps);
+
+        // --- Router (CPU, identical). ---
+        let mut r = rms_norm(attn_out, None, eps);
+        let inv = 1.0f32 / (hidden as f32).sqrt();
+        for (rv, sv) in r.iter_mut().zip(&moe.gate_inp_scale) {
+            *rv = *rv * inv * sv;
+        }
+        let logits = f32_matvec(&moe.gate_inp, hidden, moe.n_expert, &r);
+        let maxl = logits.iter().cloned().fold(f32::MIN, f32::max);
+        let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+        let sum: f32 = probs.iter().sum();
+        for p in probs.iter_mut() {
+            *p /= sum;
+        }
+        let mut idx: Vec<usize> = (0..moe.n_expert).collect();
+        idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap().then(a.cmp(&b)));
+        idx.truncate(moe.n_expert_used);
+        if std::env::var_os("CAMELID_GEMMA4_ROUTE_TRACE").is_some() {
+            eprintln!("[route] l={l} e={idx:?}");
+        }
+        let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
+        wsum = wsum.max(6.103_515e-5);
+
+        // --- Expert branch: quantize the shared input once (CPU), upload once. ---
+        let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
+        let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
+        let two_nff = 2 * moe.n_ff_exp;
+        let nff = moe.n_ff_exp;
+        let gu_blocks = hidden / 32; // gate_up in_dim = hidden
+        let down_blocks = nff / 32; // down in_dim = n_ff_exp
+        let gu_row_bytes = gu_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+        let down_row_bytes = down_blocks * crate::inference::Q4_0_WIRE_BYTES_PER_BLOCK;
+
+        // Upload the shared Q8_0 expert input (scales + concatenated i8 quants) once —
+        // every selected expert dots against the same activation. Device scratch is
+        // allocated locally (keeps the hot path `&self`; batch-1 GEMVs are launch-bound
+        // so the alloc cost is negligible next to the per-expert launch overhead).
+        let in_scales: Vec<f32> = cur_moe_q.iter().map(|b| b.scale).collect();
+        let mut in_quants = vec![0i8; gu_blocks * 32];
+        for (b, blk) in cur_moe_q.iter().enumerate() {
+            in_quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+        }
+        let d_in_s = s.clone_htod(&in_scales).map_err(cu)?;
+        let d_in_q = s.clone_htod(&in_quants).map_err(cu)?;
+        let mut d_gate_up = s.alloc_zeros::<f32>(two_nff).map_err(cu)?;
+        let mut d_geglu = s.alloc_zeros::<f32>(nff).map_err(cu)?;
+        let mut d_geglu_q = s.alloc_zeros::<i8>(nff).map_err(cu)?;
+        let mut d_geglu_s = s.alloc_zeros::<f32>(down_blocks).map_err(cu)?;
+        let mut d_y = s.alloc_zeros::<f32>(hidden).map_err(cu)?;
+
+        let gate_up_bytes = moe.gate_up_exps.bytes();
+        let down_bytes = moe.down_exps.bytes();
+
+        let mut moe_acc = vec![0f32; hidden];
+        for &e in &idx {
+            let w = probs[e] / wsum;
+            let scale = moe.down_exps_scale[e] * w;
+            let key = (l as u16, e as u16);
+
+            let cached = sser.borrow_mut().touch(key);
+            if cached {
+                // --- GPU path: fused gate‖up GEMV -> GeGLU -> quantize -> down GEMV. ---
+                // Hold the shared cache borrow for the whole launch sequence so the
+                // resident weight views stay valid; the `touch` above already bumped
+                // recency, so no entry can be evicted while this borrow is live.
+                let c = sser.borrow();
+                let ent = c.entries.get(&key).expect("touch confirmed residency");
+                let gu_dev = ent.gate_up.slice(0..ent.gate_up.len());
+                let down_dev = ent.down.slice(0..ent.down.len());
+                // gate‖up: two_nff rows, gu_blocks blocks/row.
+                crate::cuda_resident::launch_q4_0_gemv(
+                    &s,
+                    &k.q4_0_gemv,
+                    &d_in_s,
+                    &d_in_q,
+                    &gu_dev,
+                    two_nff,
+                    gu_blocks,
+                    &mut d_gate_up,
+                    0,
+                )
+                .map_err(cu)?;
+                // GeGLU: gelu_tanh(gate[o]) * up[o] where gate = out[0..nff], up = out[nff..2nff].
+                {
+                    let gate_v = d_gate_up.slice(0..nff);
+                    let up_v = d_gate_up.slice(nff..two_nff);
+                    let cfg = LaunchConfig {
+                        grid_dim: ((nff as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let n_i = nff as i32;
+                    let mut b = s.launch_builder(&k.geglu_mul);
+                    b.arg(&gate_v).arg(&up_v).arg(&mut d_geglu).arg(&n_i);
+                    unsafe { b.launch(cfg) }.map_err(cu)?;
+                }
+                crate::cuda_resident::launch_quantize(
+                    &s,
+                    &k.quantize,
+                    &d_geglu,
+                    &mut d_geglu_q,
+                    &mut d_geglu_s,
+                    down_blocks,
+                )
+                .map_err(cu)?;
+                // down: hidden rows, down_blocks blocks/row.
+                crate::cuda_resident::launch_q4_0_gemv(
+                    &s,
+                    &k.q4_0_gemv,
+                    &d_geglu_s,
+                    &d_geglu_q,
+                    &down_dev,
+                    hidden,
+                    down_blocks,
+                    &mut d_y,
+                    0,
+                )
+                .map_err(cu)?;
+                drop(c);
+                sser.borrow_mut().hits += 1;
+                let mut y = vec![0f32; hidden];
+                s.memcpy_dtoh(&d_y, &mut y).map_err(cu)?;
+                s.synchronize().map_err(cu)?;
+                for (a, yv) in moe_acc.iter_mut().zip(&y) {
+                    *a += yv * scale;
+                }
+            } else {
+                // --- CPU miss path (bit-identical to M1 moe_layer_ffn), then promote. ---
+                sser.borrow_mut().misses += 1;
+                let gate_up = moe
+                    .gate_up_exps
+                    .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q);
+                let hexp: Vec<f32> = (0..nff)
+                    .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + nff])
+                    .collect();
+                let hexp_q = quantize_q8_0_blocks(&hexp);
+                let y = moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q);
+                for (a, yv) in moe_acc.iter_mut().zip(&y) {
+                    *a += yv * scale;
+                }
+                // Promote: upload this expert's two Q4_0 slices into the VRAM cache.
+                let gu_off = e * two_nff * gu_row_bytes;
+                let down_off = e * hidden * down_row_bytes;
+                let gu_slice = &gate_up_bytes[gu_off..gu_off + two_nff * gu_row_bytes];
+                let down_slice = &down_bytes[down_off..down_off + hidden * down_row_bytes];
+                let gu_dev = s.clone_htod(gu_slice).map_err(cu)?;
+                let down_dev = s.clone_htod(down_slice).map_err(cu)?;
+                let mut c = sser.borrow_mut();
+                c.evict_if_full();
+                c.clock += 1;
+                let stamp = c.clock;
+                c.entries.insert(
+                    key,
+                    SserExpertDev {
+                        gate_up: gu_dev,
+                        down: down_dev,
+                        last_used: stamp,
+                    },
+                );
+            }
+        }
+        let cur_moe = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
+
+        // Combine the two branches, then the shared post_ffw_norm (CPU, identical).
+        let mut combined = mlp;
+        for (c, m) in combined.iter_mut().zip(&cur_moe) {
+            *c += m;
+        }
+        Ok(rms_norm(&combined, Some(&lw.post_ffw_norm), eps))
     }
 
     /// One token's forward; returns next-token logits. Mirrors the CPU
@@ -2852,7 +3236,13 @@ impl Gemma4CudaResident {
         // Record the graph only AFTER a warmup pass: a kernel's first launch does
         // lazy init (module/function load) which is not stream-capturable. The warmup
         // call runs the loop directly; the next call captures it; later calls replay.
-        let do_capture = self.decode_graph.is_none() && self.warmed;
+        //
+        // MoE (A4B/26B) rows compute their FFN on the CPU via a per-layer device<->host
+        // round-trip (synchronize + memcpy). That CANNOT live inside a captured/replayed
+        // graph, so disable capture entirely for any model with a MoE layer and always
+        // run the explicit per-launch path. (Dense/E-series models keep the graph.)
+        let has_moe = self.cpu.layers.iter().any(|lw| lw.moe.is_some());
+        let do_capture = !has_moe && self.decode_graph.is_none() && self.warmed;
         if do_capture {
             use cudarc::driver::sys;
             s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
@@ -3134,103 +3524,138 @@ impl Gemma4CudaResident {
                 )
                 .map_err(cu)?;
 
-                // FFN: norm + quantize -> gate/up -> GeGLU -> quantize -> down -> post-ffw norm -> residual.
-                crate::cuda_resident::launch_rmsnorm(
-                    &s,
-                    &k.rms_norm,
-                    &self.d_hidden,
-                    &nrm.ffn_norm,
-                    &mut self.d_normed,
-                    hidden,
-                    eps,
-                )
-                .map_err(cu)?;
-                crate::cuda_resident::launch_quantize(
-                    &s,
-                    &k.quantize,
-                    &self.d_normed,
-                    &mut self.d_inq,
-                    &mut self.d_ins,
-                    hidden / 32,
-                )
-                .map_err(cu)?;
-                gemma_proj_gemv(
-                    &s,
-                    k,
-                    lwd.gate_q,
-                    &self.d_ins,
-                    &self.d_inq,
-                    &lwd.gate.slice(0..lwd.gate.len()),
-                    ffn_dim,
-                    hidden / 32,
-                    &mut self.d_gate,
-                )
-                .map_err(cu)?;
-                gemma_proj_gemv(
-                    &s,
-                    k,
-                    lwd.up_q,
-                    &self.d_ins,
-                    &self.d_inq,
-                    &lwd.up.slice(0..lwd.up.len()),
-                    ffn_dim,
-                    hidden / 32,
-                    &mut self.d_up,
-                )
-                .map_err(cu)?;
-                {
-                    let cfg = LaunchConfig {
-                        grid_dim: ((ffn_dim as u32).div_ceil(256), 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
+                // FFN. MoE (A4B/26B) rows run the full two-branch dense+expert
+                // block on the CPU via the shared bit-exact `moe_layer_ffn` helper
+                // (attention stays on the GPU): copy attn_out device->host, compute
+                // ffn_out, copy back, and add it to the residual. The GPU dense-FFN
+                // kernels below run ONLY on dense rows (never both, or the dense
+                // branch would be double-counted). Note: `moe_layer_ffn` reads the
+                // post-attention residual `d_hidden` — that must be settled first,
+                // so synchronize the stream before the host copy.
+                if lw.moe.is_some() {
+                    s.synchronize().map_err(cu)?;
+                    let mut attn_out_host = vec![0f32; hidden];
+                    s.memcpy_dtoh(&self.d_hidden, &mut attn_out_host)
+                        .map_err(cu)?;
+                    // SSER (M2): when the VRAM expert cache is enabled, dispatch the
+                    // 8 selected experts' GEMVs to the GPU when cached (else CPU +
+                    // promote). Off = M1's full-CPU MoE FFN. `moe_layer_ffn_cached`
+                    // takes `&self` (the LRU is behind a RefCell), so it coexists with
+                    // the loop-level `&self.kernels` borrow.
+                    let ffn_out = if self.sser.is_some() {
+                        self.moe_layer_ffn_cached(li, &attn_out_host)?
+                    } else {
+                        self.cpu.moe_layer_ffn(li, &attn_out_host)
                     };
-                    let n_i = ffn_dim as i32;
-                    let mut b = s.launch_builder(&k.geglu_mul);
-                    b.arg(&self.d_gate)
-                        .arg(&self.d_up)
-                        .arg(&mut self.d_geglu)
-                        .arg(&n_i);
-                    unsafe { b.launch(cfg) }.map_err(cu)?;
+                    s.memcpy_htod(&ffn_out, &mut self.d_ffn_out).map_err(cu)?;
+                    crate::cuda_resident::launch_residual(
+                        &s,
+                        &k.residual_add,
+                        &mut self.d_hidden,
+                        &self.d_ffn_out,
+                        hidden,
+                    )
+                    .map_err(cu)?;
+                } else {
+                    // Dense row: norm + quantize -> gate/up -> GeGLU -> quantize ->
+                    // down -> post-ffw norm -> residual, all on the GPU.
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &self.d_hidden,
+                        &nrm.ffn_norm,
+                        &mut self.d_normed,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_quantize(
+                        &s,
+                        &k.quantize,
+                        &self.d_normed,
+                        &mut self.d_inq,
+                        &mut self.d_ins,
+                        hidden / 32,
+                    )
+                    .map_err(cu)?;
+                    gemma_proj_gemv(
+                        &s,
+                        k,
+                        lwd.gate_q,
+                        &self.d_ins,
+                        &self.d_inq,
+                        &lwd.gate.slice(0..lwd.gate.len()),
+                        ffn_dim,
+                        hidden / 32,
+                        &mut self.d_gate,
+                    )
+                    .map_err(cu)?;
+                    gemma_proj_gemv(
+                        &s,
+                        k,
+                        lwd.up_q,
+                        &self.d_ins,
+                        &self.d_inq,
+                        &lwd.up.slice(0..lwd.up.len()),
+                        ffn_dim,
+                        hidden / 32,
+                        &mut self.d_up,
+                    )
+                    .map_err(cu)?;
+                    {
+                        let cfg = LaunchConfig {
+                            grid_dim: ((ffn_dim as u32).div_ceil(256), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let n_i = ffn_dim as i32;
+                        let mut b = s.launch_builder(&k.geglu_mul);
+                        b.arg(&self.d_gate)
+                            .arg(&self.d_up)
+                            .arg(&mut self.d_geglu)
+                            .arg(&n_i);
+                        unsafe { b.launch(cfg) }.map_err(cu)?;
+                    }
+                    crate::cuda_resident::launch_quantize(
+                        &s,
+                        &k.quantize,
+                        &self.d_geglu,
+                        &mut self.d_geglu_q,
+                        &mut self.d_geglu_s,
+                        ffn_dim / 32,
+                    )
+                    .map_err(cu)?;
+                    gemma_proj_gemv(
+                        &s,
+                        k,
+                        lwd.down_q,
+                        &self.d_geglu_s,
+                        &self.d_geglu_q,
+                        &lwd.down.slice(0..lwd.down.len()),
+                        hidden,
+                        ffn_dim / 32,
+                        &mut self.d_ffn_out,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &self.d_ffn_out,
+                        &nrm.post_ffw_norm,
+                        &mut self.d_normed,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_residual(
+                        &s,
+                        &k.residual_add,
+                        &mut self.d_hidden,
+                        &self.d_normed,
+                        hidden,
+                    )
+                    .map_err(cu)?;
                 }
-                crate::cuda_resident::launch_quantize(
-                    &s,
-                    &k.quantize,
-                    &self.d_geglu,
-                    &mut self.d_geglu_q,
-                    &mut self.d_geglu_s,
-                    ffn_dim / 32,
-                )
-                .map_err(cu)?;
-                gemma_proj_gemv(
-                    &s,
-                    k,
-                    lwd.down_q,
-                    &self.d_geglu_s,
-                    &self.d_geglu_q,
-                    &lwd.down.slice(0..lwd.down.len()),
-                    hidden,
-                    ffn_dim / 32,
-                    &mut self.d_ffn_out,
-                )
-                .map_err(cu)?;
-                crate::cuda_resident::launch_rmsnorm(
-                    &s,
-                    &k.rms_norm,
-                    &self.d_ffn_out,
-                    &nrm.post_ffw_norm,
-                    &mut self.d_normed,
-                    hidden,
-                    eps,
-                )
-                .map_err(cu)?;
-                crate::cuda_resident::launch_residual(
-                    &s,
-                    &k.residual_add,
-                    &mut self.d_hidden,
-                    &self.d_normed,
-                    hidden,
-                )
-                .map_err(cu)?;
 
                 // PLE injection on the GPU (no host round-trip): gated = inp_gate·h ->
                 // gelu_tanh(gated)*pli[li] -> proj·gated -> post_norm -> residual -> output_scale.
@@ -3525,6 +3950,40 @@ impl Gemma4CudaResident {
         self.cached_tokens.extend_from_slice(&generated);
         let text = self.cpu.tokenizer.decode(&generated, true)?;
         Ok((text, generated))
+    }
+
+    /// Greedy generate returning per-decode-token wall-clock times (seconds), for the
+    /// SSER warm-up-curve measurement. `per_token[i]` is the time to produce
+    /// `generated[i]` (the forward that emitted the NEXT logits), excluding prefill.
+    pub fn generate_greedy_timed(
+        &mut self,
+        prompt: &str,
+        max_new: usize,
+    ) -> Result<(String, Vec<u32>, Vec<f64>)> {
+        let prompt_tokens = self.cpu.tokenizer.encode(prompt, true, true)?;
+        let eot = gemma4_stop_token_ids(&self.cpu.tokenizer);
+        let mut logits = self.prefill_reusing_cache(&prompt_tokens)?;
+        let mut generated = Vec::new();
+        let mut per_token = Vec::new();
+        let decode_end = (prompt_tokens.len() + max_new).min(self.max_positions);
+        for pos in prompt_tokens.len()..decode_end {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap();
+            if eot.contains(&next) {
+                break;
+            }
+            generated.push(next);
+            let t = std::time::Instant::now();
+            logits = self.forward_token(next, pos, true)?;
+            per_token.push(t.elapsed().as_secs_f64());
+        }
+        self.cached_tokens.extend_from_slice(&generated);
+        let text = self.cpu.tokenizer.decode(&generated, true)?;
+        Ok((text, generated, per_token))
     }
 
     /// Greedy-generate emitting a per-token text delta (for SSE streaming): after
