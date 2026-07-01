@@ -140,6 +140,108 @@ pub struct Q8_0PackedRows4Block {
     pub quants: [i8; 128],
 }
 
+/// Q4_0 wire geometry (GGUF on-disk): 32 values per block, stored as a 2-byte
+/// little-endian f16 scale followed by 16 nibble bytes (byte `j` low nibble is
+/// value `j`, high nibble is value `j+16`; both unsigned with a -8 bias).
+const Q4_0_WIRE_BYTES_PER_BLOCK: usize = 18;
+
+/// Eight Q4_0 weight rows interleaved for the AVX2 8-row GEMV, mirroring
+/// llama.cpp's `block_q4_0x8` (`d[8]` f16 scales + `qs[128]` nibble bytes).
+///
+/// Layout of `qs` (matches `ggml_gemv_q4_0_8x8_q8_0_generic`): for
+/// `k in 0..2`, `row in 0..8`, `i in 0..8`, byte `qs[k*64 + row*8 + i]` holds
+/// weight-nibbles for the 8 columns of one activation half — its LOW nibble is
+/// the weight for activation index `k*8 + i`, its HIGH nibble the weight for
+/// activation index `k*8 + i + 16` (both `-8`-biased). This is exactly the
+/// scalar [`crate::inference::q4_0_wire_row_dot_scalar`] contract, re-laned so 8
+/// rows can be dotted against one activation block in a single SIMD pass.
+#[repr(C, align(32))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q4_0PackedRows8Block {
+    pub scales: [f32; 8],
+    pub qs: [u8; 128],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q4_0PackedRows8 {
+    pub rows: usize,
+    pub blocks_per_row: usize,
+    /// `(rows / 8) * blocks_per_row` interleaved blocks, row-group major then
+    /// block major (group g, block b at index `g * blocks_per_row + b`).
+    pub blocks: Vec<Q4_0PackedRows8Block>,
+}
+
+impl Q4_0PackedRows8 {
+    /// Interleave `rows` (multiple of 8) Q4_0 weight rows read straight from the
+    /// GGUF wire bytes into the 8-row layout. `q4_0_bytes` is the tensor's full
+    /// wire slice, row-major, `blocks_per_row` Q4_0 blocks per row.
+    pub fn from_q4_0_bytes(
+        rows: usize,
+        blocks_per_row: usize,
+        q4_0_bytes: &[u8],
+    ) -> Result<Self> {
+        let expected_blocks = rows.checked_mul(blocks_per_row).ok_or_else(|| {
+            BackendError::InvalidTensorData("q4_0 packed rows8 block count overflow".to_string())
+        })?;
+        let expected_bytes = expected_blocks
+            .checked_mul(Q4_0_WIRE_BYTES_PER_BLOCK)
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData("q4_0 packed rows8 byte count overflow".to_string())
+            })?;
+        if q4_0_bytes.len() != expected_bytes || !rows.is_multiple_of(8) {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q4_0 packed rows8 expected GGUF Q4_0 bytes for rows multiple of 8; rows={rows}, blocks_per_row={blocks_per_row}, got {} bytes, expected {expected_bytes}",
+                q4_0_bytes.len()
+            )));
+        }
+
+        let mut blocks = Vec::with_capacity((rows / 8) * blocks_per_row);
+        for row_group in (0..rows).step_by(8) {
+            for block_idx in 0..blocks_per_row {
+                let mut scales = [0.0_f32; 8];
+                let mut qs = [0_u8; 128];
+                for (lane, scale) in scales.iter_mut().enumerate() {
+                    let source_block = (row_group + lane) * blocks_per_row + block_idx;
+                    let source_start = source_block * Q4_0_WIRE_BYTES_PER_BLOCK;
+                    *scale = f16_bits_to_f32(u16::from_le_bytes([
+                        q4_0_bytes[source_start],
+                        q4_0_bytes[source_start + 1],
+                    ]));
+                }
+                // Re-lane the 16 wire nibble bytes of each of the 8 rows.
+                // Wire byte `j` (0..16): low nibble = value `j`, high nibble =
+                // value `j+16`. Interleaved byte `qs[k*64 + lane*8 + i]` must
+                // carry value `k*8 + i` in its low nibble and value `k*8+i+16`
+                // in its high nibble. Since wire byte `j` already pairs `j` with
+                // `j+16`, the mapping is a straight copy: k*8+i == j (i.e. j in
+                // 0..16 splits as k = j/8, i = j%8), so qs[k*64+lane*8+i] equals
+                // wire byte (k*8+i).
+                for lane in 0..8 {
+                    let source_block = (row_group + lane) * blocks_per_row + block_idx;
+                    let source_start = source_block * Q4_0_WIRE_BYTES_PER_BLOCK + 2;
+                    for k in 0..2 {
+                        for i in 0..8 {
+                            let j = k * 8 + i;
+                            qs[k * 64 + lane * 8 + i] = q4_0_bytes[source_start + j];
+                        }
+                    }
+                }
+                blocks.push(Q4_0PackedRows8Block { scales, qs });
+            }
+        }
+
+        Ok(Self {
+            rows,
+            blocks_per_row,
+            blocks,
+        })
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.blocks.len() * std::mem::size_of::<Q4_0PackedRows8Block>()
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Q8_0AmxPackedBlock {

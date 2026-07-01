@@ -11088,6 +11088,72 @@ fn q4_0_wire_row_dot_scalar_matches_dequant_reference() {
     );
 }
 
+/// The interleaved 8-row Q4_0 GEMV (both the packed-scalar reference and the
+/// AVX2/dispatch path) must be BIT-EXACT to `q4_0_wire_row_dot_scalar` run over
+/// each of the eight rows. Repacking is a layout change, not a math change.
+#[test]
+fn q4_0_packed_gemv8_matches_scalar_bit_exact() {
+    use crate::tensor::Q4_0PackedRows8;
+
+    let blocks_per_row = 6usize; // 192 weights per row
+    let rows = 8usize;
+
+    // Deterministic pseudo-random wire bytes for 8 rows.
+    let mut wire = vec![0u8; rows * blocks_per_row * super::Q4_0_WIRE_BYTES_PER_BLOCK];
+    let mut state = 0x1234_5678u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for b in wire.chunks_exact_mut(super::Q4_0_WIRE_BYTES_PER_BLOCK) {
+        let scale = 0.005f32 + (next() % 97) as f32 * 0.001f32;
+        b[0..2].copy_from_slice(&super::f32_to_f16_bits(scale).to_le_bytes());
+        for byte in &mut b[2..18] {
+            *byte = (next() & 0xFF) as u8;
+        }
+    }
+
+    // Random activation row.
+    let activation: Vec<f32> = (0..blocks_per_row * 32)
+        .map(|i| ((i as f32) * 0.19 + 0.3).sin() * 4.0 - 1.0)
+        .collect();
+    let xq = super::quantize_q8_0_blocks(&activation);
+
+    // Per-row scalar oracle.
+    let row_bytes = blocks_per_row * super::Q4_0_WIRE_BYTES_PER_BLOCK;
+    let mut oracle = [0f32; 8];
+    for (r, o) in oracle.iter_mut().enumerate() {
+        *o = super::q4_0_wire_row_dot_scalar(&wire[r * row_bytes..(r + 1) * row_bytes], &xq);
+    }
+
+    let packed = Q4_0PackedRows8::from_q4_0_bytes(rows, blocks_per_row, &wire).unwrap();
+
+    let mut packed_scalar = [0f32; 8];
+    super::q4_0_packed_gemv8_scalar(&packed, 0, &xq, &mut packed_scalar);
+
+    let mut dispatched = [0f32; 8];
+    super::q4_0_packed_gemv8(&packed, 0, &xq, &mut dispatched);
+
+    for r in 0..8 {
+        assert_eq!(
+            packed_scalar[r].to_bits(),
+            oracle[r].to_bits(),
+            "packed-scalar row {r}: {} vs oracle {}",
+            packed_scalar[r],
+            oracle[r]
+        );
+        assert_eq!(
+            dispatched[r].to_bits(),
+            oracle[r].to_bits(),
+            "dispatched (AVX2) row {r}: {} vs oracle {}",
+            dispatched[r],
+            oracle[r]
+        );
+    }
+}
+
 #[test]
 fn q4_0_wire_block_dequant_matches_nibble_layout() {
     let scale = 0.5f32;
