@@ -357,6 +357,12 @@ pub struct RunnableModel {
     /// layers have no K/V attention). When set, the forward path is routed to the
     /// dedicated `*_qwen35` methods and `layers` is empty. See [`Qwen35Runtime`].
     qwen35: Option<Qwen35Runtime>,
+    /// Lazily-built GPU resident decode engine for the qwen35 lane, gated by
+    /// `CAMELID_QWEN35_CUDA=1`. `Mutex` gives the `&mut` the per-token forward needs
+    /// while `generate_*` take `&self`; built on first use and reused, with the SSM/conv
+    /// recurrent state reset at the start of every generate. `None` until first use.
+    #[cfg(feature = "cuda")]
+    cuda: std::sync::Mutex<Option<crate::cuda_resident::CudaResidentDecode>>,
 }
 
 impl RunnableModel {
@@ -534,6 +540,8 @@ impl RunnableModel {
                     value_dim,
                     conv_dim,
                 }),
+                #[cfg(feature = "cuda")]
+                cuda: std::sync::Mutex::new(None),
             });
         }
 
@@ -642,6 +650,8 @@ impl RunnableModel {
             output_norm,
             layers,
             qwen35: None,
+            #[cfg(feature = "cuda")]
+            cuda: std::sync::Mutex::new(None),
         })
     }
 
@@ -1243,7 +1253,33 @@ impl RunnableModel {
     /// for the shared prefix (same per-token math, same accumulation order).
     ///
     /// [`forward_logits_qwen35`]: RunnableModel::forward_logits_qwen35
+    /// qwen35 greedy decode. Routes to the GPU resident lane when `CAMELID_QWEN35_CUDA=1`
+    /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
+    /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
+        #[cfg(feature = "cuda")]
+        {
+            if std::env::var("CAMELID_QWEN35_CUDA")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                match self.generate_qwen35_cuda(prompt, max_new, stop) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        eprintln!("[qwen35] CUDA lane failed ({e}); falling back to CPU");
+                    }
+                }
+            }
+        }
+        self.generate_qwen35_cpu(prompt, max_new, stop)
+    }
+
+    fn generate_qwen35_cpu(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+    ) -> Result<Vec<u32>> {
         // Batched prefill of the whole prompt (weights read once per layer), then
         // per-token greedy decode from the resulting cache.
         let (mut cache, last) = self.prefill_qwen35(prompt)?;
@@ -1261,6 +1297,79 @@ impl RunnableModel {
                 let logits = self.decode_token_qwen35(next, pos, &mut cache, true)?;
                 pos += 1;
                 next = argmax(&logits);
+            }
+        }
+        Ok(out)
+    }
+
+    /// GPU resident greedy decode for qwen35. Builds the engine on first use (cached in
+    /// `self.cuda`), resets the recurrent SSM/conv state, then prefills the prompt and
+    /// greedily decodes via `forward_token`. Token-parity with the CPU lane (not
+    /// bit-identical: int8 activation quant + FP-reassociated attention).
+    #[cfg(feature = "cuda")]
+    fn generate_qwen35_cuda(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+    ) -> Result<Vec<u32>> {
+        // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
+        // layers don't attend — see build_qwen35_resident::sparsify_kv), so KV is ~4x
+        // smaller than dense and 8192 positions fit alongside the 5.24 GB Q4_K_M on a 6 GB
+        // card (~5.8 GB resident). Default 8192; override (e.g. higher on bigger cards).
+        let max_pos: usize = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let mut guard = self
+            .cuda
+            .lock()
+            .map_err(|_| BackendError::InvalidTensorData("qwen35 cuda mutex poisoned".into()))?;
+        if guard.is_none() {
+            let e = self
+                .build_qwen35_resident(max_pos)
+                .map_err(BackendError::InvalidTensorData)?;
+            *guard = Some(e);
+        }
+        let engine = guard.as_mut().unwrap();
+        // CRITICAL: the SSM/conv recurrent state persists across generate calls; reset it
+        // at the start of every call or the 2nd+ prompt decodes on stale state.
+        engine
+            .reset_qwen35_state()
+            .map_err(BackendError::InvalidTensorData)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        // Prefill: only the final prompt token needs logits.
+        let mut next = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let emb = self.token_embd.dequant_row(tok as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(i, self.rope_base, self.rope_dim);
+            let last = i == prompt.len() - 1;
+            let out = engine
+                .forward_token(&emb, &cos, &sin, i, scale, last)
+                .map_err(BackendError::InvalidTensorData)?;
+            if last {
+                next = out.ok_or_else(|| {
+                    BackendError::InvalidTensorData("no logits on final prompt token".into())
+                })?;
+            }
+        }
+        let mut out = Vec::with_capacity(max_new);
+        let mut pos = prompt.len();
+        for i in 0..max_new {
+            if stop.contains(&next) {
+                break;
+            }
+            out.push(next);
+            if i + 1 < max_new {
+                let emb = self.token_embd.dequant_row(next as usize, "token_embd")?;
+                let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+                next = engine
+                    .forward_token(&emb, &cos, &sin, pos, scale, true)
+                    .map_err(BackendError::InvalidTensorData)?
+                    .ok_or_else(|| {
+                        BackendError::InvalidTensorData("no logits on decode step".into())
+                    })?;
+                pos += 1;
             }
         }
         Ok(out)
@@ -1733,4 +1842,984 @@ fn read_tensor_bytes(f: &mut File, d: &GgufTensorDescriptor, name: &str) -> Resu
         source: e,
     })?;
     Ok(bytes)
+}
+
+/// qwen35 (Ornith) partial-NEOX RoPE cos/sin tables for absolute `pos`, length
+/// `rope_dim/2`. VERBATIM `apply_rope`: `1.0/base.powf(2.0*i/rope_dim)` then
+/// `(pos*freq).sin_cos()` (sin first) — do NOT use the negated-exponent form the
+/// Llama lane uses (last-ULP drift can flip a near-tie greedy token).
+#[cfg(feature = "cuda")]
+#[allow(dead_code)] // used by the GPU test + the M4 generate_qwen35_cuda driver (next).
+fn qwen35_rope_tables(pos: usize, rope_base: f32, rope_dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let half = rope_dim / 2;
+    let mut cos_t = vec![0.0f32; half];
+    let mut sin_t = vec![0.0f32; half];
+    for i in 0..half {
+        let freq = 1.0f32 / rope_base.powf(2.0 * i as f32 / rope_dim as f32);
+        let (s, c) = (pos as f32 * freq).sin_cos();
+        cos_t[i] = c;
+        sin_t[i] = s;
+    }
+    (cos_t, sin_t)
+}
+
+#[cfg(feature = "cuda")]
+impl RunnableModel {
+    /// Build a GPU resident decode engine for this qwen35 (Ornith) model: upload every
+    /// layer (SSM or full-attn) + the LM head, mirroring the proven per-layer GPU
+    /// sequences. Maps each tensor's quant per-tensor (Q8_0 widened 34->36; Q4_K/Q6_K
+    /// raw passthrough), so both the Q8_0 and the 6 GB-fitting Q4_K_M rows build.
+    pub(crate) fn build_qwen35_resident(
+        &self,
+        max_pos: usize,
+    ) -> std::result::Result<crate::cuda_resident::CudaResidentDecode, String> {
+        use crate::cuda_resident::{widen_q8, CudaResidentDecode, ProjQuant};
+        let rt = self.qwen35.as_ref().ok_or("not a qwen35 model")?;
+        let ffn_dim = rt.layers[0].ffn_gate.out_features;
+        // Per-tensor quant: Q8_0 weights are widened 34->36 (set_*'s repack_for_lane
+        // then runs repack_q8_soa); K-quant (Q4_K/Q6_K) bytes pass through raw (the
+        // q4k/q6k GEMV kernels expand them on the fly). Returns (repack-ready bytes, lane).
+        let prep = |m: &RawMat| -> std::result::Result<(Vec<u8>, ProjQuant), String> {
+            match m.tt {
+                GgufTensorType::Q8_0 => Ok((widen_q8(&m.bytes), ProjQuant::Q8_0)),
+                GgufTensorType::Q4K => Ok((m.bytes.clone(), ProjQuant::Q4K)),
+                GgufTensorType::Q6K => Ok((m.bytes.clone(), ProjQuant::Q6K)),
+                other => Err(format!(
+                    "qwen35 CUDA lane: unsupported projection quant {other:?}"
+                )),
+            }
+        };
+        let mut e = CudaResidentDecode::new(
+            self.n_layers,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            self.d_model,
+            ffn_dim,
+            self.rope_dim,
+            max_pos,
+            self.vocab,
+            self.eps,
+            self.rope_neox,
+        )?;
+        e.set_qwen35(
+            rt.d_state,
+            rt.d_conv,
+            rt.num_k_heads,
+            rt.num_v_heads,
+            rt.head_v_dim,
+            rt.key_dim,
+            rt.value_dim,
+            rt.conv_dim,
+        )?;
+        // Sparse KV: only the 8 full-attention layers attend; the 24 SSM layers never
+        // touch KV (the SSM forward arm skips kv_scatter/attention). new() over-allocated
+        // dense KV for all 32 layers, so free the SSM layers' buffers NOW — before any
+        // weights are resident — and trim the async pool so the freed VRAM is reused by
+        // the weights. With ~4x less KV, max_pos fits ~4x higher in the 6 GB card.
+        let keep_full: Vec<bool> = rt
+            .layers
+            .iter()
+            .map(|l| matches!(l.kind, Qwen35Kind::Full { .. }))
+            .collect();
+        e.sparsify_kv(&keep_full)?;
+        crate::cuda::release_async_pool();
+        for layer in &rt.layers {
+            match &layer.kind {
+                Qwen35Kind::Full {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                } => {
+                    let (bq, qq) = prep(wq)?;
+                    let (bk, qk) = prep(wk)?;
+                    let (bv, qv) = prep(wv)?;
+                    let (bo, qo) = prep(wo)?;
+                    let (bg, qg) = prep(&layer.ffn_gate)?;
+                    let (bu, qu) = prep(&layer.ffn_up)?;
+                    let (bd, qd) = prep(&layer.ffn_down)?;
+                    e.set_layer_located(
+                        &bq,
+                        &bk,
+                        &bv,
+                        &bo,
+                        &bg,
+                        &bu,
+                        &bd,
+                        &layer.attn_norm,
+                        &layer.post_attn_norm,
+                        Some(q_norm.as_slice()),
+                        Some(k_norm.as_slice()),
+                        true,
+                        [qq, qk, qv, qo, qg, qu, qd],
+                    )?;
+                    e.push_ssm_placeholders()?;
+                }
+                Qwen35Kind::Ssm {
+                    wqkv,
+                    wqkv_gate,
+                    conv1d,
+                    dt_bias,
+                    a,
+                    beta,
+                    alpha,
+                    ssm_norm,
+                    ssm_out,
+                } => {
+                    let (bg, qg) = prep(&layer.ffn_gate)?;
+                    let (bu, qu) = prep(&layer.ffn_up)?;
+                    let (bd, qd) = prep(&layer.ffn_down)?;
+                    let (bqkv, qqkv) = prep(wqkv)?;
+                    let (bgate, qgate) = prep(wqkv_gate)?;
+                    let (bbeta, qbeta) = prep(beta)?;
+                    let (balpha, qalpha) = prep(alpha)?;
+                    let (bout, qout) = prep(ssm_out)?;
+                    e.set_layer_ssm_qwen35(
+                        &bg,
+                        &bu,
+                        &bd,
+                        &layer.attn_norm,
+                        &layer.post_attn_norm,
+                        &bqkv,
+                        &bgate,
+                        &bbeta,
+                        &balpha,
+                        &bout,
+                        conv1d,
+                        dt_bias,
+                        a,
+                        ssm_norm,
+                        [qqkv, qgate, qbeta, qalpha, qout],
+                        [qg, qu, qd],
+                        rt.conv_dim,
+                        rt.d_conv,
+                        rt.num_v_heads,
+                        rt.d_state,
+                    )?;
+                }
+            }
+        }
+        let (bout, qout) = prep(&self.output)?;
+        e.set_output(&self.output_norm, &bout, qout)?;
+        Ok(e)
+    }
+}
+
+/// GPU single-SSM-layer parity: upload layer 0's REAL Ornith SSM weights and run the
+/// whole GPU forward (rmsnorm+quantize -> q8 gemv x4 -> SSM kernel chain -> ssm_out
+/// gemv), comparing the layer `mix` to the CPU `qwen35_ssm`. Proves the gemv-from-real-
+/// weights path composes with the proven SSM chain — the mechanism the resident
+/// forward_pass SSM branch will use. Q8_0 weights (34-byte GGUF blocks widened to the
+/// 36-byte f32-scale layout repack_q8_soa expects).
+#[cfg(all(test, feature = "cuda"))]
+mod gpu_ssm_layer_tests {
+    use super::*;
+    use crate::cuda_resident::{
+        launch_gemv, launch_quantize, launch_rmsnorm_quantize, repack_q8_soa, CudaResidentKernels,
+    };
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+
+    fn widen_q8(bytes: &[u8]) -> Vec<u8> {
+        let nb = bytes.len() / 34;
+        let mut out = Vec::with_capacity(nb * 36);
+        for b in 0..nb {
+            let base = b * 34;
+            let scale =
+                crate::tensor::f16_bits_to_f32(u16::from_le_bytes([bytes[base], bytes[base + 1]]));
+            out.extend_from_slice(&scale.to_le_bytes());
+            out.extend_from_slice(&bytes[base + 2..base + 34]);
+        }
+        out
+    }
+
+    fn rel_close(a: &[f32], b: &[f32], tol: f32) -> (bool, f32) {
+        let mut worst = 0.0f32;
+        for (x, y) in a.iter().zip(b) {
+            let d = (x - y).abs() / y.abs().max(1.0);
+            if d > worst {
+                worst = d;
+            }
+        }
+        (worst < tol, worst)
+    }
+
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (Q8) + a CUDA device"]
+    fn qwen35_ssm_layer_gpu_matches_cpu() {
+        let path = match std::env::var("CAMELID_ORNITH_GGUF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Ok(k) = CudaResidentKernels::new() else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        let rt = model.qwen35.as_ref().expect("qwen35 runtime");
+        let li = 0usize; // layer 0 is SSM ((0+1)%4 != 0)
+        let layer = &rt.layers[li];
+        let (wqkv, wqkv_gate, conv1d, dt_bias, a_vec, beta_m, alpha_m, ssm_norm, ssm_out) =
+            match &layer.kind {
+                Qwen35Kind::Ssm {
+                    wqkv,
+                    wqkv_gate,
+                    conv1d,
+                    dt_bias,
+                    a,
+                    beta,
+                    alpha,
+                    ssm_norm,
+                    ssm_out,
+                } => (
+                    wqkv, wqkv_gate, conv1d, dt_bias, a, beta, alpha, ssm_norm, ssm_out,
+                ),
+                _ => panic!("layer 0 is not SSM"),
+            };
+        for m in [wqkv, wqkv_gate, beta_m, alpha_m, ssm_out] {
+            assert_eq!(
+                m.tt,
+                GgufTensorType::Q8_0,
+                "test assumes a Q8_0 Ornith GGUF"
+            );
+        }
+        let hidden_dim = model.d_model;
+        let eps = model.eps;
+        let (ds, nk, nv) = (rt.d_state, rt.num_k_heads, rt.num_v_heads);
+        let (key_dim, value_dim, conv_dim, d_conv) =
+            (rt.key_dim, rt.value_dim, rt.conv_dim, rt.d_conv);
+
+        // Deterministic pseudo-random hidden activation.
+        let mut seed = 0x1234_5678u64;
+        let mut nextf = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let hidden: Vec<f32> = (0..hidden_dim).map(|_| nextf()).collect();
+
+        // ---- CPU reference: the layer mix from qwen35_ssm ----
+        let mut cache = Qwen35Cache::new(rt, rt.layers.len());
+        let xn = rms_norm(&hidden, &layer.attn_norm, eps);
+        let cpu_mix = model
+            .qwen35_ssm(rt, layer, li, &xn, &mut cache)
+            .expect("cpu ssm");
+
+        // ---- GPU forward ----
+        let s = &k.stream;
+        let up = |m: &RawMat| s.clone_htod(&repack_q8_soa(&widen_q8(&m.bytes))).unwrap();
+        let d_wqkv = up(wqkv);
+        let d_wqkv_gate = up(wqkv_gate);
+        let d_beta_w = up(beta_m);
+        let d_alpha_w = up(alpha_m);
+        let d_ssm_out = up(ssm_out);
+        let d_conv1d = s.clone_htod(conv1d).unwrap();
+        let d_dt = s.clone_htod(dt_bias).unwrap();
+        let d_a = s.clone_htod(a_vec).unwrap();
+        let d_norm = s.clone_htod(ssm_norm).unwrap();
+        let d_attn_norm = s.clone_htod(&layer.attn_norm).unwrap();
+        let d_hidden = s.clone_htod(&hidden).unwrap();
+
+        let hb = hidden_dim / 32;
+        let vb = value_dim / 32;
+        let mut in_q = s.alloc_zeros::<i8>(hidden_dim).unwrap();
+        let mut in_s = s.alloc_zeros::<f32>(hb).unwrap();
+        let mut d_qkv = s.alloc_zeros::<f32>(conv_dim).unwrap();
+        let mut d_z = s.alloc_zeros::<f32>(value_dim).unwrap();
+        let mut d_br = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_ar = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_beta = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_glog = s.alloc_zeros::<f32>(nv).unwrap();
+        let mut d_conv_out = s.alloc_zeros::<f32>(conv_dim).unwrap();
+        let mut d_ssm_mix = s.alloc_zeros::<f32>(value_dim).unwrap();
+        let mut d_conv_state = s.alloc_zeros::<f32>(conv_dim * (d_conv - 1)).unwrap();
+        let mut d_state = s.alloc_zeros::<f32>(nv * ds * ds).unwrap();
+        let mut mix_q = s.alloc_zeros::<i8>(value_dim).unwrap();
+        let mut mix_s = s.alloc_zeros::<f32>(vb).unwrap();
+        let mut d_mix = s.alloc_zeros::<f32>(hidden_dim).unwrap();
+
+        // attn rmsnorm + quantize the hidden
+        launch_rmsnorm_quantize(
+            s,
+            &k.rms_norm_quantize,
+            &d_hidden,
+            &d_attn_norm,
+            &mut in_q,
+            &mut in_s,
+            hidden_dim,
+            eps,
+        )
+        .unwrap();
+        // projections (Q8_0 q8_gemv): wqkv -> qkv, wqkv_gate -> z, beta -> br, alpha -> ar
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_wqkv.slice(0..d_wqkv.len()),
+            conv_dim,
+            hb,
+            &mut d_qkv,
+        )
+        .unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_wqkv_gate.slice(0..d_wqkv_gate.len()),
+            value_dim,
+            hb,
+            &mut d_z,
+        )
+        .unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_beta_w.slice(0..d_beta_w.len()),
+            nv,
+            hb,
+            &mut d_br,
+        )
+        .unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &in_s,
+            &in_q,
+            &d_alpha_w.slice(0..d_alpha_w.len()),
+            nv,
+            hb,
+            &mut d_ar,
+        )
+        .unwrap();
+
+        let nvi = nv as i32;
+        let dsi = ds as i32;
+        let nki = nk as i32;
+        // gates
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (nv as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = s.launch_builder(&k.ssm_gates);
+            b.arg(&d_br)
+                .arg(&d_ar)
+                .arg(&d_dt)
+                .arg(&d_a)
+                .arg(&mut d_beta)
+                .arg(&mut d_glog)
+                .arg(&nvi);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // conv1d
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (conv_dim.div_ceil(256) as u32, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let cdi = conv_dim as i32;
+            let dci = d_conv as i32;
+            let mut b = s.launch_builder(&k.ssm_conv1d);
+            b.arg(&d_conv1d)
+                .arg(&d_qkv)
+                .arg(&mut d_conv_state)
+                .arg(&mut d_conv_out)
+                .arg(&cdi)
+                .arg(&dci);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // l2norm q (0..key_dim) and k (key_dim..2*key_dim)
+        for lo in [0usize, key_dim] {
+            let cfg = LaunchConfig {
+                grid_dim: (nk as u32, 1, 1),
+                block_dim: (ds as u32, 1, 1),
+                shared_mem_bytes: (ds as u32) * 4,
+            };
+            let mut view = d_conv_out.slice_mut(lo..lo + key_dim);
+            let mut b = s.launch_builder(&k.ssm_l2_norm_per_head);
+            b.arg(&mut view).arg(&dsi).arg(&eps);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // delta rule
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (nv as u32, 1, 1),
+                block_dim: (ds as u32, 1, 1),
+                shared_mem_bytes: (3 * ds as u32) * 4,
+            };
+            let qv = d_conv_out.slice(0..key_dim);
+            let kv = d_conv_out.slice(key_dim..2 * key_dim);
+            let vv = d_conv_out.slice(2 * key_dim..2 * key_dim + value_dim);
+            let mut b = s.launch_builder(&k.ssm_delta_rule);
+            b.arg(&mut d_state)
+                .arg(&kv)
+                .arg(&qv)
+                .arg(&vv)
+                .arg(&d_z)
+                .arg(&d_beta)
+                .arg(&d_glog)
+                .arg(&d_norm)
+                .arg(&mut d_ssm_mix)
+                .arg(&dsi)
+                .arg(&nki)
+                .arg(&eps);
+            unsafe { b.launch(cfg).unwrap() };
+        }
+        // quantize the SSM mix, then ssm_out projection (Q8_0 gemv) -> d_mix
+        launch_quantize(s, &k.quantize, &d_ssm_mix, &mut mix_q, &mut mix_s, vb).unwrap();
+        launch_gemv(
+            s,
+            &k.gemv,
+            &mix_s,
+            &mix_q,
+            &d_ssm_out.slice(0..d_ssm_out.len()),
+            hidden_dim,
+            vb,
+            &mut d_mix,
+        )
+        .unwrap();
+
+        let mut got = vec![0f32; hidden_dim];
+        s.memcpy_dtoh(&d_mix, &mut got).unwrap();
+        k.ctx.synchronize().unwrap();
+        let (ok, worst) = rel_close(&got, &cpu_mix, 1e-2);
+        assert!(
+            ok,
+            "qwen35 SSM layer GPU vs CPU diverged (worst rel {worst:.3e})"
+        );
+        eprintln!("qwen35_ssm_layer_gpu: PASS (worst rel {worst:.3e})");
+    }
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (Q8) + a CUDA device"]
+    fn qwen35_full_attn_layer_gpu_matches_cpu() {
+        use crate::cuda_resident::{
+            launch_attention, launch_kv_scatter, launch_rms_norm_per_head, launch_rope,
+        };
+        let path = match std::env::var("CAMELID_ORNITH_GGUF") {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let Ok(k) = CudaResidentKernels::new() else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        let rt = model.qwen35.as_ref().expect("qwen35 runtime");
+        let li = 3usize; // layer 3 is full-attention ((3+1) % 4 == 0)
+        let layer = &rt.layers[li];
+        let (wq, wk, wv, wo, q_norm, k_norm) = match &layer.kind {
+            Qwen35Kind::Full {
+                wq,
+                wk,
+                wv,
+                wo,
+                q_norm,
+                k_norm,
+            } => (wq, wk, wv, wo, q_norm, k_norm),
+            _ => panic!("layer {li} is not full-attention"),
+        };
+        for m in [wq, wk, wv, wo] {
+            assert_eq!(
+                m.tt,
+                GgufTensorType::Q8_0,
+                "test assumes a Q8_0 Ornith GGUF"
+            );
+        }
+
+        let hidden_dim = model.d_model; // 4096
+        let eps = model.eps; // 1e-6
+        let n_head = model.n_heads; // 16
+        let n_kv = model.n_kv_heads; // 4
+        let hd = model.head_dim; // 256
+        let rope_dim = model.rope_dim; // 64
+        let rope_base = model.rope_base; // 1e7
+        let pairing = if model.rope_neox { 1i32 } else { 0i32 };
+        let q_width = n_head * hd; // 4096
+        let kv_width = n_kv * hd; // 1024
+        let half = rope_dim / 2; // 32 rope pairs
+        let hb = hidden_dim / 32; // 128 input blocks per projection row
+        let qb = q_width / 32; // 128 blocks for the wo input (attn-out)
+        let scale = 1.0f32 / (hd as f32).sqrt(); // 1/sqrt(256) = 0.0625
+        let n_steps = 6usize;
+        let max_pos = 8usize;
+        assert!(n_steps <= max_pos);
+
+        // Deterministic pseudo-random hidden activations, one DISTINCT vector per
+        // position (distinct K/V per step => a genuinely non-uniform softmax at pos>0,
+        // which is what exercises GQA / q-k-norm / RoPE / scale; pos=0 alone is
+        // degenerate: a single key makes softmax==1 and the output == V regardless).
+        let mut seed = 0x1234_5678u64;
+        let mut nextf = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let hiddens: Vec<Vec<f32>> = (0..n_steps)
+            .map(|_| (0..hidden_dim).map(|_| nextf()).collect())
+            .collect();
+
+        // ---- GPU: upload Q8_0 weights once (SoA-repacked, 34->36 widened) ----
+        let s = &k.stream;
+        let up = |m: &RawMat| s.clone_htod(&repack_q8_soa(&widen_q8(&m.bytes))).unwrap();
+        let d_wq = up(wq);
+        let d_wk = up(wk);
+        let d_wv = up(wv);
+        let d_wo = up(wo);
+        let d_qn = s.clone_htod(q_norm).unwrap();
+        let d_kn = s.clone_htod(k_norm).unwrap();
+        let d_attn_norm = s.clone_htod(&layer.attn_norm).unwrap();
+
+        // device scratch (reused across positions)
+        let mut d_hidden = s.alloc_zeros::<f32>(hidden_dim).unwrap();
+        let mut in_q = s.alloc_zeros::<i8>(hidden_dim).unwrap();
+        let mut in_s = s.alloc_zeros::<f32>(hb).unwrap();
+        let mut d_qgate = s.alloc_zeros::<f32>(2 * q_width).unwrap(); // fused [q|gate]
+        let mut d_q = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut d_gate = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut d_k = s.alloc_zeros::<f32>(kv_width).unwrap();
+        let mut d_v = s.alloc_zeros::<f32>(kv_width).unwrap();
+        let mut d_attn = s.alloc_zeros::<f32>(q_width).unwrap();
+        let mut mix_q = s.alloc_zeros::<i8>(q_width).unwrap();
+        let mut mix_s = s.alloc_zeros::<f32>(qb).unwrap();
+        let mut d_mix = s.alloc_zeros::<f32>(hidden_dim).unwrap();
+
+        // persistent KV cache (f16 bits, layout [kv_head][position][head_dim]) +
+        // device position + per-pair RoPE tables.
+        let mut cache_k = s.alloc_zeros::<u16>(kv_width * max_pos).unwrap();
+        let mut cache_v = s.alloc_zeros::<u16>(kv_width * max_pos).unwrap();
+        let mut d_pos = s.alloc_zeros::<i32>(1).unwrap();
+        let mut d_cos = s.alloc_zeros::<f32>(half).unwrap();
+        let mut d_sin = s.alloc_zeros::<f32>(half).unwrap();
+
+        // CPU reference cache (grows per position; only the full-attn layer li used).
+        let mut cache = Qwen35Cache::new(rt, rt.layers.len());
+
+        let mut worst_all = 0.0f32;
+        // `p` is the absolute position (used in RoPE tables, kv_scatter, d_pos) as well
+        // as the index into `hiddens`, so a plain range loop is clearest here.
+        #[allow(clippy::needless_range_loop)]
+        for p in 0..n_steps {
+            let hidden = &hiddens[p];
+
+            // ---- CPU reference: the FULL layer attention mix (incl. wo); also grows
+            // cache.k/v[li] exactly as the GPU scatter does. qwen35_full_attn internally
+            // calls qwen35_attn_compute then wo.par_matvec — so we compare the post-wo
+            // mix on both sides (the GPU pipeline below also ends in wo). ----
+            let xn = rms_norm(hidden, &layer.attn_norm, eps);
+            let cpu_mix = model
+                .qwen35_full_attn(li, wq, wk, wv, wo, q_norm, k_norm, &xn, p, &mut cache)
+                .expect("cpu full attn");
+
+            // ---- GPU forward for this position ----
+            // RoPE cos/sin for absolute position p (computed in f32 on the host, exactly
+            // like apply_rope's per-pair freqs, then uploaded -> GPU RoPE is bit-identical).
+            let mut cosv = vec![0f32; half];
+            let mut sinv = vec![0f32; half];
+            for i in 0..half {
+                let freq = 1.0f32 / rope_base.powf(2.0 * i as f32 / rope_dim as f32);
+                let (si, ci) = (p as f32 * freq).sin_cos();
+                cosv[i] = ci;
+                sinv[i] = si;
+            }
+            s.memcpy_htod(&cosv, &mut d_cos).unwrap();
+            s.memcpy_htod(&sinv, &mut d_sin).unwrap();
+            s.memcpy_htod(&[p as i32], &mut d_pos).unwrap();
+            s.memcpy_htod(hidden.as_slice(), &mut d_hidden).unwrap();
+
+            // attn-norm + quantize the hidden -> in_q / in_s
+            launch_rmsnorm_quantize(
+                s,
+                &k.rms_norm_quantize,
+                &d_hidden,
+                &d_attn_norm,
+                &mut in_q,
+                &mut in_s,
+                hidden_dim,
+                eps,
+            )
+            .unwrap();
+
+            // fused query+gate projection: wq rows = 2*q_width = 8192
+            launch_gemv(
+                s,
+                &k.gemv,
+                &in_s,
+                &in_q,
+                &d_wq.slice(0..d_wq.len()),
+                2 * q_width,
+                hb,
+                &mut d_qgate,
+            )
+            .unwrap();
+            // K / V projections (kv_width = 1024 rows each)
+            launch_gemv(
+                s,
+                &k.gemv,
+                &in_s,
+                &in_q,
+                &d_wk.slice(0..d_wk.len()),
+                kv_width,
+                hb,
+                &mut d_k,
+            )
+            .unwrap();
+            launch_gemv(
+                s,
+                &k.gemv,
+                &in_s,
+                &in_q,
+                &d_wv.slice(0..d_wv.len()),
+                kv_width,
+                hb,
+                &mut d_v,
+            )
+            .unwrap();
+
+            // deinterleave fused [query(hd)|gate(hd)] x n_head -> contiguous d_q / d_gate
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: ((q_width as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let (nh, hdi) = (n_head as i32, hd as i32);
+                let mut b = s.launch_builder(&k.deinterleave_qgate);
+                b.arg(&d_qgate)
+                    .arg(&mut d_q)
+                    .arg(&mut d_gate)
+                    .arg(&nh)
+                    .arg(&hdi);
+                unsafe { b.launch(cfg).unwrap() };
+            }
+
+            // QK per-head RMSNorm (BEFORE RoPE), shared weight across heads
+            launch_rms_norm_per_head(s, &k.rms_norm_per_head, &mut d_q, &d_qn, n_head, hd, eps)
+                .unwrap();
+            launch_rms_norm_per_head(s, &k.rms_norm_per_head, &mut d_k, &d_kn, n_kv, hd, eps)
+                .unwrap();
+
+            // partial NEOX RoPE on Q (n_head heads) and K (n_kv heads)
+            launch_rope(
+                s, &k.rope, &mut d_q, &d_cos, &d_sin, n_head, hd, rope_dim, pairing,
+            )
+            .unwrap();
+            launch_rope(
+                s, &k.rope, &mut d_k, &d_cos, &d_sin, n_kv, hd, rope_dim, pairing,
+            )
+            .unwrap();
+
+            // scatter K (post-norm, post-rope) and V (RAW) into the cache at position p
+            launch_kv_scatter(
+                s,
+                &k.kv_scatter,
+                &d_k,
+                &mut cache_k,
+                &d_pos,
+                n_kv,
+                hd,
+                max_pos,
+            )
+            .unwrap();
+            launch_kv_scatter(
+                s,
+                &k.kv_scatter,
+                &d_v,
+                &mut cache_v,
+                &d_pos,
+                n_kv,
+                hd,
+                max_pos,
+            )
+            .unwrap();
+
+            // GQA causal attention over positions 0..=p
+            let n_pos = p + 1;
+            launch_attention(
+                s,
+                &k.attention,
+                &d_q,
+                &cache_k,
+                &cache_v,
+                &mut d_attn,
+                n_head,
+                n_kv,
+                hd,
+                &d_pos,
+                n_pos,
+                max_pos,
+                scale,
+            )
+            .unwrap();
+
+            // sigmoid output gate: attn[i] *= sigmoid(gate[i])
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: ((q_width as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let n_i = q_width as i32;
+                let mut b = s.launch_builder(&k.sigmoid_mul);
+                b.arg(&mut d_attn).arg(&d_gate).arg(&n_i);
+                unsafe { b.launch(cfg).unwrap() };
+            }
+
+            // quantize the gated attn-out, then the O projection -> d_mix
+            launch_quantize(s, &k.quantize, &d_attn, &mut mix_q, &mut mix_s, qb).unwrap();
+            launch_gemv(
+                s,
+                &k.gemv,
+                &mix_s,
+                &mix_q,
+                &d_wo.slice(0..d_wo.len()),
+                hidden_dim,
+                qb,
+                &mut d_mix,
+            )
+            .unwrap();
+
+            let mut got = vec![0f32; hidden_dim];
+            s.memcpy_dtoh(&d_mix, &mut got).unwrap();
+            k.ctx.synchronize().unwrap();
+            let (_ok, worst) = rel_close(&got, &cpu_mix, 1e-2);
+            if worst > worst_all {
+                worst_all = worst;
+            }
+            eprintln!("qwen35_full_attn pos {p}: worst rel {worst:.3e}");
+        }
+        assert!(
+            worst_all < 1e-2,
+            "qwen35 full-attn layer GPU vs CPU diverged (worst rel {worst_all:.3e})"
+        );
+        eprintln!("qwen35_full_attn_layer_gpu: PASS (worst rel {worst_all:.3e})");
+    }
+
+    fn argmax_u32(v: &[f32]) -> u32 {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv {
+                    (i, x)
+                } else {
+                    (bi, bv)
+                }
+            })
+            .0 as u32
+    }
+
+    /// Full 32-layer GPU stack: build the resident engine from real weights, run a
+    /// prompt token-by-token through forward_pass (SSM + full-attn branches), and assert
+    /// the GPU next-token argmax equals the CPU runnable lane's (greedy-token parity).
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (Q8) + a CUDA device"]
+    fn qwen35_gpu_single_token_matches_cpu() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let cpu_logits = model.forward_logits_qwen35(&prompt).expect("cpu forward");
+        let cpu_tok = argmax_u32(&cpu_logits);
+        let mut e = match model.build_qwen35_resident(prompt.len() + 4) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("build_qwen35_resident failed: {err}");
+                return;
+            }
+        };
+        e.reset_qwen35_state().unwrap();
+        let scale = 1.0f32 / (model.head_dim as f32).sqrt();
+        let mut gpu_tok = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let emb = model
+                .token_embd
+                .dequant_row(tok as usize, "token_embd")
+                .expect("embd");
+            let (cos, sin) = super::qwen35_rope_tables(i, model.rope_base, model.rope_dim);
+            let last = i == prompt.len() - 1;
+            let out = e
+                .forward_token(&emb, &cos, &sin, i, scale, last)
+                .expect("gpu forward_token");
+            if last {
+                gpu_tok = out.expect("logits on final token");
+            }
+        }
+        eprintln!("qwen35_gpu_single_token: cpu={cpu_tok} gpu={gpu_tok}");
+        assert_eq!(gpu_tok, cpu_tok, "GPU next-token argmax != CPU runnable");
+    }
+
+    /// End-to-end qwen35 GPU greedy decode vs the CPU runnable lane (point
+    /// CAMELID_ORNITH_GGUF at the 5.24 GB Q4_K_M so it fits 6 GB VRAM). Also a run-twice
+    /// check: the second GPU call reuses the cached engine, so identical streams prove
+    /// reset_qwen35_state() actually clears the recurrent SSM/conv state.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (point at Q4_K_M) + a CUDA device"]
+    fn qwen35_gpu_greedy_matches_cpu() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        // "What is the capital of France?" prompt tokens.
+        let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let n = 8usize;
+        let cpu = model.generate_qwen35_cpu(&prompt, n, &[]).expect("cpu gen");
+        let gpu = model
+            .generate_qwen35_cuda(&prompt, n, &[])
+            .expect("gpu gen");
+        // run-twice reuses the cached engine -> validates reset_qwen35_state.
+        let gpu2 = model
+            .generate_qwen35_cuda(&prompt, n, &[])
+            .expect("gpu gen 2");
+        eprintln!("cpu ={cpu:?}");
+        eprintln!("gpu ={gpu:?}");
+        eprintln!("gpu2={gpu2:?}");
+        assert_eq!(
+            gpu, gpu2,
+            "qwen35 CUDA run-twice differs — SSM state not reset"
+        );
+        assert_eq!(gpu, cpu, "qwen35 CUDA greedy != CPU runnable");
+        // Coherence sanity: decode a 16-token GPU continuation.
+        if let Ok(gguf) = read_metadata(&path) {
+            if let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&gguf) {
+                let ids16 = model
+                    .generate_qwen35_cuda(&prompt, 16, &[])
+                    .expect("gpu 16-tok");
+                let text = tok.decode(&ids16, true).unwrap_or_default();
+                eprintln!("qwen35 GPU 16-tok decode: {text}");
+            }
+        }
+        eprintln!("qwen35_gpu_greedy: PASS (8-tok GPU==CPU, run-twice stable)");
+    }
+
+    /// Decode tok/s benchmark, GPU resident lane vs CPU runnable lane, same Q4_K_M
+    /// model. Two-point timing ((t_hi - t_lo) over (n_hi - n_lo) generated tokens)
+    /// cancels the per-call prompt prefill + model-load + GPU build, leaving the
+    /// steady-state per-token decode rate. Needs CAMELID_ORNITH_GGUF = the Q4_K_M.
+    #[test]
+    #[ignore = "tok/s benchmark — needs CAMELID_ORNITH_GGUF (Q4_K_M) + a CUDA device"]
+    fn qwen35_gpu_vs_cpu_tokps() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let (n_lo, n_hi) = (16usize, 64usize);
+        let secs = |gpu: bool, n: usize| -> f64 {
+            let t = std::time::Instant::now();
+            let r = if gpu {
+                model.generate_qwen35_cuda(&prompt, n, &[])
+            } else {
+                model.generate_qwen35_cpu(&prompt, n, &[])
+            };
+            r.expect("generate");
+            t.elapsed().as_secs_f64()
+        };
+        // GPU: warm (lazy-build + 5.24 GB upload), then two timed runs.
+        let _ = model.generate_qwen35_cuda(&prompt, 4, &[]);
+        let g_lo = secs(true, n_lo);
+        let g_hi = secs(true, n_hi);
+        let gpu_tokps = (n_hi - n_lo) as f64 / (g_hi - g_lo);
+        // CPU: two timed runs.
+        let c_lo = secs(false, n_lo);
+        let c_hi = secs(false, n_hi);
+        let cpu_tokps = (n_hi - n_lo) as f64 / (c_hi - c_lo);
+        eprintln!(
+            "qwen35 DECODE tok/s (Q4_K_M): GPU={gpu_tokps:.2}  CPU={cpu_tokps:.2}  \
+             speedup={:.2}x  [GPU {g_lo:.1}s@{n_lo} -> {g_hi:.1}s@{n_hi}; \
+             CPU {c_lo:.1}s@{n_lo} -> {c_hi:.1}s@{n_hi}]",
+            gpu_tokps / cpu_tokps
+        );
+    }
+
+    /// Sparse-KV long-context proof: build the resident engine at max_pos=8192 (which
+    /// ONLY fits the 6 GB card because sparsify_kv frees the 24 SSM layers' KV — dense KV
+    /// at 8192 is ~1 GB on top of the 5.24 GB Q4_K_M = OOM), prefill a >2048-token prompt
+    /// (beyond the old dense cap, so the full-attn layers' KV is actually addressed past
+    /// 2048), and decode a few tokens. Succeeding (no OOM, in-range tokens) proves sparse
+    /// KV both fits and works. Point CAMELID_ORNITH_GGUF at the Q4_K_M.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF (point at Q4_K_M) + a CUDA device"]
+    fn qwen35_gpu_long_context_fits() {
+        let Ok(path) = std::env::var("CAMELID_ORNITH_GGUF") else {
+            return;
+        };
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        if model.qwen35.is_none() {
+            return;
+        }
+        let max_pos = 8192usize; // only fits with sparse KV
+        let mut e = match model.build_qwen35_resident(max_pos) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("build_qwen35_resident({max_pos}) failed (OOM => sparse KV not applied?): {err}");
+                panic!("long-context build failed: {err}");
+            }
+        };
+        e.reset_qwen35_state().unwrap();
+        let scale = 1.0f32 / (model.head_dim as f32).sqrt();
+        // A >2048-token prompt: repeat a short base until past the old dense cap.
+        let base: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
+        let mut prompt: Vec<u32> = Vec::new();
+        while prompt.len() < 2100 {
+            prompt.extend_from_slice(&base);
+        }
+        let plen = prompt.len();
+        assert!(
+            plen > 2048,
+            "prompt must exceed the old 2048 cap (got {plen})"
+        );
+        let mut next = 0u32;
+        for (i, &tok) in prompt.iter().enumerate() {
+            let emb = model
+                .token_embd
+                .dequant_row(tok as usize, "token_embd")
+                .expect("embd");
+            let (cos, sin) = super::qwen35_rope_tables(i, model.rope_base, model.rope_dim);
+            let last = i == plen - 1;
+            let out = e
+                .forward_token(&emb, &cos, &sin, i, scale, last)
+                .expect("gpu forward_token (long-ctx prefill)");
+            if last {
+                next = out.expect("logits on final prompt token");
+            }
+        }
+        let mut decoded = vec![next];
+        for step in 0..4 {
+            let pos = plen + step;
+            let emb = model
+                .token_embd
+                .dequant_row(next as usize, "token_embd")
+                .expect("embd");
+            let (cos, sin) = super::qwen35_rope_tables(pos, model.rope_base, model.rope_dim);
+            next = e
+                .forward_token(&emb, &cos, &sin, pos, scale, true)
+                .expect("gpu forward_token (long-ctx decode)")
+                .expect("logits");
+            decoded.push(next);
+        }
+        eprintln!(
+            "qwen35_gpu_long_context: prefilled {plen} tokens at max_pos={max_pos}, decoded {decoded:?}"
+        );
+        assert!(
+            decoded.iter().all(|&t| (t as usize) < model.vocab),
+            "decoded token out of range"
+        );
+    }
 }
