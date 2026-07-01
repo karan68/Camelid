@@ -175,11 +175,7 @@ impl Q4_0PackedRows8 {
     /// Interleave `rows` (multiple of 8) Q4_0 weight rows read straight from the
     /// GGUF wire bytes into the 8-row layout. `q4_0_bytes` is the tensor's full
     /// wire slice, row-major, `blocks_per_row` Q4_0 blocks per row.
-    pub fn from_q4_0_bytes(
-        rows: usize,
-        blocks_per_row: usize,
-        q4_0_bytes: &[u8],
-    ) -> Result<Self> {
+    pub fn from_q4_0_bytes(rows: usize, blocks_per_row: usize, q4_0_bytes: &[u8]) -> Result<Self> {
         let expected_blocks = rows.checked_mul(blocks_per_row).ok_or_else(|| {
             BackendError::InvalidTensorData("q4_0 packed rows8 block count overflow".to_string())
         })?;

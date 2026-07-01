@@ -1425,8 +1425,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             eprintln!("[gemma4-cuda] loading resident {}...", path.display());
             let t0 = std::time::Instant::now();
-            let mut runtime =
-                camelid::gemma4_runtime::Gemma4CudaResident::load(&path, 4096)?;
+            let mut runtime = camelid::gemma4_runtime::Gemma4CudaResident::load(&path, 4096)?;
             eprintln!(
                 "[gemma4-cuda] resident loaded in {:.1}s; generating {max_tokens} tokens...",
                 t0.elapsed().as_secs_f32()
@@ -1449,7 +1448,12 @@ async fn main() -> anyhow::Result<()> {
                     let end = (i + win).min(per_token.len());
                     let secs: f64 = per_token[i..end].iter().sum();
                     let n = (end - i) as f64;
-                    eprint!(" [{}-{}]={:.2}", i, end - 1, if secs > 0.0 { n / secs } else { 0.0 });
+                    eprint!(
+                        " [{}-{}]={:.2}",
+                        i,
+                        end - 1,
+                        if secs > 0.0 { n / secs } else { 0.0 }
+                    );
                     i = end;
                 }
                 eprintln!();

@@ -15947,10 +15947,8 @@ unsafe fn q4_0_packed_gemv8_avx2(
         // produced by the blend network. `blk.scales` is in natural row order, so
         // permute it to the same interleaved order before folding, then a single
         // final permute restores natural order for the store.
-        let col_scale = _mm256_permutevar8x32_ps(
-            _mm256_loadu_ps(blk.scales.as_ptr()),
-            interleave_scale_mask,
-        );
+        let col_scale =
+            _mm256_permutevar8x32_ps(_mm256_loadu_ps(blk.scales.as_ptr()), interleave_scale_mask);
         let row_scale = _mm256_set1_ps(i_block.scale);
         // Match the scalar fold EXACTLY: ((isum * w_scale) * x_scale) then add,
         // with three separate roundings and a non-fused add (no `fmadd`), so the

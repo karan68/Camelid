@@ -1681,7 +1681,10 @@ impl Gemma4Runtime {
             CPU_EMBED_US.fetch_add(embed_us, Relaxed);
             CPU_ATTN_US.fetch_add(attn_us, Relaxed);
             CPU_FFN_US.fetch_add(ffn_us, Relaxed);
-            CPU_OUTPROJ_US.fetch_add(t_out.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            CPU_OUTPROJ_US.fetch_add(
+                t_out.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             CPU_STEP_N.fetch_add(1, Relaxed);
         }
         Ok(Gemma4StepOutput::Logits(logits))
@@ -3175,7 +3178,10 @@ impl Gemma4CudaResident {
         let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
         wsum = wsum.max(6.103_515e-5);
         if prof {
-            SSER_PROF_ROUTER_NS.fetch_add(tp1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            SSER_PROF_ROUTER_NS.fetch_add(
+                tp1.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let tp2 = std::time::Instant::now();
 
@@ -3343,7 +3349,10 @@ impl Gemma4CudaResident {
         // with the dense branch, applies post_ffw_norm, and adds to the residual, all
         // on the GPU.
         if prof {
-            SSER_PROF_EXPERT_NS.fetch_add(tp2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            SSER_PROF_EXPERT_NS.fetch_add(
+                tp2.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         Ok(d_moe_acc)
     }
