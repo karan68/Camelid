@@ -1500,7 +1500,7 @@ impl Gemma4Runtime {
             CPU_EMBED_US.fetch_add(embed_us, Relaxed);
             CPU_ATTN_US.fetch_add(attn_us, Relaxed);
             CPU_FFN_US.fetch_add(ffn_us, Relaxed);
-            CPU_OUTPROJ_US.fetch_add(t_out.elapsed().as_micros() as u64, Relaxed);
+            CPU_OUTPROJ_US.fetch_add(t_out.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             CPU_STEP_N.fetch_add(1, Relaxed);
         }
         Ok(Gemma4StepOutput::Logits(logits))
@@ -2375,6 +2375,19 @@ struct SserExpertDev {
 /// `CAMELID_SSER_CACHE` (off = M1 all-CPU MoE); capacity `CAMELID_SSER_CACHE_EXPERTS`
 /// (#experts). Eviction is LRU on miss-when-full. Bit-exact: the GPU `q4_0_gemv` is
 /// proven bit-identical to the CPU `q4_0_wire_row_dot` the cache-miss path uses.
+// Throwaway M3 profiling counters (env CAMELID_SSER_PROFILE): total ns spent in
+// the dense-MLP branch, router, and expert loop across all MoE layers/tokens.
+#[cfg(feature = "cuda")]
+static SSER_PROF_DENSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static SSER_PROF_ROUTER_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static SSER_PROF_EXPERT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static SSER_PROF_HIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "cuda")]
+static SSER_PROF_MISS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(feature = "cuda")]
 struct SserCache {
     entries: std::collections::HashMap<(u16, u16), SserExpertDev>,
@@ -2851,6 +2864,22 @@ impl Gemma4CudaResident {
     /// SSER cache diagnostics: `(hits, misses, resident_experts, capacity)`.
     /// `None` when the cache is disabled (`CAMELID_SSER_CACHE` unset).
     pub fn sser_stats(&self) -> Option<(u64, u64, usize, usize)> {
+        if std::env::var_os("CAMELID_SSER_PROFILE").is_some() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let d = SSER_PROF_DENSE_NS.load(Relaxed) as f64 / 1e6;
+            let r = SSER_PROF_ROUTER_NS.load(Relaxed) as f64 / 1e6;
+            let e = SSER_PROF_EXPERT_NS.load(Relaxed) as f64 / 1e6;
+            let hit = SSER_PROF_HIT_NS.load(Relaxed) as f64 / 1e6;
+            let miss = SSER_PROF_MISS_NS.load(Relaxed) as f64 / 1e6;
+            eprintln!(
+                "[sser-profile] MoE CPU-side totals: dense-MLP {d:.0} ms, router {r:.0} ms, expert-loop {e:.0} ms (sum {:.0} ms)",
+                d + r + e
+            );
+            eprintln!(
+                "[sser-profile]   expert-loop split: hit-path {hit:.0} ms, miss-path {miss:.0} ms, rest(prep+dtoh+sync) {:.0} ms",
+                e - hit - miss
+            );
+        }
         self.sser.as_ref().map(|c| {
             let c = c.borrow();
             (c.hits, c.misses, c.entries.len(), c.capacity)
@@ -2899,6 +2928,8 @@ impl Gemma4CudaResident {
             .as_ref()
             .expect("moe_layer_ffn_cached requires the SSER cache");
 
+        let prof = std::env::var_os("CAMELID_SSER_PROFILE").is_some();
+        let tp0 = std::time::Instant::now();
         // --- Dense "shared expert" MLP branch (CPU, identical to moe_layer_ffn). ---
         let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
         let xnq = quantize_q8_0_blocks(&xn);
@@ -2911,6 +2942,10 @@ impl Gemma4CudaResident {
             .collect();
         let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
         let mlp = rms_norm(&mlp, Some(&moe.post_norm_1), eps);
+        if prof {
+            SSER_PROF_DENSE_NS.fetch_add(tp0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let tp1 = std::time::Instant::now();
 
         // --- Router (CPU, identical). ---
         let mut r = rms_norm(attn_out, None, eps);
@@ -2933,6 +2968,10 @@ impl Gemma4CudaResident {
         }
         let mut wsum: f32 = idx.iter().map(|&e| probs[e]).sum();
         wsum = wsum.max(6.103_515e-5);
+        if prof {
+            SSER_PROF_ROUTER_NS.fetch_add(tp1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        let tp2 = std::time::Instant::now();
 
         // --- Expert branch: quantize the shared input once (CPU), upload once. ---
         let cur_moe = rms_norm(attn_out, Some(&moe.pre_norm_2), eps);
@@ -2978,13 +3017,47 @@ impl Gemma4CudaResident {
             let key = (l as u16, e as u16);
 
             let cached = sser.borrow_mut().touch(key);
-            if cached {
-                // --- GPU path: fused gate‖up GEMV -> GeGLU -> quantize -> down GEMV. ---
-                // Hold the shared cache borrow for the whole launch sequence so the
-                // resident weight views stay valid; the `touch` above already bumped
-                // recency, so no entry can be evicted while this borrow is live.
+            let te = std::time::Instant::now();
+            // On a MISS, upload the expert's two Q4_0 slices and insert them into the
+            // VRAM cache (promotion) BEFORE running — then the GPU pipeline below reads
+            // the freshly-resident slices exactly as it does for a hit. This moves the
+            // expensive part of a miss (the ~1.8 ms CPU expert matvec, which profiling
+            // showed was ~72% of all MoE time) onto the GPU: a miss now costs only the
+            // ~6 MiB weight htod + the same tiny GEMV launches a hit already pays.
+            if !cached {
+                sser.borrow_mut().misses += 1;
+                let gu_off = e * two_nff * gu_row_bytes;
+                let down_off = e * hidden * down_row_bytes;
+                let gu_slice = &gate_up_bytes[gu_off..gu_off + two_nff * gu_row_bytes];
+                let down_slice = &down_bytes[down_off..down_off + hidden * down_row_bytes];
+                let gu_dev = s.clone_htod(gu_slice).map_err(cu)?;
+                let down_dev = s.clone_htod(down_slice).map_err(cu)?;
+                let mut c = sser.borrow_mut();
+                c.evict_if_full();
+                c.clock += 1;
+                let stamp = c.clock;
+                c.entries.insert(
+                    key,
+                    SserExpertDev {
+                        gate_up: gu_dev,
+                        down: down_dev,
+                        last_used: stamp,
+                    },
+                );
+            } else {
+                sser.borrow_mut().hits += 1;
+            }
+
+            // --- GPU pipeline (hit OR promoted-miss): fused gate‖up GEMV -> GeGLU ->
+            // quantize -> down GEMV -> weighted on-device accumulate. Every expert now
+            // takes the identical bit-exact GPU path, so the token stream no longer
+            // depends on cache warmth (removes host/device path-divergence). Hold the
+            // shared cache borrow for the whole launch sequence so the resident weight
+            // views stay valid; `touch`/`insert` above made `key` the newest entry, so
+            // it cannot be evicted while this borrow is live. ---
+            {
                 let c = sser.borrow();
-                let ent = c.entries.get(&key).expect("touch confirmed residency");
+                let ent = c.entries.get(&key).expect("hit or just-promoted miss");
                 let gu_dev = ent.gate_up.slice(0..ent.gate_up.len());
                 let down_dev = ent.down.slice(0..ent.down.len());
                 // gate‖up: two_nff rows, gu_blocks blocks/row.
@@ -3036,75 +3109,29 @@ impl Gemma4CudaResident {
                     0,
                 )
                 .map_err(cu)?;
-                drop(c);
-                sser.borrow_mut().hits += 1;
-                // On-device weighted accumulate: d_moe_acc[i] += d_y[i] * scale.
-                // No per-expert dtoh/sync — matches the host `*a += yv * scale` and
-                // (with --fmad=false) rounds identically. Deferred to a single dtoh
-                // after the loop.
-                {
-                    let cfg = LaunchConfig {
-                        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let n_i = hidden as i32;
-                    // scaled_axpy(acc, y, scale, n): acc[i] += y[i]*scale.
-                    let mut b = s.launch_builder(&k.scaled_axpy);
-                    b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
-                    unsafe { b.launch(cfg) }.map_err(cu)?;
+            }
+            // On-device weighted accumulate: d_moe_acc[i] += d_y[i] * scale (deferred to
+            // one dtoh after the loop). scaled_axpy(acc, y, scale, n): acc += y*scale.
+            {
+                let cfg = LaunchConfig {
+                    grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                let n_i = hidden as i32;
+                let mut b = s.launch_builder(&k.scaled_axpy);
+                b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
+                unsafe { b.launch(cfg) }.map_err(cu)?;
+            }
+            any_gpu_expert = true;
+            if prof {
+                let ns = te.elapsed().as_nanos() as u64;
+                use std::sync::atomic::Ordering::Relaxed;
+                if cached {
+                    SSER_PROF_HIT_NS.fetch_add(ns, Relaxed);
+                } else {
+                    SSER_PROF_MISS_NS.fetch_add(ns, Relaxed);
                 }
-                any_gpu_expert = true;
-            } else {
-                // --- CPU miss path (bit-identical to M1 moe_layer_ffn), then promote. ---
-                sser.borrow_mut().misses += 1;
-                let gate_up = moe
-                    .gate_up_exps
-                    .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q);
-                let hexp: Vec<f32> = (0..nff)
-                    .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + nff])
-                    .collect();
-                let hexp_q = quantize_q8_0_blocks(&hexp);
-                let y = moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q);
-                // Accumulate this CPU-computed expert into the SAME device buffer, in
-                // the SAME idx order as the GPU hits — upload `y` and scaled_axpy it
-                // into `d_moe_acc`. This keeps the layer's expert sum a single strict
-                // left-to-right accumulation identical to M2 (one buffer, idx order),
-                // so the whole layer stays byte-identical while collapsing to one
-                // dtoh + one sync total. The per-miss htod is `hidden` f32 (~10 KiB)
-                // and grows rare as the cache warms.
-                s.memcpy_htod(&y, &mut d_y).map_err(cu)?;
-                {
-                    let cfg = LaunchConfig {
-                        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    let n_i = hidden as i32;
-                    let mut b = s.launch_builder(&k.scaled_axpy);
-                    b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
-                    unsafe { b.launch(cfg) }.map_err(cu)?;
-                }
-                any_gpu_expert = true;
-                // Promote: upload this expert's two Q4_0 slices into the VRAM cache.
-                let gu_off = e * two_nff * gu_row_bytes;
-                let down_off = e * hidden * down_row_bytes;
-                let gu_slice = &gate_up_bytes[gu_off..gu_off + two_nff * gu_row_bytes];
-                let down_slice = &down_bytes[down_off..down_off + hidden * down_row_bytes];
-                let gu_dev = s.clone_htod(gu_slice).map_err(cu)?;
-                let down_dev = s.clone_htod(down_slice).map_err(cu)?;
-                let mut c = sser.borrow_mut();
-                c.evict_if_full();
-                c.clock += 1;
-                let stamp = c.clock;
-                c.entries.insert(
-                    key,
-                    SserExpertDev {
-                        gate_up: gu_dev,
-                        down: down_dev,
-                        last_used: stamp,
-                    },
-                );
             }
         }
         // Every selected expert (hit OR miss) accumulated into `d_moe_acc` in strict
@@ -3116,6 +3143,9 @@ impl Gemma4CudaResident {
         if any_gpu_expert {
             s.memcpy_dtoh(&d_moe_acc, &mut moe_acc).map_err(cu)?;
             s.synchronize().map_err(cu)?;
+        }
+        if prof {
+            SSER_PROF_EXPERT_NS.fetch_add(tp2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         let cur_moe = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
 
