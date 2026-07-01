@@ -15746,6 +15746,9 @@ pub(crate) fn q4_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
 /// same per-block sequential `isum * w_scale * x_scale` f32 accumulate, same
 /// block order. Only the within-block iteration order differs (re-laned), and
 /// integer addition is order-independent.
+// Lane-indexed kernel loops mirror the interleaved SIMD layout (index == row lane),
+// so iterator rewrites would obscure the mapping.
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn q4_0_packed_gemv8_scalar(
     packed: &crate::tensor::Q4_0PackedRows8,
     group_block_start: usize,
