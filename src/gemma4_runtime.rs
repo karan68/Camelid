@@ -228,6 +228,26 @@ impl WireQuant {
         out
     }
 
+    /// Repack a contiguous band of `row_count` Q4_0 output rows starting at
+    /// `row_start` into the interleaved 8-row [`Q4_0PackedRows8`] layout the AVX2
+    /// GEMV consumes. `blocks_per_row` = in_dim/32. `row_start`, `row_count`, and
+    /// `blocks_per_row` are all block/8-aligned for the expert bands. Called once
+    /// per expert per session (cached), not per token.
+    fn pack_rows(
+        &self,
+        row_start: usize,
+        row_count: usize,
+        blocks_per_row: usize,
+    ) -> crate::tensor::Q4_0PackedRows8 {
+        debug_assert_eq!(self.format, WireFormat::Q4_0);
+        let row_bytes = blocks_per_row * self.format.bytes_per_block();
+        let bytes = self.bytes();
+        let start = row_start * row_bytes;
+        let band = &bytes[start..start + row_count * row_bytes];
+        crate::tensor::Q4_0PackedRows8::from_q4_0_bytes(row_count, blocks_per_row, band)
+            .expect("Q4_0 expert band repack (rows multiple of 8, block-aligned)")
+    }
+
     /// Batched [`matvec_q`]: dot each output row against EACH of the `xqs`
     /// activations, reading the weight row from the wire bytes ONCE per row and
     /// reusing it across all `xqs`. For K activations this reads the whole weight
@@ -532,6 +552,107 @@ struct LayerWeights {
     moe: Option<MoeWeights>,
 }
 
+/// One expert's two projection matrices, pre-repacked into the interleaved
+/// 8-row layout [`crate::tensor::Q4_0PackedRows8`] the AVX2 GEMV consumes. Built
+/// lazily on first use and cached (see [`ExpertPackCache`]) so the repack is paid
+/// once per expert per session instead of once per token — the packed GEMV then
+/// runs with no per-call repack/alloc, which is what makes it beat the (already
+/// autovectorized) scalar wire dot.
+struct PackedExpert {
+    /// Fused gate‖up, `2*n_ff_exp` rows × (n_embd/32) blocks/row.
+    gate_up: crate::tensor::Q4_0PackedRows8,
+    /// Down, `n_embd` rows × (n_ff_exp/32) blocks/row.
+    down: crate::tensor::Q4_0PackedRows8,
+}
+
+impl PackedExpert {
+    fn byte_len(&self) -> usize {
+        self.gate_up.byte_len() + self.down.byte_len()
+    }
+}
+
+/// Bounded host-RAM cache of [`PackedExpert`]s for ONE MoE layer, keyed by expert
+/// index. A greedy decode fires a small, stable subset of the 128 experts, so a
+/// modest cap keeps the hot experts pre-packed (steady-state SIMD GEMV with no
+/// repack) while bounding the extra RAM — the packed form is a second copy of the
+/// expert weights (~11% larger than the mmap wire bytes), so caching ALL experts
+/// of ALL layers would blow this box's RAM. Eviction is FIFO on the insertion
+/// order (the working set is stable, so FIFO ≈ LRU here). Budget in MiB via
+/// `CAMELID_GEMMA4_EXPERT_PACK_MIB` (default 1024; 0 disables the SIMD pack path,
+/// falling back to the scalar wire dot). Correctness is independent of the cache:
+/// a miss that cannot be cached just repacks on the fly, still bit-exact.
+struct ExpertPackCache {
+    entries: std::collections::HashMap<u16, Arc<PackedExpert>>,
+    order: std::collections::VecDeque<u16>,
+    bytes: usize,
+    budget_bytes: usize,
+}
+
+impl ExpertPackCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            budget_bytes,
+        }
+    }
+
+    fn get(&self, e: u16) -> Option<Arc<PackedExpert>> {
+        self.entries.get(&e).cloned()
+    }
+
+    /// Insert `packed` for expert `e`, evicting FIFO until it fits the budget.
+    /// If a single expert exceeds the budget it is not cached (returned Arc is
+    /// still usable by the caller for this one token).
+    fn insert(&mut self, e: u16, packed: Arc<PackedExpert>) {
+        let sz = packed.byte_len();
+        if sz > self.budget_bytes {
+            return;
+        }
+        while self.bytes + sz > self.budget_bytes {
+            let Some(old) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(p) = self.entries.remove(&old) {
+                self.bytes -= p.byte_len();
+            }
+        }
+        if self.entries.insert(e, packed).is_none() {
+            self.order.push_back(e);
+            self.bytes += sz;
+        }
+    }
+}
+
+/// Per-layer expert-pack budget (bytes) from `CAMELID_GEMMA4_EXPERT_PACK_MIB`
+/// (default 1024 MiB). `0` disables pre-packing (scalar wire-dot fallback).
+fn expert_pack_budget_bytes() -> usize {
+    std::env::var("CAMELID_GEMMA4_EXPERT_PACK_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1024)
+        .saturating_mul(1024 * 1024)
+}
+
+/// GEMV a whole pre-packed [`crate::tensor::Q4_0PackedRows8`] band against a Q8
+/// activation, returning one f32 per row. One rayon task per group of 8 rows runs
+/// the AVX2 [`crate::inference::q4_0_packed_gemv8`] into eight fixed output slots
+/// — no repack, no per-call allocation. Bit-identical to `matvec_q_rows` on the
+/// same rows (the kernel is proven bit-exact vs the scalar wire dot and the row
+/// order is preserved).
+fn packed_band_matvec(packed: &crate::tensor::Q4_0PackedRows8, xq: &[Q8_0Block]) -> Vec<f32> {
+    debug_assert_eq!(packed.blocks_per_row, xq.len());
+    let mut out = vec![0f32; packed.rows];
+    out.par_chunks_mut(8).enumerate().for_each(|(g, dst)| {
+        let group_block_start = g * packed.blocks_per_row;
+        let mut acc = [0f32; 8];
+        crate::inference::q4_0_packed_gemv8(packed, group_block_start, xq, &mut acc);
+        dst.copy_from_slice(&acc);
+    });
+    out
+}
+
 /// Sparse 128-expert branch weights for one Gemma 4 A4B MoE layer. The dense
 /// `ffn_gate/up/down` on [`LayerWeights`] are the parallel shared-expert MLP.
 struct MoeWeights {
@@ -553,6 +674,42 @@ struct MoeWeights {
     n_expert: usize,
     n_expert_used: usize,
     n_ff_exp: usize,
+    /// Lazy per-expert pre-packed (interleaved 8-row) form of the two Q4_0 expert
+    /// matrices, for the AVX2 GEMV expert path. Populated on first use, bounded by
+    /// [`expert_pack_budget_bytes`]. `None` when the experts are not Q4_0 (the
+    /// pack path only supports Q4_0) or the budget is 0.
+    pack_cache: Option<std::sync::Mutex<ExpertPackCache>>,
+}
+
+impl MoeWeights {
+    /// Return expert `e`'s pre-packed (interleaved 8-row) projections, packing
+    /// and caching them on first use. `None` when the pack path is disabled
+    /// (non-Q4_0 experts or a 0 budget) — the caller then uses the scalar wire
+    /// dot. `hidden` = n_embd (gate_up in_dim), `two_nff` = 2*n_ff_exp (gate_up
+    /// row count / down in_dim). Packing happens under the cache lock but the
+    /// returned `Arc` is cloned out, so the GEMV runs lock-free.
+    fn packed_expert(&self, e: usize, hidden: usize, two_nff: usize) -> Option<Arc<PackedExpert>> {
+        let cache = self.pack_cache.as_ref()?;
+        let key = e as u16;
+        {
+            let guard = cache.lock().expect("expert pack cache poisoned");
+            if let Some(p) = guard.get(key) {
+                return Some(p);
+            }
+        }
+        // Miss: pack this expert's two bands (outside the lock is not required —
+        // the pack is the same work regardless — but we build then insert under
+        // the lock so concurrent callers converge; decode is single-threaded here
+        // so there is no real contention).
+        let gu_blocks = hidden / 32; // gate_up in_dim = n_embd
+        let down_blocks = two_nff / 2 / 32; // down in_dim = n_ff_exp
+        let gate_up = self.gate_up_exps.pack_rows(e * two_nff, two_nff, gu_blocks);
+        let down = self.down_exps.pack_rows(e * hidden, hidden, down_blocks);
+        let packed = Arc::new(PackedExpert { gate_up, down });
+        let mut guard = cache.lock().expect("expert pack cache poisoned");
+        guard.insert(key, packed.clone());
+        Some(packed)
+    }
 }
 
 /// Per-phase CPU decode counters (µs), populated only when
@@ -714,13 +871,25 @@ impl Gemma4Runtime {
                         let n_expert = moe_meta.expert_count as usize;
                         // 2*n_ff_exp = gate_up rows / n_expert; n_ff_exp halves it.
                         let gate_up = q8(&m.gate_up_exps.name)?;
+                        let down = q8(&m.down_exps.name)?;
                         let two_nff =
                             gate_up.element_count / (n_expert * config.embedding_length as usize);
+                        // Enable the AVX2 pre-pack expert path only when BOTH expert
+                        // matrices are Q4_0 (the pack format) and a budget is set.
+                        let budget = expert_pack_budget_bytes();
+                        let pack_cache = if budget > 0
+                            && gate_up.format == WireFormat::Q4_0
+                            && down.format == WireFormat::Q4_0
+                        {
+                            Some(std::sync::Mutex::new(ExpertPackCache::new(budget)))
+                        } else {
+                            None
+                        };
                         Ok(MoeWeights {
                             gate_inp: f32t(&m.gate_inp.name)?,
                             gate_inp_scale: f32t(&m.gate_inp_scale.name)?,
                             gate_up_exps: gate_up,
-                            down_exps: q8(&m.down_exps.name)?,
+                            down_exps: down,
                             down_exps_scale: f32t(&m.down_exps_scale.name)?,
                             pre_norm_2: f32t(&m.pre_norm_2.name)?,
                             post_norm_1: f32t(&m.post_norm_1.name)?,
@@ -728,6 +897,7 @@ impl Gemma4Runtime {
                             n_expert,
                             n_expert_used: moe_meta.expert_used_count as usize,
                             n_ff_exp: two_nff / 2,
+                            pack_cache,
                         })
                     })
                     .transpose()?,
@@ -1173,18 +1343,29 @@ impl Gemma4Runtime {
         let cur_moe_q = quantize_q8_0_blocks(&cur_moe);
         let two_nff = 2 * moe.n_ff_exp;
         let mut moe_acc = vec![0f32; hidden];
+        // Pre-packed (interleaved 8-row) expert matrices for the AVX2 GEMV, packed
+        // once per expert per session and cached; `None` disables the fast path.
         for &e in &idx {
             let w = probs[e] / wsum;
+            let packed = moe.packed_expert(e, hidden, two_nff);
             // fused gate‖up for expert e: rows e*2nff .. +2nff, in_dim=n_embd.
-            let gate_up = moe
-                .gate_up_exps
-                .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q);
+            // Interleaved 8-row AVX2 GEMV (bit-exact vs the scalar row path) when
+            // the expert is pre-packed, else the scalar wire dot.
+            let gate_up = match &packed {
+                Some(p) => packed_band_matvec(&p.gate_up, &cur_moe_q),
+                None => moe
+                    .gate_up_exps
+                    .matvec_q_rows(e * two_nff, two_nff, &cur_moe_q),
+            };
             let hexp: Vec<f32> = (0..moe.n_ff_exp)
                 .map(|o| gelu_tanh(gate_up[o]) * gate_up[o + moe.n_ff_exp])
                 .collect();
             let hexp_q = quantize_q8_0_blocks(&hexp);
             // down for expert e: rows e*n_embd .. +n_embd, in_dim=n_ff_exp.
-            let y = moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q);
+            let y = match &packed {
+                Some(p) => packed_band_matvec(&p.down, &hexp_q),
+                None => moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q),
+            };
             let scale = moe.down_exps_scale[e] * w;
             for (a, yv) in moe_acc.iter_mut().zip(&y) {
                 *a += yv * scale;
