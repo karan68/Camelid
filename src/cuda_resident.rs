@@ -1334,6 +1334,19 @@ extern "C" __global__ void residual_add(float* __restrict__ acc, const float* __
     if (i < n) acc[i] += add[i];
 }
 
+// ---- Scaled axpy: acc[i] += y[i] * scale ----------------------------------
+// SSER (M3) on-device MoE accumulation: each cached expert's down-GEMV output
+// `y` is folded into the layer's device `moe_acc` scaled by its routing weight,
+// so a k-hit layer costs one dtoh + one sync total instead of k of each. The
+// f32 mul-then-add matches the CPU host accumulate `*a += yv * scale` (with
+// --fmad=false the compiler cannot fuse it, so the rounding is identical).
+extern "C" __global__ void scaled_axpy(
+    float* __restrict__ acc, const float* __restrict__ y, float scale, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) acc[i] += y[i] * scale;
+}
+
 // ---- Greedy argmax (strict >, first index wins ties) ----------------------
 // Single block. Each thread scans a stride; reduce in shared keeping lower idx
 // on ties to match the CPU `>` scan.
@@ -2157,6 +2170,7 @@ pub struct CudaResidentKernels {
     pub(crate) f32_gemv: CudaFunction,
     pub(crate) scale_f32: CudaFunction,
     pub(crate) residual_add: CudaFunction,
+    pub(crate) scaled_axpy: CudaFunction,
     pub(crate) argmax: CudaFunction,
     pub(crate) sample_gumbel: CudaFunction,
     pub(crate) gemm_batched: CudaFunction,
@@ -2230,6 +2244,7 @@ impl CudaResidentKernels {
             f32_gemv: f("f32_gemv")?,
             scale_f32: f("scale_f32")?,
             residual_add: f("residual_add")?,
+            scaled_axpy: f("scaled_axpy")?,
             argmax: f("argmax_f32")?,
             sample_gumbel: f("sample_gumbel")?,
             gemm_batched: f("q8_gemm_batched")?,

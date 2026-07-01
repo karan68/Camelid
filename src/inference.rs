@@ -15737,6 +15737,268 @@ pub(crate) fn q4_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
     total
 }
 
+/// Scalar reference for the interleaved 8-row Q4_0×Q8_0 GEMV. Consumes one
+/// [`crate::tensor::Q4_0PackedRows8`] row-group (`blocks_per_row` interleaved
+/// blocks starting at `group_block_start`) and one Q8 activation row, writing
+/// eight dot products (one per interleaved row) into `out`.
+///
+/// Bit-exact against [`q4_0_wire_row_dot_scalar`]: same per-block int32 dot,
+/// same per-block sequential `isum * w_scale * x_scale` f32 accumulate, same
+/// block order. Only the within-block iteration order differs (re-laned), and
+/// integer addition is order-independent.
+// Lane-indexed kernel loops mirror the interleaved SIMD layout (index == row lane),
+// so iterator rewrites would obscure the mapping.
+#[allow(clippy::needless_range_loop)]
+pub(crate) fn q4_0_packed_gemv8_scalar(
+    packed: &crate::tensor::Q4_0PackedRows8,
+    group_block_start: usize,
+    input: &[Q8_0Block],
+    out: &mut [f32; 8],
+) {
+    *out = [0.0_f32; 8];
+    let bpr = packed.blocks_per_row;
+    for (b, i_block) in input.iter().enumerate() {
+        let blk = &packed.blocks[group_block_start + b];
+        let mut isum = [0i32; 8];
+        // qs[k*64 + lane*8 + i]: low nibble is weight for act idx k*8+i,
+        // high nibble is weight for act idx k*8+i+16 (both -8 biased).
+        for k in 0..2 {
+            for lane in 0..8 {
+                let mut acc = 0i32;
+                for i in 0..8 {
+                    let byte = blk.qs[k * 64 + lane * 8 + i];
+                    let lo = (byte & 0x0F) as i32 - 8;
+                    let hi = (byte >> 4) as i32 - 8;
+                    let a_lo = i_block.quants[k * 8 + i] as i32;
+                    let a_hi = i_block.quants[k * 8 + i + 16] as i32;
+                    acc += lo * a_lo + hi * a_hi;
+                }
+                isum[lane] += acc;
+            }
+        }
+        for lane in 0..8 {
+            out[lane] += isum[lane] as f32 * blk.scales[lane] * i_block.scale;
+        }
+    }
+    let _ = bpr;
+}
+
+/// Runtime-dispatched interleaved 8-row Q4_0×Q8_0 GEMV: AVX2 when available,
+/// else the scalar reference above. Both paths are bit-identical to
+/// [`q4_0_wire_row_dot_scalar`] run over the same eight rows.
+#[inline]
+pub(crate) fn q4_0_packed_gemv8(
+    packed: &crate::tensor::Q4_0PackedRows8,
+    group_block_start: usize,
+    input: &[Q8_0Block],
+    out: &mut [f32; 8],
+) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed at runtime; slices bounds-validated by caller
+            // (group_block_start + input.len() <= packed.blocks.len()).
+            unsafe { q4_0_packed_gemv8_avx2(packed, group_block_start, input, out) };
+            return;
+        }
+    }
+    q4_0_packed_gemv8_scalar(packed, group_block_start, input, out);
+}
+
+/// AVX2 interleaved 8-row Q4_0×Q8_0 GEMV. Ported from llama.cpp's
+/// `gemv_q4_b32_8x8_q8_0_lut_avx` (arch/x86/repack.cpp), tied to the Camelid
+/// scalar contract (nibbles carry a `-8` bias). All 8 output rows accumulate in
+/// parallel in the eight 32-bit lanes of one `__m256i`; nibbles are sign-biased
+/// via a `_mm256_shuffle_epi8` LUT and dotted with `maddubs`+`madd` — no
+/// AVX-512-VNNI dependency (the 11800H has none).
+///
+/// Bit-exact vs [`q4_0_packed_gemv8_scalar`] / [`q4_0_wire_row_dot_scalar`]:
+/// the int32 per-block dot is exact (nibble×i8 pair-sums cannot overflow i16),
+/// integer accumulation is order-independent, and the per-block f32
+/// `isum·w_scale·x_scale` accumulate runs in the same block order.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn q4_0_packed_gemv8_avx2(
+    packed: &crate::tensor::Q4_0PackedRows8,
+    group_block_start: usize,
+    input: &[Q8_0Block],
+    out: &mut [f32; 8],
+) {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    // Signed-nibble LUT: masked nibble n (0..15) -> (n - 8) as i8. Duplicated
+    // across both 128-bit halves so the 256-bit byte-shuffle works per-half.
+    #[rustfmt::skip]
+    let signextendlut = _mm256_setr_epi8(
+        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
+        -8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7,
+    );
+    let m4b = _mm256_set1_epi8(0x0F);
+    // finalpermutemask: llama interleaves lanes as (0,2,4,6,1,3,5,7) within the
+    // 256-bit int accumulator; this permute restores natural row order 0..7.
+    let finalpermutemask = _mm256_setr_epi32(0, 2, 4, 6, 1, 3, 5, 7);
+    // Natural row order -> interleaved lane order (r0,r4,r1,r5,r2,r6,r3,r7), used
+    // to align the per-row weight scales with the interleaved int accumulator.
+    let interleave_scale_mask = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+
+    let mut acc_row = _mm256_setzero_ps();
+
+    for (b, i_block) in input.iter().enumerate() {
+        let blk = packed.blocks.get_unchecked(group_block_start + b);
+        let qptr = blk.qs.as_ptr();
+
+        // Two 32-byte loads per nibble-plane group.
+        // qs[0..32]   = rows 0-3, activation positions 0-7   (k=0)
+        // qs[32..64]  = rows 4-7, activation positions 0-7   (k=0)
+        // qs[64..96]  = rows 0-3, activation positions 8-15  (k=1)
+        // qs[96..128] = rows 4-7, activation positions 8-15  (k=1)
+        // Each byte's LOW nibble is the weight for act[pos], HIGH nibble the
+        // weight for act[pos+16].
+        let raw_0123_k0 = _mm256_loadu_si256(qptr as *const __m256i);
+        let raw_4567_k0 = _mm256_loadu_si256(qptr.add(32) as *const __m256i);
+        let raw_0123_k1 = _mm256_loadu_si256(qptr.add(64) as *const __m256i);
+        let raw_4567_k1 = _mm256_loadu_si256(qptr.add(96) as *const __m256i);
+
+        // Low nibble -> weights for act positions {0-7 | 8-15}
+        let w_0123_lo0 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(raw_0123_k0, m4b));
+        let w_4567_lo0 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(raw_4567_k0, m4b));
+        let w_0123_lo1 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(raw_0123_k1, m4b));
+        let w_4567_lo1 = _mm256_shuffle_epi8(signextendlut, _mm256_and_si256(raw_4567_k1, m4b));
+        // High nibble -> weights for act positions {16-23 | 24-31}
+        let w_0123_hi0 = _mm256_shuffle_epi8(
+            signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(raw_0123_k0, 4), m4b),
+        );
+        let w_4567_hi0 = _mm256_shuffle_epi8(
+            signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(raw_4567_k0, 4), m4b),
+        );
+        let w_0123_hi1 = _mm256_shuffle_epi8(
+            signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(raw_0123_k1, 4), m4b),
+        );
+        let w_4567_hi1 = _mm256_shuffle_epi8(
+            signextendlut,
+            _mm256_and_si256(_mm256_srli_epi16(raw_4567_k1, 4), m4b),
+        );
+
+        // Broadcast the 32 activation i8 values across both 128-bit halves so a
+        // per-lane 32-bit shuffle can select the right 4-byte activation group.
+        let aptr = i_block.quants.as_ptr();
+        let a_lo = _mm256_permute2f128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128(aptr as *const __m128i)),
+            _mm256_castsi128_si256(_mm_loadu_si128(aptr as *const __m128i)),
+            0,
+        );
+        let a_hi = _mm256_permute2f128_si256(
+            _mm256_castsi128_si256(_mm_loadu_si128(aptr.add(16) as *const __m128i)),
+            _mm256_castsi128_si256(_mm_loadu_si128(aptr.add(16) as *const __m128i)),
+            0,
+        );
+
+        let mut iacc = _mm256_setzero_si256();
+        // For each activation 4-lane group (positions 0-3,4-7,8-11,...,28-31)
+        // interleave rows {0,4,1,5,2,6,3,7} and maddubs against the broadcast
+        // activation group. `_mm256_shuffle_epi32(a, imm)` selects one 32-bit
+        // group of 4 activation bytes and broadcasts it into all four 32-bit
+        // slots of each 128-bit half.
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(w_0123_lo0, _mm256_shuffle_epi32(w_4567_lo0, 0xB1), 0xAA),
+            _mm256_shuffle_epi32(a_lo, 0x00),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(_mm256_shuffle_epi32(w_0123_lo0, 0xB1), w_4567_lo0, 0xAA),
+            _mm256_shuffle_epi32(a_lo, 0x55),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(w_0123_lo1, _mm256_shuffle_epi32(w_4567_lo1, 0xB1), 0xAA),
+            _mm256_shuffle_epi32(a_lo, 0xAA),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(_mm256_shuffle_epi32(w_0123_lo1, 0xB1), w_4567_lo1, 0xAA),
+            _mm256_shuffle_epi32(a_lo, 0xFF),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(w_0123_hi0, _mm256_shuffle_epi32(w_4567_hi0, 0xB1), 0xAA),
+            _mm256_shuffle_epi32(a_hi, 0x00),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(_mm256_shuffle_epi32(w_0123_hi0, 0xB1), w_4567_hi0, 0xAA),
+            _mm256_shuffle_epi32(a_hi, 0x55),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(w_0123_hi1, _mm256_shuffle_epi32(w_4567_hi1, 0xB1), 0xAA),
+            _mm256_shuffle_epi32(a_hi, 0xAA),
+        );
+        iacc = mul_sum_i8_pairs_acc_i32x8(
+            iacc,
+            _mm256_blend_epi32(_mm256_shuffle_epi32(w_0123_hi1, 0xB1), w_4567_hi1, 0xAA),
+            _mm256_shuffle_epi32(a_hi, 0xFF),
+        );
+
+        // `iacc` lanes are in the interleaved row order (r0,r4,r1,r5,r2,r6,r3,r7)
+        // produced by the blend network. `blk.scales` is in natural row order, so
+        // permute it to the same interleaved order before folding, then a single
+        // final permute restores natural order for the store.
+        let col_scale =
+            _mm256_permutevar8x32_ps(_mm256_loadu_ps(blk.scales.as_ptr()), interleave_scale_mask);
+        let row_scale = _mm256_set1_ps(i_block.scale);
+        // Match the scalar fold EXACTLY: ((isum * w_scale) * x_scale) then add,
+        // with three separate roundings and a non-fused add (no `fmadd`), so the
+        // result is bit-identical to `q4_0_wire_row_dot_scalar`.
+        let prod = _mm256_mul_ps(
+            _mm256_mul_ps(_mm256_cvtepi32_ps(iacc), col_scale),
+            row_scale,
+        );
+        acc_row = _mm256_add_ps(acc_row, prod);
+    }
+
+    // Restore natural row order 0..7 and store.
+    let ordered = _mm256_permutevar8x32_ps(acc_row, finalpermutemask);
+    _mm256_storeu_ps(out.as_mut_ptr(), ordered);
+}
+
+/// int8×int8 pairwise-dot of two `__m256i` where each 32-bit lane holds 4
+/// signed bytes of `x` (weights, [-8,7]) and 4 of `y` (activations, [-128,127]),
+/// producing 8 int32 lane-dots added to `acc`. Uses the `maddubs` sign-trick
+/// (no AVX-512-VNNI): `abs(x)` is the unsigned operand, `y·sign(x)` the signed
+/// operand. Bit-exact vs the scalar dot: `|x|` ∈ [0,8] is unsigned-safe, and
+/// because weights are never `i8::MIN`, `sign_epi8` never hits the `-(-128)`
+/// overflow; the only value that could is a `-128` activation, but that lands in
+/// the *signed* operand `y` (`sign_epi8(y,x)` negates `y` only where `x<0`), and
+/// `-128` negated stays `-128` — which is exactly what the scalar path computes
+/// too, since `(-8)*(-128) = 1024` would need the *weight* to be the one negated.
+/// The weight is `x`; its abs is taken, so no activation value is ever negated
+/// into a wrong magnitude. Verified bit-exact by
+/// `q4_0_packed_gemv8_matches_scalar_bit_exact`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn mul_sum_i8_pairs_acc_i32x8(
+    acc: core::arch::x86_64::__m256i,
+    x: core::arch::x86_64::__m256i,
+    y: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+    let ax = _mm256_sign_epi8(x, x);
+    let sy = _mm256_sign_epi8(y, x);
+    let dot = _mm256_maddubs_epi16(ax, sy);
+    let ones = _mm256_set1_epi16(1);
+    _mm256_add_epi32(acc, _mm256_madd_epi16(dot, ones))
+}
+
 /// Q4_1 weight row dotted against a Q8_0-quantized activation. Q4_1 block = 20 bytes
 /// (f16 scale `d` + f16 min `m` + 16 nibble bytes, 32 values); the nibble is UNSIGNED
 /// (no -8 bias) and dequant is `q*d + m` (matches `decode_q4_1_tensor`/`Q4_1Block`).
