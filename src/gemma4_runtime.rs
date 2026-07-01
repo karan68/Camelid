@@ -2960,6 +2960,13 @@ impl Gemma4CudaResident {
         let mut d_geglu_q = s.alloc_zeros::<i8>(nff).map_err(cu)?;
         let mut d_geglu_s = s.alloc_zeros::<f32>(down_blocks).map_err(cu)?;
         let mut d_y = s.alloc_zeros::<f32>(hidden).map_err(cu)?;
+        // M3 on-device MoE accumulator: cache-HIT experts fold their weighted
+        // down-GEMV output straight into this device buffer (one scaled_axpy launch
+        // each), so the whole hit set costs ONE dtoh + ONE sync per layer instead of
+        // k of each. Cache-MISS experts still run on the CPU and accumulate into
+        // `moe_acc` (host); the two partials are summed after the loop.
+        let mut d_moe_acc = s.alloc_zeros::<f32>(hidden).map_err(cu)?;
+        let mut any_gpu_expert = false;
 
         let gate_up_bytes = moe.gate_up_exps.bytes();
         let down_bytes = moe.down_exps.bytes();
@@ -3031,12 +3038,23 @@ impl Gemma4CudaResident {
                 .map_err(cu)?;
                 drop(c);
                 sser.borrow_mut().hits += 1;
-                let mut y = vec![0f32; hidden];
-                s.memcpy_dtoh(&d_y, &mut y).map_err(cu)?;
-                s.synchronize().map_err(cu)?;
-                for (a, yv) in moe_acc.iter_mut().zip(&y) {
-                    *a += yv * scale;
+                // On-device weighted accumulate: d_moe_acc[i] += d_y[i] * scale.
+                // No per-expert dtoh/sync — matches the host `*a += yv * scale` and
+                // (with --fmad=false) rounds identically. Deferred to a single dtoh
+                // after the loop.
+                {
+                    let cfg = LaunchConfig {
+                        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let n_i = hidden as i32;
+                    // scaled_axpy(acc, y, scale, n): acc[i] += y[i]*scale.
+                    let mut b = s.launch_builder(&k.scaled_axpy);
+                    b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
+                    unsafe { b.launch(cfg) }.map_err(cu)?;
                 }
+                any_gpu_expert = true;
             } else {
                 // --- CPU miss path (bit-identical to M1 moe_layer_ffn), then promote. ---
                 sser.borrow_mut().misses += 1;
@@ -3048,9 +3066,26 @@ impl Gemma4CudaResident {
                     .collect();
                 let hexp_q = quantize_q8_0_blocks(&hexp);
                 let y = moe.down_exps.matvec_q_rows(e * hidden, hidden, &hexp_q);
-                for (a, yv) in moe_acc.iter_mut().zip(&y) {
-                    *a += yv * scale;
+                // Accumulate this CPU-computed expert into the SAME device buffer, in
+                // the SAME idx order as the GPU hits — upload `y` and scaled_axpy it
+                // into `d_moe_acc`. This keeps the layer's expert sum a single strict
+                // left-to-right accumulation identical to M2 (one buffer, idx order),
+                // so the whole layer stays byte-identical while collapsing to one
+                // dtoh + one sync total. The per-miss htod is `hidden` f32 (~10 KiB)
+                // and grows rare as the cache warms.
+                s.memcpy_htod(&y, &mut d_y).map_err(cu)?;
+                {
+                    let cfg = LaunchConfig {
+                        grid_dim: ((hidden as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    let n_i = hidden as i32;
+                    let mut b = s.launch_builder(&k.scaled_axpy);
+                    b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
+                    unsafe { b.launch(cfg) }.map_err(cu)?;
                 }
+                any_gpu_expert = true;
                 // Promote: upload this expert's two Q4_0 slices into the VRAM cache.
                 let gu_off = e * two_nff * gu_row_bytes;
                 let down_off = e * hidden * down_row_bytes;
@@ -3071,6 +3106,16 @@ impl Gemma4CudaResident {
                     },
                 );
             }
+        }
+        // Every selected expert (hit OR miss) accumulated into `d_moe_acc` in strict
+        // idx order, so the layer's expert sum is one left-to-right f32 accumulation
+        // identical to M2's single-buffer host loop. Read it back with a SINGLE dtoh
+        // + sync for the whole layer (vs k dtoh + k syncs in M2). `any_gpu_expert` is
+        // false only when the layer selected no experts (never, for this model), in
+        // which case `moe_acc` stays zero as before.
+        if any_gpu_expert {
+            s.memcpy_dtoh(&d_moe_acc, &mut moe_acc).map_err(cu)?;
+            s.synchronize().map_err(cu)?;
         }
         let cur_moe = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
 
