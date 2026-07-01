@@ -11,6 +11,21 @@ use super::tools::ToolCall;
 
 /// Parse `text` into zero or more tool calls. Empty = no tool call (plain answer).
 pub fn parse(text: &str, family: &str) -> Vec<ToolCall> {
+    // Ornith / qwen35 emit a custom XML form `<tool_call><function=NAME>
+    // <parameter=ARG>VALUE</parameter>…</function></tool_call>` (NOT JSON), so it
+    // must be checked BEFORE the qwen/hermes arm (note "qwen35" contains "qwen").
+    if family.contains("ornith") || family.contains("qwen35") {
+        let calls = parse_ornith(text);
+        if !calls.is_empty() {
+            return calls;
+        }
+        // Fall back to hermes/JSON in case a future build emits standard tags.
+        let calls = parse_hermes(text);
+        if !calls.is_empty() {
+            return calls;
+        }
+        return parse_json(text);
+    }
     if family.contains("mistral") {
         let calls = parse_mistral(text);
         if !calls.is_empty() {
@@ -82,6 +97,66 @@ fn parse_hermes(text: &str) -> Vec<ToolCall> {
                 calls.push(call);
             }
         }
+    }
+    calls
+}
+
+/// Ornith / Qwen3.5 custom XML tool calls:
+/// `<tool_call>\n<function=NAME>\n<parameter=ARG>\nVALUE\n</parameter>…\n</function>\n</tool_call>`.
+/// Parses on the `<function=…>` boundary (the `<tool_call>` wrapper is optional in
+/// practice), so a bare function block still lifts. Each `<parameter=ARG>` value keeps
+/// the template's wrapper newline stripped; values that look like JSON objects/arrays
+/// are decoded (the template `tojson`s mapping/sequence args), scalars stay strings.
+fn parse_ornith(text: &str) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(fstart) = rest.find("<function=") {
+        let after = &rest[fstart + "<function=".len()..];
+        let Some(name_end) = after.find('>') else {
+            break;
+        };
+        let name = after[..name_end].trim().to_string();
+        let body = &after[name_end + 1..];
+        let (params_blob, next) = match body.find("</function>") {
+            Some(end) => (&body[..end], &body[end + "</function>".len()..]),
+            None => (body, ""),
+        };
+
+        let mut args = serde_json::Map::new();
+        let mut p = params_blob;
+        while let Some(ps) = p.find("<parameter=") {
+            let pa = &p[ps + "<parameter=".len()..];
+            let Some(pname_end) = pa.find('>') else { break };
+            let pname = pa[..pname_end].trim().to_string();
+            let pbody = &pa[pname_end + 1..];
+            let (pval, pnext) = match pbody.find("</parameter>") {
+                Some(end) => (&pbody[..end], &pbody[end + "</parameter>".len()..]),
+                None => (pbody, ""),
+            };
+            // The template wraps the value as `>\nVALUE\n</parameter>`; strip exactly
+            // one leading + one trailing newline to recover VALUE verbatim.
+            let v = pval.strip_prefix('\n').unwrap_or(pval);
+            let v = v.strip_suffix('\n').unwrap_or(v);
+            let trimmed = v.trim();
+            let value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                serde_json::from_str::<Value>(trimmed)
+                    .unwrap_or_else(|_| Value::String(v.to_string()))
+            } else {
+                Value::String(v.to_string())
+            };
+            if !pname.is_empty() {
+                args.insert(pname, value);
+            }
+            p = pnext;
+        }
+
+        if !name.is_empty() {
+            calls.push(ToolCall {
+                name,
+                args: Value::Object(args),
+            });
+        }
+        rest = next;
     }
     calls
 }
@@ -414,5 +489,61 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].name, "read_file");
         assert_eq!(out[1].name, "list_dir");
+    }
+
+    // ---- Ornith / qwen35 custom XML tool-call lift (Bug-1 gate) ----
+
+    /// The exact bytes the Ornith chat template emits for a tool call, routed by the
+    /// `qwen35` family (note: "qwen35" contains "qwen", so order matters).
+    #[test]
+    fn parses_ornith_single_tool_call() {
+        let text = "<tool_call>\n<function=read_file>\n<parameter=path>\nnotes.txt\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(text, "qwen35");
+        assert_eq!(out.len(), 1, "exactly one call, single parse");
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "notes.txt");
+    }
+
+    /// Reasoning must NOT contaminate the tool lift, and a natural-language preamble
+    /// before the call (allowed by the template) is ignored.
+    #[test]
+    fn parses_ornith_call_after_think_and_preamble() {
+        let text = "<think>\nI should read the file to count lines.\n</think>\n\nI'll read it now.\n<tool_call>\n<function=read_file>\n<parameter=path>\nnotes.txt\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(text, "qwen35");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "notes.txt");
+    }
+
+    /// Multiple parameters; a JSON-object-valued parameter is decoded, a scalar stays
+    /// a string. No double-parse.
+    #[test]
+    fn parses_ornith_multi_param_and_json_value() {
+        let text = "<tool_call>\n<function=edit_file>\n<parameter=path>\nsrc/x.rs\n</parameter>\n<parameter=edits>\n{\"a\": 1}\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(text, "qwen35");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "edit_file");
+        assert_eq!(out[0].args["path"], "src/x.rs");
+        assert_eq!(out[0].args["edits"]["a"], 1);
+    }
+
+    /// Two calls in one message lift to two structured calls.
+    #[test]
+    fn parses_ornith_two_calls() {
+        let text = "<tool_call>\n<function=read_file>\n<parameter=path>\na.txt\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=list_dir>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let out = parse(text, "qwen35");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "read_file");
+        assert_eq!(out[0].args["path"], "a.txt");
+        assert_eq!(out[1].name, "list_dir");
+        assert_eq!(out[1].args["path"], ".");
+    }
+
+    /// Plain assistant text (no call) yields no calls — the loop treats it as a final
+    /// answer rather than mis-firing a tool.
+    #[test]
+    fn ornith_plain_answer_no_calls() {
+        let text = "<think>\nThe answer is 3.\n</think>\n\nThe file has 3 lines.";
+        assert!(parse(text, "qwen35").is_empty());
     }
 }

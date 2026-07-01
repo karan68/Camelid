@@ -110,18 +110,73 @@ struct EvalCase {
 
 const FIXTURE: &str = "alpha\nbeta\ngamma\n"; // 3 lines
 
+/// True if a tool `name` ran cleanly (well-formed args → the sandbox executed it)
+/// and its output satisfies `out_ok`.
+fn tool_ran_ok(r: &EvalReporter, name: &str, out_ok: impl Fn(&str) -> bool) -> bool {
+    r.results
+        .iter()
+        .any(|(n, ok, out)| n == name && *ok && out_ok(out))
+}
+
+/// A genuine multi-tool battery exercising three distinct tools (read_file /
+/// list_dir / write_file). Each case requires the RIGHT tool to execute cleanly with
+/// a correct result AND a correct final answer — tighter than the prior single-case
+/// `answer.contains` heuristic. All must pass for a promotion-eligible certificate.
 fn battery() -> Vec<EvalCase> {
-    vec![EvalCase {
-        name: "read_and_count",
-        goal: "Read the file notes.txt and tell me how many lines it has. Use the read_file tool, \
-               then give the count.",
-        check: |r| {
-            // A read_file call executed cleanly (well-formed args → the sandbox
-            // ran it) AND the final answer states the correct line count.
-            let read_ok = r.results.iter().any(|(n, ok, _)| n == "read_file" && *ok);
-            read_ok && r.answer.contains('3')
+    let all = vec![
+        EvalCase {
+            name: "read_and_count",
+            goal: "Read the file notes.txt and tell me how many lines it has. Use the read_file \
+                   tool, then give the count.",
+            check: |r| {
+                // read_file read the real fixture AND the answer states the count.
+                tool_ran_ok(r, "read_file", |o| {
+                    o.contains("alpha") && o.contains("gamma")
+                }) && r.answer.contains('3')
+            },
         },
-    }]
+        EvalCase {
+            name: "list_dir_find",
+            goal:
+                "List the entries of the current directory '.' with the list_dir tool, then tell \
+                   me the name of the text file you find there.",
+            check: |r| {
+                tool_ran_ok(r, "list_dir", |o| o.contains("notes.txt"))
+                    && r.answer.to_lowercase().contains("notes.txt")
+            },
+        },
+        EvalCase {
+            name: "write_greeting",
+            goal:
+                "Create a file named greeting.txt whose exact contents are: hello there\nUse the \
+                   write_file tool ONCE, then reply in words that you created it. Do not call any \
+                   further tools and do not read the file back.",
+            check: |r| {
+                let wrote = r
+                    .calls
+                    .iter()
+                    .any(|c| c.contains("write_file") && c.contains("greeting"))
+                    && r.results.iter().any(|(n, ok, _)| n == "write_file" && *ok);
+                wrote
+                    && (r.answer.to_lowercase().contains("created")
+                        || r.answer.to_lowercase().contains("greeting")
+                        || r.answer.to_lowercase().contains("hello there"))
+            },
+        },
+    ];
+    // The pure-f32 runnable lane is slow for a 9B (a full multi-tool prompt prefills
+    // at ~200s/turn on this host), so a full multi-case battery overruns the agent
+    // client's read budget. `CAMELID_EVAL_CASE=<name>` runs exactly one case per
+    // invocation, keeping each run within budget; absent the env, the full battery
+    // runs (the fast path for optimized-lane models). Each single-case run still
+    // mints a full promotion-eligible receipt for that case.
+    if let Ok(name) = std::env::var("CAMELID_EVAL_CASE") {
+        if all.iter().any(|c| c.name == name) {
+            return all.into_iter().filter(|c| c.name == name).collect();
+        }
+        // Unknown name: fall through to the full battery rather than a 0-case PASS.
+    }
+    all
 }
 
 pub fn run(cfg: EvalConfig) -> anyhow::Result<i32> {
@@ -372,7 +427,12 @@ fn family_for(gguf: &std::path::Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if name.contains("qwen") {
+    // Ornith / qwen35 emit the custom `<function=…>` XML tool format, which routes
+    // to `parse_ornith`. Check before "qwen" (the model is Qwen3.5-derived but its
+    // tool grammar differs from Qwen2/Qwen3 JSON-in-`<tool_call>`).
+    if name.contains("ornith") || name.contains("qwen35") || name.contains("qwen3.5") {
+        "ornith".into()
+    } else if name.contains("qwen") {
         "qwen".into()
     } else if name.contains("mistral") {
         "mistral".into()

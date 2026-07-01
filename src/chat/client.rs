@@ -300,19 +300,19 @@ impl Client {
         Ok((end, deltas))
     }
 
-    /// `POST /v1/chat/completions` with `stream=false`. Returns
-    /// `(assistant_text, prompt_tokens, completion_tokens)` from the response
-    /// `usage` block.
     /// POST a chat request and return the full assistant turn: text content PLUS
     /// any structured `tool_calls` (OpenAI shape). The server emits structured
     /// tool calls and EMPTIES `content` on a tool call, so an agent loop MUST read
     /// `tool_calls` here — reading only the text loses every tool call.
     pub fn chat_turn(&self, request: &Value) -> anyhow::Result<ChatTurn> {
+        // Read deadline: a fast model answers in seconds; the 30-min ceiling is only
+        // hit by the slow pure-f32 runnable oracle lane (e.g. a 9B qwen35 prefilling a
+        // long tool prompt at ~1s/token), without masking a genuinely hung server.
         let (status, body) = self.request(
             "POST",
             "/v1/chat/completions",
             Some(request),
-            Duration::from_secs(600),
+            Duration::from_secs(1800),
         )?;
         if status != 200 {
             anyhow::bail!(envelope_message(&body).unwrap_or_else(|| format!("HTTP {status}")));

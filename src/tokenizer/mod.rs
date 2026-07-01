@@ -34,6 +34,17 @@ pub enum BpePreTokenizer {
     /// Byte-for-byte identical to `llama-bpe` in every other branch — verified
     /// against `llama-vocab.cpp` LLAMA_VOCAB_PRE_TYPE_LLAMA3 vs _QWEN2.
     Qwen2,
+    /// llama.cpp `qwen35` (Qwen3.5 / Ornith): single-digit grouping like `qwen2`,
+    /// and `LLAMA_VOCAB_PRE_TYPE_QWEN35`'s regex additionally folds Unicode
+    /// combining marks `\p{M}` into the letter class (`\p{L}+` → `[\p{L}\p{M}]+`
+    /// and the punctuation class excludes `\p{M}`). That mark-folding is a documented
+    /// DEFERRAL here: the split behaves exactly like `Qwen2`, which is byte-identical
+    /// to qwen35 for any text without combining marks (ASCII, code, and the standard
+    /// parity prompt set). Faithfully replicating `\p{M}` needs a Unicode
+    /// general-category table the tokenizer deliberately avoids depending on; until
+    /// then, combining-mark text is the one known tokenization deviation from the
+    /// qwen35 oracle.
+    Qwen35,
 }
 
 impl BpePreTokenizer {
@@ -41,7 +52,7 @@ impl BpePreTokenizer {
     fn digit_group_max(self) -> usize {
         match self {
             Self::Llama3 => 3,
-            Self::Qwen2 => 1,
+            Self::Qwen2 | Self::Qwen35 => 1,
         }
     }
 }
@@ -246,9 +257,12 @@ impl Tokenizer {
                 // (single digit vs runs of three); the byte-BPE merge step is
                 // identical. Verified against llama.cpp llama-vocab.cpp.
                 Some("qwen2") => BpePreTokenizer::Qwen2,
+                // Qwen3.5 / Ornith: same single-digit split as qwen2; its `\p{M}`
+                // mark-folding is a documented deferral (see `BpePreTokenizer::Qwen35`).
+                Some("qwen35") => BpePreTokenizer::Qwen35,
                 other => {
                     return Err(BackendError::UnsupportedTokenizer(format!(
-                        "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2"
+                        "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35"
                     )))
                 }
             }

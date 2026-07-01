@@ -2914,6 +2914,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         rope_neox_pairing: false,
         moe: None,
         gemma4: None,
+        qwen35: None,
     })
 }
 
