@@ -677,6 +677,20 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Hidden: hot-cache micro-benchmark of the attention f32 dot kernels
+    /// (legacy scalar chain vs canonical blocked scalar vs blocked AVX2/FMA).
+    #[command(hide = true)]
+    BenchAttnDot {
+        /// Vector lengths to measure (defaults cover the real head dims).
+        #[arg(long = "len", default_values_t = [64usize, 128])]
+        lens: Vec<usize>,
+        /// Measured iterations per variant.
+        #[arg(long, default_value_t = 2_000_000)]
+        repeats: usize,
+        /// Unreported warmup iterations per variant.
+        #[arg(long, default_value_t = 100_000)]
+        warmup: usize,
+    },
     /// Load one GGUF Q8_0 tensor as retained blocks and benchmark bounded row dequantization/dot rows.
     #[command(hide = true)]
     BenchQ8Blocks {
@@ -1633,6 +1647,25 @@ async fn main() -> anyhow::Result<()> {
             configure_rayon_threads(threads)?;
             let report = bench_dense_hotloops(hidden, ffn, repeats, warmup)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::BenchAttnDot {
+            lens,
+            repeats,
+            warmup,
+        } => {
+            for len in lens {
+                for (variant, ns_per_call) in
+                    camelid::inference::attn_f32_dot_microbench(len, repeats, warmup)
+                {
+                    let record = serde_json::json!({
+                        "schema": "camelid.bench-attn-dot/v1",
+                        "len": len,
+                        "variant": variant,
+                        "ns_per_call": ns_per_call,
+                    });
+                    println!("{}", serde_json::to_string(&record)?);
+                }
+            }
         }
         Command::BenchQ8Blocks {
             path,

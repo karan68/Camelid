@@ -22,6 +22,7 @@ use crate::execution_plan::MAC_Q8_PREFILL_I8MM_MIN_ROWS;
 use crate::metal;
 use crate::telemetry;
 
+mod attn_f32_dot;
 #[cfg(target_arch = "aarch64")]
 mod cpu_neon;
 mod diagnostic_config;
@@ -1263,6 +1264,76 @@ pub fn dump_stage_timings() {
             pct(us)
         );
     }
+}
+
+/// Hot-cache micro-benchmark for the attention f32 dot kernels: the legacy
+/// scalar chain (`tensor::dot_product`) vs the canonical blocked scalar
+/// reference vs the blocked AVX2/FMA realization. Returns
+/// `(variant, ns_per_call)` pairs; the AVX2 row is omitted when the CPU lacks
+/// AVX2+FMA. Bench-only entry point — never called on the inference path.
+pub fn attn_f32_dot_microbench(
+    len: usize,
+    repeats: usize,
+    warmup: usize,
+) -> Vec<(&'static str, f64)> {
+    let x: Vec<f32> = (0..len).map(|i| ((i % 97) as f32 - 48.0) * 0.001).collect();
+    let y: Vec<f32> = (0..len).map(|i| ((i % 89) as f32 - 44.0) * 0.002).collect();
+    fn measure(
+        results: &mut Vec<(&'static str, f64)>,
+        x: &[f32],
+        y: &[f32],
+        repeats: usize,
+        warmup: usize,
+        label: &'static str,
+        mut f: impl FnMut(&[f32], &[f32]) -> f32,
+    ) {
+        use std::hint::black_box;
+        let mut sink = 0.0f32;
+        for _ in 0..warmup {
+            sink += f(black_box(x), black_box(y));
+        }
+        let started = Instant::now();
+        for _ in 0..repeats {
+            sink += f(black_box(x), black_box(y));
+        }
+        let elapsed = started.elapsed();
+        black_box(sink);
+        results.push((label, elapsed.as_nanos() as f64 / repeats as f64));
+    }
+
+    let mut results = Vec::new();
+    measure(
+        &mut results,
+        &x,
+        &y,
+        repeats,
+        warmup,
+        "legacy_scalar_chain",
+        crate::tensor::dot_product,
+    );
+    measure(
+        &mut results,
+        &x,
+        &y,
+        repeats,
+        warmup,
+        "blocked_scalar",
+        attn_f32_dot::dot_blocked_scalar,
+    );
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        measure(
+            &mut results,
+            &x,
+            &y,
+            repeats,
+            warmup,
+            "blocked_avx2",
+            // SAFETY: guarded by the runtime AVX2+FMA feature check above.
+            |a, b| unsafe { attn_f32_dot::dot_blocked_avx2(a, b) },
+        );
+    }
+    results
 }
 
 #[allow(dead_code)]
@@ -20776,6 +20847,30 @@ fn causal_attention_context_batch(
     CpuTensor::from_f32(name, vec![rows, expected_width], out)
 }
 
+/// Flag gate for the canonical blocked f32 attention kernels
+/// (`BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT`, default off). Scoped to the
+/// Windows x86_64 decode attention lane; any guard failing (flag off, AVX2 or
+/// FMA missing) keeps the exact legacy scalar code path. Resolved once per
+/// process outside tests.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn attention_f32_blocked_dot_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT")
+            && std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(test))]
+    {
+        static ATTENTION_F32_BLOCKED_DOT_ENABLED: OnceLock<bool> = OnceLock::new();
+        *ATTENTION_F32_BLOCKED_DOT_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT")
+                && std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("fma")
+        })
+    }
+}
+
 struct AttentionContextHeadParams<'a> {
     kv_cache: &'a LlamaKvCache,
     layer_idx: usize,
@@ -20800,10 +20895,21 @@ fn attention_context_for_head_into(
         .head_base_offset(params.layer_idx, params.kv_head);
     let position_stride = params.kv_cache.position_stride();
 
+    // Canonical blocked f32 kernels (Windows x86_64, flag-gated, default off).
+    // `false` on every other target keeps the legacy path literally unchanged.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let use_blocked_kernels = attention_f32_blocked_dot_enabled();
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let use_blocked_kernels = false;
+
     let mut key_start = head_base;
     for position in 0..params.position_count {
         let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
-        let score = dot_product(params.query_slice, key_slice) * params.scale;
+        let score = if use_blocked_kernels {
+            attn_f32_dot::dot_blocked(params.query_slice, key_slice) * params.scale
+        } else {
+            dot_product(params.query_slice, key_slice) * params.scale
+        };
         scores.push(score);
         if position + 1 < params.position_count {
             key_start += position_stride;
@@ -20827,8 +20933,12 @@ fn attention_context_for_head_into(
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
         let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
-        for (out_value, value) in out_slice.iter_mut().zip(value_slice) {
-            *out_value += probability * *value;
+        if use_blocked_kernels {
+            attn_f32_dot::axpy_blocked(out_slice, probability, value_slice);
+        } else {
+            for (out_value, value) in out_slice.iter_mut().zip(value_slice) {
+                *out_value += probability * *value;
+            }
         }
         if position + 1 < params.position_count {
             value_start += position_stride;
