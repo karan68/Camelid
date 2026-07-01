@@ -2982,6 +2982,7 @@ fn known_arch_config(arch: &str) -> anyhow::Result<LlamaModelConfig> {
         rope_neox_pairing: false,
         moe: None,
         gemma4: None,
+        qwen35: None,
     })
 }
 
@@ -5091,17 +5092,29 @@ fn apply_spec_decode_env(
     });
     if let Some(mode) = mode {
         std::env::set_var("CAMELID_SPEC_DECODE", mode);
-        // Speculative verification needs CPU-resident packed Q8 weights; the
-        // Metal-resident execution plan deliberately keeps CPU-side weights
-        // file-backed (the GPU owns the resident copy), which makes verify
-        // rounds pay a file-speed weight pass each. A spec-enabled server
-        // therefore runs the validated CPU repack plan.
-        std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
-        std::env::set_var("CAMELID_METAL_RESIDENT_PREFILL", "0");
-        tracing::info!(
-            "speculative decoding enabled; selecting the CPU execution plan \
-             (Metal resident paths disabled server-wide)"
+        // GPU speculative verify (CAMELID_SPEC_GPU=1) runs the batched `verify_batch` on the
+        // target's resident engine, which owns the weights — so keep the Metal resident paths
+        // ON for it. Without GPU verify the CPU chunk verify needs CPU-resident packed Q8
+        // weights, but the Metal-resident plan deliberately keeps CPU-side weights file-backed
+        // (the GPU owns the resident copy), so each verify round would pay a file-speed weight
+        // pass — fall back to the validated CPU repack plan in that case only.
+        let spec_gpu = matches!(
+            std::env::var("CAMELID_SPEC_GPU").ok().as_deref(),
+            Some("1") | Some("true") | Some("on") | Some("yes")
         );
+        if !spec_gpu {
+            std::env::set_var("CAMELID_METAL_RESIDENT_DECODE", "0");
+            std::env::set_var("CAMELID_METAL_RESIDENT_PREFILL", "0");
+            tracing::info!(
+                "speculative decoding enabled; selecting the CPU execution plan \
+                 (Metal resident paths disabled server-wide)"
+            );
+        } else {
+            tracing::info!(
+                "speculative decoding enabled with GPU verify (CAMELID_SPEC_GPU=1); \
+                 keeping the resident decode engine for the batched verify"
+            );
+        }
     }
     if let Some(path) = spec_draft_model {
         std::env::set_var("CAMELID_SPEC_DRAFT_MODEL", path);

@@ -85,6 +85,11 @@ pub struct AppState {
     /// (`CAMELID_GEMMA4_SERVE`) and a gemma4 model is loaded. This is an
     /// additive, parallel path: the Llama/3B backend is untouched.
     gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<Gemma4ServeRuntime>>>>,
+    /// Runnable-lane serve runtimes (qwen35/Ornith), keyed by model id. Populated
+    /// only when `CAMELID_RUNNABLE_SERVE` is set and a runnable-served arch is
+    /// loaded. Additive, parallel to the optimized engine — see the runnable serve
+    /// bridge near `runnable_chat_nonstreaming`.
+    runnable_runtimes: Arc<RwLock<HashMap<String, Arc<RunnableServeRuntime>>>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
@@ -113,6 +118,7 @@ impl Default for AppState {
         Self {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            runnable_runtimes: Arc::new(RwLock::new(HashMap::new())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
             active_model_id: Arc::new(RwLock::new(None)),
@@ -1662,8 +1668,16 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         "none"
     };
     // The gemma4 runtime (Q8-resident) is ready as soon as it is loaded; the Llama
-    // f32-budget check does not apply to it.
-    let generation_ready = gemma4_available || model.is_some_and(loaded_model_generation_ready);
+    // f32-budget check does not apply to it. Likewise, a model served by the runnable
+    // lane (CAMELID_RUNNABLE_SERVE + a runnable-served arch, e.g. qwen35/Ornith) is
+    // generation-ready once loaded — the runnable serve runtime is built lazily on the
+    // first chat, so gate on "runnable-serve enabled + runnable arch + loaded" rather
+    // than the lazy runtime map (otherwise chat stays locked until you chat → deadlock).
+    let runnable_serve_ready = runnable_serve_enabled()
+        && model.is_some_and(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()));
+    let generation_ready = gemma4_available
+        || runnable_serve_ready
+        || model.is_some_and(loaded_model_generation_ready);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
         .as_ref()
@@ -2375,6 +2389,54 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
         ],
         model_compatibility: vec![
+            // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), runnable serve lane.
+            // tool_capable earned by three committed camelid.agent_eval/v1 PASS
+            // receipts (read_file / list_dir / write_file). The id matches the
+            // side-loaded server id (general.name) so the live `--agent` gate
+            // (`active_tool_capable`) resolves; `family: "ornith"` routes tool-call
+            // parsing to the custom `<function=…>` XML parser.
+            ModelCompatibilityTarget {
+                id: "Ornith 1.0 9B",
+                tool_capable: true,
+                family: "ornith",
+                quantization: "Q8_0",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "model-native/larger context, broader arbitrary templates beyond the native Ornith ChatML renderer, production throughput on the pure-f32 runnable lane, portability, and durable repeated current-head bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_qwen35_bpe_mark_folding_deferred",
+                tensors_load: "validated_all_427_qwen35_tensors",
+                generation_runs: "runnable_serve_chat_plus_agent_eval_validated",
+                parity_audited: "greedy_token_identical_4_prompt_vs_llamacpp_acd79d6",
+                performance_measured: "avx2_q8_dot_plus_batched_prefill_measured",
+                frontend_load_path_verified: "not_promoted",
+                frontend_readiness_gate: "green only when this exact qwen35 Q8_0 row is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1",
+                tested_context: "short_serve_smoke_plus_agent_eval_read_list_write",
+                chat_template_renderer: "ornith-chatml-native",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "agent_eval_read_list_write",
+                latest_checked_result: "pass",
+                latest_checked_output: "3x camelid.agent_eval/v1 PASS",
+                evidence: "qwen35 (Ornith-1.0-9B) Q8_0 on Windows x86_64 CPU: all 427 tensors of the hybrid gated-delta-net arch load; the from-scratch runnable lane is greedy token-identical to the pinned llama.cpp acd79d6 oracle on 4 prompts (G-PARITY, qa/ornith/G-PARITY-qwen35-vs-llamacpp.md); the model's custom <function=...> tool format lifts cleanly into structured tool_calls (G-TOOLCALL, qa/ornith/G-TOOLCALL-qwen35.md); and three distinct tools (read_file/list_dir/write_file) each pass the agent loop with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q8_0-{1782768506,1782768988,1782770407}-PASS.json, G-AGENT, qa/ornith/G-AGENT-qwen35.md). tool_capable earned ONLY by those receipts. NOT model-native/larger context, NOT broader templates, NOT production throughput (the runnable lane is correct but slow vs an optimized SIMD/CUDA kernel).",
+                next_step: "preserve the parity-certified runnable lane + the read/list/write agent capability for this exact row; an optimized-lane qwen35 kernel for production throughput, context-pack coverage, and the frontend load path remain before any broader/full-support claim",
+            },
             ModelCompatibilityTarget {
                 id: "tinyllama_1_1b_chat_q8_0",
                 tool_capable: false,
@@ -4163,6 +4225,383 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
     }
 }
 
+// ===================================================================================
+// Runnable-lane serve bridge (additive, gated by CAMELID_RUNNABLE_SERVE).
+//
+// Architectures implemented only in the runnable (pure-f32 oracle) lane — currently
+// `qwen35` (Ornith) — are not in the optimized inference engine, so the Llama serve
+// path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
+// per-model-id runtime map, a short-circuit at the top of `chat_completions`, and a
+// dedicated chat handler. The optimized lane is untouched. Generation is greedy
+// (matches the brief) on a blocking thread; the runtime is `&self`-immutable so it
+// needs no Mutex (unlike the CUDA gemma4 variant).
+// ===================================================================================
+
+/// The Ornith / qwen35 tool-call instruction literal, byte-for-byte from the GGUF
+/// chat template (the custom `<tool_call><function=…><parameter=…>` format the model
+/// was trained on). Rendering anything else makes the model emit the wrong format.
+const ORNITH_TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+/// The runnable serve lane is gated behind `CAMELID_RUNNABLE_SERVE` (1/true/yes).
+/// When off, a qwen35 model load is metadata-only (no serve runtime) exactly as today.
+fn runnable_serve_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_RUNNABLE_SERVE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// True for architectures served through the runnable bridge (qwen35 today).
+fn is_runnable_serve_arch(arch: &str) -> bool {
+    arch == "qwen35"
+}
+
+/// A runnable-lane model wrapped for the serve path: greedy generation + the GGUF
+/// tokenizer (for prompt encode, EOG stop set, and detokenize).
+pub struct RunnableServeRuntime {
+    model: crate::runnable::RunnableModel,
+    tokenizer: std::sync::Arc<Tokenizer>,
+    architecture: String,
+}
+
+impl RunnableServeRuntime {
+    fn load(path: &std::path::Path) -> std::result::Result<Self, BackendError> {
+        let path_str = path.to_string_lossy().to_string();
+        let gguf = crate::gguf::read_metadata(&path_str)?;
+        let architecture = gguf.architecture().unwrap_or_default().to_string();
+        let tokenizer = std::sync::Arc::new(Tokenizer::from_gguf(&gguf)?);
+        let model = crate::runnable::RunnableModel::load(&path_str)?;
+        Ok(Self {
+            model,
+            tokenizer,
+            architecture,
+        })
+    }
+
+    /// Greedy-generate from already-tokenized `prompt_ids`, stopping at the first EOG
+    /// (`<|im_end|>` / eos). Returns the detokenized text + the generated token ids.
+    fn generate_greedy(
+        &self,
+        prompt_ids: &[u32],
+        max_new: usize,
+    ) -> std::result::Result<(String, Vec<u32>), BackendError> {
+        let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let ids = self.model.generate_stopping(prompt_ids, max_new, &stop)?;
+        let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
+        Ok((text, ids))
+    }
+}
+
+/// Render an Ornith/qwen35 ChatML prompt (no tools). The generation prompt opens the
+/// reasoning block (`<think>\n`) when thinking is enabled, else prefills an empty one.
+fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
+    let mut prompt = String::new();
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n");
+        prompt.push_str(if enable_thinking {
+            "<think>\n"
+        } else {
+            "<think>\n\n</think>\n\n"
+        });
+    }
+    prompt
+}
+
+/// Render an Ornith/qwen35 ChatML prompt with tool definitions, faithful to the GGUF
+/// template's tools system block + custom `<function=…>` instructions. `tools` are the
+/// flat function objects (`{name,description,parameters}`). Tool results (`role:"tool"`)
+/// are wrapped in `<tool_response>` user turns as the template expects.
+fn render_ornith_chatml_prompt_with_tools(
+    messages: &[ChatMessage],
+    tools: &[serde_json::Value],
+    enable_thinking: bool,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("<|im_start|>system\n");
+    prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for tool in tools {
+        if let Ok(json) = serde_json::to_string(tool) {
+            prompt.push('\n');
+            prompt.push_str(&json);
+        }
+    }
+    prompt.push_str("\n</tools>");
+    prompt.push_str(ORNITH_TOOL_INSTRUCTIONS);
+    for message in messages {
+        if message.role.trim() == "system" && !message.content.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&message.content);
+        }
+    }
+    prompt.push_str("<|im_end|>\n");
+
+    let mut append_generation_prompt = true;
+    for message in messages {
+        let role = message.role.trim();
+        if role == "system" {
+            continue;
+        }
+        if role == "tool" {
+            prompt.push_str("<|im_start|>user\n<tool_response>\n");
+            prompt.push_str(&message.content);
+            prompt.push_str("\n</tool_response><|im_end|>\n");
+            append_generation_prompt = true;
+            continue;
+        }
+        prompt.push_str("<|im_start|>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(&message.content);
+        prompt.push_str("<|im_end|>\n");
+        append_generation_prompt = role != "assistant";
+    }
+    if append_generation_prompt {
+        prompt.push_str("<|im_start|>assistant\n");
+        prompt.push_str(if enable_thinking {
+            "<think>\n"
+        } else {
+            "<think>\n\n</think>\n\n"
+        });
+    }
+    prompt
+}
+
+/// Split an Ornith generation into `(reasoning, content)` on the first `</think>`.
+/// The generation prompt prefills `<think>` (or an empty think block), so the model's
+/// output is `REASONING</think>\n\nCONTENT` (thinking on) or just `CONTENT` (off). The
+/// reasoning is surfaced separately and never re-enters tool parsing or content.
+fn split_ornith_think(text: &str) -> (Option<String>, String) {
+    if let Some(end) = text.find("</think>") {
+        let reasoning = text[..end].trim_start_matches("<think>").trim().to_string();
+        let content = text[end + "</think>".len()..].trim_start().to_string();
+        let reasoning = if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning)
+        };
+        (reasoning, content)
+    } else {
+        (None, text.to_string())
+    }
+}
+
+/// Lift Ornith/qwen35 `<tool_call><function=NAME><parameter=ARG>VALUE</parameter>…
+/// </function></tool_call>` XML into OpenAI `tool_calls` JSON
+/// (`{id,type:"function",function:{name,arguments:<json-string>}}`). Mirrors the
+/// chat-lane `parse_ornith`; `arguments` is a JSON object string. Scalars stay
+/// strings; values that look like JSON objects/arrays are decoded.
+fn parse_ornith_tool_calls_json(text: &str) -> Vec<serde_json::Value> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(fstart) = rest.find("<function=") {
+        let after = &rest[fstart + "<function=".len()..];
+        let Some(name_end) = after.find('>') else {
+            break;
+        };
+        let name = after[..name_end].trim().to_string();
+        let body = &after[name_end + 1..];
+        let (params_blob, next) = match body.find("</function>") {
+            Some(end) => (&body[..end], &body[end + "</function>".len()..]),
+            None => (body, ""),
+        };
+        let mut args = serde_json::Map::new();
+        let mut p = params_blob;
+        while let Some(ps) = p.find("<parameter=") {
+            let pa = &p[ps + "<parameter=".len()..];
+            let Some(pname_end) = pa.find('>') else { break };
+            let pname = pa[..pname_end].trim().to_string();
+            let pbody = &pa[pname_end + 1..];
+            let (pval, pnext) = match pbody.find("</parameter>") {
+                Some(end) => (&pbody[..end], &pbody[end + "</parameter>".len()..]),
+                None => (pbody, ""),
+            };
+            let v = pval.strip_prefix('\n').unwrap_or(pval);
+            let v = v.strip_suffix('\n').unwrap_or(v);
+            let trimmed = v.trim();
+            let value = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                serde_json::from_str::<serde_json::Value>(trimmed)
+                    .unwrap_or_else(|_| serde_json::Value::String(v.to_string()))
+            } else {
+                serde_json::Value::String(v.to_string())
+            };
+            if !pname.is_empty() {
+                args.insert(pname, value);
+            }
+            p = pnext;
+        }
+        if !name.is_empty() {
+            calls.push(serde_json::json!({
+                "id": format!("call_{}", calls.len()),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": serde_json::Value::Object(args).to_string(),
+                },
+            }));
+        }
+        rest = next;
+    }
+    calls
+}
+
+/// Resolve a runnable serve runtime for the requested (or active) model id.
+async fn resolve_runnable_runtime(
+    state: &AppState,
+    model: &Option<String>,
+) -> std::result::Result<Option<(String, Arc<RunnableServeRuntime>)>, Response> {
+    let id = match model.clone() {
+        Some(m) => m,
+        None => match state.active_model_id.read().await.clone() {
+            Some(m) => m,
+            None => return Ok(None),
+        },
+    };
+    if let Some(runtime) = state.runnable_runtimes.read().await.get(&id).cloned() {
+        return Ok(Some((id, runtime)));
+    }
+    // Loaded as a runnable-served arch but no runtime → fail clearly rather than
+    // letting the Llama path produce garbage / an unsupported error.
+    let needs_runnable = state
+        .loaded_models
+        .read()
+        .await
+        .get(&id)
+        .map(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()))
+        .unwrap_or(false);
+    if needs_runnable {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model_not_ready",
+            format!(
+                "model '{id}' (runnable-lane architecture) is loaded but its serve runtime \
+                 is unavailable; set CAMELID_RUNNABLE_SERVE=1 and reload the model"
+            ),
+            None,
+        ));
+    }
+    Ok(None)
+}
+
+/// Load the runnable serve runtime for a model id (blocking thread; ~9.5 GB read).
+async fn load_runnable_serve_runtime(
+    state: &AppState,
+    id: &str,
+    model_path: &std::path::Path,
+) -> std::result::Result<(), BackendError> {
+    let load_path = model_path.to_path_buf();
+    let runtime = tokio::task::spawn_blocking(move || RunnableServeRuntime::load(&load_path))
+        .await
+        .map_err(|e| {
+            BackendError::InvalidModelMetadata(format!("runnable serve load task panicked: {e}"))
+        })??;
+    let arch = runtime.architecture.clone();
+    state
+        .runnable_runtimes
+        .write()
+        .await
+        .insert(id.to_string(), Arc::new(runtime));
+    tracing::info!(model = %id, arch = %arch, "runnable serve runtime loaded");
+    Ok(())
+}
+
+/// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
+/// ChatML prompt (with tools when present), greedy-generate to EOG, split the
+/// `<think>` reasoning, and lift `<function=…>` tool calls into structured `tool_calls`
+/// (the content keeps the tool-call text so the agent's client-side parser also lifts).
+async fn runnable_chat_nonstreaming(
+    id: String,
+    runtime: Arc<RunnableServeRuntime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
+    let tools: Vec<serde_json::Value> = req
+        .tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .collect();
+    let prompt_text = if tools.is_empty() {
+        render_ornith_chatml_prompt(&messages, enable_thinking)
+    } else {
+        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+    };
+    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, false, true) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenize_error",
+                e.to_string(),
+                None,
+            )
+        }
+    };
+    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let rt = runtime.clone();
+    let result =
+        tokio::task::spawn_blocking(move || rt.generate_greedy(&prompt_ids, max_tokens)).await;
+    let (text, ids) = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                e.to_string(),
+                None,
+            )
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                format!("runnable generation task panicked: {e}"),
+                None,
+            )
+        }
+    };
+
+    let (reasoning, content) = split_ornith_think(&text);
+    // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=…>` XML.
+    // The agent loop ALSO re-parses the content text client-side (chat-lane
+    // `parse_ornith`), so the content keeps the tool-call text below.
+    let tool_calls = parse_ornith_tool_calls_json(&content);
+    let finish_reason = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    };
+
+    let mut message = serde_json::json!({ "role": "assistant", "content": content });
+    if let Some(r) = reasoning {
+        message["reasoning_content"] = serde_json::Value::String(r);
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
+    let body = serde_json::json!({
+        "id": "chatcmpl-runnable",
+        "object": "chat.completion",
+        "created": unix_secs(),
+        "model": id,
+        "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
+        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "camelid": { "generated_token_ids": ids, "lane": "runnable_qwen35" },
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 /// Streaming Gemma 4 chat (SSE). Mirrors the OpenAI `chat.completion.chunk`
 /// shape: a role chunk, one content delta per generated token, a final
 /// finish_reason chunk, then `[DONE]`. Generation runs on a blocking thread and
@@ -4399,6 +4838,14 @@ async fn load_model_from_path_with_activation(
         load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
     }
 
+    // Runnable serve path (additive, gated by CAMELID_RUNNABLE_SERVE): load a
+    // runnable-lane runtime (qwen35/Ornith) so /v1/chat can route to it.
+    if runnable_serve_enabled()
+        && is_runnable_serve_arch(loaded.gguf.architecture().unwrap_or_default())
+    {
+        load_runnable_serve_runtime(state, &id, &loaded.path).await?;
+    }
+
     Ok(loaded)
 }
 
@@ -4500,6 +4947,7 @@ async fn unload_model(
     if let Some(id) = target_id {
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
+        state.runnable_runtimes.write().await.remove(&id);
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
@@ -4511,6 +4959,7 @@ async fn unload_model(
     } else {
         state.loaded_models.write().await.clear();
         state.gemma4_runtimes.write().await.clear();
+        state.runnable_runtimes.write().await.clear();
         state.execution_plans.write().await.clear();
         state.cached_weights.write().await.clear();
         state.model_last_used.write().await.clear();
@@ -5698,6 +6147,17 @@ async fn chat_completions(
             } else {
                 gemma4_chat_nonstreaming(id, runtime, &req).await
             };
+        }
+        Ok(None) => {}
+        Err(resp) => return resp,
+    }
+    // Runnable serve path (additive, gated by CAMELID_RUNNABLE_SERVE): short-circuits
+    // a qwen35/Ornith model to the runnable lane. Streaming is not yet implemented on
+    // this lane, so a stream request gets a valid single-shot (non-streamed) response;
+    // the agent loop is non-streaming.
+    match resolve_runnable_runtime(&state, &req.model).await {
+        Ok(Some((id, runtime))) => {
+            return runnable_chat_nonstreaming(id, runtime, &req).await;
         }
         Ok(None) => {}
         Err(resp) => return resp,
@@ -11455,6 +11915,11 @@ mod tests {
                 "qwen3_4b_instruct_q8_0",
                 "qwen3_8b_instruct_q8_0",
                 "tinyllama_1_1b_chat_q8_0",
+                // Ornith-1.0-9B (qwen35 hybrid gated-delta-net) runnable serve lane:
+                // exact-row serve smoke + greedy token-identical parity vs llama.cpp
+                // acd79d6 (4 prompts) + tool_capable via 3 agent-eval PASS receipts.
+                // Short-chat/agent smoke only; no bounded-context/perf/full support.
+                "Ornith 1.0 9B",
             ])
         );
 
@@ -13769,6 +14234,7 @@ mod tests {
             attention_key_length: None,
             moe: None,
             gemma4: None,
+            qwen35: None,
         }
     }
 

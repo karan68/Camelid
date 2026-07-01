@@ -26,7 +26,9 @@ use crate::error::BackendError;
 use crate::gguf::{GgufFile, GgufTensorType};
 
 /// v1 covered architectures (`general.architecture`).
-pub const COVERED_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "gemma2", "gemma3", "phi3"];
+pub const COVERED_ARCHITECTURES: &[&str] = &[
+    "llama", "qwen2", "qwen3", "qwen35", "gemma2", "gemma3", "phi3",
+];
 
 /// v1 covered tokenizer models (`tokenizer.ggml.model`), grouped by family below.
 /// SPM (sentencepiece/llama-style) + BPE (gpt2-style) are the two covered families.
