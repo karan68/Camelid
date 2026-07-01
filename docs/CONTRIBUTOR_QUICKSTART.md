@@ -91,6 +91,12 @@ cargo doc --no-deps --all-features
 bash scripts/check-public-scrub.sh
 ```
 
+Windows note: cap test-build parallelism with `cargo test -j 4 ...`. The
+default 16-way build spawns enough concurrent `link.exe` processes to fail
+intermittently (`could not exec the linker`, or `LNK1104: cannot open file
+'msvcrt.lib'`), especially under memory pressure. Also never run two cargo
+commands concurrently in one checkout — the build lock deadlocks.
+
 ### Frontend change
 
 ```bash
