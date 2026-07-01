@@ -96,7 +96,12 @@ function normalizePrompt(prompt, { packPath, index, defaultMaxTokens, defaultRen
   return {
     id: typeof prompt.id === 'string' && prompt.id.trim() ? prompt.id.trim() : `p${index + 1}`,
     note: typeof prompt.note === 'string' ? prompt.note : null,
-    message: hasMessages ? null : requireString(prompt.message, `${packPath}.prompts[${index}].message`),
+    // requireContentString, not requireString: the message is prompt CONTENT,
+    // and trimming here silently rewrote whitespace-sensitive prompts (the
+    // trailing-spaces pack entry never actually tested trailing spaces).
+    message: hasMessages
+      ? null
+      : requireContentString(prompt.message, `${packPath}.prompts[${index}].message`),
     messages: hasMessages ? normalizeMessages(prompt.messages, `${packPath}.prompts[${index}].messages`) : null,
     max_tokens: parsePositiveInt(prompt.max_tokens ?? defaultMaxTokens, `${packPath}.prompts[${index}].max_tokens`),
     render_mode: renderMode,
