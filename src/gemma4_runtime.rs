@@ -2175,6 +2175,11 @@ struct Gemma4LayerNormsDev {
     post_attn_norm: cudarc::driver::CudaSlice<f32>,
     ffn_norm: cudarc::driver::CudaSlice<f32>,
     post_ffw_norm: cudarc::driver::CudaSlice<f32>,
+    // MoE-only: the dense shared-expert branch's own post-norm (`post_norm_1`) and
+    // the sparse expert-sum post-norm (`post_norm_2`). Resident so the whole MoE
+    // dense + compose runs on the GPU (M4). `None` on dense rows.
+    moe_post_norm_1: Option<cudarc::driver::CudaSlice<f32>>,
+    moe_post_norm_2: Option<cudarc::driver::CudaSlice<f32>>,
 }
 
 /// Per-layer projection weights kept resident on the GPU in the SoA layout
@@ -2504,6 +2509,10 @@ pub struct Gemma4CudaResident {
     d_geglu_q: cudarc::driver::CudaSlice<i8>,
     d_geglu_s: cudarc::driver::CudaSlice<f32>,
     d_ffn_out: cudarc::driver::CudaSlice<f32>,
+    // M4: holds the MoE dense shared-expert branch (branch A) result on-device
+    // (`rms_norm(down_out, post_norm_1)`) while the sparse expert branch runs, so the
+    // two branches can be composed on the GPU without a host round-trip.
+    d_mlp: cudarc::driver::CudaSlice<f32>,
     // All layers' RoPE tables for this token (slot li at li*half_max), uploaded once
     // so the per-layer loop has no in-loop memcpy (required for graph capture).
     d_cos_all: cudarc::driver::CudaSlice<f32>,
@@ -2652,6 +2661,14 @@ impl Gemma4CudaResident {
                 post_attn_norm: s.clone_htod(&lw.post_attn_norm).map_err(cu)?,
                 ffn_norm: s.clone_htod(&lw.ffn_norm).map_err(cu)?,
                 post_ffw_norm: s.clone_htod(&lw.post_ffw_norm).map_err(cu)?,
+                moe_post_norm_1: match lw.moe.as_ref() {
+                    Some(m) => Some(s.clone_htod(&m.post_norm_1).map_err(cu)?),
+                    None => None,
+                },
+                moe_post_norm_2: match lw.moe.as_ref() {
+                    Some(m) => Some(s.clone_htod(&m.post_norm_2).map_err(cu)?),
+                    None => None,
+                },
             });
         }
 
@@ -2836,6 +2853,7 @@ impl Gemma4CudaResident {
             d_geglu_q: alloc_i(ffn_max).map_err(cu)?,
             d_geglu_s: alloc_f(ffn_max / 32).map_err(cu)?,
             d_ffn_out: alloc_f(hidden).map_err(cu)?,
+            d_mlp: alloc_f(hidden).map_err(cu)?,
             d_cos_all: alloc_f(block_count * (head_dim_max / 2)).map_err(cu)?,
             d_sin_all: alloc_f(block_count * (head_dim_max / 2)).map_err(cu)?,
             d_position: s.alloc_zeros::<i32>(1).map_err(cu)?,
@@ -2913,20 +2931,27 @@ impl Gemma4CudaResident {
         }
     }
 
-    /// SSER (M2) MoE FFN: bit-parallel twin of `Gemma4Runtime::moe_layer_ffn`, but
-    /// each selected expert's two GEMVs run on the GPU when the (layer,expert) is
-    /// cached in VRAM, else on the CPU (+ promote into the cache). The dense
-    /// "shared expert" branch, the router, and every norm run on the CPU exactly as
-    /// M1 — only the 8 expert GEMVs move. `attn_out` is the post-attention residual
-    /// (already copied device->host by the caller). Returns the FFN output to add to
-    /// the residual (same contract as `moe_layer_ffn`).
+    /// SSER (M2/M3/M4) sparse-expert branch of the MoE FFN. Runs the router on the
+    /// CPU (tiny), then every selected expert's two GEMVs on the GPU — cached in VRAM
+    /// (hit) or uploaded+promoted (miss) — accumulating each expert's weighted
+    /// down-GEMV into an on-device buffer (`scaled_axpy`). Returns that device
+    /// accumulator (the sparse expert sum, BEFORE `post_norm_2`); the caller composes
+    /// it on-device with the GPU dense branch (M4). `attn_out` is the post-attention
+    /// residual (already copied device->host by the caller for the router).
+    ///
+    /// The dense "shared expert" branch and the final compose+norms now run on the
+    /// GPU in the layer loop (M4); this method owns ONLY the router + 8 expert GEMVs.
     ///
     /// Parity: the GPU `q4_0_gemv` is bit-identical to the CPU `q4_0_wire_row_dot`
     /// the miss path uses (proven in `q4_0_gemv_matches_oracle`), and the GPU GeGLU
     /// (`geglu_mul`) matches `gelu_tanh` within the accepted f16-KV/tanhf floor — so
     /// cached and uncached experts produce the same content tokens as M1.
     #[allow(clippy::too_many_lines)]
-    fn moe_layer_ffn_cached(&self, li: usize, attn_out: &[f32]) -> Result<Vec<f32>> {
+    fn moe_layer_ffn_cached(
+        &self,
+        li: usize,
+        attn_out: &[f32],
+    ) -> Result<cudarc::driver::CudaSlice<f32>> {
         use cudarc::driver::{LaunchConfig, PushKernelArg};
         let s = self.cap_stream.clone();
         let k = &self.kernels;
@@ -2935,7 +2960,6 @@ impl Gemma4CudaResident {
         let cpu = &self.cpu;
         let lw = &cpu.layers[li];
         let l = cpu.first_layer + li;
-        let ffn_dim = cpu.g.ffn_length_at(l) as usize;
         let moe = lw
             .moe
             .as_ref()
@@ -2946,22 +2970,6 @@ impl Gemma4CudaResident {
             .expect("moe_layer_ffn_cached requires the SSER cache");
 
         let prof = std::env::var_os("CAMELID_SSER_PROFILE").is_some();
-        let tp0 = std::time::Instant::now();
-        // --- Dense "shared expert" MLP branch (CPU, identical to moe_layer_ffn). ---
-        let xn = rms_norm(attn_out, Some(&lw.ffn_norm), eps);
-        let xnq = quantize_q8_0_blocks(&xn);
-        let gate = lw.ffn_gate.matvec_q(ffn_dim, &xnq);
-        let up = lw.ffn_up.matvec_q(ffn_dim, &xnq);
-        let act: Vec<f32> = gate
-            .iter()
-            .zip(&up)
-            .map(|(g, u)| gelu_tanh(*g) * u)
-            .collect();
-        let mlp = lw.ffn_down.matvec(ffn_dim, hidden, &act);
-        let mlp = rms_norm(&mlp, Some(&moe.post_norm_1), eps);
-        if prof {
-            SSER_PROF_DENSE_NS.fetch_add(tp0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        }
         let tp1 = std::time::Instant::now();
 
         // --- Router (CPU, identical). ---
@@ -3016,18 +3024,15 @@ impl Gemma4CudaResident {
         let mut d_geglu_q = s.alloc_zeros::<i8>(nff).map_err(cu)?;
         let mut d_geglu_s = s.alloc_zeros::<f32>(down_blocks).map_err(cu)?;
         let mut d_y = s.alloc_zeros::<f32>(hidden).map_err(cu)?;
-        // M3 on-device MoE accumulator: cache-HIT experts fold their weighted
-        // down-GEMV output straight into this device buffer (one scaled_axpy launch
-        // each), so the whole hit set costs ONE dtoh + ONE sync per layer instead of
-        // k of each. Cache-MISS experts still run on the CPU and accumulate into
-        // `moe_acc` (host); the two partials are summed after the loop.
+        // M3/M4 on-device MoE accumulator: every selected expert (hit OR uploaded-miss)
+        // folds its weighted down-GEMV output straight into this device buffer (one
+        // scaled_axpy launch each). In M4 the buffer is RETURNED to the caller and
+        // composed with the dense branch on-device — no per-layer dtoh at all.
         let mut d_moe_acc = s.alloc_zeros::<f32>(hidden).map_err(cu)?;
-        let mut any_gpu_expert = false;
 
         let gate_up_bytes = moe.gate_up_exps.bytes();
         let down_bytes = moe.down_exps.bytes();
 
-        let mut moe_acc = vec![0f32; hidden];
         for &e in &idx {
             let w = probs[e] / wsum;
             let scale = moe.down_exps_scale[e] * w;
@@ -3140,7 +3145,6 @@ impl Gemma4CudaResident {
                 b.arg(&mut d_moe_acc).arg(&d_y).arg(&scale).arg(&n_i);
                 unsafe { b.launch(cfg) }.map_err(cu)?;
             }
-            any_gpu_expert = true;
             if prof {
                 let ns = te.elapsed().as_nanos() as u64;
                 use std::sync::atomic::Ordering::Relaxed;
@@ -3151,27 +3155,16 @@ impl Gemma4CudaResident {
                 }
             }
         }
-        // Every selected expert (hit OR miss) accumulated into `d_moe_acc` in strict
-        // idx order, so the layer's expert sum is one left-to-right f32 accumulation
-        // identical to M2's single-buffer host loop. Read it back with a SINGLE dtoh
-        // + sync for the whole layer (vs k dtoh + k syncs in M2). `any_gpu_expert` is
-        // false only when the layer selected no experts (never, for this model), in
-        // which case `moe_acc` stays zero as before.
-        if any_gpu_expert {
-            s.memcpy_dtoh(&d_moe_acc, &mut moe_acc).map_err(cu)?;
-            s.synchronize().map_err(cu)?;
-        }
+        // Every selected expert (hit OR uploaded-miss) accumulated into `d_moe_acc` in
+        // strict idx order, so the layer's expert sum is one left-to-right f32
+        // accumulation identical to M1's single-buffer host loop. In M4 we return the
+        // device buffer directly (no dtoh) — the caller applies post_norm_2, composes
+        // with the dense branch, applies post_ffw_norm, and adds to the residual, all
+        // on the GPU.
         if prof {
             SSER_PROF_EXPERT_NS.fetch_add(tp2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        let cur_moe = rms_norm(&moe_acc, Some(&moe.post_norm_2), eps);
-
-        // Combine the two branches, then the shared post_ffw_norm (CPU, identical).
-        let mut combined = mlp;
-        for (c, m) in combined.iter_mut().zip(&cur_moe) {
-            *c += m;
-        }
-        Ok(rms_norm(&combined, Some(&lw.post_ffw_norm), eps))
+        Ok(d_moe_acc)
     }
 
     /// One token's forward; returns next-token logits. Mirrors the CPU
@@ -3616,29 +3609,189 @@ impl Gemma4CudaResident {
                 )
                 .map_err(cu)?;
 
-                // FFN. MoE (A4B/26B) rows run the full two-branch dense+expert
-                // block on the CPU via the shared bit-exact `moe_layer_ffn` helper
-                // (attention stays on the GPU): copy attn_out device->host, compute
-                // ffn_out, copy back, and add it to the residual. The GPU dense-FFN
-                // kernels below run ONLY on dense rows (never both, or the dense
-                // branch would be double-counted). Note: `moe_layer_ffn` reads the
-                // post-attention residual `d_hidden` — that must be settled first,
-                // so synchronize the stream before the host copy.
-                if lw.moe.is_some() {
+                // FFN. MoE (A4B/26B) rows have TWO branches off the post-attention
+                // residual `attn_out` (in `d_hidden`): (A) a dense "shared expert" MLP
+                // and (B) the sparse 8-expert branch. With the SSER cache ON (M4) BOTH
+                // branches run on the GPU and are composed on-device — the CPU only
+                // runs the tiny router. With the cache OFF (M1) the whole two-branch
+                // block runs on the CPU via the shared bit-exact `moe_layer_ffn`
+                // helper. Either way `d_hidden` must be settled (attention done) before
+                // reading it, so synchronize + dtoh first.
+                if lw.moe.is_some() && self.sser.is_some() {
+                    // --- M4: both MoE branches on the GPU. ---
+                    // The router still runs on the CPU, so copy the post-attention
+                    // residual to the host once (branch A + the experts read `d_hidden`
+                    // on-device; only the top-8 pick needs the host copy).
                     s.synchronize().map_err(cu)?;
                     let mut attn_out_host = vec![0f32; hidden];
                     s.memcpy_dtoh(&self.d_hidden, &mut attn_out_host)
                         .map_err(cu)?;
-                    // SSER (M2): when the VRAM expert cache is enabled, dispatch the
-                    // 8 selected experts' GEMVs to the GPU when cached (else CPU +
-                    // promote). Off = M1's full-CPU MoE FFN. `moe_layer_ffn_cached`
-                    // takes `&self` (the LRU is behind a RefCell), so it coexists with
-                    // the loop-level `&self.kernels` borrow.
-                    let ffn_out = if self.sser.is_some() {
-                        self.moe_layer_ffn_cached(li, &attn_out_host)?
-                    } else {
-                        self.cpu.moe_layer_ffn(li, &attn_out_host)
-                    };
+
+                    // Branch A — dense shared-expert MLP, GPU (reuses the dense-row
+                    // FFN kernels): rms_norm(attn_out, ffn_norm) -> quantize -> gate/up
+                    // GEMV -> GeGLU -> quantize -> down GEMV -> rms_norm(_, post_norm_1)
+                    // -> d_mlp. Differs from the dense-row path ONLY by post_norm_1 (vs
+                    // post_ffw_norm) and by parking the result in d_mlp instead of
+                    // folding straight into the residual.
+                    let prof = std::env::var_os("CAMELID_SSER_PROFILE").is_some();
+                    let ta = std::time::Instant::now();
+                    let post_norm_1 = nrm
+                        .moe_post_norm_1
+                        .as_ref()
+                        .expect("MoE layer binds post_norm_1");
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &self.d_hidden,
+                        &nrm.ffn_norm,
+                        &mut self.d_normed,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_quantize(
+                        &s,
+                        &k.quantize,
+                        &self.d_normed,
+                        &mut self.d_inq,
+                        &mut self.d_ins,
+                        hidden / 32,
+                    )
+                    .map_err(cu)?;
+                    gemma_proj_gemv(
+                        &s,
+                        k,
+                        lwd.gate_q,
+                        &self.d_ins,
+                        &self.d_inq,
+                        &lwd.gate.slice(0..lwd.gate.len()),
+                        ffn_dim,
+                        hidden / 32,
+                        &mut self.d_gate,
+                    )
+                    .map_err(cu)?;
+                    gemma_proj_gemv(
+                        &s,
+                        k,
+                        lwd.up_q,
+                        &self.d_ins,
+                        &self.d_inq,
+                        &lwd.up.slice(0..lwd.up.len()),
+                        ffn_dim,
+                        hidden / 32,
+                        &mut self.d_up,
+                    )
+                    .map_err(cu)?;
+                    {
+                        let cfg = LaunchConfig {
+                            grid_dim: ((ffn_dim as u32).div_ceil(256), 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let n_i = ffn_dim as i32;
+                        let mut b = s.launch_builder(&k.geglu_mul);
+                        b.arg(&self.d_gate)
+                            .arg(&self.d_up)
+                            .arg(&mut self.d_geglu)
+                            .arg(&n_i);
+                        unsafe { b.launch(cfg) }.map_err(cu)?;
+                    }
+                    crate::cuda_resident::launch_quantize(
+                        &s,
+                        &k.quantize,
+                        &self.d_geglu,
+                        &mut self.d_geglu_q,
+                        &mut self.d_geglu_s,
+                        ffn_dim / 32,
+                    )
+                    .map_err(cu)?;
+                    gemma_proj_gemv(
+                        &s,
+                        k,
+                        lwd.down_q,
+                        &self.d_geglu_s,
+                        &self.d_geglu_q,
+                        &lwd.down.slice(0..lwd.down.len()),
+                        hidden,
+                        ffn_dim / 32,
+                        &mut self.d_ffn_out,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &self.d_ffn_out,
+                        post_norm_1,
+                        &mut self.d_mlp,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    if prof {
+                        SSER_PROF_DENSE_NS.fetch_add(
+                            ta.elapsed().as_nanos() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+
+                    // Branch B — sparse expert sum on-device (returns d_moe_acc, the
+                    // weighted expert accumulation BEFORE post_norm_2). Takes `&self`
+                    // (LRU behind a RefCell), so it coexists with the loop-level
+                    // `&self.kernels` borrow.
+                    let d_moe_acc = self.moe_layer_ffn_cached(li, &attn_out_host)?;
+
+                    // Compose on-device: rms_norm(moe_acc, post_norm_2) -> + d_mlp ->
+                    // rms_norm(_, post_ffw_norm) -> add to the residual. Bit-identical
+                    // op order to the CPU `moe_layer_ffn` tail.
+                    let post_norm_2 = nrm
+                        .moe_post_norm_2
+                        .as_ref()
+                        .expect("MoE layer binds post_norm_2");
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &d_moe_acc,
+                        post_norm_2,
+                        &mut self.d_ffn_out,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    // d_ffn_out (cur_moe) += d_mlp (dense branch).
+                    crate::cuda_resident::launch_residual(
+                        &s,
+                        &k.residual_add,
+                        &mut self.d_ffn_out,
+                        &self.d_mlp,
+                        hidden,
+                    )
+                    .map_err(cu)?;
+                    // rms_norm(combined, post_ffw_norm) -> d_normed -> + residual.
+                    crate::cuda_resident::launch_rmsnorm(
+                        &s,
+                        &k.rms_norm,
+                        &self.d_ffn_out,
+                        &nrm.post_ffw_norm,
+                        &mut self.d_normed,
+                        hidden,
+                        eps,
+                    )
+                    .map_err(cu)?;
+                    crate::cuda_resident::launch_residual(
+                        &s,
+                        &k.residual_add,
+                        &mut self.d_hidden,
+                        &self.d_normed,
+                        hidden,
+                    )
+                    .map_err(cu)?;
+                } else if lw.moe.is_some() {
+                    // --- M1: whole two-branch MoE FFN on the CPU (cache OFF). ---
+                    s.synchronize().map_err(cu)?;
+                    let mut attn_out_host = vec![0f32; hidden];
+                    s.memcpy_dtoh(&self.d_hidden, &mut attn_out_host)
+                        .map_err(cu)?;
+                    let ffn_out = self.cpu.moe_layer_ffn(li, &attn_out_host);
                     s.memcpy_htod(&ffn_out, &mut self.d_ffn_out).map_err(cu)?;
                     crate::cuda_resident::launch_residual(
                         &s,
