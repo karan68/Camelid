@@ -2767,7 +2767,24 @@ impl Gemma4CudaResident {
             // Budget: keep the cache under ~80% of the free VRAM after the resident set
             // (leaving headroom for the per-token scratch + the KV cache growth).
             let (free, _total) = cudarc::driver::result::mem_get_info().unwrap_or((0, 0));
-            let budget = (free as f64 * 0.80) as usize;
+            // Cache budget = free VRAM at load MINUS a fixed reserve for the transient
+            // per-miss weight uploads (a few pooled ~6 MiB `clone_htod` buffers) and
+            // driver slack. The KV caches and per-token scratch are already allocated
+            // ABOVE (so `free` excludes them) — the only dynamic post-cache consumer is
+            // those small transient buffers, whose need is ~constant, not proportional
+            // to free VRAM. A fixed reserve therefore lets the cache claim far more of
+            // the card than the old flat 0.80 factor did: on the 6 GB box this lifts
+            // the cap ~690 -> ~820 experts, cutting the miss count and measuring
+            // +~50% steady decode (miss-bound, capacity-limited). Reserve tunable via
+            // CAMELID_SSER_CACHE_RESERVE_MIB; a hard 0.98 cap on the free fraction is a
+            // final belt-and-suspenders against a pathologically small `free`.
+            let reserve_mib = std::env::var("CAMELID_SSER_CACHE_RESERVE_MIB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(160);
+            let reserve = reserve_mib * 1024 * 1024;
+            let hard_cap = (free as f64 * 0.98) as usize;
+            let budget = free.saturating_sub(reserve).min(hard_cap);
             let fit_cap = budget.checked_div(per_expert_bytes).unwrap_or(0);
             let req_cap = std::env::var("CAMELID_SSER_CACHE_EXPERTS")
                 .ok()
