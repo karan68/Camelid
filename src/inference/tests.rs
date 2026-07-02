@@ -888,6 +888,42 @@ fn resolve_prefill_thread_count_widens_only_on_measured_default() {
 }
 
 #[test]
+fn resolve_decode_thread_count_defaults_off_and_prefers_explicit_width() {
+    // Neither flag: no decode pool — decode stays inline (the default path).
+    assert_eq!(resolve_decode_thread_count_from(None, false, 16), None);
+    // Explicit width wins.
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("4"), false, 16),
+        Some(4)
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some(" 6 "), true, 16),
+        Some(6)
+    );
+    // 0/off/empty/invalid fall through to the dedicated check.
+    assert_eq!(resolve_decode_thread_count_from(Some("0"), false, 16), None);
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("off"), false, 16),
+        None
+    );
+    assert_eq!(resolve_decode_thread_count_from(Some(""), false, 16), None);
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("abc"), false, 16),
+        None
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("0"), true, 16),
+        Some(16)
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("abc"), true, 16),
+        Some(16)
+    );
+    // Dedicated alone isolates at the global width.
+    assert_eq!(resolve_decode_thread_count_from(None, true, 12), Some(12));
+}
+
+#[test]
 fn prefill_layer_major_chunk_token_count_has_separate_headroom_default() {
     let _env_guard = env_lock();
     std::env::remove_var("CAMELID_PREFILL_CHUNK_TOKENS");

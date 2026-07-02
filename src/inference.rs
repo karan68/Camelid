@@ -3860,8 +3860,33 @@ impl LlamaInferenceSession {
         Ok(timings)
     }
 
-    #[allow(unused_assignments)]
     fn forward_single_token_timed_internal(
+        &mut self,
+        token_id: u32,
+        collect_diagnostics: bool,
+        compute_logits: bool,
+    ) -> Result<LlamaFastForwardOutput> {
+        // Item 4 Lane A: hop the whole single-token decode onto the dedicated
+        // decode pool when configured. Default is None — inline on the
+        // caller's pool, byte-identical to before the lane existed.
+        if decode_thread_pool().is_some() {
+            return run_on_decode_pool(|| {
+                self.forward_single_token_timed_on_current_pool(
+                    token_id,
+                    collect_diagnostics,
+                    compute_logits,
+                )
+            });
+        }
+        self.forward_single_token_timed_on_current_pool(
+            token_id,
+            collect_diagnostics,
+            compute_logits,
+        )
+    }
+
+    #[allow(unused_assignments)]
+    fn forward_single_token_timed_on_current_pool(
         &mut self,
         token_id: u32,
         collect_diagnostics: bool,
@@ -4737,6 +4762,87 @@ fn resolve_prefill_thread_count_from(
 /// [`prefill_thread_pool`] for the rationale and bit-exactness guarantee.
 fn run_on_prefill_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
     match prefill_thread_pool() {
+        Some(pool) => pool.install(op),
+        None => op(),
+    }
+}
+
+/// Dedicated Rayon pool for single-token decode (Item 4 Lane A). Default OFF:
+/// with neither flag set this resolves to `None` and decode runs inline on the
+/// caller's pool, byte-identical to before.
+///
+/// * `BACKENDINFERENCE_DECODE_THREADS=N` sizes a dedicated decode pool to N
+///   workers (P0 attribution: decode is a memory-bound matvec stream that is
+///   fastest well below the logical core count — SMT siblings only add
+///   memory-controller contention; see the decode-sched receipts).
+/// * `BACKENDINFERENCE_DECODE_POOL_DEDICATED=1` isolates decode onto its own
+///   pool at the current global width without resizing (the serve/tokio
+///   interference probe).
+///
+/// Bit-exact by the same argument as the prefill pool: every decode parallel
+/// region splits independent output rows/chunks with serial per-output
+/// reductions (the attention decode lane is additionally bitwise-locked by
+/// its own contract), so pool choice and width never change the numbers.
+fn decode_thread_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(build_decode_thread_pool).as_ref()
+}
+
+fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
+    let global = rayon::current_num_threads();
+    let target = resolve_decode_thread_count_from(
+        env::var("BACKENDINFERENCE_DECODE_THREADS").ok().as_deref(),
+        q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_DECODE_POOL_DEDICATED"),
+        global,
+    )?;
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(target)
+        .thread_name(|i| format!("camelid-decode-{i}"))
+        .build()
+    {
+        Ok(pool) => {
+            tracing::info!(
+                decode_threads = target,
+                global_threads = global,
+                "decode scheduling lane: single-token decode on a dedicated pool"
+            );
+            Some(pool)
+        }
+        Err(err) => {
+            tracing::warn!("failed to build decode thread pool ({err}); using global pool");
+            None
+        }
+    }
+}
+
+/// Pure resolution of the decode pool width, factored out for testing.
+///
+/// * `spec` — raw `BACKENDINFERENCE_DECODE_THREADS` value, if present.
+/// * `dedicated` — `BACKENDINFERENCE_DECODE_POOL_DEDICATED` flag.
+/// * `global` — current global pool width (the no-resize isolation width).
+///
+/// An explicit positive `spec` wins; `0`/`off`/empty/invalid fall through to
+/// the `dedicated` check (isolate at global width) and otherwise `None`.
+fn resolve_decode_thread_count_from(
+    spec: Option<&str>,
+    dedicated: bool,
+    global: usize,
+) -> Option<usize> {
+    if let Some(spec) = spec {
+        let trimmed = spec.trim();
+        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("off") && trimmed != "0" {
+            if let Some(count) = trimmed.parse::<usize>().ok().filter(|n| *n > 0) {
+                return Some(count);
+            }
+        }
+    }
+    dedicated.then_some(global)
+}
+
+/// Run the decode `op` on the dedicated decode pool when one is configured,
+/// otherwise inline. See [`decode_thread_pool`].
+fn run_on_decode_pool<R: Send>(op: impl FnOnce() -> R + Send) -> R {
+    match decode_thread_pool() {
         Some(pool) => pool.install(op),
         None => op(),
     }
