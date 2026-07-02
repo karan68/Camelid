@@ -497,3 +497,28 @@
 .flowbench__tuner-toggle { position: absolute; bottom: 8px; right: 8px; z-index: 5; font-family: var(--font-mono); font-size: 0.625rem; color: var(--color-text-faint); background: var(--color-glass); border: 1px solid var(--color-border-soft); border-radius: var(--radius-sm); padding: 2px 8px; }
 .flowbench__tuner { position: absolute; top: 8px; right: 8px; z-index: 5; width: 230px; max-height: 90%; overflow-y: auto; background: var(--color-glass-strong); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); padding: var(--space-2); display: flex; flex-direction: column; gap: 4px; }
 .flowbench__tuner label { display: flex; flex-direction: column; font-family: var(--font-mono); font-size: 0.625rem; color: var(--color-text-muted); }
+
+/* ==========================================================================
+   Neural Field — renderer mode toggle (Flow Bench | Neural Field)
+   ========================================================================== */
+.observatory-renderer-toggle {
+  display: inline-flex;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  background: var(--color-bg-elevated);
+}
+.observatory-renderer-toggle button {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--color-text-muted);
+  background: transparent;
+  border: none;
+  padding: var(--space-1) var(--space-3);
+  cursor: pointer;
+}
+.observatory-renderer-toggle button + button { border-left: 1px solid var(--color-border-soft); }
+.observatory-renderer-toggle button.is-active {
+  color: var(--color-text);
+  background: var(--color-accent-soft);
+}
