@@ -302,17 +302,20 @@ assert.match(chatSource, /cxcomposer__status[\s\S]*runtimeStatusLabel[\s\S]*supp
 assert.match(chatSource, /selectedCompatibilityLabel/, 'redesigned chat must surface the exact-row compatibility label, not a generic green badge')
 assert.match(chatSource, /StreamingLoader/, 'live 3B chat must keep an accessible pre-token loader')
 assert.equal((chatSource.match(/aria-label="Message Camelid"/g) || []).length, 1, 'redesigned chat docks a single shared composer textarea')
-assert.match(modelsSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'ModelsView 3B acceptance target must hide only on exact target match')
-assert.doesNotMatch(modelsSource, /model\?\.source,[\s\S]*\]\.map\(pathBasename\)/, 'ModelsView 3B acceptance target must not treat source metadata as local GGUF artifact identity')
-assert.match(modelsSource, /Fill import form with exact path/, 'ModelsView must provide the exact 3B import path affordance when the row is absent locally')
-assert.match(modelsSource, /Chat unlockable/, 'ModelsView must expose the retained exact-row chat-unlock state')
-assert.match(modelsSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'ModelsView retained 3B row cards must use the shared chat gate for loaded_now and generation_ready checks')
-assert.equal((modelsSource.match(/runtimeReady\s*=\s*chatGate\.runtimeReady/g) || []).length, 2, 'ModelsView local/setup cards must derive runtime readiness from the shared exact-row chat gate')
+// Redesign (2026-07, D14): the Models page was rebuilt as five derived zones. The 3B
+// acceptance panel, tracked-row cards, and legacy catalog cards were deleted; exact-row
+// honesty now flows through lib/modelLanes (laneOf → shared capability matcher, including
+// the exact-artifact and quant gates) and the inspect-first fail-closed load flow.
+// Row-scoped capability-lane copy stays asserted on the System/API views below.
+const modelLanesSource = readFileSync(new URL('../src/lib/modelLanes.js', import.meta.url), 'utf8')
+const catalogSource = readFileSync(new URL('../src/components/models/CatalogLaneBrowse.jsx', import.meta.url), 'utf8')
+assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, matchModel\(entry\)\)/, 'Models lane derivation must ask the shared contract matcher — the supported gate stays the contract voice')
+assert.match(modelsSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'ModelsView section membership must be derived from the live scan + capabilities at render time')
+assert.doesNotMatch(modelsSource, /SUPPORTED_MODELS/, 'ModelsView must not place models from a hand-authored array')
+assert.match(modelsSource, /api\/models\/inspect[\s\S]*setBlocker\(inspect\.blocker\)[\s\S]*return[\s\S]*api\/models\/load/, 'ModelsView load flow must inspect first and stop on typed blockers before any load attempt')
 assert.doesNotMatch(modelsSource, /runtimeReady\s*=\s*isRunnableModel\(model\)/, 'ModelsView must not label runtime readiness from stale model-only readiness')
-assert.match(modelsSource, /catalogCompatibilityHint\s*=\s*findCompatibilityHint\(capabilities, localMatch, item\)/, 'ModelsView catalog cards must resolve exact-row support through the shared capability matcher')
-assert.match(modelsSource, /catalogExactTarget\.id[\s\S]*supported exact row/, 'ModelsView catalog cards must visibly label exact supported rows without widening catalog metadata into broad support')
-assert.match(modelsSource, /supportLanes\s*=\s*exactTarget \? exactRowSupportLanes\(exactTarget, capabilities\?\.api_features \|\| \[\]\) : \[\]/, 'ModelsView exact-row evidence blocks must render row-scoped capability lanes from /api/capabilities')
-assert.match(modelsSource, /Capability lanes:[\s\S]*supportLanes\.map\(\(lane\) => `\$\{supportLaneTitle\(lane\)\}: \$\{lane\.label\}`\)\.join\(' · '\)/, 'ModelsView local and catalog cards must show 3B template/context/throughput lanes instead of a generic support label')
+assert.match(catalogSource, /isCompatibilitySupportedForModel\(capabilities, null, item\)/, 'catalog rows must resolve their landing lane through the shared capability matcher')
+assert.match(catalogSource, /if \(item\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
 assert.match(apiSource, /Selected exact-row evidence/, 'API view must surface selected 3B exact-row evidence')
 assert.match(apiSource, /selectedChatGate\s*=\s*getChatGateState\(capabilities, selectedModel, runtime\)/, 'API view must use the shared exact-row chat gate for 3B endpoint readiness')
 assert.match(apiSource, /selectedExactRowReady\s*=\s*selectedChatGate\.chatUnlocked/, 'API view must not reimplement 3B endpoint readiness separately from Chat/System')

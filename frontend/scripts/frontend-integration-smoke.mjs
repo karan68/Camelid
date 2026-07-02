@@ -408,120 +408,56 @@ try {
   assert.doesNotMatch(aliasTopBarMarkup, /tinyllama/i, 'TopBar model chip must not mislabel an active 3B row as TinyLlama')
   assert.doesNotMatch(aliasTopBarMarkup, /No model selected/, 'TopBar must not show an empty model state for alias-selected loaded 3B rows')
 
-  const modelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
-    runtime: readyRuntime,
+  // Redesign (2026-07, D14): the Models page was rebuilt as five derived zones; the
+  // acceptance panel, tracked-row cards, and legacy grids are gone. Under SSR the data
+  // spine cannot fetch, so the page must render its honest fallbacks — never a
+  // fabricated loaded/downloaded state. The neighboring-quant and neighboring-artifact
+  // acceptance gates now live in the lane derivation (lib/modelLanes) and are asserted
+  // directly against the same capabilities fixture below.
+  const { laneOf } = await server.ssrLoadModule('/src/lib/modelLanes.js')
+  const laneEntry = (filename, quantization) => ({ filename, quantization, runnable_receipt_present: false, admitted: false, oracle_qualified: false })
+  assert.equal(
+    laneOf(laneEntry('Llama-3.2-3B-Instruct-Q8_0.gguf', 'Q8_0'), capabilities),
+    'supported',
+    'the exact 3B Q8_0 artifact must derive into the Supported lane from the live contract fixture',
+  )
+  assert.equal(
+    laneOf(laneEntry('Llama-3.2-3B-Instruct-Q4_0.gguf', 'Q4_0'), capabilities),
+    'not_anchored',
+    '3B neighboring GGUF quant must not inherit the canonical Q8_0 supported lane',
+  )
+  assert.equal(
+    laneOf(laneEntry('Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf', 'Q8_0'), capabilities),
+    'not_anchored',
+    'a same-label Q8 file without the exact GGUF filename must not inherit the supported lane',
+  )
+
+  const modelsViewProps = {
+    runtime: { ...readyRuntime, status: 'online' },
     capabilities,
     refreshDashboard: noop,
+    unloadCurrentModel: noop,
+    loadingModelId: '',
     registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
     setRegisterForm: noop,
-    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
-    setExternalForm: noop,
     registerModel: noop,
-    connectExternalModel: noop,
-    models: [aliasSelectedModel],
-    selectedModelId: aliasSelectedModel.id,
-    setSelectedModelId: noop,
-    loadingModelId: '',
-    activateModel: noop,
-    unloadCurrentModel: noop,
-    installModel: noop,
-    installCatalogModel: noop,
-    cancelModelDownload: noop,
-  }))
-
-  assert.match(modelsMarkup, /Llama 3\.2 3B Instruct Q8_0/, 'Models view should render the exact 3B row when the browser id differs from the backend runtime id')
-  assert.match(modelsMarkup, /chat enabled|The selected model is loaded, generation-ready, and backed by an exact supported \/api\/capabilities row/, 'Models view should treat runtime_model_name active_model_id matches as next-chat ready when exact 3B evidence is supported')
-  assert.match(modelsMarkup, /Chat unlockable/, 'Tracked 3B card should turn green only after exact row support and runtime readiness both match')
-  assert.match(modelsMarkup, /Loaded exact-row match/, 'Tracked 3B card should mark the alias model as the loaded exact-row match')
-  assert.match(modelsMarkup, /3B API\/WebUI smoke passed/, 'Models view should keep 3B end-to-end WebUI evidence visible on the exact row card')
-  assert.match(modelsMarkup, /Capability lanes:[\s\S]*Template\/Jinja readiness: Template rendering ready for this exact row[\s\S]*Checked context readiness: Checked context packs ready for this exact row[\s\S]*Throughput readiness: Production throughput not promoted/, 'Models exact-row evidence blocks should render 3B row-scoped capability lanes without promoting production throughput')
-  assert.doesNotMatch(modelsMarkup, /This browser\/runtime list does not currently show the exact 3B row/, 'Alias runtime matches must not fall through to the missing-3B acceptance placeholder')
-
-  const staleRuntimeModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
-    runtime: { ...readyRuntime, loaded_now: false },
-    capabilities,
-    refreshDashboard: noop,
-    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
-    setRegisterForm: noop,
-    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
-    setExternalForm: noop,
-    registerModel: noop,
-    connectExternalModel: noop,
-    models: [aliasSelectedModel],
-    selectedModelId: aliasSelectedModel.id,
-    setSelectedModelId: noop,
-    loadingModelId: '',
-    activateModel: noop,
-    unloadCurrentModel: noop,
-    installModel: noop,
-    installCatalogModel: noop,
-    cancelModelDownload: noop,
-  }))
-
-  assert.match(staleRuntimeModelsMarkup, /Runtime still needed/, 'Tracked 3B card must use the shared chat gate and stay blocked when runtime loaded_now=false')
-  assert.doesNotMatch(staleRuntimeModelsMarkup, /Chat unlockable/, 'Tracked 3B card must not present stale browser generation_ready state as WebUI chat support')
-
-  const neighboringQuantAcceptanceRecord = {
-    ...aliasSelectedModel,
-    id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
-    name: 'Llama 3.2 3B Instruct Q4_0',
-    runtime_model_name: 'llama32_3b_instruct_q4_0',
-    quant: 'Q4_0',
-    model_path: '/models/Llama-3.2-3B-Instruct-Q4_0.gguf',
+    apiBase: 'http://127.0.0.1:8181',
   }
-  const neighboringQuantAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
-    runtime: { ...readyRuntime, active_model_id: neighboringQuantAcceptanceRecord.runtime_model_name },
-    capabilities,
-    refreshDashboard: noop,
-    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
-    setRegisterForm: noop,
-    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
-    setExternalForm: noop,
-    registerModel: noop,
-    connectExternalModel: noop,
-    models: [neighboringQuantAcceptanceRecord],
-    selectedModelId: neighboringQuantAcceptanceRecord.id,
-    setSelectedModelId: noop,
-    loadingModelId: '',
-    activateModel: noop,
-    unloadCurrentModel: noop,
-    installModel: noop,
-    installCatalogModel: noop,
-    cancelModelDownload: noop,
-  }))
-  assert.match(neighboringQuantAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when the browser acceptance id is backed by a neighboring quant')
-  assert.match(neighboringQuantAcceptanceMarkup, /llama32_3b_instruct_q8_0: quant mismatch/, '3B acceptance hardening should surface the Q8_0 row mismatch instead of treating the browser id as exact evidence')
+  const modelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, modelsViewProps))
+  assert.match(modelsMarkup, /Active model/, 'Models view must render the active-model bar zone')
+  assert.match(modelsMarkup, /No model loaded/, 'Models view must not fabricate a loaded model before /api/models/current answers')
+  assert.match(modelsMarkup, /Supported/, 'Models view must render the Supported zone')
+  assert.match(modelsMarkup, /Experimental/, 'Models view must render the Experimental zone')
+  assert.match(modelsMarkup, /Get models/, 'Models view must render the Get-models zone')
+  assert.match(modelsMarkup, /Diagnostics/, 'Models view must keep the diagnostics disclosure')
+  assert.match(modelsMarkup, /Scanning local models…|Local model scan unavailable\./, 'Models view sections must show the honest scan fallback instead of inventing membership')
+  assert.doesNotMatch(modelsMarkup, /Downloaded/, 'Models view must not claim any downloaded state without the live disk scan')
 
-  const neighboringArtifactAcceptanceRecord = {
-    ...aliasSelectedModel,
-    id: LLAMA32_3B_ACCEPTANCE_TARGET.id,
-    name: 'Llama 3.2 3B Instruct Q8_0',
-    runtime_model_name: 'llama32_3b_instruct_q8_0_neighbor',
-    quant: 'Q8_0',
-    model_path: '/models/Llama-3.2-3B-Instruct-Q8_0-neighbor.gguf',
-  }
-  const neighboringArtifactAcceptanceMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
-    runtime: { ...readyRuntime, active_model_id: neighboringArtifactAcceptanceRecord.runtime_model_name },
-    capabilities,
-    refreshDashboard: noop,
-    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
-    setRegisterForm: noop,
-    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
-    setExternalForm: noop,
-    registerModel: noop,
-    connectExternalModel: noop,
-    models: [neighboringArtifactAcceptanceRecord],
-    selectedModelId: neighboringArtifactAcceptanceRecord.id,
-    setSelectedModelId: noop,
-    loadingModelId: '',
-    activateModel: noop,
-    unloadCurrentModel: noop,
-    installModel: noop,
-    installCatalogModel: noop,
-    cancelModelDownload: noop,
+  const offlineModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
+    ...modelsViewProps,
+    runtime: { ...readyRuntime, status: 'offline', loaded_now: false, generation_ready: false },
   }))
-  assert.match(neighboringArtifactAcceptanceMarkup, /This browser\/runtime list does not currently show the exact 3B row/, '3B acceptance placeholder must stay visible when a same-label Q8 record lacks the exact GGUF filename')
-  assert.match(neighboringArtifactAcceptanceMarkup, /llama32_3b_instruct_q8_0: exact GGUF not verified/, '3B acceptance hardening should require exact artifact identity, not just the 3B Instruct Q8 label')
+  assert.match(offlineModelsMarkup, /Runtime offline/, 'Models view must surface the offline runtime state instead of stale readiness')
 
   const green3BCapabilities = JSON.parse(JSON.stringify(capabilities))
   green3BCapabilities.api_features.push({ id: 'production_throughput', status: 'supported_exact_row_evidence', notes: '3B production-throughput lane validated end-to-end.' })
@@ -553,31 +489,8 @@ try {
   assert.match(green3BApiMarkup, /Throughput readiness[\s\S]*Production-throughput readiness is green for this supported exact row from production throughput validated evidence/, 'API view should render green 3B production-throughput evidence only when /api/capabilities advertises row-owned evidence')
   assert.doesNotMatch(green3BApiMarkup, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'API view 3B boundary should not repeat resolved template/Jinja or production-throughput blockers after green evidence')
 
-  const green3BModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
-    runtime: readyRuntime,
-    capabilities: green3BCapabilities,
-    refreshDashboard: noop,
-    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
-    setRegisterForm: noop,
-    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
-    setExternalForm: noop,
-    registerModel: noop,
-    connectExternalModel: noop,
-    models: [aliasSelectedModel],
-    selectedModelId: aliasSelectedModel.id,
-    setSelectedModelId: noop,
-    loadingModelId: '',
-    activateModel: noop,
-    unloadCurrentModel: noop,
-    installModel: noop,
-    installCatalogModel: noop,
-    cancelModelDownload: noop,
-  }))
-  const green3BTrackedCard = green3BModelsMarkup.match(/<article class="model-card models-model-card">(?:(?!<\/article>)[\s\S])*<strong>llama32_3b_instruct_q8_0<\/strong>(?:(?!<\/article>)[\s\S])*<\/article>/)?.[0] || ''
-  assert.ok(green3BTrackedCard, 'Models view should render the tracked 3B row card')
-  assert.match(green3BModelsMarkup, /Chat unlockable/, 'Models tracked 3B card should remain chat-unlockable when exact row, runtime readiness, and green evidence all align')
-  assert.match(green3BModelsMarkup, /Throughput: Production throughput ready for this exact row/, 'Models tracked 3B card should show production-throughput green only from row/API evidence')
-  assert.doesNotMatch(green3BTrackedCard, /Remaining support boundary:<\/b>[\s\S]{0,220}(?:arbitrary|Jinja|production|throughput)/i, 'Models tracked 3B card should not keep resolved 3B support blockers visible when evidence is green')
+  // (D14: the tracked 3B row card left the Models page; its green-lane rendering is
+  // asserted on the API view above and the ledger keeps the row-scoped evidence.)
 
   assert.equal(
     resolveLoadedModelDisplayName({
@@ -620,30 +533,8 @@ try {
   assert.equal(misleadingTinyChatGate.chatUnlocked, true, 'live 3B runs with a stale tinyllama-q8 runtime id should still unlock only from exact loaded GGUF path + Q8_0 support evidence')
   assert.equal(misleadingTinyChatGate.hint.target.id, 'llama32_3b_instruct_q8_0', 'stale tinyllama-q8 runtime ids must not steal the TinyLlama row when the loaded file is Llama 3.2 3B Instruct Q8_0')
 
-  const misleadingTinyModelsMarkup = renderToStaticMarkup(React.createElement(ModelsView, {
-    runtime: misleadingTinyRuntime,
-    capabilities,
-    refreshDashboard: noop,
-    registerForm: { id: '', name: '', model_path: '', runtime_model_name: '' },
-    setRegisterForm: noop,
-    externalForm: { id: '', name: '', source: '', api_base: '', api_key: '', model_name: '' },
-    setExternalForm: noop,
-    registerModel: noop,
-    connectExternalModel: noop,
-    models: [misleadingTinyRuntimeModel],
-    selectedModelId: misleadingTinyRuntimeModel.id,
-    setSelectedModelId: noop,
-    loadingModelId: '',
-    activateModel: noop,
-    unloadCurrentModel: noop,
-    installModel: noop,
-    installCatalogModel: noop,
-    cancelModelDownload: noop,
-  }))
-
-  assert.match(misleadingTinyModelsMarkup, /llama32_3b_instruct_q8_0: supported current gate/, 'Models view should present the stale-id live run as the exact 3B row, not TinyLlama')
-  assert.match(misleadingTinyModelsMarkup, /Loaded exact-row match/, 'Models tracked 3B card should mark stale-id live runs as loaded exact-row matches')
-  assert.doesNotMatch(misleadingTinyModelsMarkup, /tinyllama_1_1b_chat_q8_0: supported current gate/, 'stale tinyllama-q8 runtime ids must not make the selected live 3B model inherit TinyLlama support copy')
+  // (D14: the stale-id presentation moved off the Models page; the identity resolution
+  // itself is asserted through misleadingTinyChatGate above and the chat markup below.)
 
   const liveBackendIdChatMarkup = renderToStaticMarkup(React.createElement(ChatWorkspace, {
     selectedConversation: null,

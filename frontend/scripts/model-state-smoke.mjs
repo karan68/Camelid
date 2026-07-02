@@ -214,16 +214,20 @@ const promotedSupportFixture = {
 const promotedSupportLanes = exactRowSupportLanes(promotedSupportFixture.model_compatibility[0], promotedSupportFixture.api_features)
 assert.deepEqual(promotedSupportLanes.map((lane) => [lane.key, lane.ready]), [['template', true], ['context', false], ['throughput', true]], 'explicit broad template and production-throughput evidence may clear those readiness lanes without inventing checked-context evidence')
 assert.doesNotMatch(rowSupportBoundaryCopy(promotedSupportFixture.model_compatibility[0], promotedSupportFixture.api_features), /arbitrary|Jinja|production|throughput/i, 'resolved template/Jinja and production-throughput blockers should not remain in exact-row boundary copy')
+// Redesign (2026-07, D14): the Models page was rebuilt as five derived zones. Hardcoded
+// per-row evidence badges (e.g. the 8B pin-badge copy) were deleted with the tracked-row
+// panel; row evidence renders from live /api/capabilities in the Compatibility ledger.
+// The page-level invariant is now that membership is DERIVED, never hand-authored.
 const modelsViewSource = readFileSync(new URL('../src/views/ModelsView.jsx', import.meta.url), 'utf8')
-assert.match(
-  modelsViewSource,
-  /pin-badge ready[^>]*>8B 1024\/2048 bounded packs passed</,
-  'ModelsView should show 8B 1024/2048 ready only after fresh current-head evidence and docs/API/frontend alignment land',
-)
 assert.doesNotMatch(
   modelsViewSource,
-  /pin-badge warm[^>]*>8B 1024\/2048 needs fresh current-head PASS</,
-  'ModelsView must not keep stale warm 8B 1024/2048 copy after fresh current-head PASS and alignment land',
+  /pin-badge/,
+  'ModelsView must not hardcode per-row evidence badges; evidence must come from live /api/capabilities surfaces',
+)
+assert.match(
+  modelsViewSource,
+  /bucketByLane\(spine\.local\.models, capabilities\)/,
+  'ModelsView section membership must be derived from the live /api/models/local scan + support contract at render time',
 )
 
 const genericExactRowFixture = {
