@@ -20699,26 +20699,20 @@ fn causal_attention_context(
                 .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
         }
     } else {
-        let mut scores = Vec::with_capacity(position_count);
-        for attention_head in 0..attention_heads {
-            let kv_head =
-                map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
-            let query_start = attention_head * head_dim;
-            let query_slice = &query.data[query_start..query_start + head_dim];
-            let out_start = attention_head * head_dim;
-            attention_context_for_head_into(
-                AttentionContextHeadParams {
-                    kv_cache,
-                    layer_idx,
-                    kv_head,
-                    query_slice,
-                    position_count,
-                    scale,
-                },
-                &mut out[out_start..out_start + head_dim],
-                &mut scores,
-            )?;
-        }
+        decode_attention_all_heads_into(
+            &DecodeAttentionHeadsParams {
+                kv_cache,
+                layer_idx,
+                query_data: &query.data,
+                attention_heads,
+                repeats,
+                kv_heads,
+                head_mapping,
+                position_count,
+                scale,
+            },
+            &mut out,
+        )?;
     }
 
     let tensor = CpuTensor::from_f32(name, vec![1, expected_width], out)?;
@@ -20871,6 +20865,57 @@ fn attention_f32_blocked_dot_enabled() -> bool {
     }
 }
 
+/// Flag gate for the decode attention head-parallel lane
+/// (`BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL`, default off). Scoped to
+/// Windows x86_64 per the standing Windows-first directive — the mechanism
+/// itself is arch-agnostic (scheduling only, no arithmetic), so lifting the
+/// gate is a one-line follow-up decision, not a code change. Resolved once
+/// per process outside tests.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn attention_decode_parallel_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL")
+    }
+    #[cfg(not(test))]
+    {
+        static ATTENTION_DECODE_PARALLEL_ENABLED: OnceLock<bool> = OnceLock::new();
+        *ATTENTION_DECODE_PARALLEL_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL")
+        })
+    }
+}
+
+/// Provisional dispatch-overhead floor for the head-parallel lane; below this
+/// many cached positions the serial loop runs even with the lane on. The
+/// shipped default comes from the Phase-4 crossover sweep.
+const ATTENTION_DECODE_PARALLEL_DEFAULT_MIN_POSITIONS: usize = 64;
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn attention_decode_parallel_min_positions_uncached() -> usize {
+    env::var("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(ATTENTION_DECODE_PARALLEL_DEFAULT_MIN_POSITIONS)
+}
+
+/// Position threshold for the head-parallel lane
+/// (`BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL_MIN_POSITIONS`). Resolved once
+/// per process outside tests.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn attention_decode_parallel_min_positions() -> usize {
+    #[cfg(test)]
+    {
+        attention_decode_parallel_min_positions_uncached()
+    }
+    #[cfg(not(test))]
+    {
+        static ATTENTION_DECODE_PARALLEL_MIN_POSITIONS: OnceLock<usize> = OnceLock::new();
+        *ATTENTION_DECODE_PARALLEL_MIN_POSITIONS
+            .get_or_init(attention_decode_parallel_min_positions_uncached)
+    }
+}
+
 struct AttentionContextHeadParams<'a> {
     kv_cache: &'a LlamaKvCache,
     layer_idx: usize,
@@ -20880,10 +20925,127 @@ struct AttentionContextHeadParams<'a> {
     scale: f32,
 }
 
+/// Everything the multi-position decode attention driver needs to run every
+/// Q head, serially or across the rayon pool.
+struct DecodeAttentionHeadsParams<'a> {
+    kv_cache: &'a LlamaKvCache,
+    layer_idx: usize,
+    query_data: &'a [f32],
+    attention_heads: usize,
+    repeats: usize,
+    kv_heads: usize,
+    head_mapping: GqaHeadMapping,
+    position_count: usize,
+    scale: f32,
+}
+
+/// Multi-position decode attention over all Q heads. Picks the head-parallel
+/// lane when the Windows flag gate and the position threshold both pass;
+/// otherwise runs the historical serial loop.
+fn decode_attention_all_heads_into(
+    params: &DecodeAttentionHeadsParams<'_>,
+    out: &mut [f32],
+) -> Result<()> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let parallel = attention_decode_parallel_enabled()
+        && params.position_count >= attention_decode_parallel_min_positions();
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let parallel = false;
+    decode_attention_all_heads_into_with_mode(params, out, parallel)
+}
+
+/// Explicit-mode variant of [`decode_attention_all_heads_into`] so the
+/// bitwise-identity tests can pin the scheduling mode without touching
+/// process env.
+///
+/// The parallel arm is a SCHEDULING-ONLY change: each Q head runs the exact
+/// per-head body the serial loop runs (`attention_context_for_head_into`) on
+/// its own disjoint `head_dim` output chunk, with one scratch Vec per rayon
+/// worker instead of one total. No cross-task reduction exists, so serial
+/// and parallel outputs are bitwise identical by construction.
+fn decode_attention_all_heads_into_with_mode(
+    params: &DecodeAttentionHeadsParams<'_>,
+    out: &mut [f32],
+    parallel: bool,
+) -> Result<()> {
+    let head_dim = params.kv_cache.plan.head_dim;
+    debug_assert_eq!(out.len(), params.attention_heads * head_dim);
+    if parallel {
+        return out
+            .par_chunks_exact_mut(head_dim)
+            .enumerate()
+            .try_for_each_init(Vec::new, |scores, (attention_head, out_slice)| {
+                let kv_head = map_attention_head_to_kv_head(
+                    attention_head,
+                    params.repeats,
+                    params.kv_heads,
+                    params.head_mapping,
+                );
+                let query_start = attention_head * head_dim;
+                attention_context_for_head_into(
+                    AttentionContextHeadParams {
+                        kv_cache: params.kv_cache,
+                        layer_idx: params.layer_idx,
+                        kv_head,
+                        query_slice: &params.query_data[query_start..query_start + head_dim],
+                        position_count: params.position_count,
+                        scale: params.scale,
+                    },
+                    out_slice,
+                    scores,
+                )
+            });
+    }
+
+    let mut scores = Vec::with_capacity(params.position_count);
+    for attention_head in 0..params.attention_heads {
+        let kv_head = map_attention_head_to_kv_head(
+            attention_head,
+            params.repeats,
+            params.kv_heads,
+            params.head_mapping,
+        );
+        let query_start = attention_head * head_dim;
+        let out_start = attention_head * head_dim;
+        attention_context_for_head_into(
+            AttentionContextHeadParams {
+                kv_cache: params.kv_cache,
+                layer_idx: params.layer_idx,
+                kv_head,
+                query_slice: &params.query_data[query_start..query_start + head_dim],
+                position_count: params.position_count,
+                scale: params.scale,
+            },
+            &mut out[out_start..out_start + head_dim],
+            &mut scores,
+        )?;
+    }
+    Ok(())
+}
+
 fn attention_context_for_head_into(
     params: AttentionContextHeadParams<'_>,
     out_slice: &mut [f32],
     scores: &mut Vec<f32>,
+) -> Result<()> {
+    // Canonical blocked f32 kernels (Windows x86_64, flag-gated, default off).
+    // `false` on every other target keeps the legacy path literally unchanged.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    let use_blocked_kernels = attention_f32_blocked_dot_enabled();
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    let use_blocked_kernels = false;
+    attention_context_for_head_into_with_kernels(params, out_slice, scores, use_blocked_kernels)
+}
+
+/// Explicit-dot-lane variant of [`attention_context_for_head_into`] so the
+/// bitwise-identity tests can pin the kernel lane without touching process
+/// env. Production callers go through the flag-resolving wrapper above; the
+/// arithmetic below is byte-for-byte the pre-split body.
+fn attention_context_for_head_into_with_kernels(
+    params: AttentionContextHeadParams<'_>,
+    out_slice: &mut [f32],
+    scores: &mut Vec<f32>,
+    use_blocked_kernels: bool,
 ) -> Result<()> {
     let head_dim = params.kv_cache.plan.head_dim;
     debug_assert_eq!(params.query_slice.len(), head_dim);
@@ -20894,13 +21056,6 @@ fn attention_context_for_head_into(
         .kv_cache
         .head_base_offset(params.layer_idx, params.kv_head);
     let position_stride = params.kv_cache.position_stride();
-
-    // Canonical blocked f32 kernels (Windows x86_64, flag-gated, default off).
-    // `false` on every other target keeps the legacy path literally unchanged.
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-    let use_blocked_kernels = attention_f32_blocked_dot_enabled();
-    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-    let use_blocked_kernels = false;
 
     let mut key_start = head_base;
     for position in 0..params.position_count {

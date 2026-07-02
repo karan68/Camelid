@@ -11487,3 +11487,196 @@ fn cuda_resident_accepts_qwen3_qk_norm() {
         "test fixture should have QK-norm weights"
     );
 }
+
+/// Item 2 bitwise lock: the decode attention head-parallel lane is a
+/// scheduling-only change, so its full attention output must be bit-identical
+/// to the serial loop for every GQA shape, head_dim, position count, dot
+/// lane, and random content — and identical across repeated parallel runs.
+#[test]
+fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
+    struct XorShift64Star(u64);
+    impl XorShift64Star {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Finite f32 spanning subnormals through +-1e12, both signs.
+        fn next_f32(&mut self) -> f32 {
+            let unit = ((self.next_u64() >> 40) as f32) / (1u64 << 24) as f32 - 0.5;
+            match self.next_u64() % 8 {
+                0 => unit * f32::MIN_POSITIVE * 0.5,
+                1 => unit * 1e-12,
+                2..=4 => unit * 2.0,
+                5 => unit * 1e4,
+                _ => unit * 1e12,
+            }
+        }
+        fn fill(&mut self, len: usize) -> Vec<f32> {
+            (0..len).map(|_| self.next_f32()).collect()
+        }
+    }
+
+    let gqa_shapes = [(32usize, 4usize), (24, 8), (32, 8)];
+    let head_dims = [64usize, 128];
+    let position_counts = [2usize, 63, 64, 65, 511, 2048];
+    let cases_per_point = 100u64;
+    let dot_lanes: &[bool] = if cfg!(target_arch = "x86_64")
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma")
+    {
+        &[false, true]
+    } else {
+        &[false]
+    };
+
+    let mut points = Vec::new();
+    for &(attention_heads, kv_heads) in &gqa_shapes {
+        for &head_dim in &head_dims {
+            for &position_count in &position_counts {
+                for case in 0..cases_per_point {
+                    points.push((attention_heads, kv_heads, head_dim, position_count, case));
+                }
+            }
+        }
+    }
+
+    // The case grid is large (36 shape points x 100 cases x up to 2048
+    // positions); spread cases across the pool so the suite stays fast. Any
+    // scheduling sensitivity this introduces is exactly what the assertion
+    // must be immune to.
+    let mismatches: usize = points
+        .par_iter()
+        .map(
+            |&(attention_heads, kv_heads, head_dim, position_count, case)| {
+                let mut rng = XorShift64Star(
+                    0x1770_0001
+                        ^ ((attention_heads as u64) << 48)
+                        ^ ((kv_heads as u64) << 40)
+                        ^ ((head_dim as u64) << 24)
+                        ^ ((position_count as u64) << 8)
+                        ^ case,
+                );
+                let plan = LlamaKvCachePlan {
+                    max_sequence_length: position_count,
+                    layer_count: 1,
+                    kv_head_count: kv_heads,
+                    head_dim,
+                    key_shape: vec![1, position_count, kv_heads, head_dim],
+                    value_shape: vec![1, position_count, kv_heads, head_dim],
+                };
+                let mut kv_cache = LlamaKvCache::new(plan).expect("kv cache");
+                let kv_len = position_count * kv_heads * head_dim;
+                kv_cache.keys = rng.fill(kv_len);
+                kv_cache.values = rng.fill(kv_len);
+                kv_cache.allocated_sequence_length = position_count;
+                kv_cache.position = position_count - 1;
+                let query = rng.fill(attention_heads * head_dim);
+                let params = DecodeAttentionHeadsParams {
+                    kv_cache: &kv_cache,
+                    layer_idx: 0,
+                    query_data: &query,
+                    attention_heads,
+                    repeats: attention_heads / kv_heads,
+                    kv_heads,
+                    head_mapping: GqaHeadMapping::Grouped,
+                    position_count,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                };
+
+                let width = attention_heads * head_dim;
+                let repeats = attention_heads / kv_heads;
+                let mut mismatch = 0usize;
+
+                // Production driver, serial vs parallel, parallel run twice to
+                // expose scheduling nondeterminism. The per-head body resolves the
+                // dot lane from env (untouched in tests => the legacy lane).
+                let mut serial = vec![0.0f32; width];
+                decode_attention_all_heads_into_with_mode(&params, &mut serial, false)
+                    .expect("serial");
+                let mut parallel_a = vec![0.0f32; width];
+                decode_attention_all_heads_into_with_mode(&params, &mut parallel_a, true)
+                    .expect("parallel run 1");
+                let mut parallel_b = vec![0.0f32; width];
+                decode_attention_all_heads_into_with_mode(&params, &mut parallel_b, true)
+                    .expect("parallel run 2");
+                for ((s, a), b) in serial.iter().zip(&parallel_a).zip(&parallel_b) {
+                    if s.to_bits() != a.to_bits() || a.to_bits() != b.to_bits() {
+                        mismatch += 1;
+                    }
+                }
+
+                // Dot-lane lock: run every head through the explicit-kernel body
+                // with the lane pinned (no process-env writes), serial vs a rayon
+                // scope mirroring the production parallel arm, compared bitwise.
+                // Covers composition with the Item-1 blocked lane on AVX2 hosts.
+                for &use_blocked in dot_lanes {
+                    let mut serial_pinned = vec![0.0f32; width];
+                    let mut scores = Vec::new();
+                    for head in 0..attention_heads {
+                        let kv_head = map_attention_head_to_kv_head(
+                            head,
+                            repeats,
+                            kv_heads,
+                            params.head_mapping,
+                        );
+                        attention_context_for_head_into_with_kernels(
+                            AttentionContextHeadParams {
+                                kv_cache: &kv_cache,
+                                layer_idx: 0,
+                                kv_head,
+                                query_slice: &query[head * head_dim..(head + 1) * head_dim],
+                                position_count,
+                                scale: params.scale,
+                            },
+                            &mut serial_pinned[head * head_dim..(head + 1) * head_dim],
+                            &mut scores,
+                            use_blocked,
+                        )
+                        .expect("serial pinned");
+                    }
+                    let mut parallel_pinned = vec![0.0f32; width];
+                    parallel_pinned
+                        .par_chunks_exact_mut(head_dim)
+                        .enumerate()
+                        .try_for_each_init(Vec::new, |scratch, (head, out_slice)| {
+                            let kv_head = map_attention_head_to_kv_head(
+                                head,
+                                repeats,
+                                kv_heads,
+                                params.head_mapping,
+                            );
+                            attention_context_for_head_into_with_kernels(
+                                AttentionContextHeadParams {
+                                    kv_cache: &kv_cache,
+                                    layer_idx: 0,
+                                    kv_head,
+                                    query_slice: &query[head * head_dim..(head + 1) * head_dim],
+                                    position_count,
+                                    scale: params.scale,
+                                },
+                                out_slice,
+                                scratch,
+                                use_blocked,
+                            )
+                        })
+                        .expect("parallel pinned");
+                    for (s, p) in serial_pinned.iter().zip(&parallel_pinned) {
+                        if s.to_bits() != p.to_bits() {
+                            mismatch += 1;
+                        }
+                    }
+                }
+                mismatch
+            },
+        )
+        .sum();
+
+    assert_eq!(
+        mismatches, 0,
+        "decode attention parallel lane diverged from serial in {mismatches} element(s)"
+    );
+}
