@@ -11524,14 +11524,16 @@ fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
     let head_dims = [64usize, 128];
     let position_counts = [2usize, 63, 64, 65, 511, 2048];
     let cases_per_point = 100u64;
-    let dot_lanes: &[bool] = if cfg!(target_arch = "x86_64")
-        && std::arch::is_x86_feature_detected!("avx2")
+    #[cfg(target_arch = "x86_64")]
+    let dot_lanes: &[bool] = if std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("fma")
     {
         &[false, true]
     } else {
         &[false]
     };
+    #[cfg(not(target_arch = "x86_64"))]
+    let dot_lanes: &[bool] = &[false];
 
     let mut points = Vec::new();
     for &(attention_heads, kv_heads) in &gqa_shapes {
