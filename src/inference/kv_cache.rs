@@ -135,9 +135,16 @@ pub enum KvLayout {
 /// Env gate for the head-major layout, read once per cache construction.
 /// Windows-first per the standing directive; the mechanism is arch-agnostic
 /// and lifting the gate is a one-line decision.
+///
+/// DEFAULT ON (Windows x86_64 promotion): the lane carries a bitwise-identity
+/// contract (Item-3 Lane-A matrix incl. rollback/growth/CUDA-mirror, zero
+/// divergent bits), so the flip cannot change any output byte. Explicit
+/// rollback: `BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR=0`.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn kv_layout_head_major_enabled() -> bool {
-    super::q8_runtime::q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR")
+    super::q8_runtime::q8_0_env_flag_enabled_default_on_fail_closed(
+        "BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR",
+    )
 }
 
 /// Element storage for the K/V buffers. Chosen ONCE at cache construction

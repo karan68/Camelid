@@ -888,39 +888,64 @@ fn resolve_prefill_thread_count_widens_only_on_measured_default() {
 }
 
 #[test]
-fn resolve_decode_thread_count_defaults_off_and_prefers_explicit_width() {
-    // Neither flag: no decode pool — decode stays inline (the default path).
-    assert_eq!(resolve_decode_thread_count_from(None, false, 16), None);
-    // Explicit width wins.
+fn resolve_decode_thread_count_promotes_physical_default_with_kill_switch() {
+    // No flags, no policy input: no decode pool (pre-promotion inline path).
     assert_eq!(
-        resolve_decode_thread_count_from(Some("4"), false, 16),
+        resolve_decode_thread_count_from(None, false, 16, None),
+        None
+    );
+    // Promoted default policy: dedicated pool at detected physical cores...
+    assert_eq!(
+        resolve_decode_thread_count_from(None, false, 16, Some(8)),
+        Some(8)
+    );
+    // ...including physical == global (the isolation configuration)...
+    assert_eq!(
+        resolve_decode_thread_count_from(None, false, 8, Some(8)),
+        Some(8)
+    );
+    // ...but never wider than an operator-narrowed global.
+    assert_eq!(
+        resolve_decode_thread_count_from(None, false, 4, Some(8)),
+        None
+    );
+    // Explicit width wins over the policy.
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("4"), false, 16, Some(8)),
         Some(4)
     );
     assert_eq!(
-        resolve_decode_thread_count_from(Some(" 6 "), true, 16),
+        resolve_decode_thread_count_from(Some(" 6 "), true, 16, Some(8)),
         Some(6)
     );
-    // 0/off/empty/invalid fall through to the dedicated check.
-    assert_eq!(resolve_decode_thread_count_from(Some("0"), false, 16), None);
+    // Explicit 0/off is the KILL SWITCH: disables the pool entirely, over
+    // both the dedicated flag and the default policy.
     assert_eq!(
-        resolve_decode_thread_count_from(Some("off"), false, 16),
-        None
-    );
-    assert_eq!(resolve_decode_thread_count_from(Some(""), false, 16), None);
-    assert_eq!(
-        resolve_decode_thread_count_from(Some("abc"), false, 16),
+        resolve_decode_thread_count_from(Some("0"), true, 16, Some(8)),
         None
     );
     assert_eq!(
-        resolve_decode_thread_count_from(Some("0"), true, 16),
+        resolve_decode_thread_count_from(Some("off"), false, 16, Some(8)),
+        None
+    );
+    // Empty/invalid specs fall through to dedicated, then the policy.
+    assert_eq!(
+        resolve_decode_thread_count_from(Some(""), false, 16, Some(8)),
+        Some(8)
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("abc"), true, 16, None),
         Some(16)
     );
     assert_eq!(
-        resolve_decode_thread_count_from(Some("abc"), true, 16),
-        Some(16)
+        resolve_decode_thread_count_from(Some("abc"), false, 16, None),
+        None
     );
     // Dedicated alone isolates at the global width.
-    assert_eq!(resolve_decode_thread_count_from(None, true, 12), Some(12));
+    assert_eq!(
+        resolve_decode_thread_count_from(None, true, 12, None),
+        Some(12)
+    );
 }
 
 #[test]
