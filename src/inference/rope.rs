@@ -87,6 +87,23 @@ pub fn diagnostic_rope_pairing() -> Result<RopePairing> {
 }
 
 pub fn diagnostic_rope_direction() -> Result<RopeDirection> {
+    // Resolved once per process (non-test): `apply_rope` consults this per
+    // call on the decode hot loop, and env reads allocate on Windows. Invalid
+    // values stay uncached (the error re-reads; it aborts the forward anyway).
+    #[cfg(not(test))]
+    {
+        static RESOLVED: std::sync::OnceLock<RopeDirection> = std::sync::OnceLock::new();
+        if let Some(direction) = RESOLVED.get() {
+            return Ok(*direction);
+        }
+        let direction = diagnostic_rope_direction_uncached()?;
+        Ok(*RESOLVED.get_or_init(|| direction))
+    }
+    #[cfg(test)]
+    diagnostic_rope_direction_uncached()
+}
+
+fn diagnostic_rope_direction_uncached() -> Result<RopeDirection> {
     match env::var("CAMELID_ROPE_DIRECTION") {
         Ok(value) if value == "inverse" => Ok(RopeDirection::Inverse),
         Ok(value) if value == "forward" || value.is_empty() => Ok(RopeDirection::Forward),
@@ -101,6 +118,20 @@ pub fn diagnostic_rope_direction() -> Result<RopeDirection> {
 }
 
 pub fn diagnostic_rope_position_mode() -> Result<RopePositionMode> {
+    #[cfg(not(test))]
+    {
+        static RESOLVED: std::sync::OnceLock<RopePositionMode> = std::sync::OnceLock::new();
+        if let Some(mode) = RESOLVED.get() {
+            return Ok(*mode);
+        }
+        let mode = diagnostic_rope_position_mode_uncached()?;
+        Ok(*RESOLVED.get_or_init(|| mode))
+    }
+    #[cfg(test)]
+    diagnostic_rope_position_mode_uncached()
+}
+
+fn diagnostic_rope_position_mode_uncached() -> Result<RopePositionMode> {
     match env::var("CAMELID_ROPE_POSITION_MODE") {
         Ok(value) if value == "one_based" => Ok(RopePositionMode::OneBased),
         Ok(value) if value == "zero_based" || value.is_empty() => Ok(RopePositionMode::ZeroBased),

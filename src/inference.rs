@@ -3317,6 +3317,20 @@ impl LlamaInferenceSession {
         Ok(self.forward_single_token_timed_fast(token_id)?.output)
     }
 
+    /// Alloc-gate probe (Lane B step 6): the plain decode forward with the
+    /// logits stage optionally skipped, so the gate can attribute allocation
+    /// churn to the layer loop vs the final norm + output projection.
+    #[cfg(feature = "alloc-gate")]
+    pub fn forward_single_token_alloc_probe(
+        &mut self,
+        token_id: u32,
+        compute_logits: bool,
+    ) -> Result<LlamaForwardOutput> {
+        Ok(self
+            .forward_single_token_timed_internal(token_id, false, compute_logits)?
+            .output)
+    }
+
     pub fn forward_single_token_timed(&mut self, token_id: u32) -> Result<LlamaTimedForwardOutput> {
         let timed = self.forward_single_token_timed_internal(token_id, true, true)?;
         Ok(LlamaTimedForwardOutput {
@@ -3486,6 +3500,9 @@ impl LlamaInferenceSession {
             .embedding_lookup(token_ids, "token_embedding_prefill_chunk")?;
         let mut timings = LlamaForwardTimings {
             embedding: embedding_started.elapsed().as_micros(),
+            // One allocation instead of a per-push growth chain (one layer
+            // entry pushed per layer per forward).
+            layers: Vec::with_capacity(self.weights.layers.len()),
             ..LlamaForwardTimings::default()
         };
         if let Some(memory) = &mut memory {
@@ -3587,6 +3604,9 @@ impl LlamaInferenceSession {
             .embedding_lookup(token_ids, "token_embedding_verify_chunk")?;
         let mut timings = LlamaForwardTimings {
             embedding: embedding_started.elapsed().as_micros(),
+            // One allocation instead of a per-push growth chain (one layer
+            // entry pushed per layer per forward).
+            layers: Vec::with_capacity(self.weights.layers.len()),
             ..LlamaForwardTimings::default()
         };
         let layers_started = Instant::now();
@@ -3695,6 +3715,9 @@ impl LlamaInferenceSession {
             .embedding_lookup(token_ids, "token_embedding_prefill_layer_major")?;
         let mut timings = LlamaForwardTimings {
             embedding: embedding_started.elapsed().as_micros(),
+            // One allocation instead of a per-push growth chain (one layer
+            // entry pushed per layer per forward).
+            layers: Vec::with_capacity(self.weights.layers.len()),
             ..LlamaForwardTimings::default()
         };
         if let Some(memory) = &mut memory {
@@ -3885,6 +3908,9 @@ impl LlamaInferenceSession {
             .transpose()?;
         let mut timings = LlamaForwardTimings {
             embedding: embedding_started.elapsed().as_micros(),
+            // One allocation instead of a per-push growth chain (one layer
+            // entry pushed per layer per forward).
+            layers: Vec::with_capacity(self.weights.layers.len()),
             ..LlamaForwardTimings::default()
         };
         let mut layer_diagnostics =
@@ -7683,6 +7709,23 @@ fn linear_with_diagnostic_layouts_with_plan(
         let descriptor_weight = linear_weight_reinterpreted_as_descriptor(weight, input_width)?;
         matmul_descriptor_with_precision_with_plan(input, &descriptor_weight, name, runtime_plan)
     } else if rectangular_layout == RectangularLinearLayout::Transposed || rows == input_width {
+        // Zero-clone fast path for the dominant decode case: a Q8_0 weight
+        // whose (shape-reinterpreted) view routes to the block-dot kernel.
+        // Materializing the reinterpreted tensor below clones the weight's
+        // full Vec<Q8_0Block> per call; the borrowed view runs the SAME
+        // kernel on the SAME blocks/packed storage without the copy. The
+        // tq2_0/q4_k/q6_k routes checked ahead of block-dot in the tensor
+        // chain cannot fire for a Q8_0-sourced weight, so gating on the
+        // block-dot predicate alone preserves route selection exactly.
+        let borrowed = borrowed_linear_weight_as_transposed(weight, input_width)?;
+        if should_use_borrowed_q8_0_block_dot_with_plan(borrowed, input_width, runtime_plan) {
+            return matmul_rhs_transposed_q8_0_block_dot_borrowed_with_plan(
+                input,
+                borrowed,
+                name,
+                runtime_plan,
+            );
+        }
         let transposed_weight = linear_weight_reinterpreted_as_transposed(weight, input_width)?;
         matmul_rhs_transposed_with_precision_with_plan(
             input,
@@ -8949,9 +8992,9 @@ fn try_attention_qkv_shared_q8_0_block_dot(
     };
 
     let quantized_input = quantize_q8_0_row(input_row);
-    let mut q = vec![0.0; q_width];
-    let mut k = vec![0.0; k_width];
-    let mut v = vec![0.0; v_width];
+    let mut q = decode_scratch::take(q_width);
+    let mut k = decode_scratch::take(k_width);
+    let mut v = decode_scratch::take(v_width);
     accumulate_transposed_linear_row_q8_0_block_dot_quantized(
         &quantized_input.blocks,
         q_transposed,
@@ -8969,9 +9012,9 @@ fn try_attention_qkv_shared_q8_0_block_dot(
     );
 
     Ok(Some((
-        CpuTensor::from_f32("attention_q_shared_q8", vec![1, q_width], q)?,
-        CpuTensor::from_f32("attention_k_shared_q8", vec![1, k_width], k)?,
-        CpuTensor::from_f32("attention_v_shared_q8", vec![1, v_width], v)?,
+        decode_scratch::tensor_from_pooled("attention_q_shared_q8", &[1, q_width], q)?,
+        decode_scratch::tensor_from_pooled("attention_k_shared_q8", &[1, k_width], k)?,
+        decode_scratch::tensor_from_pooled("attention_v_shared_q8", &[1, v_width], v)?,
     )))
 }
 
@@ -9040,8 +9083,8 @@ fn gated_ffn_activation_with_plan(
     }
 
     let input_row = &input.data[..input_width];
-    let mut gate = vec![0.0; gate_width];
-    let mut up = vec![0.0; up_width];
+    let mut gate = decode_scratch::take(gate_width);
+    let mut up = decode_scratch::take(up_width);
 
     let ffn_gate_up_decode_consumer = if collect_diagnostics {
         if runtime_plan.q8.ffn_gate_up_decode_consumer {
@@ -9176,12 +9219,13 @@ fn gated_ffn_activation_with_plan(
     metal_seam::synchronize_active_session();
     let order = diagnostic_ffn_gate_up_order()?;
     let started = Instant::now();
-    for (gate_value, up_value) in gate.iter_mut().zip(up) {
+    for (gate_value, up_value) in gate.iter_mut().zip(up.iter().copied()) {
         *gate_value = match order {
             FfnGateUpOrder::GateUp => (*gate_value / (1.0 + (-*gate_value).exp())) * up_value,
             FfnGateUpOrder::UpGate => (up_value / (1.0 + (-up_value).exp())) * *gate_value,
         };
     }
+    decode_scratch::recycle(up);
     let activation_elapsed = started.elapsed().as_micros();
     if used_ffn_gate_up_decode_consumer {
         add_q8_schedule_counter(
@@ -9190,7 +9234,7 @@ fn gated_ffn_activation_with_plan(
         );
     }
     let tensor_started = q8_schedule_telemetry_enabled().then(Instant::now);
-    let tensor = CpuTensor::from_f32(name, vec![1, gate_width], gate)?;
+    let tensor = decode_scratch::tensor_from_pooled(&name, &[1, gate_width], gate)?;
     if used_ffn_gate_up_decode_consumer {
         if let Some(started) = tensor_started {
             add_q8_schedule_counter(
@@ -9234,7 +9278,8 @@ fn try_x86_q8_ffn_gate_up_decode_fused_activation_path(
     name: impl Into<String>,
     runtime_plan: &ResolvedRuntimePlan,
 ) -> Result<Option<GatedFfnActivation>> {
-    let name = name.into();
+    // Bail before materializing the name String: on plans without the fused
+    // route this runs (and returns None) once per layer per decode token.
     if !runtime_plan.q8.ffn_gate_up_decode_consumer
         || !runtime_plan.q8.ffn_gate_up_decode_fused_activation
         || input.rank() != 2
@@ -9242,6 +9287,7 @@ fn try_x86_q8_ffn_gate_up_decode_fused_activation_path(
     {
         return Ok(None);
     }
+    let name = name.into();
     let input_width = input.dim(1)?;
     if !input_width.is_multiple_of(Q8_0_BLOCK_VALUES) {
         record_q8_schedule_projection_route_denial(
@@ -10340,8 +10386,18 @@ fn q8_0_block_dot_enabled() -> bool {
 fn q8_0_file_reader_block_dot_enabled() -> bool {
     // Lazy/file-backed Q8 rows should also use block-dot by default. Preserving this
     // default is required because Q8 runtime/packed tensors may not have row-major
-    // f32 backing for a safe generic fallback.
-    q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_Q8_0_FILE_READER_BLOCK_DOT")
+    // f32 backing for a safe generic fallback. Read once per process (non-test).
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_Q8_0_FILE_READER_BLOCK_DOT")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_Q8_0_FILE_READER_BLOCK_DOT")
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -15711,7 +15767,7 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
         }
     }
 
-    let mut output = vec![0.0_f32; rows * output_width];
+    let mut output = decode_scratch::take(rows * output_width);
     use rayon::prelude::*;
     if should_parallelize_linear_output(rows * output_width) {
         output
@@ -15806,7 +15862,165 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
             }
         }
     }
-    CpuTensor::from_f32(name, vec![rows, output_width], output)
+    decode_scratch::tensor_from_pooled(&name, &[rows, output_width], output)
+}
+
+/// [`matmul_rhs_transposed_q8_0_block_dot_with_plan`] over a borrowed weight
+/// view — the SAME kernel body reading the same blocks/packed storage, minus
+/// the materialized weight tensor. This is the zero-clone path for shape-
+/// reinterpreted linears: `weight_with_swapped_matrix_shape` cloned the full
+/// `Vec<Q8_0Block>` per call (28 MB per layer per token for the 3B ffn_down
+/// decode projection), and the clone's only purpose was carrying swapped dims.
+fn matmul_rhs_transposed_q8_0_block_dot_borrowed_with_plan(
+    input: &CpuTensor,
+    weight: BorrowedLinearWeight<'_>,
+    name: impl Into<String>,
+    runtime_plan: &ResolvedRuntimePlan,
+) -> Result<CpuTensor> {
+    let name = name.into();
+    let rows = input.dim(0)?;
+    let input_width = input.dim(1)?;
+    let output_width = weight.rows;
+    let rhs_k = weight.cols;
+    if input_width != rhs_k {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "q8_0 block-dot shape mismatch: lhs {:?}, rhs [{}, {}]",
+            input.shape.dims, weight.rows, weight.cols
+        )));
+    }
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    let expected_blocks = output_width * blocks_per_row;
+    if let Some(weight_blocks) = weight.q8_0_blocks {
+        if weight_blocks.len() != expected_blocks {
+            return Err(BackendError::RuntimeShapeMismatch(format!(
+                "q8_0 block-dot expected {expected_blocks} blocks for weight [{}, {}] feeding {name}, got {}",
+                weight.rows,
+                weight.cols,
+                weight_blocks.len()
+            )));
+        }
+    } else if q8_0_selected_borrowed_packed_rows4(weight)
+        .filter(|(packed, _)| {
+            packed.rows == output_width && packed.blocks_per_row == blocks_per_row
+        })
+        .is_none()
+    {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "q8_0 block-dot requested for {name} without q8_0 blocks or matching packed rows4"
+        )));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if mac_q8_prefill_i8mm_enabled() && mac_q8_prefill_i8mm_row_threshold_met(rows) {
+        if let Some((packed, Q8_0PackedRows4Interleave::I8)) =
+            q8_0_selected_borrowed_packed_rows4(weight)
+        {
+            if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
+                return matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
+                    input,
+                    packed,
+                    output_width,
+                    q8_schedule_role_for_output_name(&name),
+                    name,
+                );
+            }
+        }
+    }
+
+    let mut output = decode_scratch::take(rows * output_width);
+    use rayon::prelude::*;
+    if should_parallelize_linear_output(rows * output_width) {
+        output
+            .par_chunks_mut(output_width)
+            .enumerate()
+            .for_each(|(row, output_row)| {
+                let input_start = row * input_width;
+                let quantized_input =
+                    quantize_q8_0_row(&input.data[input_start..input_start + input_width]);
+                if let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(weight) {
+                    if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
+                        accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                            &quantized_input.blocks,
+                            packed,
+                            interleave,
+                            output_row,
+                        );
+                        return;
+                    }
+                }
+                let weight_blocks = weight
+                    .q8_0_blocks
+                    .expect("q8_0 block-dot precondition checked");
+                for (output_idx, out_value) in output_row.iter_mut().enumerate() {
+                    let weight_start = output_idx * blocks_per_row;
+                    *out_value = q8_0_dot_rows(
+                        &weight_blocks[weight_start..weight_start + blocks_per_row],
+                        &quantized_input.blocks,
+                    );
+                }
+            });
+    } else {
+        for row in 0..rows {
+            let input_start = row * input_width;
+            let quantized_input =
+                quantize_q8_0_row(&input.data[input_start..input_start + input_width]);
+            let out_start = row * output_width;
+            let output_row = &mut output[out_start..out_start + output_width];
+            if let Some((packed, interleave)) = q8_0_selected_borrowed_packed_rows4(weight) {
+                if packed.rows == output_width && packed.blocks_per_row == blocks_per_row {
+                    accumulate_q8_0_packed_rows4_dot_quantized_cpu(
+                        &quantized_input.blocks,
+                        packed,
+                        interleave,
+                        output_row,
+                    );
+                    continue;
+                }
+            }
+            let weight_blocks = weight
+                .q8_0_blocks
+                .expect("q8_0 block-dot precondition checked");
+            if runtime_plan.q8.metal_retained {
+                let weight_bytes = q8_0_blocks_as_bytes(weight_blocks);
+                if with_q8_0_block_scales_and_quants(
+                    &quantized_input.blocks,
+                    |input_scales, input_quants| {
+                        metal_seam::try_block_linear_row(
+                            input_scales,
+                            input_quants,
+                            weight_bytes,
+                            output_width,
+                            blocks_per_row,
+                            output_row,
+                        )
+                    },
+                ) {
+                    continue;
+                }
+            }
+            if should_parallelize_q8_0_file_reader_output(output_width) {
+                output_row
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(output_idx, out_value)| {
+                        let weight_start = output_idx * blocks_per_row;
+                        *out_value = q8_0_dot_rows(
+                            &weight_blocks[weight_start..weight_start + blocks_per_row],
+                            &quantized_input.blocks,
+                        );
+                    });
+            } else {
+                for (output_idx, out_value) in output_row.iter_mut().enumerate() {
+                    let weight_start = output_idx * blocks_per_row;
+                    *out_value = q8_0_dot_rows(
+                        &weight_blocks[weight_start..weight_start + blocks_per_row],
+                        &quantized_input.blocks,
+                    );
+                }
+            }
+        }
+    }
+    decode_scratch::tensor_from_pooled(&name, &[rows, output_width], output)
 }
 
 fn quantize_q8_0_row(input: &[f32]) -> QuantizedQ8_0Row {
@@ -16889,7 +17103,18 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
 /// documented follow-up.
 pub(crate) fn q4_k_cpu_block_dot_enabled() -> bool {
-    q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q4K_DECODE")
+    // Read once per process (non-test): this predicate runs per projection
+    // call on the decode hot loop, and env reads allocate on Windows.
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q4K_DECODE")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED
+            .get_or_init(|| q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q4K_DECODE"))
+    }
 }
 
 /// Streaming Q4_K linear: quantise each input row to Q8_K once, then dot it
@@ -18001,7 +18226,7 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_f32_input(
             packed.rows, packed.blocks_per_row
         )));
     }
-    let mut output = vec![0.0_f32; rows * output_width];
+    let mut output = decode_scratch::take(rows * output_width);
     use rayon::prelude::*;
     if should_parallelize_linear_output(rows * output_width) {
         output
@@ -18028,7 +18253,8 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_f32_input(
             );
         }
     }
-    CpuTensor::from_f32(name, vec![rows, output_width], output)
+    let name = name.into();
+    decode_scratch::tensor_from_pooled(&name, &[rows, output_width], output)
 }
 
 #[cfg(test)]
@@ -18963,17 +19189,30 @@ fn q8_0_file_reader_scratch_capacities() -> (usize, usize, usize, usize) {
 
 fn should_parallelize_q8_0_file_reader_output(output_width: usize) -> bool {
     const DEFAULT_Q8_0_FILE_READER_PARALLEL_MIN_OUTPUTS: usize = 1024;
+    // (defer_to_linear, min_outputs), resolved once per process outside tests:
+    // this predicate runs inside per-row kernels on the decode hot loop.
+    fn config_uncached() -> (bool, usize) {
+        let defer_to_linear = env::var("CAMELID_PARALLEL_LINEAR").is_ok();
+        let min_outputs = env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_Q8_0_FILE_READER_PARALLEL_MIN_OUTPUTS);
+        (defer_to_linear, min_outputs)
+    }
+    #[cfg(test)]
+    let (defer_to_linear, min_outputs) = config_uncached();
+    #[cfg(not(test))]
+    let (defer_to_linear, min_outputs) = {
+        static CONFIG: OnceLock<(bool, usize)> = OnceLock::new();
+        *CONFIG.get_or_init(config_uncached)
+    };
     if rayon::current_num_threads() <= 1 {
         return false;
     }
-    if env::var("CAMELID_PARALLEL_LINEAR").is_ok() {
+    if defer_to_linear {
         return should_parallelize_linear_output(output_width);
     }
-    let min_outputs = env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_Q8_0_FILE_READER_PARALLEL_MIN_OUTPUTS);
     output_width >= min_outputs
 }
 
@@ -19258,11 +19497,29 @@ fn accumulate_transposed_linear_row_q8_0_block_dot_quantized_with_flags(
 }
 
 fn q8_0_packed_4x4_dot_enabled() -> bool {
-    env_flag_enabled("CAMELID_Q8_0_PACKED_4X4_DOT")
+    // Read once per process (non-test): consulted by packed-rows selection on
+    // every projection call in the decode hot loop.
+    #[cfg(test)]
+    {
+        env_flag_enabled("CAMELID_Q8_0_PACKED_4X4_DOT")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| env_flag_enabled("CAMELID_Q8_0_PACKED_4X4_DOT"))
+    }
 }
 
 fn q8_0_packed_4x8_dot_enabled() -> bool {
-    env_flag_enabled("CAMELID_Q8_0_PACKED_4X8_DOT")
+    #[cfg(test)]
+    {
+        env_flag_enabled("CAMELID_Q8_0_PACKED_4X8_DOT")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| env_flag_enabled("CAMELID_Q8_0_PACKED_4X8_DOT"))
+    }
 }
 
 fn q8_0_selected_packed_rows4(

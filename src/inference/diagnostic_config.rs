@@ -183,6 +183,23 @@ pub(super) fn diagnostic_zero_delta_value(
 }
 
 pub fn diagnostic_gqa_head_mapping() -> Result<GqaHeadMapping> {
+    // Resolved once per process (non-test): the attention context consults
+    // this per call on the decode hot loop, and env reads allocate on
+    // Windows. Invalid values stay uncached (the error aborts the forward).
+    #[cfg(not(test))]
+    {
+        static RESOLVED: std::sync::OnceLock<GqaHeadMapping> = std::sync::OnceLock::new();
+        if let Some(mapping) = RESOLVED.get() {
+            return Ok(*mapping);
+        }
+        let mapping = diagnostic_gqa_head_mapping_uncached()?;
+        Ok(*RESOLVED.get_or_init(|| mapping))
+    }
+    #[cfg(test)]
+    diagnostic_gqa_head_mapping_uncached()
+}
+
+fn diagnostic_gqa_head_mapping_uncached() -> Result<GqaHeadMapping> {
     match env::var("CAMELID_GQA_HEAD_MAPPING") {
         Ok(value) if value == "modulo" => Ok(GqaHeadMapping::Modulo),
         Ok(value) if value == "grouped" || value.is_empty() => Ok(GqaHeadMapping::Grouped),
@@ -197,6 +214,20 @@ pub fn diagnostic_gqa_head_mapping() -> Result<GqaHeadMapping> {
 }
 
 pub fn diagnostic_attention_score_scale() -> Result<AttentionScoreScale> {
+    #[cfg(not(test))]
+    {
+        static RESOLVED: std::sync::OnceLock<AttentionScoreScale> = std::sync::OnceLock::new();
+        if let Some(scale) = RESOLVED.get() {
+            return Ok(*scale);
+        }
+        let scale = diagnostic_attention_score_scale_uncached()?;
+        Ok(*RESOLVED.get_or_init(|| scale))
+    }
+    #[cfg(test)]
+    diagnostic_attention_score_scale_uncached()
+}
+
+fn diagnostic_attention_score_scale_uncached() -> Result<AttentionScoreScale> {
     match env::var("CAMELID_ATTENTION_SCORE_SCALE") {
         Ok(value) if value == "none" => Ok(AttentionScoreScale::None),
         Ok(value) if value == "head_dim" || value.is_empty() => Ok(AttentionScoreScale::HeadDim),
@@ -225,6 +256,22 @@ pub fn diagnostic_linear_accumulation_precision() -> Result<LinearAccumulationPr
 }
 
 pub fn diagnostic_ffn_gate_up_order() -> Result<FfnGateUpOrder> {
+    // Resolved once per process (non-test): consulted per FFN activation on
+    // the decode hot loop, and env reads allocate on Windows.
+    #[cfg(not(test))]
+    {
+        static RESOLVED: std::sync::OnceLock<FfnGateUpOrder> = std::sync::OnceLock::new();
+        if let Some(order) = RESOLVED.get() {
+            return Ok(*order);
+        }
+        let order = diagnostic_ffn_gate_up_order_uncached()?;
+        Ok(*RESOLVED.get_or_init(|| order))
+    }
+    #[cfg(test)]
+    diagnostic_ffn_gate_up_order_uncached()
+}
+
+fn diagnostic_ffn_gate_up_order_uncached() -> Result<FfnGateUpOrder> {
     match env::var("CAMELID_FFN_GATE_UP_ORDER") {
         Ok(value) if value == "up_gate" => Ok(FfnGateUpOrder::UpGate),
         Ok(value) if value == "gate_up" || value.is_empty() => Ok(FfnGateUpOrder::GateUp),
@@ -308,6 +355,24 @@ pub fn diagnostic_rectangular_linear_layout() -> Result<RectangularLinearLayout>
 pub fn diagnostic_rectangular_linear_layout_for_role(
     role: &str,
 ) -> Result<RectangularLinearLayout> {
+    // Hot-path short-circuit (non-test): when NO rectangular-layout override
+    // is present in the environment — the overwhelmingly common case — every
+    // role resolves to Auto, and the per-call role-key/format!/env::var work
+    // below (three allocations per projection call) is skipped entirely. Any
+    // override present falls through to the exact per-call resolution.
+    #[cfg(not(test))]
+    {
+        static ANY_OVERRIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let any_override = *ANY_OVERRIDE.get_or_init(|| {
+            env::vars_os().any(|(key, _)| {
+                key.to_string_lossy()
+                    .starts_with("CAMELID_RECTANGULAR_LINEAR_LAYOUT")
+            })
+        });
+        if !any_override {
+            return Ok(RectangularLinearLayout::Auto);
+        }
+    }
     let role_key = role
         .chars()
         .map(|ch| {

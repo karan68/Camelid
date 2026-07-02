@@ -3260,21 +3260,46 @@ pub(crate) fn should_parallelize_linear_output(output_width: usize) -> bool {
 }
 
 fn parallel_linear_enabled() -> bool {
-    match env::var("CAMELID_PARALLEL_LINEAR") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes" | "enabled"
-        ),
-        Err(_) => false,
+    // Read once per process (non-test): `should_parallelize_linear_output`
+    // runs on every elementwise/matmul call in the decode hot loop, and env
+    // reads allocate on Windows. Tests keep the uncached read.
+    fn uncached() -> bool {
+        match env::var("CAMELID_PARALLEL_LINEAR") {
+            Ok(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes" | "enabled"
+            ),
+            Err(_) => false,
+        }
+    }
+    #[cfg(test)]
+    {
+        uncached()
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(uncached)
     }
 }
 
 fn parallel_linear_min_outputs() -> usize {
-    env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS)
+    fn uncached() -> usize {
+        env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS)
+    }
+    #[cfg(test)]
+    {
+        uncached()
+    }
+    #[cfg(not(test))]
+    {
+        static MIN_OUTPUTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MIN_OUTPUTS.get_or_init(uncached)
+    }
 }
 
 pub struct TensorStore {

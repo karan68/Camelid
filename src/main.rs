@@ -677,6 +677,31 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Hidden: decode zero-alloc gate — decode real tokens through a loaded
+    /// model under the counting global allocator and report steady-state heap
+    /// allocations per token. Requires `--features alloc-gate`.
+    #[cfg(feature = "alloc-gate")]
+    #[command(hide = true)]
+    BenchAllocGate {
+        /// GGUF model to decode.
+        #[arg(long)]
+        model: std::path::PathBuf,
+        /// Unmeasured tokens to warm pools, binding cells, and KV growth.
+        #[arg(long, default_value_t = 8)]
+        warmup: usize,
+        /// Measured steady-state tokens.
+        #[arg(long, default_value_t = 32)]
+        tokens: usize,
+        /// Skip the final norm + logits projection (attribution mode).
+        #[arg(long, default_value_t = false)]
+        skip_logits: bool,
+        /// Print backtraces for the first few >=1MiB steady-state allocations.
+        #[arg(long, default_value_t = false)]
+        trace_big: bool,
+        /// Fail (non-zero exit) if allocations per token exceed this.
+        #[arg(long)]
+        max_per_token: Option<f64>,
+    },
     /// Hidden: micro-benchmark rayon fork-join region overhead on the global
     /// pool (hot = back-to-back regions; cold = workers idle between regions).
     #[command(hide = true)]
@@ -1661,6 +1686,35 @@ async fn main() -> anyhow::Result<()> {
             configure_rayon_threads(threads)?;
             let report = bench_dense_hotloops(hidden, ffn, repeats, warmup)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        #[cfg(feature = "alloc-gate")]
+        Command::BenchAllocGate {
+            model,
+            warmup,
+            tokens,
+            skip_logits,
+            trace_big,
+            max_per_token,
+        } => {
+            let report = camelid::alloc_gate::run_decode_alloc_gate(
+                &model,
+                warmup,
+                tokens,
+                !skip_logits,
+                trace_big,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if let Some(max_per_token) = max_per_token {
+                let per_token = report["allocations_per_token"]
+                    .as_f64()
+                    .expect("report always carries allocations_per_token");
+                if per_token > max_per_token {
+                    anyhow::bail!(
+                        "decode alloc gate FAILED: {per_token} allocations/token exceeds the \
+                         allowed {max_per_token}"
+                    );
+                }
+            }
         }
         Command::BenchRayonRegion {
             iterations,

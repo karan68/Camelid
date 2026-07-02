@@ -102,6 +102,10 @@ cudarc = { version = "0.19", default-features = false, features = [
 # The CPU path remains the parity reference everywhere.
 default = []
 cuda = ["dep:cudarc"]
+# Decode zero-alloc gate (Lane B step 6): installs a counting global allocator
+# and enables the hidden `bench-alloc-gate` subcommand. Measurement-only build;
+# never enabled in shipped binaries (the default allocator stays untouched).
+alloc-gate = []
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

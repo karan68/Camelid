@@ -142,6 +142,28 @@ impl ResolvedRuntimePlan {
 
 impl Q8RuntimeFlags {
     pub(super) fn from_env() -> Self {
+        // Same caching contract as `ResolvedRuntimePlan::from_env` above: the
+        // flags are fixed post-startup, and callers outside the resolved-plan
+        // path (e.g. the shared-QKV block-dot predicate) used to re-read ~30
+        // env vars per layer per decode token — on Windows every env::var
+        // read allocates, even on a miss. Tests keep the uncached read so
+        // env-manipulating tests observe their changes.
+        #[cfg(test)]
+        {
+            Self::from_env_uncached()
+        }
+        #[cfg(not(test))]
+        {
+            static RESOLVED: std::sync::OnceLock<Q8RuntimeFlags> = std::sync::OnceLock::new();
+            if let Some(flags) = RESOLVED.get() {
+                return *flags;
+            }
+            let flags = Self::from_env_uncached();
+            *RESOLVED.get_or_init(|| flags)
+        }
+    }
+
+    fn from_env_uncached() -> Self {
         Self {
             block_dot: q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_Q8_0_BLOCK_DOT"),
             file_reader_block_dot: q8_0_env_flag_enabled_default_on_fail_closed(

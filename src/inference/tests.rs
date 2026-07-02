@@ -8388,6 +8388,96 @@ fn output_projection_diagnostics_support_loader_packed_and_retained_block_rows()
     }
 }
 
+/// The zero-clone borrowed block-dot path must be bitwise-identical to the
+/// cloning path it replaces (`linear_weight_reinterpreted_as_transposed` +
+/// tensor block-dot), for both weight forms the swap can present: retained
+/// blocks only, and runtime packed rows4 that survives the orientation swap.
+#[test]
+fn borrowed_q8_0_block_dot_matches_cloned_swapped_tensor_path() {
+    let _env_guard = env_lock();
+    let input_width = 64usize; // 2 Q8_0 blocks per weight row
+    let output_width = 8usize;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    let weight_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|row| Q8_0Block {
+            scale: f16_bits_to_f32(f32_to_f16_bits(0.03 + row as f32 * 0.011)),
+            quants: std::array::from_fn(|idx| ((row * 31 + idx * 7) % 251) as i8),
+        })
+        .collect();
+    let input_data: Vec<f32> = (0..input_width)
+        .map(|i| (((i % 89) as f32) - 44.0) * 0.017)
+        .collect();
+    let input =
+        CpuTensor::from_f32("borrowed_dot_probe", vec![1, input_width], input_data).unwrap();
+
+    // GGUF orientation [input_width, output_width]: rows == input width, so the
+    // linear chain reinterprets by swapping the matrix shape.
+    let make_weight = || {
+        CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, output_width],
+            },
+            Q8_0PackedRows4::from_rows(
+                output_width,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &weight_blocks,
+            )
+            .unwrap(),
+        )
+    };
+    // Form 1: retained blocks only. Form 2: runtime packed rows4 that matches
+    // the swapped orientation (kept across the swap by both paths).
+    let mut blocks_weight = make_weight();
+    blocks_weight.q8_0_runtime_storage = None;
+    blocks_weight.q8_0_blocks = Some(weight_blocks.clone());
+    let packed_weight = make_weight();
+
+    let runtime_plan = ResolvedRuntimePlan::from_env().expect("plan");
+    for (label, weight) in [
+        ("blocks", &blocks_weight),
+        ("runtime_packed", &packed_weight),
+    ] {
+        let cloned =
+            linear_weight_reinterpreted_as_transposed(weight, input_width).expect("reinterpret");
+        assert!(
+            should_use_q8_0_block_dot_with_plan(&cloned, input_width, &runtime_plan),
+            "{label}: cloned path must route to block-dot for this probe"
+        );
+        let expected = matmul_rhs_transposed_q8_0_block_dot_with_plan(
+            &input,
+            &cloned,
+            "borrowed_dot_out",
+            &runtime_plan,
+        )
+        .expect("cloned kernel");
+
+        let borrowed =
+            borrowed_linear_weight_as_transposed(weight, input_width).expect("borrowed view");
+        assert!(
+            should_use_borrowed_q8_0_block_dot_with_plan(borrowed, input_width, &runtime_plan),
+            "{label}: borrowed predicate must match the cloned predicate"
+        );
+        let actual = matmul_rhs_transposed_q8_0_block_dot_borrowed_with_plan(
+            &input,
+            borrowed,
+            "borrowed_dot_out",
+            &runtime_plan,
+        )
+        .expect("borrowed kernel");
+
+        assert_eq!(expected.shape.dims, actual.shape.dims, "{label}");
+        for (idx, (a, b)) in expected.data.iter().zip(actual.data.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{label}: divergence at output {idx}: {a} vs {b}"
+            );
+        }
+    }
+}
+
 #[test]
 fn output_projection_diagnostics_reject_q8_0_file_backed_unaligned_rows_before_read() {
     let _env_guard = env_lock();
