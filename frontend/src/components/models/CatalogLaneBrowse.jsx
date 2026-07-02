@@ -37,8 +37,8 @@ function predictedLane(item, capabilities) {
 
 function laneChip(lane) {
   if (lane === 'supported') return <EvidenceChip status="supported" asText>Lands in Supported</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Lands in Experimental · runnable</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText>Lands in Experimental · unverified</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Experimental · runnable</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
 }
 
 function CatalogRow({
