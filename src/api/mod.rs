@@ -4290,6 +4290,23 @@ impl RunnableServeRuntime {
         let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
         Ok((text, ids))
     }
+
+    /// [`generate_greedy`](Self::generate_greedy) with a per-token-id callback —
+    /// the runnable lane's SSE source. Returns the same (text, ids) as the
+    /// non-streaming path (identical generation by construction).
+    fn generate_greedy_streaming<F: FnMut(u32)>(
+        &self,
+        prompt_ids: &[u32],
+        max_new: usize,
+        mut on_token: F,
+    ) -> std::result::Result<(String, Vec<u32>), BackendError> {
+        let stop: Vec<u32> = self.tokenizer.special.eog.iter().copied().collect();
+        let ids =
+            self.model
+                .generate_stopping_streaming(prompt_ids, max_new, &stop, &mut on_token)?;
+        let text = self.tokenizer.decode(&ids, true).unwrap_or_default();
+        Ok((text, ids))
+    }
 }
 
 /// Render an Ornith/qwen35 ChatML prompt (no tools). The generation prompt opens the
@@ -4548,6 +4565,7 @@ async fn runnable_chat_nonstreaming(
             )
         }
     };
+    let prompt_token_count = prompt_ids.len();
     let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
     let rt = runtime.clone();
     let result =
@@ -4596,10 +4614,207 @@ async fn runnable_chat_nonstreaming(
         "created": unix_secs(),
         "model": id,
         "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
-        "usage": { "prompt_tokens": 0, "completion_tokens": ids.len(), "total_tokens": ids.len() },
+        "usage": {
+            "prompt_tokens": prompt_token_count,
+            "completion_tokens": ids.len(),
+            "total_tokens": prompt_token_count + ids.len(),
+        },
         "camelid": { "generated_token_ids": ids, "lane": "runnable_qwen35" },
     });
     (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Streaming chat for a runnable-served model (qwen35/Ornith), SSE. Mirrors the
+/// OpenAI `chat.completion.chunk` shape and the non-streaming bridge's semantics:
+/// think-block tokens stream as `delta.reasoning_content`, post-`</think>` tokens
+/// as `delta.content` (tool-call XML included, as in non-streaming), then one
+/// aggregate `tool_calls` delta when the finished content lifts into structured
+/// calls, the finish_reason chunk, an optional `stream_options.include_usage`
+/// terminal usage chunk, and `[DONE]`. The phase switch keys on the `</think>`
+/// TOKEN ID (a single user_defined token in the qwen35 vocab), so no text
+/// scanning is needed; per-phase text is decoded incrementally with UTF-8
+/// hold-back (a multi-token code point emits only once complete).
+async fn runnable_chat_streaming(
+    id: String,
+    runtime: Arc<RunnableServeRuntime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let enable_thinking = req.camelid_enable_thinking.unwrap_or(false);
+    let tools: Vec<serde_json::Value> = req
+        .tools
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.get("function").cloned().unwrap_or(t))
+        .collect();
+    let prompt_text = if tools.is_empty() {
+        render_ornith_chatml_prompt(&messages, enable_thinking)
+    } else {
+        render_ornith_chatml_prompt_with_tools(&messages, &tools, enable_thinking)
+    };
+    let prompt_ids = match runtime.tokenizer.encode(&prompt_text, false, true) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "tokenize_error",
+                e.to_string(),
+                None,
+            )
+        }
+    };
+    let prompt_token_count = prompt_ids.len();
+    let max_tokens = req.max_tokens.unwrap_or(256).min(4096) as usize;
+    let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let think_close = runtime.tokenizer.token_to_id.get("</think>").copied();
+    let created = unix_secs();
+
+    enum StreamItem {
+        Token(u32),
+        Done(String, Vec<u32>),
+        Fail(String),
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+    let rt = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let send_tx = tx.clone();
+        let result = rt.generate_greedy_streaming(&prompt_ids, max_tokens, |tok| {
+            let _ = send_tx.send(StreamItem::Token(tok));
+        });
+        match result {
+            Ok((text, ids)) => {
+                let _ = tx.send(StreamItem::Done(text, ids));
+            }
+            Err(e) => {
+                let _ = tx.send(StreamItem::Fail(e.to_string()));
+            }
+        }
+    });
+
+    let tokenizer = runtime.tokenizer.clone();
+    let events = async_stream::stream! {
+        let chunk = |delta: serde_json::Value, finish: Option<&str>| {
+            serde_json::json!({
+                "id": "chatcmpl-runnable",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": id,
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+            })
+        };
+        yield Ok::<Event, std::convert::Infallible>(
+            Event::default().data(chunk(serde_json::json!({ "role": "assistant" }), None).to_string()),
+        );
+
+        // Per-phase incremental decode state. `emitted` counts bytes of the phase's
+        // decoded string already sent; `seen_visible` gates the leading-whitespace
+        // trim (mirroring split_ornith_think's trim of the reasoning/content edges).
+        let mut in_think = enable_thinking && think_close.is_some();
+        let mut phase_ids: Vec<u32> = Vec::new();
+        let mut emitted = 0usize;
+        let mut seen_visible = false;
+        let mut final_state: Option<std::result::Result<(String, Vec<u32>), String>> = None;
+
+        while let Some(item) = rx.recv().await {
+            match item {
+                StreamItem::Token(tok) => {
+                    if in_think && Some(tok) == think_close {
+                        // Phase switch: reasoning is done; content decodes fresh.
+                        in_think = false;
+                        phase_ids.clear();
+                        emitted = 0;
+                        seen_visible = false;
+                        continue;
+                    }
+                    phase_ids.push(tok);
+                    let decoded = tokenizer.decode(&phase_ids, true).unwrap_or_default();
+                    // UTF-8 hold-back: a code point split across tokens decodes to
+                    // U+FFFD until its continuation arrives — wait for it.
+                    if decoded.ends_with('\u{FFFD}') {
+                        continue;
+                    }
+                    let mut new_start = emitted;
+                    if !seen_visible {
+                        let vis = decoded[new_start..]
+                            .find(|c: char| !c.is_whitespace())
+                            .map(|off| new_start + off);
+                        match vis {
+                            Some(v) => {
+                                new_start = v;
+                                seen_visible = true;
+                            }
+                            None => continue, // still leading whitespace — hold
+                        }
+                    }
+                    if new_start >= decoded.len() {
+                        continue;
+                    }
+                    let delta_text = decoded[new_start..].to_string();
+                    emitted = decoded.len();
+                    let delta = if in_think {
+                        serde_json::json!({ "reasoning_content": delta_text })
+                    } else {
+                        serde_json::json!({ "content": delta_text })
+                    };
+                    yield Ok(Event::default().data(chunk(delta, None).to_string()));
+                }
+                StreamItem::Done(text, ids) => {
+                    final_state = Some(Ok((text, ids)));
+                    break;
+                }
+                StreamItem::Fail(e) => {
+                    final_state = Some(Err(e));
+                    break;
+                }
+            }
+        }
+
+        match final_state {
+            Some(Ok((text, ids))) => {
+                let (_reasoning, content) = split_ornith_think(&text);
+                let tool_calls = parse_ornith_tool_calls_json(&content);
+                let finish = if tool_calls.is_empty() { "stop" } else { "tool_calls" };
+                if !tool_calls.is_empty() {
+                    let deltas: Vec<serde_json::Value> = tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| {
+                            let mut d = c.clone();
+                            d["index"] = serde_json::json!(i);
+                            d
+                        })
+                        .collect();
+                    yield Ok(Event::default().data(
+                        chunk(serde_json::json!({ "tool_calls": deltas }), None).to_string(),
+                    ));
+                }
+                yield Ok(Event::default().data(chunk(serde_json::json!({}), Some(finish)).to_string()));
+                if include_usage {
+                    let usage = serde_json::json!({
+                        "id": "chatcmpl-runnable",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": id,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_token_count,
+                            "completion_tokens": ids.len(),
+                            "total_tokens": prompt_token_count + ids.len(),
+                        },
+                    });
+                    yield Ok(Event::default().data(usage.to_string()));
+                }
+            }
+            Some(Err(e)) => {
+                let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
+                yield Ok(Event::default().data(err.to_string()));
+            }
+            None => {}
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    Sse::new(events).into_response()
 }
 
 /// Streaming Gemma 4 chat (SSE). Mirrors the OpenAI `chat.completion.chunk`
@@ -6152,11 +6367,13 @@ async fn chat_completions(
         Err(resp) => return resp,
     }
     // Runnable serve path (additive, gated by CAMELID_RUNNABLE_SERVE): short-circuits
-    // a qwen35/Ornith model to the runnable lane. Streaming is not yet implemented on
-    // this lane, so a stream request gets a valid single-shot (non-streamed) response;
-    // the agent loop is non-streaming.
+    // a qwen35/Ornith model to the runnable lane. Streaming mirrors the OpenAI
+    // chunk shape with think tokens as `reasoning_content` deltas.
     match resolve_runnable_runtime(&state, &req.model).await {
         Ok(Some((id, runtime))) => {
+            if req.stream.unwrap_or(false) {
+                return runnable_chat_streaming(id, runtime, &req).await;
+            }
             return runnable_chat_nonstreaming(id, runtime, &req).await;
         }
         Ok(None) => {}
