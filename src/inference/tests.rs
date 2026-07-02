@@ -11496,6 +11496,125 @@ fn q4_k_wire_dot_consistent_with_tensor_dequant() {
     );
 }
 
+/// Q5_K: the wire-row dot must agree with an f64 dot of the tensor-layer
+/// dequant (`Q5KBlock::dequantize`, an independent implementation of the same
+/// format via `q4_k_scale_min` rather than the kmask scheme) against the
+/// dequantized Q8_K activations — the same cross-check as
+/// `q4_k_wire_dot_consistent_with_tensor_dequant`, exercising the added qh fifth bit.
+#[test]
+fn q5_k_wire_dot_consistent_with_tensor_dequant() {
+    let blocks = 3usize;
+    let mut wire = vec![0u8; blocks * super::Q5_K_WIRE_BYTES_PER_BLOCK];
+    for (i, b) in wire.iter_mut().enumerate() {
+        *b = ((i * 131 + 17) % 256) as u8;
+    }
+    // sane f16 scales: d at +0, dmin at +2 of each superblock
+    for blk in wire.chunks_exact_mut(super::Q5_K_WIRE_BYTES_PER_BLOCK) {
+        blk[0..2].copy_from_slice(&super::f32_to_f16_bits(0.0173).to_le_bytes());
+        blk[2..4].copy_from_slice(&super::f32_to_f16_bits(0.0049).to_le_bytes());
+    }
+
+    let activation: Vec<f32> = (0..blocks * 256)
+        .map(|i| ((i as f32) * 0.37).sin() * 3.0)
+        .collect();
+    let xq = super::quantize_q8_k_blocks(&activation);
+
+    let dot = super::q5_k_wire_row_dot(&wire, &xq);
+
+    let decoded = crate::tensor::decode_q5_k_blocks(&wire).expect("decode q5_k blocks");
+    let mut reference = 0f64;
+    let mut vals = [0f32; 256];
+    for (bi, block) in decoded.iter().enumerate() {
+        block.dequantize(&mut vals);
+        let y = &xq[bi];
+        for (l, &w) in vals.iter().enumerate() {
+            reference += w as f64 * (y.d as f64 * y.qs[l] as f64);
+        }
+    }
+    assert!(
+        (dot as f64 - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+        "q5_k dot {dot} vs tensor dequant reference {reference}"
+    );
+}
+
+/// Real-weight Q5_K parity: for each 2-D Q5_K linear in a downloaded Q5_K_M GGUF,
+/// the CPU block-dot (`q5_k_block_dot_core`, which quantises the activation to Q8_K)
+/// must match an independent f32 reference — the tensor-layer decoder
+/// (`decode_q5_k_tensor`, a different scale-unpack path) dotted against the SAME
+/// Q8_K-dequantised activation. Same methodology as the synthetic Q4_K/Q5_K unit
+/// tests, but on real model weights, exercising the load + block-dot wiring.
+/// Skips unless `CAMELID_Q5KM_GGUF` points to a `*-Q5_K_M.gguf`.
+#[test]
+fn q5_k_block_dot_matches_decode_on_real_model() {
+    let Some(path) = std::env::var_os("CAMELID_Q5KM_GGUF") else {
+        eprintln!(
+            "skipping q5_k block-dot real-model parity: set CAMELID_Q5KM_GGUF to a *-Q5_K_M.gguf"
+        );
+        return;
+    };
+    let path = std::path::PathBuf::from(path);
+    let gguf = crate::gguf::read_metadata(&path).expect("read gguf metadata");
+    let store = crate::tensor::TensorStore::open(&path, &gguf);
+
+    // Deterministic activation in [-1, 1) (xorshift; no RNG dependency).
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next_f32 = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        ((state >> 40) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    };
+
+    let mut tested = 0usize;
+    for desc in &gguf.tensors {
+        if desc.tensor_type != crate::gguf::GgufTensorType::Q5K || desc.dimensions.len() != 2 {
+            continue;
+        }
+        // GGUF linear: dimensions[0] = contraction (in), dimensions[1] = output rows.
+        let in_dim = desc.dimensions[0] as usize;
+        let out_dim = desc.dimensions[1] as usize;
+        if !in_dim.is_multiple_of(256) {
+            continue;
+        }
+        let wire = store.tensor_bytes(&desc.name).expect("wire bytes");
+        let f32w = crate::tensor::decode_q5_k_tensor(&desc.name, &wire, in_dim * out_dim)
+            .expect("decode q5_k tensor");
+
+        let n_rows = 2usize;
+        let input_data: Vec<f32> = (0..n_rows * in_dim).map(|_| next_f32()).collect();
+        let input =
+            crate::tensor::CpuTensor::from_f32("q5k_in", vec![n_rows, in_dim], input_data.clone())
+                .expect("input tensor");
+
+        let out_bd = super::q5_k_block_dot_core(&input, &wire, out_dim, in_dim, "q5k_bd")
+            .expect("q5_k block dot");
+
+        for r in 0..n_rows {
+            let xq = super::quantize_q8_k_blocks(&input_data[r * in_dim..(r + 1) * in_dim]);
+            for o in 0..out_dim {
+                let mut reference = 0f64;
+                for (blk, y) in xq.iter().enumerate() {
+                    for l in 0..256 {
+                        let k = blk * 256 + l;
+                        reference += f32w[o * in_dim + k] as f64 * (y.d as f64 * y.qs[l] as f64);
+                    }
+                }
+                let got = out_bd.data[r * out_dim + o] as f64;
+                assert!(
+                    (got - reference).abs() <= reference.abs() * 1e-4 + 1e-3,
+                    "q5_k block-dot mismatch in {} row {r} out {o}: got {got} ref {reference}",
+                    desc.name
+                );
+            }
+        }
+        tested += 1;
+        if tested >= 3 {
+            break;
+        }
+    }
+    assert!(tested > 0, "no 2-D Q5_K linears found in {path:?}");
+}
+
 /// Q5_0: the wire-row dot must agree with an f64 dot of the tensor-layer
 /// dequant (`Q5_0Block`) against the dequantized Q8_0 activations.
 /// (DiffusionGemma lane.)
