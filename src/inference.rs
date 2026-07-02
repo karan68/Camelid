@@ -25,6 +25,7 @@ use crate::telemetry;
 mod attn_f32_dot;
 #[cfg(target_arch = "aarch64")]
 mod cpu_neon;
+mod decode_scratch;
 mod diagnostic_config;
 pub mod draft_merge;
 pub(crate) mod gemma4;
@@ -6024,7 +6025,7 @@ fn forward_layer_timed(
         &q,
         config.attention_head_count as usize,
         config.attention_head_count_kv as usize,
-        cached_layer_label!(layer_idx, "attention_context"),
+        &cached_layer_label!(layer_idx, "attention_context"),
         collect_diagnostics,
     )?;
     let attention_trace = attention_context.trace;
@@ -21046,7 +21047,7 @@ fn causal_attention_context(
     query: &CpuTensor,
     attention_heads: usize,
     kv_heads: usize,
-    name: impl Into<String>,
+    name: &str,
     collect_diagnostics: bool,
 ) -> Result<LlamaAttentionContextOutput> {
     if kv_heads == 0 || !attention_heads.is_multiple_of(kv_heads) {
@@ -21080,7 +21081,9 @@ fn causal_attention_context(
     let head_mapping = diagnostic_gqa_head_mapping()?;
     let score_scale = diagnostic_attention_score_scale()?;
     let scale = attention_score_scale_value(head_dim, score_scale);
-    let mut out = vec![0.0; expected_width];
+    // Pooled buffer: bit-identical to `vec![0.0; expected_width]` (zeroed to
+    // length); recycled by the layer forward when the context tensor dies.
+    let mut out = decode_scratch::take(expected_width);
 
     if position_count == 1 {
         for attention_head in 0..attention_heads {
@@ -21111,7 +21114,7 @@ fn causal_attention_context(
         )?;
     }
 
-    let tensor = CpuTensor::from_f32(name, vec![1, expected_width], out)?;
+    let tensor = decode_scratch::tensor_from_pooled(name, vec![1, expected_width], out)?;
     let trace = collect_diagnostics
         .then(|| {
             attention_trace_with_params(AttentionTraceParams {
@@ -21371,10 +21374,16 @@ fn decode_attention_all_heads_into_with_mode(
     let head_dim = params.kv_cache.plan.head_dim;
     debug_assert_eq!(out.len(), params.attention_heads * head_dim);
     if parallel {
-        return out
-            .par_chunks_exact_mut(head_dim)
-            .enumerate()
-            .try_for_each_init(Vec::new, |scores, (attention_head, out_slice)| {
+        // Per-WORKER persistent scratch: thread-local so parallel regions
+        // never contend on the decode pool, alive across tokens so
+        // steady-state decode allocates nothing here. The callee clears the
+        // buffer per head, so reuse is content-invisible.
+        thread_local! {
+            static ATTN_WORKER_SCORES: std::cell::RefCell<Vec<f32>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        return out.par_chunks_exact_mut(head_dim).enumerate().try_for_each(
+            |(attention_head, out_slice)| {
                 let kv_head = map_attention_head_to_kv_head(
                     attention_head,
                     params.repeats,
@@ -21382,22 +21391,27 @@ fn decode_attention_all_heads_into_with_mode(
                     params.head_mapping,
                 );
                 let query_start = attention_head * head_dim;
-                attention_context_for_head_into(
-                    AttentionContextHeadParams {
-                        kv_cache: params.kv_cache,
-                        layer_idx: params.layer_idx,
-                        kv_head,
-                        query_slice: &params.query_data[query_start..query_start + head_dim],
-                        position_count: params.position_count,
-                        scale: params.scale,
-                    },
-                    out_slice,
-                    scores,
-                )
-            });
+                ATTN_WORKER_SCORES.with(|cell| {
+                    attention_context_for_head_into(
+                        AttentionContextHeadParams {
+                            kv_cache: params.kv_cache,
+                            layer_idx: params.layer_idx,
+                            kv_head,
+                            query_slice: &params.query_data[query_start..query_start + head_dim],
+                            position_count: params.position_count,
+                            scale: params.scale,
+                        },
+                        out_slice,
+                        &mut cell.borrow_mut(),
+                    )
+                })
+            },
+        );
     }
 
-    let mut scores = Vec::with_capacity(params.position_count);
+    // Pooled serial scratch, recycled on every exit path.
+    let mut scores = decode_scratch::take(0);
+    scores.reserve(params.position_count);
     for attention_head in 0..params.attention_heads {
         let kv_head = map_attention_head_to_kv_head(
             attention_head,
@@ -21407,7 +21421,7 @@ fn decode_attention_all_heads_into_with_mode(
         );
         let query_start = attention_head * head_dim;
         let out_start = attention_head * head_dim;
-        attention_context_for_head_into(
+        let head_result = attention_context_for_head_into(
             AttentionContextHeadParams {
                 kv_cache: params.kv_cache,
                 layer_idx: params.layer_idx,
@@ -21418,8 +21432,13 @@ fn decode_attention_all_heads_into_with_mode(
             },
             &mut out[out_start..out_start + head_dim],
             &mut scores,
-        )?;
+        );
+        if let Err(error) = head_result {
+            decode_scratch::recycle(scores);
+            return Err(error);
+        }
     }
+    decode_scratch::recycle(scores);
     Ok(())
 }
 
