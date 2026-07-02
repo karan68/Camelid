@@ -895,6 +895,11 @@ pub struct CpuTensor {
     /// repack them into the `q4k_gemv` SoA layout. Populated by the Q4_K load path;
     /// `None` for non-Q4_K tensors.
     pub q4_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// Q5_K super-block wire bytes (176 bytes/super-block, row-major), retained when
+    /// the tensor's `source_type` is `Q5K` so the CPU block-dot streams them via
+    /// `q5_k_wire_row_dot` with no f32 materialisation. Populated by the Q5_K load
+    /// path; `None` for non-Q5_K tensors. (No GPU `q5k_gemv` kernel yet — CPU only.)
+    pub q5_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
     /// Q6_K super-block wire bytes (210 bytes/super-block, row-major), retained when
     /// the tensor's `source_type` is `Q6K` so the GPU-resident decode path can feed
     /// them straight to the `q6k_gemv` kernel (which reads the wire layout directly).
@@ -1068,6 +1073,7 @@ impl Q8_0TensorBlocks {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -1140,6 +1146,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -1228,6 +1235,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -1260,6 +1268,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -1287,6 +1296,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -1314,6 +1324,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: Some(backings),
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -1901,6 +1912,20 @@ impl CpuTensor {
                 |b, out| {
                     let blk: &[u8; Q4_K_BLOCK_BYTES] = b.try_into().unwrap();
                     Q4KBlock::from_bytes(blk).dequantize(out);
+                },
+            );
+        }
+        if let Some(wire) = self.q5_k_wire_bytes.as_deref() {
+            return self.embedding_lookup_kquant_wire(
+                token_ids,
+                name,
+                vocab,
+                width,
+                wire,
+                Q5_K_BLOCK_BYTES,
+                |b, out| {
+                    let blk: &[u8; Q5_K_BLOCK_BYTES] = b.try_into().unwrap();
+                    Q5KBlock::from_bytes(blk).dequantize(out);
                 },
             );
         }
@@ -3322,18 +3347,24 @@ impl TensorStore {
         let shape = TensorShape::from_gguf_dims(&desc.dimensions)?;
         let is_kquant = matches!(
             desc.tensor_type,
-            GgufTensorType::Q4K | GgufTensorType::Q6K | GgufTensorType::Q2K | GgufTensorType::Q3K
+            GgufTensorType::Q4K
+                | GgufTensorType::Q5K
+                | GgufTensorType::Q6K
+                | GgufTensorType::Q2K
+                | GgufTensorType::Q3K
         );
         if !is_kquant || shape.dims.len() != 2 {
             return self.load_cpu_f32(name);
         }
         let bytes = self.tensor_bytes(name)?;
         let mut q4_k_wire_bytes = None;
+        let mut q5_k_wire_bytes = None;
         let mut q6_k_wire_bytes = None;
         let mut q2_k_wire_bytes = None;
         let mut q3_k_wire_bytes = None;
         match desc.tensor_type {
             GgufTensorType::Q4K => q4_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
+            GgufTensorType::Q5K => q5_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
             GgufTensorType::Q6K => q6_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
             GgufTensorType::Q2K => q2_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
             GgufTensorType::Q3K => q3_k_wire_bytes = Some(std::sync::Arc::new(bytes.to_vec())),
@@ -3353,6 +3384,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
+            q5_k_wire_bytes,
             q6_k_wire_bytes,
             q2_k_wire_bytes,
             q3_k_wire_bytes,
@@ -3385,6 +3417,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
             q3_k_wire_bytes: None,
@@ -3615,6 +3648,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
+            q5_k_wire_bytes: None,
             q6_k_wire_bytes,
             q2_k_wire_bytes,
             q3_k_wire_bytes,
