@@ -532,6 +532,28 @@ enum Command {
     /// RUNNABLE receipt (lane=runnable, never copper; attests deterministic
     /// execution, NOT parity) to stdout on pass; exits non-zero on refusal/failure.
     RunnableSmoke { path: PathBuf },
+    /// Tokenize text through the model's tokenizer (parity-harness utility,
+    /// mirrors llama.cpp's `llama-tokenize`). Input is either `--prompt` or
+    /// `--file` (a JSON array of strings; exact bytes preserved). Prints one
+    /// JSON object per input: {"ids":[...],"decoded":"..."} where `decoded`
+    /// is the decode round-trip of the encoded ids (specials retained).
+    Tokenize {
+        /// GGUF model (tokenizer metadata source).
+        #[arg(long)]
+        model: PathBuf,
+        /// Single prompt to tokenize.
+        #[arg(long, short = 'p', conflicts_with = "file")]
+        prompt: Option<String>,
+        /// JSON file: array of strings to tokenize.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Parse special tokens (e.g. <|im_start|>) into their single IDs.
+        #[arg(long)]
+        parse_special: bool,
+        /// Do not add BOS/EOS even if the model's metadata asks for them.
+        #[arg(long)]
+        no_add_special: bool,
+    },
     /// Layer offloading — Phase 1: print the planned VRAM/host layer split for a
     /// model (no weights loaded, no compute). `--budget-mb` forces a small VRAM
     /// budget to demonstrate partial offload; `--arch <name>` plans a known
@@ -1355,6 +1377,40 @@ async fn main() -> anyhow::Result<()> {
         Command::Inspect { path } => {
             let gguf = read_metadata(path)?;
             println!("{}", serde_json::to_string_pretty(&gguf)?);
+        }
+        Command::Tokenize {
+            model,
+            prompt,
+            file,
+            parse_special,
+            no_add_special,
+        } => {
+            // Deep-recursion headroom (large vocab BPE build): dedicated big-stack
+            // thread so the harness behaves identically in debug and release.
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || -> anyhow::Result<()> {
+                    let gguf = read_metadata(model)?;
+                    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+                    let inputs: Vec<String> = if let Some(p) = prompt {
+                        vec![p]
+                    } else if let Some(f) = file {
+                        serde_json::from_str(&std::fs::read_to_string(f)?)?
+                    } else {
+                        anyhow::bail!("tokenize: provide --prompt or --file");
+                    };
+                    for text in &inputs {
+                        let ids = tokenizer.encode(text, !no_add_special, parse_special)?;
+                        let decoded = tokenizer.decode(&ids, false)?;
+                        println!(
+                            "{}",
+                            serde_json::json!({ "ids": ids, "decoded": decoded })
+                        );
+                    }
+                    Ok(())
+                })?
+                .join()
+                .map_err(|_| anyhow::anyhow!("tokenize worker panicked"))??;
         }
         Command::RunnableSmoke { path } => {
             let path_str = path.to_string_lossy();
