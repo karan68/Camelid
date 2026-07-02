@@ -74,6 +74,8 @@ pub struct LlamaKvCachePositionTrace {
 #[derive(Debug, Clone)]
 pub struct LlamaKvCache {
     pub plan: LlamaKvCachePlan,
+    /// Physical K/V arrangement; see [`KvLayout`]. Fixed at construction.
+    pub layout: KvLayout,
     pub keys: Vec<f32>,
     pub values: Vec<f32>,
     pub allocated_sequence_length: usize,
@@ -91,6 +93,7 @@ impl PartialEq for LlamaKvCache {
         // Cache STATE only. `kv_budget_bytes` is host-derived operational config and
         // must not affect equality (the session PartialEq compares caches across runs).
         self.plan == other.plan
+            && self.layout == other.layout
             && self.keys == other.keys
             && self.values == other.values
             && self.allocated_sequence_length == other.allocated_sequence_length
@@ -98,10 +101,52 @@ impl PartialEq for LlamaKvCache {
     }
 }
 
+/// Physical arrangement of the K/V buffers. Chosen ONCE at cache
+/// construction (`BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR`, default off) and
+/// carried on the cache; every element address goes through the layout-aware
+/// accessors below, so the choice never appears in hot loops as more than a
+/// resolved stride. Values and arithmetic are identical in both layouts —
+/// only addresses differ — so the head-major lane carries a bitwise-identity
+/// contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvLayout {
+    /// `[position, layer, kv_head, head_dim]` — the historical layout; one
+    /// token's row is contiguous, one head's positions sit a full token
+    /// stride apart.
+    PositionMajor,
+    /// `[layer, kv_head, position, head_dim]` — each head's K/V is one
+    /// contiguous stream over positions (stride = `allocated_sequence_length
+    /// * head_dim`, re-laid-out on growth); decode reads become sequential.
+    HeadMajor,
+}
+
+/// Env gate for the head-major layout, read once per cache construction.
+/// Windows-first per the standing directive; the mechanism is arch-agnostic
+/// and lifting the gate is a one-line decision.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn kv_layout_head_major_enabled() -> bool {
+    super::q8_runtime::q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR")
+}
+
 impl LlamaKvCache {
     pub fn new(plan: LlamaKvCachePlan) -> Result<Self> {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        let layout = if kv_layout_head_major_enabled() {
+            KvLayout::HeadMajor
+        } else {
+            KvLayout::PositionMajor
+        };
+        #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+        let layout = KvLayout::PositionMajor;
+        Self::new_with_layout(plan, layout)
+    }
+
+    /// Explicit-layout constructor so the bitwise-identity tests can build
+    /// both layouts without touching process env.
+    pub fn new_with_layout(plan: LlamaKvCachePlan, layout: KvLayout) -> Result<Self> {
         Ok(Self {
             plan,
+            layout,
             keys: Vec::new(),
             values: Vec::new(),
             allocated_sequence_length: 0,
@@ -115,10 +160,10 @@ impl LlamaKvCache {
     }
 
     /// Roll the cache back to an earlier `position`, discarding newer
-    /// entries. Storage is position-major and `position` alone bounds what
-    /// attention reads, so entries past the rollback point are dead until
-    /// overwritten by later appends — no buffer work is needed. Used by
-    /// speculative decoding to drop rejected draft tokens.
+    /// entries. In both layouts `position` alone bounds what attention
+    /// reads, so entries past the rollback point are dead until overwritten
+    /// by later appends — no buffer work is needed. Used by speculative
+    /// decoding to drop rejected draft tokens.
     pub fn rollback_to_position(&mut self, position: usize) -> Result<()> {
         if position > self.position {
             return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -167,8 +212,37 @@ impl LlamaKvCache {
             .ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
             })?;
-        self.keys.resize(values, 0.0);
-        self.values.resize(values, 0.0);
+        match self.layout {
+            KvLayout::PositionMajor => {
+                // Positions are outermost, so growth is a pure append.
+                self.keys.resize(values, 0.0);
+                self.values.resize(values, 0.0);
+            }
+            KvLayout::HeadMajor => {
+                // Each head's stream stride is the allocated capacity, so
+                // growth re-lays the buffer: copy every (layer, head) block
+                // to its new base. Pure permutation of identical bits —
+                // bitwise-neutral — amortized over the growth chunking.
+                let head_dim = self.plan.head_dim;
+                let old_len = self.allocated_sequence_length * head_dim;
+                let streams = self.plan.layer_count * self.plan.kv_head_count;
+                let new_len = target_sequence_length * head_dim;
+                let mut new_keys = vec![0.0f32; values];
+                let mut new_values = vec![0.0f32; values];
+                if old_len > 0 {
+                    for stream in 0..streams {
+                        let old_base = stream * old_len;
+                        let new_base = stream * new_len;
+                        new_keys[new_base..new_base + old_len]
+                            .copy_from_slice(&self.keys[old_base..old_base + old_len]);
+                        new_values[new_base..new_base + old_len]
+                            .copy_from_slice(&self.values[old_base..old_base + old_len]);
+                    }
+                }
+                self.keys = new_keys;
+                self.values = new_values;
+            }
+        }
         self.allocated_sequence_length = target_sequence_length;
         Ok(())
     }
@@ -193,14 +267,38 @@ impl LlamaKvCache {
     }
 
     pub(super) fn offset(&self, layer_idx: usize, position: usize, kv_head: usize) -> usize {
-        (((position * self.plan.layer_count) + layer_idx) * self.plan.kv_head_count + kv_head)
-            * self.plan.head_dim
+        match self.layout {
+            KvLayout::PositionMajor => {
+                (((position * self.plan.layer_count) + layer_idx) * self.plan.kv_head_count
+                    + kv_head)
+                    * self.plan.head_dim
+            }
+            KvLayout::HeadMajor => {
+                (((layer_idx * self.plan.kv_head_count) + kv_head)
+                    * self.allocated_sequence_length
+                    + position)
+                    * self.plan.head_dim
+            }
+        }
     }
 
     pub(super) fn head_base_offset(&self, layer_idx: usize, kv_head: usize) -> usize {
-        ((layer_idx * self.plan.kv_head_count) + kv_head) * self.plan.head_dim
+        self.offset(layer_idx, 0, kv_head)
     }
 
+    /// Element step between one head's consecutive positions — the stride the
+    /// per-head attention walks take. A full token stride in position-major,
+    /// `head_dim` (contiguous) in head-major.
+    pub(super) fn head_position_stride(&self) -> usize {
+        match self.layout {
+            KvLayout::PositionMajor => self.position_stride(),
+            KvLayout::HeadMajor => self.plan.head_dim,
+        }
+    }
+
+    /// Elements ONE TOKEN occupies per buffer across all layers/heads —
+    /// layout-independent count used for capacity and budget math, NOT an
+    /// address stride (use [`Self::head_position_stride`] for walks).
     pub(super) fn position_stride(&self) -> usize {
         self.plan.layer_count * self.plan.kv_head_count * self.plan.head_dim
     }

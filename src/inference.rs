@@ -29,6 +29,7 @@ mod diagnostic_config;
 pub mod draft_merge;
 pub(crate) mod gemma4;
 mod kv_cache;
+mod kv_f16;
 mod metal_resident;
 mod metal_seam;
 mod q8_block_reader;
@@ -56,7 +57,9 @@ pub use diagnostic_config::{
     GqaHeadMapping, LinearAccumulationPrecision, OutputProjectionLayout, RectangularLinearLayout,
     SquareLinearLayout,
 };
-pub use kv_cache::{LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace};
+pub use kv_cache::{
+    KvLayout, LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace,
+};
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
     q8_0_env_flag_enabled_default_off, q8_0_env_flag_enabled_default_on_fail_closed,
@@ -20421,10 +20424,23 @@ fn write_kv_cache(
         )));
     }
     kv_cache.ensure_position_capacity(kv_cache.position + 1)?;
-    let offset = kv_cache.offset(layer_idx, kv_cache.position, 0);
-    let end = offset + expected_width;
-    copy_to_f16_kv_cache_storage(&mut kv_cache.keys[offset..end], &key.data);
-    copy_to_f16_kv_cache_storage(&mut kv_cache.values[offset..end], &value.data);
+    // Per-head copies: identical element order and per-element math as the
+    // historical whole-row copy in position-major (heads are contiguous
+    // there), and the only correct shape in head-major, where one token's
+    // heads live in separate streams.
+    let head_dim = kv_cache.plan.head_dim;
+    for kv_head in 0..kv_cache.plan.kv_head_count {
+        let dst = kv_cache.offset(layer_idx, kv_cache.position, kv_head);
+        let src = kv_head * head_dim;
+        copy_to_f16_kv_cache_storage(
+            &mut kv_cache.keys[dst..dst + head_dim],
+            &key.data[src..src + head_dim],
+        );
+        copy_to_f16_kv_cache_storage(
+            &mut kv_cache.values[dst..dst + head_dim],
+            &value.data[src..src + head_dim],
+        );
+    }
     Ok(())
 }
 
@@ -20455,20 +20471,23 @@ fn write_kv_cache_batch(
     }
     let rows = key.dim(0)?;
     kv_cache.ensure_position_capacity(base_position + rows)?;
+    // Per-head copies; see `write_kv_cache` for the order argument.
+    let head_dim = kv_cache.plan.head_dim;
     for row in 0..rows {
         let position = base_position + row;
-        let offset = kv_cache.offset(layer_idx, position, 0);
-        let end = offset + expected_width;
         let row_start = row * expected_width;
-        let row_end = row_start + expected_width;
-        copy_to_f16_kv_cache_storage(
-            &mut kv_cache.keys[offset..end],
-            &key.data[row_start..row_end],
-        );
-        copy_to_f16_kv_cache_storage(
-            &mut kv_cache.values[offset..end],
-            &value.data[row_start..row_end],
-        );
+        for kv_head in 0..kv_cache.plan.kv_head_count {
+            let dst = kv_cache.offset(layer_idx, position, kv_head);
+            let src = row_start + kv_head * head_dim;
+            copy_to_f16_kv_cache_storage(
+                &mut kv_cache.keys[dst..dst + head_dim],
+                &key.data[src..src + head_dim],
+            );
+            copy_to_f16_kv_cache_storage(
+                &mut kv_cache.values[dst..dst + head_dim],
+                &value.data[src..src + head_dim],
+            );
+        }
     }
     Ok(())
 }
@@ -20513,37 +20532,45 @@ fn kv_cache_trace(
     let mut value_max_abs_position = 0;
     let mut value_max_abs_index = 0;
 
+    // Walk per (position, kv_head) with the LOGICAL in-token index so the
+    // checksum/ordinal stream is identical in both KV layouts (in
+    // position-major this touches the exact same addresses in the exact same
+    // order as the historical whole-row walk).
+    let head_dim = kv_cache.plan.head_dim;
     for position in 0..position_count {
-        let start = kv_cache.offset(layer_idx, position, 0);
-        let end = start + key_value_width;
-        for (idx, (&key, &value)) in kv_cache.keys[start..end]
-            .iter()
-            .zip(kv_cache.values[start..end].iter())
-            .enumerate()
-        {
-            if !key.is_finite() || !value.is_finite() {
-                return Err(BackendError::RuntimeShapeMismatch(format!(
-                    "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
-                )));
-            }
-            let ordinal = ((position * key_value_width) + idx + 1) as f64;
-            let key64 = key as f64;
-            let value64 = value as f64;
-            key_sum_square += key64 * key64;
-            value_sum_square += value64 * value64;
-            key_checksum += ordinal * key64;
-            value_checksum += ordinal * value64;
-            let key_abs = key.abs();
-            if key_abs > key_max_abs {
-                key_max_abs = key_abs;
-                key_max_abs_position = position;
-                key_max_abs_index = idx;
-            }
-            let value_abs = value.abs();
-            if value_abs > value_max_abs {
-                value_max_abs = value_abs;
-                value_max_abs_position = position;
-                value_max_abs_index = idx;
+        for kv_head in 0..kv_cache.plan.kv_head_count {
+            let start = kv_cache.offset(layer_idx, position, kv_head);
+            let end = start + head_dim;
+            for (dim, (&key, &value)) in kv_cache.keys[start..end]
+                .iter()
+                .zip(kv_cache.values[start..end].iter())
+                .enumerate()
+            {
+                let idx = kv_head * head_dim + dim;
+                if !key.is_finite() || !value.is_finite() {
+                    return Err(BackendError::RuntimeShapeMismatch(format!(
+                        "KV trace found non-finite value at layer {layer_idx} position {position} index {idx}"
+                    )));
+                }
+                let ordinal = ((position * key_value_width) + idx + 1) as f64;
+                let key64 = key as f64;
+                let value64 = value as f64;
+                key_sum_square += key64 * key64;
+                value_sum_square += value64 * value64;
+                key_checksum += ordinal * key64;
+                value_checksum += ordinal * value64;
+                let key_abs = key.abs();
+                if key_abs > key_max_abs {
+                    key_max_abs = key_abs;
+                    key_max_abs_position = position;
+                    key_max_abs_index = idx;
+                }
+                let value_abs = value.abs();
+                if value_abs > value_max_abs {
+                    value_max_abs = value_abs;
+                    value_max_abs_position = position;
+                    value_max_abs_index = idx;
+                }
             }
         }
     }
@@ -20580,10 +20607,20 @@ fn kv_cache_position_trace(
     position: usize,
     key_value_width: usize,
 ) -> Result<LlamaKvCachePositionTrace> {
-    let start = kv_cache.offset(layer_idx, position, 0);
-    let end = start + key_value_width;
-    let key_slice = &kv_cache.keys[start..end];
-    let value_slice = &kv_cache.values[start..end];
+    // Materialize the token's logical row (kv_head-major element order, the
+    // historical contiguous order) so checksums, ordinals, and sampled
+    // values are identical in both KV layouts. Diagnostics-only path; the
+    // copy is TENSOR-trace sized, not hot.
+    let head_dim = kv_cache.plan.head_dim;
+    let mut key_row = Vec::with_capacity(key_value_width);
+    let mut value_row = Vec::with_capacity(key_value_width);
+    for kv_head in 0..kv_cache.plan.kv_head_count {
+        let start = kv_cache.offset(layer_idx, position, kv_head);
+        key_row.extend_from_slice(&kv_cache.keys[start..start + head_dim]);
+        value_row.extend_from_slice(&kv_cache.values[start..start + head_dim]);
+    }
+    let key_slice = key_row.as_slice();
+    let value_slice = value_row.as_slice();
     let mut key_sum_square = 0.0_f64;
     let mut value_sum_square = 0.0_f64;
     let mut key_checksum = 0.0_f64;
@@ -21055,7 +21092,7 @@ fn attention_context_for_head_into_with_kernels(
     let head_base = params
         .kv_cache
         .head_base_offset(params.layer_idx, params.kv_head);
-    let position_stride = params.kv_cache.position_stride();
+    let position_stride = params.kv_cache.head_position_stride();
 
     let mut key_start = head_base;
     for position in 0..params.position_count {
@@ -21270,7 +21307,7 @@ fn attention_scores_for_head(
     let head_dim = kv_cache.plan.head_dim;
     let mut scores = Vec::with_capacity(position_count);
     let mut key_start = kv_cache.head_base_offset(layer_idx, kv_head);
-    let position_stride = kv_cache.position_stride();
+    let position_stride = kv_cache.head_position_stride();
     for position in 0..position_count {
         let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
         let score = dot_product(query_slice, key_slice) * scale;

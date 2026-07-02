@@ -214,6 +214,193 @@ pub(super) fn axpy_blocked(out: &mut [f32], prob: f32, v: &[f32]) {
     axpy_blocked_scalar(out, prob, v);
 }
 
+// ---------------------------------------------------------------------------
+// f16-operand variants (KV f16 storage lane, `BACKENDINFERENCE_KV_F16`).
+//
+// Canonical order: convert each f16 element to f32 (exact expansion, pinned
+// to the existing-helper semantics — see `kv_f16`), THEN the identical
+// blocked order above. The conversion is fused into the loads (`vcvtph2ps`
+// on the fast path) so no f32 staging buffer re-adds the traffic the lane
+// removes. Bitwise-locked to their scalar references by the same >=10k-case
+// to_bits() property tests as the f32 kernels.
+// ---------------------------------------------------------------------------
+
+use super::kv_f16::f16_to_f32_kv;
+
+/// Canonical blocked dot with an f16 K operand — scalar reference.
+// Consumed by the flag-gated KV f16 storage integration; until that wiring
+// lands only the tests exercise it.
+#[allow(dead_code)]
+pub(super) fn dot_blocked_f16_scalar(x: &[f32], y16: &[u16]) -> f32 {
+    debug_assert_eq!(x.len(), y16.len());
+    let len = x.len();
+    let mut acc = [[0.0f32; LANES]; 4];
+    let mut i = 0;
+    while i + BLOCK <= len {
+        for (k, acc_k) in acc.iter_mut().enumerate() {
+            let base = i + k * LANES;
+            for (l, lane) in acc_k.iter_mut().enumerate() {
+                *lane = x[base + l].mul_add(f16_to_f32_kv(y16[base + l]), *lane);
+            }
+        }
+        i += BLOCK;
+    }
+    let mut s = [0.0f32; LANES];
+    for (l, s_lane) in s.iter_mut().enumerate() {
+        let s01 = acc[0][l] + acc[1][l];
+        let s23 = acc[2][l] + acc[3][l];
+        *s_lane = s01 + s23;
+    }
+    let t0 = s[0] + s[4];
+    let t1 = s[1] + s[5];
+    let t2 = s[2] + s[6];
+    let t3 = s[3] + s[7];
+    let u0 = t0 + t2;
+    let u1 = t1 + t3;
+    let mut h = u0 + u1;
+    while i < len {
+        h = x[i].mul_add(f16_to_f32_kv(y16[i]), h);
+        i += 1;
+    }
+    h
+}
+
+/// Canonical V accumulation with an f16 V operand — scalar reference.
+#[allow(dead_code)]
+pub(super) fn axpy_blocked_f16_scalar(out: &mut [f32], prob: f32, v16: &[u16]) {
+    debug_assert_eq!(out.len(), v16.len());
+    for (out_value, value) in out.iter_mut().zip(v16) {
+        *out_value = prob.mul_add(f16_to_f32_kv(*value), *out_value);
+    }
+}
+
+/// AVX2/FMA/F16C realization of [`dot_blocked_f16_scalar`]: 8 halves per
+/// load expanded with `vcvtph2ps` (exact, matches the scalar expansion
+/// bitwise on all 2^16 inputs), then the identical accumulator/combine/tail
+/// structure as [`dot_blocked_avx2`].
+///
+/// # Safety
+/// Caller must ensure AVX2, FMA, and F16C are available on the running CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn dot_blocked_f16_avx2(x: &[f32], y16: &[u16]) -> f32 {
+    use std::arch::x86_64::{
+        _mm256_add_ps, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+        _mm256_storeu_ps, _mm_loadu_si128, __m128i,
+    };
+    debug_assert_eq!(x.len(), y16.len());
+    let len = x.len();
+    let xp = x.as_ptr();
+    let yp = y16.as_ptr();
+    let mut acc0 = _mm256_setzero_ps();
+    let mut acc1 = _mm256_setzero_ps();
+    let mut acc2 = _mm256_setzero_ps();
+    let mut acc3 = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + BLOCK <= len {
+        // SAFETY: the loop guard ensures `i + 32 <= len`, so every 8-lane
+        // load below stays inside both slices.
+        unsafe {
+            let y0 = _mm256_cvtph_ps(_mm_loadu_si128(yp.add(i) as *const __m128i));
+            acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(i)), y0, acc0);
+            let y1 = _mm256_cvtph_ps(_mm_loadu_si128(yp.add(i + 8) as *const __m128i));
+            acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(i + 8)), y1, acc1);
+            let y2 = _mm256_cvtph_ps(_mm_loadu_si128(yp.add(i + 16) as *const __m128i));
+            acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(i + 16)), y2, acc2);
+            let y3 = _mm256_cvtph_ps(_mm_loadu_si128(yp.add(i + 24) as *const __m128i));
+            acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(xp.add(i + 24)), y3, acc3);
+        }
+        i += BLOCK;
+    }
+    let s01 = _mm256_add_ps(acc0, acc1);
+    let s23 = _mm256_add_ps(acc2, acc3);
+    let s = _mm256_add_ps(s01, s23);
+    let mut lanes = [0.0f32; LANES];
+    // SAFETY: `lanes` is exactly 8 f32s, the width of one __m256 store.
+    unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), s) };
+    let t0 = lanes[0] + lanes[4];
+    let t1 = lanes[1] + lanes[5];
+    let t2 = lanes[2] + lanes[6];
+    let t3 = lanes[3] + lanes[7];
+    let u0 = t0 + t2;
+    let u1 = t1 + t3;
+    let mut h = u0 + u1;
+    while i < len {
+        h = x[i].mul_add(f16_to_f32_kv(y16[i]), h);
+        i += 1;
+    }
+    h
+}
+
+/// AVX2/FMA/F16C realization of [`axpy_blocked_f16_scalar`].
+///
+/// # Safety
+/// Caller must ensure AVX2, FMA, and F16C are available on the running CPU.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn axpy_blocked_f16_avx2(out: &mut [f32], prob: f32, v16: &[u16]) {
+    use std::arch::x86_64::{
+        _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps,
+        _mm_loadu_si128, __m128i,
+    };
+    debug_assert_eq!(out.len(), v16.len());
+    let len = out.len();
+    let prob_v = _mm256_set1_ps(prob);
+    let mut i = 0;
+    while i + LANES <= len {
+        // SAFETY: the loop guard ensures `i + 8 <= len` for both slices.
+        unsafe {
+            let value = _mm256_cvtph_ps(_mm_loadu_si128(v16.as_ptr().add(i) as *const __m128i));
+            let current = _mm256_loadu_ps(out.as_ptr().add(i));
+            _mm256_storeu_ps(
+                out.as_mut_ptr().add(i),
+                _mm256_fmadd_ps(prob_v, value, current),
+            );
+        }
+        i += LANES;
+    }
+    while i < len {
+        out[i] = prob.mul_add(f16_to_f32_kv(v16[i]), out[i]);
+        i += 1;
+    }
+}
+
+/// Runtime dispatch guard for the f16 kernel fast paths, resolved once.
+#[cfg(target_arch = "x86_64")]
+fn attn_f16_kernels_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+    })
+}
+
+/// f16-K blocked dot with safe dispatch. Both paths produce identical bits.
+// Consumed by the flag-gated KV f16 storage integration; until that wiring
+// lands only the tests exercise it.
+#[allow(dead_code)]
+pub(super) fn dot_blocked_f16(x: &[f32], y16: &[u16]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if attn_f16_kernels_available() {
+        // SAFETY: guarded by the runtime AVX2+FMA+F16C feature check above.
+        return unsafe { dot_blocked_f16_avx2(x, y16) };
+    }
+    dot_blocked_f16_scalar(x, y16)
+}
+
+/// f16-V blocked axpy with safe dispatch, mirroring [`dot_blocked_f16`].
+#[allow(dead_code)]
+pub(super) fn axpy_blocked_f16(out: &mut [f32], prob: f32, v16: &[u16]) {
+    #[cfg(target_arch = "x86_64")]
+    if attn_f16_kernels_available() {
+        // SAFETY: guarded by the runtime AVX2+FMA+F16C feature check above.
+        unsafe { axpy_blocked_f16_avx2(out, prob, v16) };
+        return;
+    }
+    axpy_blocked_f16_scalar(out, prob, v16);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,6 +444,111 @@ mod tests {
 
     fn fill(rng: &mut XorShift64Star, len: usize) -> Vec<f32> {
         (0..len).map(|_| rng.next_f32()).collect()
+    }
+
+    /// Random u16 across the FULL binary16 domain — finite values,
+    /// subnormals, ±inf, and NaN payloads all occur; the f16 kernels must be
+    /// bitwise-locked on all of them.
+    fn fill_u16(rng: &mut XorShift64Star, len: usize) -> Vec<u16> {
+        (0..len).map(|_| rng.next_u64() as u16).collect()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn f16_kernels_testable() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+            && std::arch::is_x86_feature_detected!("f16c")
+    }
+
+    /// Fusion oracle: the f16 scalar kernel must equal "expand every element
+    /// through the pinned conversion, then the existing f32 blocked order".
+    #[test]
+    fn dot_blocked_f16_scalar_equals_expand_then_blocked() {
+        let mut rng = XorShift64Star(0xf16d_0001);
+        for case in 0..2_000 {
+            let len = match case % 4 {
+                0 => 64,
+                1 => 128,
+                _ => 1 + rng.next_usize(512),
+            };
+            let x = fill(&mut rng, len);
+            let y16 = fill_u16(&mut rng, len);
+            let expanded: Vec<f32> = y16.iter().map(|&b| super::f16_to_f32_kv(b)).collect();
+            let fused = dot_blocked_f16_scalar(&x, &y16);
+            let staged = dot_blocked_scalar(&x, &expanded);
+            assert_eq!(
+                fused.to_bits(),
+                staged.to_bits(),
+                "case {case}: len {len}, fused {fused}, staged {staged}"
+            );
+            let prob = rng.next_f32();
+            let mut out_fused = x.clone();
+            let mut out_staged = x.clone();
+            axpy_blocked_f16_scalar(&mut out_fused, prob, &y16);
+            axpy_blocked_scalar(&mut out_staged, prob, &expanded);
+            for (a, b) in out_fused.iter().zip(&out_staged) {
+                assert_eq!(a.to_bits(), b.to_bits(), "axpy case {case}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn dot_blocked_f16_avx2_matches_scalar_bitwise() {
+        if !f16_kernels_testable() {
+            eprintln!("skipping: AVX2+FMA+F16C not available on this host");
+            return;
+        }
+        let mut rng = XorShift64Star(0xf16b_0001);
+        for case in 0..10_000 {
+            let len = match case % 4 {
+                0 => 64,
+                1 => 128,
+                _ => 1 + rng.next_usize(512),
+            };
+            let x = fill(&mut rng, len);
+            let y16 = fill_u16(&mut rng, len);
+            let scalar = dot_blocked_f16_scalar(&x, &y16);
+            // SAFETY: guarded by the runtime feature check above.
+            let avx2 = unsafe { dot_blocked_f16_avx2(&x, &y16) };
+            assert_eq!(
+                scalar.to_bits(),
+                avx2.to_bits(),
+                "case {case}: len {len}, scalar {scalar}, avx2 {avx2}"
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn axpy_blocked_f16_avx2_matches_scalar_bitwise() {
+        if !f16_kernels_testable() {
+            eprintln!("skipping: AVX2+FMA+F16C not available on this host");
+            return;
+        }
+        let mut rng = XorShift64Star(0xf16a_0001);
+        for case in 0..10_000 {
+            let len = match case % 4 {
+                0 => 64,
+                1 => 128,
+                _ => 1 + rng.next_usize(512),
+            };
+            let prob = rng.next_f32();
+            let base = fill(&mut rng, len);
+            let v16 = fill_u16(&mut rng, len);
+            let mut out_scalar = base.clone();
+            let mut out_avx2 = base;
+            axpy_blocked_f16_scalar(&mut out_scalar, prob, &v16);
+            // SAFETY: guarded by the runtime feature check above.
+            unsafe { axpy_blocked_f16_avx2(&mut out_avx2, prob, &v16) };
+            for (d, (s, a)) in out_scalar.iter().zip(&out_avx2).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    a.to_bits(),
+                    "case {case}: len {len}, element {d}, scalar {s}, avx2 {a}"
+                );
+            }
+        }
     }
 
     #[test]
