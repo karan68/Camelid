@@ -192,6 +192,55 @@ impl InferenceWorkspace {
     }
 }
 
+/// One steady-state decode kernel binding: which `try_x86_q8_*` cascade arm
+/// the first rows==1 call selected for a projection slot. The cascade remains
+/// the BUILDER of this choice (it runs once and records the winner); the
+/// per-call path afterwards jumps straight to the recorded arm, whose own
+/// guards stay in place as the fail-closed check (a miss rebinds through the
+/// full cascade). Scheduling cache, not weight state: `Clone` starts fresh
+/// (a cloned session rebinds on first use) and equality always holds so
+/// weight comparisons ignore it.
+#[derive(Debug)]
+pub struct DecodeBindingCell(std::sync::atomic::AtomicU8);
+
+impl Default for DecodeBindingCell {
+    fn default() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(DECODE_ARM_UNBOUND))
+    }
+}
+
+impl DecodeBindingCell {
+    fn load(&self) -> u8 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn store(&self, arm: u8) {
+        self.0.store(arm, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for DecodeBindingCell {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for DecodeBindingCell {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+/// Per-layer decode kernel bindings, one cell per linear-projection slot that
+/// routes through the role cascade at decode.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DecodeLinearBindings {
+    pub attention_q: DecodeBindingCell,
+    pub attention_k: DecodeBindingCell,
+    pub attention_v: DecodeBindingCell,
+    pub attention_output: DecodeBindingCell,
+    pub ffn_down: DecodeBindingCell,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaLayerWeights {
     pub attention_norm: CpuTensor,
@@ -211,6 +260,8 @@ pub struct LlamaLayerWeights {
     pub ffn_up: CpuTensor,
     pub ffn_down: CpuTensor,
     pub moe_router: Option<CpuTensor>,
+    /// Steady-state decode kernel bindings; see [`DecodeBindingCell`].
+    pub decode_bindings: DecodeLinearBindings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -221,6 +272,10 @@ pub struct LlamaLoadedWeights {
     pub rope_freqs: Option<CpuTensor>,
     pub layers: Vec<LlamaLayerWeights>,
     pub layer_range: Option<std::ops::Range<usize>>,
+    /// Reserved decode binding for the logits/output projection. Its dispatch
+    /// is shape-driven (two dim reads per call, no try-cascade), so it is not
+    /// bound yet; the cell exists so a future binding needs no struct change.
+    pub output_projection_binding: DecodeBindingCell,
 }
 
 /// Result of [`LlamaLoadedWeights::q8_0_residency_report`]: how many Q8_0 linears hold plain
@@ -379,13 +434,13 @@ impl LlamaLoadedWeights {
         load_output: bool,
     ) -> Result<Self> {
         // Q8_0 linears are ALWAYS retained as plain RAM-resident blocks. The old policy
-        // estimated a retention budget over the WHOLE binding — even on a pipeline-sharded
-        // node that loads only its layer range — and silently fell back to per-token file
+        // estimated a retention budget over the WHOLE binding â€” even on a pipeline-sharded
+        // node that loads only its layer range â€” and silently fell back to per-token file
         // streaming when the estimate crossed a cap: ~100x slower decode, and it disqualified
         // the GPU-resident path (which requires q8_0_blocks). The only way off the resident
         // path now is the explicit CAMELID_LAZY_Q8_0_LINEAR opt-out, and it is loud.
         // Fast-load (CAMELID_METAL_NOCOPY): Q8_0 linears read their wire bytes once
-        // into page-aligned allocations the GPU wraps in place — no 36-byte decode, no
+        // into page-aligned allocations the GPU wraps in place â€” no 36-byte decode, no
         // upload copy, and the page cache stays warm so reloading a model is fast.
         let nocopy_fast_load = metal_nocopy_fast_load_enabled();
         if nocopy_fast_load {
@@ -403,7 +458,7 @@ impl LlamaLoadedWeights {
         }
         let load_linear = |name: &str| {
             // K-quant (Q4_K / Q6_K) 2-D linears: retain only the raw super-block wire
-            // bytes (no f32 materialization — an 8B model fully decoded to f32 is ~32 GB
+            // bytes (no f32 materialization â€” an 8B model fully decoded to f32 is ~32 GB
             // and OOMs). The GPU-resident decode reads these via q4k_gemv / q6k_gemv.
             if let Ok(desc) = store.descriptor(name) {
                 // Ternary TQ2_0 2-D linears: stream the wire bytes (the CPU ternary
@@ -521,7 +576,7 @@ impl LlamaLoadedWeights {
                     ),
                 };
                 // DEBUG ONLY: CAMELID_DEBUG_DISABLE_QK_NORM=1 skips loading the
-                // QK-norm weights so a Qwen3 forward runs as if it had none — used
+                // QK-norm weights so a Qwen3 forward runs as if it had none â€” used
                 // to bisect whether QK-norm is the source of a parity gap. Never
                 // set in production.
                 let debug_disable_qk_norm =
@@ -557,6 +612,7 @@ impl LlamaLoadedWeights {
                     ffn_up,
                     ffn_down,
                     moe_router,
+                    decode_bindings: DecodeLinearBindings::default(),
                 });
             } else {
                 layers.push(LlamaLayerWeights {
@@ -617,6 +673,7 @@ impl LlamaLoadedWeights {
                             Some(CpuTensor::from_f32(&router.name, vec![0], vec![])?)
                         }
                     },
+                    decode_bindings: DecodeLinearBindings::default(),
                 });
             }
         }
@@ -627,6 +684,7 @@ impl LlamaLoadedWeights {
             rope_freqs,
             layers,
             layer_range,
+            output_projection_binding: DecodeBindingCell::default(),
         })
     }
 
@@ -1273,7 +1331,7 @@ pub fn dump_stage_timings() {
 /// scalar chain (`tensor::dot_product`) vs the canonical blocked scalar
 /// reference vs the blocked AVX2/FMA realization. Returns
 /// `(variant, ns_per_call)` pairs; the AVX2 row is omitted when the CPU lacks
-/// AVX2+FMA. Bench-only entry point — never called on the inference path.
+/// AVX2+FMA. Bench-only entry point â€” never called on the inference path.
 pub fn attn_f32_dot_microbench(
     len: usize,
     repeats: usize,
@@ -1337,6 +1395,33 @@ pub fn attn_f32_dot_microbench(
         );
     }
     results
+}
+
+/// Micro-benchmark the fork-join overhead of one rayon parallel region on
+/// the global pool: per-item work is a single black_box add, so region
+/// dispatch dominates. `idle_us_between > 0` sleeps between regions so the
+/// workers park (cold regions); 0 measures back-to-back (hot) regions.
+/// Returns microseconds per region. Bench-only entry point.
+pub fn rayon_region_microbench(iterations: usize, idle_us_between: u64) -> f64 {
+    use std::hint::black_box;
+    let chunks = rayon::current_num_threads().max(1) * 2;
+    let mut out = vec![0.0f32; chunks * 64];
+    for _ in 0..100 {
+        out.par_chunks_exact_mut(64)
+            .for_each(|chunk| chunk[0] = black_box(chunk[0] + 1.0));
+    }
+    let mut total = std::time::Duration::ZERO;
+    for _ in 0..iterations {
+        if idle_us_between > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(idle_us_between));
+        }
+        let started = Instant::now();
+        out.par_chunks_exact_mut(64)
+            .for_each(|chunk| chunk[0] = black_box(chunk[0] + 1.0));
+        total += started.elapsed();
+    }
+    black_box(&out);
+    total.as_micros() as f64 / iterations as f64
 }
 
 #[allow(dead_code)]
@@ -1684,7 +1769,7 @@ pub struct LlamaInferenceSession {
     resident_paths_disabled: bool,
     /// When set, the deterministic forward pass folds each layer's output hidden state and the
     /// final logits into a streaming SHA-256 rollup (an execution-trace digest). Transient
-    /// proof-carrying state, not part of the session's logical identity — skipped by
+    /// proof-carrying state, not part of the session's logical identity â€” skipped by
     /// Clone/PartialEq/Debug like `resident_decode`. Only enabled in deterministic mode
     /// (`enable_execution_trace`); the default path never allocates it.
     execution_trace: Option<ExecutionTraceHasher>,
@@ -1693,7 +1778,7 @@ pub struct LlamaInferenceSession {
     /// without this the key would be the `weights` Arc pointer, which is not stable
     /// across separately-loaded `Arc<LlamaLoadedWeights>` for the same model (e.g. a
     /// prompt-prefix-cache-restored session vs a freshly loaded one). When two such
-    /// Arcs alternate, the single-slot engine cache thrashes — a multi-second 3.4 GB
+    /// Arcs alternate, the single-slot engine cache thrashes â€” a multi-second 3.4 GB
     /// re-upload on every request. The API sets this from the model id; when unset
     /// (tests, CLI), the wrappers fall back to the Arc pointer. Transient identity,
     /// copied by Clone/take_for_step so restored sessions keep the same key.
@@ -1729,7 +1814,7 @@ impl LlamaInferenceSession {
 
     /// Move the session out for a blocking generation step, leaving a hollow placeholder
     /// behind (same identity, empty KV, no resident state). Unlike `clone`, this PRESERVES
-    /// the resident GPU session — the on-GPU KV cache and encode-ahead pipeline — which is
+    /// the resident GPU session â€” the on-GPU KV cache and encode-ahead pipeline â€” which is
     /// single-owner and dropped by `clone`. The caller must re-assign the returned session
     /// when the step finishes or the sequence loses its KV state entirely.
     pub fn take_for_step(&mut self) -> LlamaInferenceSession {
@@ -1778,7 +1863,7 @@ impl LlamaInferenceSession {
     }
 
     /// Approximate resident-weight footprint of this session in bytes: the raw Q8_0 block
-    /// bytes of every layer's attention + FFN tensors plus the output projection — the same
+    /// bytes of every layer's attention + FFN tensors plus the output projection â€” the same
     /// unit `build_resident_cuda_engine` sizes VRAM against. Used to compute the
     /// speculative-coexistence reserve (how much VRAM a draft model needs to stay resident).
     #[cfg(feature = "cuda")]
@@ -1914,7 +1999,7 @@ impl LlamaInferenceSession {
 
     /// Arm the execution-trace rollup: subsequent forward passes fold every layer's output
     /// hidden state and the final logits into a streaming SHA-256 (see [`ExecutionTraceHasher`]).
-    /// Fails closed unless deterministic mode is active — the rollup is only meaningful on the
+    /// Fails closed unless deterministic mode is active â€” the rollup is only meaningful on the
     /// order-stable CPU lane (RECEIPTS.md rule 2), and arming it would otherwise advertise a
     /// digest over a non-reproducible run. Returns whether the trace was armed.
     pub fn enable_execution_trace(&mut self) -> bool {
@@ -1946,7 +2031,7 @@ impl LlamaInferenceSession {
     }
 
     /// Roll the sequence back to `position`, discarding newer KV entries.
-    /// Requires CPU-authoritative KV state — the GPU-resident cache has no
+    /// Requires CPU-authoritative KV state â€” the GPU-resident cache has no
     /// rollback, so any resident session is dropped and reseeds from CPU on
     /// next use.
     pub fn rollback_to_position(&mut self, position: usize) -> Result<()> {
@@ -2018,7 +2103,7 @@ impl LlamaInferenceSession {
             return Ok(false);
         }
         // Wire-page (fast-load) weights satisfy residency too, but only when the wire
-        // kernels are active — their bytes exist solely in the 34-byte wire layout.
+        // kernels are active â€” their bytes exist solely in the 34-byte wire layout.
         let wire_ok = metal_seam::wire_mode_active();
         let is_q8 = |t: &CpuTensor| {
             t.source_type == Some(GgufTensorType::Q8_0)
@@ -2031,7 +2116,7 @@ impl LlamaInferenceSession {
         // source_type, so a model may be all-Q8_0, all-Q4_K, or mixed.
         // The contraction dimension (in_features) is gguf dim(0) in the runtime shape:
         // a `[in, out]` gguf linear is stored out-major (out rows of `in` contiguous
-        // values), so each output row spans `in/256` super-blocks — the kernel's `n_sb`.
+        // values), so each output row spans `in/256` super-blocks â€” the kernel's `n_sb`.
         // (The output/lm_head, with a non-256-aligned vocab in dim(1), is the case that
         // makes checking the wrong dim wrongly reject it.)
         let is_q4k = |t: &CpuTensor| {
@@ -2150,7 +2235,7 @@ impl LlamaInferenceSession {
     /// GPU prefill (CAMELID_METAL_RESIDENT_PREFILL=1): run the prompt's first N tokens
     /// through the resident session in ONE command buffer (weights stream once, attention
     /// per position). On success the GPU KV cache holds positions 0..N, the CPU KV cache is
-    /// advanced (positions left empty — only the resident path continues this sequence),
+    /// advanced (positions left empty â€” only the resident path continues this sequence),
     /// and the caller skips its CPU prefill loop entirely; the last prompt token then runs
     /// through the resident decode for logits.
     fn try_resident_prefill(&mut self, token_ids: &[u32]) -> Result<bool> {
@@ -2171,7 +2256,7 @@ impl LlamaInferenceSession {
     /// NVIDIA device (one forward per token, KV built incrementally, a single sync
     /// at the end), then leave the global engine ready at `position = n` so the
     /// last prompt token decodes straight into the first generated token. Replaces
-    /// the CPU prefill — the main time-to-first-token cost. Returns `false` to fall
+    /// the CPU prefill â€” the main time-to-first-token cost. Returns `false` to fall
     /// back to the CPU prefill for any unsupported config.
     #[cfg(feature = "cuda")]
     fn try_resident_prefill_cuda(&mut self, token_ids: &[u32]) -> Result<bool> {
@@ -2286,7 +2371,7 @@ impl LlamaInferenceSession {
         }
         // Default to the batched prefill (each weight read once per MAX_VERIFY_K-token
         // chunk instead of once per token). `CAMELID_CUDA_RESIDENT_PREFILL_BATCHED=0`
-        // forces the serial per-token loop — an A/B switch for parity bisection. Both
+        // forces the serial per-token loop â€” an A/B switch for parity bisection. Both
         // write bit-identical KV (the batched stack reuses the same per-block dot and
         // block-ordered sum), so decode after either is token-identical.
         let serial_prefill = std::env::var_os("CAMELID_CUDA_RESIDENT_PREFILL_BATCHED")
@@ -2319,7 +2404,7 @@ impl LlamaInferenceSession {
         // KV cache is authoritative too: otherwise any later forward that takes the
         // CPU path (dense diagnostics, a GPU-decode fallback, or a KV rollback) reads
         // an all-zero history and generation degenerates. The copy is a few MB of
-        // device->host transfer — negligible next to the prefill compute it follows,
+        // device->host transfer â€” negligible next to the prefill compute it follows,
         // and it keeps both backends in lockstep.
         if let Err(e) =
             self.copy_resident_cuda_kv_to_host(&slot.engine, n_layers, n, n_kv, head_dim)
@@ -2364,7 +2449,7 @@ impl LlamaInferenceSession {
                     let src = (h * n + p) * head_dim;
                     // Canonical store, not a raw copy: the GPU KV is f16, so
                     // this data is f16-exact and the rounding inside is
-                    // idempotent — the routing enforces the invariant
+                    // idempotent â€” the routing enforces the invariant
                     // structurally instead of relying on the GPU dtype.
                     self.kv_cache.store_kv_head_row(
                         layer,
@@ -2386,7 +2471,7 @@ impl LlamaInferenceSession {
     /// id sampled ON the GPU. The token graph's tail runs the argmax (exactly
     /// `LlamaSampler::Greedy`: strict greater-than, lowest-index tie-break) and gathers the
     /// sampled token's embedding row into the next pre-encoded graph's input, and that next
-    /// graph is event-released before this one finishes — so consecutive tokens run
+    /// graph is event-released before this one finishes â€” so consecutive tokens run
     /// back-to-back on the GPU with no logits readback or CPU sampling on the critical
     /// path. Returns Ok(None) when the resident fast path is unavailable (the caller falls
     /// back to the general path, which this call then leaves untouched).
@@ -2427,7 +2512,7 @@ impl LlamaInferenceSession {
 
     /// Temperature-sampling analog of the greedy resident fast lane: when the
     /// sampler is plain temperature (no top-k / top-p / penalties / logit-bias),
-    /// draw the next token on the GPU via Gumbel-max — no 128K-logit host copy and
+    /// draw the next token on the GPU via Gumbel-max â€” no 128K-logit host copy and
     /// no CPU sort, which the profiler showed cost ~7 ms/token (more than the whole
     /// forward). Returns `Ok(None)` when the config isn't GPU-eligible or CUDA
     /// resident decode is off, so the caller uses the CPU logits path unchanged.
@@ -2488,7 +2573,7 @@ impl LlamaInferenceSession {
     /// proposes up to `max_draft` tokens from `history`; the model verifies them in
     /// ONE batched forward (`verify_batch`), and the longest correct prefix plus
     /// one bonus token are accepted. Output is exactly what greedy decode would
-    /// have produced (the model's argmax verifies every token) — lossless — but a
+    /// have produced (the model's argmax verifies every token) â€” lossless â€” but a
     /// single memory-bound forward can emit several tokens. Returns the accepted
     /// tokens (1..=max_draft+1) and advances the KV position, or `Ok(None)` when no
     /// draft is available or the GPU engine isn't ready (caller does a normal step).
@@ -2563,7 +2648,7 @@ impl LlamaInferenceSession {
         }
 
         // Same key the build/decode wrappers use (stable model identity when set,
-        // else the weights Arc pointer) — otherwise the readiness check never matches.
+        // else the weights Arc pointer) â€” otherwise the readiness check never matches.
         let key = self
             .resident_cache_key
             .map(|k| k as usize)
@@ -2728,7 +2813,7 @@ impl LlamaInferenceSession {
     /// Non-CUDA build: route the GPU resident tree speculative-verify to the Metal seam
     /// (`verify_tree_metal`), which runs the batched bit-identical `verify_batch_tree` when the
     /// resident engine is live and ready, else returns `Ok(None)` so the caller takes a normal
-    /// step. Lossless either way (the target verify is authoritative — every emitted token is the
+    /// step. Lossless either way (the target verify is authoritative â€” every emitted token is the
     /// model's own greedy argmax along the accepted path).
     #[cfg(not(feature = "cuda"))]
     pub fn verify_tree_gpu(
@@ -3441,7 +3526,7 @@ impl LlamaInferenceSession {
     /// accepted token followed by drafted tokens) in ONE batched pass through
     /// the chunked-prefill layer path, then compute logits for EVERY position
     /// and return the greedy argmax per position. One weight read serves all
-    /// M tokens — the same amortization the prefill path gets.
+    /// M tokens â€” the same amortization the prefill path gets.
     ///
     /// KV entries are appended for all `token_ids` (position advances by M);
     /// the caller drops rejected suffixes with `rollback_to_position`.
@@ -3999,7 +4084,7 @@ impl LlamaInferenceSession {
     }
 
     /// `allowed_tokens`, when set, is a vocab-sized mask applied to the logits
-    /// before sampling (disallowed tokens forced to `-inf`) — grammar-constrained
+    /// before sampling (disallowed tokens forced to `-inf`) â€” grammar-constrained
     /// decoding. The unmasked logits are still returned in the step (so logprobs /
     /// diagnostics see the real distribution).
     pub fn generate_next_token_with_history_diagnostics(
@@ -4301,9 +4386,9 @@ fn env_flag_enabled(key: &str) -> bool {
 /// forward pass: every Metal/GPU dispatch gate fails closed to its CPU equivalent,
 /// regardless of any `CAMELID_METAL_*` override. This makes the supported TinyLlama
 /// 1.1B Q8_0 forward pass bit-exact and reduction-order-stable across runs, thread
-/// counts, and processes (the CPU reduction order is already fixed — each output owns
+/// counts, and processes (the CPU reduction order is already fixed â€” each output owns
 /// its full serial K-dimension reduction; see `qa/determinism/determinism-baseline-*.md` and
-/// DECISIONS.md §D9). The library default is OFF, so the default (GPU fast) path and
+/// DECISIONS.md Â§D9). The library default is OFF, so the default (GPU fast) path and
 /// every embedder are byte-for-byte unchanged. The pinned reduction order mirrors the
 /// llama.cpp reference block-wise Q8_0 dot layout the parity contract is gated against.
 pub fn deterministic_mode_enabled() -> bool {
@@ -4324,7 +4409,7 @@ pub const EXECUTION_TRACE_ALGORITHM_ROLLUP_V1: &str = "sha256-rollup-v1";
 /// This is a single *rollup*: a mismatch proves the run differs but does not localize which
 /// token or layer. It is only meaningful on the order-stable CPU lane (deterministic mode):
 /// the underlying values are reduction-order-stable there (see [`deterministic_mode_enabled`]
-/// and DECISIONS.md §D9), and byte-for-byte reproducibility requires greedy decoding
+/// and DECISIONS.md Â§D9), and byte-for-byte reproducibility requires greedy decoding
 /// (RECEIPTS.md rule 2). The digest is ISA-specific (i8mm vs scalar round differently), so it
 /// is re-derivable on the same deterministic lane/host, not portable across ISAs.
 #[derive(Clone)]
@@ -4451,12 +4536,12 @@ fn prefill_layer_major_enabled(weights: &LlamaLoadedWeights) -> bool {
 
 /// Dedicated, wider Rayon pool for the compute-bound prompt-prefill GEMM.
 ///
-/// Prompt prefill is a matrix–matrix multiply (high arithmetic intensity): it
+/// Prompt prefill is a matrixâ€“matrix multiply (high arithmetic intensity): it
 /// scales with *logical* cores, gaining throughput from SMT siblings. Single-token
-/// decode is the opposite — a matrix–vector stream that is memory-bandwidth-bound,
+/// decode is the opposite â€” a matrixâ€“vector stream that is memory-bandwidth-bound,
 /// where SMT siblings only add memory-controller contention and *cost* throughput.
-/// Measured on an i7-11800H (8C/16T): prefill 19.5→23.6 tok/s going 8→16 threads
-/// (+21%), while decode peaks near 6 threads and falls 5.7→5.2 over the same range
+/// Measured on an i7-11800H (8C/16T): prefill 19.5â†’23.6 tok/s going 8â†’16 threads
+/// (+21%), while decode peaks near 6 threads and falls 5.7â†’5.2 over the same range
 /// (see `docs/perf-deep-dive/PERF_RECEIPTS/.../p1-cpu-thread-sweep`). The global
 /// pool stays sized for decode (physical cores on Windows, see
 /// `configure_rayon_threads`); only the prefill forward pass installs onto this
@@ -4464,7 +4549,7 @@ fn prefill_layer_major_enabled(weights: &LlamaLoadedWeights) -> bool {
 ///
 /// Bit-exact: the prefill matmul parallelizes over *independent* output rows, and
 /// each row's block accumulation is serial, so the thread count never changes the
-/// numeric result (verified byte-identical across 4–16 threads in the sweep above).
+/// numeric result (verified byte-identical across 4â€“16 threads in the sweep above).
 ///
 /// Returns `None` (prefill stays on the global pool) on non-Windows/x86_64 targets,
 /// under an explicit `CAMELID_PREFILL_THREADS=0|off|global`, when the operator has
@@ -4512,10 +4597,10 @@ fn build_prefill_thread_pool() -> Option<rayon::ThreadPool> {
 
 /// Pure resolution of the prefill pool width, factored out for testing.
 ///
-/// * `spec` — the raw `CAMELID_PREFILL_THREADS` value, if set.
-/// * `global_pinned` — whether `CAMELID_THREADS` explicitly pinned the global pool.
-/// * `logical` — logical core count (the default widen target).
-/// * `widen_by_default` — whether this target auto-widens prefill (Windows/x86_64).
+/// * `spec` â€” the raw `CAMELID_PREFILL_THREADS` value, if set.
+/// * `global_pinned` â€” whether `CAMELID_THREADS` explicitly pinned the global pool.
+/// * `logical` â€” logical core count (the default widen target).
+/// * `widen_by_default` â€” whether this target auto-widens prefill (Windows/x86_64).
 fn resolve_prefill_thread_count_from(
     spec: Option<&str>,
     global_pinned: bool,
@@ -5488,7 +5573,7 @@ fn sample_with_config(
     // Advance the RNG per decode step: `token_history.len()` is the deterministic
     // stream position, so each step draws a fresh uniform while a fixed seed still
     // reproduces the whole sequence token-for-token. (Previously the draw depended
-    // only on the seed, so every step reused one identical value — a degenerate
+    // only on the seed, so every step reused one identical value â€” a degenerate
     // sampler.)
     let draw = seeded_unit_interval_at(config.seed.unwrap_or(0), token_history.len() as u64);
     let mut cumulative = 0.0;
@@ -5691,34 +5776,38 @@ fn forward_layer_timed(
         (q, k, v, Some(elapsed))
     } else {
         let started = Instant::now();
-        let q = linear_runtime_with_plan(
+        let q = linear_for_role_bound(
             &attn_norm,
             &layer.attention_q,
             format!("layer_{layer_idx}_attention_q"),
+            "linear",
             runtime_plan,
             collect_diagnostics,
+            &layer.decode_bindings.attention_q,
         )?;
         timings.attention_q = started.elapsed().as_micros();
 
         let started = Instant::now();
-        let k = linear_for_role_runtime_with_plan(
+        let k = linear_for_role_bound(
             &attn_norm,
             &layer.attention_k,
             format!("layer_{layer_idx}_attention_k"),
             "attention_k",
             runtime_plan,
             collect_diagnostics,
+            &layer.decode_bindings.attention_k,
         )?;
         timings.attention_k = started.elapsed().as_micros();
 
         let started = Instant::now();
-        let v = linear_for_role_runtime_with_plan(
+        let v = linear_for_role_bound(
             &attn_norm,
             &layer.attention_v,
             format!("layer_{layer_idx}_attention_v"),
             "attention_v",
             runtime_plan,
             collect_diagnostics,
+            &layer.decode_bindings.attention_v,
         )?;
         timings.attention_v = started.elapsed().as_micros();
         (q, k, v, None)
@@ -5873,12 +5962,14 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_context_done");
 
     let started = Instant::now();
-    let mut attn_out = linear_runtime_with_plan(
+    let mut attn_out = linear_for_role_bound(
         &context,
         &layer.attention_output,
         format!("layer_{layer_idx}_attention_output"),
+        "linear",
         runtime_plan,
         collect_diagnostics,
+        &layer.decode_bindings.attention_output,
     )?;
     if collect_diagnostics && diagnostic_zero_delta(DeltaZeroTarget::Attention, layer_idx)? {
         attn_out = zero_like(
@@ -6033,13 +6124,14 @@ fn forward_layer_timed(
             }
             trace_forward_layer_memory(layer_idx, "ffn_gate_up_activation_done");
             let started = Instant::now();
-            let ffn_out = linear_for_role_runtime_with_plan(
+            let ffn_out = linear_for_role_bound(
                 &activated,
                 &layer.ffn_down,
                 down_name,
                 "ffn_down",
                 runtime_plan,
                 collect_diagnostics,
+                &layer.decode_bindings.ffn_down,
             )?;
             let ffn_out_already_residual = false;
             let ffn_output_stats = collect_diagnostics
@@ -6946,87 +7038,249 @@ fn linear_for_role_runtime_with_plan(
     if collect_diagnostics {
         linear_for_role(input, weight, name, rectangular_role)
     } else {
-        let name = name.into();
-        // Lane 1: unified tiled Q8_0 prefill GEMM owner (default-off). Role-agnostic — covers
-        // every Q8_0 projection (q/k/v/o, gate/up, ffn_down) in ONE place. Returns None for
-        // decode, non-Q8, or non-PackedRows4 weights, so the default path is unchanged when off.
-        if let Some(output) =
-            try_q8_matmul_owner_prefill(input, weight, &name, rectangular_role, runtime_plan)?
-        {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
+        decode_linear_cascade(
             input,
             weight,
-            &name,
+            name.into(),
             rectangular_role,
             runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_attention_output_packed_rows4_matmul_path(
-            input,
-            weight,
-            &name,
-            rectangular_role,
-            runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_attention_projection_decode_consumer_path(
-            input,
-            weight,
-            &name,
-            rectangular_role,
-            runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_ffn_down_gemm4_prefill_path(
-            input,
-            weight,
-            &name,
-            rectangular_role,
-            runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_ffn_down_single_owner_path(
-            input,
-            weight,
-            &name,
-            rectangular_role,
-            runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_ffn_down_decode_consumer_path(
-            input,
-            weight,
-            &name,
-            rectangular_role,
-            runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        if let Some(output) = try_x86_q8_ffn_down_packed_rows4_matmul_path(
-            input,
-            weight,
-            &name,
-            rectangular_role,
-            runtime_plan,
-        )? {
-            return Ok(output);
-        }
-        linear_with_diagnostic_layouts_with_plan(
-            input,
-            weight,
-            name,
-            SquareLinearLayout::Transposed,
-            RectangularLinearLayout::Auto,
-            runtime_plan,
+            None,
         )
     }
+}
+
+/// Cascade arm identifiers recorded in [`DecodeBindingCell`]s. Prefill-only
+/// arms are never recorded (bindings apply to rows==1 decode calls).
+const DECODE_ARM_UNBOUND: u8 = 0;
+const DECODE_ARM_ATTN_OUTPUT_DECODE_CONSUMER: u8 = 1;
+const DECODE_ARM_ATTN_OUTPUT_PACKED_ROWS4: u8 = 2;
+const DECODE_ARM_ATTN_PROJECTION_DECODE_CONSUMER: u8 = 3;
+const DECODE_ARM_FFN_DOWN_SINGLE_OWNER: u8 = 4;
+const DECODE_ARM_FFN_DOWN_DECODE_CONSUMER: u8 = 5;
+const DECODE_ARM_FFN_DOWN_PACKED_ROWS4: u8 = 6;
+const DECODE_ARM_FALLBACK: u8 = 7;
+
+/// Decode-bound variant of [`linear_for_role_runtime_with_plan`]: the first
+/// rows==1 call per binding cell runs the historical cascade and records the
+/// winning arm; steady-state calls jump straight to that arm. The arm's own
+/// guards remain in force — if they ever miss (they cannot for a fixed plan
+/// and shape), the call falls back to the full cascade and rebinds, so the
+/// fail-closed ordering is preserved by construction. Prefill (rows > 1) and
+/// diagnostics calls always take the historical paths untouched.
+fn linear_for_role_bound(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+    collect_diagnostics: bool,
+    binding: &DecodeBindingCell,
+) -> Result<CpuTensor> {
+    if collect_diagnostics {
+        return linear_for_role(input, weight, name, rectangular_role);
+    }
+    let name = name.into();
+    if input.dim(0)? != 1 {
+        return decode_linear_cascade(input, weight, name, rectangular_role, runtime_plan, None);
+    }
+    match binding.load() {
+        DECODE_ARM_ATTN_OUTPUT_DECODE_CONSUMER => {
+            if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
+                input,
+                weight,
+                &name,
+                rectangular_role,
+                runtime_plan,
+            )? {
+                return Ok(output);
+            }
+        }
+        DECODE_ARM_ATTN_OUTPUT_PACKED_ROWS4 => {
+            if let Some(output) = try_x86_q8_attention_output_packed_rows4_matmul_path(
+                input,
+                weight,
+                &name,
+                rectangular_role,
+                runtime_plan,
+            )? {
+                return Ok(output);
+            }
+        }
+        DECODE_ARM_ATTN_PROJECTION_DECODE_CONSUMER => {
+            if let Some(output) = try_x86_q8_attention_projection_decode_consumer_path(
+                input,
+                weight,
+                &name,
+                rectangular_role,
+                runtime_plan,
+            )? {
+                return Ok(output);
+            }
+        }
+        DECODE_ARM_FFN_DOWN_SINGLE_OWNER => {
+            if let Some(output) = try_x86_q8_ffn_down_single_owner_path(
+                input,
+                weight,
+                &name,
+                rectangular_role,
+                runtime_plan,
+            )? {
+                return Ok(output);
+            }
+        }
+        DECODE_ARM_FFN_DOWN_DECODE_CONSUMER => {
+            if let Some(output) = try_x86_q8_ffn_down_decode_consumer_path(
+                input,
+                weight,
+                &name,
+                rectangular_role,
+                runtime_plan,
+            )? {
+                return Ok(output);
+            }
+        }
+        DECODE_ARM_FFN_DOWN_PACKED_ROWS4 => {
+            if let Some(output) = try_x86_q8_ffn_down_packed_rows4_matmul_path(
+                input,
+                weight,
+                &name,
+                rectangular_role,
+                runtime_plan,
+            )? {
+                return Ok(output);
+            }
+        }
+        DECODE_ARM_FALLBACK => {
+            return linear_with_diagnostic_layouts_with_plan(
+                input,
+                weight,
+                name,
+                SquareLinearLayout::Transposed,
+                RectangularLinearLayout::Auto,
+                runtime_plan,
+            );
+        }
+        _ => {}
+    }
+    decode_linear_cascade(
+        input,
+        weight,
+        name,
+        rectangular_role,
+        runtime_plan,
+        Some(binding),
+    )
+}
+
+/// The historical role-dispatch cascade, unchanged in ORDER and guards; when
+/// `record` is provided (rows==1 bound calls), the winning decode-capable arm
+/// is written into the binding cell. This function remains the single
+/// authority on kernel selection — the bound fast path above only replays its
+/// recorded verdict.
+fn decode_linear_cascade(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: String,
+    rectangular_role: &str,
+    runtime_plan: &ResolvedRuntimePlan,
+    record: Option<&DecodeBindingCell>,
+) -> Result<CpuTensor> {
+    // Lane 1: unified tiled Q8_0 prefill GEMM owner (default-off). Role-agnostic — covers
+    // every Q8_0 projection (q/k/v/o, gate/up, ffn_down) in ONE place. Returns None for
+    // decode, non-Q8, or non-PackedRows4 weights, so the default path is unchanged when off.
+    if let Some(output) =
+        try_q8_matmul_owner_prefill(input, weight, &name, rectangular_role, runtime_plan)?
+    {
+        return Ok(output);
+    }
+    if let Some(output) = try_x86_q8_attention_output_decode_consumer_path(
+        input,
+        weight,
+        &name,
+        rectangular_role,
+        runtime_plan,
+    )? {
+        if let Some(binding) = record {
+            binding.store(DECODE_ARM_ATTN_OUTPUT_DECODE_CONSUMER);
+        }
+        return Ok(output);
+    }
+    if let Some(output) = try_x86_q8_attention_output_packed_rows4_matmul_path(
+        input,
+        weight,
+        &name,
+        rectangular_role,
+        runtime_plan,
+    )? {
+        if let Some(binding) = record {
+            binding.store(DECODE_ARM_ATTN_OUTPUT_PACKED_ROWS4);
+        }
+        return Ok(output);
+    }
+    if let Some(output) = try_x86_q8_attention_projection_decode_consumer_path(
+        input,
+        weight,
+        &name,
+        rectangular_role,
+        runtime_plan,
+    )? {
+        if let Some(binding) = record {
+            binding.store(DECODE_ARM_ATTN_PROJECTION_DECODE_CONSUMER);
+        }
+        return Ok(output);
+    }
+    if let Some(output) = try_x86_q8_ffn_down_gemm4_prefill_path(
+        input,
+        weight,
+        &name,
+        rectangular_role,
+        runtime_plan,
+    )? {
+        return Ok(output);
+    }
+    if let Some(output) =
+        try_x86_q8_ffn_down_single_owner_path(input, weight, &name, rectangular_role, runtime_plan)?
+    {
+        if let Some(binding) = record {
+            binding.store(DECODE_ARM_FFN_DOWN_SINGLE_OWNER);
+        }
+        return Ok(output);
+    }
+    if let Some(output) = try_x86_q8_ffn_down_decode_consumer_path(
+        input,
+        weight,
+        &name,
+        rectangular_role,
+        runtime_plan,
+    )? {
+        if let Some(binding) = record {
+            binding.store(DECODE_ARM_FFN_DOWN_DECODE_CONSUMER);
+        }
+        return Ok(output);
+    }
+    if let Some(output) = try_x86_q8_ffn_down_packed_rows4_matmul_path(
+        input,
+        weight,
+        &name,
+        rectangular_role,
+        runtime_plan,
+    )? {
+        if let Some(binding) = record {
+            binding.store(DECODE_ARM_FFN_DOWN_PACKED_ROWS4);
+        }
+        return Ok(output);
+    }
+    if let Some(binding) = record {
+        binding.store(DECODE_ARM_FALLBACK);
+    }
+    linear_with_diagnostic_layouts_with_plan(
+        input,
+        weight,
+        name,
+        SquareLinearLayout::Transposed,
+        RectangularLinearLayout::Auto,
+        runtime_plan,
+    )
 }
 
 fn linear_projection_diagnostics(
@@ -7270,8 +7524,8 @@ fn linear_with_diagnostic_layouts_with_plan(
     let rows = weight.dim(0)?;
     let cols = weight.dim(1)?;
     // K-quant (Q4_K / Q6_K) wire weights have no f32 data and no general CPU
-    // consumer; intercept them here — the single chokepoint both the diagnostic
-    // and runtime linear chains funnel through — with the original tensor, before
+    // consumer; intercept them here â€” the single chokepoint both the diagnostic
+    // and runtime linear chains funnel through â€” with the original tensor, before
     // any layout reinterpretation that would drop the wire bytes. The block-dot
     // is layout-agnostic: it takes the contraction width from the input and the
     // output width from the wire length, so a GGUF `[in, out]` weight (where
@@ -9992,7 +10246,7 @@ fn resident_cuda_cache() -> &'static std::sync::Mutex<Option<ResidentCudaSlot>> 
 
 /// Second resident-engine cache, dedicated to the speculative draft model. Draft
 /// and target are different models (different weight identities), so giving them
-/// separate single-slot caches lets BOTH stay GPU-resident at once — sharing one
+/// separate single-slot caches lets BOTH stay GPU-resident at once â€” sharing one
 /// slot would thrash (rebuild + 3.4 GB re-upload) every time control passed between
 /// drafter and target. Routed by `LlamaInferenceSession::is_drafter`.
 #[cfg(feature = "cuda")]
@@ -10013,7 +10267,7 @@ static SPEC_COEXIST_RESERVE_BYTES: std::sync::atomic::AtomicU64 =
 
 /// Record the draft model's resident footprint so the target leaves room for it. Pass 0 to
 /// disable (single-model path). Does NOT evict already-built engines: a resident target built
-/// before the reserve was set keeps running (reused, not rebuilt) — rebuilding it would free
+/// before the reserve was set keeps running (reused, not rebuilt) â€” rebuilding it would free
 /// its VRAM only to the cudarc pool (which the free-VRAM probe does not see), so the rebuild
 /// would wrongly fall to CPU. The reserve therefore only shapes engines built AFTER it is set
 /// (e.g. when the drafter is configured before the target's first decode).
@@ -10031,7 +10285,7 @@ fn spec_coexist_reserve_bytes() -> u64 {
 
 /// KV-cache positions a speculative draft engine is sized for (env-tunable). The draft only
 /// needs to span the prompt + generated tokens it drafts over; capping it keeps the draft's
-/// VRAM small so it fits beside the resident target. Lossless either way — the target verify is
+/// VRAM small so it fits beside the resident target. Lossless either way â€” the target verify is
 /// authoritative, so a shorter draft context only affects accept rate, never correctness.
 #[cfg(feature = "cuda")]
 fn spec_draft_kv_context() -> usize {
@@ -10054,7 +10308,7 @@ pub fn reset_resident_caches() {
         .unwrap_or_else(|p| p.into_inner()) = None;
     // The engines dropped above returned their VRAM to cudarc's stream-ordered async
     // pool (cuMemFreeAsync), where the free-VRAM probe cannot see it. Trim the pool so
-    // the next model's resident fit decision measures the real free VRAM — otherwise a
+    // the next model's resident fit decision measures the real free VRAM â€” otherwise a
     // larger model wrongly falls back to the CPU path (the ~20x-slower symptom this
     // unload path exists to prevent).
     crate::cuda::release_async_pool();
@@ -10065,7 +10319,7 @@ pub fn reset_resident_caches() {}
 /// Prompt-lookup n-gram drafter: find the most recent earlier occurrence of the
 /// last `ngram` tokens and propose the up-to-`max_draft` tokens that followed it.
 /// Cheap (no model), and it hits whenever the model repeats a phrase already in
-/// the context (code, lists, quoted text) — exactly where greedy decode is
+/// the context (code, lists, quoted text) â€” exactly where greedy decode is
 /// predictable. Empty when there's no match.
 #[cfg(feature = "cuda")]
 fn draft_ngram(history: &[u32], max_draft: usize, ngram: usize) -> Vec<u32> {
@@ -10154,9 +10408,9 @@ fn build_resident_cuda_engine(
     // VRAM-driven resident-context sizing (portability, not hardcoded to any card):
     //   resident weights are uploaded once and live for the engine's lifetime; the
     //   GPU KV cache is allocated once at `cap` positions, costing
-    //   kv_bytes_per_pos = n_layers · n_kv · head_dim · 2(K,V) · 2(f16 bits) each. Size the
+    //   kv_bytes_per_pos = n_layers Â· n_kv Â· head_dim Â· 2(K,V) Â· 2(f16 bits) each. Size the
     //   cap so weights + KV + a scratch/headroom reserve fit in *detected free* VRAM:
-    //     cap = min(requested, (free_vram − weights − headroom) / kv_bytes_per_pos)
+    //     cap = min(requested, (free_vram âˆ’ weights âˆ’ headroom) / kv_bytes_per_pos)
     //   On a 6 GB card this stays conservative; on a 24 GB card it grows automatically
     //   to a long context. If even the floor (256) cannot fit, return None so the
     //   caller runs the model on the CPU path rather than oversubscribing VRAM.
@@ -10181,10 +10435,10 @@ fn build_resident_cuda_engine(
         + raw(weights.output_projection())
             .map(|b| b.len() as u64)
             .unwrap_or(0);
-    // Scratch reserve: logits row (vocab·f32) + per-stage activation buffers + a flat
+    // Scratch reserve: logits row (vocabÂ·f32) + per-stage activation buffers + a flat
     // safety margin for driver/context overhead and fragmentation. The flat margin is
     // env-overridable (CAMELID_CUDA_RESIDENT_HEADROOM_MB) so a second engine can be
-    // packed onto a small card — e.g. drafter + target for speculative decode, where
+    // packed onto a small card â€” e.g. drafter + target for speculative decode, where
     // the default 512 MiB per engine would not leave room for both.
     // The flat margin defaults to 512 MiB for a sole resident engine. Under speculative
     // coexistence both engines pack onto the card, so 512 MiB each would not fit: the draft
@@ -10199,7 +10453,7 @@ fn build_resident_cuda_engine(
     // takes the remaining free VRAM). BUT only honor the reserve when the target still fits
     // FULLY resident after it, measured against the NORMAL single-engine headroom. If reserving
     // would force the target to offload trailing layers, that offload (a) slows the target
-    // forward and (b) pushes the batched verify onto the serial/CPU path — a different backend
+    // forward and (b) pushes the batched verify onto the serial/CPU path â€” a different backend
     // than the resident plain decode, which diverges at near-ties. Not worth it: drop the
     // reserve, build the target full-resident (NORMAL headroom), and let the draft fall back to
     // CPU (the prior, lossless behavior). So the resident-draft win is taken only on a GPU big
@@ -10220,7 +10474,7 @@ fn build_resident_cuda_engine(
     let coexist_fit_headroom = (vocab as u64 * 4) + (coexist_headroom_mb * 1024 * 1024);
     // Bounded over-allocation the WDDM driver pages to shared host memory (how llama.cpp fits both
     // models on a 6 GB card): treat free VRAM as larger by this much for the coexistence sizing.
-    // Default 0 (strict — no spill). Opt in via CAMELID_SPEC_COEXIST_SPILL_MB on a tight card.
+    // Default 0 (strict â€” no spill). Opt in via CAMELID_SPEC_COEXIST_SPILL_MB on a tight card.
     let coexist_spill = std::env::var("CAMELID_SPEC_COEXIST_SPILL_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -10238,7 +10492,7 @@ fn build_resident_cuda_engine(
     };
     // Honor the reserve only if the target still fits fully resident after it (measured with the
     // small coexist headroom; the reserve already accounts for the draft's footprint). If not,
-    // drop the reserve and build the target full-resident — offloading it to make room is a net
+    // drop the reserve and build the target full-resident â€” offloading it to make room is a net
     // loss (slow target + serial/CPU verify that diverges at near-ties from the resident plain
     // decode), so the draft falls back to CPU (the prior lossless behavior).
     let honor_reserve = raw_reserve > 0
@@ -10307,7 +10561,7 @@ fn build_resident_cuda_engine(
     // host RAM (test/override hook, fires even on a model that fits). Otherwise the
     // split is AUTOMATIC: when all weights + a minimum KV cache + headroom cannot fit
     // in free VRAM, offload the fewest TRAILING layers needed so the rest fit. Each
-    // offloaded layer streams its weights to a GPU scratch buffer every forward — a
+    // offloaded layer streams its weights to a GPU scratch buffer every forward â€” a
     // capacity tradeoff, token-identical to the all-resident path.
     let force_offload = std::env::var("CAMELID_OFFLOAD_FORCE_LAYERS")
         .ok()
@@ -10339,7 +10593,7 @@ fn build_resident_cuda_engine(
     let n_resident_layers = n_layers - offload_count;
 
     // VRAM left for the KV cache after the RESIDENT weights and (if offloading) the
-    // streaming scratch — so freed weight VRAM grows the resident context.
+    // streaming scratch â€” so freed weight VRAM grows the resident context.
     let offloaded_bytes: u64 = per_layer_bytes[n_resident_layers..].iter().sum();
     let resident_weights_bytes = weights_bytes.saturating_sub(offloaded_bytes);
     let scratch_reserve = if offload_count > 0 {
@@ -10384,7 +10638,7 @@ fn build_resident_cuda_engine(
         }
         return None;
     }
-    // Task 4 — explicit VRAM headroom policy. Project the actual device
+    // Task 4 â€” explicit VRAM headroom policy. Project the actual device
     // allocation (resident weights + streaming scratch + the sized KV cache) and
     // run it past the headroom policy *before* allocating. If it would OOM or
     // leave less than the minimum post-load headroom, refuse the resident load
@@ -10395,7 +10649,7 @@ fn build_resident_cuda_engine(
         let projected_alloc =
             resident_weights_bytes + scratch_reserve + (cap as u64) * kv_bytes_per_pos;
         // Evaluate against ACTUAL free VRAM. Under coexistence the budget already excludes the
-        // draft's reserve, so the target's sizing leaves that reserve free by construction —
+        // draft's reserve, so the target's sizing leaves that reserve free by construction â€”
         // here we only require a small absolute safety margin (NOT reserve+margin, which would
         // double-count and falsely refuse). The draft, allocating last, likewise needs only the
         // small margin. Outside coexistence this is the normal 512 MiB post-load floor.
@@ -10439,7 +10693,7 @@ fn build_resident_cuda_engine(
             }
             _ => return None,
         };
-        // Per-projection quant lanes (q,k,v,o,gate,up,down) — drives the per-tensor
+        // Per-projection quant lanes (q,k,v,o,gate,up,down) â€” drives the per-tensor
         // repack + GEMV kernel + activation quantizer. Q4_K_M is mixed: most
         // projections Q4_K, with attn_v/ffn_down promoted to Q6_K in ~half the layers.
         let quants = [
@@ -10532,7 +10786,7 @@ fn resident_gpu_temperature_sampling_enabled() -> bool {
 }
 
 /// CUDA GPU-resident decode gate (the NVIDIA analog of the Metal one). On
-/// automatically whenever a usable CUDA device is present — the end-user app
+/// automatically whenever a usable CUDA device is present â€” the end-user app
 /// "just works" fast on the GPU with no flag or toggle. Deterministic mode
 /// (opt-in) forces the CPU reference; `CAMELID_CUDA_RESIDENT_DECODE=0` is an
 /// explicit escape hatch for debugging. Falls back to CPU per token for any
@@ -10570,7 +10824,7 @@ fn resident_decode_cuda_enabled() -> bool {
 /// is NOT bit-identical to a fresh GPU prefill: a cache hit reseeds the GPU KV from the
 /// f16-rounded host history and resumes, a different reduction order than a clean GPU
 /// prefill, which flips borderline (near-tie) tokens. The CPU lane is reduction-order
-/// stable, so it keeps the cache; the GPU lane must bypass it — exactly as deterministic
+/// stable, so it keeps the cache; the GPU lane must bypass it â€” exactly as deterministic
 /// mode already bypasses the cache on the CPU lane.
 pub fn resident_decode_cuda_active() -> bool {
     resident_decode_cuda_enabled()
@@ -10578,9 +10832,9 @@ pub fn resident_decode_cuda_active() -> bool {
 
 /// Maximum sequence length the CUDA resident engine keeps on the GPU. The GPU KV
 /// cache is allocated once at this many positions, so it directly sets the engine's
-/// VRAM footprint (≈ n_layers·n_kv·head_dim·2·4 bytes per position) on top of the
+/// VRAM footprint (â‰ˆ n_layersÂ·n_kvÂ·head_dimÂ·2Â·4 bytes per position) on top of the
 /// resident weights. On a 6 GB laptop card a 3B Q8_0 model's weights already take
-/// ~3.4 GB, so an 8192-position KV (~1.8 GB for 3B) leaves almost no headroom — any
+/// ~3.4 GB, so an 8192-position KV (~1.8 GB for 3B) leaves almost no headroom â€” any
 /// other GPU app then pushes the engine past VRAM, it can no longer stay resident,
 /// and it is rebuilt (a multi-second 3.4 GB re-upload) on every request. A 4096 cap
 /// halves the KV footprint and keeps the engine resident with room to spare; beyond
@@ -10588,7 +10842,7 @@ pub fn resident_decode_cuda_active() -> bool {
 /// Optional hard ceiling on the resident KV context the wrappers *request*. The
 /// real limit is VRAM-driven inside `build_resident_cuda_engine` (which sizes the
 /// cap to detected free VRAM and reports it), so by default this imposes no extra
-/// cap — a big card gets a long resident context automatically. Set
+/// cap â€” a big card gets a long resident context automatically. Set
 /// `CAMELID_CUDA_RESIDENT_MAX_CONTEXT` to force a lower ceiling (e.g. to leave more
 /// VRAM for other apps).
 #[cfg(feature = "cuda")]
@@ -10660,8 +10914,8 @@ fn q8_0_hybrid_retained_gpu_rows(output_rows: usize) -> usize {
 }
 
 /// Explicit (and loud) opt-out from RAM-resident Q8_0 blocks: only an affirmatively set
-/// `CAMELID_LAZY_Q8_0_LINEAR` forces the per-token file-streaming path. Absence — and any
-/// disabled spelling — means weights are retained in RAM. There is no auto/budget fallback.
+/// `CAMELID_LAZY_Q8_0_LINEAR` forces the per-token file-streaming path. Absence â€” and any
+/// disabled spelling â€” means weights are retained in RAM. There is no auto/budget fallback.
 fn lazy_q8_0_linear_forced() -> bool {
     matches!(
         env::var("CAMELID_LAZY_Q8_0_LINEAR"),
@@ -10674,7 +10928,7 @@ fn lazy_q8_0_linear_forced() -> bool {
 }
 
 /// Fast-load gate: CAMELID_METAL_NOCOPY loads Q8_0 linears as page-aligned wire
-/// pages for in-place GPU consumption. macOS only — the storage is consumed by
+/// pages for in-place GPU consumption. macOS only â€” the storage is consumed by
 /// the Metal wire kernels.
 fn metal_nocopy_fast_load_enabled() -> bool {
     cfg!(target_os = "macos") && env_flag_enabled("CAMELID_METAL_NOCOPY")
@@ -13377,7 +13631,7 @@ fn q8_0_packed_rows4_gemm4_accumulate_block(
 
 /// Phase 3 (K-quant conductor): opt-in software prefetch of the weight stream ahead
 /// of the x86 packed decode dot. Default-off (`CAMELID_X86_PREFETCH`). Memory hint
-/// only — byte-identical output by construction. The macOS/aarch64 dot already issues
+/// only â€” byte-identical output by construction. The macOS/aarch64 dot already issues
 /// a NEON `prfm` two blocks ahead; this gives the x86 decode dot the same option so it
 /// can be measured on a bandwidth-bound host (the Q8 gated-SIMD history says prove the
 /// win on the box before promoting to default).
@@ -13536,16 +13790,16 @@ fn run_q8_0_packed_rows4_prefill_gemm4_kernel(
 // A role-agnostic, BIT-EXACT drop-in for the per-projection prefill block-dot. It reuses the
 // proven 4x4 register microkernel `q8_0_packed_rows4_gemm4_accumulate_block` VERBATIM, so every
 // output cell still accumulates `((int as f32) * weight_scale) * input_scale` over ascending
-// blocks with no FMA — byte-identical to the scalar oracle. The ONLY difference vs the (default-
+// blocks with no FMA â€” byte-identical to the scalar oracle. The ONLY difference vs the (default-
 // off, regressing) ffn_down GEMM4 lane is the loop nest: it parallelizes over OUTPUT-row bands
 // and streams every input group against an L1/L2-resident weight band, so each weight block is
-// read from DRAM ~once instead of once per 4-row input group — the arithmetic-intensity fix for
+// read from DRAM ~once instead of once per 4-row input group â€” the arithmetic-intensity fix for
 // the bandwidth-bound host. Tiling reorders only which cells co-compute, never the per-cell
 // arithmetic sequence, so the result is byte-identical to row-at-a-time for any band size.
 
 /// Raw output pointer shared across rayon tasks. SAFETY: each task writes a DISJOINT set of
-/// (output_row, output_channel) cells — output-group bands are partitioned across tasks and each
-/// task owns its channel range [og*4, og*4+4) exclusively — so no two tasks ever touch the same
+/// (output_row, output_channel) cells â€” output-group bands are partitioned across tasks and each
+/// task owns its channel range [og*4, og*4+4) exclusively â€” so no two tasks ever touch the same
 /// cell despite the shared base pointer.
 #[derive(Clone, Copy)]
 struct Q8UnifiedOutPtr(*mut f32);
@@ -13580,7 +13834,7 @@ fn run_q8_0_unified_prefill_tiled(
     // Parallelize over chunks of output-row groups. Each chunk keeps its weight band resident
     // (read once) and sweeps ALL input groups against it.
     (0..num_chunks).into_par_iter().for_each(|chunk_idx| {
-        // Capture the whole wrapper (Copy + Send + Sync), not the bare `*mut f32` field — Rust
+        // Capture the whole wrapper (Copy + Send + Sync), not the bare `*mut f32` field â€” Rust
         // 2021 disjoint closure capture would otherwise grab `out.0` and reject the raw pointer.
         #[allow(clippy::redundant_locals)]
         let out = out;
@@ -13757,7 +14011,7 @@ unsafe fn q8_0_packed_rows4_gemm4_accumulate_block_avx512vnni(
 }
 
 /// 4x8 dispatcher (v3): accumulate ONE input group against TWO weight groups, sharing the input
-/// load (VNNI only — wider AVX-512 register tile). Byte-identical to two independent 4x4 groups.
+/// load (VNNI only â€” wider AVX-512 register tile). Byte-identical to two independent 4x4 groups.
 /// On non-x86 this is never reached at runtime (use_vnni is always false) but must still compile.
 #[inline(always)]
 fn q8_0_unified_accumulate_pair(
@@ -15740,7 +15994,7 @@ unsafe fn q8_0_two_dot_rows_avx2(
     (first_sum, second_sum)
 }
 
-/// Q8×Q8 dot of one weight row read straight from the GGUF **wire** bytes (34-byte
+/// Q8Ã—Q8 dot of one weight row read straight from the GGUF **wire** bytes (34-byte
 /// blocks: a little-endian f16 scale + 32 i8 quants) against a pre-quantized
 /// activation row, dispatching to the same NEON `sdot` path as
 /// `cpu_neon::q8_0_dot_rows_neon_dotprod`. This lets the gemma4 wire-mmap runtime share
@@ -15780,7 +16034,7 @@ pub(crate) fn q8_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
 }
 
 // ---------------------------------------------------------------------------
-// Gemma 4 QAT (Q4_0 / Q6_K) wire kernels — groundwork for the QAT exact rows
+// Gemma 4 QAT (Q4_0 / Q6_K) wire kernels â€” groundwork for the QAT exact rows
 // (gemma-4-E4B_q4_0-it.gguf de-risk row, then 26B A4B). Marked allow(dead_code)
 // until the gemma4 loader's quant-aware wiring lands; unit-tested below.
 // ---------------------------------------------------------------------------
@@ -15790,10 +16044,10 @@ pub(crate) fn q8_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
 /// j+16 in its high nibble; both nibbles are unsigned with a -8 bias).
 pub(crate) const Q4_0_WIRE_BYTES_PER_BLOCK: usize = 18;
 
-/// Q4_0×Q8_0 dot of one weight row read straight from the GGUF wire bytes
+/// Q4_0Ã—Q8_0 dot of one weight row read straight from the GGUF wire bytes
 /// against a pre-quantized activation row. Same accumulation contract as
 /// [`q8_0_wire_row_dot`]: one exact integer dot per 32-weight block, then a
-/// sequential `int_sum * w_scale * x_scale` f32 accumulate — the gemma4 QAT
+/// sequential `int_sum * w_scale * x_scale` f32 accumulate â€” the gemma4 QAT
 /// (Q4_0) lane shares the comparator-pinning doctrine of the Q8 lane rather
 /// than mimicking any particular reference SIMD reduction shape.
 pub(crate) fn q4_0_wire_row_dot(weight_wire: &[u8], input: &[Q8_0Block]) -> f32 {
@@ -15832,7 +16086,7 @@ pub(crate) fn q4_0_wire_row_dot_scalar(weight_wire: &[u8], input: &[Q8_0Block]) 
     total
 }
 
-/// Scalar reference for the interleaved 8-row Q4_0×Q8_0 GEMV. Consumes one
+/// Scalar reference for the interleaved 8-row Q4_0Ã—Q8_0 GEMV. Consumes one
 /// [`crate::tensor::Q4_0PackedRows8`] row-group (`blocks_per_row` interleaved
 /// blocks starting at `group_block_start`) and one Q8 activation row, writing
 /// eight dot products (one per interleaved row) into `out`.
@@ -15878,7 +16132,7 @@ pub(crate) fn q4_0_packed_gemv8_scalar(
     let _ = bpr;
 }
 
-/// Runtime-dispatched interleaved 8-row Q4_0×Q8_0 GEMV: AVX2 when available,
+/// Runtime-dispatched interleaved 8-row Q4_0Ã—Q8_0 GEMV: AVX2 when available,
 /// else the scalar reference above. Both paths are bit-identical to
 /// [`q4_0_wire_row_dot_scalar`] run over the same eight rows.
 #[inline]
@@ -15900,17 +16154,17 @@ pub(crate) fn q4_0_packed_gemv8(
     q4_0_packed_gemv8_scalar(packed, group_block_start, input, out);
 }
 
-/// AVX2 interleaved 8-row Q4_0×Q8_0 GEMV. Ported from llama.cpp's
+/// AVX2 interleaved 8-row Q4_0Ã—Q8_0 GEMV. Ported from llama.cpp's
 /// `gemv_q4_b32_8x8_q8_0_lut_avx` (arch/x86/repack.cpp), tied to the Camelid
 /// scalar contract (nibbles carry a `-8` bias). All 8 output rows accumulate in
 /// parallel in the eight 32-bit lanes of one `__m256i`; nibbles are sign-biased
-/// via a `_mm256_shuffle_epi8` LUT and dotted with `maddubs`+`madd` — no
+/// via a `_mm256_shuffle_epi8` LUT and dotted with `maddubs`+`madd` â€” no
 /// AVX-512-VNNI dependency (the 11800H has none).
 ///
 /// Bit-exact vs [`q4_0_packed_gemv8_scalar`] / [`q4_0_wire_row_dot_scalar`]:
-/// the int32 per-block dot is exact (nibble×i8 pair-sums cannot overflow i16),
+/// the int32 per-block dot is exact (nibbleÃ—i8 pair-sums cannot overflow i16),
 /// integer accumulation is order-independent, and the per-block f32
-/// `isum·w_scale·x_scale` accumulate runs in the same block order.
+/// `isumÂ·w_scaleÂ·x_scale` accumulate runs in the same block order.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn q4_0_packed_gemv8_avx2(
@@ -16063,15 +16317,15 @@ unsafe fn q4_0_packed_gemv8_avx2(
     _mm256_storeu_ps(out.as_mut_ptr(), ordered);
 }
 
-/// int8×int8 pairwise-dot of two `__m256i` where each 32-bit lane holds 4
+/// int8Ã—int8 pairwise-dot of two `__m256i` where each 32-bit lane holds 4
 /// signed bytes of `x` (weights, [-8,7]) and 4 of `y` (activations, [-128,127]),
 /// producing 8 int32 lane-dots added to `acc`. Uses the `maddubs` sign-trick
-/// (no AVX-512-VNNI): `abs(x)` is the unsigned operand, `y·sign(x)` the signed
-/// operand. Bit-exact vs the scalar dot: `|x|` ∈ [0,8] is unsigned-safe, and
+/// (no AVX-512-VNNI): `abs(x)` is the unsigned operand, `yÂ·sign(x)` the signed
+/// operand. Bit-exact vs the scalar dot: `|x|` âˆˆ [0,8] is unsigned-safe, and
 /// because weights are never `i8::MIN`, `sign_epi8` never hits the `-(-128)`
 /// overflow; the only value that could is a `-128` activation, but that lands in
 /// the *signed* operand `y` (`sign_epi8(y,x)` negates `y` only where `x<0`), and
-/// `-128` negated stays `-128` — which is exactly what the scalar path computes
+/// `-128` negated stays `-128` â€” which is exactly what the scalar path computes
 /// too, since `(-8)*(-128) = 1024` would need the *weight* to be the one negated.
 /// The weight is `x`; its abs is taken, so no activation value is ever negated
 /// into a wrong magnitude. Verified bit-exact by
@@ -16133,14 +16387,14 @@ pub(crate) const Q6_K_VALUES_PER_BLOCK: usize = 256;
 pub(crate) const Q6_K_WIRE_BYTES_PER_BLOCK: usize = 210;
 
 /// A 256-value Q8_K activation superblock (the reference's activation format
-/// for K-quant dots). `bsums` are omitted — the q6_K dot does not read them.
+/// for K-quant dots). `bsums` are omitted â€” the q6_K dot does not read them.
 pub(crate) struct Q8KBlock {
     pub d: f32,
     pub qs: [i8; Q6_K_VALUES_PER_BLOCK],
 }
 
 /// The reference's magic-number round-to-nearest-even (`nearest_int`): adding
-/// 1.5·2^23 forces the value into the mantissa with round-to-nearest applied,
+/// 1.5Â·2^23 forces the value into the mantissa with round-to-nearest applied,
 /// matching its quantizer bit-for-bit (plain `round()` half-away-from-zero
 /// would differ on exact .5 ties).
 #[inline]
@@ -16210,8 +16464,8 @@ fn quantize_q8_k_with_bsums(input: &[f32]) -> (Vec<Q8KBlock>, Vec<[i16; 16]>) {
 }
 
 /// Scalar reference dot (parity floor): one TQ2_0 weight row against a Q8_K activation
-/// row. Port of ggml `ggml_vec_dot_tq2_0_q8_K_generic`: per block, sumi = Σ (code-1)·q8,
-/// scaled by d_x·d_y; the 2-bit codes {0,1,2} recenter to {-1,0,+1} via the `-1`.
+/// row. Port of ggml `ggml_vec_dot_tq2_0_q8_K_generic`: per block, sumi = Î£ (code-1)Â·q8,
+/// scaled by d_xÂ·d_y; the 2-bit codes {0,1,2} recenter to {-1,0,+1} via the `-1`.
 fn tq2_0_row_dot(w_row: &[u8], q8: &[Q8KBlock], blocks_per_row: usize) -> f32 {
     let mut sumf = 0f32;
     for b in 0..blocks_per_row {
@@ -16238,7 +16492,7 @@ fn tq2_0_row_dot(w_row: &[u8], q8: &[Q8KBlock], blocks_per_row: usize) -> f32 {
 
 /// AVX2 ternary dot, mirroring ggml `ggml_vec_dot_tq2_0_q8_K`: unpack the 2-bit codes,
 /// `maddubs` against the int8 activations (16-bit accumulate, safe within a 256-block),
-/// subtract the per-group activation sums (`bsums`) to recenter, then scale by d_x·d_y.
+/// subtract the per-group activation sums (`bsums`) to recenter, then scale by d_xÂ·d_y.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn tq2_0_row_dot_avx2(
@@ -16316,10 +16570,10 @@ fn tq2_0_dot(w_row: &[u8], q8: &[Q8KBlock], bsums: &[[i16; 16]], blocks_per_row:
     tq2_0_row_dot(w_row, q8, blocks_per_row)
 }
 
-/// Streaming TQ2_0 (ternary) linear: `output[n_rows, out_dim] = input @ weightᵀ`, with
+/// Streaming TQ2_0 (ternary) linear: `output[n_rows, out_dim] = input @ weightáµ€`, with
 /// the weight held as raw TQ2_0 wire bytes (never materialised to f32). PREFILL TILING:
 /// all `n_rows` activation rows are quantised once, then each weight row is streamed once
-/// (rayon-parallel over the output dimension) and dotted against every token — so the
+/// (rayon-parallel over the output dimension) and dotted against every token â€” so the
 /// weight is read once instead of once-per-token. This is the win llama.cpp's un-tiled
 /// per-element TQ kernel leaves on the table.
 fn matmul_rhs_transposed_tq2_0_block_dot(
@@ -16464,13 +16718,13 @@ fn matmul_rhs_transposed_q6_k_block_dot(
 /// Whether the experimental CPU Q4_K block-dot decode path is enabled. Default
 /// off (fail-closed): without it, Q4_K 2-D linears have no CPU consumer (their
 /// wire bytes are retained for the GPU resident path), so the gate cannot
-/// regress any working CPU behavior — it only adds one.
+/// regress any working CPU behavior â€” it only adds one.
 /// CPU K-quant (Q4_K / Q6_K) decode block-dot. **DEFAULT-ON** (opt out with
 /// `CAMELID_X86_Q4K_DECODE=0`). K-quant 2-D linears load WIRE-ONLY (no f32 `data`)
 /// for the resident GPU engine; with this gate off the CPU linear path has no
 /// consumer for them and errors (`no-row-major-data`, data_len=0). The GPU-resident
 /// decode lane never reaches this chokepoint (it runs q4k_gemv/q6k_gemv on-GPU), so
-/// default-on changes ONLY CPU-mode K-quant decode — turning a hard error into
+/// default-on changes ONLY CPU-mode K-quant decode â€” turning a hard error into
 /// parity-correct output (Q4_K via the AVX2 `q4_k_dot_arm`, Q6_K via the 8-lane
 /// `q6_k_wire_row_dot`). Windows greedy parity is proven vs llama.cpp acd79d6
 /// (K-quant conductor Phase 2); Linux/macOS f32-near-tie parity confirmation is a
@@ -16640,10 +16894,10 @@ pub(crate) fn q6_k_wire_block_dequant(block_bytes: &[u8]) -> [f32; Q6_K_VALUES_P
     out
 }
 
-/// Q6_K×Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// Q6_KÃ—Q8_K dot of one weight row read straight from the GGUF wire bytes,
 /// mirroring the reference generic kernel's numeric shape: per superblock the
-/// 6-bit weights are rebuilt exactly, the per-16-group `scale * Σ(q8·w)`
-/// products accumulate into 8 integer lanes, the superblock's `d_w · d_act`
+/// 6-bit weights are rebuilt exactly, the per-16-group `scale * Î£(q8Â·w)`
+/// products accumulate into 8 integer lanes, the superblock's `d_w Â· d_act`
 /// scales those lanes into 8 f32 accumulators, and the 8 lanes reduce
 /// sequentially at the end.
 pub(crate) fn q6_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
@@ -16696,11 +16950,11 @@ pub(crate) fn q6_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
 
 /// K-quant conductor Phase 2 follow-up: opt-in AVX2 Q6_K row dot
 /// (`CAMELID_X86_Q6K_AVX2`, default-off). BIT-IDENTICAL to [`q6_k_wire_row_dot`]
-/// by construction — it vectorizes ONLY the associative integer `aux32[8]` and
+/// by construction â€” it vectorizes ONLY the associative integer `aux32[8]` and
 /// keeps the load-bearing 8-lane f32 reduction (`sums[l] += d * aux32[l]`, then
 /// the left-fold `sums.iter().sum()`) exactly as the scalar oracle. (The refmath
 /// `q6_k_dot_avx2` is NOT a substitute: it mirrors the single-accumulator
-/// `q6_k_dot_scalar` order, a different bit pattern.) Default-off until measured —
+/// `q6_k_dot_scalar` order, a different bit pattern.) Default-off until measured â€”
 /// CPU decode is bandwidth-bound on the dev box, so this is expected to be ~null.
 #[cfg(target_arch = "x86_64")]
 fn q6k_avx2_enabled() -> bool {
@@ -16737,7 +16991,7 @@ fn q6_k_wire_row_dot_simd(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
     q6_k_wire_row_dot(weight_wire, input)
 }
 
-/// AVX2 sibling of [`q6_k_wire_row_dot`] — see `q6k_avx2_enabled` for the parity
+/// AVX2 sibling of [`q6_k_wire_row_dot`] â€” see `q6k_avx2_enabled` for the parity
 /// contract. Vectorizes the per-superblock integer dot into the oracle's 8
 /// position-lanes (`aux32[l]`), exact integers; the 6-bit rebuild and the f32
 /// reduction stay byte-for-byte identical to the scalar path.
@@ -16774,8 +17028,8 @@ unsafe fn q6_k_wire_row_dot_avx2(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 
             qh += 32;
         }
 
-        // aux32[l] = Σ_j scale_j · (q8[16j+l]·a[16j+l] + q8[16j+8+l]·a[16j+8+l]),
-        // l in 0..8, all exact integers (associative — SIMD lane order is free).
+        // aux32[l] = Î£_j scale_j Â· (q8[16j+l]Â·a[16j+l] + q8[16j+8+l]Â·a[16j+8+l]),
+        // l in 0..8, all exact integers (associative â€” SIMD lane order is free).
         let mut acc = _mm256_setzero_si256();
         let aptr = a.as_ptr();
         let qptr = y.qs.as_ptr();
@@ -16798,7 +17052,7 @@ unsafe fn q6_k_wire_row_dot_avx2(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 
         let mut aux32 = [0i32; 8];
         _mm256_storeu_si256(aux32.as_mut_ptr() as *mut __m256i, acc);
 
-        // Load-bearing 8-lane f32 reduction — identical to the scalar oracle.
+        // Load-bearing 8-lane f32 reduction â€” identical to the scalar oracle.
         for l in 0..8 {
             sums[l] += d * aux32[l] as f32;
         }
@@ -16806,7 +17060,7 @@ unsafe fn q6_k_wire_row_dot_avx2(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 
     sums.iter().sum()
 }
 
-/// Dequantize a single Q4_0 wire block (18 bytes) into 32 f32 values —
+/// Dequantize a single Q4_0 wire block (18 bytes) into 32 f32 values â€”
 /// the row-gather counterpart of [`q4_0_wire_row_dot`] for embedding-style
 /// lookups into Q4_0 tables.
 pub(crate) fn q4_0_wire_block_dequant(block_bytes: &[u8]) -> [f32; 32] {
@@ -16824,14 +17078,14 @@ pub(crate) fn q4_0_wire_block_dequant(block_bytes: &[u8]) -> [f32; 32] {
 pub(crate) const Q4_K_WIRE_BYTES_PER_BLOCK: usize = 144;
 pub(crate) const Q5_0_WIRE_BYTES_PER_BLOCK: usize = 22;
 
-/// Q4_K×Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// Q4_KÃ—Q8_K dot of one weight row read straight from the GGUF wire bytes,
 /// mirroring the reference generic kernel's numeric shape exactly
 /// (`ggml_vec_dot_q4_K_q8_K_generic`): per superblock the nibbles expand
 /// low-then-high in 64-value groups, the packed 6-bit scales/mins unpack via
-/// the kmask scheme, per-32-group `scale * Σ(q8·q4)` products accumulate into
-/// 8 integer lanes scaled by `d_w·d_act`, and the mins side subtracts
-/// `dmin·d_act · Σ(min_g · bsum_g)` with per-16 activation sums (computed
-/// inline; the reference precomputes them as Q8_K `bsums` — identical
+/// the kmask scheme, per-32-group `scale * Î£(q8Â·q4)` products accumulate into
+/// 8 integer lanes scaled by `d_wÂ·d_act`, and the mins side subtracts
+/// `dminÂ·d_act Â· Î£(min_g Â· bsum_g)` with per-16 activation sums (computed
+/// inline; the reference precomputes them as Q8_K `bsums` â€” identical
 /// integers). DiffusionGemma lane: correctness-first scalar, no SIMD.
 // index-based loops intentionally mirror the reference C kernel's structure
 // unit-tested ports of the reference GENERIC kernels (the DG runtime now
@@ -16859,7 +17113,7 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
             }
         }
 
-        // unpack the 8 packed 6-bit (scale, min) pairs — kmask scheme
+        // unpack the 8 packed 6-bit (scale, min) pairs â€” kmask scheme
         let mut utmp = [0u32; 4];
         utmp[0] = u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]);
         utmp[1] = u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]);
@@ -16894,7 +17148,7 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
             ((utmp[3] >> 24) & 0xff) as u8,
         ];
 
-        // mins side: Σ over the 16 per-16 activation sums × min of their group
+        // mins side: Î£ over the 16 per-16 activation sums Ã— min of their group
         let mut sumi = 0i32;
         for j in 0..16 {
             let bsum: i32 = y.qs[j * 16..(j + 1) * 16].iter().map(|&q| q as i32).sum();
@@ -16922,12 +17176,12 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
     sumf + sums.iter().sum::<f32>()
 }
 
-/// Q2_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// Q2_K Ã— Q8_K dot of one weight row read straight from the GGUF wire bytes,
 /// mirroring the reference generic kernel `ggml_vec_dot_q2_K_q8_K`. Each 84-byte
 /// super-block is scales[16] (low nibble = quant scale, high nibble = min scale,
 /// one pair per 16-value sub-block), qs[64] (2-bit quants), d(f16), dmin(f16).
 /// Unlike Q4_K/Q6_K the reference keeps a SINGLE integer `isum` per super-block, so
-/// each super-block contributes `dall·isum − dmin·summs` (subtraction first) to the
+/// each super-block contributes `dallÂ·isum âˆ’ dminÂ·summs` (subtraction first) to the
 /// f32 sum, summed in order. The `q2k_gemv` CUDA kernel reproduces this exactly.
 /// Correctness-first scalar (the reference's "no SIMD" generic shape).
 #[allow(dead_code, clippy::needless_range_loop)]
@@ -16941,14 +17195,14 @@ pub(crate) fn q2_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
         let d = f16_bits_to_f32(u16::from_le_bytes([block[80], block[81]]));
         let dmin = f16_bits_to_f32(u16::from_le_bytes([block[82], block[83]]));
 
-        // mins side: Σ over the 16 sub-blocks of (per-16 activation sum) × min scale
+        // mins side: Î£ over the 16 sub-blocks of (per-16 activation sum) Ã— min scale
         let mut summs = 0i32;
         for j in 0..16 {
             let bsum: i32 = y.qs[j * 16..(j + 1) * 16].iter().map(|&q| q as i32).sum();
             summs += bsum * (scales[j] >> 4) as i32;
         }
 
-        // main side: 2 halves × 4 groups; each group reuses the same 32 qs bytes at
+        // main side: 2 halves Ã— 4 groups; each group reuses the same 32 qs bytes at
         // shift 2*group, split into a low (l<16) and high (l>=16) sub-block, each
         // with its own low-nibble quant scale. q8 advances 32 per group.
         let mut isum = 0i32;
@@ -16983,13 +17237,13 @@ pub(crate) fn q2_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
     sumf
 }
 
-/// Q3_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// Q3_K Ã— Q8_K dot of one weight row read straight from the GGUF wire bytes,
 /// mirroring the reference generic kernel `ggml_vec_dot_q3_K_q8_K`. Each 110-byte
 /// super-block is hmask[32] (high bit of each 3-bit quant), qs[64] (low 2 bits),
 /// scales[12] (16 signed 6-bit scales, kmask-packed), d(f16). Q3_K has NO mins: the
 /// 3-bit quant is reconstructed as `((qs>>shift)&3) - (hmask_bit ? 0 : 4)` (centered
-/// to −4..3) and dequantized as `d·(scale−32)·value`. So each super-block contributes
-/// a single `d·isum` (isum = Σ_sb (scale−32)·Σ q8·value), summed in order. The
+/// to âˆ’4..3) and dequantized as `dÂ·(scaleâˆ’32)Â·value`. So each super-block contributes
+/// a single `dÂ·isum` (isum = Î£_sb (scaleâˆ’32)Â·Î£ q8Â·value), summed in order. The
 /// `q3k_gemv` CUDA kernel reproduces this exactly. Correctness-first scalar.
 #[allow(dead_code, clippy::needless_range_loop)]
 pub(crate) fn q3_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
@@ -17024,8 +17278,8 @@ pub(crate) fn q3_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
             }
         }
 
-        // isum = Σ over the 16 sub-blocks of (scale−32) × Σ q8·value. 2 halves × 4
-        // groups × {low,high}; qs reused per group at shift 2*group; hmask bit advances
+        // isum = Î£ over the 16 sub-blocks of (scaleâˆ’32) Ã— Î£ q8Â·value. 2 halves Ã— 4
+        // groups Ã— {low,high}; qs reused per group at shift 2*group; hmask bit advances
         // per group (1<<(half*4+group)); q8 in natural order.
         let mut isum = 0i32;
         let mut sb = 0usize;
@@ -17063,11 +17317,11 @@ pub(crate) fn q3_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
     sumf
 }
 
-/// Q5_0×Q8_0 dot of one weight row read straight from the GGUF wire bytes,
+/// Q5_0Ã—Q8_0 dot of one weight row read straight from the GGUF wire bytes,
 /// mirroring the reference generic kernel (`ggml_vec_dot_q5_0_q8_0_generic`):
 /// per 32-value block, rebuild the signed 5-bit weights from the nibble plus
 /// its qh bit, accumulate the two half-block integer dots, then scale by
-/// `d_w·d_act`. DiffusionGemma lane: correctness-first scalar, no SIMD.
+/// `d_wÂ·d_act`. DiffusionGemma lane: correctness-first scalar, no SIMD.
 // index-based loops intentionally mirror the reference C kernel's structure
 // unit-tested ports of the reference GENERIC kernels (the DG runtime now
 // uses the ARM-order variants in diffusion_gemma::refmath)
@@ -18144,7 +18398,7 @@ fn try_accumulate_descriptor_linear_row_metal(
     #[cfg(target_os = "macos")]
     {
         // Cheap existing check first so the default path (Metal linear off) short-circuits
-        // before the deterministic-mode env read — zero added work when the flag is unused.
+        // before the deterministic-mode env read â€” zero added work when the flag is unused.
         if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1")
             || deterministic_mode_enabled()
         {
@@ -19007,7 +19261,7 @@ fn matmul_rhs_transposed_q8_0_packed_rows4_prefill_i8mm(
     let mut output = vec![0.0_f32; rows * output_width];
     // The small-M weight-resident kernel absorbs the partial final row group as a
     // zero-padded lane set so the conservative per-row GEMV tail (a full weight pass
-    // per tail row — ruinous for 5-20 row speculative verify chunks) never runs.
+    // per tail row â€” ruinous for 5-20 row speculative verify chunks) never runs.
     let small_m = rows >= 4 && rows.div_ceil(4) <= mac_q8_i8mm_small_m_max_input_groups();
     let packed_rows = if small_m { rows } else { rows / 4 * 4 };
     let collect_q8_schedule = q8_schedule_telemetry_enabled();
@@ -19844,7 +20098,7 @@ fn q8_0_packed_rows4_dot(
                 }
             }
         }
-        // Phase 3: opt-in x86 weight-stream prefetch, two packed blocks ahead — the
+        // Phase 3: opt-in x86 weight-stream prefetch, two packed blocks ahead â€” the
         // x86 mirror of the macOS NEON `prfm` above. Default-off; a memory hint only,
         // so the decoded values are byte-identical regardless of the flag.
         #[cfg(all(
@@ -20217,7 +20471,7 @@ fn try_accumulate_transposed_linear_row_metal(
     #[cfg(target_os = "macos")]
     {
         // Cheap existing check first so the default path (Metal linear off) short-circuits
-        // before the deterministic-mode env read — zero added work when the flag is unused.
+        // before the deterministic-mode env read â€” zero added work when the flag is unused.
         if std::env::var("CAMELID_METAL_LINEAR").ok().as_deref() != Some("1")
             || deterministic_mode_enabled()
         {
@@ -20929,7 +21183,7 @@ fn attention_f32_blocked_dot_enabled() -> bool {
 
 /// Flag gate for the decode attention head-parallel lane
 /// (`BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL`, default off). Scoped to
-/// Windows x86_64 per the standing Windows-first directive — the mechanism
+/// Windows x86_64 per the standing Windows-first directive â€” the mechanism
 /// itself is arch-agnostic (scheduling only, no arithmetic), so lifting the
 /// gate is a one-line follow-up decision, not a code change. Resolved once
 /// per process outside tests.

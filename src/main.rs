@@ -677,6 +677,20 @@ enum Command {
         #[arg(long)]
         threads: Option<usize>,
     },
+    /// Hidden: micro-benchmark rayon fork-join region overhead on the global
+    /// pool (hot = back-to-back regions; cold = workers idle between regions).
+    #[command(hide = true)]
+    BenchRayonRegion {
+        /// Measured regions per point.
+        #[arg(long, default_value_t = 10_000)]
+        iterations: usize,
+        /// Idle time between regions in microseconds (0 = hot).
+        #[arg(long, default_value_t = 0)]
+        idle_us: u64,
+        /// Override Rayon worker threads.
+        #[arg(long)]
+        threads: Option<usize>,
+    },
     /// Hidden: hot-cache micro-benchmark of the attention f32 dot kernels
     /// (legacy scalar chain vs canonical blocked scalar vs blocked AVX2/FMA).
     #[command(hide = true)]
@@ -1647,6 +1661,22 @@ async fn main() -> anyhow::Result<()> {
             configure_rayon_threads(threads)?;
             let report = bench_dense_hotloops(hidden, ffn, repeats, warmup)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Command::BenchRayonRegion {
+            iterations,
+            idle_us,
+            threads,
+        } => {
+            configure_rayon_threads(threads)?;
+            let us_per_region = camelid::inference::rayon_region_microbench(iterations, idle_us);
+            let record = serde_json::json!({
+                "schema": "camelid.bench-rayon-region/v1",
+                "threads": rayon::current_num_threads(),
+                "iterations": iterations,
+                "idle_us_between": idle_us,
+                "us_per_region": us_per_region,
+            });
+            println!("{}", serde_json::to_string(&record)?);
         }
         Command::BenchAttnDot {
             lens,

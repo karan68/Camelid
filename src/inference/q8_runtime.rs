@@ -110,6 +110,27 @@ pub(super) struct ResolvedRuntimePlan {
 
 impl ResolvedRuntimePlan {
     pub(super) fn from_env() -> Result<Self> {
+        // Resolve ONCE per process outside tests: the ~20 env flags below are
+        // fixed post-startup (every lane flag already assumes this via its
+        // own OnceLock), and this constructor used to run on per-op paths —
+        // ~20 raw env::var reads per projection call. Tests keep the uncached
+        // read so env-manipulating tests observe their changes.
+        #[cfg(test)]
+        {
+            Self::from_env_uncached()
+        }
+        #[cfg(not(test))]
+        {
+            static RESOLVED: std::sync::OnceLock<ResolvedRuntimePlan> = std::sync::OnceLock::new();
+            if let Some(plan) = RESOLVED.get() {
+                return Ok(*plan);
+            }
+            let plan = Self::from_env_uncached()?;
+            Ok(*RESOLVED.get_or_init(|| plan))
+        }
+    }
+
+    fn from_env_uncached() -> Result<Self> {
         let q8 = Q8RuntimeFlags::from_env();
         Ok(Self {
             linear_accumulation_precision: diagnostic_linear_accumulation_precision()?,
