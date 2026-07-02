@@ -1,12 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
+import { SUPPORTED_MODELS } from '../../lib/supportedModels'
 import { EvidenceChip } from '../ui/EvidenceChip'
 
-/* Acquire known GGUFs from HuggingFace. Each entry shows which lane it WOULD land in
-   (derived: supported contract match, oracle-qualified runnable, or not-yet-anchored).
-   Download is user-initiated and explicitly confirmed (filename + HF repo + size); no
-   background/auto pulls. After a download completes we run smoke-admission, and the
-   model then appears in its derived local section. */
+/* Zone 5 — Get models. Curated picks first, then live Hugging Face GGUF search
+   (>= 2 chars). Each row shows which lane it WOULD land in (derived: supported
+   contract match, oracle-qualified runnable, or not-yet-anchored). Download is
+   user-initiated and explicitly confirmed (filename + HF repo + size); no
+   background/auto pulls. Live progress renders in the global Downloads zone —
+   rows here only reflect their own acquisition state, read from the shared
+   downloads poll + the live /api/models/local scan (never localStorage). After a
+   download lands, smoke-admission runs for oracle-qualified combos and the model
+   appears in its derived local section. */
 
 const GB = 1024 * 1024 * 1024
 function prettySize(bytes) {
@@ -14,6 +19,10 @@ function prettySize(bytes) {
   if (bytes >= GB) return `${(bytes / GB).toFixed(bytes >= 10 * GB ? 0 : 1)} GB`
   return `${Math.round(bytes / (1024 * 1024))} MB`
 }
+
+/* Curated download suggestions (blurbs, "Recommended") may DECORATE catalog rows,
+   never place them: lane membership and outcome chips stay derived. */
+const CURATED_DECORATION = new Map(SUPPORTED_MODELS.map((item) => [item.catalog_id, item]))
 
 /* Predicted lane for a catalog entry — derived, never a hand-authored label. */
 function predictedLane(item, capabilities) {
@@ -27,52 +36,89 @@ function predictedLane(item, capabilities) {
 }
 
 function laneChip(lane) {
-  if (lane === 'supported') return <EvidenceChip status="supported" asText>Supported lane</EvidenceChip>
-  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Runnable lane</EvidenceChip>
-  return <EvidenceChip state="unsupported" asText>Not yet in a lane</EvidenceChip>
+  if (lane === 'supported') return <EvidenceChip status="supported" asText>Lands in Supported</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText>Lands in Experimental · runnable</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText>Lands in Experimental · unverified</EvidenceChip>
 }
 
-function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
-  // phase: idle | confirm | installing | smoking | done | error
+function CatalogRow({
+  item,
+  capabilities,
+  installed,
+  downloading,
+  apiBase,
+  installAvailable,
+  installBlockedReason,
+  onInstallStarted,
+  onAcquired,
+}) {
+  // phase: idle | confirm | starting | waiting | smoking | done
   const [phase, setPhase] = useState('idle')
-  const [progress, setProgress] = useState(null) // { bytes, total }
   const [message, setMessage] = useState('')
-  const pollRef = useRef(null)
+  const [isError, setIsError] = useState(false)
+  const sawDownloadRef = useRef(false)
+  const startedAtRef = useRef(0)
   const lane = predictedLane(item, capabilities)
+  const decoration = item.group === 'experimental' ? null : CURATED_DECORATION.get(item.catalog_id)
 
-  useEffect(() => () => clearInterval(pollRef.current), [])
+  const finishLanded = useCallback(async () => {
+    // After download: smoke-admission only applies to oracle-qualified combos. For
+    // everything else the file just lands on disk — a machine with the right
+    // support lane can still run it; we don't gate the download on local hardware.
+    if (item.oracle_qualified) {
+      setPhase('smoking')
+      try {
+        const smoke = await fetch(`${apiBase}/api/models/runnable-smoke`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: item.filename }),
+        })
+        const body = await smoke.json().catch(() => ({}))
+        setMessage(
+          smoke.ok && body.passed
+            ? 'Downloaded and smoke-admitted — see it above in its section.'
+            : body?.error?.message
+              ? `Downloaded. Smoke-admission did not pass here: ${body.error.message}`
+              : 'Downloaded. Smoke-admission did not pass on this machine — the file is on disk.',
+        )
+      } catch (err) {
+        setMessage(`Downloaded. Smoke-admission could not run: ${String(err?.message || err)}`)
+      }
+    } else {
+      setMessage('Downloaded — see it above in its section.')
+    }
+    setPhase('done')
+    setIsError(false)
+    onAcquired?.()
+  }, [apiBase, item.filename, item.oracle_qualified, onAcquired])
 
-  const pollUntilDone = useCallback(async () => {
-    return new Promise((resolve) => {
-      pollRef.current = setInterval(async () => {
-        try {
-          const res = await fetch(`${apiBase}/api/models/catalog/downloads`)
-          const list = res.ok ? await res.json() : []
-          const dl = list.find((d) => d.filename === item.filename)
-          if (dl) {
-            setProgress({ bytes: dl.bytes_downloaded, total: dl.total_bytes || item.size_bytes })
-            if (dl.status === 'failed') {
-              clearInterval(pollRef.current)
-              resolve(false)
-            }
-          } else {
-            // No longer downloading — confirm the file actually landed on disk.
-            clearInterval(pollRef.current)
-            const localRes = await fetch(`${apiBase}/api/models/local`)
-            const local = localRes.ok ? await localRes.json() : { models: [] }
-            resolve(local.models.some((m) => m.filename === item.filename))
-          }
-        } catch {
-          /* transient; keep polling */
-        }
-      }, 1500)
-    })
-  }, [apiBase, item.filename, item.size_bytes])
+  // The row watches the SHARED downloads poll + local scan instead of polling
+  // itself: downloading -> (gone + on disk) = landed; (gone + not on disk after
+  // having been seen) = failed or canceled.
+  useEffect(() => {
+    if (phase !== 'waiting') return
+    if (downloading) {
+      sawDownloadRef.current = true
+      return
+    }
+    if (installed) {
+      finishLanded()
+      return
+    }
+    const waitedMs = Date.now() - startedAtRef.current
+    if (sawDownloadRef.current || waitedMs > 20000) {
+      setPhase('idle')
+      setIsError(true)
+      setMessage('Download did not complete (canceled or failed). It can be retried.')
+    }
+  }, [phase, downloading, installed, finishLanded])
 
   const confirmDownload = async () => {
-    setPhase('installing')
+    setPhase('starting')
     setMessage('')
-    setProgress({ bytes: 0, total: item.size_bytes })
+    setIsError(false)
+    sawDownloadRef.current = false
+    startedAtRef.current = Date.now()
     try {
       const res = await fetch(`${apiBase}/api/models/catalog/install`, {
         method: 'POST',
@@ -88,46 +134,23 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
         const text = await res.text()
         throw new Error(text || `download failed (HTTP ${res.status})`)
       }
-      const completed = await pollUntilDone()
-      if (!completed) throw new Error('download did not complete')
-
-      // After download: smoke-admission only applies to oracle-qualified combos. For
-      // everything else the file just lands on disk — a machine with the right
-      // support lane can still run it; we don't gate the download on local hardware.
-      if (item.oracle_qualified) {
-        setPhase('smoking')
-        const smoke = await fetch(`${apiBase}/api/models/runnable-smoke`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ filename: item.filename }),
-        })
-        const body = await smoke.json().catch(() => ({}))
-        setPhase('done')
-        setMessage(
-          smoke.ok && body.passed
-            ? 'Downloaded and smoke-admitted — see it above in its lane section.'
-            : body?.error?.message
-              ? `Downloaded. Smoke-admission did not pass here: ${body.error.message}`
-              : 'Downloaded. Smoke-admission did not pass on this machine — the file is on disk.',
-        )
-      } else {
-        setPhase('done')
-        setMessage('Downloaded — on disk now. Not in the runnable lane; a machine with the right support lane can run it.')
-      }
-      onAcquired?.()
+      setPhase('waiting')
+      onInstallStarted?.()
     } catch (err) {
-      setPhase('error')
+      setPhase('idle')
+      setIsError(true)
       setMessage(String(err?.message || err))
     }
   }
-
-  const pct = progress && progress.total ? Math.min(100, Math.round((progress.bytes / progress.total) * 100)) : 0
 
   return (
     <article className={`catalog-row${lane === 'not_anchored' ? ' catalog-row--advisory' : ''}`}>
       <div className="catalog-row-head">
         <div className="catalog-row-id">
-          <span className="catalog-row-name">{item.name}</span>
+          <span className="catalog-row-name">
+            {item.name}
+            {decoration?.recommended ? <span className="catalog-row-recommended">Recommended</span> : null}
+          </span>
           <span className="catalog-row-meta">
             {item.repo_id} · {item.filename} · {prettySize(item.size_bytes)}
             {item.architecture ? ` · ${item.architecture}` : ''}
@@ -135,9 +158,10 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
         </div>
         {laneChip(lane)}
       </div>
+      {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
 
       {installed ? (
-        <p className="catalog-row-faint">Already on disk — shown in its lane section above.</p>
+        <p className="catalog-row-faint">Already on disk — shown in its section above.</p>
       ) : phase === 'idle' ? (
         <>
           {item.group === 'experimental' ? (
@@ -149,12 +173,22 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
           ) : lane === 'not_anchored' ? (
             <p className="catalog-row-faint">
               Its {item.architecture}/{item.quant} combo is not yet in the runnable lane — still
-              downloadable; a machine with the right support lane can run it.
+              downloadable; it lands in Experimental and loads through the experimental chat path.
             </p>
           ) : null}
-          <button type="button" className="catalog-row-action" onClick={() => setPhase('confirm')}>
-            Download…
-          </button>
+          {message ? <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p> : null}
+          {installAvailable ? (
+            <button type="button" className="catalog-row-action" onClick={() => setPhase('confirm')}>
+              Download…
+            </button>
+          ) : (
+            <>
+              <button type="button" className="catalog-row-action" disabled>
+                Download unavailable
+              </button>
+              <p className="catalog-row-faint">{installBlockedReason}</p>
+            </>
+          )}
         </>
       ) : phase === 'confirm' ? (
         <div className="catalog-confirm">
@@ -171,23 +205,14 @@ function CatalogRow({ item, capabilities, installed, apiBase, onAcquired }) {
             </button>
           </div>
         </div>
-      ) : phase === 'installing' ? (
-        <button
-          type="button"
-          className={`catalog-row-action catalog-row-action--progress${pct === 0 ? ' is-indeterminate' : ''}`}
-          disabled
-          aria-label={`Downloading, ${pct} percent`}
-          aria-busy="true"
-        >
-          <span className="catalog-row-action__fill" style={{ width: `${pct}%` }} aria-hidden="true" />
-          <span className="catalog-row-action__label">
-            Downloading {pct}% · {prettySize(progress?.bytes)} / {prettySize(progress?.total)}
-          </span>
-        </button>
+      ) : phase === 'starting' || phase === 'waiting' ? (
+        <p className="catalog-row-faint">
+          {downloading ? 'Downloading — live progress in Downloads above.' : 'Starting download…'}
+        </p>
       ) : phase === 'smoking' ? (
         <p className="catalog-row-faint">Download complete — running smoke-admission…</p>
       ) : (
-        <p className={phase === 'error' ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p>
+        <p className={isError ? 'catalog-row-error' : 'catalog-row-faint'}>{message}</p>
       )}
     </article>
   )
@@ -203,7 +228,7 @@ function ExperimentalMarker() {
   )
 }
 
-function CatalogGroup({ title, marker, items, capabilities, localNames, base, onAcquired, emptyText }) {
+function CatalogGroup({ title, marker, items, emptyText, renderRow }) {
   return (
     <section className="catalog-group">
       <div className="catalog-group-head">
@@ -211,26 +236,25 @@ function CatalogGroup({ title, marker, items, capabilities, localNames, base, on
         {marker}
       </div>
       <div className="catalog-list">
-        {items.map((item) => (
-          <CatalogRow
-            key={item.catalog_id}
-            item={item}
-            capabilities={capabilities}
-            installed={localNames.has(item.filename)}
-            apiBase={base}
-            onAcquired={onAcquired}
-          />
-        ))}
+        {items.map(renderRow)}
         {items.length === 0 ? <p className="lane-empty">{emptyText}</p> : null}
       </div>
     </section>
   )
 }
 
-export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
+export function CatalogLaneBrowse({
+  apiBase = '',
+  capabilities,
+  localFilenames = new Set(),
+  downloads = [],
+  installAvailable = true,
+  installBlockedReason = '',
+  onInstallStarted,
+  onAcquired,
+}) {
   const base = (apiBase || '').replace(/\/$/, '')
   const [items, setItems] = useState(null)
-  const [localNames, setLocalNames] = useState(new Set())
   const [query, setQuery] = useState('')
   const [debouncedQuery, setDebouncedQuery] = useState('')
   const [nextCursor, setNextCursor] = useState(null)
@@ -247,18 +271,11 @@ export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
     setError('')
     try {
       const params = debouncedQuery ? `?query=${encodeURIComponent(debouncedQuery)}` : ''
-      const [cat, local] = await Promise.all([
-        fetch(`${base}/api/models/catalog${params}`),
-        fetch(`${base}/api/models/local`),
-      ])
-      if (!cat.ok) throw new Error(`catalog HTTP ${cat.status}`)
-      const catBody = await cat.json()
-      setItems(catBody.items || [])
-      setNextCursor(catBody.next_cursor || null)
-      if (local.ok) {
-        const lb = await local.json()
-        setLocalNames(new Set((lb.models || []).map((m) => m.filename)))
-      }
+      const res = await fetch(`${base}/api/models/catalog${params}`)
+      if (!res.ok) throw new Error(`catalog HTTP ${res.status}`)
+      const body = await res.json()
+      setItems(body.items || [])
+      setNextCursor(body.next_cursor || null)
     } catch (err) {
       setError(String(err?.message || err))
     }
@@ -290,7 +307,23 @@ export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
     }
   }, [base, debouncedQuery, nextCursor])
 
-  if (items === null && !error) return <p className="lane-empty">Loading catalog…</p>
+  const downloadingNames = new Set(
+    downloads.filter((d) => d.status === 'downloading').map((d) => d.filename),
+  )
+  const renderRow = (item) => (
+    <CatalogRow
+      key={item.catalog_id}
+      item={item}
+      capabilities={capabilities}
+      installed={localFilenames.has(item.filename)}
+      downloading={downloadingNames.has(item.filename)}
+      apiBase={base}
+      installAvailable={installAvailable}
+      installBlockedReason={installBlockedReason}
+      onInstallStarted={onInstallStarted}
+      onAcquired={onAcquired}
+    />
+  )
 
   const curated = (items || []).filter((it) => it.group !== 'experimental')
   const experimental = (items || []).filter((it) => it.group === 'experimental')
@@ -299,44 +332,45 @@ export function CatalogLaneBrowse({ apiBase = '', capabilities, onAcquired }) {
   return (
     <div className="catalog-lane-browse">
       <div className="local-lane-head">
-        <h2>Catalog — acquire from HuggingFace</h2>
+        <h2>Get models</h2>
       </div>
       <p className="local-lane-intro">
-        Curated rows are pinned and known-good. Searching also browses live Hugging Face GGUFs as an
+        Curated picks are pinned and known-good. Searching also browses live Hugging Face GGUFs as an
         experimental group — those are unverified and carry no parity claim. Downloads are explicit
-        and confirmed; after a download we run smoke-admission and the model joins its lane section
-        above.
+        and confirmed; progress appears in Downloads above, and the model joins its derived section
+        when the file lands.
       </p>
       <input
         className="catalog-search"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
-        placeholder="Search curated rows and live Hugging Face GGUFs (name, repo, filename)"
+        placeholder="Search curated picks and live Hugging Face GGUFs (name, repo, filename)"
       />
-      {error ? <p className="lane-error">{error}</p> : null}
+      {error ? (
+        <p className="lane-error">
+          {items === null ? `Catalog unavailable: ${error}` : error}
+        </p>
+      ) : null}
+      {items === null && !error ? <p className="lane-empty">Loading catalog…</p> : null}
 
-      <CatalogGroup
-        title="Curated"
-        marker={null}
-        items={curated}
-        capabilities={capabilities}
-        localNames={localNames}
-        base={base}
-        onAcquired={onAcquired}
-        emptyText="No curated entries match."
-      />
+      {items !== null || error ? (
+        <CatalogGroup
+          title="Curated"
+          marker={null}
+          items={curated}
+          emptyText={debouncedQuery ? 'No curated entries match.' : 'No curated entries available.'}
+          renderRow={renderRow}
+        />
+      ) : null}
 
-      {searching ? (
+      {searching && items !== null ? (
         <>
           <CatalogGroup
             title="Experimental (Hugging Face)"
             marker={<ExperimentalMarker />}
             items={experimental}
-            capabilities={capabilities}
-            localNames={localNames}
-            base={base}
-            onAcquired={onAcquired}
             emptyText="No live Hugging Face GGUFs match (or the Hub is unreachable)."
+            renderRow={renderRow}
           />
           {nextCursor ? (
             <button

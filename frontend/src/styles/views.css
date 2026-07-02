@@ -1352,6 +1352,12 @@
 .lane-row-loaded { font-size: var(--text-xs); font-weight: 700; color: var(--color-text); margin: var(--space-2) 0 0; }
 .lane-empty { font-size: var(--text-sm); color: var(--color-text-muted); }
 
+/* ---- Models tab: Zone 4 downloads in progress ---- */
+.downloads-row .lane-row-head { align-items: center; }
+.downloads-cancel { margin-top: 0; }
+.downloads-progress { margin-top: var(--space-2); height: 6px; border-radius: var(--radius-pill); background: var(--color-chip); overflow: hidden; }
+.downloads-progress span { display: block; height: 100%; background: var(--color-evidence); border-radius: var(--radius-pill); transition: width 0.6s ease; }
+
 /* ---- Models tab: HuggingFace catalog (lane-aware acquire) ---- */
 .catalog-lane-browse { margin-top: var(--space-5); border-top: 1px solid var(--color-border-soft); padding-top: var(--space-3); }
 .catalog-search { width: 100%; margin: var(--space-2) 0 var(--space-3); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-surface); color: var(--color-text); font-size: var(--text-sm); }
@@ -1372,6 +1378,8 @@
 .catalog-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); }
 .catalog-row-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .catalog-row-name { font-weight: 600; }
+.catalog-row-recommended { margin-left: var(--space-2); font-size: var(--text-xs); font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-accent); }
+.catalog-row-blurb { font-size: var(--text-sm); color: var(--color-text-muted); margin: var(--space-2) 0 0; }
 .catalog-row-meta { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted); overflow-wrap: anywhere; }
 .catalog-row-note { font-size: var(--text-sm); color: var(--color-text); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
 .catalog-row-faint { font-size: var(--text-xs); color: var(--color-text-faint); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }

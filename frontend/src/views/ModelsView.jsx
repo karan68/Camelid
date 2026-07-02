@@ -4,12 +4,12 @@ import { capabilityStatusTone, compatibilityHintCopy, compatibilityHintLabel, co
 import { getChatGateState } from '../lib/chatGate'
 import { formatBytes, formatCompactNumber } from '../lib/formatters'
 import { canLoadIntoRuntime, describeModelState, getModelStatusLabel, hasLocalModelPath, isExternalModel, isHostedRoutingAvailable, isModelGenerationReady, isModelLoadedNow, modelRuntimeIdMatches } from '../lib/modelState'
-import { SupportedModels } from '../components/models/SupportedModels'
 import { ModelInspector } from '../components/models/ModelInspector'
 import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
+import { DownloadsPanel } from '../components/models/DownloadsPanel'
 import { UnsupportedBlocker } from '../components/models/UnsupportedBlocker'
 import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow } from '../components/models/LaneRows'
 import { useModelsPageData } from '../hooks/useModelsPageData'
@@ -471,6 +471,20 @@ export default function ModelsView({
     }
   }
 
+  const [cancelingDownloads, setCancelingDownloads] = useState(new Set())
+  const cancelDownloadById = async (id) => {
+    setCancelingDownloads((s) => new Set([...s, id]))
+    try {
+      await spine.cancelDownload(id)
+    } finally {
+      setCancelingDownloads((s) => {
+        const next = new Set(s)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
   const runSmoke = async (filename) => {
     setSmokeBusy((b) => ({ ...b, [filename]: true }))
     setLaneError('')
@@ -806,18 +820,26 @@ export default function ModelsView({
         )}
       </Section>
 
-      <SupportedModels
-        models={models}
-        runtime={runtime}
-        apiBase={catalogApiBase || apiBase}
-        installCatalogModel={installCatalogModel}
-        cancelModelDownload={cancelModelDownload}
-        activateModel={activateModel}
-        loadingModelId={loadingModelId}
+      {/* Zone 4 — downloads in progress (global; hidden while idle) */}
+      <DownloadsPanel
+        downloads={spine.downloads}
+        cancelingIds={cancelingDownloads}
+        onCancel={cancelDownloadById}
       />
+
+      {/* Zone 5 — get models: curated picks + live Hugging Face search */}
       <CatalogLaneBrowse
         apiBase={catalogApiBase || apiBase}
         capabilities={capabilities}
+        localFilenames={spine.localFilenames}
+        downloads={spine.downloads}
+        installAvailable={runtimeOnline && catalogInstallAvailable}
+        installBlockedReason={
+          !runtimeOnline
+            ? 'The runtime is offline — start the Camelid backend to download models.'
+            : 'The backend does not advertise a catalog-install capability, so downloads stay disabled.'
+        }
+        onInstallStarted={spine.kickDownloadsPoll}
         onAcquired={() => spine.refreshLocal()}
       />
 
