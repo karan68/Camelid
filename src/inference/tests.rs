@@ -11682,3 +11682,332 @@ fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
         "decode attention parallel lane diverged from serial in {mismatches} element(s)"
     );
 }
+
+/// Item 3 Lane A bitwise lock: the head-major KV layout is address math only.
+/// (KV content magnitudes cap below the f16 finite max — the real write path
+/// f16-rounds every stored element, on main too, and inf KV rejects softmax.)
+/// For every GQA shape, head_dim, and position count: build one cache per
+/// layout, drive them through the REAL write paths (write_kv_cache /
+/// write_kv_cache_batch) including growth re-layout (positions > the 256
+/// grow chunk), a rollback + divergent overwrite sequence, and the CUDA
+/// mirror-back accessor pattern (offset-addressed per (position, head)
+/// writes, covering copy_resident_cuda_kv_to_host); then assert (a) logical
+/// buffer equality element-by-element via offset(), and (b) bitwise-equal
+/// attention outputs in both scheduling modes and both dot lanes.
+#[test]
+fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
+    struct XorShift64Star(u64);
+    impl XorShift64Star {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn next_f32(&mut self) -> f32 {
+            let unit = ((self.next_u64() >> 40) as f32) / (1u64 << 24) as f32 - 0.5;
+            match self.next_u64() % 8 {
+                0 => unit * f32::MIN_POSITIVE * 0.5,
+                1 => unit * 1e-12,
+                2..=4 => unit * 2.0,
+                5 => unit * 1e4,
+                // Cap below the f16 finite max (65504): the REAL write path
+                // rounds every stored element through f16, so bigger inputs
+                // become ±inf in the cache (true on main too) and inf KV
+                // makes softmax reject the row.
+                _ => unit * 6e4,
+            }
+        }
+        fn fill(&mut self, len: usize) -> Vec<f32> {
+            (0..len).map(|_| self.next_f32()).collect()
+        }
+    }
+
+    let gqa_shapes = [(32usize, 4usize), (24, 8), (32, 8)];
+    let head_dims = [64usize, 128];
+    let position_counts = [2usize, 63, 64, 65, 511, 2048];
+    let cases_per_point = 8u64;
+
+    let mut points = Vec::new();
+    for &(attention_heads, kv_heads) in &gqa_shapes {
+        for &head_dim in &head_dims {
+            for &position_count in &position_counts {
+                for case in 0..cases_per_point {
+                    points.push((attention_heads, kv_heads, head_dim, position_count, case));
+                }
+            }
+        }
+    }
+
+    let mismatches: usize = points
+        .par_iter()
+        .map(
+            |&(attention_heads, kv_heads, head_dim, position_count, case)| {
+                let mut rng = XorShift64Star(
+                    0x1a1e_0001
+                        ^ ((attention_heads as u64) << 48)
+                        ^ ((kv_heads as u64) << 40)
+                        ^ ((head_dim as u64) << 24)
+                        ^ ((position_count as u64) << 8)
+                        ^ case,
+                );
+                let width = kv_heads * head_dim;
+                let plan = || LlamaKvCachePlan {
+                    // max_sequence_length >= 512 engages the 256-position grow
+                    // chunking, so deep points exercise the head-major
+                    // re-layout-on-growth path.
+                    max_sequence_length: position_count.max(512),
+                    layer_count: 2,
+                    kv_head_count: kv_heads,
+                    head_dim,
+                    key_shape: vec![2, position_count.max(512), kv_heads, head_dim],
+                    value_shape: vec![2, position_count.max(512), kv_heads, head_dim],
+                };
+                let mut pm = LlamaKvCache::new_with_layout(plan(), KvLayout::PositionMajor)
+                    .expect("pm cache");
+                let mut hm =
+                    LlamaKvCache::new_with_layout(plan(), KvLayout::HeadMajor).expect("hm cache");
+                let mut pm16 = LlamaKvCache::new_with_layout_and_dtype(
+                    plan(),
+                    KvLayout::PositionMajor,
+                    KvDtype::F16,
+                )
+                .expect("pm16 cache");
+                let mut hm16 = LlamaKvCache::new_with_layout_and_dtype(
+                    plan(),
+                    KvLayout::HeadMajor,
+                    KvDtype::F16,
+                )
+                .expect("hm16 cache");
+
+                // Phase A: append `position_count` tokens through the real
+                // single-token write path on layer 0 and the batch path on
+                // layer 1 (same data), on BOTH caches.
+                let mut token_rows = Vec::with_capacity(position_count);
+                for _ in 0..position_count {
+                    token_rows.push((rng.fill(width), rng.fill(width)));
+                }
+                for (p, (k_row, v_row)) in token_rows.iter().enumerate() {
+                    let k = CpuTensor::from_f32("k", vec![1, width], k_row.clone()).unwrap();
+                    let v = CpuTensor::from_f32("v", vec![1, width], v_row.clone()).unwrap();
+                    for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                        cache.position = p;
+                        write_kv_cache(cache, 0, &k, &v).expect("write layer0");
+                    }
+                }
+                let flat_k: Vec<f32> = token_rows.iter().flat_map(|(k, _)| k.clone()).collect();
+                let flat_v: Vec<f32> = token_rows.iter().flat_map(|(_, v)| v.clone()).collect();
+                let bk = CpuTensor::from_f32("bk", vec![position_count, width], flat_k).unwrap();
+                let bv = CpuTensor::from_f32("bv", vec![position_count, width], flat_v).unwrap();
+                for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                    write_kv_cache_batch(cache, 1, 0, &bk, &bv).expect("batch write");
+                    cache.position = position_count - 1;
+                }
+
+                // Phase B: rollback to half depth and overwrite the tail with
+                // DIFFERENT data (spec-decode shape), through the real path.
+                if position_count >= 4 {
+                    let half = position_count / 2;
+                    for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                        cache.rollback_to_position(half).unwrap();
+                    }
+                    for p in half..position_count {
+                        let k = CpuTensor::from_f32("k2", vec![1, width], rng.fill(width)).unwrap();
+                        let v = CpuTensor::from_f32("v2", vec![1, width], rng.fill(width)).unwrap();
+                        for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                            cache.position = p;
+                            write_kv_cache(cache, 0, &k, &v).expect("overwrite layer0");
+                        }
+                    }
+                    for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                        cache.position = position_count - 1;
+                    }
+                }
+
+                // Phase C: CUDA mirror-back pattern (copy_resident_cuda_kv_to_host):
+                // per-(position, head) stores of f16-exact rows into layer 1
+                // through the canonical store, exactly like the fixed site.
+                for p in 0..position_count.min(8) {
+                    for h in 0..kv_heads {
+                        let row: Vec<f32> = (0..head_dim)
+                            .map(|_| f16_bits_to_f32(f32_to_f16_bits(rng.next_f32())))
+                            .collect();
+                        for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                            cache.store_kv_head_row(1, p, h, &row, &row);
+                        }
+                    }
+                }
+
+                let mut mismatch = 0usize;
+
+                // (a) Logical buffer equality across layouts, every element.
+                for layer in 0..2 {
+                    for p in 0..position_count {
+                        for h in 0..kv_heads {
+                            let po = pm.offset(layer, p, h);
+                            let ho = hm.offset(layer, p, h);
+                            for d in 0..head_dim {
+                                if pm.keys[po + d].to_bits() != hm.keys[ho + d].to_bits()
+                                    || pm.values[po + d].to_bits() != hm.values[ho + d].to_bits()
+                                {
+                                    mismatch += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // (b) Attention outputs bitwise-equal across layouts, both
+                // scheduling modes, both dot lanes (pinned per head, env-free).
+                let query = rng.fill(attention_heads * head_dim);
+                let scale = 1.0 / (head_dim as f32).sqrt();
+                let repeats = attention_heads / kv_heads;
+                // is_x86_feature_detected! cannot COMPILE on non-x86 targets
+                // (aarch64 macOS CI), so this needs a cfg split, not cfg!().
+                #[cfg(target_arch = "x86_64")]
+                let dot_lanes: &[bool] = if std::arch::is_x86_feature_detected!("avx2")
+                    && std::arch::is_x86_feature_detected!("fma")
+                {
+                    &[false, true]
+                } else {
+                    &[false]
+                };
+                #[cfg(not(target_arch = "x86_64"))]
+                let dot_lanes: &[bool] = &[false];
+                for layer in 0..2 {
+                    for &parallel in &[false, true] {
+                        let run = |cache: &LlamaKvCache| {
+                            let params = DecodeAttentionHeadsParams {
+                                kv_cache: cache,
+                                layer_idx: layer,
+                                query_data: &query,
+                                attention_heads,
+                                repeats,
+                                kv_heads,
+                                head_mapping: GqaHeadMapping::Grouped,
+                                position_count,
+                                scale,
+                            };
+                            let mut out = vec![0.0f32; attention_heads * head_dim];
+                            decode_attention_all_heads_into_with_mode(&params, &mut out, parallel)
+                                .expect("attention");
+                            out
+                        };
+                        let a = run(&pm);
+                        let b = run(&hm);
+                        for (x, y) in a.iter().zip(&b) {
+                            if x.to_bits() != y.to_bits() {
+                                mismatch += 1;
+                            }
+                        }
+                    }
+                    for &use_blocked in dot_lanes {
+                        let mut scores = Vec::new();
+                        for head in 0..attention_heads {
+                            let kv_head = map_attention_head_to_kv_head(
+                                head,
+                                repeats,
+                                kv_heads,
+                                GqaHeadMapping::Grouped,
+                            );
+                            let mut out_pm = vec![0.0f32; head_dim];
+                            let mut out_hm = vec![0.0f32; head_dim];
+                            for (cache, out) in [(&pm, &mut out_pm), (&hm, &mut out_hm)] {
+                                attention_context_for_head_into_with_kernels(
+                                    AttentionContextHeadParams {
+                                        kv_cache: cache,
+                                        layer_idx: layer,
+                                        kv_head,
+                                        query_slice: &query[head * head_dim..(head + 1) * head_dim],
+                                        position_count,
+                                        scale,
+                                    },
+                                    out,
+                                    &mut scores,
+                                    use_blocked,
+                                )
+                                .expect("pinned attention");
+                            }
+                            for (x, y) in out_pm.iter().zip(&out_hm) {
+                                if x.to_bits() != y.to_bits() {
+                                    mismatch += 1;
+                                }
+                            }
+
+                            // Lane B: f16 storage under the blocked lane must
+                            // be bitwise-equal to f32 storage under the
+                            // blocked lane, in both layouts (the values are
+                            // identical — the write path always rounded — and
+                            // the fused kernel is expand-then-blocked).
+                            if use_blocked {
+                                let mut out_pm16 = vec![0.0f32; head_dim];
+                                let mut out_hm16 = vec![0.0f32; head_dim];
+                                for (cache, out) in [(&pm16, &mut out_pm16), (&hm16, &mut out_hm16)]
+                                {
+                                    attention_context_for_head_into_with_kernels(
+                                        AttentionContextHeadParams {
+                                            kv_cache: cache,
+                                            layer_idx: layer,
+                                            kv_head,
+                                            query_slice: &query
+                                                [head * head_dim..(head + 1) * head_dim],
+                                            position_count,
+                                            scale,
+                                        },
+                                        out,
+                                        &mut scores,
+                                        true,
+                                    )
+                                    .expect("pinned f16 attention");
+                                }
+                                for ((x, y), z) in out_pm.iter().zip(&out_pm16).zip(&out_hm16) {
+                                    if x.to_bits() != y.to_bits() || y.to_bits() != z.to_bits() {
+                                        mismatch += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // (c) Logical content equality across dtypes: the f16 caches
+                // expand to exactly the values the f32 caches hold.
+                let mut row_ref = vec![0.0f32; head_dim];
+                let mut row_alt = vec![0.0f32; head_dim];
+                for layer in 0..2 {
+                    for p in 0..position_count {
+                        for h in 0..kv_heads {
+                            pm.copy_key_row_into(layer, p, h, &mut row_ref);
+                            for cache in [&pm16, &hm16] {
+                                cache.copy_key_row_into(layer, p, h, &mut row_alt);
+                                for (x, y) in row_ref.iter().zip(&row_alt) {
+                                    if x.to_bits() != y.to_bits() {
+                                        mismatch += 1;
+                                    }
+                                }
+                            }
+                            pm.copy_value_row_into(layer, p, h, &mut row_ref);
+                            for cache in [&pm16, &hm16] {
+                                cache.copy_value_row_into(layer, p, h, &mut row_alt);
+                                for (x, y) in row_ref.iter().zip(&row_alt) {
+                                    if x.to_bits() != y.to_bits() {
+                                        mismatch += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                mismatch
+            },
+        )
+        .sum();
+
+    assert_eq!(
+        mismatches, 0,
+        "KV layout/dtype lanes diverged from the position-major f32 reference in \
+         {mismatches} element(s)"
+    );
+}
