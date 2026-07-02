@@ -14,8 +14,8 @@
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
 use crate::tensor::{
-    decode_q4_0_tensor, decode_q4_k_tensor, decode_q5_k_tensor, decode_q6_k_tensor,
-    decode_q8_0_tensor, f16_bits_to_f32,
+    decode_q3_k_tensor, decode_q4_0_tensor, decode_q4_k_tensor, decode_q5_k_tensor,
+    decode_q6_k_tensor, decode_q8_0_tensor, f16_bits_to_f32,
 };
 
 /// Dequantize one tensor's wire bytes to a flat row-major `Vec<f32>` of
@@ -31,12 +31,13 @@ pub fn dequantize(
         GgufTensorType::F16 => dequantize_f16(bytes, n_elements, tensor_name),
         GgufTensorType::Q8_0 => decode_q8_0_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q4_0 => decode_q4_0_tensor(tensor_name, bytes, n_elements),
+        GgufTensorType::Q3K => decode_q3_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q4K => decode_q4_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q5K => decode_q5_k_tensor(tensor_name, bytes, n_elements),
         GgufTensorType::Q6K => decode_q6_k_tensor(tensor_name, bytes, n_elements),
         other => Err(BackendError::UnsupportedTensorType(format!(
             "tensor {tensor_name} is {other:?}; runnable dequant covers \
-             F32, F16, Q8_0, Q4_0, Q4_K, Q5_K, Q6_K"
+             F32, F16, Q8_0, Q4_0, Q3_K, Q4_K, Q5_K, Q6_K"
         ))),
     }
 }

@@ -180,6 +180,7 @@ fn is_covered_quant(tt: GgufTensorType) -> bool {
             | GgufTensorType::Q6K
             | GgufTensorType::Q5K
             | GgufTensorType::Q4K
+            | GgufTensorType::Q3K
             | GgufTensorType::Q4_0
     )
 }
@@ -294,6 +295,7 @@ mod tests {
         for tt in [
             GgufTensorType::F16,
             GgufTensorType::Q4_0,
+            GgufTensorType::Q3K,
             GgufTensorType::Q4K,
             GgufTensorType::Q5K,
             GgufTensorType::Q6K,
@@ -327,12 +329,14 @@ mod tests {
     #[test]
     fn rejects_unknown_quant_naming_tensor() {
         let mut file = base_fixture();
-        // Q3_K is an explicit v1 gap (deferred to v1.1).
+        // Q2_K has no runnable-lane dequant (resident-GPU-engine only) — the
+        // runnable admission must reject it. (Q3_K, formerly the example here,
+        // was covered by the Ornith constrained-VRAM conductor's Q3_K_M lane.)
         file.tensors
-            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q3K));
-        let reject = admit(&file).expect_err("Q3_K must reject");
+            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q2K));
+        let reject = admit(&file).expect_err("Q2_K must reject");
         assert_eq!(reject.axis, AdmissionAxis::Quant);
-        assert_eq!(reject.offending_value, "Q3K");
+        assert_eq!(reject.offending_value, "Q2K");
         assert_eq!(reject.tensor.as_deref(), Some("blk.12.ffn_down.weight"));
         assert!(reject.message.contains("blk.12.ffn_down.weight"));
     }
@@ -383,11 +387,11 @@ mod tests {
     fn reject_serializes_to_machine_readable_json() {
         let mut file = base_fixture();
         file.tensors
-            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q3K));
-        let reject = admit(&file).expect_err("Q3_K must reject");
+            .push(tensor("blk.12.ffn_down.weight", GgufTensorType::Q2K));
+        let reject = admit(&file).expect_err("Q2_K must reject");
         let json = serde_json::to_value(&reject).expect("reject serializes");
         assert_eq!(json["axis"], "quant");
-        assert_eq!(json["offending_value"], "Q3K");
+        assert_eq!(json["offending_value"], "Q2K");
         assert_eq!(json["tensor"], "blk.12.ffn_down.weight");
     }
 

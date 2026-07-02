@@ -1912,11 +1912,16 @@ impl RunnableModel {
         let rt = self.qwen35.as_ref().ok_or("not a qwen35 model")?;
         let ffn_dim = rt.layers[0].ffn_gate.out_features;
         // Per-tensor quant: Q8_0 weights are widened 34->36 (set_*'s repack_for_lane
-        // then runs repack_q8_soa); K-quant (Q4_K/Q6_K) bytes pass through raw (the
-        // q4k/q6k GEMV kernels expand them on the fly). Returns (repack-ready bytes, lane).
+        // then runs repack_q8_soa); K-quant (Q2_K/Q3_K/Q4_K/Q6_K) bytes pass through
+        // raw (the q2k/q3k/q4k/q6k GEMV kernels expand them on the fly). Returns
+        // (repack-ready bytes, lane). Q5_K has no resident GEMV — the Item 4 quant
+        // recipe overrides Q3_K_M's four q5_K tensors to q6_K instead
+        // (qa/ornith/constrained-vram/QUANT_QUALITY_TABLE.md).
         let prep = |m: &RawMat| -> std::result::Result<(Vec<u8>, ProjQuant), String> {
             match m.tt {
                 GgufTensorType::Q8_0 => Ok((widen_q8(&m.bytes), ProjQuant::Q8_0)),
+                GgufTensorType::Q2K => Ok((m.bytes.clone(), ProjQuant::Q2K)),
+                GgufTensorType::Q3K => Ok((m.bytes.clone(), ProjQuant::Q3K)),
                 GgufTensorType::Q4K => Ok((m.bytes.clone(), ProjQuant::Q4K)),
                 GgufTensorType::Q6K => Ok((m.bytes.clone(), ProjQuant::Q6K)),
                 other => Err(format!(
