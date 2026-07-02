@@ -570,3 +570,33 @@ app reuses the shipped engine and gate wholesale; any tokens/sec readout (Phase 
 the existing SSE `decode_tps` real generation event, rendered unavailable when absent. The new
 release job is additive and independently skippable; existing server artifacts are untouched.
 See `camelid-desktop/README.md`.
+
+## D12 — CPU KV cache: f16-rounded values were stored in f32 buffers; f16 storage + head-major layout lanes (2026-07-01)
+
+Measured finding (Item-3 recon): the CPU KV write path has rounded every stored
+key/value element through f16 unconditionally since the f16-KV work landed
+(`copy_to_f16_kv_cache_storage`, now `store_kv_head_row` in
+`src/inference/kv_cache.rs`), but kept the results in f32 buffers — 2x the
+bytes for zero additional precision. For Llama-3.2-3B at 8192 ctx that is
+~1.79 GiB of KV instead of ~0.9 GiB, which is exactly what host-limited
+deep-context runs on the 15.7 GiB Windows dev box.
+
+Consequences, recorded as binding context for future parity claims:
+
+- All Item-1 (blocked-dot, PR #355) and Item-2 (head-parallel, PR #358)
+  parity and A/B evidence was earned on f16-rounded KV values.
+- The Item-3 f16 storage lane (`BACKENDINFERENCE_KV_F16`, PR #359) therefore
+  introduces ZERO new rounding: it stores the same bits as u16 and expands
+  exactly on read. Both Item-3 lanes (with `BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR`)
+  carry the bitwise-identity contract — end-to-end token identity was proven
+  in 17/17 flag combinations plus the serve stack, and the 8192-ctx run
+  completes on the dev box (4.037 tok/s, 5.72 GB peak working set).
+- Canonical conversions are pinned in `src/inference/kv_f16.rs`: store = the
+  historical helper semantics (RNE, NaN -> sign|0x7E00, F16C fast path with a
+  NaN fixup); read = exact `vcvtph2ps` semantics on the full 2^16 domain
+  (quiets signalling NaNs — unreachable from the canonical store; the delta
+  vs the older helper is documented there and locked by exhaustive tests).
+
+Receipts: `target/kv-lanes-baseline-20260701T180113/`,
+`target/kv-lanes-ab-20260701T185422/`, `target/kv-lanes-ab2-20260701T195346/`
+(SHA256-sealed, dev box) and the PR #359 description.
