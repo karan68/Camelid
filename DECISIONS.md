@@ -621,3 +621,38 @@ configuration at -4.5% wall and an explicit narrower width at -7.1%. This host's
 measured optimum (6) is deliberately NOT hardcoded: the portable, defensible policy is
 "physical, not logical"; per-host refinement of the exact width within the flat region
 is deferred to GAIT calibration.
+
+
+## D14 — Models page: five-zone IA, derived membership only, no localStorage truth (2026-07-02)
+
+**Decision:** the Models page is exactly five zones in one scroll — (1) active model
+bar with the only Unload action, (2) Supported, (3) Experimental
+(compatible → eligible → not-anchored), (4) one global Downloads panel, (5) Get
+models (curated + live Hugging Face search with confirmed downloads). Section
+membership is computed at render time from `/api/models/local` +
+`/api/capabilities` via `frontend/src/lib/modelLanes.js` (extracted verbatim from
+the old LocalLaneSections); no hand-authored array places a model. The
+`SUPPORTED_MODELS` list survives only as curated-download decoration
+(blurb/Recommended) in Zone 5.
+
+**localStorage download tracking is removed as a source of truth.** Download
+progress renders only from the `/api/models/catalog/downloads` poll
+(bytes/total), owned by one spine hook (`useModelsPageData`); "downloaded" means
+the file is present in the live `/api/models/local` scan, nothing else.
+
+**Diagnostics relocation:** Tokenizer Playground and the Model Inspector moved
+into a collapsed "Diagnostics" disclosure at the page bottom (only ModelsView
+consumed them). Import-a-GGUF-by-path also lives there — it is the only way to
+load a GGUF stored outside `models/`, so the capability is preserved but off the
+primary surface. The permanently-disabled Hosted API fieldset, the legacy
+FILTERS grid, the hero ledger, the runtime status grid, the acceptance/tracked-
+row panels, and the localStorage-driven SupportedModels section were deleted
+outright. (The import/hosted-API panel was not listed in the rebuild conductor's
+inventory; this disposition is the flagged resolution.)
+
+**"Not-yet-runnable, visible but disabled" interpretation:** the backend exposes
+no pre-download refusal signal per catalog row, so the disabled-with-reason state
+is driven by the real derivable gates — runtime offline or the backend not
+advertising `hf_catalog_install`/`model_downloads`. Per-row implementability is
+still decided at load time by the inspect-first typed-blocker flow (fail-closed,
+rendered verbatim).
