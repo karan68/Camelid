@@ -3304,7 +3304,8 @@ impl LlamaInferenceSession {
                     },
                     &mut self.kv_cache,
                 )?;
-                hidden = timed.output;
+                let prev_hidden = std::mem::replace(&mut hidden, timed.output);
+                decode_scratch::recycle_tensor(prev_hidden);
             }
             self.kv_cache.position = position + 1;
         }
@@ -3952,7 +3953,10 @@ impl LlamaInferenceSession {
                     },
                     &mut self.kv_cache,
                 )?;
-                hidden = timed.output;
+                let prev_hidden = std::mem::replace(&mut hidden, timed.output);
+                if !collect_diagnostics {
+                    decode_scratch::recycle_tensor(prev_hidden);
+                }
                 if let Some(trace) = execution_trace.as_mut() {
                     trace.fold_layer_hidden(layer_idx, &hidden.data);
                 }
@@ -5782,6 +5786,27 @@ struct PrefillLayerChunkParams<'a> {
     chunk_rows: usize,
 }
 
+/// [`CpuTensor::rms_norm`] with the output tensor built from the decode
+/// scratch pools (same kernel via `rms_norm_into`, so one numeric path).
+fn pooled_rms_norm(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    eps: f32,
+    name: &str,
+) -> Result<CpuTensor> {
+    let mut out = decode_scratch::take(input.data.len());
+    input.rms_norm_into(weight, eps, &mut out)?;
+    decode_scratch::tensor_from_pooled(name, &input.shape.dims, out)
+}
+
+/// [`CpuTensor::add`] with the output tensor built from the decode scratch
+/// pools (same kernel via `add_into`, so one numeric path).
+fn pooled_add(lhs: &CpuTensor, rhs: &CpuTensor, name: &str) -> Result<CpuTensor> {
+    let mut out = decode_scratch::take(lhs.data.len());
+    lhs.add_into(rhs, &mut out)?;
+    decode_scratch::tensor_from_pooled(name, &lhs.shape.dims, out)
+}
+
 fn forward_layer_timed(
     hidden: &CpuTensor,
     layer: &LlamaLayerWeights,
@@ -5804,10 +5829,11 @@ fn forward_layer_timed(
         .then(|| LlamaLayerMemoryTimings::new(layer_idx, capture_memory_sample(kv_cache)));
 
     let started = timings_on.then(Instant::now);
-    let attn_norm = hidden.rms_norm(
+    let attn_norm = pooled_rms_norm(
+        hidden,
         &layer.attention_norm,
         rms_norm_epsilon,
-        cached_layer_label!(layer_idx, "attention_norm"),
+        &cached_layer_label!(layer_idx, "attention_norm"),
     )?;
     let attention_norm_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&attn_norm))
@@ -5948,7 +5974,7 @@ fn forward_layer_timed(
         config.attention_head_count as usize,
         config,
         rope_freqs,
-        cached_layer_label!(layer_idx, "attention_q_rope"),
+        &cached_layer_label!(layer_idx, "attention_q_rope"),
     )?;
     let k = apply_rope(
         &k_before_rope,
@@ -5956,7 +5982,7 @@ fn forward_layer_timed(
         config.attention_head_count_kv as usize,
         config,
         rope_freqs,
-        cached_layer_label!(layer_idx, "attention_k_rope"),
+        &cached_layer_label!(layer_idx, "attention_k_rope"),
     )?;
     let attention_q_rope_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&q))
@@ -6071,9 +6097,10 @@ fn forward_layer_timed(
 
     let started = timings_on.then(Instant::now);
     metal_seam::synchronize_active_session();
-    let residual = hidden.add(
+    let residual = pooled_add(
+        hidden,
         &attn_out,
-        cached_layer_label!(layer_idx, "attention_residual"),
+        &cached_layer_label!(layer_idx, "attention_residual"),
     )?;
     let attention_residual_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&residual))
@@ -6091,10 +6118,11 @@ fn forward_layer_timed(
     trace_forward_layer_memory(layer_idx, "attention_residual_done");
 
     let started = timings_on.then(Instant::now);
-    let ffn_norm = residual.rms_norm(
+    let ffn_norm = pooled_rms_norm(
+        &residual,
         &layer.ffn_norm,
         rms_norm_epsilon,
-        cached_layer_label!(layer_idx, "ffn_norm"),
+        &cached_layer_label!(layer_idx, "ffn_norm"),
     )?;
     let ffn_norm_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&ffn_norm))
@@ -6252,7 +6280,11 @@ fn forward_layer_timed(
     let output = if ffn_out_already_residual {
         ffn_out.clone()
     } else {
-        residual.add(&ffn_out, cached_layer_label!(layer_idx, "ffn_residual"))?
+        pooled_add(
+            &residual,
+            &ffn_out,
+            &cached_layer_label!(layer_idx, "ffn_residual"),
+        )?
     };
     let ffn_residual_stats = collect_diagnostics
         .then(|| LlamaTensorStats::from_tensor(&output))
@@ -6269,6 +6301,22 @@ fn forward_layer_timed(
         memory.record_end();
     }
     trace_forward_layer_memory(layer_idx, "ffn_residual_done");
+    if !collect_diagnostics {
+        // Every intermediate below is provably dead here (`output` is the only
+        // tensor that leaves this function); returning them keeps the scratch
+        // pools warm so the next layer's takes are allocation-free.
+        decode_scratch::recycle_tensor(attn_norm);
+        decode_scratch::recycle_tensor(q_before_rope);
+        decode_scratch::recycle_tensor(k_before_rope);
+        decode_scratch::recycle_tensor(q);
+        decode_scratch::recycle_tensor(k);
+        decode_scratch::recycle_tensor(v);
+        decode_scratch::recycle_tensor(context);
+        decode_scratch::recycle_tensor(attn_out);
+        decode_scratch::recycle_tensor(residual);
+        decode_scratch::recycle_tensor(ffn_norm);
+        decode_scratch::recycle_tensor(ffn_out);
+    }
     timings.total = timing_elapsed_us(&total_started);
     timings.memory = memory;
     let diagnostics = if collect_diagnostics {
@@ -12010,6 +12058,9 @@ fn try_x86_q8_ffn_decode_chain_path(
         down_route.output_width,
         down_elapsed,
     );
+    // The activated intermediate is dead once the down projection has
+    // consumed its quantized form.
+    decode_scratch::recycle_tensor(activated);
 
     let gate_elapsed = gate_up_elapsed / 2;
     Ok(Some(Q8FfnDecodeChainOutput {
@@ -12457,9 +12508,9 @@ fn q8_0_vnni_decode_1x64_projection(
         )));
     }
 
-    let mut output = vec![0.0_f32; output_width];
+    let mut output = decode_scratch::take(output_width);
     q8_0_vnni_decode_1x64_projection_into(packed, quantized_input, &mut output, use_rawptr)?;
-    CpuTensor::from_f32(name, vec![1, output_width], output)
+    decode_scratch::tensor_from_pooled(name, &[1, output_width], output)
 }
 
 fn q8_0_vnni_decode_1x64_projection_into(
@@ -13253,7 +13304,7 @@ fn q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
         )));
     }
 
-    let mut output = vec![0.0_f32; output_width];
+    let mut output = decode_scratch::take(output_width);
     let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled();
     let compute_group = |group_idx: usize, output_chunk: &mut [f32]| {
         let group_start = group_idx * blocks_per_row;
@@ -13288,7 +13339,7 @@ fn q8_0_packed_rows4_single_input_projection_pair_activated_from_quantized(
             compute_group(group_idx, output_chunk);
         }
     }
-    CpuTensor::from_f32(name, vec![1, output_width], output)
+    decode_scratch::tensor_from_pooled(name, &[1, output_width], output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -13333,9 +13384,9 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     let q_groups = q8_0_packed_rows4_output_groups(q_width, "QKV decode q projection")?;
     let k_groups = q8_0_packed_rows4_output_groups(k_width, "QKV decode k projection")?;
     let v_groups = q8_0_packed_rows4_output_groups(v_width, "QKV decode v projection")?;
-    let mut q_output = vec![0.0_f32; q_width];
-    let mut k_output = vec![0.0_f32; k_width];
-    let mut v_output = vec![0.0_f32; v_width];
+    let mut q_output = decode_scratch::take(q_width);
+    let mut k_output = decode_scratch::take(k_width);
+    let mut v_output = decode_scratch::take(v_width);
     let use_hoisted_avx2 = x86_q8_packed_rows4_avx2_dot_decode_hoist_enabled();
 
     if q_width == k_width
@@ -13454,19 +13505,19 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
     }
 
     Ok((
-        CpuTensor::from_f32(
+        decode_scratch::tensor_from_pooled(
             "attention_q_x86_q8_qkv_consumer",
-            vec![1, q_width],
+            &[1, q_width],
             q_output,
         )?,
-        CpuTensor::from_f32(
+        decode_scratch::tensor_from_pooled(
             "attention_k_x86_q8_qkv_consumer",
-            vec![1, k_width],
+            &[1, k_width],
             k_output,
         )?,
-        CpuTensor::from_f32(
+        decode_scratch::tensor_from_pooled(
             "attention_v_x86_q8_qkv_consumer",
-            vec![1, v_width],
+            &[1, v_width],
             v_output,
         )?,
     ))
@@ -20701,7 +20752,7 @@ fn rope_diagnostics(
             scaling,
             rope_freqs,
         },
-        format!("{role}_rope_diagnostic"),
+        &format!("{role}_rope_diagnostic"),
     )?;
 
     let mut max_abs_delta = 0.0_f32;

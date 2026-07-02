@@ -112,9 +112,6 @@ pub(super) fn tensor_from_pooled(
 /// Reclaim a dead intermediate tensor: its data buffer, name String, and
 /// dims Vec all return to their pools. Call ONLY where the tensor is
 /// provably dead (the layer forward's end-of-scope points).
-// Consumed by the layer-forward recycling pass (step 5c); until that lands
-// only the tests exercise it.
-#[allow(dead_code)]
 pub(super) fn recycle_tensor(tensor: CpuTensor) {
     let (name, dims, data) = tensor.into_parts();
     recycle(data);

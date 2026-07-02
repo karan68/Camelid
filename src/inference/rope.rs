@@ -120,7 +120,7 @@ pub(super) fn apply_rope(
     head_count: usize,
     config: &LlamaModelConfig,
     rope_freqs: Option<&CpuTensor>,
-    name: impl Into<String>,
+    name: &str,
 ) -> Result<CpuTensor> {
     if head_count == 0 {
         return Err(BackendError::RuntimeShapeMismatch(
@@ -444,12 +444,15 @@ pub(super) struct RopeParams<'a> {
 pub(super) fn apply_rope_with_pairing(
     tensor: &CpuTensor,
     params: RopeParams<'_>,
-    name: impl Into<String>,
+    name: &str,
 ) -> Result<CpuTensor> {
-    let mut data = tensor.data.clone();
+    // Pooled copy of the input, bit-identical to `tensor.data.clone()` (RoPE
+    // rewrites the rope dims in place and leaves the rest as copied).
+    let mut data = super::decode_scratch::take(tensor.data.len());
+    data.copy_from_slice(&tensor.data);
     apply_rope_to_row(&mut data, params.position, params);
 
-    CpuTensor::from_f32(name, tensor.shape.dims.clone(), data)
+    super::decode_scratch::tensor_from_pooled(name, &tensor.shape.dims, data)
 }
 
 fn apply_rope_to_row(data: &mut [f32], position: usize, mut params: RopeParams<'_>) {
