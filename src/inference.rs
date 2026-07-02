@@ -58,7 +58,7 @@ pub use diagnostic_config::{
     SquareLinearLayout,
 };
 pub use kv_cache::{
-    KvLayout, LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace,
+    KvDtype, KvLayout, LlamaKvCache, LlamaKvCachePlan, LlamaKvCachePositionTrace, LlamaKvCacheTrace,
 };
 pub use q8_block_reader::Q8BlockReader;
 use q8_runtime::{
@@ -1740,6 +1740,7 @@ impl LlamaInferenceSession {
         // cache so a later re-assign round-trips identically.
         let kv_budget_bytes = self.kv_cache.kv_budget_bytes;
         let layout = self.kv_cache.layout;
+        let dtype = self.kv_cache.dtype;
         LlamaInferenceSession {
             config: self.config.clone(),
             weights: Arc::clone(&self.weights),
@@ -1748,8 +1749,11 @@ impl LlamaInferenceSession {
                 LlamaKvCache {
                     plan,
                     layout,
+                    dtype,
                     keys: Vec::new(),
                     values: Vec::new(),
+                    keys_f16: Vec::new(),
+                    values_f16: Vec::new(),
                     allocated_sequence_length: 0,
                     position: 0,
                     kv_budget_bytes,
@@ -2358,11 +2362,17 @@ impl LlamaInferenceSession {
             for p in 0..n {
                 for h in 0..n_kv {
                     let src = (h * n + p) * head_dim;
-                    let dst = self.kv_cache.offset(layer, p, h);
-                    self.kv_cache.keys[dst..dst + head_dim]
-                        .copy_from_slice(&k[src..src + head_dim]);
-                    self.kv_cache.values[dst..dst + head_dim]
-                        .copy_from_slice(&v[src..src + head_dim]);
+                    // Canonical store, not a raw copy: the GPU KV is f16, so
+                    // this data is f16-exact and the rounding inside is
+                    // idempotent — the routing enforces the invariant
+                    // structurally instead of relying on the GPU dtype.
+                    self.kv_cache.store_kv_head_row(
+                        layer,
+                        p,
+                        h,
+                        &k[src..src + head_dim],
+                        &v[src..src + head_dim],
+                    );
                 }
             }
         }
@@ -2971,12 +2981,19 @@ impl LlamaInferenceSession {
                     let mut cv = vec![0.0f32; kv_dim * position];
                     for p in 0..position {
                         for h in 0..n_kv {
-                            let src = self.kv_cache.offset(range.start + layer, p, h);
                             let dst = (h * position + p) * head_dim;
-                            ck[dst..dst + head_dim]
-                                .copy_from_slice(&self.kv_cache.keys[src..src + head_dim]);
-                            cv[dst..dst + head_dim]
-                                .copy_from_slice(&self.kv_cache.values[src..src + head_dim]);
+                            self.kv_cache.copy_key_row_into(
+                                range.start + layer,
+                                p,
+                                h,
+                                &mut ck[dst..dst + head_dim],
+                            );
+                            self.kv_cache.copy_value_row_into(
+                                range.start + layer,
+                                p,
+                                h,
+                                &mut cv[dst..dst + head_dim],
+                            );
                         }
                     }
                     if slot.engine.seed_layer(layer, &ck, &cv, position).is_err() {
@@ -20428,20 +20445,19 @@ fn write_kv_cache(
         )));
     }
     kv_cache.ensure_position_capacity(kv_cache.position + 1)?;
-    // Per-head copies: identical element order and per-element math as the
+    // Per-head stores: identical element order and per-element math as the
     // historical whole-row copy in position-major (heads are contiguous
     // there), and the only correct shape in head-major, where one token's
-    // heads live in separate streams.
+    // heads live in separate streams. `store_kv_head_row` is the canonical
+    // f16-rounding store for both dtypes.
     let head_dim = kv_cache.plan.head_dim;
     for kv_head in 0..kv_cache.plan.kv_head_count {
-        let dst = kv_cache.offset(layer_idx, kv_cache.position, kv_head);
         let src = kv_head * head_dim;
-        copy_to_f16_kv_cache_storage(
-            &mut kv_cache.keys[dst..dst + head_dim],
+        kv_cache.store_kv_head_row(
+            layer_idx,
+            kv_cache.position,
+            kv_head,
             &key.data[src..src + head_dim],
-        );
-        copy_to_f16_kv_cache_storage(
-            &mut kv_cache.values[dst..dst + head_dim],
             &value.data[src..src + head_dim],
         );
     }
@@ -20475,20 +20491,18 @@ fn write_kv_cache_batch(
     }
     let rows = key.dim(0)?;
     kv_cache.ensure_position_capacity(base_position + rows)?;
-    // Per-head copies; see `write_kv_cache` for the order argument.
+    // Per-head stores; see `write_kv_cache` for the order argument.
     let head_dim = kv_cache.plan.head_dim;
     for row in 0..rows {
         let position = base_position + row;
         let row_start = row * expected_width;
         for kv_head in 0..kv_cache.plan.kv_head_count {
-            let dst = kv_cache.offset(layer_idx, position, kv_head);
             let src = row_start + kv_head * head_dim;
-            copy_to_f16_kv_cache_storage(
-                &mut kv_cache.keys[dst..dst + head_dim],
+            kv_cache.store_kv_head_row(
+                layer_idx,
+                position,
+                kv_head,
                 &key.data[src..src + head_dim],
-            );
-            copy_to_f16_kv_cache_storage(
-                &mut kv_cache.values[dst..dst + head_dim],
                 &value.data[src..src + head_dim],
             );
         }
@@ -20537,19 +20551,17 @@ fn kv_cache_trace(
     let mut value_max_abs_index = 0;
 
     // Walk per (position, kv_head) with the LOGICAL in-token index so the
-    // checksum/ordinal stream is identical in both KV layouts (in
-    // position-major this touches the exact same addresses in the exact same
-    // order as the historical whole-row walk).
+    // checksum/ordinal stream is identical in both KV layouts and dtypes (in
+    // position-major/f32 this reads the exact same values in the exact same
+    // order as the historical whole-row walk; f16 expansion is exact).
     let head_dim = kv_cache.plan.head_dim;
+    let mut key_row = vec![0.0f32; head_dim];
+    let mut value_row = vec![0.0f32; head_dim];
     for position in 0..position_count {
         for kv_head in 0..kv_cache.plan.kv_head_count {
-            let start = kv_cache.offset(layer_idx, position, kv_head);
-            let end = start + head_dim;
-            for (dim, (&key, &value)) in kv_cache.keys[start..end]
-                .iter()
-                .zip(kv_cache.values[start..end].iter())
-                .enumerate()
-            {
+            kv_cache.copy_key_row_into(layer_idx, position, kv_head, &mut key_row);
+            kv_cache.copy_value_row_into(layer_idx, position, kv_head, &mut value_row);
+            for (dim, (&key, &value)) in key_row.iter().zip(value_row.iter()).enumerate() {
                 let idx = kv_head * head_dim + dim;
                 if !key.is_finite() || !value.is_finite() {
                     return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -20613,15 +20625,25 @@ fn kv_cache_position_trace(
 ) -> Result<LlamaKvCachePositionTrace> {
     // Materialize the token's logical row (kv_head-major element order, the
     // historical contiguous order) so checksums, ordinals, and sampled
-    // values are identical in both KV layouts. Diagnostics-only path; the
-    // copy is TENSOR-trace sized, not hot.
+    // values are identical in both KV layouts and dtypes. Diagnostics-only
+    // path; the copy is TENSOR-trace sized, not hot.
     let head_dim = kv_cache.plan.head_dim;
-    let mut key_row = Vec::with_capacity(key_value_width);
-    let mut value_row = Vec::with_capacity(key_value_width);
+    let mut key_row = vec![0.0f32; key_value_width];
+    let mut value_row = vec![0.0f32; key_value_width];
     for kv_head in 0..kv_cache.plan.kv_head_count {
-        let start = kv_cache.offset(layer_idx, position, kv_head);
-        key_row.extend_from_slice(&kv_cache.keys[start..start + head_dim]);
-        value_row.extend_from_slice(&kv_cache.values[start..start + head_dim]);
+        let out_start = kv_head * head_dim;
+        kv_cache.copy_key_row_into(
+            layer_idx,
+            position,
+            kv_head,
+            &mut key_row[out_start..out_start + head_dim],
+        );
+        kv_cache.copy_value_row_into(
+            layer_idx,
+            position,
+            kv_head,
+            &mut value_row[out_start..out_start + head_dim],
+        );
     }
     let key_slice = key_row.as_slice();
     let value_slice = value_row.as_slice();
@@ -20667,13 +20689,6 @@ fn kv_cache_position_trace(
             .copied()
             .collect(),
     })
-}
-
-fn copy_to_f16_kv_cache_storage(dest: &mut [f32], source: &[f32]) {
-    debug_assert_eq!(dest.len(), source.len());
-    for (dest_value, source_value) in dest.iter_mut().zip(source.iter().copied()) {
-        *dest_value = f16_bits_to_f32(f32_to_f16_bits(source_value));
-    }
 }
 
 const ATTENTION_TRACE_HEAD_LIMIT: usize = 8;
@@ -20735,9 +20750,12 @@ fn causal_attention_context(
             let kv_head =
                 map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
             let out_start = attention_head * head_dim;
-            let value_start = kv_cache.offset(layer_idx, 0, kv_head);
-            out[out_start..out_start + head_dim]
-                .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
+            kv_cache.copy_value_row_into(
+                layer_idx,
+                0,
+                kv_head,
+                &mut out[out_start..out_start + head_dim],
+            );
         }
     } else {
         decode_attention_all_heads_into(
@@ -20837,9 +20855,12 @@ fn causal_attention_context_batch(
                 let kv_head =
                     map_attention_head_to_kv_head(attention_head, repeats, kv_heads, head_mapping);
                 let out_start = attention_head * head_dim;
-                let value_start = kv_cache.offset(layer_idx, 0, kv_head);
-                out_row[out_start..out_start + head_dim]
-                    .copy_from_slice(&kv_cache.values[value_start..value_start + head_dim]);
+                kv_cache.copy_value_row_into(
+                    layer_idx,
+                    0,
+                    kv_head,
+                    &mut out_row[out_start..out_start + head_dim],
+                );
             }
         } else {
             for attention_head in 0..attention_heads {
@@ -21101,11 +21122,23 @@ fn attention_context_for_head_into_with_kernels(
 
     let mut key_start = head_base;
     for position in 0..params.position_count {
-        let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
-        let score = if use_blocked_kernels {
-            attn_f32_dot::dot_blocked(params.query_slice, key_slice) * params.scale
-        } else {
-            dot_product(params.query_slice, key_slice) * params.scale
+        let score = match params.kv_cache.dtype {
+            KvDtype::F32 => {
+                let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
+                if use_blocked_kernels {
+                    attn_f32_dot::dot_blocked(params.query_slice, key_slice) * params.scale
+                } else {
+                    dot_product(params.query_slice, key_slice) * params.scale
+                }
+            }
+            KvDtype::F16 => {
+                // f16 storage requires the blocked lane (enforced at cache
+                // construction; fail-closed to F32 otherwise). The fused
+                // kernel expands each element exactly and then runs the
+                // identical canonical blocked order.
+                let key_slice = &params.kv_cache.keys_f16[key_start..key_start + head_dim];
+                attn_f32_dot::dot_blocked_f16(params.query_slice, key_slice) * params.scale
+            }
         };
         scores.push(score);
         if position + 1 < params.position_count {
@@ -21129,12 +21162,20 @@ fn attention_context_for_head_into_with_kernels(
     let mut value_start = head_base;
     for (position, score) in scores.iter().copied().enumerate() {
         let probability = score * inv_score_sum;
-        let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
-        if use_blocked_kernels {
-            attn_f32_dot::axpy_blocked(out_slice, probability, value_slice);
-        } else {
-            for (out_value, value) in out_slice.iter_mut().zip(value_slice) {
-                *out_value += probability * *value;
+        match params.kv_cache.dtype {
+            KvDtype::F32 => {
+                let value_slice = &params.kv_cache.values[value_start..value_start + head_dim];
+                if use_blocked_kernels {
+                    attn_f32_dot::axpy_blocked(out_slice, probability, value_slice);
+                } else {
+                    for (out_value, value) in out_slice.iter_mut().zip(value_slice) {
+                        *out_value += probability * *value;
+                    }
+                }
+            }
+            KvDtype::F16 => {
+                let value_slice = &params.kv_cache.values_f16[value_start..value_start + head_dim];
+                attn_f32_dot::axpy_blocked_f16(out_slice, probability, value_slice);
             }
         }
         if position + 1 < params.position_count {
@@ -21246,9 +21287,19 @@ fn attention_trace_with_params(params: AttentionTraceParams<'_>) -> Result<Llama
         let sampled_positions = sampled_attention_trace_positions(params.position_count);
         let mut positions = Vec::with_capacity(sampled_positions.len());
         for position in sampled_positions {
-            let key_start = params.kv_cache.offset(params.layer_idx, position, kv_head);
-            let key_slice = &params.kv_cache.keys[key_start..key_start + head_dim];
-            let value_slice = &params.kv_cache.values[key_start..key_start + head_dim];
+            let mut key_row = vec![0.0f32; head_dim];
+            let mut value_row = vec![0.0f32; head_dim];
+            params
+                .kv_cache
+                .copy_key_row_into(params.layer_idx, position, kv_head, &mut key_row);
+            params.kv_cache.copy_value_row_into(
+                params.layer_idx,
+                position,
+                kv_head,
+                &mut value_row,
+            );
+            let key_slice = key_row.as_slice();
+            let value_slice = value_row.as_slice();
             let qk_products = query_slice
                 .iter()
                 .zip(key_slice.iter())
@@ -21311,15 +21362,14 @@ fn attention_scores_for_head(
 ) -> Vec<f32> {
     let head_dim = kv_cache.plan.head_dim;
     let mut scores = Vec::with_capacity(position_count);
-    let mut key_start = kv_cache.head_base_offset(layer_idx, kv_head);
-    let position_stride = kv_cache.head_position_stride();
+    // Diagnostics-only reconstruction: materialize each key row (exact for
+    // both dtypes; a plain copy for f32) and keep the historical legacy-dot
+    // scoring this trace has always used.
+    let mut key_row = vec![0.0f32; head_dim];
     for position in 0..position_count {
-        let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
-        let score = dot_product(query_slice, key_slice) * scale;
+        kv_cache.copy_key_row_into(layer_idx, position, kv_head, &mut key_row);
+        let score = dot_product(query_slice, &key_row) * scale;
         scores.push(score);
-        if position + 1 < position_count {
-            key_start += position_stride;
-        }
     }
     scores
 }
@@ -21360,11 +21410,11 @@ fn reconstruct_attention_context_for_head(
     probabilities: &[f32],
 ) -> Vec<f32> {
     let mut context = vec![0.0; head_dim];
+    let mut value_row = vec![0.0f32; head_dim];
     for (position, probability) in probabilities.iter().copied().enumerate() {
-        let value_start = kv_cache.offset(layer_idx, position, kv_head);
-        let value_slice = &kv_cache.values[value_start..value_start + head_dim];
+        kv_cache.copy_value_row_into(layer_idx, position, kv_head, &mut value_row);
         for dim in 0..head_dim {
-            context[dim] += probability * value_slice[dim];
+            context[dim] += probability * value_row[dim];
         }
     }
     context
@@ -21396,15 +21446,16 @@ fn top_attention_probability_positions(
         .into_iter()
         .take(ATTENTION_TRACE_TOP_PROBABILITY_LIMIT)
         .map(|(position, probability)| {
-            let key_start = kv_cache.offset(layer_idx, position, kv_head);
-            let key_slice = &kv_cache.keys[key_start..key_start + head_dim];
-            let value_slice = &kv_cache.values[key_start..key_start + head_dim];
+            let mut key_row = vec![0.0f32; head_dim];
+            let mut value_row = vec![0.0f32; head_dim];
+            kv_cache.copy_key_row_into(layer_idx, position, kv_head, &mut key_row);
+            kv_cache.copy_value_row_into(layer_idx, position, kv_head, &mut value_row);
             LlamaAttentionTopProbabilityTrace {
                 position,
                 score: scores[position],
                 probability,
-                key_first_values: sample_first_values(key_slice),
-                value_first_values: sample_first_values(value_slice),
+                key_first_values: sample_first_values(&key_row),
+                value_first_values: sample_first_values(&value_row),
             }
         })
         .collect()

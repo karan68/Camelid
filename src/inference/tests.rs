@@ -11769,6 +11769,18 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                     .expect("pm cache");
                 let mut hm =
                     LlamaKvCache::new_with_layout(plan(), KvLayout::HeadMajor).expect("hm cache");
+                let mut pm16 = LlamaKvCache::new_with_layout_and_dtype(
+                    plan(),
+                    KvLayout::PositionMajor,
+                    KvDtype::F16,
+                )
+                .expect("pm16 cache");
+                let mut hm16 = LlamaKvCache::new_with_layout_and_dtype(
+                    plan(),
+                    KvLayout::HeadMajor,
+                    KvDtype::F16,
+                )
+                .expect("hm16 cache");
 
                 // Phase A: append `position_count` tokens through the real
                 // single-token write path on layer 0 and the batch path on
@@ -11780,7 +11792,7 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                 for (p, (k_row, v_row)) in token_rows.iter().enumerate() {
                     let k = CpuTensor::from_f32("k", vec![1, width], k_row.clone()).unwrap();
                     let v = CpuTensor::from_f32("v", vec![1, width], v_row.clone()).unwrap();
-                    for cache in [&mut pm, &mut hm] {
+                    for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
                         cache.position = p;
                         write_kv_cache(cache, 0, &k, &v).expect("write layer0");
                     }
@@ -11789,41 +11801,41 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                 let flat_v: Vec<f32> = token_rows.iter().flat_map(|(_, v)| v.clone()).collect();
                 let bk = CpuTensor::from_f32("bk", vec![position_count, width], flat_k).unwrap();
                 let bv = CpuTensor::from_f32("bv", vec![position_count, width], flat_v).unwrap();
-                write_kv_cache_batch(&mut pm, 1, 0, &bk, &bv).expect("batch pm");
-                write_kv_cache_batch(&mut hm, 1, 0, &bk, &bv).expect("batch hm");
-                pm.position = position_count - 1;
-                hm.position = position_count - 1;
+                for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                    write_kv_cache_batch(cache, 1, 0, &bk, &bv).expect("batch write");
+                    cache.position = position_count - 1;
+                }
 
                 // Phase B: rollback to half depth and overwrite the tail with
                 // DIFFERENT data (spec-decode shape), through the real path.
                 if position_count >= 4 {
                     let half = position_count / 2;
-                    pm.rollback_to_position(half).unwrap();
-                    hm.rollback_to_position(half).unwrap();
+                    for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                        cache.rollback_to_position(half).unwrap();
+                    }
                     for p in half..position_count {
                         let k = CpuTensor::from_f32("k2", vec![1, width], rng.fill(width)).unwrap();
                         let v = CpuTensor::from_f32("v2", vec![1, width], rng.fill(width)).unwrap();
-                        for cache in [&mut pm, &mut hm] {
+                        for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
                             cache.position = p;
                             write_kv_cache(cache, 0, &k, &v).expect("overwrite layer0");
                         }
                     }
-                    pm.position = position_count - 1;
-                    hm.position = position_count - 1;
+                    for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                        cache.position = position_count - 1;
+                    }
                 }
 
                 // Phase C: CUDA mirror-back pattern (copy_resident_cuda_kv_to_host):
-                // raw offset-addressed per-(position, head) writes of f16-exact
-                // rows into layer 1 of both caches.
+                // per-(position, head) stores of f16-exact rows into layer 1
+                // through the canonical store, exactly like the fixed site.
                 for p in 0..position_count.min(8) {
                     for h in 0..kv_heads {
                         let row: Vec<f32> = (0..head_dim)
                             .map(|_| f16_bits_to_f32(f32_to_f16_bits(rng.next_f32())))
                             .collect();
-                        for cache in [&mut pm, &mut hm] {
-                            let dst = cache.offset(1, p, h);
-                            cache.keys[dst..dst + head_dim].copy_from_slice(&row);
-                            cache.values[dst..dst + head_dim].copy_from_slice(&row);
+                        for cache in [&mut pm, &mut hm, &mut pm16, &mut hm16] {
+                            cache.store_kv_head_row(1, p, h, &row, &row);
                         }
                     }
                 }
@@ -11923,6 +11935,68 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                                     mismatch += 1;
                                 }
                             }
+
+                            // Lane B: f16 storage under the blocked lane must
+                            // be bitwise-equal to f32 storage under the
+                            // blocked lane, in both layouts (the values are
+                            // identical — the write path always rounded — and
+                            // the fused kernel is expand-then-blocked).
+                            if use_blocked {
+                                let mut out_pm16 = vec![0.0f32; head_dim];
+                                let mut out_hm16 = vec![0.0f32; head_dim];
+                                for (cache, out) in [(&pm16, &mut out_pm16), (&hm16, &mut out_hm16)]
+                                {
+                                    attention_context_for_head_into_with_kernels(
+                                        AttentionContextHeadParams {
+                                            kv_cache: cache,
+                                            layer_idx: layer,
+                                            kv_head,
+                                            query_slice: &query
+                                                [head * head_dim..(head + 1) * head_dim],
+                                            position_count,
+                                            scale,
+                                        },
+                                        out,
+                                        &mut scores,
+                                        true,
+                                    )
+                                    .expect("pinned f16 attention");
+                                }
+                                for ((x, y), z) in out_pm.iter().zip(&out_pm16).zip(&out_hm16) {
+                                    if x.to_bits() != y.to_bits() || y.to_bits() != z.to_bits() {
+                                        mismatch += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // (c) Logical content equality across dtypes: the f16 caches
+                // expand to exactly the values the f32 caches hold.
+                let mut row_ref = vec![0.0f32; head_dim];
+                let mut row_alt = vec![0.0f32; head_dim];
+                for layer in 0..2 {
+                    for p in 0..position_count {
+                        for h in 0..kv_heads {
+                            pm.copy_key_row_into(layer, p, h, &mut row_ref);
+                            for cache in [&pm16, &hm16] {
+                                cache.copy_key_row_into(layer, p, h, &mut row_alt);
+                                for (x, y) in row_ref.iter().zip(&row_alt) {
+                                    if x.to_bits() != y.to_bits() {
+                                        mismatch += 1;
+                                    }
+                                }
+                            }
+                            pm.copy_value_row_into(layer, p, h, &mut row_ref);
+                            for cache in [&pm16, &hm16] {
+                                cache.copy_value_row_into(layer, p, h, &mut row_alt);
+                                for (x, y) in row_ref.iter().zip(&row_alt) {
+                                    if x.to_bits() != y.to_bits() {
+                                        mismatch += 1;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -11933,6 +12007,7 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
 
     assert_eq!(
         mismatches, 0,
-        "head-major KV layout diverged from position-major in {mismatches} element(s)"
+        "KV layout/dtype lanes diverged from the position-major f32 reference in \
+         {mismatches} element(s)"
     );
 }

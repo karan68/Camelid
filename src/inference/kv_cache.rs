@@ -76,8 +76,17 @@ pub struct LlamaKvCache {
     pub plan: LlamaKvCachePlan,
     /// Physical K/V arrangement; see [`KvLayout`]. Fixed at construction.
     pub layout: KvLayout,
+    /// Element storage type; see [`KvDtype`]. Fixed at construction. In
+    /// `F32` mode `keys`/`values` are live and the `_f16` buffers stay
+    /// empty; in `F16` mode the reverse. The stored VALUES are identical
+    /// either way — the write path has always rounded through f16 — so the
+    /// dtype choice is bytes, not bits.
+    pub dtype: KvDtype,
     pub keys: Vec<f32>,
     pub values: Vec<f32>,
+    /// f16 storage (bit patterns), live only when `dtype == KvDtype::F16`.
+    pub keys_f16: Vec<u16>,
+    pub values_f16: Vec<u16>,
     pub allocated_sequence_length: usize,
     pub position: usize,
     /// Max f32 K+V bytes this session may materialize before the predict-and-abort
@@ -94,8 +103,11 @@ impl PartialEq for LlamaKvCache {
         // must not affect equality (the session PartialEq compares caches across runs).
         self.plan == other.plan
             && self.layout == other.layout
+            && self.dtype == other.dtype
             && self.keys == other.keys
             && self.values == other.values
+            && self.keys_f16 == other.keys_f16
+            && self.values_f16 == other.values_f16
             && self.allocated_sequence_length == other.allocated_sequence_length
             && self.position == other.position
     }
@@ -128,27 +140,78 @@ fn kv_layout_head_major_enabled() -> bool {
     super::q8_runtime::q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_KV_LAYOUT_HEAD_MAJOR")
 }
 
+/// Element storage for the K/V buffers. Chosen ONCE at cache construction
+/// (`BACKENDINFERENCE_KV_F16`, default off). f16 storage holds exactly the
+/// values the write path has always produced (it rounds through f16
+/// unconditionally), so both dtypes carry the bitwise-identity contract —
+/// f16 just stops paying 2x the bytes for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvDtype {
+    F32,
+    F16,
+}
+
+/// Env gate for f16 storage, read once per cache construction. Requires the
+/// Item-1 blocked-dot lane (the fused f16 kernels realize its canonical
+/// order; the legacy serial dot has no f16 variant by design) — requested
+/// without it, the flag is inert and logged once.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn kv_f16_enabled() -> bool {
+    let requested = super::q8_runtime::q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_KV_F16");
+    if requested && !super::attention_f32_blocked_dot_enabled() {
+        static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        LOGGED.get_or_init(|| {
+            eprintln!(
+                "[kv-f16] BACKENDINFERENCE_KV_F16 requested without \
+                 BACKENDINFERENCE_ATTENTION_F32_BLOCKED_DOT; the f16 lane is inert \
+                 (the fused f16 kernels require the blocked-dot lane)"
+            );
+        });
+        return false;
+    }
+    requested
+}
+
 impl LlamaKvCache {
     pub fn new(plan: LlamaKvCachePlan) -> Result<Self> {
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        let layout = if kv_layout_head_major_enabled() {
-            KvLayout::HeadMajor
-        } else {
-            KvLayout::PositionMajor
-        };
+        let (layout, dtype) = (
+            if kv_layout_head_major_enabled() {
+                KvLayout::HeadMajor
+            } else {
+                KvLayout::PositionMajor
+            },
+            if kv_f16_enabled() {
+                KvDtype::F16
+            } else {
+                KvDtype::F32
+            },
+        );
         #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
-        let layout = KvLayout::PositionMajor;
-        Self::new_with_layout(plan, layout)
+        let (layout, dtype) = (KvLayout::PositionMajor, KvDtype::F32);
+        Self::new_with_layout_and_dtype(plan, layout, dtype)
     }
 
     /// Explicit-layout constructor so the bitwise-identity tests can build
     /// both layouts without touching process env.
     pub fn new_with_layout(plan: LlamaKvCachePlan, layout: KvLayout) -> Result<Self> {
+        Self::new_with_layout_and_dtype(plan, layout, KvDtype::F32)
+    }
+
+    /// Explicit-everything constructor for the bitwise-identity tests.
+    pub fn new_with_layout_and_dtype(
+        plan: LlamaKvCachePlan,
+        layout: KvLayout,
+        dtype: KvDtype,
+    ) -> Result<Self> {
         Ok(Self {
             plan,
             layout,
+            dtype,
             keys: Vec::new(),
             values: Vec::new(),
+            keys_f16: Vec::new(),
+            values_f16: Vec::new(),
             allocated_sequence_length: 0,
             position: 0,
             kv_budget_bytes: resolve_kv_cache_budget_bytes(),
@@ -212,36 +275,70 @@ impl LlamaKvCache {
             .ok_or_else(|| {
                 BackendError::RuntimeShapeMismatch("KV cache element count overflow".to_string())
             })?;
-        match self.layout {
-            KvLayout::PositionMajor => {
-                // Positions are outermost, so growth is a pure append.
-                self.keys.resize(values, 0.0);
-                self.values.resize(values, 0.0);
-            }
-            KvLayout::HeadMajor => {
-                // Each head's stream stride is the allocated capacity, so
-                // growth re-lays the buffer: copy every (layer, head) block
-                // to its new base. Pure permutation of identical bits —
-                // bitwise-neutral — amortized over the growth chunking.
-                let head_dim = self.plan.head_dim;
-                let old_len = self.allocated_sequence_length * head_dim;
-                let streams = self.plan.layer_count * self.plan.kv_head_count;
-                let new_len = target_sequence_length * head_dim;
-                let mut new_keys = vec![0.0f32; values];
-                let mut new_values = vec![0.0f32; values];
-                if old_len > 0 {
-                    for stream in 0..streams {
-                        let old_base = stream * old_len;
-                        let new_base = stream * new_len;
-                        new_keys[new_base..new_base + old_len]
-                            .copy_from_slice(&self.keys[old_base..old_base + old_len]);
-                        new_values[new_base..new_base + old_len]
-                            .copy_from_slice(&self.values[old_base..old_base + old_len]);
-                    }
+        #[allow(clippy::too_many_arguments)]
+        fn grow_buffers<T: Copy + Default>(
+            keys: &mut Vec<T>,
+            vals: &mut Vec<T>,
+            layout: KvLayout,
+            elements: usize,
+            old_alloc: usize,
+            new_alloc: usize,
+            head_dim: usize,
+            streams: usize,
+        ) {
+            match layout {
+                KvLayout::PositionMajor => {
+                    // Positions are outermost, so growth is a pure append.
+                    keys.resize(elements, T::default());
+                    vals.resize(elements, T::default());
                 }
-                self.keys = new_keys;
-                self.values = new_values;
+                KvLayout::HeadMajor => {
+                    // Each head's stream stride is the allocated capacity, so
+                    // growth re-lays the buffer: copy every (layer, head)
+                    // block to its new base. Pure permutation of identical
+                    // bits — bitwise-neutral — amortized over the chunking.
+                    let old_len = old_alloc * head_dim;
+                    let new_len = new_alloc * head_dim;
+                    let mut new_keys = vec![T::default(); elements];
+                    let mut new_vals = vec![T::default(); elements];
+                    if old_len > 0 {
+                        for stream in 0..streams {
+                            let old_base = stream * old_len;
+                            let new_base = stream * new_len;
+                            new_keys[new_base..new_base + old_len]
+                                .copy_from_slice(&keys[old_base..old_base + old_len]);
+                            new_vals[new_base..new_base + old_len]
+                                .copy_from_slice(&vals[old_base..old_base + old_len]);
+                        }
+                    }
+                    *keys = new_keys;
+                    *vals = new_vals;
+                }
             }
+        }
+        let head_dim = self.plan.head_dim;
+        let streams = self.plan.layer_count * self.plan.kv_head_count;
+        match self.dtype {
+            KvDtype::F32 => grow_buffers(
+                &mut self.keys,
+                &mut self.values,
+                self.layout,
+                values,
+                self.allocated_sequence_length,
+                target_sequence_length,
+                head_dim,
+                streams,
+            ),
+            KvDtype::F16 => grow_buffers(
+                &mut self.keys_f16,
+                &mut self.values_f16,
+                self.layout,
+                values,
+                self.allocated_sequence_length,
+                target_sequence_length,
+                head_dim,
+                streams,
+            ),
         }
         self.allocated_sequence_length = target_sequence_length;
         Ok(())
@@ -259,11 +356,18 @@ impl LlamaKvCache {
     }
 
     pub fn allocated_elements(&self) -> usize {
-        self.keys.len() + self.values.len()
+        self.keys.len() + self.values.len() + self.keys_f16.len() + self.values_f16.len()
     }
 
     pub fn allocated_bytes(&self) -> u64 {
-        (self.allocated_elements() as u64) * (std::mem::size_of::<f32>() as u64)
+        (self.allocated_elements() as u64) * self.element_bytes()
+    }
+
+    fn element_bytes(&self) -> u64 {
+        match self.dtype {
+            KvDtype::F32 => std::mem::size_of::<f32>() as u64,
+            KvDtype::F16 => std::mem::size_of::<u16>() as u64,
+        }
     }
 
     pub(super) fn offset(&self, layer_idx: usize, position: usize, kv_head: usize) -> usize {
@@ -302,12 +406,97 @@ impl LlamaKvCache {
         self.plan.layer_count * self.plan.kv_head_count * self.plan.head_dim
     }
 
-    /// f32 bytes one token's KV occupies across all layers/heads, counting both the
-    /// K and V buffers — the per-token cost the predict-and-abort guard projects.
+    /// Bytes one token's KV occupies across all layers/heads at the active
+    /// dtype, counting both the K and V buffers — the per-token cost the
+    /// predict-and-abort guard projects.
     fn kv_bytes_per_token(&self) -> u64 {
         (self.position_stride() as u64)
             .saturating_mul(2) // K + V
-            .saturating_mul(std::mem::size_of::<f32>() as u64)
+            .saturating_mul(self.element_bytes())
+    }
+
+    /// THE canonical KV store: one (layer, position, kv_head) row of K and V,
+    /// rounded through f16 exactly as the write path always has, into
+    /// whichever dtype backs this cache. Every writer routes through here —
+    /// including the CUDA prefill mirror-back, whose data is f16-exact
+    /// already (re-rounding is idempotent), so the routing is bit-neutral
+    /// and enforces the f16-exactness invariant structurally.
+    pub(super) fn store_kv_head_row(
+        &mut self,
+        layer_idx: usize,
+        position: usize,
+        kv_head: usize,
+        key_row: &[f32],
+        value_row: &[f32],
+    ) {
+        let head_dim = self.plan.head_dim;
+        debug_assert_eq!(key_row.len(), head_dim);
+        debug_assert_eq!(value_row.len(), head_dim);
+        let dst = self.offset(layer_idx, position, kv_head);
+        match self.dtype {
+            KvDtype::F32 => {
+                for (slot, &value) in self.keys[dst..dst + head_dim].iter_mut().zip(key_row) {
+                    *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                }
+                for (slot, &value) in self.values[dst..dst + head_dim].iter_mut().zip(value_row) {
+                    *slot = super::kv_f16::f16_to_f32_kv(super::kv_f16::f32_to_f16_kv(value));
+                }
+            }
+            KvDtype::F16 => {
+                super::kv_f16::convert_f32_slice_to_f16(
+                    key_row,
+                    &mut self.keys_f16[dst..dst + head_dim],
+                );
+                super::kv_f16::convert_f32_slice_to_f16(
+                    value_row,
+                    &mut self.values_f16[dst..dst + head_dim],
+                );
+            }
+        }
+    }
+
+    /// Copy one key row out as f32, whichever dtype backs it. Cold paths
+    /// only (diagnostics, GPU seeding) — the decode hot path reads the
+    /// buffers directly through the layout accessors.
+    pub(super) fn copy_key_row_into(
+        &self,
+        layer_idx: usize,
+        position: usize,
+        kv_head: usize,
+        out: &mut [f32],
+    ) {
+        let head_dim = self.plan.head_dim;
+        debug_assert_eq!(out.len(), head_dim);
+        let src = self.offset(layer_idx, position, kv_head);
+        match self.dtype {
+            KvDtype::F32 => out.copy_from_slice(&self.keys[src..src + head_dim]),
+            KvDtype::F16 => {
+                for (slot, &bits) in out.iter_mut().zip(&self.keys_f16[src..src + head_dim]) {
+                    *slot = super::kv_f16::f16_to_f32_kv(bits);
+                }
+            }
+        }
+    }
+
+    /// Copy one value row out as f32; see [`Self::copy_key_row_into`].
+    pub(super) fn copy_value_row_into(
+        &self,
+        layer_idx: usize,
+        position: usize,
+        kv_head: usize,
+        out: &mut [f32],
+    ) {
+        let head_dim = self.plan.head_dim;
+        debug_assert_eq!(out.len(), head_dim);
+        let src = self.offset(layer_idx, position, kv_head);
+        match self.dtype {
+            KvDtype::F32 => out.copy_from_slice(&self.values[src..src + head_dim]),
+            KvDtype::F16 => {
+                for (slot, &bits) in out.iter_mut().zip(&self.values_f16[src..src + head_dim]) {
+                    *slot = super::kv_f16::f16_to_f32_kv(bits);
+                }
+            }
+        }
     }
 }
 

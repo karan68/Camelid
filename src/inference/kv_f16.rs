@@ -112,9 +112,6 @@ pub(super) fn f16_to_f32_kv(bits: u16) -> f32 {
 
 /// Convert a full f32 slice into f16 storage, F16C-accelerated where the CPU
 /// has it. Both paths produce identical bits (property-tested).
-// Consumed by the flag-gated KV f16 storage integration; until that wiring
-// lands only the tests exercise it.
-#[allow(dead_code)]
 pub(super) fn convert_f32_slice_to_f16(source: &[f32], dest: &mut [u16]) {
     debug_assert_eq!(source.len(), dest.len());
     #[cfg(target_arch = "x86_64")]

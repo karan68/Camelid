@@ -228,9 +228,6 @@ pub(super) fn axpy_blocked(out: &mut [f32], prob: f32, v: &[f32]) {
 use super::kv_f16::f16_to_f32_kv;
 
 /// Canonical blocked dot with an f16 K operand — scalar reference.
-// Consumed by the flag-gated KV f16 storage integration; until that wiring
-// lands only the tests exercise it.
-#[allow(dead_code)]
 pub(super) fn dot_blocked_f16_scalar(x: &[f32], y16: &[u16]) -> f32 {
     debug_assert_eq!(x.len(), y16.len());
     let len = x.len();
@@ -266,7 +263,6 @@ pub(super) fn dot_blocked_f16_scalar(x: &[f32], y16: &[u16]) -> f32 {
 }
 
 /// Canonical V accumulation with an f16 V operand — scalar reference.
-#[allow(dead_code)]
 pub(super) fn axpy_blocked_f16_scalar(out: &mut [f32], prob: f32, v16: &[u16]) {
     debug_assert_eq!(out.len(), v16.len());
     for (out_value, value) in out.iter_mut().zip(v16) {
@@ -377,9 +373,6 @@ fn attn_f16_kernels_available() -> bool {
 }
 
 /// f16-K blocked dot with safe dispatch. Both paths produce identical bits.
-// Consumed by the flag-gated KV f16 storage integration; until that wiring
-// lands only the tests exercise it.
-#[allow(dead_code)]
 pub(super) fn dot_blocked_f16(x: &[f32], y16: &[u16]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if attn_f16_kernels_available() {
@@ -390,7 +383,6 @@ pub(super) fn dot_blocked_f16(x: &[f32], y16: &[u16]) -> f32 {
 }
 
 /// f16-V blocked axpy with safe dispatch, mirroring [`dot_blocked_f16`].
-#[allow(dead_code)]
 pub(super) fn axpy_blocked_f16(out: &mut [f32], prob: f32, v16: &[u16]) {
     #[cfg(target_arch = "x86_64")]
     if attn_f16_kernels_available() {
