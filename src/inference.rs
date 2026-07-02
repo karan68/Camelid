@@ -20889,6 +20889,7 @@ fn attention_decode_parallel_enabled() -> bool {
 /// Provisional dispatch-overhead floor for the head-parallel lane; below this
 /// many cached positions the serial loop runs even with the lane on. The
 /// shipped default comes from the Phase-4 crossover sweep.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const ATTENTION_DECODE_PARALLEL_DEFAULT_MIN_POSITIONS: usize = 64;
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
