@@ -1,4 +1,4 @@
-use std::{
+﻿use std::{
     collections::HashMap,
     convert::Infallible,
     env, mem,
@@ -87,7 +87,7 @@ pub struct AppState {
     gemma4_runtimes: Arc<RwLock<HashMap<String, Arc<Gemma4ServeRuntime>>>>,
     /// Runnable-lane serve runtimes (qwen35/Ornith), keyed by model id. Populated
     /// only when `CAMELID_RUNNABLE_SERVE` is set and a runnable-served arch is
-    /// loaded. Additive, parallel to the optimized engine — see the runnable serve
+    /// loaded. Additive, parallel to the optimized engine â€” see the runnable serve
     /// bridge near `runnable_chat_nonstreaming`.
     runnable_runtimes: Arc<RwLock<HashMap<String, Arc<RunnableServeRuntime>>>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
@@ -99,7 +99,7 @@ pub struct AppState {
     /// Serializes token generation across requests. The CUDA-resident Q8 runtime
     /// keeps KV / decode state in GPU-resident buffers that are reached through
     /// shared `Arc`s under read locks, so two decodes running at once clobber each
-    /// other's state — producing garbled "word-salad" output, non-deterministic
+    /// other's state â€” producing garbled "word-salad" output, non-deterministic
     /// greedy decoding, and an intermittent out-of-bounds slice panic in the
     /// worker. This lock is held for the full duration of every generation,
     /// including the entire SSE stream, so only one decode is ever in flight.
@@ -434,7 +434,7 @@ pub struct ChatCompletionRequest {
     pub camelid_dense_diagnostics: Option<bool>,
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
     /// Opt-in: attach a parity receipt to the (non-streaming) response. The
-    /// receipt is a claim of output for the verifier to check — no reference
+    /// receipt is a claim of output for the verifier to check â€” no reference
     /// runs here, so its parity block is emitted as not-compared.
     pub camelid_receipt: Option<bool>,
     /// Opt-in gemma4 thinking mode: renders the reference's enable_thinking
@@ -445,7 +445,7 @@ pub struct ChatCompletionRequest {
     /// OpenAI-style tool/function definitions. When present, they are rendered
     /// into the prompt through the loaded model's own chat template (Hybrid agent
     /// mode); the model's tool-call output is parsed back into `tool_calls` (for
-    /// templates that render tools — Llama 3.x etc.). Models whose template does
+    /// templates that render tools â€” Llama 3.x etc.). Models whose template does
     /// not render tools simply ignore them.
     pub tools: Option<Vec<serde_json::Value>>,
     /// OpenAI `tool_choice`: `"auto"` (default), `"none"` (suppress parsing), or
@@ -455,7 +455,7 @@ pub struct ChatCompletionRequest {
     /// OpenAI `parallel_tool_calls`: accepted and ignored (Camelid surfaces the
     /// tool calls the model actually emits). Declared here so it is not rejected.
     pub parallel_tool_calls: Option<bool>,
-    /// OpenAI `response_format`. Only `{"type":"json_object"}` is honored — it turns
+    /// OpenAI `response_format`. Only `{"type":"json_object"}` is honored â€” it turns
     /// on JSON-grammar-constrained decoding so the output is guaranteed valid JSON.
     /// `{"type":"text"}`/absent is normal decoding; other shapes (json_schema) are
     /// rejected. Declared here so it is not in `unsupported_fields`.
@@ -514,8 +514,8 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     /// Content-part types from the OpenAI parts form that Camelid cannot honor
-    /// (`image_url`, `input_audio`, `video_url`, …). Camelid generates text
-    /// tokens only — vision/audio towers are never loaded — so the chat
+    /// (`image_url`, `input_audio`, `video_url`, â€¦). Camelid generates text
+    /// tokens only â€” vision/audio towers are never loaded â€” so the chat
     /// handlers fail closed with a typed `unsupported_multimodal_content`
     /// error whenever this is non-empty. Plain-string content and `text` parts
     /// never populate it.
@@ -912,7 +912,7 @@ pub struct GenerationSessionRequest {
     pub camelid_dense_diagnostic_generated_index: Option<u32>,
     /// Opt-in Qwen3/gemma4 thinking mode: when true the chat renderer emits the
     /// template's thinking generation prompt (the model produces its own
-    /// `<think>…</think>` block) instead of the deterministic thinking-disabled
+    /// `<think>â€¦</think>` block) instead of the deterministic thinking-disabled
     /// shape. `None`/false preserves the parity-locked thinking-disabled default.
     pub camelid_enable_thinking: Option<bool>,
     /// Tool/function definitions, rendered into the prompt via the model's chat
@@ -960,7 +960,7 @@ pub struct ChatCompletionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub camelid_receipt: Option<ParityReceipt>,
     /// Serve-lane disclosure. Present and `"experimental"` only when the active
-    /// model is an implemented decoder that is NOT a supported exact row — the
+    /// model is an implemented decoder that is NOT a supported exact row â€” the
     /// output is unverified and carries no parity claim. Omitted for supported rows
     /// (whose support is asserted by `/api/capabilities`, never by this field) and
     /// is NEVER a parity receipt: the live token stream is not evidence of support.
@@ -1528,22 +1528,22 @@ pub async fn serve(
 
     // Warm the generation path BEFORE telling the user we're ready. The GPU resident
     // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
-    // lazily on the first generation — a one-time cost of several seconds. If it lands
+    // lazily on the first generation â€” a one-time cost of several seconds. If it lands
     // on the user's first prompt the model looks "dog slow" (it's really the cold
     // build, on the GPU the whole time). So: start serving in the background, fire one
     // tiny self-request through the exact same code path to build the engine, BLOCK on
     // it, and only then print "ready". After this the first real request is warm
-    // (~0.5s) instead of ~10s. The warm-up is best-effort — any failure just falls back
+    // (~0.5s) instead of ~10s. The warm-up is best-effort â€” any failure just falls back
     // to the old lazy build and is not fatal.
     let warm_model_id = state.active_model_id.read().await.clone();
     let server = tokio::spawn(async move { axum::serve(listener, router_with_state(state)).await });
     if let Some(model_id) = warm_model_id {
-        // Word the banner for the device that will actually serve — saying "GPU"
+        // Word the banner for the device that will actually serve â€” saying "GPU"
         // on a CPU-only run (e.g. CUDA_VISIBLE_DEVICES=-1) was misleading.
         let warming_msg = if crate::cuda::gpu_accel_enabled() {
-            "🐪 Warming up the GPU (building the resident engine, one-time)…"
+            "ðŸª Warming up the GPU (building the resident engine, one-time)â€¦"
         } else {
-            "🐪 Warming up the model (building the engine, one-time)…"
+            "ðŸª Warming up the model (building the engine, one-time)â€¦"
         };
         eprintln!("\n  {warming_msg}");
         warmup_generation_blocking(addr, model_id).await;
@@ -1566,7 +1566,7 @@ async fn warmup_generation_blocking(addr: SocketAddr, model_id: String) {
 
 /// Send the warm-up chat request and read the full response (blocking). Returns once
 /// the forward has completed so the resident engine is built before the caller
-/// proceeds. Errors are swallowed by the caller — this only shaves the cold start.
+/// proceeds. Errors are swallowed by the caller â€” this only shaves the cold start.
 fn warmup_request(addr: SocketAddr, model_id: &str) {
     use std::io::{Read, Write};
     // Give the just-spawned listener a moment to start accepting; retry briefly.
@@ -1609,7 +1609,7 @@ fn warmup_request(addr: SocketAddr, model_id: &str) {
 /// `tracing` output is for operators; this banner is for the person who just
 /// ran `camelid serve` and wants to know where to click.
 fn print_ready_banner(url: &str) {
-    eprintln!("\n  🐪 Camelid is ready");
+    eprintln!("\n  ðŸª Camelid is ready");
     eprintln!("  Open the chat UI:  {url}");
     eprintln!("  OpenAI-style API:  {url}/v1/chat/completions\n");
 }
@@ -1670,9 +1670,9 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     // The gemma4 runtime (Q8-resident) is ready as soon as it is loaded; the Llama
     // f32-budget check does not apply to it. Likewise, a model served by the runnable
     // lane (CAMELID_RUNNABLE_SERVE + a runnable-served arch, e.g. qwen35/Ornith) is
-    // generation-ready once loaded — the runnable serve runtime is built lazily on the
+    // generation-ready once loaded â€” the runnable serve runtime is built lazily on the
     // first chat, so gate on "runnable-serve enabled + runnable arch + loaded" rather
-    // than the lazy runtime map (otherwise chat stays locked until you chat → deadlock).
+    // than the lazy runtime map (otherwise chat stays locked until you chat â†’ deadlock).
     let runnable_serve_ready = runnable_serve_enabled()
         && model.is_some_and(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()));
     let generation_ready = gemma4_available
@@ -2238,7 +2238,7 @@ fn current_gpu_runtime() -> GpuRuntimeState {
     GpuRuntimeState {
         available: crate::cuda::is_available(),
         // Report the MASTER GPU-acceleration switch (resident decode), which is what
-        // actually runs the model on the GPU — not the legacy hybrid-matmul flag, which
+        // actually runs the model on the GPU â€” not the legacy hybrid-matmul flag, which
         // defaults off and made the UI read "GPU off" while the GPU did all the work.
         enabled: crate::cuda::gpu_accel_enabled(),
         device: crate::cuda::device_name(),
@@ -2247,12 +2247,12 @@ fn current_gpu_runtime() -> GpuRuntimeState {
     }
 }
 
-/// GET `/api/runtime/gpu` — current GPU-acceleration availability + on/off state.
+/// GET `/api/runtime/gpu` â€” current GPU-acceleration availability + on/off state.
 async fn gpu_runtime() -> Json<GpuRuntimeState> {
     Json(current_gpu_runtime())
 }
 
-/// POST `/api/runtime/gpu` `{ "enabled": bool }` — flip GPU acceleration at
+/// POST `/api/runtime/gpu` `{ "enabled": bool }` â€” flip GPU acceleration at
 /// runtime (no restart). A no-op effect when no CUDA device is present, since
 /// the inference dispatch falls back to the CPU reference either way.
 async fn set_gpu_runtime(Json(req): Json<GpuRuntimeRequest>) -> Json<GpuRuntimeState> {
@@ -2394,7 +2394,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             // receipts (read_file / list_dir / write_file). The id matches the
             // side-loaded server id (general.name) so the live `--agent` gate
             // (`active_tool_capable`) resolves; `family: "ornith"` routes tool-call
-            // parsing to the custom `<function=…>` XML parser.
+            // parsing to the custom `<function=â€¦>` XML parser.
             ModelCompatibilityTarget {
                 id: "Ornith 1.0 9B",
                 tool_capable: true,
@@ -3349,14 +3349,14 @@ struct InspectModelResponse {
     quant: Option<String>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
     lane_class: ModelLaneClass,
-    /// The exact typed blocker the load would hit — predicted WITHOUT binding
+    /// The exact typed blocker the load would hit â€” predicted WITHOUT binding
     /// tensors or loading weights. `None` when the architecture is implemented
     /// (it would load and run, supported or experimental).
     #[serde(skip_serializing_if = "Option::is_none")]
     blocker: Option<InspectBlocker>,
 }
 
-/// `POST /api/models/inspect` — header-only prediction of a GGUF's lane and the
+/// `POST /api/models/inspect` â€” header-only prediction of a GGUF's lane and the
 /// exact reason it would fail closed, WITHOUT loading weights, so the UI can warn
 /// before a multi-GB load attempt. Reads only the GGUF metadata header.
 async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
@@ -3391,8 +3391,8 @@ async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
         .to_string();
     let quant = Some(crate::runnable::headline_quant_of(&gguf)).filter(|q| !q.is_empty());
 
-    // Parse the config header (no tensor bind, no weight load). Ok ⇒ it would load;
-    // Err ⇒ it would fail closed with this exact typed reason.
+    // Parse the config header (no tensor bind, no weight load). Ok â‡’ it would load;
+    // Err â‡’ it would fail closed with this exact typed reason.
     let (lane_class, blocker) = match LlamaModelConfig::from_gguf(&gguf) {
         Ok(_) => (
             classify_model_lane(architecture.as_deref(), &filename),
@@ -3452,21 +3452,21 @@ fn model_family(gguf: &GgufFile) -> &'static str {
 }
 
 /// Gemma 4 chat template constants + renderer. Turns are
-/// `<|turn>{system|user|model}\n…<turn|>\n` and generation follows a trailing
+/// `<|turn>{system|user|model}\nâ€¦<turn|>\n` and generation follows a trailing
 /// `<|turn>model\n`; a leading system message gets its own system turn, and
 /// thinking mode injects `<|think|>` (see `gemma4_chat_prompt`). The renderer
 /// is locked byte-for-byte to the reference rendering by
 /// `qa/gemma4/template_shapes_v1.json`.
 /// Gemma 4 turn markers. Gemma 4 RENAMED them from Gemma 3's
 /// `<start_of_turn>`/`<end_of_turn>` to `<|turn>` (id 105) / `<turn|>` (id 106)
-/// — verified against the E2B/E4B/12B GGUF vocab and the GGUF-embedded Jinja
-/// chat template (`'<|turn>' + role + '\n'` … `'<turn|>\n'`). Using the old
+/// â€” verified against the E2B/E4B/12B GGUF vocab and the GGUF-embedded Jinja
+/// chat template (`'<|turn>' + role + '\n'` â€¦ `'<turn|>\n'`). Using the old
 /// spellings tokenizes as PLAIN TEXT: the model mimics them back and the stop
 /// token never matches.
 pub(crate) const GEMMA4_TURN_START: &str = "<|turn>";
 pub(crate) const GEMMA4_TURN_END: &str = "<turn|>";
 /// Thinking-channel markers (ids 100/101): the model may wrap hidden reasoning
-/// in `<|channel>…<channel|>`. The GGUF template strips these spans from chat
+/// in `<|channel>â€¦<channel|>`. The GGUF template strips these spans from chat
 /// history; Camelid strips them from chat OUTPUT so hidden reasoning never
 /// leaks to the client.
 pub(crate) const GEMMA4_CHANNEL_START: &str = "<|channel>";
@@ -3544,7 +3544,7 @@ mod gemma4_template_tests {
         }];
         let prompt = render_qwen3_chatml_prompt(&messages, true);
         // Thinking enabled: bare assistant turn, no pre-filled <think></think>
-        // block — the model emits its own reasoning (the template default branch).
+        // block â€” the model emits its own reasoning (the template default branch).
         assert_eq!(
             prompt,
             "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n\
@@ -3620,7 +3620,7 @@ mod gemma4_template_tests {
         assert_eq!(pack.pack_id, "qwen3-chatml-thinking-template-pack-v1");
         assert_eq!(pack.support_scope, "thinking_opt_in_leading_trace_only");
         assert!(!pack.shapes.is_empty(), "pack must carry shapes");
-        // At least one enable_thinking=true shape — the lane's whole reason to exist.
+        // At least one enable_thinking=true shape â€” the lane's whole reason to exist.
         assert!(
             pack.shapes.iter().any(|s| s.enable_thinking),
             "pack must lock at least one enable_thinking=true shape"
@@ -3793,9 +3793,9 @@ fn gemma4_chat_prompt(messages: &[ChatMessage], thinking: bool) -> String {
     out
 }
 
-/// Strip `<|channel>…<channel|>` thinking spans from a complete gemma4 chat
+/// Strip `<|channel>â€¦<channel|>` thinking spans from a complete gemma4 chat
 /// response. An unterminated span (generation hit the token budget inside the
-/// channel) is stripped to its start — hidden reasoning must never leak.
+/// channel) is stripped to its start â€” hidden reasoning must never leak.
 fn gemma4_strip_channels(text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
@@ -3906,7 +3906,7 @@ impl Gemma4ServeRuntime {
 }
 
 /// Distributed gemma4 serve config from the environment: both vars must be
-/// present and well-formed, or the pair is rejected loudly — a half-configured
+/// present and well-formed, or the pair is rejected loudly â€” a half-configured
 /// distributed lane must never silently fall back to a partial local load.
 fn gemma4_distributed_serve_config() -> std::result::Result<Option<(String, usize)>, String> {
     let worker = std::env::var("CAMELID_GEMMA4_WORKER").ok();
@@ -3985,7 +3985,7 @@ fn unix_secs() -> u64 {
 /// Non-streaming Gemma 4 chat. Builds the gemma prompt, generates greedily on a
 /// blocking thread, and returns a minimal OpenAI-compatible response.
 /// Gemma 4 raw completion (non-streaming): BOS + plain prompt text through the
-/// greedy runtime — the same envelope the committed basic_v1 oracle pack checks.
+/// greedy runtime â€” the same envelope the committed basic_v1 oracle pack checks.
 async fn gemma4_completion_nonstreaming(
     id: String,
     runtime: Arc<Gemma4ServeRuntime>,
@@ -4228,8 +4228,8 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 // ===================================================================================
 // Runnable-lane serve bridge (additive, gated by CAMELID_RUNNABLE_SERVE).
 //
-// Architectures implemented only in the runnable (pure-f32 oracle) lane — currently
-// `qwen35` (Ornith) — are not in the optimized inference engine, so the Llama serve
+// Architectures implemented only in the runnable (pure-f32 oracle) lane â€” currently
+// `qwen35` (Ornith) â€” are not in the optimized inference engine, so the Llama serve
 // path fails closed on them. This bridge mirrors the gemma4 serve pattern: a parallel
 // per-model-id runtime map, a short-circuit at the top of `chat_completions`, and a
 // dedicated chat handler. The optimized lane is untouched. Generation is greedy
@@ -4238,7 +4238,7 @@ fn gemma4_telemetry_error(message: String) -> telemetry::RequestFinish {
 // ===================================================================================
 
 /// The Ornith / qwen35 tool-call instruction literal, byte-for-byte from the GGUF
-/// chat template (the custom `<tool_call><function=…><parameter=…>` format the model
+/// chat template (the custom `<tool_call><function=â€¦><parameter=â€¦>` format the model
 /// was trained on). Rendering anything else makes the model emit the wrong format.
 const ORNITH_TOOL_INSTRUCTIONS: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
 
@@ -4318,7 +4318,7 @@ fn render_ornith_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) 
 }
 
 /// Render an Ornith/qwen35 ChatML prompt with tool definitions, faithful to the GGUF
-/// template's tools system block + custom `<function=…>` instructions. `tools` are the
+/// template's tools system block + custom `<function=â€¦>` instructions. `tools` are the
 /// flat function objects (`{name,description,parameters}`). Tool results (`role:"tool"`)
 /// are wrapped in `<tool_response>` user turns as the template expects.
 fn render_ornith_chatml_prompt_with_tools(
@@ -4395,7 +4395,7 @@ fn split_ornith_think(text: &str) -> (Option<String>, String) {
     }
 }
 
-/// Lift Ornith/qwen35 `<tool_call><function=NAME><parameter=ARG>VALUE</parameter>…
+/// Lift Ornith/qwen35 `<tool_call><function=NAME><parameter=ARG>VALUE</parameter>â€¦
 /// </function></tool_call>` XML into OpenAI `tool_calls` JSON
 /// (`{id,type:"function",function:{name,arguments:<json-string>}}`). Mirrors the
 /// chat-lane `parse_ornith`; `arguments` is a JSON object string. Scalars stay
@@ -4469,7 +4469,7 @@ async fn resolve_runnable_runtime(
     if let Some(runtime) = state.runnable_runtimes.read().await.get(&id).cloned() {
         return Ok(Some((id, runtime)));
     }
-    // Loaded as a runnable-served arch but no runtime → fail clearly rather than
+    // Loaded as a runnable-served arch but no runtime â†’ fail clearly rather than
     // letting the Llama path produce garbage / an unsupported error.
     let needs_runnable = state
         .loaded_models
@@ -4516,7 +4516,7 @@ async fn load_runnable_serve_runtime(
 
 /// Non-streaming chat for a runnable-served model (qwen35/Ornith): render the Ornith
 /// ChatML prompt (with tools when present), greedy-generate to EOG, split the
-/// `<think>` reasoning, and lift `<function=…>` tool calls into structured `tool_calls`
+/// `<think>` reasoning, and lift `<function=â€¦>` tool calls into structured `tool_calls`
 /// (the content keeps the tool-call text so the agent's client-side parser also lifts).
 async fn runnable_chat_nonstreaming(
     id: String,
@@ -4573,7 +4573,7 @@ async fn runnable_chat_nonstreaming(
     };
 
     let (reasoning, content) = split_ornith_think(&text);
-    // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=…>` XML.
+    // Structured tool_calls (OpenAI shape) lifted from the Ornith `<function=â€¦>` XML.
     // The agent loop ALSO re-parses the content text client-side (chat-lane
     // `parse_ornith`), so the content keeps the tool-call text below.
     let tool_calls = parse_ornith_tool_calls_json(&content);
@@ -4770,7 +4770,7 @@ async fn load_model_from_path_with_activation(
     }
     // Capture the exact typed blocker so a loaded-but-non-runnable model surfaces
     // WHY it fails closed (architecture not implemented, missing/invalid metadata,
-    // DiffusionGemma redirect, …) instead of silently sitting non-generative.
+    // DiffusionGemma redirect, â€¦) instead of silently sitting non-generative.
     let unsupported_runtime = match &llama_config_result {
         Err(
             err @ (BackendError::UnsupportedModelArchitecture(_)
@@ -4832,7 +4832,7 @@ async fn load_model_from_path_with_activation(
     }
 
     // Gemma 4 serve path (additive, gated by CAMELID_GEMMA4_SERVE): load a
-    // serve runtime so /v1/chat can route to it. Fail clearly on error — never
+    // serve runtime so /v1/chat can route to it. Fail clearly on error â€” never
     // silently fall back to the Llama path (which would produce garbage here).
     if gemma4_serve_enabled() && model_family(&loaded.gguf) == "gemma4" {
         load_gemma4_serve_runtime(state, &id, &loaded.path).await?;
@@ -6023,7 +6023,7 @@ async fn completions(
 /// Non-streaming multi-choice (`n` > 1) chat generation: runs `n_choices`
 /// independent generations, each with its own derived seed so the choices are
 /// distinct yet reproducible, and assembles them into one OpenAI response. Each
-/// choice is a full generation (its own prefill + decode) — a capability, not a
+/// choice is a full generation (its own prefill + decode) â€” a capability, not a
 /// throughput claim. `camelid` diagnostics mirror the first choice; usage counts
 /// the prompt once and sums completion tokens across choices. Streaming and
 /// receipts are rejected upstream for this path. The caller holds the generation
@@ -6254,7 +6254,7 @@ async fn chat_completions(
             Some("logprobs"),
         );
     }
-    // OpenAI stream_options.include_usage: resolved here (permissive — see
+    // OpenAI stream_options.include_usage: resolved here (permissive â€” see
     // stream_options_include_usage) before `req` is consumed into the generation
     // request. Threaded into stream_completion; ignored on the non-streaming
     // branch, which already returns `usage`.
@@ -6809,7 +6809,7 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
             && matches!(desc.dimensions.len(), 2 | 3);
         // K-quant 2-D/3-D linears (Q4_K/Q6_K/Q2_K/Q3_K) load via the wire path
         // (`load_kquant_wire_linear`), retaining only the compact super-block wire
-        // bytes — they never materialize an f32 copy, so they must not be counted
+        // bytes â€” they never materialize an f32 copy, so they must not be counted
         // against the f32 budget (otherwise a 4B Q2_K/Q4_K model's ~16 GB f32 estimate
         // wrongly trips the safety limit even though the resident GPU path uses wire).
         let wire_resident_kquant = matches!(
@@ -6952,12 +6952,12 @@ fn estimate_cpu_weight_materialization_bytes(binding: &LlamaTensorBinding) -> cr
 /// Q6_K) in a dense (non-MoE) layout. Such a model is loaded WIRE-ONLY: K-quant 2-D
 /// linears keep only their packed super-block wire bytes (see `load_kquant_wire_linear`
 /// in `LlamaLoadedWeights::load_with_ownership`) and Q8_0 linears keep their 36-byte
-/// blocks/pages — neither materializes the f32 the CPU-budget guard estimates. The CUDA
+/// blocks/pages â€” neither materializes the f32 the CPU-budget guard estimates. The CUDA
 /// resident decode engine reads those packed bytes in place (q8_gemv / q4k_gemv /
 /// q6k_gemv), so the f32 quantity the guard sizes is never produced for this model.
 ///
 /// This is the binding-level mirror of `LlamaInferenceSession::resident_decode_eligible`
-/// (which needs a built session); it intentionally checks only what the guard needs —
+/// (which needs a built session); it intentionally checks only what the guard needs â€”
 /// the per-tensor quant types and the dense layout. Anything else (an f16/f32 linear, a
 /// MoE router/expert stack) keeps the eager-f32 CPU path and stays under the guard.
 fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
@@ -6990,7 +6990,7 @@ fn binding_all_resident_quant_linears(binding: &LlamaTensorBinding) -> bool {
     })
 }
 
-/// Whether the GPU-resident decode engine will run this model — and therefore the
+/// Whether the GPU-resident decode engine will run this model â€” and therefore the
 /// CPU f32 weight materialization the budget guard estimates is never produced. True
 /// only when CUDA resident decode is active for this process AND every linear is a
 /// resident-eligible quant (`binding_all_resident_quant_linears`). On non-CUDA builds
@@ -6999,7 +6999,7 @@ fn binding_runs_on_resident_gpu(binding: &LlamaTensorBinding) -> bool {
     crate::inference::resident_decode_cuda_active() && binding_all_resident_quant_linears(binding)
 }
 
-/// Whether the CPU decode path consumes every linear WIRE-ONLY — and so, like the
+/// Whether the CPU decode path consumes every linear WIRE-ONLY â€” and so, like the
 /// resident-GPU case, never materializes the f32 weights the budget guard sizes. True
 /// when the K-quant CPU block-dot is enabled (Q4_K/Q6_K linears stream their wire bytes
 /// via `q4_k`/`q6_k_block_dot`, Q8_0 linears stream their packed blocks) AND every linear
@@ -7015,13 +7015,13 @@ fn binding_runs_on_cpu_wire_only(binding: &LlamaTensorBinding) -> bool {
 fn guard_cpu_weight_materialization_budget(binding: &LlamaTensorBinding) -> crate::Result<u64> {
     // Resident-GPU models load wire-only (packed Q8_0/Q4_K/Q6_K bytes the CUDA engine
     // reads in place) and never materialize the f32 weights this guard sizes. Bypass the
-    // CPU budget for them — but ONLY them; genuinely CPU-bound large models (or any
+    // CPU budget for them â€” but ONLY them; genuinely CPU-bound large models (or any
     // build/host without the resident GPU path) still hit the guard below.
     if binding_runs_on_resident_gpu(binding) {
         return Ok(0);
     }
     // CPU K-quant block-dot decode is also wire-only (no f32 materialization), so the
-    // same bypass applies on the CPU lane — otherwise a K-quant model that runs fine via
+    // same bypass applies on the CPU lane â€” otherwise a K-quant model that runs fine via
     // the block-dot is wrongly rejected here. (K-quant conductor Phase 2 follow-up.)
     if binding_runs_on_cpu_wire_only(binding) {
         return Ok(0);
@@ -7343,7 +7343,7 @@ async fn prepare_generation(
         stream: req.stream.unwrap_or(false),
     };
 
-    // Logprobs request → collect chosen + top-N each step. Chat uses logprobs:true
+    // Logprobs request â†’ collect chosen + top-N each step. Chat uses logprobs:true
     // plus top_logprobs:N; legacy completions uses logprobs:N directly.
     let logprobs_top_n = if matches!(req.chat_logprobs, Some(true)) {
         Some(req.top_logprobs.unwrap_or(0) as usize)
@@ -7377,7 +7377,7 @@ async fn prepare_generation(
 /// Build the draft-model drafter for `CAMELID_SPEC_DECODE=draft`: load the
 /// configured draft GGUF under the reserved `spec-draft` id (without making
 /// it the active model) and fail closed unless its token mapping is
-/// identical to the target's — drafted token ids must mean the same text in
+/// identical to the target's â€” drafted token ids must mean the same text in
 /// the target vocabulary.
 async fn build_model_drafter(
     state: &AppState,
@@ -7802,7 +7802,7 @@ fn static_param_name(param: &str) -> &'static str {
 /// `include_usage` is absent or not a boolean; and ignores any unknown subfields.
 /// Only an explicit `include_usage: true` turns the terminal usage chunk on, so
 /// it is the sole honored subfield (exact-row support); nothing else is claimed.
-/// `stream: false` needs no handling here — the non-streaming response already
+/// `stream: false` needs no handling here â€” the non-streaming response already
 /// carries `usage`, so a non-streaming request with `stream_options` "just works"
 /// untouched.
 fn stream_options_include_usage(stream_options: Option<&serde_json::Value>) -> bool {
@@ -7941,7 +7941,7 @@ async fn generate_decoded_tokens_blocking(
     });
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(result)) => {
-            // §4 safe-boot: a decode ran to completion under the applied gait
+            // Â§4 safe-boot: a decode ran to completion under the applied gait
             // without wedging the host, so clear the in-progress marker. Cheap
             // and idempotent (a no-op after the first call, or when no gait was
             // applied), so it is safe on the hot path.
@@ -8313,7 +8313,7 @@ fn lookup_prompt_prefix_cache(prepared: &PreparedGeneration) -> Option<CachedPro
 
 fn store_prompt_prefix_cache(prepared: &PreparedGeneration, step: &LlamaGenerationStep) {
     // A resident-GPU-prefilled session keeps its K/V history on the GPU only; the cached
-    // clone would drop it and resume from empty CPU buffers. Skip caching those sessions —
+    // clone would drop it and resume from empty CPU buffers. Skip caching those sessions â€”
     // a cache miss just re-runs the (fast, resident) prefill.
     if !prepared.session.cpu_kv_authoritative() {
         return;
@@ -8600,7 +8600,7 @@ fn generate_token_ids(
             } else {
                 Vec::new()
             };
-            // No drafts (e.g. no n-gram match) → fall through to the plain
+            // No drafts (e.g. no n-gram match) â†’ fall through to the plain
             // single-token step below; a one-token verify chunk would only
             // add chunk-path overhead over the tuned decode step.
             if !drafts.is_empty() {
@@ -8608,7 +8608,7 @@ fn generate_token_ids(
                 // batched forward on the target's resident engine, which manages the KV
                 // itself (accept the longest matching prefix, advance position). Falls
                 // back to the CPU chunk verify when the engine isn't resident-ready.
-                // Lossless either way — the emitted tokens are the target's own greedy
+                // Lossless either way â€” the emitted tokens are the target's own greedy
                 // argmax given the accepted prefix.
                 let gpu_accepted = if spec_gpu_enabled() {
                     prepared
@@ -9479,7 +9479,7 @@ fn stream_completion(
     };
     let events = async_stream::stream! {
         // Hold the generation lock for the entire stream so no other decode
-        // starts until this one finishes — or the client disconnects and the
+        // starts until this one finishes â€” or the client disconnects and the
         // stream is dropped, releasing the guard. See AppState::generation_lock.
         let _gen_guard = gen_guard;
         let stream_started = Instant::now();
@@ -9551,7 +9551,7 @@ fn stream_completion(
         // Bypass the prompt-prefix cache when the CUDA-resident engine drives
         // decode: reusing a cached session reseeds the GPU KV from f16-rounded
         // host history (a different reduction order than a clean GPU prefill),
-        // which corrupts the resumed decode — mild for greedy (a few near-tie
+        // which corrupts the resumed decode â€” mild for greedy (a few near-tie
         // flips) but catastrophic under temperature sampling, where it produces
         // garbled, off-topic output. The non-streaming path already gates the
         // cache this way (see resident_decode_cuda_active); the streaming path
@@ -9943,7 +9943,7 @@ fn normalize_mistral_instruct_bos_prefix_tokens(
     let Some(bos_text) = tokenizer.token_text(Some(bos_id)) else {
         return;
     };
-    let Some(space_id) = tokenizer.token_id("▁") else {
+    let Some(space_id) = tokenizer.token_id("â–") else {
         return;
     };
     if rendered_prompt.parse_special
@@ -10010,11 +10010,11 @@ fn render_chat_prompt_for_tokenization_with_tools(
     tokenizer: &Tokenizer,
     tools: &[serde_json::Value],
 ) -> std::result::Result<RenderedPrompt, MiniJinjaError> {
-    // Normalize OpenAI-style `{ "type":"function", "function":{…} }` tools to the
+    // Normalize OpenAI-style `{ "type":"function", "function":{â€¦} }` tools to the
     // flat function objects (`{ "name", "description", "parameters" }`) the chat
-    // templates (Llama 3.x etc.) actually render — matching llama.cpp / vLLM. This
+    // templates (Llama 3.x etc.) actually render â€” matching llama.cpp / vLLM. This
     // keeps the wire format OpenAI-standard while the prompt the model sees aligns
-    // with the `{"name":…, "parameters":…}` response format the template requests
+    // with the `{"name":â€¦, "parameters":â€¦}` response format the template requests
     // (the nested envelope otherwise leaks into the prompt and small models echo
     // the schema). See `TOOLCALL_DIAG.md`.
     let normalized: Vec<serde_json::Value> = tools
@@ -10027,7 +10027,7 @@ fn render_chat_prompt_for_tokenization_with_tools(
         .collect();
     if let Some(template) = tokenizer.chat_template.as_deref() {
         // Mistral Instruct templates (v0.3 GGUF) don't reference the `tools`
-        // Jinja variable — the generic Jinja render silently drops them. Use
+        // Jinja variable â€” the generic Jinja render silently drops them. Use
         // the dedicated renderer that produces [AVAILABLE_TOOLS] natively.
         if is_mistral_instruct_template(template) {
             return Ok(RenderedPrompt {
@@ -10079,7 +10079,7 @@ fn render_chat_prompt_for_tokenization_fallback(
         // The marker strings themselves (<|user|>, <|assistant|>, <|system|>)
         // are not vocab entries and stay plain SPM text either way; the
         // template's `</s>` IS a control token, and llama-server encodes it
-        // as EOS when tokenizing the rendered template — so chat prompts
+        // as EOS when tokenizing the rendered template â€” so chat prompts
         // parse specials (chat_prompt_parse_special), with dummy-prefix
         // handling after control tokens preserved by encode_piece.
         // Checked BEFORE tinyllama: Phi-3 reuses the same <|user|>/<|assistant|>
@@ -10092,7 +10092,7 @@ fn render_chat_prompt_for_tokenization_fallback(
                 // Phi-3 sets add_bos_token=true; the tokenizer prepends <s>.
                 add_special: true,
                 // Parse specials so <|user|>/<|assistant|>/<|end|> become the control
-                // token ids — in particular <|end|> as the end-of-turn stop token.
+                // token ids â€” in particular <|end|> as the end-of-turn stop token.
                 parse_special: true,
             };
         }
@@ -10147,9 +10147,9 @@ fn render_chat_prompt_for_tokenization_fallback(
 /// the generation prompt for the requested thinking mode:
 /// - `enable_thinking = false` (the deterministic, parity-locked default):
 ///   `<|im_start|>assistant\n<think>\n\n</think>\n\n` (the template's
-///   `enable_thinking is false` branch — a direct answer, no reasoning).
+///   `enable_thinking is false` branch â€” a direct answer, no reasoning).
 /// - `enable_thinking = true`: `<|im_start|>assistant\n` (the template's default
-///   branch — the model emits its own `<think>…</think>` reasoning block first).
+///   branch â€” the model emits its own `<think>â€¦</think>` reasoning block first).
 ///
 /// Verified token-identical to the reference for single-turn user prompts.
 fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -> String {
@@ -10169,7 +10169,7 @@ fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -
     if append_generation_prompt {
         if enable_thinking {
             // Thinking enabled: the bare assistant turn matches the GGUF template's
-            // default branch; the model generates its own <think>…</think> block.
+            // default branch; the model generates its own <think>â€¦</think> block.
             prompt.push_str("<|im_start|>assistant\n");
         } else {
             // Thinking disabled: the empty <think></think> block matches the GGUF
@@ -10184,7 +10184,7 @@ fn render_qwen3_chatml_prompt(messages: &[ChatMessage], enable_thinking: bool) -
 /// Renders a Qwen3 ChatML prompt with tool definitions injected into the system
 /// message and thinking suppressed. The format matches Qwen3's expected tool-call
 /// protocol: tools as flat JSON objects in the system turn, model responds with
-/// `<tool_call>{"name":…,"arguments":{…}}</tool_call>`.
+/// `<tool_call>{"name":â€¦,"arguments":{â€¦}}</tool_call>`.
 fn render_qwen3_chatml_prompt_with_tools(
     messages: &[ChatMessage],
     tools: &[serde_json::Value],
@@ -10220,7 +10220,7 @@ fn render_qwen3_chatml_prompt_with_tools(
         }
     }
     if !has_system {
-        // No system message from caller — tool block IS the system message.
+        // No system message from caller â€” tool block IS the system message.
     }
     prompt.push_str(&tool_block);
     prompt.push_str("<|im_end|>\n");
@@ -10885,7 +10885,10 @@ mod tests {
 
     use crate::{
         execution_plan::{ExecutionPlan, ExecutionProfile},
-        inference::{LlamaInferenceSession, LlamaLayerWeights, LlamaLoadedWeights, SamplingConfig},
+        inference::{
+            DecodeBindingCell, DecodeLinearBindings, LlamaInferenceSession, LlamaLayerWeights,
+            LlamaLoadedWeights, SamplingConfig,
+        },
         model::LlamaModelConfig,
         tensor::CpuTensor,
         tokenizer::{
@@ -10901,7 +10904,7 @@ mod tests {
     /// generation handlers (`completions`, `chat_completions`,
     /// `llama_server_completion`) and `stream_completion` must hold
     /// `AppState::generation_lock` for the whole decode. This verifies the lock
-    /// actually serializes — with many tasks acquiring it the way the handlers
+    /// actually serializes â€” with many tasks acquiring it the way the handlers
     /// do, never more than one is inside the critical section at a time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn generation_lock_serializes_decoding() {
@@ -11055,7 +11058,7 @@ mod tests {
             &json!({"include_usage": false})
         )));
         // Wrong-typed include_usage -> off (matches the permissive oracle; the
-        // request is never rejected — see ref_err_bad_type capture, HTTP 200).
+        // request is never rejected â€” see ref_err_bad_type capture, HTTP 200).
         assert!(!stream_options_include_usage(Some(
             &json!({"include_usage": "yes"})
         )));
@@ -11631,7 +11634,7 @@ mod tests {
                 target.evidence.contains("windows-x86-chatml-parity"),
                 "{id} evidence should cite the Windows bundle"
             );
-            // ChatML short-chat smoke only — no bounded context pack is promoted.
+            // ChatML short-chat smoke only â€” no bounded context pack is promoted.
             assert_eq!(
                 target.bounded_context_512_pack, "not_promoted",
                 "{id} ctx512"
@@ -11641,7 +11644,7 @@ mod tests {
 
     #[test]
     fn classify_model_lane_separates_supported_experimental_and_unsupported() {
-        // Exact supported curated artifact → Supported.
+        // Exact supported curated artifact â†’ Supported.
         assert_eq!(
             classify_model_lane(Some("llama"), "tinyllama-1.1b-chat-v1.0.Q8_0.gguf"),
             ModelLaneClass::Supported,
@@ -11651,7 +11654,7 @@ mod tests {
             ModelLaneClass::Supported,
         );
         // Implemented architecture but NOT a supported exact artifact (different
-        // quant/filename) → experimental, never falsely supported.
+        // quant/filename) â†’ experimental, never falsely supported.
         assert_eq!(
             classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q4_K_M.gguf"),
             ModelLaneClass::ExperimentalImplemented,
@@ -11660,7 +11663,7 @@ mod tests {
             classify_model_lane(Some("mistral"), "some-random-mistral-finetune-Q8_0.gguf"),
             ModelLaneClass::ExperimentalImplemented,
         );
-        // Architecture not in the implemented set → Unsupported (fails closed at load).
+        // Architecture not in the implemented set â†’ Unsupported (fails closed at load).
         assert_eq!(
             classify_model_lane(Some("falcon"), "falcon-7b-Q8_0.gguf"),
             ModelLaneClass::Unsupported,
@@ -12424,7 +12427,7 @@ mod tests {
 
     #[test]
     fn binding_all_resident_quant_linears_rejects_non_quant_linears() {
-        // An f32/f16 linear is NOT resident-eligible — it takes the eager-f32 CPU path,
+        // An f32/f16 linear is NOT resident-eligible â€” it takes the eager-f32 CPU path,
         // which the guard must keep protecting.
         for ty in [GgufTensorType::F32, GgufTensorType::F16] {
             let binding = materialization_binding(false, ty, vec![256, 256]);
@@ -12453,7 +12456,7 @@ mod tests {
     #[test]
     fn cpu_weight_materialization_budget_bypassed_for_kquant_block_dot() {
         // The budget guard must treat a K-quant block-dot model as wire-only (no f32
-        // materialization) on the CPU lane — otherwise serve CPU mode false-positives
+        // materialization) on the CPU lane â€” otherwise serve CPU mode false-positives
         // on the f32 size it never produces (Phase 2 follow-up). Tested directly on
         // `binding_runs_on_cpu_wire_only` to avoid the `resident_decode_cuda_active`
         // GPU-bypass confound on CUDA builds.
@@ -14163,7 +14166,7 @@ mod tests {
 
         assert_eq!(generated, vanilla);
         // The tiny model settles into a cycle, so the drafters must have
-        // actually accepted drafted tokens — otherwise this test would pass
+        // actually accepted drafted tokens â€” otherwise this test would pass
         // without exercising multi-token acceptance and rollback.
         assert!(
             accepted_total > 0,
@@ -14272,8 +14275,10 @@ mod tests {
                 attention_q_norm: None,
                 attention_k_norm: None,
                 moe_router: None,
+                decode_bindings: DecodeLinearBindings::default(),
             }],
             layer_range: None,
+            output_projection_binding: DecodeBindingCell::default(),
         }
     }
 
@@ -14318,7 +14323,7 @@ pub struct CatalogItem {
     pub downloads: u64,
     pub likes: u64,
     pub quant: &'static str,
-    /// `general.architecture` the GGUF will report (authoritative — curated, not
+    /// `general.architecture` the GGUF will report (authoritative â€” curated, not
     /// inferred from the filename). Drives the catalog's predicted lane.
     pub architecture: &'static str,
     pub license: &'static str,
@@ -14326,7 +14331,7 @@ pub struct CatalogItem {
 
 /// A catalog item plus its predicted runnable lane, so the Models tab can show which
 /// lane each entry would land in without downloading it. `oracle_qualified` means the
-/// `(architecture, quant)` combo is anchored → it would be Compatible after download
+/// `(architecture, quant)` combo is anchored â†’ it would be Compatible after download
 /// (unless it also matches a supported contract row, which the frontend resolves).
 ///
 /// Owns its strings so it can carry both **curated** rows (authoritative metadata,
@@ -14334,7 +14339,7 @@ pub struct CatalogItem {
 /// (`arch_detected: false`, where `architecture`/`quant` are filename guesses). The
 /// JSON field names are unchanged from the previous flattened `CatalogItem` shape;
 /// `group`/`arch_detected` are additive. Experimental rows always report
-/// `oracle_qualified: false` — a filename guess can never anchor a lane, so the
+/// `oracle_qualified: false` â€” a filename guess can never anchor a lane, so the
 /// frontend resolves them to "not yet in a lane" regardless of name coincidence.
 #[derive(Debug, serde::Serialize)]
 pub struct CatalogItemView {
@@ -14620,19 +14625,19 @@ pub struct LocalModelEntry {
     pub admission_reason: Option<String>,
     /// The (architecture, quant) combo is oracle-qualified, so smoke-admission is
     /// allowed. A model that is admitted but NOT oracle_qualified is "combo not yet
-    /// anchored" — never presented as compatible.
+    /// anchored" â€” never presented as compatible.
     pub oracle_qualified: bool,
     /// A cached runnable smoke receipt already exists for this file (it passed
-    /// smoke-admission before) — i.e. it belongs in the Compatible section.
+    /// smoke-admission before) â€” i.e. it belongs in the Compatible section.
     pub runnable_receipt_present: bool,
-    /// The GGUF ships a chat template — i.e. it is an instruction-tuned chat model
+    /// The GGUF ships a chat template â€” i.e. it is an instruction-tuned chat model
     /// (vs a base text-completion model). A model capability, not a system fact.
     pub chat_capable: bool,
-    /// Trained context window (tokens) from the GGUF — a model capability.
+    /// Trained context window (tokens) from the GGUF â€” a model capability.
     pub context_length: Option<u32>,
     /// Server-computed lane class from real header metadata (architecture) + the
     /// exact-artifact supported-row check. `experimental_implemented` means the
-    /// architecture is implemented but this is NOT a supported row — attemptable,
+    /// architecture is implemented but this is NOT a supported row â€” attemptable,
     /// unverified, no parity claim. Corroborates the frontend contract gate; it
     /// never promotes a row.
     pub lane_class: ModelLaneClass,
@@ -14647,7 +14652,7 @@ pub struct LocalModelsResponse {
 
 /// Cached metadata-derived facts for one local model, keyed by (mtime, size) so a
 /// re-download invalidates it. Parsing a GGUF's tensor index is slow for big models
-/// (the 16 GB MoE alone is seconds), and this endpoint is polled — so we re-parse
+/// (the 16 GB MoE alone is seconds), and this endpoint is polled â€” so we re-parse
 /// only files that are new or changed.
 #[derive(Clone)]
 struct CachedLocalMeta {
@@ -14680,7 +14685,7 @@ fn runnable_smoke_receipt_path(filename: &str) -> PathBuf {
         .join(format!("{stem}.json"))
 }
 
-/// `GET /api/models/local` — enumerate `models/*.gguf` with per-model lane facts.
+/// `GET /api/models/local` â€” enumerate `models/*.gguf` with per-model lane facts.
 /// Membership is derived downstream from these facts; nothing here is hand-authored.
 async fn local_models() -> Json<LocalModelsResponse> {
     let dir = PathBuf::from("models");
@@ -14797,7 +14802,7 @@ struct RunnableReceiptQuery {
     filename: String,
 }
 
-/// `GET /api/models/runnable-receipt?filename=<gguf>` — return the cached runnable
+/// `GET /api/models/runnable-receipt?filename=<gguf>` â€” return the cached runnable
 /// smoke receipt for a model (lane=runnable; attests deterministic execution, not
 /// parity). 404 when the model has not been smoke-admitted yet.
 async fn runnable_receipt(
@@ -14835,7 +14840,7 @@ struct RunnableSmokeRequest {
     filename: String,
 }
 
-/// `POST /api/models/runnable-smoke {filename}` — run smoke-admission on a local
+/// `POST /api/models/runnable-smoke {filename}` â€” run smoke-admission on a local
 /// model (admit -> load -> forward sanity -> coherence), cache + return the runnable
 /// receipt on pass. User-initiated; the model joins the Compatible section after.
 /// CPU-heavy (~minute) so it runs on a blocking thread.
@@ -14907,23 +14912,23 @@ async fn run_runnable_smoke(Json(req): Json<RunnableSmokeRequest>) -> Response {
 const HF_SEARCH_LIMIT: usize = 15;
 
 /// Lane classification for a downloaded/loaded model, driven only by real GGUF
-/// metadata (`general.architecture`) and the exact-artifact supported-row check —
+/// metadata (`general.architecture`) and the exact-artifact supported-row check â€”
 /// never a filename guess of the architecture. Drives experimental UI copy only; it
 /// never promotes a row or widens what `LlamaModelConfig::from_gguf` accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelLaneClass {
-    /// Exact supported row (asserted by `/api/capabilities`) — the full supported lane.
+    /// Exact supported row (asserted by `/api/capabilities`) â€” the full supported lane.
     Supported,
     /// Architecture is implemented but this is NOT a supported row: attemptable,
     /// unverified, no parity claim.
     ExperimentalImplemented,
-    /// Architecture is not in the implemented set — fails closed at load.
+    /// Architecture is not in the implemented set â€” fails closed at load.
     Unsupported,
 }
 
 /// The `id`s of `/api/capabilities` compatibility rows whose status is `supported*`.
-/// Memoized — these are static contract literals. Reads the SAME rows the contract
+/// Memoized â€” these are static contract literals. Reads the SAME rows the contract
 /// publishes, so this introduces no second ledger.
 fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'static str> {
     static IDS: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
@@ -14996,9 +15001,9 @@ fn backend_error_code(err: &BackendError) -> &'static str {
 
 /// The Models-tab catalog: a **curated** group (pinned, known-good rows, always
 /// first) followed, when the user is searching, by an **experimental** group of
-/// live Hugging Face results. Experimental rows are advisory-only — `oracle_qualified`
-/// is forced false and the frontend marks them unverified — so live browse can never
-/// widen what Camelid claims. A non-trivial `query` (≥2 chars) triggers the HF search;
+/// live Hugging Face results. Experimental rows are advisory-only â€” `oracle_qualified`
+/// is forced false and the frontend marks them unverified â€” so live browse can never
+/// widen what Camelid claims. A non-trivial `query` (â‰¥2 chars) triggers the HF search;
 /// a network failure degrades silently to curated-only.
 async fn get_catalog(
     axum::extract::Query(q): axum::extract::Query<CatalogQuery>,
@@ -15094,8 +15099,8 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
         req.repo_id, req.filename
     );
 
-    // `-f` makes curl FAIL on an HTTP error (404/403/…) instead of writing the
-    // error page to the output file and exiting 0 — which previously looked like an
+    // `-f` makes curl FAIL on an HTTP error (404/403/â€¦) instead of writing the
+    // error page to the output file and exiting 0 â€” which previously looked like an
     // instant successful download.
     match std::process::Command::new("curl")
         .args(["-f", "-L", "-C", "-", "-o", &part_path, &url])
@@ -15121,7 +15126,7 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
                 let mut child = child;
                 let succeeded = matches!(child.wait(), Ok(status) if status.success());
                 // Completion is the curl exit code AND a successful promote of the
-                // .part file to the final path — never a size heuristic.
+                // .part file to the final path â€” never a size heuristic.
                 let promoted =
                     succeeded && std::fs::rename(&part_path_clone, &dest_path_clone).is_ok();
                 if !promoted {

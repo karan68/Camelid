@@ -792,6 +792,7 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
         output: None,
         rope_freqs: None,
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
             attention_norm: CpuTensor::from_f32("blk.0.attn_norm.weight", vec![2], vec![1.0; 2])
                 .unwrap(),
@@ -815,6 +816,7 @@ fn tiny_prefill_schedule_weights(attention_q: CpuTensor) -> LlamaLoadedWeights {
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            decode_bindings: DecodeLinearBindings::default(),
         }],
     }
 }
@@ -883,6 +885,42 @@ fn resolve_prefill_thread_count_widens_only_on_measured_default() {
         resolve_prefill_thread_count_from(None, true, 16, true),
         None
     );
+}
+
+#[test]
+fn resolve_decode_thread_count_defaults_off_and_prefers_explicit_width() {
+    // Neither flag: no decode pool — decode stays inline (the default path).
+    assert_eq!(resolve_decode_thread_count_from(None, false, 16), None);
+    // Explicit width wins.
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("4"), false, 16),
+        Some(4)
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some(" 6 "), true, 16),
+        Some(6)
+    );
+    // 0/off/empty/invalid fall through to the dedicated check.
+    assert_eq!(resolve_decode_thread_count_from(Some("0"), false, 16), None);
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("off"), false, 16),
+        None
+    );
+    assert_eq!(resolve_decode_thread_count_from(Some(""), false, 16), None);
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("abc"), false, 16),
+        None
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("0"), true, 16),
+        Some(16)
+    );
+    assert_eq!(
+        resolve_decode_thread_count_from(Some("abc"), true, 16),
+        Some(16)
+    );
+    // Dedicated alone isolates at the global width.
+    assert_eq!(resolve_decode_thread_count_from(None, true, 12), Some(12));
 }
 
 #[test]
@@ -1158,6 +1196,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
         output: None,
         rope_freqs: None,
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
             attention_norm: dense_vector("blk.0.attn_norm.weight"),
             attention_q,
@@ -1171,6 +1210,7 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
             ffn_up: dense_matrix("blk.0.ffn_up.weight"),
             ffn_down: dense_matrix("blk.0.ffn_down.weight"),
             moe_router: None,
+            decode_bindings: DecodeLinearBindings::default(),
         }],
     };
     let mut session = LlamaInferenceSession::new(config, weights).unwrap();
@@ -6758,10 +6798,10 @@ fn q8_0_encoded_row_matches_decoded_scale_helper() {
         quants: std::array::from_fn(|idx| idx as i8 - 12),
     };
     let input = QuantizedQ8_0Row {
-        blocks: vec![Q8_0Block {
+        blocks: PooledQ8Blocks(vec![Q8_0Block {
             scale: f16_bits_to_f32(f32_to_f16_bits(0.25)),
             quants: std::array::from_fn(|idx| 15 - idx as i8),
-        }],
+        }]),
     };
     let mut row_bytes = Vec::with_capacity(Q8BlockReader::BLOCK_SIZE_BYTES);
     row_bytes.extend_from_slice(&f32_to_f16_bits(row.scale).to_le_bytes());
@@ -8290,7 +8330,7 @@ fn output_projection_diagnostics_support_runtime_packed_tied_output_rows() {
 /// The CPU repack execution plan retains the output projection as loader-packed rows
 /// (`q8_0_packed_rows4_4x8`) or plain retained blocks (`q8_0_blocks`) with no dense
 /// values, no file backing, and no runtime storage. Dense diagnostics used to 503 on
-/// these ("... with 0 values") — both storages must now decode token rows.
+/// these ("... with 0 values") â€” both storages must now decode token rows.
 #[test]
 fn output_projection_diagnostics_support_loader_packed_and_retained_block_rows() {
     let _env_guard = env_lock();
@@ -8379,6 +8419,96 @@ fn output_projection_diagnostics_support_loader_packed_and_retained_block_rows()
             assert_close(
                 diagnostic.decoded_component_reconstructed_logit,
                 diagnostic.reported_logit,
+            );
+        }
+    }
+}
+
+/// The zero-clone borrowed block-dot path must be bitwise-identical to the
+/// cloning path it replaces (`linear_weight_reinterpreted_as_transposed` +
+/// tensor block-dot), for both weight forms the swap can present: retained
+/// blocks only, and runtime packed rows4 that survives the orientation swap.
+#[test]
+fn borrowed_q8_0_block_dot_matches_cloned_swapped_tensor_path() {
+    let _env_guard = env_lock();
+    let input_width = 64usize; // 2 Q8_0 blocks per weight row
+    let output_width = 8usize;
+    let blocks_per_row = input_width / Q8_0_BLOCK_VALUES;
+    let weight_blocks: Vec<Q8_0Block> = (0..output_width * blocks_per_row)
+        .map(|row| Q8_0Block {
+            scale: f16_bits_to_f32(f32_to_f16_bits(0.03 + row as f32 * 0.011)),
+            quants: std::array::from_fn(|idx| ((row * 31 + idx * 7) % 251) as i8),
+        })
+        .collect();
+    let input_data: Vec<f32> = (0..input_width)
+        .map(|i| (((i % 89) as f32) - 44.0) * 0.017)
+        .collect();
+    let input =
+        CpuTensor::from_f32("borrowed_dot_probe", vec![1, input_width], input_data).unwrap();
+
+    // GGUF orientation [input_width, output_width]: rows == input width, so the
+    // linear chain reinterprets by swapping the matrix shape.
+    let make_weight = || {
+        CpuTensor::q8_0_runtime_packed_rows4_linear(
+            "blk.0.ffn_down.weight",
+            TensorShape {
+                dims: vec![input_width, output_width],
+            },
+            Q8_0PackedRows4::from_rows(
+                output_width,
+                blocks_per_row,
+                Q8_0PackedRows4Interleave::I8,
+                &weight_blocks,
+            )
+            .unwrap(),
+        )
+    };
+    // Form 1: retained blocks only. Form 2: runtime packed rows4 that matches
+    // the swapped orientation (kept across the swap by both paths).
+    let mut blocks_weight = make_weight();
+    blocks_weight.q8_0_runtime_storage = None;
+    blocks_weight.q8_0_blocks = Some(weight_blocks.clone());
+    let packed_weight = make_weight();
+
+    let runtime_plan = ResolvedRuntimePlan::from_env().expect("plan");
+    for (label, weight) in [
+        ("blocks", &blocks_weight),
+        ("runtime_packed", &packed_weight),
+    ] {
+        let cloned =
+            linear_weight_reinterpreted_as_transposed(weight, input_width).expect("reinterpret");
+        assert!(
+            should_use_q8_0_block_dot_with_plan(&cloned, input_width, &runtime_plan),
+            "{label}: cloned path must route to block-dot for this probe"
+        );
+        let expected = matmul_rhs_transposed_q8_0_block_dot_with_plan(
+            &input,
+            &cloned,
+            "borrowed_dot_out",
+            &runtime_plan,
+        )
+        .expect("cloned kernel");
+
+        let borrowed =
+            borrowed_linear_weight_as_transposed(weight, input_width).expect("borrowed view");
+        assert!(
+            should_use_borrowed_q8_0_block_dot_with_plan(borrowed, input_width, &runtime_plan),
+            "{label}: borrowed predicate must match the cloned predicate"
+        );
+        let actual = matmul_rhs_transposed_q8_0_block_dot_borrowed_with_plan(
+            &input,
+            borrowed,
+            "borrowed_dot_out",
+            &runtime_plan,
+        )
+        .expect("borrowed kernel");
+
+        assert_eq!(expected.shape.dims, actual.shape.dims, "{label}");
+        for (idx, (a, b)) in expected.data.iter().zip(actual.data.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "{label}: divergence at output {idx}: {a} vs {b}"
             );
         }
     }
@@ -9601,8 +9731,10 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            decode_bindings: DecodeLinearBindings::default(),
         }],
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
     });
     let mut session = LlamaInferenceSession::new(config, weights).unwrap();
 
@@ -9860,8 +9992,10 @@ fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            decode_bindings: DecodeLinearBindings::default(),
         }],
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
     });
 
     let prompt = [0, 1, 2, 3, 0, 1, 2];
@@ -10053,6 +10187,7 @@ fn prefill_layer_rejects_misaligned_kv_cache_cursor() {
         attention_q_norm: None,
         attention_k_norm: None,
         moe_router: None,
+        decode_bindings: DecodeLinearBindings::default(),
     };
     let hidden = CpuTensor::from_f32("hidden", vec![2, 2], vec![0.1, 0.2, 0.3, 0.4]).unwrap();
     let plan = LlamaKvCachePlan::from_config(&config).unwrap();
@@ -10318,8 +10453,10 @@ fn zero_prefill_chunk_env_falls_back_without_panicking() {
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            decode_bindings: DecodeLinearBindings::default(),
         }],
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
     });
 
     std::env::set_var("CAMELID_PREFILL_CHUNK_TOKENS", "0");
@@ -10968,6 +11105,7 @@ fn q8_0_residency_report_counts_resident_blocks_and_flags_file_backed() {
         rope_freqs: None,
         layers: Vec::new(),
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
     };
 
     let report = weights.q8_0_residency_report();
@@ -11040,7 +11178,7 @@ fn resident_prefill_rope_tables_match_per_position_builder() {
 }
 
 /// Q4_0 wire dot: the scalar and NEON paths must agree bit-exactly with each
-/// other and track a plain f32 dequant·f32 reference closely (the integer dot
+/// other and track a plain f32 dequantÂ·f32 reference closely (the integer dot
 /// is exact per block; only the per-block f32 scale accumulate rounds).
 #[test]
 fn q4_0_wire_row_dot_scalar_matches_dequant_reference() {
@@ -11073,7 +11211,7 @@ fn q4_0_wire_row_dot_scalar_matches_dequant_reference() {
         .collect();
     let xq = super::quantize_q8_0_blocks(&activation);
 
-    // Reference: dequantized weights × dequantized activation, block-sequential.
+    // Reference: dequantized weights Ã— dequantized activation, block-sequential.
     let mut reference = 0f32;
     for (b, xb) in xq.iter().enumerate() {
         let mut isum = 0i32;
@@ -11241,7 +11379,7 @@ fn q6_k_wire_dot_consistent_with_dequant() {
 }
 
 /// Phase-2 follow-up parity gate: the opt-in AVX2 Q6_K row dot must be BIT-IDENTICAL
-/// to the 8-lane scalar oracle `q6_k_wire_row_dot` (not merely close) — it vectorizes
+/// to the 8-lane scalar oracle `q6_k_wire_row_dot` (not merely close) â€” it vectorizes
 /// only the associative integer dot and reproduces the same 8-lane f32 reduction. This
 /// is the proof obligation that lets `CAMELID_X86_Q6K_AVX2` ship without a parity risk.
 #[cfg(target_arch = "x86_64")]
@@ -11432,7 +11570,7 @@ fn perf_q4_q8_q6_dot() {
 
 /// Build a 1-layer `LlamaLoadedWeights` for the CUDA arch-guard test, with per-head
 /// QK-norm tensors present (`qk_norm = true`, i.e. a Qwen3-shaped row) or absent
-/// (`false`, a plain Llama row). All other tensors are trivial 2×2 placeholders; the
+/// (`false`, a plain Llama row). All other tensors are trivial 2Ã—2 placeholders; the
 /// guard only inspects `attention_q_norm` / `attention_k_norm`.
 #[cfg(feature = "cuda")]
 fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
@@ -11453,6 +11591,7 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
         output: None,
         rope_freqs: None,
         layer_range: None,
+        output_projection_binding: DecodeBindingCell::default(),
         layers: vec![LlamaLayerWeights {
             attention_norm: t("blk.0.attn_norm.weight", vec![2], 2),
             attention_q: t("blk.0.attn_q.weight", vec![2, 2], 4),
@@ -11466,6 +11605,7 @@ fn minimal_weights_with_qk_norm(qk_norm: bool) -> LlamaLoadedWeights {
             ffn_up: t("blk.0.ffn_up.weight", vec![2, 2], 4),
             ffn_down: t("blk.0.ffn_down.weight", vec![2, 2], 4),
             moe_router: None,
+            decode_bindings: DecodeLinearBindings::default(),
         }],
     }
 }
@@ -11491,7 +11631,7 @@ fn cuda_resident_accepts_qwen3_qk_norm() {
 /// Item 2 bitwise lock: the decode attention head-parallel lane is a
 /// scheduling-only change, so its full attention output must be bit-identical
 /// to the serial loop for every GQA shape, head_dim, position count, dot
-/// lane, and random content — and identical across repeated parallel runs.
+/// lane, and random content â€” and identical across repeated parallel runs.
 #[test]
 fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
     struct XorShift64Star(u64);
@@ -11684,7 +11824,7 @@ fn decode_attention_parallel_lane_is_bitwise_identical_to_serial() {
 }
 
 /// Item 3 Lane A bitwise lock: the head-major KV layout is address math only.
-/// (KV content magnitudes cap below the f16 finite max — the real write path
+/// (KV content magnitudes cap below the f16 finite max â€” the real write path
 /// f16-rounds every stored element, on main too, and inf KV rejects softmax.)
 /// For every GQA shape, head_dim, and position count: build one cache per
 /// layout, drive them through the REAL write paths (write_kv_cache /
@@ -11715,7 +11855,7 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                 5 => unit * 1e4,
                 // Cap below the f16 finite max (65504): the REAL write path
                 // rounds every stored element through f16, so bigger inputs
-                // become ±inf in the cache (true on main too) and inf KV
+                // become Â±inf in the cache (true on main too) and inf KV
                 // makes softmax reject the row.
                 _ => unit * 6e4,
             }
@@ -11939,7 +12079,7 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
                             // Lane B: f16 storage under the blocked lane must
                             // be bitwise-equal to f32 storage under the
                             // blocked lane, in both layouts (the values are
-                            // identical — the write path always rounded — and
+                            // identical â€” the write path always rounded â€” and
                             // the fused kernel is expand-then-blocked).
                             if use_blocked {
                                 let mut out_pm16 = vec![0.0f32; head_dim];
@@ -12010,4 +12150,132 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
         "KV layout/dtype lanes diverged from the position-major f32 reference in \
          {mismatches} element(s)"
     );
+}
+
+/// Items 4+5 P1.1 binder equivalence: for EVERY projection weight of a real
+/// loaded 3B model, across runtime-plan flag combinations, (a) the recording
+/// cascade selects a stable arm across repeated fresh runs, (b) the bound
+/// fast path replays that arm without rebinding, and (c) bound and cascade
+/// outputs are bitwise-identical. Skips when the 3B GGUF is absent (CI).
+#[test]
+fn decode_linear_binder_matches_cascade_on_real_3b_weights() {
+    let model = std::env::var("CAMELID_3B_GGUF").unwrap_or_else(|_| {
+        r"C:\Users\timto\Camelid\models\Llama-3.2-3B-Instruct-Q8_0.gguf".to_string()
+    });
+    let model = std::path::PathBuf::from(model);
+    if !model.exists() {
+        eprintln!("skipping: 3B GGUF not present at {}", model.display());
+        return;
+    }
+    let gguf = crate::gguf::read_metadata(&model).expect("metadata");
+    let config = crate::model::LlamaModelConfig::from_gguf(&gguf).expect("config");
+    let binding = crate::model::LlamaTensorBinding::bind(&gguf, &config).expect("binding");
+    let store = crate::tensor::TensorStore::open(&model, &gguf);
+    let weights = LlamaLoadedWeights::load(&store, &binding, None).expect("weights");
+
+    let hidden = config.embedding_length as usize;
+    let ffn = config.feed_forward_length as usize;
+    let fill = |width: usize, scale: f32| -> CpuTensor {
+        let data: Vec<f32> = (0..width)
+            .map(|i| (((i % 97) as f32) - 48.0) * scale)
+            .collect();
+        CpuTensor::from_f32("binder_probe", vec![1, width], data).unwrap()
+    };
+
+    let base_plan = ResolvedRuntimePlan::from_env().expect("plan");
+    let mut packed_on = base_plan;
+    packed_on.q8.attention_output_packed_rows4_matmul = true;
+    packed_on.q8.ffn_down_packed_rows4_matmul = true;
+    packed_on.q8_packed_rows4_matmul_schedule =
+        Q8PackedRows4MatmulSchedule::from_q8_flags(packed_on.q8);
+    let mut consumers_on = packed_on;
+    consumers_on.q8.attention_output_decode_consumer = true;
+    consumers_on.q8.attention_projection_decode_consumer = true;
+    consumers_on.q8.ffn_down_decode_consumer = true;
+    consumers_on.q8_packed_rows4_matmul_schedule =
+        Q8PackedRows4MatmulSchedule::from_q8_flags(consumers_on.q8);
+    let plans = [
+        ("default", base_plan),
+        ("packed", packed_on),
+        ("consumers", consumers_on),
+    ];
+
+    let mut checked = 0usize;
+    for (plan_name, plan) in &plans {
+        for (layer_idx, layer) in weights.layers.iter().enumerate() {
+            let slots: [(&CpuTensor, &str, usize); 5] = [
+                (&layer.attention_q, "linear", hidden),
+                (&layer.attention_k, "attention_k", hidden),
+                (&layer.attention_v, "attention_v", hidden),
+                (&layer.attention_output, "linear", hidden),
+                (&layer.ffn_down, "ffn_down", ffn),
+            ];
+            for (slot_idx, (weight, role, width)) in slots.iter().enumerate() {
+                let input = fill(*width, 0.001 + slot_idx as f32 * 1e-4);
+                let cell_a = DecodeBindingCell::default();
+                let out_a = decode_linear_cascade(
+                    &input,
+                    weight,
+                    format!("binder_a_{layer_idx}_{slot_idx}"),
+                    role,
+                    plan,
+                    Some(&cell_a),
+                )
+                .expect("cascade a");
+                let arm_a = cell_a.load();
+                let cell_b = DecodeBindingCell::default();
+                let out_b = decode_linear_cascade(
+                    &input,
+                    weight,
+                    format!("binder_b_{layer_idx}_{slot_idx}"),
+                    role,
+                    plan,
+                    Some(&cell_b),
+                )
+                .expect("cascade b");
+                assert_eq!(
+                    arm_a,
+                    cell_b.load(),
+                    "unstable arm: plan {plan_name} layer {layer_idx} slot {slot_idx}"
+                );
+                let bound = linear_for_role_bound(
+                    &input,
+                    weight,
+                    format!("binder_c_{layer_idx}_{slot_idx}"),
+                    role,
+                    plan,
+                    false,
+                    &cell_a,
+                )
+                .expect("bound replay");
+                assert_eq!(
+                    arm_a,
+                    cell_a.load(),
+                    "bound path rebound: plan {plan_name} layer {layer_idx} slot {slot_idx}"
+                );
+                assert_eq!(out_a.data.len(), out_b.data.len());
+                assert_eq!(out_a.data.len(), bound.data.len());
+                for (i, ((a, b), c)) in out_a
+                    .data
+                    .iter()
+                    .zip(&out_b.data)
+                    .zip(&bound.data)
+                    .enumerate()
+                {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "cascade nondeterminism at {plan_name}/{layer_idx}/{slot_idx}/{i}"
+                    );
+                    assert_eq!(
+                        a.to_bits(),
+                        c.to_bits(),
+                        "bound output diverged at {plan_name}/{layer_idx}/{slot_idx}/{i}"
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("binder equivalence: {checked} (weight x plan) combinations checked, 0 mismatches");
 }

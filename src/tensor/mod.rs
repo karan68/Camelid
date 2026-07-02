@@ -1215,6 +1215,14 @@ impl Q8_0TensorBlocks {
 }
 
 impl CpuTensor {
+    /// Decompose into the owned name, dims, and f32 data buffer so the
+    /// decode scratch pool can recycle all three. Only meaningful for
+    /// plain-F32 tensors; quantized side-storage (never present on decode
+    /// intermediates) is dropped.
+    pub(crate) fn into_parts(self) -> (String, Vec<usize>, Vec<f32>) {
+        (self.name, self.shape.dims, self.data)
+    }
+
     pub fn from_f32(name: impl Into<String>, dims: Vec<usize>, data: Vec<f32>) -> Result<Self> {
         let shape = TensorShape { dims };
         let expected = shape.element_count()?;
@@ -1641,14 +1649,23 @@ impl CpuTensor {
     }
 
     pub fn add(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
+        let mut out = vec![0.0; self.data.len()];
+        self.add_into(rhs, &mut out)?;
+        Self::from_f32(name, self.shape.dims.clone(), out)
+    }
+
+    /// The exact kernel of [`Self::add`], writing into a caller-provided
+    /// buffer (same length as `self.data`). Shared by the allocating path
+    /// above and the decode scratch-pool path so both are one numeric path.
+    pub(crate) fn add_into(&self, rhs: &Self, out: &mut [f32]) -> Result<()> {
         if self.shape != rhs.shape {
             return Err(BackendError::RuntimeShapeMismatch(format!(
                 "shape mismatch: lhs {:?}, rhs {:?}",
                 self.shape.dims, rhs.shape.dims
             )));
         }
-        let mut out = vec![0.0; self.data.len()];
         let len = self.data.len();
+        debug_assert_eq!(out.len(), len);
         if should_parallelize_linear_output(len) {
             out.par_iter_mut()
                 .zip(self.data.par_iter())
@@ -1682,7 +1699,7 @@ impl CpuTensor {
                 }
             }
         }
-        Self::from_f32(name, self.shape.dims.clone(), out)
+        Ok(())
     }
 
     pub fn mul(&self, rhs: &Self, name: impl Into<String>) -> Result<Self> {
@@ -1818,6 +1835,16 @@ impl CpuTensor {
     }
 
     pub fn rms_norm(&self, weight: &Self, eps: f32, name: impl Into<String>) -> Result<Self> {
+        let mut out = vec![0.0; self.data.len()];
+        self.rms_norm_into(weight, eps, &mut out)?;
+        Self::from_f32(name, self.shape.dims.clone(), out)
+    }
+
+    /// The exact kernel of [`Self::rms_norm`], writing into a caller-provided
+    /// buffer (same length as `self.data`). Shared by the allocating path
+    /// above and the decode scratch-pool path so both are one numeric path
+    /// (same reduction order, same parallel split).
+    pub(crate) fn rms_norm_into(&self, weight: &Self, eps: f32, out: &mut [f32]) -> Result<()> {
         require_rank(self, 2, "rms_norm input")?;
         require_rank(weight, 1, "rms_norm weight")?;
         let rows = self.dim(0)?;
@@ -1828,7 +1855,7 @@ impl CpuTensor {
                 weight.shape.dims, self.shape.dims
             )));
         }
-        let mut out = vec![0.0; self.data.len()];
+        debug_assert_eq!(out.len(), self.data.len());
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -1876,7 +1903,7 @@ impl CpuTensor {
             }
         }
 
-        Self::from_f32(name, self.shape.dims.clone(), out)
+        Ok(())
     }
 
     /// Per-head RMSNorm (Qwen3 QK-norm). Treats each row of this `[rows, cols]`
@@ -3233,21 +3260,46 @@ pub(crate) fn should_parallelize_linear_output(output_width: usize) -> bool {
 }
 
 fn parallel_linear_enabled() -> bool {
-    match env::var("CAMELID_PARALLEL_LINEAR") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes" | "enabled"
-        ),
-        Err(_) => false,
+    // Read once per process (non-test): `should_parallelize_linear_output`
+    // runs on every elementwise/matmul call in the decode hot loop, and env
+    // reads allocate on Windows. Tests keep the uncached read.
+    fn uncached() -> bool {
+        match env::var("CAMELID_PARALLEL_LINEAR") {
+            Ok(value) => matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes" | "enabled"
+            ),
+            Err(_) => false,
+        }
+    }
+    #[cfg(test)]
+    {
+        uncached()
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(uncached)
     }
 }
 
 fn parallel_linear_min_outputs() -> usize {
-    env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS)
+    fn uncached() -> usize {
+        env::var("CAMELID_PARALLEL_LINEAR_MIN_OUTPUTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_PARALLEL_LINEAR_MIN_OUTPUTS)
+    }
+    #[cfg(test)]
+    {
+        uncached()
+    }
+    #[cfg(not(test))]
+    {
+        static MIN_OUTPUTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *MIN_OUTPUTS.get_or_init(uncached)
+    }
 }
 
 pub struct TensorStore {

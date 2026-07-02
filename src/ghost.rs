@@ -1,9 +1,9 @@
-//! Ghost (layer-streaming) mode: the `.cghost` container format and its reader/writer.
+﻿//! Ghost (layer-streaming) mode: the `.cghost` container format and its reader/writer.
 //!
 //! Standard GGUF files scatter a transformer block's tensors across the file, which turns a
 //! layer-by-layer streaming pass into random reads. A `.cghost` file is a pure re-layout of
 //! a GGUF at **source quantization**: every tensor a block needs is contiguous on disk, so
-//! streaming one layer is ONE sequential read. v1 deliberately does not requantize —
+//! streaming one layer is ONE sequential read. v1 deliberately does not requantize â€”
 //! identical bytes mean the ghost path can be parity-gated against the resident path.
 //!
 //! Layout:
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{BackendError, Result};
 use crate::gguf::GgufTensorType;
-use crate::inference::LlamaLayerWeights;
+use crate::inference::{DecodeLinearBindings, LlamaLayerWeights};
 use crate::model::{LlamaFfnTensors, LlamaTensorBinding};
 use crate::tensor::{cpu_tensor_from_gguf_bytes, CpuTensor, TensorStore};
 
@@ -98,12 +98,12 @@ fn io_err(path: &Path, source: std::io::Error) -> BackendError {
     }
 }
 
-/// Write a `.cghost` re-layout of `store`'s GGUF. Dense models only — ghost v1 refuses MoE
+/// Write a `.cghost` re-layout of `store`'s GGUF. Dense models only â€” ghost v1 refuses MoE
 /// (the streaming window assumes one fixed-size group per block).
 ///
 /// `layer_range` selects a pipeline shard: only those "blk.N" groups are written, the "pre"
 /// group (embedding) only when the range starts at layer 0, and the "post" group
-/// (output norm/projection) only when it ends at the last layer — so each mesh node hosts
+/// (output norm/projection) only when it ends at the last layer â€” so each mesh node hosts
 /// just its own half of the payload on local disk. `None` writes the whole model.
 pub fn write_cghost(
     store: &TensorStore,
@@ -234,7 +234,7 @@ impl GhostFile {
     /// handle (macOS) so streamed reads bypass the page cache entirely. For models that fit
     /// in RAM the cache is a free win (leave this off); for the over-RAM models ghost mode
     /// targets, the cache can only thrash and the OS must not accumulate the file's pages.
-    /// (`posix_madvise(DONTNEED)` does not apply here — that is for mmap'd ranges, and the
+    /// (`posix_madvise(DONTNEED)` does not apply here â€” that is for mmap'd ranges, and the
     /// streamer uses positioned reads.)
     pub fn open_with_options(path: &Path, evict_page_cache: bool) -> Result<Self> {
         let this = Self::open(path)?;
@@ -345,12 +345,13 @@ impl GhostFile {
                 ffn_up: take("ffn_up")?,
                 ffn_down: take("ffn_down")?,
                 moe_router: None,
+                decode_bindings: DecodeLinearBindings::default(),
             },
             span_len,
         ))
     }
 
-    /// Largest "blk.N" group payload in bytes — the size of the streaming read buffer.
+    /// Largest "blk.N" group payload in bytes â€” the size of the streaming read buffer.
     pub fn max_layer_span(&self) -> u64 {
         self.index
             .groups
@@ -375,7 +376,7 @@ pub struct PrefetchedLayer {
 
 /// Double-buffered streaming: a background worker reads + decodes layer N+1 from the
 /// `.cghost` file while the main thread runs layer N's forward. The result channel is a
-/// rendezvous (capacity 0), so at most TWO layer windows exist at any instant — one in the
+/// rendezvous (capacity 0), so at most TWO layer windows exist at any instant â€” one in the
 /// session being computed, one finished in the worker's hand awaiting handoff. The worker
 /// fulfills requests strictly in order; the main thread queues each chunk's layer indices
 /// ahead of consuming them (and primes the next chunk before the current one finishes, so
@@ -429,7 +430,7 @@ impl GhostPrefetcher {
     }
 
     /// Block until the next requested layer is ready (instant when the worker finished
-    /// while the previous layer was computing — the double-buffered steady state).
+    /// while the previous layer was computing â€” the double-buffered steady state).
     pub fn next(&self) -> Result<PrefetchedLayer> {
         self.result_rx
             .as_ref()

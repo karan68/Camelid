@@ -1,3 +1,5 @@
+#[cfg(feature = "alloc-gate")]
+pub mod alloc_gate;
 pub mod api;
 pub mod capability;
 pub mod catalog;

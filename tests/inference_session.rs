@@ -606,8 +606,10 @@ fn tiny_weights() -> LlamaLoadedWeights {
             attention_q_norm: None,
             attention_k_norm: None,
             moe_router: None,
+            decode_bindings: camelid::inference::DecodeLinearBindings::default(),
         }],
         layer_range: None,
+        output_projection_binding: camelid::inference::DecodeBindingCell::default(),
     }
 }
 
