@@ -281,6 +281,9 @@ jobs:
       - name: Frontend support-contract smoke
         run: npm run smoke:model-state
 
+      - name: Frontend model-lanes smoke
+        run: npm run smoke:model-lanes
+
       - name: Frontend 3B exact-row closure smoke
         run: npm run smoke:3b-closure
 

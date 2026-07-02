@@ -64,13 +64,13 @@ function App() {
     selectedModelId, setSelectedModelId, search, setSearch, memorySearch, setMemorySearch,
     composer, setComposer, newChatTitle, setNewChatTitle, sending, receiptMode, setReceiptMode,
     thinkingMode, setThinkingMode,
-    loadingModelId, registerForm, setRegisterForm, externalForm, setExternalForm,
+    loadingModelId, registerForm, setRegisterForm,
     conversations, memories, filteredConversations, models, runtime, selectedConversation,
     selectedModel, selectedModelRunnable, selectedModelExperimental, latestAssistantMessage, pendingConversation,
     createConversation, showNewChatLanding, sendMessage, resendFromMessage, stopGeneration, saveToMemory,
     createMemory, updateMemory, deleteMemory, renameConversation, deleteConversation, deleteAllConversations,
-    installModel, installCatalogModel, cancelModelDownload, activateModel, unloadCurrentModel,
-    registerModel, connectExternalModel, loadDashboard, stoppingGeneration,
+    activateModel, unloadCurrentModel,
+    registerModel, loadDashboard, stoppingGeneration,
     apiBase, setApiBase,
   } = dash
 
@@ -318,23 +318,12 @@ function App() {
               runtime={runtime}
               capabilities={dashboard?.capabilities}
               refreshDashboard={loadDashboard}
+              unloadCurrentModel={unloadCurrentModel}
+              loadingModelId={loadingModelId}
               registerForm={registerForm}
               setRegisterForm={setRegisterForm}
-              externalForm={externalForm}
-              setExternalForm={setExternalForm}
               registerModel={registerModel}
-              connectExternalModel={connectExternalModel}
-              models={models}
-              selectedModelId={selectedModelId}
-              setSelectedModelId={setSelectedModelId}
-              loadingModelId={loadingModelId}
-              activateModel={activateModel}
-              unloadCurrentModel={unloadCurrentModel}
-              installModel={installModel}
-              installCatalogModel={installCatalogModel}
-              cancelModelDownload={cancelModelDownload}
               apiBase={apiBase}
-              setTab={navigateTab}
             />
           )}
 

@@ -53,11 +53,10 @@
   color: var(--color-accent-text);
   margin: 0 0 var(--space-2);
 }
-.camelid-view--page .model-summary,
+
 .camelid-view--page .hero-summary,
 .camelid-view--page .view-hero-copy p,
-.camelid-view--page .section-sub,
-.camelid-view--page .library-error-copy {
+.camelid-view--page .section-sub{
   color: var(--color-text-muted);
   line-height: var(--leading-snug);
   font-size: var(--text-sm);
@@ -66,8 +65,7 @@
 /* ==========================================================================
    Page hero — the header block at the top of each view
    ========================================================================== */
-.camelid-view--page .panel.models-hero-panel,
-.camelid-view--page .panel.models-overview-hero,
+
 .camelid-view--page > .view-stack > .panel:first-child,
 .camelid-view--page .view-hero,
 .camelid-view--page .hero-panel {
@@ -77,7 +75,7 @@
     radial-gradient(120% 140% at 0% 0%, var(--color-hero-glow) 0%, transparent 55%),
     var(--color-bg-elevated);
 }
-.camelid-view--page .models-hero-panel h2,
+
 .camelid-view--page .view-hero h1 { font-size: var(--text-2xl); letter-spacing: -0.02em; }
 
 /* ---- Cards / panels (unified elevated surface) ---- */
@@ -86,10 +84,6 @@
 .camelid-view--page .api-panel,
 .camelid-view--page .analytics-panel,
 .camelid-view--page .analytics-stat-card,
-.camelid-view--page .models-section-panel,
-.camelid-view--page .models-status-card,
-.camelid-view--page .model-card,
-.camelid-view--page .models-model-card,
 .camelid-view--page .runtime-stat,
 .camelid-view--page .panel-section,
 .camelid-view--page .stat-card,
@@ -101,22 +95,12 @@
 }
 .camelid-view--page .panel,
 .camelid-view--page .api-card,
-.camelid-view--page .analytics-panel,
-.camelid-view--page .models-section-panel,
-.camelid-view--page .models-status-card,
-.camelid-view--page .model-card,
-.camelid-view--page .models-model-card { padding: var(--space-6); }
+.camelid-view--page .analytics-panel{ padding: var(--space-6); }
 .camelid-view--page .analytics-stat-card,
 .camelid-view--page .stat-card,
 .camelid-view--page .runtime-stat { padding: var(--space-5); }
 
 /* Interactive / selectable cards lift on hover */
-.camelid-view--page .model-card,
-.camelid-view--page .models-model-card { transition: border-color var(--dur-fast), box-shadow var(--dur-fast), transform var(--dur-fast); }
-.camelid-view--page .model-card:hover,
-.camelid-view--page .models-model-card:hover { border-color: var(--color-border-strong); box-shadow: var(--shadow-2); }
-.camelid-view--page .active-model-card { border-color: var(--color-ready); box-shadow: 0 0 0 1px var(--color-ready) inset, var(--shadow-2); }
-.camelid-view--page .selected-model-card { border-color: var(--color-selected-row-border); box-shadow: 0 0 0 1px var(--color-selected-row-border) inset, var(--shadow-1); }
 
 /* Nested cards stay flat to avoid card-in-card noise */
 .camelid-view--page .panel .panel,
@@ -131,7 +115,7 @@
 .camelid-view--page .panel-hero { border-radius: var(--radius-md); }
 
 /* ---- Section headings inside panels ---- */
-.camelid-view--page .models-section-heading,
+
 .camelid-view--page .section-heading {
   display: flex;
   flex-wrap: wrap;
@@ -140,16 +124,11 @@
   gap: var(--space-3);
   margin-bottom: var(--space-5);
 }
-.camelid-view--page .models-section-heading > div:first-child { min-width: 0; }
-.camelid-view--page .models-section-heading .model-summary,
-.camelid-view--page .section-heading .model-summary { max-width: 52ch; margin: 0; }
 
 /* ==========================================================================
    Stat strips / ledgers — big number + label, like the cluster stat row
    ========================================================================== */
-.camelid-view--page .models-hero-ledger,
-.camelid-view--page .models-truth-strip,
-.camelid-view--page .models-compatibility-strip,
+
 .camelid-view--page .stat-grid,
 .camelid-view--page .analytics-stat-grid,
 .camelid-view--page .runtime-stat-grid {
@@ -157,10 +136,7 @@
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: var(--space-3);
 }
-.camelid-view--page .models-hero-ledger { margin-top: var(--space-5); }
-.camelid-view--page .models-hero-ledger > div,
-.camelid-view--page .models-truth-strip > div,
-.camelid-view--page .models-compatibility-strip > div,
+
 .camelid-view--page .runtime-stat {
   display: flex;
   flex-direction: column;
@@ -171,9 +147,7 @@
   border: 1px solid var(--color-border-soft);
 }
 /* the label (span), value (strong), sub (small) rhythm */
-.camelid-view--page .models-hero-ledger > div > span,
-.camelid-view--page .models-truth-strip > div > span,
-.camelid-view--page .models-compatibility-strip > div > span,
+
 .camelid-view--page .runtime-stat > span:first-child,
 .camelid-view--page .stat-card__label {
   font-size: var(--text-xs);
@@ -182,35 +156,7 @@
   text-transform: uppercase;
   color: var(--color-text-faint);
 }
-.camelid-view--page .models-hero-ledger > div > strong,
-.camelid-view--page .models-truth-strip > div > strong,
-.camelid-view--page .models-compatibility-strip > div > strong {
-  font-size: var(--text-lg);
-  font-weight: 700;
-  letter-spacing: -0.01em;
-  color: var(--color-text);
-  line-height: var(--leading-tight);
-  margin-top: 2px;
-}
-.camelid-view--page .models-hero-ledger > div > small,
-.camelid-view--page .models-truth-strip > div > small,
-.camelid-view--page .models-compatibility-strip > div > small {
-  font-size: var(--text-xs);
-  color: var(--color-text-muted);
-  line-height: var(--leading-snug);
-  margin-top: 2px;
-  /* Long evidence / support-contract strings get dumped into these sub slots —
-     contain them so a single cell can't blow up the strip height. */
-  display: -webkit-box;
-  -webkit-line-clamp: 4;
-  line-clamp: 4;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
 /* Stat strips: rows align to top, cells don't stretch to the tallest sibling. */
-.camelid-view--page .models-truth-strip,
-.camelid-view--page .models-compatibility-strip,
-.camelid-view--page .models-hero-ledger { align-items: start; }
 
 /* Pure number stat cards (analytics) */
 .camelid-view--page .analytics-stat-card { display: flex; flex-direction: column; gap: var(--space-1); }
@@ -224,56 +170,23 @@
 }
 
 /* Models summary pills (filter toggles) */
-.camelid-view--page .models-summary-strip { display: flex; flex-wrap: wrap; gap: var(--space-2); }
-.camelid-view--page .models-summary-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-4);
-  border-radius: var(--radius-pill);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-soft);
-  color: var(--color-text-muted);
-  font-size: var(--text-sm);
-  font-weight: 600;
-  transition: background var(--dur-fast), color var(--dur-fast), border-color var(--dur-fast);
-}
-.camelid-view--page button.models-summary-pill:hover { background: var(--color-surface-hover); color: var(--color-text); }
-.camelid-view--page .models-summary-pill strong { color: var(--color-text); font-weight: 700; }
-.camelid-view--page .models-summary-pill.active { background: var(--color-accent-soft); border-color: var(--color-selected-row-border); color: var(--color-accent-text); }
-.camelid-view--page .models-summary-pill.active strong { color: var(--color-accent-text); }
 
 /* ---- Grids ---- */
-.camelid-view--page .models-card-grid,
+
 .camelid-view--page .api-grid,
 .camelid-view--page .api-grid-polished,
 .camelid-view--page .api-capabilities-grid,
-.camelid-view--page .models-status-grid,
-.camelid-view--page .view-hero-stats,
-.camelid-view--page .import-grid,
-.camelid-view--page .import-grid-advanced {
+.camelid-view--page .view-hero-stats{
   display: grid;
   gap: var(--space-4);
 }
-.camelid-view--page .models-card-grid,
+
 .camelid-view--page .api-capabilities-grid { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-.camelid-view--page .models-status-grid { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 
 /* ---- Card heads (title + status) ---- */
-.camelid-view--page .models-card-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-3);
-  margin-bottom: var(--space-3);
-}
-.camelid-view--page .models-card-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.camelid-view--page .models-card-title strong { font-size: var(--text-md); font-weight: 650; letter-spacing: -0.01em; overflow-wrap: anywhere; }
-.camelid-view--page .models-card-title span { font-size: var(--text-xs); color: var(--color-text-muted); overflow-wrap: anywhere; }
-.camelid-view--page .models-card-display-name { color: var(--color-text) !important; font-weight: 600; }
 
 /* ---- Chips / badges / pills ---- */
-.camelid-view--page .pin-badge,
+
 .camelid-view--page .context-chip,
 .camelid-view--page .history-metric-pill,
 .camelid-view--page .runtime-stat-tag {
@@ -293,106 +206,18 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
-.camelid-view--page .models-card-tags { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-bottom: var(--space-4); min-width: 0; }
-.camelid-view--page .pin-badge.ready { background: var(--color-evidence-soft); color: var(--color-evidence); border-color: var(--color-evidence-border); }
-.camelid-view--page .pin-badge.warm { background: var(--color-planned-soft); color: var(--color-planned); border-color: var(--color-planned-border); }
-.camelid-view--page .pin-badge.error { background: color-mix(in srgb, var(--color-error) 12%, transparent); color: var(--color-error); border-color: color-mix(in srgb, var(--color-error) 40%, transparent); }
 
 /* Status pills — the prominent per-card status */
-.camelid-view--page .status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 3px var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--color-surface-strong);
-  border: 1px solid var(--color-border-soft);
-  color: var(--color-text-muted);
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  flex: none;
-}
-.camelid-view--page .status-pill::before {
-  content: '';
-  width: 7px; height: 7px; border-radius: 50%;
-  background: currentColor;
-  opacity: 0.9;
-}
-.camelid-view--page .status-pill.ready { background: color-mix(in srgb, var(--color-ready) 12%, transparent); color: var(--color-ready); border-color: color-mix(in srgb, var(--color-ready) 35%, transparent); }
-.camelid-view--page .status-pill.warm { background: var(--color-planned-soft); color: var(--color-planned); border-color: var(--color-planned-border); }
-.camelid-view--page .status-pill.error { background: color-mix(in srgb, var(--color-error) 12%, transparent); color: var(--color-error); border-color: color-mix(in srgb, var(--color-error) 40%, transparent); }
 
 /* ---- Definition / readiness grids (key → value) ---- */
-.camelid-view--page .models-definition-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: var(--space-2);
-  margin: var(--space-3) 0 0;
-}
-.camelid-view--page .models-definition-grid > div {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-soft);
-}
-.camelid-view--page .models-definition-grid > div.ready { background: color-mix(in srgb, var(--color-ready) 9%, transparent); border-color: color-mix(in srgb, var(--color-ready) 22%, transparent); }
-.camelid-view--page .models-definition-grid dt { font-size: var(--text-xs); color: var(--color-text-faint); font-weight: 600; }
-.camelid-view--page .models-definition-grid dd { margin: 0; font-size: var(--text-sm); font-family: var(--font-mono); color: var(--color-text); overflow-wrap: anywhere; }
-.camelid-view--page .models-readiness-path { grid-column: 1 / -1; }
-.camelid-view--page .models-readiness-path dd { font-size: var(--text-xs); color: var(--color-text-muted); overflow-wrap: anywhere; }
 
 /* ---- Capability map (3-up label / value / sub) ---- */
-.camelid-view--page .models-card-capability-map {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: var(--space-3);
-  margin: var(--space-4) 0;
-  padding: var(--space-4);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-soft);
-}
-.camelid-view--page .models-card-capability-map > div { display: flex; flex-direction: column; gap: 2px; }
-.camelid-view--page .models-card-capability-map span { font-size: var(--text-xs); font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; color: var(--color-text-faint); }
-.camelid-view--page .models-card-capability-map strong { font-size: var(--text-sm); color: var(--color-text); line-height: var(--leading-snug); }
-.camelid-view--page .models-card-capability-map small { font-size: var(--text-xs); color: var(--color-text-muted); line-height: var(--leading-snug); }
 
 /* ---- Copy stacks + disclosures ---- */
-.camelid-view--page .models-card-copy-stack { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-3); }
-.camelid-view--page .models-card-copy-stack .model-summary { background: none; border: none; box-shadow: none; padding: 0; }
-.camelid-view--page details.models-card-details,
-.camelid-view--page details.models-capability-evidence {
-  margin-top: var(--space-3);
-  border: 1px solid var(--color-border-soft);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  overflow: hidden;
-}
-.camelid-view--page details.models-card-details > summary,
-.camelid-view--page details.models-capability-evidence > summary {
-  cursor: pointer;
-  list-style: none;
-  padding: var(--space-2) var(--space-4);
-  font-size: var(--text-xs);
-  font-weight: 700;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  color: var(--color-text-muted);
-}
 .camelid-view--page details > summary::-webkit-details-marker { display: none; }
 .camelid-view--page details[open] > summary { border-bottom: 1px solid var(--color-border-soft); color: var(--color-text); }
-.camelid-view--page details.models-card-details .models-card-copy-stack,
-.camelid-view--page details.models-capability-evidence .models-card-copy-stack { padding: var(--space-3) var(--space-4); margin: 0; }
 
 /* ---- Card actions ---- */
-.camelid-view--page .models-card-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-4); }
 
 /* ---- Buttons ---- */
 .camelid-view--page .primary-button {
@@ -423,12 +248,6 @@
 .camelid-view--page .ghost-button-quiet:hover:not(:disabled) { background: var(--color-surface-hover); }
 
 /* ---- Inputs / search / selects in toolbars ---- */
-.camelid-view--page .models-toolbar-top { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--space-3); }
-.camelid-view--page .models-search-field { flex: 1 1 280px; }
-.camelid-view--page .models-search-field > span,
-.camelid-view--page .models-filter-field > span {
-  display: block; font-size: var(--text-xs); font-weight: 600; color: var(--color-text-faint); margin-bottom: var(--space-1);
-}
 .camelid-view--page input[type="text"],
 .camelid-view--page input[type="search"],
 .camelid-view--page input:not([type]),
@@ -452,27 +271,8 @@
 .camelid-view--page input::placeholder, .camelid-view--page textarea::placeholder { color: var(--color-text-faint); }
 
 /* ---- Empty states ---- */
-.camelid-view--page .empty-state {
-  padding: var(--space-8) var(--space-6);
-  border-radius: var(--radius-lg);
-  border: 1px dashed var(--color-border-strong);
-  background: var(--color-surface-subtle);
-  color: var(--color-text-muted);
-  text-align: center;
-  font-size: var(--text-sm);
-  line-height: var(--leading-snug);
-}
 
 /* ---- Progress bars ---- */
-.camelid-view--page .progress-wrap,
-.camelid-view--page .progress-bar {
-  height: 8px;
-  background: var(--color-surface-strong);
-  border-radius: var(--radius-pill);
-  overflow: hidden;
-}
-.camelid-view--page .progress-bar > *,
-.camelid-view--page .progress-wrap > * { height: 100%; background: var(--color-accent); border-radius: var(--radius-pill); transition: width var(--dur-base) var(--ease-standard); }
 
 /* ---- Lists ---- */
 .camelid-view--page .api-feature-list,
@@ -497,37 +297,6 @@
   overflow-x: auto;
   white-space: pre;
 }
-
-/* ==========================================================================
-   Supported models (Models page)
-   ========================================================================== */
-.supported-models { margin: 0; }
-.supported-models__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-4); }
-.supported-models__kicker { font-size: var(--text-xs); font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-text-faint); }
-.supported-models__title { font-size: var(--text-xl); margin-top: 2px; }
-.supported-models__grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: var(--space-4); }
-.supported-model {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  padding: var(--space-5);
-  border: 1px solid var(--color-border-soft);
-  border-radius: var(--radius-lg);
-  background: var(--color-bg-elevated);
-  box-shadow: var(--shadow-1);
-  transition: border-color var(--dur-fast), box-shadow var(--dur-fast);
-}
-.supported-model:hover { border-color: var(--color-border-strong); box-shadow: var(--shadow-2); }
-.supported-model.is-recommended { border-color: var(--color-selected-row-border); box-shadow: 0 0 0 1px var(--color-selected-row-border) inset, var(--shadow-1); }
-.supported-model__top { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); }
-.supported-model__name { font-size: var(--text-md); font-weight: 600; }
-.supported-model__tags { display: flex; flex-wrap: wrap; gap: var(--space-1); justify-content: flex-end; }
-.supported-model__blurb { flex: 1; font-size: var(--text-sm); color: var(--color-text-muted); line-height: var(--leading-snug); }
-.supported-model__actions { display: flex; align-items: center; gap: var(--space-2); }
-.supported-model__progress-row { display: flex; align-items: center; gap: var(--space-3); }
-.supported-model__progress { flex: 1; height: 8px; border-radius: var(--radius-pill); background: var(--color-surface-strong); overflow: hidden; }
-.supported-model__progress > span { display: block; height: 100%; background: var(--color-accent); border-radius: var(--radius-pill); transition: width var(--dur-base) var(--ease-standard); }
-.supported-model__progress-label { font-size: var(--text-xs); font-family: var(--font-mono); color: var(--color-text-muted); min-width: 3ch; }
 
 /* ==========================================================================
    Settings view
@@ -804,68 +573,8 @@
 .sys-row small { font-size: var(--text-xs); color: var(--color-text-muted); line-height: var(--leading-snug); overflow-wrap: anywhere; }
 
 /* ==========================================================================
-   Models view (.cxv) — chrome migrated to the cxv card/panel system.
-   The dense card internals (.model-card, .pin-badge, .models-card-*, etc.)
-   stay styled by the .camelid-view--page block above; these rules just settle
-   the kept legacy sub-blocks inside the new cxv-panel flex rhythm so Models
-   spaces like System/API/Analytics.
+   Models view — model inspector drawer, tokenizer playground
    ========================================================================== */
-.models-view.cxv .models-hero-ledger { margin-top: 0; }
-.models-view.cxv .cxv-panel > .models-section-heading { margin-bottom: 0; }
-.models-view.cxv .cxv-panel > .model-summary { margin: 0; }
-/* Toolbar info strips sit flush under the search row, carried by the panel gap. */
-.models-view.cxv .cxv-panel > .models-truth-strip,
-.models-view.cxv .cxv-panel > .models-compatibility-strip,
-.models-view.cxv .cxv-panel > .models-summary-strip { margin: 0; }
-
-/* Models grid/form helpers ported from the retired pre-redesign sheets so the
-   view's setup forms, readiness grids, and catalog grid keep their layout once
-   the legacy sheets are dropped. */
-.camelid-view--page .models-setup-grid { display: grid; gap: var(--space-4); grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.camelid-view--page .models-form-stack { display: grid; gap: var(--space-3); }
-.camelid-view--page .import-grid,
-.camelid-view--page .import-grid-advanced,
-.camelid-view--page .composer-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: center; }
-.camelid-view--page .import-grid-advanced { padding-top: 2px; }
-.camelid-view--page .import-callout-row { display: grid; gap: var(--space-3); grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
-.camelid-view--page .import-advanced-toggle { justify-self: start; }
-.camelid-view--page .models-readiness-grid { grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); }
-.camelid-view--page .models-readiness-grid .models-readiness-path { grid-column: 1 / -1; }
-.camelid-view--page .models-catalog-grid-clean { grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr)); }
-.camelid-view--page .models-section-heading-catalog { align-items: end; }
-.camelid-view--page .library-load-more-row { display: grid; gap: var(--space-3); justify-items: center; }
-.camelid-view--page .models-summary-pill-static { cursor: default; }
-.camelid-view--page .models-refresh-button { min-height: 44px; }
-.camelid-view--page .models-planned-fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
-.camelid-view--page .models-planned-fieldset:disabled { opacity: 0.72; }
-@media (max-width: 760px) {
-  .camelid-view--page .models-setup-grid,
-  .camelid-view--page .import-grid,
-  .camelid-view--page .import-grid-advanced,
-  .camelid-view--page .composer-actions,
-  .camelid-view--page .import-callout-row { grid-template-columns: 1fr; }
-}
-
-/* ==========================================================================
-   Phase 3 — model inspector drawer, tokenizer playground, card evidence row
-   ========================================================================== */
-.models-card-evidence-row {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  margin-bottom: var(--space-3);
-  flex-wrap: wrap;
-}
-.models-card-evidence-link {
-  font-size: var(--text-xs);
-  color: var(--color-accent-text);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 0;
-}
 
 .model-inspector-overlay {
   position: fixed;
@@ -1308,8 +1017,16 @@
 .rlc__message--caution { color: var(--color-evidence); }
 .rlc__absent { margin: 0; font-family: var(--font-mono); font-size: 0.625rem; letter-spacing: 0.02em; color: var(--color-text-faint); }
 
+/* ---- Models tab: Zone 1 active model bar ---- */
+.models-active-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-top: var(--space-4); padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); background: var(--color-surface); }
+.models-active-bar__id { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.models-active-bar__name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.models-active-bar__name strong { overflow-wrap: anywhere; }
+.models-active-bar__name span { font-size: var(--text-xs); color: var(--color-text-muted); }
+.models-active-bar__actions { display: flex; align-items: center; gap: var(--space-3); }
+.models-active-bar__actions .lane-row-action { margin-top: 0; }
+
 /* ---- Models tab: local models by lane (derived sections) ---- */
-.local-lane-sections { margin-top: var(--space-4); }
 .local-lane-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
 .local-lane-head h2 { margin: 0; }
 .local-lane-intro { font-size: var(--text-sm); color: var(--color-text-muted); margin: var(--space-1) 0 var(--space-3); }
@@ -1343,6 +1060,22 @@
 .lane-row-loaded { font-size: var(--text-xs); font-weight: 700; color: var(--color-text); margin: var(--space-2) 0 0; }
 .lane-empty { font-size: var(--text-sm); color: var(--color-text-muted); }
 
+/* ---- Models tab: diagnostics disclosure (tokenizer playground, inspector, import) ---- */
+.models-diagnostics { margin-top: var(--space-6); border-top: 1px solid var(--color-border-soft); padding-top: var(--space-3); }
+.models-diagnostics > summary { cursor: pointer; font-size: var(--text-sm); font-weight: 700; color: var(--color-text-muted); }
+.models-diagnostics > summary:hover { color: var(--color-text); }
+.models-diagnostics__body { display: flex; flex-direction: column; gap: var(--space-4); margin-top: var(--space-3); }
+.models-diagnostics__import h3 { margin: 0 0 var(--space-1); font-size: var(--text-md); }
+.models-diagnostics__import-grid { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-2); }
+.models-diagnostics__import-grid input { flex: 1 1 220px; padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-surface); color: var(--color-text); font-size: var(--text-sm); }
+.models-diagnostics__import-grid .lane-row-action { margin-top: 0; }
+
+/* ---- Models tab: Zone 4 downloads in progress ---- */
+.downloads-row .lane-row-head { align-items: center; }
+.downloads-cancel { margin-top: 0; }
+.downloads-progress { margin-top: var(--space-2); height: 6px; border-radius: var(--radius-pill); background: var(--color-chip); overflow: hidden; }
+.downloads-progress span { display: block; height: 100%; background: var(--color-evidence); border-radius: var(--radius-pill); transition: width 0.6s ease; }
+
 /* ---- Models tab: HuggingFace catalog (lane-aware acquire) ---- */
 .catalog-lane-browse { margin-top: var(--space-5); border-top: 1px solid var(--color-border-soft); padding-top: var(--space-3); }
 .catalog-search { width: 100%; margin: var(--space-2) 0 var(--space-3); padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-surface); color: var(--color-text); font-size: var(--text-sm); }
@@ -1363,8 +1096,9 @@
 .catalog-row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-2); }
 .catalog-row-id { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .catalog-row-name { font-weight: 600; }
+.catalog-row-recommended { margin-left: var(--space-2); font-size: var(--text-xs); font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: var(--color-accent); }
+.catalog-row-blurb { font-size: var(--text-sm); color: var(--color-text-muted); margin: var(--space-2) 0 0; }
 .catalog-row-meta { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted); overflow-wrap: anywhere; }
-.catalog-row-note { font-size: var(--text-sm); color: var(--color-text); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
 .catalog-row-faint { font-size: var(--text-xs); color: var(--color-text-faint); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
 .catalog-row-error { font-size: var(--text-sm); color: var(--color-warning); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
 .catalog-row-action { margin-top: var(--space-2); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-bg-elevated); color: var(--color-text); font-size: var(--text-xs); font-weight: 700; }
@@ -1376,22 +1110,7 @@
 /* Download button doubles as the progress bar: a fill grows left→right with the
    percentage (smooth transition); before the first byte lands it shows an
    indeterminate shimmer so the click feels acknowledged immediately. */
-.catalog-row-action--progress { position: relative; overflow: hidden; width: 100%; max-width: 100%; box-sizing: border-box; cursor: default; text-align: center; border-color: var(--color-accent); background: var(--color-accent-soft); padding-top: var(--space-2); padding-bottom: var(--space-2); }
-.catalog-row-action--progress:disabled { opacity: 1; }
 /* Determinate: an accent fill grows left→right with the percentage. */
-.catalog-row-action__fill { position: absolute; top: 0; left: 0; bottom: 0; width: 0; background: var(--color-accent); opacity: 0.55; transition: width 0.35s var(--ease-standard); pointer-events: none; }
-.catalog-row-action__label { position: relative; z-index: 1; font-variant-numeric: tabular-nums; font-weight: 700; }
 /* Before the first byte lands (0%): a clear shimmer sweeping the whole button so
    the click is obviously acknowledged. */
-.catalog-row-action--progress.is-indeterminate .catalog-row-action__fill {
-  width: 100% !important;
-  opacity: 1;
-  background: linear-gradient(90deg, var(--color-accent-soft) 0%, var(--color-accent-soft) 30%, var(--color-accent) 50%, var(--color-accent-soft) 70%, var(--color-accent-soft) 100%);
-  background-size: 220% 100%;
-  animation: catalogShimmer 1.15s linear infinite;
-}
 @keyframes catalogShimmer { 0% { background-position: 160% 0; } 100% { background-position: -160% 0; } }
-.catalog-progress { margin-top: var(--space-2); }
-.catalog-progress-bar { height: 6px; border-radius: var(--radius-pill); background: var(--color-chip); overflow: hidden; }
-.catalog-progress-bar > span { display: block; height: 100%; background: var(--color-evidence); transition: width 0.3s var(--ease-standard); }
-.catalog-progress small { color: var(--color-text-muted); font-size: var(--text-xs); }

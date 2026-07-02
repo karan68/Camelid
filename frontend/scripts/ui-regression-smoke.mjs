@@ -201,27 +201,30 @@ assert.match(systemViewSource, /displayCapabilityId\(feature\.id\)/, 'System vie
 assert.match(systemViewSource, /getRuntimeRequestModelId\(selectedModel, runtime, '<loaded-model-id>'\)/, 'System curl examples should use the loaded backend model id for alias-selected exact rows')
 assert.match(systemViewSource, /<EvidenceChip/, 'System contract rows should render their status claims through the Evidence Chip')
 
-/* ---- Models view ---- */
-assert.match(modelsViewSource, /Exact-row quant evidence/, 'Models support cards should display row-scoped quant evidence')
-assert.match(modelsViewSource, /Exact-row support/, 'Models support cards should display exact-row support boundaries')
-assert.match(modelsViewSource, /modelRuntimeIdMatches\(model, runtime\)/, 'Models runtime/readiness surfaces should accept backend runtime_model_name aliases for exact-row local imports')
-assert.match(modelsViewSource, /modelRuntimeIdMatches\(selectedLocalModel, runtime\)/, 'Models next-chat copy should not fall back to blocked when the selected exact row uses a browser id plus backend runtime_model_name')
-assert.match(modelsViewSource, /compatibilityHintMatchesExactTarget\(capabilities, model, target\)/, 'Models tracked-row matching must require an exact compatibility hint, not a quant-mismatch target id')
-assert.match(modelsViewSource, /matchedChatGate\s*=\s*matchedModel \? getChatGateState\(capabilities, matchedModel, runtime\) : null/, 'Models tracked exact-row cards should use the shared chat gate instead of stale browser readiness')
-assert.match(modelsViewSource, /chatUnlocked\s*=\s*Boolean\(matchedChatGate\?\.chatUnlocked\)/, 'Models tracked exact-row cards should require loaded_now, generation_ready, active_model_id, and exact support before claiming chat unlock')
-assert.match(modelsViewSource, /matchesLlama32ThreeBTarget\(model, capabilities\)/, 'The 3B acceptance target should only hide when an exact 3B Q8_0 row is present')
-assert.match(modelsViewSource, /LLAMA32_3B_ACCEPTANCE_FILENAME[\s\S]*hasExactLlama32ThreeBArtifact[\s\S]*compatibilityHintMatchesExactTarget/, 'The 3B acceptance target fallback must require exact GGUF artifact identity instead of a broad 3B Instruct Q8 label')
-assert.doesNotMatch(modelsViewSource, /findCompatibilityHint\(capabilities, model\)\?\.target\?\.id === target\.id/, 'Models tracked-row matching must not treat quant-mismatch hints as exact-row matches')
-assert.match(modelsViewSource, /rowSupportNextStepCopy\(target, apiFeatures\)/, 'Models current-row cards should filter resolved template/Jinja and throughput blockers out of next-step copy')
-assert.match(modelsViewSource, /template\/Jinja, checked context, and production-throughput shown as row-scoped readiness lanes instead of repeated generic caveats/, 'Models support section should state that template/Jinja, checked-context, and production-throughput are row-scoped lanes, not generic caveats')
-assert.match(modelsViewSource, /Catalog quant:/, 'Catalog cards may show catalog quant labels without promoting them to support')
+/* ---- Models view ----
+   Redesign (2026-07, D14): the page was rebuilt as five derived zones. The tracked-row
+   cards, acceptance panel, and per-card evidence blocks are gone; the invariants are now
+   that membership is DERIVED (live scan + contract via lib/modelLanes), loads are
+   inspect-first fail-closed, and no hand-authored array or localStorage record places a
+   model or claims a download. Row-scoped lane copy stays asserted on System/API above. */
+const modelLanesSource = read('../src/lib/modelLanes.js')
+const laneRowsSource = read('../src/components/models/LaneRows.jsx')
+const catalogBrowseSource = read('../src/components/models/CatalogLaneBrowse.jsx')
+const downloadsPanelSource = read('../src/components/models/DownloadsPanel.jsx')
+assert.match(modelsViewSource, /bucketByLane\(spine\.local\.models, capabilities\)/, 'Models section membership must be derived from the live scan + contract at render time')
+assert.match(modelLanesSource, /isCompatibilitySupportedForModel\(capabilities, matchModel\(entry\)\)/, 'Models lane derivation must ask the shared contract matcher — the supported gate stays the contract voice')
+assert.doesNotMatch(modelsViewSource, /SUPPORTED_MODELS/, 'Models view must not place models from a hand-authored array')
+assert.doesNotMatch(modelsViewSource, /localStorage\.(get|set|remove)Item/, 'Models view must not read or write localStorage truth')
+assert.match(modelsViewSource, /api\/models\/inspect[\s\S]*setBlocker\(inspect\.blocker\)[\s\S]*return[\s\S]*api\/models\/load/, 'Models loads must inspect first and stop on typed blockers before any load attempt')
+assert.match(modelsViewSource, /UnsupportedBlocker/, 'typed fail-closed blockers must render verbatim through UnsupportedBlocker')
 assert.doesNotMatch(modelsViewSource, /supported_quantization|planned_quantization|supported_model_families|planned_model_families|getQuantCapability|quantCapabilityLabel|quantCapabilityCopy/, 'Models view should not render broad quant/family capability lists as support evidence')
-assert.match(modelsViewSource, /<EvidenceChip/, 'Models tracked-row status claims should render through the Evidence Chip')
+assert.match(laneRowsSource, /<EvidenceChip/, 'Models lane rows must render their status claims through the Evidence Chip')
+assert.match(laneRowsSource, /never copper/, 'runnable rows must document that they never take the reserved supported (copper) styling')
+assert.match(catalogBrowseSource, /if \(item\.group === 'experimental'\) return 'not_anchored'/, 'live Hugging Face rows must never anchor a lane or imply support')
+assert.match(catalogBrowseSource, /Confirm download/, 'catalog downloads must go through an explicit confirmation phase')
+assert.match(downloadsPanelSource, /catalog\/downloads|bytes_downloaded/, 'download progress must come only from the backend downloads poll')
 
 /* ---- Model management (Phase 3) ---- */
-assert.match(modelsViewSource, /ModelCardEvidence/, 'local model cards must resolve their claim through the card evidence chip')
-assert.match(modelsViewSource, /no exact supported row/, 'unmatched local models must show the calm no-exact-row state, not an error')
-assert.match(modelsViewSource, /view the compatibility ledger/, 'unmatched local models must link to the compatibility view')
 assert.match(modelInspectorSource, /not support evidence/, 'the model inspector must label its contents as descriptive, not support evidence')
 assert.doesNotMatch(modelInspectorSource, /getChatGateState|isCompatibilitySupportedForModel|findCompatibilityHint/, 'the inspector renders metadata; it must never compute or imply gate state')
 assert.match(modelInspectorSource, /items\]|items…/, 'huge GGUF arrays must be summarized, not dumped')
@@ -362,7 +365,8 @@ assert.match(compatibilityViewSource, /Promotion path/, 'non-supported rows must
 assert.doesNotMatch(compatibilityViewSource, /supported_exact_row_smoke|supported_current_gate|tinyllama_|llama32_|llama3_|mistral|mixtral/i, 'the ledger source must contain zero hardcoded row ids or support statuses — the contract is the only voice')
 assert.match(evidenceChipSource, /camelid:open-ledger/, 'Evidence Chips must deep-link to the ledger via the open-ledger event')
 assert.match(appSource, /camelid:open-ledger/, 'the app shell must listen for ledger deep-links')
-assert.match(modelsViewSource, /setTab\('compatibility'\)/, 'unmatched model cards must link to the compatibility ledger view')
+// (D14: the Models page no longer renders per-card ledger links; Evidence Chips carry
+// the open-ledger deep link and the ledger stays one click away in the sidebar.)
 
 /* ---- Analytics ---- */
 assert.match(analyticsViewSource, /displayCapabilityId\(feature\.id\)/, 'Analytics view should not render raw provider-scoped API feature ids')
