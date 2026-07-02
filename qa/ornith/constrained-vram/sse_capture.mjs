@@ -19,6 +19,7 @@ const res = await fetch(`${BASE}/v1/chat/completions`, {
     tools,
     stream: true,
     stream_options: { include_usage: true },
+    camelid_enable_thinking: true,
     temperature: 0,
     max_tokens: 700,
   }),

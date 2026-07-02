@@ -1257,13 +1257,26 @@ impl RunnableModel {
     /// (lazy-built, reused, recurrent state reset per call), and falls back to the CPU
     /// runnable lane on any CUDA error. The CPU lane is the certified oracle and default.
     fn generate_qwen35(&self, prompt: &[u32], max_new: usize, stop: &[u32]) -> Result<Vec<u32>> {
+        self.generate_qwen35_streaming(prompt, max_new, stop, &mut |_| {})
+    }
+
+    /// Like [`generate_qwen35`](Self::generate_qwen35) but invokes `on_token` for
+    /// every emitted token as soon as it is decided — the serve lane's SSE source.
+    /// Token order/content identical to the non-streaming path by construction.
+    fn generate_qwen35_streaming(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
         #[cfg(feature = "cuda")]
         {
             if std::env::var("CAMELID_QWEN35_CUDA")
                 .map(|v| v == "1")
                 .unwrap_or(false)
             {
-                match self.generate_qwen35_cuda(prompt, max_new, stop) {
+                match self.generate_qwen35_cuda(prompt, max_new, stop, on_token) {
                     Ok(v) => return Ok(v),
                     Err(e) => {
                         eprintln!("[qwen35] CUDA lane failed ({e}); falling back to CPU");
@@ -1271,7 +1284,7 @@ impl RunnableModel {
                 }
             }
         }
-        self.generate_qwen35_cpu(prompt, max_new, stop)
+        self.generate_qwen35_cpu(prompt, max_new, stop, on_token)
     }
 
     fn generate_qwen35_cpu(
@@ -1279,6 +1292,7 @@ impl RunnableModel {
         prompt: &[u32],
         max_new: usize,
         stop: &[u32],
+        on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         // Batched prefill of the whole prompt (weights read once per layer), then
         // per-token greedy decode from the resulting cache.
@@ -1293,6 +1307,7 @@ impl RunnableModel {
                 break;
             }
             out.push(next);
+            on_token(next);
             if i + 1 < max_new {
                 let logits = self.decode_token_qwen35(next, pos, &mut cache, true)?;
                 pos += 1;
@@ -1312,6 +1327,7 @@ impl RunnableModel {
         prompt: &[u32],
         max_new: usize,
         stop: &[u32],
+        on_token: &mut dyn FnMut(u32),
     ) -> Result<Vec<u32>> {
         // Sparse KV: only the 8 full-attention layers keep a real KV buffer (the 24 SSM
         // layers don't attend — see build_qwen35_resident::sparsify_kv), so KV is ~4x
@@ -1360,6 +1376,7 @@ impl RunnableModel {
                 break;
             }
             out.push(next);
+            on_token(next);
             if i + 1 < max_new {
                 let emb = self.token_embd.dequant_row(next as usize, "token_embd")?;
                 let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
@@ -1387,13 +1404,31 @@ impl RunnableModel {
         max_new: usize,
         stop: &[u32],
     ) -> Result<Vec<u32>> {
+        self.generate_stopping_streaming(prompt, max_new, stop, &mut |_| {})
+    }
+
+    /// [`generate_stopping`](Self::generate_stopping) with a per-token callback
+    /// (fires as each token is decided) — the serve lane's streaming source. For
+    /// non-qwen35 runnable arches (no incremental hook yet) the tokens are replayed
+    /// through the callback after generation completes.
+    pub fn generate_stopping_streaming(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        stop: &[u32],
+        on_token: &mut dyn FnMut(u32),
+    ) -> Result<Vec<u32>> {
         if prompt.is_empty() {
             return Err(BackendError::InvalidTensorData("empty prompt".into()));
         }
         if self.qwen35.is_some() {
-            return self.generate_qwen35(prompt, max_new, stop);
+            return self.generate_qwen35_streaming(prompt, max_new, stop, on_token);
         }
-        self.generate(prompt, max_new)
+        let out = self.generate(prompt, max_new)?;
+        for &t in &out {
+            on_token(t);
+        }
+        Ok(out)
     }
 
     /// One token through the full qwen35 stack at absolute `pos`, mutating `cache`.
@@ -2676,13 +2711,15 @@ mod gpu_ssm_layer_tests {
         // "What is the capital of France?" prompt tokens.
         let prompt: Vec<u32> = vec![3710, 369, 279, 6511, 314, 9338, 30];
         let n = 8usize;
-        let cpu = model.generate_qwen35_cpu(&prompt, n, &[]).expect("cpu gen");
+        let cpu = model
+            .generate_qwen35_cpu(&prompt, n, &[], &mut |_| {})
+            .expect("cpu gen");
         let gpu = model
-            .generate_qwen35_cuda(&prompt, n, &[])
+            .generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
             .expect("gpu gen");
         // run-twice reuses the cached engine -> validates reset_qwen35_state.
         let gpu2 = model
-            .generate_qwen35_cuda(&prompt, n, &[])
+            .generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
             .expect("gpu gen 2");
         eprintln!("cpu ={cpu:?}");
         eprintln!("gpu ={gpu:?}");
@@ -2696,7 +2733,7 @@ mod gpu_ssm_layer_tests {
         if let Ok(gguf) = read_metadata(&path) {
             if let Ok(tok) = crate::tokenizer::Tokenizer::from_gguf(&gguf) {
                 let ids16 = model
-                    .generate_qwen35_cuda(&prompt, 16, &[])
+                    .generate_qwen35_cuda(&prompt, 16, &[], &mut |_| {})
                     .expect("gpu 16-tok");
                 let text = tok.decode(&ids16, true).unwrap_or_default();
                 eprintln!("qwen35 GPU 16-tok decode: {text}");
@@ -2724,15 +2761,15 @@ mod gpu_ssm_layer_tests {
         let secs = |gpu: bool, n: usize| -> f64 {
             let t = std::time::Instant::now();
             let r = if gpu {
-                model.generate_qwen35_cuda(&prompt, n, &[])
+                model.generate_qwen35_cuda(&prompt, n, &[], &mut |_| {})
             } else {
-                model.generate_qwen35_cpu(&prompt, n, &[])
+                model.generate_qwen35_cpu(&prompt, n, &[], &mut |_| {})
             };
             r.expect("generate");
             t.elapsed().as_secs_f64()
         };
         // GPU: warm (lazy-build + 5.24 GB upload), then two timed runs.
-        let _ = model.generate_qwen35_cuda(&prompt, 4, &[]);
+        let _ = model.generate_qwen35_cuda(&prompt, 4, &[], &mut |_| {});
         let g_lo = secs(true, n_lo);
         let g_hi = secs(true, n_hi);
         let gpu_tokps = (n_hi - n_lo) as f64 / (g_hi - g_lo);
