@@ -13,6 +13,6 @@
     { "id": 1, "category": "code", "text": "def fibonacci(n):", "prompt_token_ids": [727, 73111, 1393, 1590] },
     { "id": 2, "category": "completion", "text": "The opposite of hot is", "prompt_token_ids": [760, 13600, 314, 3882, 369] },
     { "id": 3, "category": "arithmetic", "text": "Count to five: 1, 2, 3,", "prompt_token_ids": [2427, 310, 4097, 25, 220, 16, 11, 220, 17, 11, 220, 18, 11] },
-    { "id": 4, "category": "explanatory", "text": "Explain why the sky is blue in one sentence.", "prompt_token_ids": null }
+    { "id": 4, "category": "explanatory", "text": "Explain why the sky is blue in one sentence.", "prompt_token_ids": [814, 20139, 3069, 279, 12515, 369, 6105, 303, 799, 11316, 13] }
   ]
 }
