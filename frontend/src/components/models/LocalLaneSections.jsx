@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { isCompatibilitySupportedForModel } from '../../lib/capabilities'
+import { laneOf } from '../../lib/modelLanes'
 import { EvidenceChip } from '../ui/EvidenceChip'
 import { ParityReceiptCard } from '../chat/render/ParityReceipt'
 import { UnsupportedBlocker } from './UnsupportedBlocker'
@@ -15,25 +15,6 @@ function prettySize(bytes) {
   if (!bytes) return ''
   if (bytes >= GB) return `${(bytes / GB).toFixed(bytes >= 10 * GB ? 0 : 1)} GB`
   return `${Math.round(bytes / (1024 * 1024))} MB`
-}
-
-/* A model object shaped for the existing contract matcher (it reads id/name/
-   model_path/quant). The supported gate stays the contract's voice — we only ask it. */
-function matchModel(entry) {
-  return {
-    id: entry.filename,
-    name: entry.filename,
-    model_path: entry.filename,
-    hf_filename: entry.filename,
-    quant: entry.quantization,
-  }
-}
-
-function laneOf(entry, capabilities) {
-  if (isCompatibilitySupportedForModel(capabilities, matchModel(entry))) return 'supported'
-  if (entry.runnable_receipt_present) return 'compatible'
-  if (entry.admitted && entry.oracle_qualified) return 'eligible'
-  return 'not_anchored'
 }
 
 function metaLine(entry) {
