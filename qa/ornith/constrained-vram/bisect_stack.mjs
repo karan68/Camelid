@@ -5,7 +5,7 @@ import { execFileSync } from 'child_process';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const MODEL = 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf';
-const CAMELID = path.resolve(HERE, '../../../target/debug/camelid.exe');
+const CAMELID = path.resolve(HERE, '../../../target/release/camelid.exe');
 
 const adversarial = JSON.parse(fs.readFileSync(path.join(HERE, 'FIXTURES_tokenizer_adversarial.json'), 'utf8'));
 const fiveProm = JSON.parse(fs.readFileSync(path.join(HERE, 'FIXTURES_five_prompt_parity.json'), 'utf8'));

@@ -9,7 +9,7 @@ import { execFileSync } from 'child_process';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const MODEL = 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf';
-const CAMELID = path.resolve(HERE, '../../../target/debug/camelid.exe');
+const CAMELID = path.resolve(HERE, '../../../target/release/camelid.exe');
 const LLAMA_TOKENIZE = 'C:/Users/timto/llama.cpp/build/bin/llama-tokenize.exe';
 
 const adversarial = JSON.parse(fs.readFileSync(path.join(HERE, 'FIXTURES_tokenizer_adversarial.json'), 'utf8'));
@@ -93,12 +93,18 @@ SPECIAL_MARKERS.forEach((m, i) => {
   receipt.special_roundtrip.push({ marker: m, oracle, camelid: mine, match: same, single_token: single, decoded: camSpecial[i].decoded });
   if (!same) failures++;
   if (single) {
-    // Unsplittability: plain user text containing the marker must NOT contain the special id.
+    // Plain-mode behavior must equal the oracle's. NOTE the two token kinds differ
+    // by design (llama.cpp partition rule): CONTROL markers (<|im_start|>...) must
+    // NOT resolve to their special id from plain user text ("unsplittable"), while
+    // USER_DEFINED markers (<think>, <tool_call>...) resolve to their single id in
+    // BOTH modes — the oracle itself does this, so a "leak" there is correct
+    // behavior, recorded as info only. The gate criterion is oracle equality.
     const leaked = camPlain[i].ids.includes(oracle[0]);
     const oraclePlain = oracleIds(m, false);
+    const oracleLeaked = oraclePlain.includes(oracle[0]);
     const plainMatch = oraclePlain.length === camPlain[i].ids.length && oraclePlain.every((v, j) => v === camPlain[i].ids[j]);
-    receipt.unsplittability.push({ marker: m, special_id: oracle[0], leaked_in_plain_mode: leaked, plain_ids_match_oracle: plainMatch });
-    if (leaked || !plainMatch) failures++;
+    receipt.unsplittability.push({ marker: m, special_id: oracle[0], kind: oracleLeaked ? 'user_defined (always merged — leak is correct)' : 'control (must not leak)', leaked_in_plain_mode: leaked, oracle_leaks_in_plain_mode: oracleLeaked, plain_ids_match_oracle: plainMatch });
+    if (!plainMatch || (leaked && !oracleLeaked)) failures++;
   }
 });
 

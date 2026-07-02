@@ -37,13 +37,11 @@ pub enum BpePreTokenizer {
     /// llama.cpp `qwen35` (Qwen3.5 / Ornith): single-digit grouping like `qwen2`,
     /// and `LLAMA_VOCAB_PRE_TYPE_QWEN35`'s regex additionally folds Unicode
     /// combining marks `\p{M}` into the letter class (`\p{L}+` → `[\p{L}\p{M}]+`
-    /// and the punctuation class excludes `\p{M}`). That mark-folding is a documented
-    /// DEFERRAL here: the split behaves exactly like `Qwen2`, which is byte-identical
-    /// to qwen35 for any text without combining marks (ASCII, code, and the standard
-    /// parity prompt set). Faithfully replicating `\p{M}` needs a Unicode
-    /// general-category table the tokenizer deliberately avoids depending on; until
-    /// then, combining-mark text is the one known tokenization deviation from the
-    /// qwen35 oracle.
+    /// and the punctuation class excludes `\p{M}`). Mark-folding is implemented
+    /// via a generated `\p{M}` range table (`mark_ranges.rs.inc`) — see
+    /// [`fold_marks`](Self::fold_marks). Byte-exactness vs the oracle is held by
+    /// the ITEM1 tokenizer gate (qa/ornith/constrained-vram), which covers NFD,
+    /// Devanagari (incl. virama clusters), Arabic harakat, and zalgo inputs.
     Qwen35,
 }
 
@@ -54,6 +52,12 @@ impl BpePreTokenizer {
             Self::Llama3 => 3,
             Self::Qwen2 | Self::Qwen35 => 1,
         }
+    }
+
+    /// Whether `\p{M}` combining marks fold into the letter class (and are
+    /// excluded from the punctuation class) — the qwen35 regex dialect.
+    fn fold_marks(self) -> bool {
+        matches!(self, Self::Qwen35)
     }
 }
 
@@ -528,28 +532,30 @@ impl Tokenizer {
         let mut byte_start = 0;
 
         while byte_start < text.len() {
-            if parse_special {
-                if let Some((token_text, token_len)) =
-                    self.longest_control_token_at(text, byte_start)
-                {
-                    if let Some(id) = self.token_to_id.get(token_text) {
-                        out.push(*id);
-                        byte_start += token_len;
-                        continue;
-                    }
+            // llama.cpp's special-token partition runs in BOTH modes: USER_DEFINED
+            // ("added") tokens are matched in raw text unconditionally; only
+            // CONTROL tokens are gated by `parse_special`. Verified against the
+            // qwen35 oracle (ITEM1 tokenizer gate): `--no-parse-special` still
+            // yields single ids for <think>/<tool_call> (USER_DEFINED), while
+            // <|im_start|> (CONTROL) tokenizes as text.
+            if let Some((token_text, token_len)) =
+                self.longest_control_token_at(text, byte_start, parse_special)
+            {
+                if let Some(id) = self.token_to_id.get(token_text) {
+                    out.push(*id);
+                    byte_start += token_len;
+                    continue;
                 }
             }
 
-            let byte_end = if parse_special {
-                self.next_control_token_start(text, byte_start)
-                    .unwrap_or(text.len())
-            } else {
-                text.len()
-            };
+            let byte_end = self
+                .next_control_token_start(text, byte_start, parse_special)
+                .unwrap_or(text.len());
 
             for segment in bpe_pretokenize_with(
                 &text[byte_start..byte_end],
                 self.bpe_pre_tokenizer.digit_group_max(),
+                self.bpe_pre_tokenizer.fold_marks(),
             ) {
                 self.encode_bpe_segment(segment, &mut out)?;
             }
@@ -639,7 +645,7 @@ impl Tokenizer {
         // `!text.starts_with(char::is_whitespace)` guard suppressed the prefix on
         // leading-whitespace input and diverged from HF on those cases (RA-5).
         if self.config.add_space_prefix
-            && !(parse_special && self.longest_control_token_at(text, 0).is_some())
+            && !(parse_special && self.longest_control_token_at(text, 0, true).is_some())
         {
             normalized.push(SPM_SPACE);
         }
@@ -665,12 +671,16 @@ impl Tokenizer {
         let mut normalized = String::with_capacity(text.len());
         let mut byte_start = 0;
         while byte_start < text.len() {
-            if let Some((token_text, token_len)) = self.longest_control_token_at(text, byte_start) {
+            if let Some((token_text, token_len)) =
+                self.longest_control_token_at(text, byte_start, true)
+            {
                 normalized.push_str(token_text);
                 byte_start += token_len;
 
                 let rest = &text[byte_start..];
-                let next_is_control = self.longest_control_token_at(text, byte_start).is_some();
+                let next_is_control = self
+                    .longest_control_token_at(text, byte_start, true)
+                    .is_some();
                 let should_insert_dummy_prefix =
                     self.should_insert_dummy_after_control(token_text, rest, next_is_control);
                 if should_insert_dummy_prefix {
@@ -719,24 +729,32 @@ impl Tokenizer {
         !rest.starts_with(SPM_SPACE)
     }
 
+    /// Longest special token whose text starts at `byte_start`. USER_DEFINED
+    /// ("added") tokens always participate; CONTROL tokens only when
+    /// `include_control` (llama.cpp's `parse_special` partition rule).
     fn longest_control_token_at<'a>(
         &'a self,
         text: &str,
         byte_start: usize,
+        include_control: bool,
     ) -> Option<(&'a str, usize)> {
         if !text.is_char_boundary(byte_start) {
             return None;
         }
 
-        // Match both CONTROL and USER_DEFINED ("added") tokens, mirroring
-        // llama.cpp's special-token partition. Qwen3 marks <think>/</think>
+        // USER_DEFINED ("added") tokens always match, mirroring llama.cpp's
+        // special-token partition. Qwen3/qwen35 mark <think>/</think>
         // (and many <|...|> markers) as USER_DEFINED (type 4) rather than CONTROL
         // (type 3); without matching USER_DEFINED, a rendered ChatML template's
         // literal "</think>" tokenizes as text instead of the single special
-        // token, and chat generation diverges from the reference.
+        // token, and chat generation diverges from the reference. CONTROL tokens
+        // participate only under `include_control` (= `parse_special`).
         self.tokens
             .iter()
-            .filter(|token| matches!(token.kind, TokenKind::Control | TokenKind::UserDefined))
+            .filter(|token| {
+                matches!(token.kind, TokenKind::UserDefined)
+                    || (include_control && matches!(token.kind, TokenKind::Control))
+            })
             .filter(|token| !token.text.is_empty())
             .filter(|token| text[byte_start..].starts_with(&token.text))
             .max_by_key(|token| token.text.len())
@@ -753,14 +771,15 @@ impl Tokenizer {
         while byte_start < piece.len() {
             if parse_special {
                 if let Some((token_text, token_len)) =
-                    self.longest_control_token_at(piece, byte_start)
+                    self.longest_control_token_at(piece, byte_start, true)
                 {
                     if let Some(id) = self.token_to_id.get(token_text) {
                         out.push(*id);
                         byte_start += token_len;
                         let rest = &piece[byte_start..];
-                        let next_is_control =
-                            self.longest_control_token_at(piece, byte_start).is_some();
+                        let next_is_control = self
+                            .longest_control_token_at(piece, byte_start, true)
+                            .is_some();
                         if self.config.add_space_prefix
                             && self.should_insert_dummy_after_control(
                                 token_text,
@@ -779,7 +798,7 @@ impl Tokenizer {
             }
 
             let byte_end = if parse_special {
-                self.next_control_token_start(piece, byte_start)
+                self.next_control_token_start(piece, byte_start, true)
                     .unwrap_or(piece.len())
             } else {
                 piece.len()
@@ -798,11 +817,19 @@ impl Tokenizer {
         Ok(out)
     }
 
-    fn next_control_token_start(&self, text: &str, byte_start: usize) -> Option<usize> {
+    fn next_control_token_start(
+        &self,
+        text: &str,
+        byte_start: usize,
+        include_control: bool,
+    ) -> Option<usize> {
         text[byte_start..]
             .char_indices()
             .map(|(offset, _)| byte_start + offset)
-            .find(|idx| self.longest_control_token_at(text, *idx).is_some())
+            .find(|idx| {
+                self.longest_control_token_at(text, *idx, include_control)
+                    .is_some()
+            })
     }
 
     fn encode_spm_segment(&self, segment: &str, out: &mut Vec<TokenId>) -> Result<()> {
@@ -958,10 +985,10 @@ impl Tokenizer {
 #[cfg(test)]
 fn bpe_pretokenize(text: &str) -> Vec<&str> {
     // Test-only convenience wrapper: the default llama-bpe digit grouping.
-    bpe_pretokenize_with(text, 3)
+    bpe_pretokenize_with(text, 3, false)
 }
 
-fn bpe_pretokenize_with(text: &str, digit_group_max: usize) -> Vec<&str> {
+fn bpe_pretokenize_with(text: &str, digit_group_max: usize, fold_marks: bool) -> Vec<&str> {
     // GPT-2/BPE pre-tokenizer, mirroring llama.cpp's tiktoken-style regex without
     // pulling in a regex dependency:
     //   (?i:'s|'t|'re|'ve|'m|'ll|'d)
@@ -979,7 +1006,7 @@ fn bpe_pretokenize_with(text: &str, digit_group_max: usize) -> Vec<&str> {
     let mut byte_start = 0;
 
     while byte_start < text.len() {
-        let byte_end = next_llama_bpe_segment_end(text, byte_start, digit_group_max);
+        let byte_end = next_llama_bpe_segment_end(text, byte_start, digit_group_max, fold_marks);
         segments.push(&text[byte_start..byte_end]);
         byte_start = byte_end;
     }
@@ -987,11 +1014,16 @@ fn bpe_pretokenize_with(text: &str, digit_group_max: usize) -> Vec<&str> {
     segments
 }
 
-fn next_llama_bpe_segment_end(text: &str, byte_start: usize, digit_group_max: usize) -> usize {
+fn next_llama_bpe_segment_end(
+    text: &str,
+    byte_start: usize,
+    digit_group_max: usize,
+    fold_marks: bool,
+) -> usize {
     if let Some(end) = consume_contraction(text, byte_start) {
         return end;
     }
-    if let Some(end) = consume_optional_prefix_letters(text, byte_start) {
+    if let Some(end) = consume_optional_prefix_letters(text, byte_start, fold_marks) {
         return end;
     }
 
@@ -999,7 +1031,7 @@ fn next_llama_bpe_segment_end(text: &str, byte_start: usize, digit_group_max: us
     if is_number(ch) {
         return consume_digits(text, byte_start, digit_group_max);
     }
-    if let Some(end) = consume_optional_space_punctuation(text, byte_start) {
+    if let Some(end) = consume_optional_space_punctuation(text, byte_start, fold_marks) {
         return end;
     }
     if let Some(end) = consume_whitespace_with_newline(text, byte_start) {
@@ -1023,31 +1055,39 @@ fn consume_contraction(text: &str, byte_start: usize) -> Option<usize> {
         })
 }
 
-fn consume_optional_prefix_letters(text: &str, byte_start: usize) -> Option<usize> {
+fn consume_optional_prefix_letters(
+    text: &str,
+    byte_start: usize,
+    fold_marks: bool,
+) -> Option<usize> {
     let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
-    if is_letter(ch) {
-        return Some(consume_letters(text, byte_start));
+    if is_letter_class(ch, fold_marks) {
+        return Some(consume_letters(text, byte_start, fold_marks));
     }
-    if ch == '\r' || ch == '\n' || is_letter(ch) || is_number(ch) {
+    if ch == '\r' || ch == '\n' || is_number(ch) {
         return None;
     }
 
     let next_idx = byte_start + ch.len_utf8();
     let next = (next_idx < text.len()).then(|| next_char(text, next_idx))??;
-    is_letter(next).then(|| consume_letters(text, next_idx))
+    is_letter_class(next, fold_marks).then(|| consume_letters(text, next_idx, fold_marks))
 }
 
-fn consume_optional_space_punctuation(text: &str, byte_start: usize) -> Option<usize> {
+fn consume_optional_space_punctuation(
+    text: &str,
+    byte_start: usize,
+    fold_marks: bool,
+) -> Option<usize> {
     let ch = next_char(text, byte_start).expect("byte_start is in-bounds");
     let punctuation_start = if ch == ' ' {
         let next_idx = byte_start + ch.len_utf8();
         let next = (next_idx < text.len()).then(|| next_char(text, next_idx))??;
-        if is_punctuation_for_bpe(next) {
+        if is_punctuation_for_bpe(next, fold_marks) {
             next_idx
         } else {
             return None;
         }
-    } else if is_punctuation_for_bpe(ch) {
+    } else if is_punctuation_for_bpe(ch, fold_marks) {
         byte_start
     } else {
         return None;
@@ -1056,7 +1096,7 @@ fn consume_optional_space_punctuation(text: &str, byte_start: usize) -> Option<u
     let mut idx = punctuation_start;
     while idx < text.len() {
         let ch = next_char(text, idx).expect("idx is in-bounds");
-        if !is_punctuation_for_bpe(ch) {
+        if !is_punctuation_for_bpe(ch, fold_marks) {
             break;
         }
         idx += ch.len_utf8();
@@ -1127,15 +1167,43 @@ fn is_whitespace(ch: char) -> bool {
     ch.is_whitespace()
 }
 
-fn is_punctuation_for_bpe(ch: char) -> bool {
-    !is_whitespace(ch) && !is_letter(ch) && !is_number(ch)
+/// Unicode `\p{M}` (Mn | Mc | Me) via a generated inclusive-range table — the
+/// qwen35 pre-tokenizer folds these into the letter class. NOTE `is_letter`
+/// (Rust `is_alphabetic` = derived Alphabetic) already covers the
+/// Other_Alphabetic subset of marks (e.g. Devanagari matras, Arabic harakat);
+/// this table adds the rest (viramas, NFD accents, enclosing marks), matching
+/// the oracle's strict general-category `[\p{L}\p{M}]` on all gate fixtures.
+fn is_mark(ch: char) -> bool {
+    const MARK_RANGES: &[(u32, u32)] = include!("mark_ranges.rs.inc");
+    let cp = ch as u32;
+    MARK_RANGES
+        .binary_search_by(|&(lo, hi)| {
+            if hi < cp {
+                std::cmp::Ordering::Less
+            } else if lo > cp {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
-fn consume_letters(text: &str, byte_start: usize) -> usize {
+/// The pre-tokenizer's letter class: `\p{L}` for llama-bpe/qwen2,
+/// `[\p{L}\p{M}]` for qwen35 (`fold_marks`).
+fn is_letter_class(ch: char, fold_marks: bool) -> bool {
+    is_letter(ch) || (fold_marks && is_mark(ch))
+}
+
+fn is_punctuation_for_bpe(ch: char, fold_marks: bool) -> bool {
+    !is_whitespace(ch) && !is_letter_class(ch, fold_marks) && !is_number(ch)
+}
+
+fn consume_letters(text: &str, byte_start: usize, fold_marks: bool) -> usize {
     let mut idx = byte_start;
     while idx < text.len() {
         let ch = next_char(text, idx).expect("idx is in-bounds");
-        if !is_letter(ch) {
+        if !is_letter_class(ch, fold_marks) {
             break;
         }
         idx += ch.len_utf8();
@@ -1226,7 +1294,7 @@ fn flush_bytes(bytes: &mut Vec<u8>, text: &mut String) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bpe_pretokenize, bpe_pretokenize_with, is_chat_control_marker, BpeRegistry, Token,
+        bpe_pretokenize, bpe_pretokenize_with, is_chat_control_marker, is_mark, BpeRegistry, Token,
         TokenKind,
     };
 
@@ -1361,11 +1429,11 @@ mod tests {
 
         // Digits split one-at-a-time under qwen2 …
         assert_eq!(
-            bpe_pretokenize_with("1234", QWEN2),
+            bpe_pretokenize_with("1234", QWEN2, false),
             vec!["1", "2", "3", "4"]
         );
         assert_eq!(
-            bpe_pretokenize_with("abc12345def", QWEN2),
+            bpe_pretokenize_with("abc12345def", QWEN2, false),
             vec!["abc", "1", "2", "3", "4", "5", "def"]
         );
         // … while the rest of the grammar is byte-for-byte identical to llama-bpe.
@@ -1380,10 +1448,59 @@ mod tests {
             "hello🙂world",
         ] {
             assert_eq!(
-                bpe_pretokenize_with(input, QWEN2),
-                bpe_pretokenize_with(input, LLAMA3),
+                bpe_pretokenize_with(input, QWEN2, false),
+                bpe_pretokenize_with(input, LLAMA3, false),
                 "non-digit input {input:?} must tokenize identically under both dialects"
             );
         }
+    }
+
+    #[test]
+    fn qwen35_pretokenizer_folds_combining_marks_into_letter_runs() {
+        // qwen35's regex letter branch is `[\p{L}\p{M}]+` and its punctuation
+        // class excludes `\p{M}` (llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35).
+        // Byte-exactness vs the oracle is held by the ITEM1 tokenizer gate
+        // (qa/ornith/constrained-vram/RECEIPT_ITEM1_tokenizer.json); these lock
+        // the split behavior at the unit level.
+        const QWEN35: usize = 1;
+
+        // NFD: base letter + U+0301 combining acute stays one letter run.
+        assert_eq!(
+            bpe_pretokenize_with("cafe\u{301} bar", QWEN35, true),
+            vec!["cafe\u{301}", " bar"]
+        );
+        // Without folding (qwen2), the bare accent splits off as punctuation.
+        assert_eq!(
+            bpe_pretokenize_with("cafe\u{301} bar", QWEN35, false),
+            vec!["cafe", "\u{301}", " bar"]
+        );
+        // Devanagari virama (U+094D, Mn but NOT Other_Alphabetic — invisible to
+        // `char::is_alphabetic`) must not break a cluster: नमस्ते is one run.
+        assert_eq!(
+            bpe_pretokenize_with("\u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}", QWEN35, true),
+            vec!["\u{928}\u{92E}\u{938}\u{94D}\u{924}\u{947}"]
+        );
+        // A mark with no preceding letter still starts a letter-class run.
+        assert_eq!(
+            bpe_pretokenize_with("\u{301}x", QWEN35, true),
+            vec!["\u{301}x"]
+        );
+        // Punctuation runs stop at a mark (punctuation class excludes \p{M}).
+        assert_eq!(
+            bpe_pretokenize_with("!!\u{301}!!", QWEN35, true),
+            vec!["!!", "\u{301}", "!!"]
+        );
+    }
+
+    #[test]
+    fn is_mark_matches_unicode_m_category_samples() {
+        assert!(is_mark('\u{301}')); // combining acute (Mn)
+        assert!(is_mark('\u{94D}')); // Devanagari virama (Mn)
+        assert!(is_mark('\u{93E}')); // Devanagari matra (Mc)
+        assert!(is_mark('\u{20DD}')); // enclosing circle (Me)
+        assert!(!is_mark('a'));
+        assert!(!is_mark('!'));
+        assert!(!is_mark(' '));
+        assert!(!is_mark('\u{4E2D}')); // CJK letter
     }
 }

@@ -1402,10 +1402,7 @@ async fn main() -> anyhow::Result<()> {
                     for text in &inputs {
                         let ids = tokenizer.encode(text, !no_add_special, parse_special)?;
                         let decoded = tokenizer.decode(&ids, false)?;
-                        println!(
-                            "{}",
-                            serde_json::json!({ "ids": ids, "decoded": decoded })
-                        );
+                        println!("{}", serde_json::json!({ "ids": ids, "decoded": decoded }));
                     }
                     Ok(())
                 })?
