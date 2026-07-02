@@ -13,9 +13,9 @@ const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z
 const MODE = process.argv[2] === 'cuda' ? 'cuda' : 'cpu';
 const N_PREDICT = parseInt(process.env.CAMELID_PARITY_NPREDICT || '64', 10);
 const SERVER = 'C:/Users/timto/llama.cpp/build/bin/llama-server.exe';
-const MODEL = MODE === 'cuda'
+const MODEL = process.env.CAMELID_ORACLE_MODEL || (MODE === 'cuda'
   ? 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf'
-  : 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q8_0.gguf';
+  : 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q8_0.gguf');
 const PORT = 8114;
 const fixtures = JSON.parse(fs.readFileSync(path.join(HERE, 'FIXTURES_five_prompt_parity.json'), 'utf8'));
 
@@ -64,7 +64,7 @@ try {
   try { execSync(`taskkill /F /PID ${child.pid}`, { stdio: 'ignore' }); } catch {}
 }
 
-fs.writeFileSync(path.join(HERE, `oracle_gen_${MODE}.json`), JSON.stringify({
+fs.writeFileSync(path.join(HERE, `oracle_gen_${process.env.CAMELID_ORACLE_SUFFIX || MODE}.json`), JSON.stringify({
   schema: 'camelid.fixture-corpus/v1',
   oracle: `llama.cpp acd79d6 llama-server ${MODE === 'cuda' ? '-ngl 99 (CUDA)' : '-ngl 0 -ctk f32 -ctv f32 --no-repack (CPU)'}`,
   model: MODEL,
@@ -73,4 +73,4 @@ fs.writeFileSync(path.join(HERE, `oracle_gen_${MODE}.json`), JSON.stringify({
   date: new Date().toISOString(),
   generations: out,
 }, null, 2));
-console.log(`wrote oracle_gen_${MODE}.json`);
+console.log(`wrote oracle_gen_${process.env.CAMELID_ORACLE_SUFFIX || MODE}.json`);
