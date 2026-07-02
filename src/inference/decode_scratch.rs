@@ -21,10 +21,35 @@
 
 use std::sync::Mutex;
 
-use crate::tensor::CpuTensor;
+use crate::tensor::{CpuTensor, Q8_0Block};
 
 static POOL: Mutex<Vec<Vec<f32>>> = Mutex::new(Vec::new());
 static NAME_POOL: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static DIMS_POOL: Mutex<Vec<Vec<usize>>> = Mutex::new(Vec::new());
+static Q8_BLOCK_POOL: Mutex<Vec<Vec<Q8_0Block>>> = Mutex::new(Vec::new());
+
+/// An empty (cleared) `Vec<Q8_0Block>`, reusing a recycled buffer's capacity
+/// when one exists. Content is produced entirely by the caller.
+pub(super) fn take_q8_blocks() -> Vec<Q8_0Block> {
+    let mut blocks = Q8_BLOCK_POOL
+        .lock()
+        .expect("decode scratch q8 block pool poisoned")
+        .pop()
+        .unwrap_or_default();
+    blocks.clear();
+    blocks
+}
+
+/// Return a quantized-input block buffer to the pool.
+pub(super) fn recycle_q8_blocks(blocks: Vec<Q8_0Block>) {
+    if blocks.capacity() == 0 {
+        return;
+    }
+    Q8_BLOCK_POOL
+        .lock()
+        .expect("decode scratch q8 block pool poisoned")
+        .push(blocks);
+}
 
 /// A zeroed `Vec<f32>` of `len`, bit-identical in content to
 /// `vec![0.0; len]`, reusing a recycled buffer when one fits.
@@ -59,38 +84,51 @@ pub(super) fn recycle(buffer: Vec<f32>) {
 }
 
 /// Build a tensor from pooled parts: the data buffer comes from the caller
-/// (usually via [`take`]) and the name String is recycled when one is
-/// available (clear + push_str reuses its capacity — no allocation once the
+/// (usually via [`take`]); the name String and dims Vec are recycled when
+/// available (clear + refill reuses their capacity — no allocation once the
 /// pool is warm).
 pub(super) fn tensor_from_pooled(
     name: &str,
-    dims: Vec<usize>,
+    dims: &[usize],
     data: Vec<f32>,
 ) -> crate::Result<CpuTensor> {
-    let mut owned = NAME_POOL
+    let mut owned_name = NAME_POOL
         .lock()
         .expect("decode scratch name pool poisoned")
         .pop()
         .unwrap_or_default();
-    owned.clear();
-    owned.push_str(name);
-    CpuTensor::from_f32(owned, dims, data)
+    owned_name.clear();
+    owned_name.push_str(name);
+    let mut owned_dims = DIMS_POOL
+        .lock()
+        .expect("decode scratch dims pool poisoned")
+        .pop()
+        .unwrap_or_default();
+    owned_dims.clear();
+    owned_dims.extend_from_slice(dims);
+    CpuTensor::from_f32(owned_name, owned_dims, data)
 }
 
-/// Reclaim a dead intermediate tensor: its data buffer and name String both
-/// return to their pools. Call ONLY where the tensor is provably dead (the
-/// layer forward's end-of-scope points).
+/// Reclaim a dead intermediate tensor: its data buffer, name String, and
+/// dims Vec all return to their pools. Call ONLY where the tensor is
+/// provably dead (the layer forward's end-of-scope points).
 // Consumed by the layer-forward recycling pass (step 5c); until that lands
 // only the tests exercise it.
 #[allow(dead_code)]
 pub(super) fn recycle_tensor(tensor: CpuTensor) {
-    let (name, data) = tensor.into_parts();
+    let (name, dims, data) = tensor.into_parts();
     recycle(data);
     if name.capacity() > 0 {
         NAME_POOL
             .lock()
             .expect("decode scratch name pool poisoned")
             .push(name);
+    }
+    if dims.capacity() > 0 {
+        DIMS_POOL
+            .lock()
+            .expect("decode scratch dims pool poisoned")
+            .push(dims);
     }
 }
 

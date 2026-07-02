@@ -6762,10 +6762,10 @@ fn q8_0_encoded_row_matches_decoded_scale_helper() {
         quants: std::array::from_fn(|idx| idx as i8 - 12),
     };
     let input = QuantizedQ8_0Row {
-        blocks: vec![Q8_0Block {
+        blocks: PooledQ8Blocks(vec![Q8_0Block {
             scale: f16_bits_to_f32(f32_to_f16_bits(0.25)),
             quants: std::array::from_fn(|idx| 15 - idx as i8),
-        }],
+        }]),
     };
     let mut row_bytes = Vec::with_capacity(Q8BlockReader::BLOCK_SIZE_BYTES);
     row_bytes.extend_from_slice(&f32_to_f16_bits(row.scale).to_le_bytes());

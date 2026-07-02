@@ -11023,9 +11023,29 @@ const X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS: usize = 1024;
 const X86_Q8_PACKED_ROWS4_MATMUL_PARALLEL_MIN_GROUPS: usize = 64;
 const X86_Q8_FFN_DOWN_GEMM4_ROW_GROUP_MIN_INPUT_GROUPS: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct QuantizedQ8_0Row {
-    blocks: Vec<Q8_0Block>,
+    blocks: PooledQ8Blocks,
+}
+
+/// A pooled lease on a `Vec<Q8_0Block>`: derefs to the block slice for every
+/// consumer and returns the buffer to the decode scratch pool on drop, so
+/// per-call input quantization stops allocating once the pool is warm. The
+/// produced blocks are identical to a freshly allocated vector's.
+#[derive(Debug)]
+struct PooledQ8Blocks(Vec<Q8_0Block>);
+
+impl std::ops::Deref for PooledQ8Blocks {
+    type Target = [Q8_0Block];
+    fn deref(&self) -> &[Q8_0Block] {
+        &self.0
+    }
+}
+
+impl Drop for PooledQ8Blocks {
+    fn drop(&mut self) {
+        decode_scratch::recycle_q8_blocks(std::mem::take(&mut self.0));
+    }
 }
 
 #[cfg(test)]
@@ -12258,14 +12278,16 @@ fn q8_0_packed_rows4_single_input_projection_with_decode_chunking(
     name: &str,
     decode_group_chunking: bool,
 ) -> Result<CpuTensor> {
-    let mut output = vec![0.0_f32; output_width];
+    // Pooled output + tensor parts: this is the shared tail of every rows==1
+    // decode projection arm, so pooling here covers the whole cascade.
+    let mut output = decode_scratch::take(output_width);
     q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
         packed,
         quantized_input,
         &mut output,
         decode_group_chunking,
     )?;
-    CpuTensor::from_f32(name, vec![1, output_width], output)
+    decode_scratch::tensor_from_pooled(name, &[1, output_width], output)
 }
 
 fn x86_q8_packed_rows4_serial_decode_enabled() -> bool {
@@ -15737,8 +15759,10 @@ fn matmul_rhs_transposed_q8_0_block_dot_with_plan(
 }
 
 fn quantize_q8_0_row(input: &[f32]) -> QuantizedQ8_0Row {
+    let mut blocks = decode_scratch::take_q8_blocks();
+    quantize_q8_0_blocks_into(input, &mut blocks);
     QuantizedQ8_0Row {
-        blocks: quantize_q8_0_blocks(input),
+        blocks: PooledQ8Blocks(blocks),
     }
 }
 
@@ -21114,7 +21138,7 @@ fn causal_attention_context(
         )?;
     }
 
-    let tensor = decode_scratch::tensor_from_pooled(name, vec![1, expected_width], out)?;
+    let tensor = decode_scratch::tensor_from_pooled(name, &[1, expected_width], out)?;
     let trace = collect_diagnostics
         .then(|| {
             attention_trace_with_params(AttentionTraceParams {

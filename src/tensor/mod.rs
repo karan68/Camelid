@@ -1215,12 +1215,12 @@ impl Q8_0TensorBlocks {
 }
 
 impl CpuTensor {
-    /// Decompose into the owned name and f32 data buffer so the decode
-    /// scratch pool can recycle both. Only meaningful for plain-F32 tensors;
-    /// quantized side-storage (never present on decode intermediates) is
-    /// dropped.
-    pub(crate) fn into_parts(self) -> (String, Vec<f32>) {
-        (self.name, self.data)
+    /// Decompose into the owned name, dims, and f32 data buffer so the
+    /// decode scratch pool can recycle all three. Only meaningful for
+    /// plain-F32 tensors; quantized side-storage (never present on decode
+    /// intermediates) is dropped.
+    pub(crate) fn into_parts(self) -> (String, Vec<usize>, Vec<f32>) {
+        (self.name, self.shape.dims, self.data)
     }
 
     pub fn from_f32(name: impl Into<String>, dims: Vec<usize>, data: Vec<f32>) -> Result<Self> {
