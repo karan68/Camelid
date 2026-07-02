@@ -4788,12 +4788,71 @@ fn decode_thread_pool() -> Option<&'static rayon::ThreadPool> {
     POOL.get_or_init(build_decode_thread_pool).as_ref()
 }
 
+/// Best-effort physical (not logical) core count on Windows, via
+/// `GetLogicalProcessorInformation` (one `RelationProcessorCore` record per
+/// physical core). The memory-bound decode matvec does not benefit from SMT
+/// siblings — oversubscribing logical cores adds memory-controller contention
+/// and measurably regresses decode (P2 sweep: 16 logical threads run ~20%
+/// slower than the 4–8 physical plateau). Returns `None` on any ambiguity;
+/// callers fail closed to existing behavior.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub fn windows_physical_core_count() -> Option<usize> {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformation, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
+    };
+    // RelationProcessorCore == 0 (LOGICAL_PROCESSOR_RELATIONSHIP); one such record
+    // per physical core.
+    const RELATION_PROCESSOR_CORE: i32 = 0;
+    unsafe {
+        let mut len: u32 = 0;
+        // First call sizes the buffer (expected to fail with ERROR_INSUFFICIENT_BUFFER).
+        GetLogicalProcessorInformation(std::ptr::null_mut(), &mut len);
+        if len == 0 {
+            return None;
+        }
+        let count = len as usize / std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
+        if count == 0 {
+            return None;
+        }
+        let mut buf: Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> = Vec::with_capacity(count);
+        if GetLogicalProcessorInformation(buf.as_mut_ptr(), &mut len) == 0 {
+            return None;
+        }
+        buf.set_len(count);
+        let physical = buf
+            .iter()
+            .filter(|info| info.Relationship == RELATION_PROCESSOR_CORE)
+            .count();
+        (physical > 0).then_some(physical)
+    }
+}
+
 fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
     let global = rayon::current_num_threads();
+    // Promoted default policy (Windows x86_64): decode runs on a dedicated
+    // pool at the DETECTED PHYSICAL core count, never the SMT logical count.
+    // Fail-closed: no detection → no pool (pre-promotion behavior); an
+    // operator-pinned global (CAMELID_THREADS, mirroring the prefill pool's
+    // pinning contract) or a global already narrower than physical is never
+    // silently overridden. The per-host optimum is deferred to GAIT; only
+    // the physical-core policy ships, not this host's tuned width.
+    let default_physical = if env::var("CAMELID_THREADS").is_ok() {
+        None
+    } else {
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            windows_physical_core_count()
+        }
+        #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+        {
+            None
+        }
+    };
     let target = resolve_decode_thread_count_from(
         env::var("BACKENDINFERENCE_DECODE_THREADS").ok().as_deref(),
         q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_DECODE_POOL_DEDICATED"),
         global,
+        default_physical,
     )?;
     match rayon::ThreadPoolBuilder::new()
         .num_threads(target)
@@ -4820,23 +4879,34 @@ fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
 /// * `spec` — raw `BACKENDINFERENCE_DECODE_THREADS` value, if present.
 /// * `dedicated` — `BACKENDINFERENCE_DECODE_POOL_DEDICATED` flag.
 /// * `global` — current global pool width (the no-resize isolation width).
+/// * `default_physical` — the promoted default policy input: detected
+///   physical core count, already `None` off-Windows, on detection failure,
+///   or when the operator pinned the global via `CAMELID_THREADS`.
 ///
-/// An explicit positive `spec` wins; `0`/`off`/empty/invalid fall through to
-/// the `dedicated` check (isolate at global width) and otherwise `None`.
+/// Precedence: an explicit positive `spec` wins; an explicit `0`/`off` is
+/// the kill switch and disables the pool entirely (including the default
+/// policy); otherwise `dedicated` isolates at the global width; otherwise
+/// the default policy builds a pool at the physical width — but never wider
+/// than the global pool (an operator who narrowed the global keeps it).
 fn resolve_decode_thread_count_from(
     spec: Option<&str>,
     dedicated: bool,
     global: usize,
+    default_physical: Option<usize>,
 ) -> Option<usize> {
     if let Some(spec) = spec {
         let trimmed = spec.trim();
-        if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("off") && trimmed != "0" {
-            if let Some(count) = trimmed.parse::<usize>().ok().filter(|n| *n > 0) {
-                return Some(count);
-            }
+        if trimmed.eq_ignore_ascii_case("off") || trimmed == "0" {
+            return None;
+        }
+        if let Some(count) = trimmed.parse::<usize>().ok().filter(|n| *n > 0) {
+            return Some(count);
         }
     }
-    dedicated.then_some(global)
+    if dedicated {
+        return Some(global);
+    }
+    default_physical.filter(|physical| *physical <= global)
 }
 
 /// Run the decode `op` on the dedicated decode pool when one is configured,
@@ -21713,15 +21783,21 @@ fn attention_f32_blocked_dot_enabled() -> bool {
 /// per process outside tests.
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 fn attention_decode_parallel_enabled() -> bool {
+    // DEFAULT ON (Windows x86_64 promotion): the lane carries a
+    // bitwise-identity contract (Item-2 matrix + A/B, zero divergent bits),
+    // so the flip cannot change any output byte. Explicit rollback:
+    // `BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL=0`.
     #[cfg(test)]
     {
-        q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL")
+        q8_0_env_flag_enabled_default_on_fail_closed("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL")
     }
     #[cfg(not(test))]
     {
         static ATTENTION_DECODE_PARALLEL_ENABLED: OnceLock<bool> = OnceLock::new();
         *ATTENTION_DECODE_PARALLEL_ENABLED.get_or_init(|| {
-            q8_0_env_flag_enabled_default_off("BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL")
+            q8_0_env_flag_enabled_default_on_fail_closed(
+                "BACKENDINFERENCE_ATTENTION_DECODE_PARALLEL",
+            )
         })
     }
 }

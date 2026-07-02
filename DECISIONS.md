@@ -600,3 +600,24 @@ Consequences, recorded as binding context for future parity claims:
 Receipts: `target/kv-lanes-baseline-20260701T180113/`,
 `target/kv-lanes-ab-20260701T185422/`, `target/kv-lanes-ab2-20260701T195346/`
 (SHA256-sealed, dev box) and the PR #359 description.
+
+
+## D13 - Decode thread-width policy: detected physical cores, never SMT logical count (2026-07-02)
+
+**Decision:** on Windows x86_64, single-token decode runs by default on a dedicated
+rayon pool sized to the DETECTED physical core count (GetLogicalProcessorInformation,
+one RelationProcessorCore record per core). The SMT logical count is never used for
+decode. Detection failure, an operator-pinned global (CAMELID_THREADS), or a global
+already narrower than physical all fail closed to the previous inline-on-global
+behavior. `BACKENDINFERENCE_DECODE_THREADS=N` remains the explicit width override and
+`=0`/`=off` is the kill switch; `BACKENDINFERENCE_DECODE_POOL_DEDICATED=1` remains the
+isolate-at-global-width override.
+
+**Basis (receipts):** the Items-4/5 P2 sweep (`target/decode-sched-p2-20260702T011105/`,
+SHA256-sealed): decode tok/s is flat across widths 4-8 (within ~3%) and falls
+monotonically past the physical count (width 16 = -20% vs the plateau at depth 512,
+-19% at 2048); the serve-path A/B in the same receipt shows the dedicated-pool
+configuration at -4.5% wall and an explicit narrower width at -7.1%. This host's
+measured optimum (6) is deliberately NOT hardcoded: the portable, defensible policy is
+"physical, not logical"; per-host refinement of the exact width within the flat region
+is deferred to GAIT calibration.
