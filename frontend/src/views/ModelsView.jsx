@@ -9,8 +9,11 @@ import { ModelInspector } from '../components/models/ModelInspector'
 import { TokenizerPlayground } from '../components/models/TokenizerPlayground'
 import { StatusDot } from '../components/ui/StatusDot'
 import { EvidenceChip } from '../components/ui/EvidenceChip'
-import { LocalLaneSections } from '../components/models/LocalLaneSections'
 import { CatalogLaneBrowse } from '../components/models/CatalogLaneBrowse'
+import { UnsupportedBlocker } from '../components/models/UnsupportedBlocker'
+import { Section, SupportedRow, CompatibleRow, EligibleRow, NotAnchoredRow } from '../components/models/LaneRows'
+import { useModelsPageData } from '../hooks/useModelsPageData'
+import { bucketByLane, laneOf } from '../lib/modelLanes'
 import { IconModels } from '../components/ui/icons'
 
 const FILTERS = [
@@ -304,6 +307,53 @@ function compareCatalogItemsByTitle(left, right) {
   })
 }
 
+/* Zone 1 — what is loaded right now, with the one Unload action. The lane chip is
+   derived for the loaded file exactly like the section rows are; runtime readiness
+   comes from /health via the dashboard runtime object. */
+function activeLaneChip(lane) {
+  if (lane === 'supported') return <EvidenceChip state="supported" asText size="sm">Supported</EvidenceChip>
+  if (lane === 'compatible') return <EvidenceChip state="runnable" asText size="sm">Runnable</EvidenceChip>
+  if (lane === 'eligible') return <EvidenceChip state="runnable" asText size="sm">Oracle-qualified</EvidenceChip>
+  return <EvidenceChip state="unsupported" asText size="sm">Experimental — unverified</EvidenceChip>
+}
+
+function ActiveModelBar({ runtime, activeFilename, activeEntry, capabilities, busy, onUnload }) {
+  const online = runtime?.status === 'online'
+  const generationReady = Boolean(runtime?.generation_ready)
+  const loaded = Boolean(activeFilename)
+  return (
+    <section className="models-active-bar" aria-label="Active model">
+      <div className="models-active-bar__id">
+        <StatusDot
+          tone={online ? (loaded && generationReady ? 'ready' : 'warn') : 'offline'}
+          pulse={loaded && generationReady}
+          label=""
+        />
+        <div className="models-active-bar__name">
+          <strong>{loaded ? activeFilename : 'No model loaded'}</strong>
+          <span>
+            {!online
+              ? 'Runtime offline'
+              : loaded
+                ? generationReady
+                  ? 'Generation-ready'
+                  : 'Loaded, but not generation-ready yet'
+                : 'Load a model below to unlock chat.'}
+          </span>
+        </div>
+      </div>
+      <div className="models-active-bar__actions">
+        {loaded && activeEntry ? activeLaneChip(laneOf(activeEntry, capabilities)) : null}
+        {loaded ? (
+          <button type="button" className="lane-row-action" onClick={onUnload} disabled={busy}>
+            {busy ? 'Unloading…' : 'Unload'}
+          </button>
+        ) : null}
+      </div>
+    </section>
+  )
+}
+
 export default function ModelsView({
   runtime,
   capabilities,
@@ -337,10 +387,133 @@ export default function ModelsView({
   const [catalogError, setCatalogError] = useState('')
   const [catalogAvailable, setCatalogAvailable] = useState(false)
   const [refreshingRuntime, setRefreshingRuntime] = useState(false)
-  const [localRefreshKey, setLocalRefreshKey] = useState(0)
 
   const catalogApiBase = (runtime?.api_base || '').replace(/\/$/, '')
   const runtimeOnline = runtime?.status === 'online'
+
+  /* ---- Zones 1–3 data spine: /api/models/local + /api/models/current +
+     downloads, one hook, no localStorage truth. ---- */
+  const spine = useModelsPageData({ apiBase: catalogApiBase || apiBase })
+  const [receipts, setReceipts] = useState({})
+  const [smokeBusy, setSmokeBusy] = useState({})
+  const [usingFilename, setUsingFilename] = useState('')
+  const [unloading, setUnloading] = useState(false)
+  // Typed fail-closed blocker from a pre-load inspect ({ code, message }), shown
+  // verbatim instead of attempting a multi-GB load that cannot run.
+  const [blocker, setBlocker] = useState(null)
+  const [laneError, setLaneError] = useState('')
+
+  const laneBuckets = useMemo(
+    () => (spine.local ? bucketByLane(spine.local.models, capabilities) : null),
+    [spine.local, capabilities],
+  )
+  const activeEntry = useMemo(
+    () => spine.local?.models.find((m) => m.filename === spine.activeFilename) || null,
+    [spine.local, spine.activeFilename],
+  )
+  const experimentalRows = laneBuckets
+    ? [...laneBuckets.compatible, ...laneBuckets.eligible, ...laneBuckets.not_anchored]
+    : []
+
+  // Load a local model into the chat backend. First predict the lane with a
+  // header-only inspect (no multi-GB read): if the architecture is not implemented,
+  // surface the exact typed blocker and stop — never attempt to run it. Implemented
+  // architectures (supported or experimental) load as before.
+  const loadModelForChat = async (filename) => {
+    setUsingFilename(filename)
+    setLaneError('')
+    setBlocker(null)
+    const path = `${spine.local?.models_dir || 'models'}/${filename}`
+    try {
+      const inspectRes = await fetch(`${spine.base}/api/models/inspect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path }),
+      })
+      if (inspectRes.ok) {
+        const inspect = await inspectRes.json()
+        if (inspect?.blocker) {
+          setBlocker(inspect.blocker)
+          return
+        }
+      }
+      // Implemented (or inspect unavailable) → attempt the real load.
+      const res = await fetch(`${spine.base}/api/models/load`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: filename, path }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        // A typed fail-closed load error (e.g. invalid metadata) becomes a blocker.
+        if (body?.error?.code && body.error.code !== 'invalid_model') {
+          setBlocker({ code: body.error.code, message: body.error.message })
+          return
+        }
+        throw new Error(body?.error?.message || `load failed (HTTP ${res.status})`)
+      }
+      await spine.refreshCurrent()
+      refreshDashboard?.({ silent: true })
+    } catch (err) {
+      setLaneError(String(err?.message || err))
+    } finally {
+      setUsingFilename('')
+    }
+  }
+
+  const handleUnload = async () => {
+    setUnloading(true)
+    try {
+      await unloadCurrentModel()
+      await spine.refreshCurrent()
+    } finally {
+      setUnloading(false)
+    }
+  }
+
+  const runSmoke = async (filename) => {
+    setSmokeBusy((b) => ({ ...b, [filename]: true }))
+    setLaneError('')
+    try {
+      const res = await fetch(`${spine.base}/api/models/runnable-smoke`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename }),
+      })
+      const body = await res.json()
+      if (res.ok && body.passed) {
+        setReceipts((r) => ({ ...r, [filename]: body.receipt }))
+        await spine.refreshLocal()
+      } else {
+        setLaneError(body?.error?.message || `Smoke-admission did not pass for ${filename}.`)
+      }
+    } catch (err) {
+      setLaneError(String(err?.message || err))
+    } finally {
+      setSmokeBusy((b) => ({ ...b, [filename]: false }))
+    }
+  }
+
+  // Pull the runnable receipt for each Compatible model (those that passed smoke).
+  useEffect(() => {
+    if (!spine.local) return
+    spine.local.models
+      .filter((m) => m.runnable_receipt_present && !receipts[m.filename])
+      .forEach(async (m) => {
+        try {
+          const res = await fetch(
+            `${spine.base}/api/models/runnable-receipt?filename=${encodeURIComponent(m.filename)}`,
+          )
+          if (res.ok) {
+            const receipt = await res.json()
+            setReceipts((r) => ({ ...r, [m.filename]: receipt }))
+          }
+        } catch {
+          /* receipt is best-effort; the row still renders */
+        }
+      })
+  }, [spine.local, spine.base, receipts])
+
   const hostedRoutingAvailable = Boolean(capabilities?.hosted_provider_routing || capabilities?.external_api_routing || capabilities?.openai_compatible_routing)
   const catalogInstallAvailable = Boolean(capabilities?.model_catalog_install || capabilities?.model_downloads || capabilities?.hf_catalog_install)
   const apiFeatures = capabilities?.api_features || []
@@ -560,11 +733,79 @@ export default function ModelsView({
           </div>
       </div>
 
-      <LocalLaneSections
-        apiBase={catalogApiBase || apiBase}
+      {/* Zone 1 — active model bar */}
+      <ActiveModelBar
+        runtime={runtime}
+        activeFilename={spine.activeFilename}
+        activeEntry={activeEntry}
         capabilities={capabilities}
-        refreshKey={localRefreshKey}
+        busy={unloading || Boolean(loadingModelId)}
+        onUnload={handleUnload}
       />
+      {laneError ? <p className="lane-error">{laneError}</p> : null}
+      {spine.localError && !spine.local ? (
+        <p className="lane-empty">Could not list local models: {spine.localError}</p>
+      ) : null}
+
+      {/* Zone 2 — supported local models (derived membership only) */}
+      <Section
+        title="Supported"
+        count={laneBuckets ? laneBuckets.supported.length : undefined}
+        subtitle="Local models matching an exact supported /api/capabilities row — cross-validated parity."
+      >
+        {!laneBuckets ? (
+          <p className="lane-empty">{spine.localLoading ? 'Scanning local models…' : 'Local model scan unavailable.'}</p>
+        ) : laneBuckets.supported.length ? (
+          laneBuckets.supported.map((m) => (
+            <SupportedRow
+              key={m.filename}
+              entry={m}
+              active={m.filename === spine.activeFilename}
+              busy={usingFilename === m.filename}
+              onUse={() => loadModelForChat(m.filename)}
+            />
+          ))
+        ) : (
+          <p className="lane-empty">No local model matches a supported row yet — download one below in “Get models”.</p>
+        )}
+      </Section>
+
+      {/* Zone 3 — everything else local, honestly labeled by evidence state */}
+      <Section
+        title="Experimental"
+        count={laneBuckets ? experimentalRows.length : undefined}
+        subtitle="These run without parity anchoring — output is not cross-validated against the reference."
+      >
+        {blocker ? <UnsupportedBlocker blocker={blocker} className="local-lane-blocker" /> : null}
+        {!laneBuckets ? (
+          <p className="lane-empty">{spine.localLoading ? 'Scanning local models…' : 'Local model scan unavailable.'}</p>
+        ) : experimentalRows.length ? (
+          <>
+            {laneBuckets.compatible.map((m) => (
+              <CompatibleRow key={m.filename} entry={m} receipt={receipts[m.filename]} />
+            ))}
+            {laneBuckets.eligible.map((m) => (
+              <EligibleRow
+                key={m.filename}
+                entry={m}
+                busy={Boolean(smokeBusy[m.filename])}
+                onRun={() => runSmoke(m.filename)}
+              />
+            ))}
+            {laneBuckets.not_anchored.map((m) => (
+              <NotAnchoredRow
+                key={m.filename}
+                entry={m}
+                busy={usingFilename === m.filename}
+                onUse={() => loadModelForChat(m.filename)}
+              />
+            ))}
+          </>
+        ) : (
+          <p className="lane-empty">Nothing experimental on disk — every local model matches a supported row.</p>
+        )}
+      </Section>
+
       <SupportedModels
         models={models}
         runtime={runtime}
@@ -577,7 +818,7 @@ export default function ModelsView({
       <CatalogLaneBrowse
         apiBase={catalogApiBase || apiBase}
         capabilities={capabilities}
-        onAcquired={() => setLocalRefreshKey((k) => k + 1)}
+        onAcquired={() => spine.refreshLocal()}
       />
 
       <div className="cxv-card cxv-panel">

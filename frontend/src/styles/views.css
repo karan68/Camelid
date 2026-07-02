@@ -1308,6 +1308,15 @@
 .rlc__message--caution { color: var(--color-evidence); }
 .rlc__absent { margin: 0; font-family: var(--font-mono); font-size: 0.625rem; letter-spacing: 0.02em; color: var(--color-text-faint); }
 
+/* ---- Models tab: Zone 1 active model bar ---- */
+.models-active-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; margin-top: var(--space-4); padding: var(--space-3) var(--space-4); border: 1px solid var(--color-border-soft); border-radius: var(--radius-md); background: var(--color-surface); }
+.models-active-bar__id { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.models-active-bar__name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.models-active-bar__name strong { overflow-wrap: anywhere; }
+.models-active-bar__name span { font-size: var(--text-xs); color: var(--color-text-muted); }
+.models-active-bar__actions { display: flex; align-items: center; gap: var(--space-3); }
+.models-active-bar__actions .lane-row-action { margin-top: 0; }
+
 /* ---- Models tab: local models by lane (derived sections) ---- */
 .local-lane-sections { margin-top: var(--space-4); }
 .local-lane-head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
