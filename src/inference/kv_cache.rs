@@ -274,8 +274,7 @@ impl LlamaKvCache {
                     * self.plan.head_dim
             }
             KvLayout::HeadMajor => {
-                (((layer_idx * self.plan.kv_head_count) + kv_head)
-                    * self.allocated_sequence_length
+                (((layer_idx * self.plan.kv_head_count) + kv_head) * self.allocated_sequence_length
                     + position)
                     * self.plan.head_dim
             }

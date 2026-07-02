@@ -285,8 +285,8 @@ pub(super) fn axpy_blocked_f16_scalar(out: &mut [f32], prob: f32, v16: &[u16]) {
 #[target_feature(enable = "avx2,fma,f16c")]
 pub(super) unsafe fn dot_blocked_f16_avx2(x: &[f32], y16: &[u16]) -> f32 {
     use std::arch::x86_64::{
-        _mm256_add_ps, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
-        _mm256_storeu_ps, _mm_loadu_si128, __m128i,
+        __m128i, _mm256_add_ps, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
+        _mm256_setzero_ps, _mm256_storeu_ps, _mm_loadu_si128,
     };
     debug_assert_eq!(x.len(), y16.len());
     let len = x.len();
@@ -340,8 +340,8 @@ pub(super) unsafe fn dot_blocked_f16_avx2(x: &[f32], y16: &[u16]) -> f32 {
 #[target_feature(enable = "avx2,fma,f16c")]
 pub(super) unsafe fn axpy_blocked_f16_avx2(out: &mut [f32], prob: f32, v16: &[u16]) {
     use std::arch::x86_64::{
-        _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps, _mm256_storeu_ps,
-        _mm_loadu_si128, __m128i,
+        __m128i, _mm256_cvtph_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps,
+        _mm256_storeu_ps, _mm_loadu_si128,
     };
     debug_assert_eq!(out.len(), v16.len());
     let len = out.len();

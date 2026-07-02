@@ -11,14 +11,15 @@
 //! reproduces today's buffer values bit-for-bit, upgrading this lane to the
 //! bitwise-identity contract.
 //!
-//! Canonical semantics are consequently pinned to the EXISTING helpers
+//! Canonical STORE semantics are consequently pinned to the EXISTING helper
 //! (round-to-nearest-even; overflow to ±inf incl. the 65520 tie; RNE
 //! subnormals; every NaN canonicalized to sign|0x7E00), NOT to raw F16C: the
-//! F16C fast paths below must match the existing scalar semantics bitwise on
-//! every input, which requires a NaN fixup after `vcvtps2ph` (hardware
-//! preserves truncated NaN payloads; the canonical form does not). The
-//! f16->f32 direction is exact and `vcvtph2ps` already matches the scalar
-//! helper on all 2^16 inputs, NaN payloads included. All enforced by the
+//! F16C write fast path must match that bitwise on every input, which
+//! requires a NaN fixup after `vcvtps2ph` (hardware preserves truncated NaN
+//! payloads; the canonical form does not). The READ direction is exact and
+//! pinned to `vcvtph2ps` on the full 2^16 domain; it differs from the repo's
+//! `f16_bits_to_f32` only on signalling-NaN inputs (hardware quiets them),
+//! which the canonical store makes unreachable. All enforced by the
 //! exhaustive + randomized property tests below.
 //!
 //! All arithmetic in the attention kernels stays f32; these conversions are
@@ -65,7 +66,14 @@ pub(super) fn f32_to_f16_kv(value: f32) -> u16 {
     half
 }
 
-/// Reference f16 -> f32 (exact), bitwise-equal to `vcvtph2ps`.
+/// Reference f16 -> f32 (exact), bitwise-equal to `vcvtph2ps` on the FULL
+/// 2^16 domain — including quieting signalling NaNs (hardware sets the f32
+/// quiet bit; payload otherwise preserved). This is the one place the read
+/// direction differs from the repo's `f16_bits_to_f32`, which passes sNaN
+/// through un-quieted: the delta is UNREACHABLE from the KV lane, because
+/// the pinned store conversion canonicalizes every NaN to sign|0x7E00 (a
+/// quiet NaN) before anything lands in the cache — locked by the tests
+/// below.
 pub(super) fn f16_to_f32_kv(bits: u16) -> f32 {
     let sign = (u32::from(bits & 0x8000)) << 16;
     let exp = (bits & 0x7c00) >> 10;
@@ -86,7 +94,14 @@ pub(super) fn f16_to_f32_kv(bits: u16) -> f32 {
                 sign | (exp32 << 23) | (mant << 13)
             }
         }
-        0x1f => sign | 0x7f80_0000 | (frac << 13),
+        0x1f => {
+            if frac == 0 {
+                sign | 0x7f80_0000
+            } else {
+                // NaN: quiet bit forced, payload preserved — vcvtph2ps.
+                sign | 0x7f80_0000 | 0x0040_0000 | (frac << 13)
+            }
+        }
         _ => {
             let exp32 = u32::from(exp) + (127 - 15);
             sign | (exp32 << 23) | (frac << 13)
@@ -133,8 +148,8 @@ pub(super) fn f16c_available() -> bool {
 #[target_feature(enable = "avx,f16c")]
 unsafe fn convert_f32_slice_to_f16_f16c(source: &[f32], dest: &mut [u16]) {
     use std::arch::x86_64::{
-        _mm256_cmp_ps, _mm256_loadu_ps, _mm256_movemask_ps, _mm_storeu_si128,
-        _CMP_UNORD_Q, _MM_FROUND_TO_NEAREST_INT, __m128i, _mm256_cvtps_ph,
+        __m128i, _mm256_cmp_ps, _mm256_cvtps_ph, _mm256_loadu_ps, _mm256_movemask_ps,
+        _mm_storeu_si128, _CMP_UNORD_Q, _MM_FROUND_TO_NEAREST_INT,
     };
     let len = source.len();
     let mut i = 0;
@@ -182,7 +197,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     fn hardware_f32_to_f16(value: f32) -> u16 {
         use std::arch::x86_64::{
-            _mm256_set1_ps, _mm_storeu_si128, _MM_FROUND_TO_NEAREST_INT, __m128i, _mm256_cvtps_ph,
+            __m128i, _mm256_cvtps_ph, _mm256_set1_ps, _mm_storeu_si128, _MM_FROUND_TO_NEAREST_INT,
         };
         assert!(f16c_available(), "test requires F16C");
         let mut out = [0u16; 8];
@@ -213,11 +228,24 @@ mod tests {
                 hardware.to_bits(),
                 "f16->f32 mismatch at bits {bits:#06x}: ref {reference}, hw {hardware}"
             );
-            assert_eq!(
-                reference.to_bits(),
-                crate::inference::f16_bits_to_f32(bits).to_bits(),
-                "f16->f32 drifted from the existing helper at bits {bits:#06x}"
-            );
+            let is_snan = (bits & 0x7c00) == 0x7c00 && (bits & 0x03ff) != 0 && (bits & 0x0200) == 0;
+            if is_snan {
+                // Documented delta: the existing helper passes sNaN through
+                // un-quieted; hardware (and this reference) quiets it. sNaN
+                // cannot reach the cache — the store conversion below
+                // canonicalizes every NaN to a quiet 0x7E00.
+                assert_eq!(
+                    reference.to_bits(),
+                    crate::inference::f16_bits_to_f32(bits).to_bits() | 0x0040_0000,
+                    "sNaN quieting delta changed shape at bits {bits:#06x}"
+                );
+            } else {
+                assert_eq!(
+                    reference.to_bits(),
+                    crate::inference::f16_bits_to_f32(bits).to_bits(),
+                    "f16->f32 drifted from the existing helper at bits {bits:#06x}"
+                );
+            }
             let round_trip = f32_to_f16_kv(reference);
             let is_nan = (bits & 0x7c00) == 0x7c00 && (bits & 0x03ff) != 0;
             if is_nan {
@@ -235,9 +263,10 @@ mod tests {
         }
     }
 
-    /// >=1M randomized f32 inputs across all magnitude classes, plus targeted
-    /// edge sets (subnormal f32/f16 territory, overflow boundary, rounding
-    /// ties, ±inf, NaN payloads): f32->f16 bitwise-equal to hardware RNE.
+    /// At least 1.2M randomized f32 inputs across all magnitude classes,
+    /// plus targeted edge sets (subnormal f32/f16 territory, overflow
+    /// boundary, rounding ties, ±inf, NaN payloads): f32->f16 bitwise-equal
+    /// to hardware RNE (non-NaN) and to the canonical-NaN form (NaN).
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn f32_to_f16_matches_hardware_randomized_and_edges() {
@@ -245,7 +274,7 @@ mod tests {
             eprintln!("skipping: F16C not available on this host");
             return;
         }
-        let mut check = |value: f32| {
+        let check = |value: f32| {
             let reference = f32_to_f16_kv(value);
             // Semantic lock to main: the KV canonical conversion must equal
             // the existing helper (whose output today's f32 buffers hold) on
@@ -260,12 +289,16 @@ mod tests {
                 // Canonical NaN by definition; hardware preserves payloads
                 // instead, so the fast path carries a NaN fixup (covered by
                 // bulk_conversion_matches_reference).
-                assert_eq!(reference, ((value.to_bits() >> 16) as u16 & 0x8000) | 0x7e00);
+                assert_eq!(
+                    reference,
+                    ((value.to_bits() >> 16) as u16 & 0x8000) | 0x7e00
+                );
                 return;
             }
             let hardware = hardware_f32_to_f16(value);
             assert_eq!(
-                reference, hardware,
+                reference,
+                hardware,
                 "f32->f16 mismatch at {value} ({:#010x}): ref {reference:#06x}, hw {hardware:#06x}",
                 value.to_bits()
             );
@@ -285,11 +318,11 @@ mod tests {
             65519.999,
             65520.0, // tie: rounds to inf
             65536.0,
-            6.1035156e-5,  // f16 min normal
-            6.0975552e-5,  // largest f16 subnormal
-            5.9604645e-8,  // f16 min subnormal
-            2.9802322e-8,  // half the min subnormal (tie to zero)
-            2.9802326e-8,  // just above the tie
+            6.1035156e-5, // f16 min normal
+            6.097555e-5,  // largest f16 subnormal
+            5.9604645e-8, // f16 min subnormal
+            2.9802322e-8, // half the min subnormal (tie to zero)
+            2.9802326e-8, // just above the tie
             f32::MIN_POSITIVE,
             f32::from_bits(1), // min f32 subnormal
         ] {

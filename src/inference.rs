@@ -1735,8 +1735,11 @@ impl LlamaInferenceSession {
     pub fn take_for_step(&mut self) -> LlamaInferenceSession {
         let plan = self.kv_cache.plan.clone();
         // Carry the resolved KV budget onto the hollow placeholder so the predict-and-abort
-        // guard stays in force without re-querying host RAM on every step.
+        // guard stays in force without re-querying host RAM on every step. Same for the
+        // layout: it is fixed at construction, and the placeholder must match the real
+        // cache so a later re-assign round-trips identically.
         let kv_budget_bytes = self.kv_cache.kv_budget_bytes;
+        let layout = self.kv_cache.layout;
         LlamaInferenceSession {
             config: self.config.clone(),
             weights: Arc::clone(&self.weights),
@@ -1744,6 +1747,7 @@ impl LlamaInferenceSession {
                 &mut self.kv_cache,
                 LlamaKvCache {
                     plan,
+                    layout,
                     keys: Vec::new(),
                     values: Vec::new(),
                     allocated_sequence_length: 0,
