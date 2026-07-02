@@ -1898,12 +1898,47 @@ fn qwen35_rope_tables(pos: usize, rope_base: f32, rope_dim: usize) -> (Vec<f32>,
     (cos_t, sin_t)
 }
 
+/// Re-encode a q5_K weight to 36-byte Q8_0 blocks (f32 scale + 32 i8) for the
+/// resident Q8_0 GEMV lane — a strict precision upcast used because the engine
+/// has no q5k kernel. Per-32 group: scale = max|v|/127, round-ties-even quants.
+/// NOTE the GPU thereby computes these tensors on a Q8_0-of-q5_K encoding while
+/// the CPU oracle dequants q5_K directly — a sub-0.5%-per-weight numeric
+/// difference inside the lane's already-documented cross-arithmetic envelope.
+#[cfg(feature = "cuda")]
+fn q5k_to_q8_0_blocks(m: &RawMat) -> std::result::Result<Vec<u8>, String> {
+    let elements = m.in_features * m.out_features;
+    let f32s = crate::tensor::decode_q5_k_tensor("q5k-upcast", &m.bytes, elements)
+        .map_err(|e| format!("q5_K upcast dequant failed: {e}"))?;
+    if f32s.len() < elements || !m.in_features.is_multiple_of(32) {
+        return Err(format!(
+            "q5_K upcast: bad shape {}x{} (len {})",
+            m.out_features,
+            m.in_features,
+            f32s.len()
+        ));
+    }
+    let blocks = elements / 32;
+    let mut out = Vec::with_capacity(blocks * 36);
+    for group in f32s[..elements].chunks_exact(32) {
+        let amax = group.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        out.extend_from_slice(&scale.to_le_bytes());
+        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+        for &v in group {
+            let q = (v * inv).round_ties_even().clamp(-127.0, 127.0) as i8;
+            out.push(q as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(feature = "cuda")]
 impl RunnableModel {
     /// Build a GPU resident decode engine for this qwen35 (Ornith) model: upload every
     /// layer (SSM or full-attn) + the LM head, mirroring the proven per-layer GPU
-    /// sequences. Maps each tensor's quant per-tensor (Q8_0 widened 34->36; Q4_K/Q6_K
-    /// raw passthrough), so both the Q8_0 and the 6 GB-fitting Q4_K_M rows build.
+    /// sequences. Maps each tensor's quant per-tensor (Q8_0 widened 34->36; K-quants
+    /// raw passthrough; q5_K upcast to Q8_0 blocks), so the Q8_0, Q4_K_M, and
+    /// Q3_K_M rows all build.
     pub(crate) fn build_qwen35_resident(
         &self,
         max_pos: usize,
@@ -1913,10 +1948,10 @@ impl RunnableModel {
         let ffn_dim = rt.layers[0].ffn_gate.out_features;
         // Per-tensor quant: Q8_0 weights are widened 34->36 (set_*'s repack_for_lane
         // then runs repack_q8_soa); K-quant (Q2_K/Q3_K/Q4_K/Q6_K) bytes pass through
-        // raw (the q2k/q3k/q4k/q6k GEMV kernels expand them on the fly). Returns
-        // (repack-ready bytes, lane). Q5_K has no resident GEMV — the Item 4 quant
-        // recipe overrides Q3_K_M's four q5_K tensors to q6_K instead
-        // (qa/ornith/constrained-vram/QUANT_QUALITY_TABLE.md).
+        // raw (the q2k/q3k/q4k/q6k GEMV kernels expand them on the fly). Q5_K has no
+        // resident GEMV: re-encode it to 36-byte Q8_0 blocks at load (a strict
+        // precision upcast, ~+3bpw on e.g. stock Q3_K_M's four q5_K tensors ≈
+        // +40 MiB VRAM) and run it on the Q8_0 lane. Returns (repack-ready bytes, lane).
         let prep = |m: &RawMat| -> std::result::Result<(Vec<u8>, ProjQuant), String> {
             match m.tt {
                 GgufTensorType::Q8_0 => Ok((widen_q8(&m.bytes), ProjQuant::Q8_0)),
@@ -1924,6 +1959,7 @@ impl RunnableModel {
                 GgufTensorType::Q3K => Ok((m.bytes.clone(), ProjQuant::Q3K)),
                 GgufTensorType::Q4K => Ok((m.bytes.clone(), ProjQuant::Q4K)),
                 GgufTensorType::Q6K => Ok((m.bytes.clone(), ProjQuant::Q6K)),
+                GgufTensorType::Q5K => Ok((q5k_to_q8_0_blocks(m)?, ProjQuant::Q8_0)),
                 other => Err(format!(
                     "qwen35 CUDA lane: unsupported projection quant {other:?}"
                 )),

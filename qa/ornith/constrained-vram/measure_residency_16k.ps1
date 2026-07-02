@@ -2,12 +2,12 @@ $ErrorActionPreference = 'Continue'
 $bin = 'C:\Users\timto\llama.cpp\build\bin\llama-cli.exe'
 $models = 'C:\Users\timto\Camelid\models'
 $here = 'C:\Users\timto\cam-ornith\qa\ornith\constrained-vram'
-$out = Join-Path $here 'residency_16k_measurements.txt'
+$out = Join-Path $here 'residency_16k_part2.txt'
 "# 16K residency measurements $(Get-Date -Format o)" | Out-File -FilePath $out -Encoding utf8
-foreach ($q in @('IQ3_XXS','Q3_K_M','IQ4_XS')) {
+foreach ($q in @('Q3_K_M','IQ4_XS')) {
     "== $q ==" | Out-File -FilePath $out -Append -Encoding utf8
     $log = Join-Path $here "res16k_$q.log"
-    $p = Start-Process -FilePath $bin -ArgumentList '-m',"$models\ornith-1.0-9b-$q.gguf",'-c','16384','-ngl','99','-p','"What is the capital of France?"','-n','8','--temp','0','--seed','0' -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru
+    $p = Start-Process -FilePath $bin -ArgumentList '-m',"$models\ornith-1.0-9b-$q.gguf",'-c','16384','-ngl','99','-p','"What is the capital of France?"','-n','8','--temp','0','--seed','0' -WindowStyle Hidden -RedirectStandardInput (Join-Path $here 'empty_stdin.txt') -RedirectStandardOutput $log -RedirectStandardError ($log + '.err') -PassThru
     $peak = 0
     while (-not $p.HasExited) {
         $used = [int](nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | Select-Object -First 1)
