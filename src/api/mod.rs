@@ -1,4 +1,4 @@
-﻿use std::{
+use std::{
     collections::HashMap,
     convert::Infallible,
     env, mem,
@@ -15126,16 +15126,20 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
                 let mut child = child;
                 let succeeded = matches!(child.wait(), Ok(status) if status.success());
                 // Completion is the curl exit code AND a successful promote of the
-                // .part file to the final path â€” never a size heuristic.
-                let promoted =
-                    succeeded && std::fs::rename(&part_path_clone, &dest_path_clone).is_ok();
-                if !promoted {
-                    // Leave nothing loadable behind on failure/cancel.
-                    std::fs::remove_file(&part_path_clone).ok();
-                }
+                // .part file to the final path, never a size heuristic. The map lock
+                // is held across the promote decision so a cancel cannot race the
+                // rename: cancel removes the entry, and an untracked (canceled)
+                // download must never promote, whatever curl's exit code says.
                 let mut map = active_downloads_map().lock().unwrap();
+                let still_tracked = map.contains_key(&catalog_id_clone);
+                let status = finalize_download_artifact(
+                    succeeded,
+                    still_tracked,
+                    &part_path_clone,
+                    &dest_path_clone,
+                );
                 if let Some(dl) = map.get_mut(&catalog_id_clone) {
-                    dl.status = if promoted { "completed" } else { "failed" };
+                    dl.status = status;
                 }
             });
 
@@ -15177,6 +15181,53 @@ async fn get_catalog_downloads() -> Json<Vec<ActiveDownload>> {
     Json(result)
 }
 
+/// Decide a finished download's fate. Promotion requires BOTH a successful curl
+/// exit AND the download still being tracked: a canceled download (entry removed
+/// from the map) must never promote its partial file to a loadable GGUF. Every
+/// non-promoted outcome removes the `.part` so nothing loadable is left behind.
+/// Returns the terminal status to record for a still-tracked download.
+fn finalize_download_artifact(
+    succeeded: bool,
+    still_tracked: bool,
+    part_path: &str,
+    dest_path: &str,
+) -> &'static str {
+    let promoted = succeeded && still_tracked && std::fs::rename(part_path, dest_path).is_ok();
+    if !promoted {
+        std::fs::remove_file(part_path).ok();
+    }
+    if promoted {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
+/// Terminate a spawned download process by PID. The `Child` handle is owned by the
+/// wait-task (blocked in `wait()`), so cancellation signals the process from the
+/// outside; the wait-task then observes the exit and cleans up the partial file.
+/// `kill` does not exist on Windows service PATHs — use `taskkill` there (`/T`
+/// also ends curl's own children, `/F` forces termination).
+fn kill_download_process(pid: u32) {
+    #[cfg(windows)]
+    let mut kill_cmd = {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut kill_cmd = {
+        let mut cmd = std::process::Command::new("kill");
+        cmd.arg(pid.to_string());
+        cmd
+    };
+    kill_cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok();
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct CancelDownloadRequest {
     pub id: String,
@@ -15186,15 +15237,104 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
     let mut map = active_downloads_map().lock().unwrap();
     if let Some(dl) = map.remove(&req.id) {
         if let Some(pid) = dl.child_pid {
-            let mut kill_cmd = std::process::Command::new("kill");
-            kill_cmd.arg(pid.to_string());
-            kill_cmd.spawn().ok();
+            kill_download_process(pid);
         }
-
-        let path = format!("models/{}", dl.filename);
-        std::fs::remove_file(path).ok();
+        // The `.part` file is cleaned by the wait-task once curl actually exits
+        // (curl may still hold it open right now). Removing the entry here is what
+        // guarantees the wait-task can never promote it. An already-completed
+        // download keeps its file: cancel is not delete.
         (StatusCode::OK, "Download canceled").into_response()
     } else {
         (StatusCode::NOT_FOUND, "Download not found").into_response()
+    }
+}
+
+#[cfg(test)]
+mod download_cancel_tests {
+    use super::{finalize_download_artifact, kill_download_process};
+
+    fn temp_paths(tag: &str) -> (String, String) {
+        let dir =
+            std::env::temp_dir().join(format!("camelid-dl-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        (
+            dir.join("model.gguf.part").to_string_lossy().into_owned(),
+            dir.join("model.gguf").to_string_lossy().into_owned(),
+        )
+    }
+
+    #[test]
+    fn successful_tracked_download_promotes_part_to_dest() {
+        let (part, dest) = temp_paths("promote");
+        std::fs::write(&part, b"payload").unwrap();
+        let status = finalize_download_artifact(true, true, &part, &dest);
+        assert_eq!(status, "completed");
+        assert!(
+            !std::path::Path::new(&part).exists(),
+            ".part must be renamed away"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"payload");
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn canceled_download_never_promotes_even_when_curl_succeeded() {
+        let (part, dest) = temp_paths("cancel");
+        std::fs::write(&part, b"payload").unwrap();
+        // still_tracked=false models a cancel that removed the map entry while
+        // curl went on to finish successfully (the Windows kill-less failure mode).
+        let status = finalize_download_artifact(true, false, &part, &dest);
+        assert_eq!(status, "failed");
+        assert!(
+            !std::path::Path::new(&part).exists(),
+            "canceled .part must be removed"
+        );
+        assert!(
+            !std::path::Path::new(&dest).exists(),
+            "canceled download must never produce a loadable GGUF"
+        );
+    }
+
+    #[test]
+    fn failed_download_removes_partial() {
+        let (part, dest) = temp_paths("fail");
+        std::fs::write(&part, b"half").unwrap();
+        let status = finalize_download_artifact(false, true, &part, &dest);
+        assert_eq!(status, "failed");
+        assert!(!std::path::Path::new(&part).exists());
+        assert!(!std::path::Path::new(&dest).exists());
+    }
+
+    #[test]
+    fn kill_download_process_terminates_a_live_child() {
+        // A long-lived stand-in for curl on each platform.
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+
+        kill_download_process(child.id());
+
+        // taskkill/kill act asynchronously; the child must die well before its
+        // natural 30s runtime.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                assert!(!status.success(), "killed child must not report success");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child was not terminated within 10s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 }
