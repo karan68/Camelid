@@ -6490,6 +6490,7 @@ impl CudaResidentDecode {
                 ProjQuant::Q6K => &this.k.embed_gather_q6k,
                 ProjQuant::Q3K => &this.k.embed_gather_q3k,
                 ProjQuant::Q8_0 => &this.k.embed_gather_q8_0,
+                ProjQuant::Q5K => return Err("q5_K embedding gather not implemented".into()),
                 ProjQuant::Q2K => return Err("q2_K embedding gather not implemented".into()),
             };
             let dim = this.hidden;
