@@ -404,6 +404,15 @@ Laptop 6 GiB, 16 GiB RAM, the pinned 16,806,810,336-byte GGUF, canonical
   leave the CPU mmap working set (model 16.8 GB > 15.7 GB usable RAM).
   Full-GPU (SC + experts) VRAM peak: 4587 MiB of 6144.
 
+- **Multi-canvas end-to-end on Windows (GPU SC + expert pool):** a
+  natural-stop 2-block run completed in 7074 s — block 0 (prefix 41,
+  23 EB steps, cut 256 → committed), block 1 (prefix **297**, equal to the
+  Apple-sealed Phase 5 grown prefix, 25 steps, cut 256), stop `blocks`,
+  512 tokens, coherent output. The adaptive-stop step counts (23/25 vs
+  the sealed 22/26) differ as expected under the non-bit-exact SC stage
+  and the off-macOS sincos/tie-order notes below; the loop structure and
+  the committed-prefix chaining match.
+
 Scope of the claim: **this-host contract** — determinism, and GPU stages
 bit-exact against this host's CPU oracle. NOT a bitwise claim against the
 Apple-sealed §8–8d artifacts: off macOS, `libm_sincosf` is Rust
