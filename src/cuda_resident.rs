@@ -2200,6 +2200,148 @@ extern "C" __global__ void sigmoid_mul(
     out[i] *= 1.0f / (1.0f + expf(-gv));
 }
 
+// ---- Device-side decode-loop helpers ----------------------------------------
+// embed_gather_*: dequantize ONE embedding row (the token id is read from a
+// DEVICE u32 pointer, e.g. the previous step's argmax output) straight into the
+// f32 hidden buffer — removing the per-token CPU round-trip (argmax D2H ->
+// host dequant_row -> 16 KB H2D) from the decode loop. Each kernel is the
+// elementwise-exact mirror of the CPU block dequantize for its family
+// (tensor/mod.rs Q*Block::dequantize / dequant.rs): identical formulas,
+// identical f32 association per element, so the hidden vector is bit-identical
+// to the host-fed path. One thread per element.
+extern "C" __global__ void embed_gather_q4k(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= dim) return;
+    const unsigned char* row = table + (long)(*token) * (long)(dim / 256) * 144;
+    const unsigned char* blk = row + (long)(e / 256) * 144;
+    int i = e & 255;
+    int pair = i >> 6;
+    int r = i & 63;
+    int half = r >> 5;
+    int l = r & 31;
+    float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+    float dmin = f16_bits_to_f32((unsigned short)blk[2] | ((unsigned short)blk[3] << 8));
+    const unsigned char* sc12 = blk + 4;
+    int idx = pair * 2 + half;
+    unsigned char sc, mn;
+    if (idx < 4) {
+        sc = sc12[idx] & 63;
+        mn = sc12[idx + 4] & 63;
+    } else {
+        sc = (sc12[idx + 4] & 0x0f) | ((sc12[idx - 4] >> 6) << 4);
+        mn = (sc12[idx + 4] >> 4) | ((sc12[idx] >> 6) << 4);
+    }
+    unsigned char byte = blk[16 + pair * 32 + l];
+    unsigned char q = half ? (byte >> 4) : (byte & 0x0f);
+    // CPU order: (d*sc) * q - (dmin*mn)
+    out[e] = (d * (float)sc) * (float)q - (dmin * (float)mn);
+}
+// Q6_K rows use the 224 B PADDED wire (pad_q6k_blocks), same as the gemv lane.
+extern "C" __global__ void embed_gather_q6k(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= dim) return;
+    const unsigned char* row = table + (long)(*token) * (long)(dim / 256) * 224;
+    const unsigned char* blk = row + (long)(e / 256) * 224;
+    int i = e & 255;
+    int n128 = i >> 7;
+    int r = i & 127;
+    int quarter = r >> 5;
+    int l = r & 31;
+    int is = l >> 4;
+    const unsigned char* ql = blk;
+    const unsigned char* qh = blk + 128;
+    const signed char* sc = (const signed char*)(blk + 192);
+    float d = f16_bits_to_f32((unsigned short)blk[208] | ((unsigned short)blk[209] << 8));
+    int ql_off = n128 * 64;
+    int qh_off = n128 * 32;
+    int sc_off = n128 * 8;
+    unsigned char h = qh[qh_off + l];
+    int q;
+    if (quarter == 0) {
+        q = (int)((ql[ql_off + l] & 0x0f) | ((h & 3) << 4)) - 32;
+    } else if (quarter == 1) {
+        q = (int)((ql[ql_off + l + 32] & 0x0f) | (((h >> 2) & 3) << 4)) - 32;
+    } else if (quarter == 2) {
+        q = (int)((ql[ql_off + l] >> 4) | (((h >> 4) & 3) << 4)) - 32;
+    } else {
+        q = (int)((ql[ql_off + l + 32] >> 4) | (((h >> 6) & 3) << 4)) - 32;
+    }
+    // CPU order: d * sc * q (left-assoc)
+    out[e] = d * (float)sc[sc_off + is + 2 * quarter] * (float)q;
+}
+extern "C" __global__ void embed_gather_q3k(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    const unsigned int KMASK1 = 0x03030303u, KMASK2 = 0x0f0f0f0fu;
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= dim) return;
+    const unsigned char* row = table + (long)(*token) * (long)(dim / 256) * 110;
+    const unsigned char* blk = row + (long)(e / 256) * 110;
+    int i = e & 255;
+    int sup = i >> 7;
+    int r = i & 127;
+    int group = r >> 5;
+    int k = r & 31;
+    int half16 = k >> 4;
+    int l = k & 15;
+    const unsigned char* hb = blk;          // high_bits[32]
+    const unsigned char* vals = blk + 32;   // values[64]
+    const unsigned char* sr = blk + 96;     // scales[12]
+    float d = f16_bits_to_f32((unsigned short)blk[108] | ((unsigned short)blk[109] << 8));
+    // kmask 6-bit scale expansion — identical to Q3KBlock::expanded_scales.
+    unsigned int a0 = (unsigned int)sr[0] | ((unsigned int)sr[1] << 8) | ((unsigned int)sr[2] << 16) | ((unsigned int)sr[3] << 24);
+    unsigned int a1 = (unsigned int)sr[4] | ((unsigned int)sr[5] << 8) | ((unsigned int)sr[6] << 16) | ((unsigned int)sr[7] << 24);
+    unsigned int a2 = (unsigned int)sr[8] | ((unsigned int)sr[9] << 8) | ((unsigned int)sr[10] << 16) | ((unsigned int)sr[11] << 24);
+    unsigned int e2w = ((a0 >> 4) & KMASK2) | (((a2 >> 4) & KMASK1) << 4);
+    unsigned int e3w = ((a1 >> 4) & KMASK2) | (((a2 >> 6) & KMASK1) << 4);
+    unsigned int e0w = (a0 & KMASK2) | ((a2 & KMASK1) << 4);
+    unsigned int e1w = (a1 & KMASK2) | (((a2 >> 2) & KMASK1) << 4);
+    int scale_idx = sup * 8 + group * 2 + half16;
+    unsigned int word = (scale_idx < 4) ? e0w : (scale_idx < 8) ? e1w : (scale_idx < 12) ? e2w : e3w;
+    signed char scv = (signed char)((word >> ((scale_idx & 3) * 8)) & 0xff);
+    int shift = group * 2;
+    unsigned int mask = 1u << (sup * 4 + group);
+    int vidx = sup * 32 + half16 * 16 + l;
+    int hidx = half16 * 16 + l;
+    int high = (hb[hidx] & mask) ? 0 : 4;
+    int val = (int)((vals[vidx] >> shift) & 3) - high;
+    // CPU order: (d * (sc - 32)) * val
+    out[e] = (d * (float)((int)scv - 32)) * (float)val;
+}
+extern "C" __global__ void embed_gather_q8_0(
+    const unsigned char* __restrict__ table, const unsigned int* __restrict__ token,
+    int dim, float* __restrict__ out
+) {
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= dim) return;
+    const unsigned char* row = table + (long)(*token) * (long)(dim / 32) * 34;
+    const unsigned char* blk = row + (long)(e / 32) * 34;
+    int j = e & 31;
+    float d = f16_bits_to_f32((unsigned short)blk[0] | ((unsigned short)blk[1] << 8));
+    out[e] = d * (float)((signed char)blk[2 + j]);
+}
+// rope_select: copy position `pos`'s precomputed cos/sin row (half = rope_dim/2
+// values each) out of the resident all-positions tables into the small per-token
+// buffers the rope kernel reads — the tables are built once on the host with the
+// VERBATIM qwen35_rope_tables math, so the rope inputs are bit-identical to the
+// host-uploaded path.
+extern "C" __global__ void rope_select(
+    const float* __restrict__ cos_all, const float* __restrict__ sin_all,
+    int pos, int half, float* __restrict__ cos_out, float* __restrict__ sin_out
+) {
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if (i >= half) return;
+    cos_out[i] = cos_all[(long)pos * half + i];
+    sin_out[i] = sin_all[(long)pos * half + i];
+}
+
 // ---- SSM gates: beta = sigmoid(beta_raw); glog = softplus(alpha_raw+dt_bias)*a -
 // One thread per value-head (nv). Feeds ssm_delta_rule (beta post-sigmoid, glog
 // pre-exp). softplus matches the CPU's (1+exp(x)).ln() with the x>20 passthrough.
@@ -2287,6 +2429,11 @@ pub struct CudaResidentKernels {
     pub(crate) ssm_conv1d: CudaFunction,
     pub(crate) ssm_delta_rule: CudaFunction,
     pub(crate) sigmoid_mul: CudaFunction,
+    pub(crate) embed_gather_q4k: CudaFunction,
+    pub(crate) embed_gather_q6k: CudaFunction,
+    pub(crate) embed_gather_q3k: CudaFunction,
+    pub(crate) embed_gather_q8_0: CudaFunction,
+    pub(crate) rope_select: CudaFunction,
     pub(crate) ssm_gates: CudaFunction,
     pub(crate) deinterleave_qgate: CudaFunction,
     /// Env-gated (CAMELID_ATTN_COALESCED) dispatch of the coalesced K-dot in
@@ -2368,6 +2515,11 @@ impl CudaResidentKernels {
             ssm_conv1d: f("ssm_conv1d")?,
             ssm_delta_rule: f("ssm_delta_rule")?,
             sigmoid_mul: f("sigmoid_mul")?,
+            embed_gather_q4k: f("embed_gather_q4k")?,
+            embed_gather_q6k: f("embed_gather_q6k")?,
+            embed_gather_q3k: f("embed_gather_q3k")?,
+            embed_gather_q8_0: f("embed_gather_q8_0")?,
+            rope_select: f("rope_select")?,
             ssm_gates: f("ssm_gates")?,
             deinterleave_qgate: f("deinterleave_qgate")?,
             attn_coalesced: std::env::var("CAMELID_ATTN_COALESCED")
@@ -3854,6 +4006,80 @@ pub(crate) fn launch_argmax(
     unsafe { b.launch(cfg) }.map(|_| ())
 }
 
+/// `launch_argmax` writing into a VIEW (one u32 slot of the device-side decode
+/// loop's d_out_tokens ring) — same kernel, same math.
+pub(crate) fn launch_argmax_at(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    logits: &CudaSlice<f32>,
+    n: usize,
+    out_idx: &mut cudarc::driver::CudaViewMut<u32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 8,
+    };
+    let n_i = n as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(logits).arg(&n_i).arg(out_idx);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Dequantize ONE embedding row on-device: the token id is read from `token`
+/// (a device u32 — the previous argmax slot or the host-fed prefill id) and the
+/// f32 row lands in `out`. `f` selects the quant family's kernel.
+pub(crate) fn launch_embed_gather(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    table: &CudaSlice<u8>,
+    token: &cudarc::driver::CudaView<u32>,
+    dim: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 256u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((dim as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let dim_i = dim as i32;
+    let mut b = s.launch_builder(f);
+    b.arg(table).arg(token).arg(&dim_i).arg(out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
+/// Copy position `pos`'s cos/sin rows out of the resident all-positions rope
+/// tables into the per-token buffers the rope kernel reads.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_rope_select(
+    s: &Arc<CudaStream>,
+    f: &CudaFunction,
+    cos_all: &CudaSlice<f32>,
+    sin_all: &CudaSlice<f32>,
+    pos: usize,
+    half: usize,
+    cos_out: &mut CudaSlice<f32>,
+    sin_out: &mut CudaSlice<f32>,
+) -> Result<(), cudarc::driver::DriverError> {
+    let block = 64u32;
+    let cfg = LaunchConfig {
+        grid_dim: ((half as u32).div_ceil(block), 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (p, h) = (pos as i32, half as i32);
+    let mut b = s.launch_builder(f);
+    b.arg(cos_all)
+        .arg(sin_all)
+        .arg(&p)
+        .arg(&h)
+        .arg(cos_out)
+        .arg(sin_out);
+    unsafe { b.launch(cfg) }.map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_sample_gumbel(
     s: &Arc<CudaStream>,
@@ -4146,6 +4372,18 @@ pub struct CudaResidentDecode {
     d_sampled: CudaSlice<u32>,
     d_cos: CudaSlice<f32>,
     d_sin: CudaSlice<f32>,
+    /// Device-side decode loop (qwen35): resident quantized embedding table
+    /// (wire bytes + quant family; q6_K rows 224 B-padded), the precomputed
+    /// all-positions rope tables (max_pos x rope_dim/2 cos + sin, built once on
+    /// the host with the VERBATIM qwen35_rope_tables math), the on-device
+    /// generated-token ring (argmax writes d_out_tokens[step]; the NEXT step's
+    /// embed_gather reads it directly — no per-token D2H/H2D round-trip), and a
+    /// 1-slot buffer for host-fed (prefill) token ids.
+    embd_table: Option<(CudaSlice<u8>, ProjQuant)>,
+    d_rope_cos_all: Option<CudaSlice<f32>>,
+    d_rope_sin_all: Option<CudaSlice<f32>>,
+    d_out_tokens: Option<CudaSlice<u32>>,
+    d_token_in: Option<CudaSlice<u32>>,
     /// Current decode position, held on the device so `kv_scatter` / `attention`
     /// read it from memory rather than a launch-time scalar. This is what lets the
     /// per-token kernel chain be captured once into a CUDA graph and replayed: the
@@ -4336,6 +4574,11 @@ impl CudaResidentDecode {
             qwen35: None,
             ssm_conv_state: Vec::new(),
             ssm_state: Vec::new(),
+            embd_table: None,
+            d_rope_cos_all: None,
+            d_rope_sin_all: None,
+            d_out_tokens: None,
+            d_token_in: None,
             k,
         })
     }
@@ -4966,6 +5209,12 @@ impl CudaResidentDecode {
         // launch) and attention's shared `scores[]` is sized to `max_pos` so the
         // captured launch config holds for every replayed position.
         graph_capture: bool,
+        // When true the per-token inputs (hidden/cos/sin/position) are ALREADY in
+        // the device buffers — written by embed_gather/rope_select plus a 4-byte
+        // async position upload (the device-side decode loop) — so the host
+        // uploads are skipped. Unlike graph_capture, attention shared stays sized
+        // to position+1 (each token still launches with live scalars).
+        device_inputs: bool,
     ) -> Result<(), String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
@@ -4979,7 +5228,7 @@ impl CudaResidentDecode {
             position + 1
         };
 
-        if !graph_capture {
+        if !graph_capture && !device_inputs {
             s.memcpy_htod(embedding, &mut self.d_hidden).map_err(map)?;
             s.memcpy_htod(cos, &mut self.d_cos).map_err(map)?;
             s.memcpy_htod(sin, &mut self.d_sin).map_err(map)?;
@@ -5867,7 +6116,7 @@ impl CudaResidentDecode {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
         if !compute_logits {
-            self.forward_pass(embedding, cos, sin, position, scale, false, false)?;
+            self.forward_pass(embedding, cos, sin, position, scale, false, false, false)?;
             self.k.ctx.synchronize().map_err(map)?;
             return Ok(None);
         }
@@ -5890,7 +6139,7 @@ impl CudaResidentDecode {
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
                 .map(Some);
         }
-        self.forward_pass(embedding, cos, sin, position, scale, true, false)?;
+        self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
         launch_argmax(
             &s,
             &self.k.argmax,
@@ -5903,6 +6152,150 @@ impl CudaResidentDecode {
         s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
         Ok(Some(out[0]))
+    }
+
+    /// Install the device-side decode-loop tables (qwen35): the quantized
+    /// embedding table wire bytes (q6_K rows pre-padded 210->224 by the caller),
+    /// the all-positions rope tables (each max_pos * rope_dim/2 f32, host-built
+    /// with the VERBATIM qwen35_rope_tables math), the on-device generated-token
+    /// ring, and the 1-slot host-fed token buffer. On failure (e.g. VRAM) the
+    /// engine simply stays on the host-fed loop.
+    pub(crate) fn set_device_decode_tables(
+        &mut self,
+        embd_wire: &[u8],
+        family: ProjQuant,
+        cos_all: &[f32],
+        sin_all: &[f32],
+    ) -> Result<(), String> {
+        let map = |e: cudarc::driver::DriverError| format!("device decode tables: {e}");
+        let s = self.k.stream.clone();
+        let table = s.clone_htod(embd_wire).map_err(map)?;
+        let cos = s.clone_htod(cos_all).map_err(map)?;
+        let sin = s.clone_htod(sin_all).map_err(map)?;
+        let out_tokens = s.alloc_zeros::<u32>(self.max_pos).map_err(map)?;
+        let token_in = s.alloc_zeros::<u32>(1).map_err(map)?;
+        self.embd_table = Some((table, family));
+        self.d_rope_cos_all = Some(cos);
+        self.d_rope_sin_all = Some(sin);
+        self.d_out_tokens = Some(out_tokens);
+        self.d_token_in = Some(token_in);
+        Ok(())
+    }
+
+    pub(crate) fn device_decode_ready(&self) -> bool {
+        self.embd_table.is_some()
+    }
+
+    /// One fully device-side forward: the input token id comes from
+    /// `prev_step` of the on-device output ring (None => the host-fed
+    /// d_token_in slot, uploaded here from `host_token`), the rope row is
+    /// selected on-device, the embedding row is gathered/dequantized on-device
+    /// (bit-identical elementwise mirror of the CPU dequant), then the standard
+    /// per-launch forward runs; when `out_step` is Some the greedy argmax lands
+    /// in d_out_tokens[out_step] — which the NEXT call can consume directly.
+    /// NO host synchronization: the caller syncs once per readback chunk.
+    pub(crate) fn forward_token_device(
+        &mut self,
+        prev_step: Option<usize>,
+        host_token: Option<u32>,
+        position: usize,
+        scale: f32,
+        out_step: Option<usize>,
+    ) -> Result<(), String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda device-decode: {e}");
+        let s = self.k.stream.clone();
+        s.memcpy_htod(&[position as i32], &mut self.d_position)
+            .map_err(map)?;
+        if let Some(tok) = host_token {
+            let tin = self
+                .d_token_in
+                .as_mut()
+                .ok_or("device decode tables not installed")?;
+            s.memcpy_htod(&[tok], tin).map_err(map)?;
+        }
+        {
+            let this = &mut *self;
+            let cos_all = this
+                .d_rope_cos_all
+                .as_ref()
+                .ok_or("device decode tables not installed")?;
+            let sin_all = this
+                .d_rope_sin_all
+                .as_ref()
+                .ok_or("device decode tables not installed")?;
+            let half = this.d_cos.len();
+            launch_rope_select(
+                &s,
+                &this.k.rope_select,
+                cos_all,
+                sin_all,
+                position,
+                half,
+                &mut this.d_cos,
+                &mut this.d_sin,
+            )
+            .map_err(map)?;
+            let (table, family) = this
+                .embd_table
+                .as_ref()
+                .ok_or("device decode tables not installed")?;
+            let tok_view = match prev_step {
+                Some(st) => this
+                    .d_out_tokens
+                    .as_ref()
+                    .ok_or("device decode tables not installed")?
+                    .slice(st..st + 1),
+                None => this
+                    .d_token_in
+                    .as_ref()
+                    .ok_or("device decode tables not installed")?
+                    .slice(0..1),
+            };
+            let f = match family {
+                ProjQuant::Q4K => &this.k.embed_gather_q4k,
+                ProjQuant::Q6K => &this.k.embed_gather_q6k,
+                ProjQuant::Q3K => &this.k.embed_gather_q3k,
+                ProjQuant::Q8_0 => &this.k.embed_gather_q8_0,
+                ProjQuant::Q2K => return Err("q2_K embedding gather not implemented".into()),
+            };
+            let dim = this.hidden;
+            launch_embed_gather(&s, f, table, &tok_view, dim, &mut this.d_hidden).map_err(map)?;
+        }
+        self.forward_pass(
+            &[],
+            &[],
+            &[],
+            position,
+            scale,
+            out_step.is_some(),
+            false,
+            true,
+        )?;
+        if let Some(st) = out_step {
+            let this = &mut *self;
+            let mut view = this
+                .d_out_tokens
+                .as_mut()
+                .ok_or("device decode tables not installed")?
+                .slice_mut(st..st + 1);
+            launch_argmax_at(&s, &this.k.argmax, &this.d_logits, this.vocab, &mut view)
+                .map_err(map)?;
+        }
+        Ok(())
+    }
+
+    /// Sync once and read `len` generated ids starting at ring slot `start`.
+    pub(crate) fn read_out_tokens(&mut self, start: usize, len: usize) -> Result<Vec<u32>, String> {
+        let map = |e: cudarc::driver::DriverError| format!("cuda device-decode read: {e}");
+        let ring = self
+            .d_out_tokens
+            .as_ref()
+            .ok_or("device decode tables not installed")?;
+        let view = ring.slice(start..start + len);
+        let mut out = vec![0u32; len];
+        self.k.stream.memcpy_dtoh(&view, &mut out).map_err(map)?;
+        self.k.ctx.synchronize().map_err(map)?;
+        Ok(out)
     }
 
     /// Greedy decode via CUDA graph: upload this token's inputs to device buffers,
@@ -5950,7 +6343,7 @@ impl CudaResidentDecode {
             s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
                 .map_err(map("begin"))?;
             let recorded = (|| -> Result<(), String> {
-                self.forward_pass(embedding, cos, sin, position, scale, true, true)?;
+                self.forward_pass(embedding, cos, sin, position, scale, true, true, false)?;
                 launch_argmax(
                     &s,
                     &self.k.argmax,
@@ -6004,7 +6397,7 @@ impl CudaResidentDecode {
     ) -> Result<Vec<f32>, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
-        self.forward_pass(embedding, cos, sin, position, scale, true, false)?;
+        self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
         let mut logits = vec![0f32; self.vocab];
         s.memcpy_dtoh(&self.d_logits, &mut logits).map_err(map)?;
         self.k.ctx.synchronize().map_err(map)?;
@@ -6029,7 +6422,7 @@ impl CudaResidentDecode {
     ) -> Result<u32, String> {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
-        self.forward_pass(embedding, cos, sin, position, scale, true, false)?;
+        self.forward_pass(embedding, cos, sin, position, scale, true, false, false)?;
         launch_sample_gumbel(
             &s,
             &self.k.sample_gumbel,
@@ -6072,7 +6465,7 @@ impl CudaResidentDecode {
             let emb = &embeddings[i * hidden..(i + 1) * hidden];
             let cos = &cos_all[i * half..(i + 1) * half];
             let sin = &sin_all[i * half..(i + 1) * half];
-            self.forward_pass(emb, cos, sin, i, scale, false, false)?;
+            self.forward_pass(emb, cos, sin, i, scale, false, false, false)?;
         }
         self.k
             .ctx

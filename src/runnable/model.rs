@@ -1435,6 +1435,79 @@ impl RunnableModel {
             .reset_qwen35_state()
             .map_err(BackendError::InvalidTensorData)?;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        if engine.device_decode_ready() {
+            // ---- Device-side decode loop ----------------------------------
+            // Every per-token input is produced ON the GPU: the embedding row
+            // is gathered from the resident quantized table (fed by the
+            // previous argmax slot directly), the rope row comes from the
+            // resident all-positions tables, and position arrives as a 4-byte
+            // async upload. The host synchronizes once per CHUNK to read the
+            // generated ids and check stop tokens — removing the per-token
+            // argmax D2H -> CPU dequant_row -> 16 KB H2D round-trip. Kernels
+            // and math are identical to the host-fed path (the gather is an
+            // elementwise-exact dequant mirror), so greedy output matches
+            // token-for-token; the only behavior difference is that forwards
+            // scheduled after a mid-chunk stop token advance the (reset-per-
+            // call) SSM/KV state without affecting the returned sequence.
+            for (i, &tok) in prompt.iter().enumerate() {
+                let last = i == prompt.len() - 1;
+                engine
+                    .forward_token_device(
+                        None,
+                        Some(tok),
+                        i,
+                        scale,
+                        if last { Some(0) } else { None },
+                    )
+                    .map_err(BackendError::InvalidTensorData)?;
+            }
+            let chunk_len: usize = std::env::var("CAMELID_DEVICE_DECODE_CHUNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&c| c >= 1)
+                .unwrap_or(8);
+            let mut out = Vec::with_capacity(max_new);
+            let mut t = 0usize; // generated candidates confirmed so far
+            'outer: while t < max_new {
+                // Candidate t is already in the ring (prefill or prior chunk);
+                // forward j (input = candidate t+j at position prompt+t+j)
+                // produces candidate t+j+1. Scheduling is bounded by the
+                // KV/ring capacity; only candidates covered by fresh forwards
+                // (plus the pre-existing candidate t) are read back.
+                let want = chunk_len.min(max_new - t);
+                let mut scheduled = 0usize;
+                for j in 0..want {
+                    let pos = prompt.len() + t + j;
+                    if pos + 1 >= max_pos {
+                        break;
+                    }
+                    engine
+                        .forward_token_device(Some(t + j), None, pos, scale, Some(t + j + 1))
+                        .map_err(BackendError::InvalidTensorData)?;
+                    scheduled += 1;
+                }
+                let readable = (scheduled + 1).min(want);
+                let ids = engine
+                    .read_out_tokens(t, readable)
+                    .map_err(BackendError::InvalidTensorData)?;
+                for id in ids {
+                    if stop.contains(&id) {
+                        break 'outer;
+                    }
+                    out.push(id);
+                    on_token(id);
+                    if out.len() >= max_new {
+                        break 'outer;
+                    }
+                }
+                t += readable;
+                if scheduled < want {
+                    break; // context capacity exhausted
+                }
+            }
+            return Ok(out);
+        }
+        // ---- Host-fed fallback loop (device tables unavailable) -----------
         // Prefill: only the final prompt token needs logits.
         let mut next = 0u32;
         for (i, &tok) in prompt.iter().enumerate() {
@@ -2161,6 +2234,37 @@ impl RunnableModel {
         }
         let (bout, qout) = prep(&self.output)?;
         e.set_output(&self.output_norm, &bout, qout)?;
+        // Device-side decode loop: resident quantized embedding table + the
+        // all-positions rope tables (built with the VERBATIM qwen35_rope_tables
+        // math, so the rope inputs are bit-identical to the host-fed path).
+        // Failure (e.g. VRAM headroom) is non-fatal — the driver falls back to
+        // the host-fed per-token loop.
+        let embd_upload: Option<(Vec<u8>, ProjQuant)> = match self.token_embd.tt {
+            GgufTensorType::Q8_0 => Some((self.token_embd.bytes.clone(), ProjQuant::Q8_0)),
+            GgufTensorType::Q3K => Some((self.token_embd.bytes.clone(), ProjQuant::Q3K)),
+            GgufTensorType::Q4K => Some((self.token_embd.bytes.clone(), ProjQuant::Q4K)),
+            GgufTensorType::Q6K => Some((
+                crate::cuda_resident::pad_q6k_blocks(&self.token_embd.bytes),
+                ProjQuant::Q6K,
+            )),
+            _ => None,
+        };
+        if let Some((wire, family)) = embd_upload {
+            let half = self.rope_dim / 2;
+            let mut cos_all = Vec::with_capacity(max_pos * half);
+            let mut sin_all = Vec::with_capacity(max_pos * half);
+            for pos in 0..max_pos {
+                let (c, sn) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+                cos_all.extend_from_slice(&c);
+                sin_all.extend_from_slice(&sn);
+            }
+            if let Err(err) = e.set_device_decode_tables(&wire, family, &cos_all, &sin_all) {
+                eprintln!(
+                    "[qwen35] device-side decode tables unavailable ({err}); using the \
+                     host-fed decode loop"
+                );
+            }
+        }
         Ok(e)
     }
 }
