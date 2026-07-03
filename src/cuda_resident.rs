@@ -477,86 +477,99 @@ extern "C" __global__ void q4k_gemv(
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
     int* myaux = aux + (long)warp * n_sb * 9;
-    if (row < rows) {
-        long row_sb0 = (long)row * n_sb;
-        // Each lane owns whole superblocks (lane, lane+32, ...); it reads the RAW wire
-        // super-block, expands the 4-bit nibbles + unpacks the kmask 6-bit scales/mins
-        // on the fly (the host no longer pre-expands — that doubled VRAM), then computes
-        // that superblock's 8 main-side integer lanes aux32[0..8] and the mins integer
-        // sumi, stashing all 9 into shared for lane 0's ordered f32 reduction.
-        // No 256-byte local `a` array (the old version spilled it to local memory, which
-        // was the bottleneck — local-memory round-trips). The wire is read with wide uint4
-        // loads (the 144 B super-block is 9*16, so it is 16-aligned off any 16-aligned row
-        // base): one uint4 for the header (d,dmin + the packed scale/min words) and one
-        // uint4 per 16 quant bytes, loaded just-in-time per byte-group to keep register
-        // pressure (hence occupancy) up and avoid a large prefetch array. Each byte-group g
-        // carries TWO scale-groups: j=2g uses the low nibble of each byte, j=2g+1 the high
-        // nibble, over the SAME 32 bytes. Element p (0..32) of a scale-group lands in
-        // aux32[p&7] with off=j*32+p (off&7==p&7), so every product matches the oracle
-        // term-for-term; the 8 integer lanes are bit-identical (integer-add order is free).
-        // Measured 1.58x faster than the a[256] version at 4096x12288 (ncu), parity green.
-        for (int b = lane; b < n_sb; b += 32) {
+    // Phase 1 — integer partials with ALL 32 lanes cooperating. Work unit
+    // u = (super-block b = u>>2, byte-group g = u&3): 32 quant bytes = two
+    // consecutive uint4 loads, so the four units of one super-block read
+    // consecutive 32 B chunks and the warp's loads coalesce (the old layout
+    // gave each lane a whole 144 B-strided super-block, leaving half the warp
+    // idle whenever n_sb <= 16 — every 4096-col projection — and defeating
+    // coalescing; measured ~60 GB/s achieved vs ~20-25% of that fixed here).
+    // Each unit computes its two scale-groups' contributions to the 8 aux
+    // lanes plus the mins-side sumi over ITS activation quarter (per-16
+    // groups 4g..4g+4, mins index gg>>1 = 2g/2g+1 — an exact partition of the
+    // oracle's loops). Integer addition is associative, so this split is
+    // BIT-EXACT; partials combine across the 4 lanes of a super-block with
+    // two shuffle steps and the g==0 lane stores the 9 totals. The ordered
+    // f32 tail below is byte-for-byte the oracle's — parity is unchanged.
+    long row_sb0 = (long)row * n_sb;
+    int units = n_sb * 4;
+    for (int u0 = 0; u0 < units; u0 += 32) {
+        int u = u0 + lane;
+        bool active = (u < units) && (row < rows);
+        int b = u >> 2;
+        int g = u & 3;
+        int aux32[8];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) aux32[l] = 0;
+        int sumi = 0;
+        if (active) {
             const unsigned char* blk = weight_bytes + (long)(row_sb0 + b) * WIRE;
             const signed char* y256 = s_iq + (long)b * 256;  // staged activation
-            int* ax = myaux + (long)b * 9;
-            // Unpack the 8 packed 6-bit (scale, min) pairs via the kmask scheme (oracle
-            // order). The 12 scale/min bytes are header bytes 4..16 = hdr.y,.z,.w.
+            // Unpack the packed 6-bit (scale, min) pairs via the kmask scheme
+            // (oracle order). The 12 scale/min bytes are header bytes 4..16.
             uint4 hdr = *reinterpret_cast<const uint4*>(blk);  // bytes 0..16
-            unsigned int u0 = hdr.y;
+            unsigned int u0w = hdr.y;
             unsigned int u1 = hdr.z;
             unsigned int u2 = hdr.w;
             unsigned int u3 = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
             unsigned int uaux = u1 & KMASK1;
-            u1 = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+            u1 = (u2 & KMASK2) | (((u0w >> 6) & KMASK3) << 4);
             u2 = uaux;
-            u0 &= KMASK1;
+            u0w &= KMASK1;
             unsigned char sc[8], mn[8];
-            sc[0] = u0 & 0xff; sc[1] = (u0 >> 8) & 0xff; sc[2] = (u0 >> 16) & 0xff; sc[3] = (u0 >> 24) & 0xff;
+            sc[0] = u0w & 0xff; sc[1] = (u0w >> 8) & 0xff; sc[2] = (u0w >> 16) & 0xff; sc[3] = (u0w >> 24) & 0xff;
             sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff; sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
             mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff; mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
             mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff; mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
             const uint4* q4v = reinterpret_cast<const uint4*>(blk + 16);  // 128 quant bytes
-            int aux32[8];
+            int slo = (int)sc[2 * g];
+            int shi = (int)sc[2 * g + 1];
+            int lobase = g * 64;          // a-index of low-nibble scale-group 2g
+            int hibase = g * 64 + 32;     // a-index of high-nibble scale-group 2g+1
+            // This unit's 32 bytes = 2 uint4 (8 uint32 words).
+            uint4 wlo = q4v[g * 2];       // qs[g*32 .. g*32+16]
+            uint4 whi = q4v[g * 2 + 1];   // qs[g*32+16 .. g*32+32]
+            const unsigned int* wd = reinterpret_cast<const unsigned int*>(&wlo);
+            const unsigned int* wd2 = reinterpret_cast<const unsigned int*>(&whi);
             #pragma unroll
-            for (int l = 0; l < 8; l++) aux32[l] = 0;
-            #pragma unroll
-            for (int g = 0; g < 4; g++) {
-                int slo = (int)sc[2 * g];
-                int shi = (int)sc[2 * g + 1];
-                int lobase = g * 64;          // a-index of low-nibble scale-group 2g
-                int hibase = g * 64 + 32;     // a-index of high-nibble scale-group 2g+1
-                // 32 bytes of this byte-group = 2 uint4 (8 uint32 words), loaded now.
-                uint4 wlo = q4v[g * 2];       // qs[g*32 .. g*32+16]
-                uint4 whi = q4v[g * 2 + 1];   // qs[g*32+16 .. g*32+32]
-                const unsigned int* wd = reinterpret_cast<const unsigned int*>(&wlo);
-                const unsigned int* wd2 = reinterpret_cast<const unsigned int*>(&whi);
+            for (int w = 0; w < 8; w++) {
+                unsigned int word = (w < 4) ? wd[w] : wd2[w - 4]; // 4 packed quant bytes
                 #pragma unroll
-                for (int w = 0; w < 8; w++) {
-                    unsigned int word = (w < 4) ? wd[w] : wd2[w - 4]; // 4 packed quant bytes
-                    #pragma unroll
-                    for (int t = 0; t < 4; t++) {
-                        int p = w * 4 + t;             // 0..32 position in the group
-                        unsigned int byte = (word >> (t * 8)) & 0xff;
-                        int lo = (int)(byte & 0xF);
-                        int hi = (int)(byte >> 4);
-                        int l = p & 7;
-                        aux32[l] += slo * (int)y256[lobase + p] * lo;
-                        aux32[l] += shi * (int)y256[hibase + p] * hi;
-                    }
+                for (int t = 0; t < 4; t++) {
+                    int p = w * 4 + t;             // 0..32 position in the group
+                    unsigned int byte = (word >> (t * 8)) & 0xff;
+                    int lo = (int)(byte & 0xF);
+                    int hi = (int)(byte >> 4);
+                    int l = p & 7;
+                    aux32[l] += slo * (int)y256[lobase + p] * lo;
+                    aux32[l] += shi * (int)y256[hibase + p] * hi;
                 }
             }
+            // Mins side, this unit's quarter: per-16 activation sums (bsums)
+            // times mins[group/2], groups 4g..4g+4 — exactly the oracle terms.
             #pragma unroll
-            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
-            // Mins side: per-16 activation sums (bsums) times mins[group/2], summed over
-            // the 16 per-16 groups (mins index = group/2), exactly as the oracle.
-            int sumi = 0;
-            #pragma unroll
-            for (int g = 0; g < 16; g++) {
+            for (int gg = 0; gg < 4; gg++) {
+                int grp = g * 4 + gg;
                 int bsum = 0;
                 #pragma unroll
-                for (int l = 0; l < 16; l++) bsum += (int)y256[g * 16 + l];
-                sumi += bsum * (int)mn[g >> 1];
+                for (int l = 0; l < 16; l++) bsum += (int)y256[grp * 16 + l];
+                sumi += bsum * (int)mn[grp >> 1];
             }
+        }
+        // Combine the 4 same-super-block lanes (g==0 collects g=1..3). Lanes
+        // whose shuffle source crosses a group boundary read garbage, but only
+        // g==0 lanes store, so it is discarded. Integer sums — order-free.
+        #pragma unroll
+        for (int off = 2; off >= 1; off >>= 1) {
+            #pragma unroll
+            for (int l = 0; l < 8; l++)
+                aux32[l] += __shfl_down_sync(0xffffffffu, aux32[l], off);
+            sumi += __shfl_down_sync(0xffffffffu, sumi, off);
+        }
+        if (active && g == 0) {
+            int* ax = myaux + (long)b * 9;
+            #pragma unroll
+            for (int l = 0; l < 8; l++) ax[l] = aux32[l];
             ax[8] = sumi;
         }
     }
@@ -632,48 +645,77 @@ extern "C" __global__ void q6k_gemv(
     int warps_per_block = blockDim.x >> 5;
     int row = blockIdx.x * warps_per_block + warp;
     int* myaux = aux + (long)warp * n_sb * 8;
-    const int WIRE = 210;
-    if (row < rows) {
-        long row_sb0 = (long)row * n_sb;
-        for (int b = lane; b < n_sb; b += 32) {
+    // Blocks are PADDED 210->224 at upload (pad_q6k_blocks) so ql(+0)/qh(+128)/
+    // scales(+192)/d(+208) are all 16-aligned for uint4 loads.
+    const int WIRE = 224;
+    // Phase 1 — integer partials with ALL 32 lanes cooperating. Work unit
+    // u = (super-block b = u>>2, quarter = u&3 with h = quarter>>1, s =
+    // quarter&1): each unit covers l in [s*16, s*16+16) of half h, i.e. the 64
+    // weights at indices h*128 + s*16 + l' + {0,32,64,96} — exactly four whole
+    // 16-element scale groups (j = 8h+s+{0,2,4,6}), an exact partition of the
+    // oracle's loops. Three uint4 loads per unit (ql lo/hi 16 B chunks + qh
+    // 16 B chunk) replace the old per-lane a[256] local-memory rebuild with
+    // scalar byte loads off the unaligned 210 B wire (half the warp also sat
+    // idle whenever n_sb <= 16). Integer sums are order-free, so this split is
+    // BIT-EXACT; the ordered f32 tail below is unchanged.
+    long row_sb0 = (long)row * n_sb;
+    int units = n_sb * 4;
+    for (int u0 = 0; u0 < units; u0 += 32) {
+        int u = u0 + lane;
+        bool active = (u < units) && (row < rows);
+        int b = u >> 2;
+        int quarter = u & 3;
+        int aux32[8];
+        #pragma unroll
+        for (int l = 0; l < 8; l++) aux32[l] = 0;
+        if (active) {
             const unsigned char* block = weight_bytes + (long)(row_sb0 + b) * WIRE;
-            const signed char* sc = (const signed char*)(block + 192); // 16 i8 scales
             const signed char* y256 = s_iq + (long)b * 256;
-            // Rebuild the 256 signed 6-bit weights exactly as q6_k_wire_block_dequant
-            // (a[w+l], a[w+l+32], a[w+l+64], a[w+l+96]; - 32), filling a[256]. NOTE: an
-            // inline-rebuild variant (no a[256], byte loads off the 210 B non-16-aligned
-            // wire) was tried and measured ~2.3x SLOWER here (the serial byte loads beat the
-            // register saving), so this clean staged build + contiguous dot is kept.
-            signed char a[256];
-            int wbase = 0, qlb = 0, qhb = 128;
+            int h = quarter >> 1;
+            int s = quarter & 1;
+            int qlb = h * 64;
+            int qhb = 128 + h * 32;
+            int wbase = h * 128;
+            // All 16 scales in one uint4 (block+192 is 16-aligned).
+            uint4 scv = *reinterpret_cast<const uint4*>(block + 192);
+            const signed char* sc = (const signed char*)&scv;
+            uint4 qlo = *reinterpret_cast<const uint4*>(block + qlb + s * 16);
+            uint4 qhiv = *reinterpret_cast<const uint4*>(block + qlb + 32 + s * 16);
+            uint4 qhv = *reinterpret_cast<const uint4*>(block + qhb + s * 16);
+            const unsigned char* ql_lo = (const unsigned char*)&qlo;
+            const unsigned char* ql_hi = (const unsigned char*)&qhiv;
+            const unsigned char* qh = (const unsigned char*)&qhv;
+            int base = wbase + s * 16;
+            int j0 = 8 * h + s; // scale group of the {+0} sub-range
+            int s0 = (int)sc[j0];
+            int s1 = (int)sc[j0 + 2];
+            int s2 = (int)sc[j0 + 4];
+            int s3 = (int)sc[j0 + 6];
             #pragma unroll
-            for (int half = 0; half < 2; half++) {
-                for (int l = 0; l < 32; l++) {
-                    a[wbase + l] = (signed char)(((int)(block[qlb + l] & 0xF)
-                        | (((int)(block[qhb + l] & 3)) << 4)) - 32);
-                    a[wbase + l + 32] = (signed char)(((int)(block[qlb + l + 32] & 0xF)
-                        | (((int)((block[qhb + l] >> 2) & 3)) << 4)) - 32);
-                    a[wbase + l + 64] = (signed char)(((int)(block[qlb + l] >> 4)
-                        | (((int)((block[qhb + l] >> 4) & 3)) << 4)) - 32);
-                    a[wbase + l + 96] = (signed char)(((int)(block[qlb + l + 32] >> 4)
-                        | (((int)((block[qhb + l] >> 6) & 3)) << 4)) - 32);
-                }
-                wbase += 128; qlb += 64; qhb += 32;
+            for (int l = 0; l < 16; l++) {
+                int albyte = (int)ql_lo[l];
+                int ahbyte = (int)ql_hi[l];
+                int hbyte = (int)qh[l];
+                int a0 = ((albyte & 0xF) | ((hbyte & 3) << 4)) - 32;
+                int a1 = ((ahbyte & 0xF) | (((hbyte >> 2) & 3) << 4)) - 32;
+                int a2 = ((albyte >> 4) | (((hbyte >> 4) & 3) << 4)) - 32;
+                int a3 = ((ahbyte >> 4) | (((hbyte >> 6) & 3) << 4)) - 32;
+                int al = l & 7;
+                aux32[al] += s0 * (int)y256[base + l] * a0;
+                aux32[al] += s1 * (int)y256[base + l + 32] * a1;
+                aux32[al] += s2 * (int)y256[base + l + 64] * a2;
+                aux32[al] += s3 * (int)y256[base + l + 96] * a3;
             }
-            int aux32[8];
+        }
+        // Combine the 4 same-super-block lanes (quarter==0 collects 1..3);
+        // cross-group shuffle reads are discarded. Integer sums — order-free.
+        #pragma unroll
+        for (int off = 2; off >= 1; off >>= 1) {
             #pragma unroll
-            for (int l = 0; l < 8; l++) aux32[l] = 0;
-            #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                int scale = (int)sc[j];
-                int off = j * 16;
-                #pragma unroll
-                for (int l = 0; l < 8; l++)
-                    aux32[l] += scale * (int)y256[off + l] * (int)a[off + l];
-                #pragma unroll
-                for (int l = 0; l < 8; l++)
-                    aux32[l] += scale * (int)y256[off + 8 + l] * (int)a[off + 8 + l];
-            }
+            for (int l = 0; l < 8; l++)
+                aux32[l] += __shfl_down_sync(0xffffffffu, aux32[l], off);
+        }
+        if (active && quarter == 0) {
             int* ax = myaux + (long)b * 8;
             #pragma unroll
             for (int l = 0; l < 8; l++) ax[l] = aux32[l];
@@ -961,15 +1003,60 @@ __device__ __forceinline__ void quant_q8k_block(
     }
     *scale_out = 1.0f / iscale;
 }
+// Parallel Q8_K super-block quantize: one BLOCK of 256 threads per super-block,
+// one element per thread. The amax scan is a first-max-wins tree reduction
+// (larger |v| wins; on an exact |v| tie the SMALLER index wins), which
+// reproduces the serial quant_q8k_block scan BIT-EXACTLY — fabsf and the
+// comparisons involve no rounding, so the reduction order is free. Replaces
+// the one-thread-per-super-block shape whose serial 256-element loops (and,
+// in silu_mul's case, a 1 KB local vals[] spill) left the kernels ~10-20x off
+// their roofline and latency-bound at ~46-78 us per call.
+__device__ __forceinline__ void quant_q8k_block_parallel(
+    float v, int tid, float* r_amax, float* r_maxv, int* r_idx,
+    signed char* __restrict__ qb, float* __restrict__ scale_out
+) {
+    r_amax[tid] = fabsf(v);
+    r_maxv[tid] = v;
+    r_idx[tid] = tid;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (tid < off) {
+            float oa = r_amax[tid + off];
+            if (oa > r_amax[tid] || (oa == r_amax[tid] && r_idx[tid + off] < r_idx[tid])) {
+                r_amax[tid] = oa;
+                r_maxv[tid] = r_maxv[tid + off];
+                r_idx[tid] = r_idx[tid + off];
+            }
+        }
+        __syncthreads();
+    }
+    float amax = r_amax[0];
+    if (amax == 0.0f) {
+        qb[tid] = 0;
+        if (tid == 0) *scale_out = 0.0f;
+        return;
+    }
+    float iscale = -127.0f / r_maxv[0];
+    int q = nearest_int_ref(iscale * v);
+    if (q > 127) q = 127;
+    qb[tid] = (signed char)q;
+    if (tid == 0) *scale_out = 1.0f / iscale;
+}
 // Standalone Q8_K quantize (used for the attention-output activation before the
-// O projection of a K-quant layer). One thread per 256-block.
+// O projection of a K-quant layer). One block per 256-block, parallel quantize.
 extern "C" __global__ void quantize_q8k(
     const float* __restrict__ x, signed char* __restrict__ quants,
     float* __restrict__ scales, int n_sb
 ) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float r_amax[256];
+    __shared__ float r_maxv[256];
+    __shared__ int r_idx[256];
+    int b = blockIdx.x;
     if (b >= n_sb) return;
-    quant_q8k_block(x + (long)b * 256, quants + (long)b * 256, scales + b);
+    int tid = threadIdx.x;
+    float v = x[(long)b * 256 + tid];
+    quant_q8k_block_parallel(v, tid, r_amax, r_maxv, r_idx,
+                             quants + (long)b * 256, scales + b);
 }
 // Fused RMS-norm + Q8_K quantize (K-quant analog of rms_norm_quantize). One block
 // stages the row in shared, thread 0 does the in-order sum-of-squares (bit-identical
@@ -979,8 +1066,17 @@ extern "C" __global__ void rms_norm_quantize_q8k(
     const float* __restrict__ x, const float* __restrict__ weight,
     signed char* __restrict__ quants, float* __restrict__ scales, int n, float eps
 ) {
+    // One block per 256-element super-block. The x·x sum must stay the CPU's
+    // serial f32 chain (the parity anchor — a tree reduce would reassociate),
+    // so EVERY block redundantly recomputes it on its thread 0: the ~n serial
+    // FMAs run concurrently across resident blocks, so wall time is one chain
+    // (~12 us at n=4096) instead of one chain PLUS a single block serially
+    // quantizing every super-block alone (measured 46 us at grid(1)).
     extern __shared__ float xsk[]; // n floats
     __shared__ float s_scale;
+    __shared__ float r_amax[256];
+    __shared__ float r_maxv[256];
+    __shared__ int r_idx[256];
     int tid = threadIdx.x;
     for (int i = tid; i < n; i += blockDim.x) xsk[i] = x[i];
     __syncthreads();
@@ -990,12 +1086,10 @@ extern "C" __global__ void rms_norm_quantize_q8k(
         s_scale = 1.0f / sqrtf(sum / (float)n + eps);
     }
     __syncthreads();
-    float scale = s_scale;
-    for (int i = tid; i < n; i += blockDim.x) xsk[i] = xsk[i] * scale * weight[i];
-    __syncthreads();
-    int n_sb = n >> 8; // n / 256
-    for (int b = tid; b < n_sb; b += blockDim.x)
-        quant_q8k_block(xsk + ((long)b << 8), quants + ((long)b << 8), scales + b);
+    int b = blockIdx.x;
+    long base = (long)b << 8;
+    float v = xsk[base + tid] * s_scale * weight[base + tid];
+    quant_q8k_block_parallel(v, tid, r_amax, r_maxv, r_idx, quants + base, scales + b);
 }
 // Fused SiLU(gate)*up + Q8_K quantize (K-quant analog of silu_mul_quantize). One
 // thread per 256-block: compute silu*up for the block's 256 elements into a local
@@ -1005,14 +1099,17 @@ extern "C" __global__ void silu_mul_quantize_q8k(
     const float* __restrict__ gate, const float* __restrict__ up,
     signed char* __restrict__ quants, float* __restrict__ scales, int n_sb
 ) {
-    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ float r_amax[256];
+    __shared__ float r_maxv[256];
+    __shared__ int r_idx[256];
+    int b = blockIdx.x;
     if (b >= n_sb) return;
-    float vals[256];
-    for (int j = 0; j < 256; j++) {
-        float g = gate[(long)b * 256 + j];
-        vals[j] = (g / (1.0f + expf(-g))) * up[(long)b * 256 + j];
-    }
-    quant_q8k_block(vals, quants + (long)b * 256, scales + b);
+    int tid = threadIdx.x;
+    long i = (long)b * 256 + tid;
+    float g = gate[i];
+    float v = (g / (1.0f + expf(-g))) * up[i]; // per-element — bit-identical
+    quant_q8k_block_parallel(v, tid, r_amax, r_maxv, r_idx,
+                             quants + (long)b * 256, scales + b);
 }
 
 // ---- Batched Q8 GEMM: K token-inputs against M weight rows ------------------
@@ -2327,8 +2424,26 @@ pub(crate) fn repack_q8_soa(bytes: &[u8]) -> Vec<u8> {
 fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
     match q {
         ProjQuant::Q8_0 => repack_q8_soa(bytes),
-        ProjQuant::Q4K | ProjQuant::Q6K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
+        ProjQuant::Q6K => pad_q6k_blocks(bytes),
+        ProjQuant::Q4K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
     }
+}
+
+/// Q6_K super-blocks are 210 B on the GGUF wire — not 16-byte aligned, which
+/// forced the q6k GEMV into scalar byte loads (measured ~60-70 GB/s achieved).
+/// Pad each block to 224 B at upload so every block — and its ql(+0)/qh(+128)/
+/// scales(+192)/d(+208) sections — sits 16-aligned for vectorized uint4 loads.
+/// The 210 payload bytes are untouched (pad is trailing zeros), so the gemv
+/// result is bit-identical; cost is +6.7% VRAM on q6_K tensors only.
+pub(crate) fn pad_q6k_blocks(bytes: &[u8]) -> Vec<u8> {
+    const WIRE: usize = 210;
+    const PADDED: usize = 224;
+    let blocks = bytes.len() / WIRE;
+    let mut out = vec![0u8; blocks * PADDED];
+    for b in 0..blocks {
+        out[b * PADDED..b * PADDED + WIRE].copy_from_slice(&bytes[b * WIRE..(b + 1) * WIRE]);
+    }
+    out
 }
 
 pub(crate) fn launch_rmsnorm(
@@ -2801,9 +2916,9 @@ pub(crate) fn launch_quantize_q8k(
     scales: &mut CudaSlice<f32>,
     n_sb: usize,
 ) -> Result<(), cudarc::driver::DriverError> {
-    let block = 64u32;
+    let block = 256u32; // one block per super-block, one thread per element
     let cfg = LaunchConfig {
-        grid_dim: ((n_sb as u32).div_ceil(block), 1, 1),
+        grid_dim: (n_sb as u32, 1, 1),
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -2829,7 +2944,7 @@ pub(crate) fn launch_rmsnorm_quantize_q8k(
 ) -> Result<(), cudarc::driver::DriverError> {
     let block = 256u32;
     let cfg = LaunchConfig {
-        grid_dim: (1, 1, 1),
+        grid_dim: ((n as u32) / 256, 1, 1), // one block per Q8_K super-block
         block_dim: (block, 1, 1),
         shared_mem_bytes: (n as u32) * 4,
     };
@@ -2850,9 +2965,9 @@ pub(crate) fn launch_silu_mul_quantize_q8k(
     scales: &mut CudaSlice<f32>,
     n_sb: usize,
 ) -> Result<(), cudarc::driver::DriverError> {
-    let block = 64u32;
+    let block = 256u32; // one block per super-block, one thread per element
     let cfg = LaunchConfig {
-        grid_dim: ((n_sb as u32).div_ceil(block), 1, 1),
+        grid_dim: (n_sb as u32, 1, 1),
         block_dim: (block, 1, 1),
         shared_mem_bytes: 0,
     };

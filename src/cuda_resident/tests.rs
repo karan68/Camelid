@@ -2644,7 +2644,12 @@ fn q6k_gemv_matches_oracle() {
 
     let d_is = k.stream.clone_htod(&in_scales).unwrap();
     let d_iq = k.stream.clone_htod(&in_quants).unwrap();
-    let d_w = k.stream.clone_htod(&wire).unwrap();
+    // The GPU-side q6k layout is the 224 B-padded wire (pad_q6k_blocks, as
+    // repack_for_lane uploads it); the CPU oracle reads the raw 210 B wire.
+    let d_w = k
+        .stream
+        .clone_htod(&super::pad_q6k_blocks(&wire))
+        .unwrap();
     let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
     super::launch_q6k_gemv(
         &k.stream,
