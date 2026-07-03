@@ -9925,6 +9925,15 @@ fn single_token_forward_diagnostics_follow_llama_stage_order() {
 #[test]
 fn chunked_prefill_matches_sequential_prefill_outputs_and_cache() {
     let _env_guard = env_lock();
+    // This test asserts the chunked prefill's q8_file_reads delta is all-zero.
+    // The delta is measured from the PROCESS-GLOBAL Q8 file-read counters
+    // (tensor::q8_0_file_read_stats), so any concurrently running test that
+    // records reads — e.g. layer_memory_record_end_captures_tail_q8_file_read_
+    // phase's record_q8_0_file_read(32)+(64) = the exact "2 calls / 96 bytes"
+    // seen in flaky runs — bleeds into the snapshot. Hold the same
+    // q8_file_state_lock every other stats-touching test holds; lock order
+    // (env -> q8) matches the dual-guard tests in this file.
+    let _q8_guard = crate::test_support::q8_file_state_lock();
     clear_dense_diagnostic_env();
 
     let config = LlamaModelConfig {
