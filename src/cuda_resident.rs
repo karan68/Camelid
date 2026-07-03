@@ -493,6 +493,15 @@ extern "C" __global__ void q4k_gemv(
     // gave each lane a whole 144 B-strided super-block, leaving half the warp
     // idle whenever n_sb <= 16 — every 4096-col projection — and defeating
     // coalescing; measured ~60 GB/s achieved vs ~20-25% of that fixed here).
+    // NEGATIVE RESULT (measured 2026-07-03, do not retry): a warp-sequential
+    // remap (whole warp walks SBs in order, lane n reads quant word n — one
+    // perfectly coalesced 128 B transaction per SB) REGRESSED ~8% end-to-end
+    // (Q4_K_M 18.7 -> 17.1 tok/s, parity intact). The per-SB combine needs ~7
+    // dependent shuffles + a shared store, serializing the loop, while THIS
+    // unit-spread shape keeps 8 independent dp4a chains in flight and L1
+    // already absorbs the scattered-sector cost. ~135 GB/s is the plateau of
+    // this shape; the llama.cpp mmvq gap (~190 GB/s) is not reachable by
+    // load-coalescing alone.
     // Each unit computes its two scale-groups' contributions to the 8 aux
     // lanes plus the mins-side sumi over ITS activation quarter (per-16
     // groups 4g..4g+4, mins index gg>>1 = 2g/2g+1 — an exact partition of the
