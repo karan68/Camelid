@@ -2134,11 +2134,11 @@ fn q4k_gemv_matches_oracle() {
     let kdim = n_sb * 256;
     let mut rng = Lcg(0x4b_4b_4b);
 
-    // Synthetic Q4_K weight wire bytes (rows*n_sb super-blocks). The kernel reads the
-    // RAW 144-byte wire layout directly (nibbles + kmask scales expanded on the fly),
-    // so no host repack — the same bytes the resident upload passes through.
+    // Synthetic Q4_K weight wire bytes (rows*n_sb super-blocks). The GPU-side
+    // layout is the upload-time quant-byte swizzle (swz_q4k_blocks, exactly as
+    // repack_for_lane applies it); the CPU oracle reads the stock wire.
     let wire = synth_q4k_wire(rows, n_sb, &mut rng);
-    let wsoa = wire.clone();
+    let wsoa = super::swz_q4k_blocks(&wire);
 
     // Q8_K activation: quantize a random f32 row, then split into per-superblock
     // scales (y.d) and the concatenated 256-wide i8 quants (y.qs).
@@ -2646,10 +2646,7 @@ fn q6k_gemv_matches_oracle() {
     let d_iq = k.stream.clone_htod(&in_quants).unwrap();
     // The GPU-side q6k layout is the 224 B-padded wire (pad_q6k_blocks, as
     // repack_for_lane uploads it); the CPU oracle reads the raw 210 B wire.
-    let d_w = k
-        .stream
-        .clone_htod(&super::pad_q6k_blocks(&wire))
-        .unwrap();
+    let d_w = k.stream.clone_htod(&super::pad_q6k_blocks(&wire)).unwrap();
     let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
     super::launch_q6k_gemv(
         &k.stream,

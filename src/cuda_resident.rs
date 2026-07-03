@@ -464,9 +464,18 @@ extern "C" __global__ void q4k_gemv(
     // per-warp scratch: 8 aux32 lanes + 1 sumi = 9 ints, per superblock.
     int* aux = (int*)(smem4 + (long)n_sb * 256 + (long)n_sb * 4); // warps*n_sb*9 int
     int tid = threadIdx.x;
-    // Stage the shared input vector cooperatively (coalesced), once per block.
-    for (int i = tid; i < n_sb * 64; i += blockDim.x)
-        ((int*)s_iq)[i] = ((const int*)input_quants)[i]; // n_sb*256 bytes as ints
+    // Stage the input vector SWIZZLED to match the upload-time weight swizzle
+    // (swz_q4k_blocks): within each 32-wide scale group jg, byte l+k*8 lands at
+    // l*4+k, so an aux lane's four stride-8 activations sit in ONE aligned i32
+    // and pair with the weight word for __dp4a. A pure byte permutation —
+    // group sums (bsums) and per-lane products are the same integers.
+    for (int i = tid; i < n_sb * 256; i += blockDim.x) {
+        int jg = i >> 5;      // 32-wide group index
+        int p = i & 31;       // linear position within the group
+        int l = p & 7;
+        int kk = p >> 3;
+        s_iq[(long)jg * 32 + l * 4 + kk] = input_quants[i];
+    }
     for (int i = tid; i < n_sb; i += blockDim.x) s_is[i] = input_scales[i];
     __syncthreads();
 
@@ -521,40 +530,33 @@ extern "C" __global__ void q4k_gemv(
             sc[4] = u1 & 0xff; sc[5] = (u1 >> 8) & 0xff; sc[6] = (u1 >> 16) & 0xff; sc[7] = (u1 >> 24) & 0xff;
             mn[0] = u2 & 0xff; mn[1] = (u2 >> 8) & 0xff; mn[2] = (u2 >> 16) & 0xff; mn[3] = (u2 >> 24) & 0xff;
             mn[4] = u3 & 0xff; mn[5] = (u3 >> 8) & 0xff; mn[6] = (u3 >> 16) & 0xff; mn[7] = (u3 >> 24) & 0xff;
-            const uint4* q4v = reinterpret_cast<const uint4*>(blk + 16);  // 128 quant bytes
             int slo = (int)sc[2 * g];
             int shi = (int)sc[2 * g + 1];
-            int lobase = g * 64;          // a-index of low-nibble scale-group 2g
-            int hibase = g * 64 + 32;     // a-index of high-nibble scale-group 2g+1
-            // This unit's 32 bytes = 2 uint4 (8 uint32 words).
-            uint4 wlo = q4v[g * 2];       // qs[g*32 .. g*32+16]
-            uint4 whi = q4v[g * 2 + 1];   // qs[g*32+16 .. g*32+32]
-            const unsigned int* wd = reinterpret_cast<const unsigned int*>(&wlo);
-            const unsigned int* wd2 = reinterpret_cast<const unsigned int*>(&whi);
+            // dp4a form over the SWIZZLED layouts: weight word l holds the four
+            // stride-8 quant bytes of aux lane l (swz_q4k_blocks); the staged
+            // activation words are permuted identically, and the low/high
+            // nibble halves of the SAME weight word serve scale groups 2g and
+            // 2g+1. aux32[l] = slo*Σ(y_lo·q_lo) + shi*Σ(y_hi·q_hi) — the
+            // distributed form of the oracle's per-element products: identical
+            // integers. The mins side collapses because the two per-16 bsums of
+            // a 32-group share one min: sumi += mn[j]*(whole-group activation
+            // sum), computed as packed dp4a against 0x01010101.
+            const int* qw = reinterpret_cast<const int*>(blk + 16 + g * 32);
+            const int* ylo = reinterpret_cast<const int*>(y256 + (2 * g) * 32);
+            const int* yhi = reinterpret_cast<const int*>(y256 + (2 * g + 1) * 32);
+            int sum_lo = 0, sum_hi = 0;
             #pragma unroll
-            for (int w = 0; w < 8; w++) {
-                unsigned int word = (w < 4) ? wd[w] : wd2[w - 4]; // 4 packed quant bytes
-                #pragma unroll
-                for (int t = 0; t < 4; t++) {
-                    int p = w * 4 + t;             // 0..32 position in the group
-                    unsigned int byte = (word >> (t * 8)) & 0xff;
-                    int lo = (int)(byte & 0xF);
-                    int hi = (int)(byte >> 4);
-                    int l = p & 7;
-                    aux32[l] += slo * (int)y256[lobase + p] * lo;
-                    aux32[l] += shi * (int)y256[hibase + p] * hi;
-                }
+            for (int l = 0; l < 8; l++) {
+                int q = qw[l];
+                int yl = ylo[l];
+                int yh = yhi[l];
+                int qlo = q & 0x0F0F0F0F;
+                int qhi = (q >> 4) & 0x0F0F0F0F;
+                aux32[l] += slo * __dp4a(qlo, yl, 0) + shi * __dp4a(qhi, yh, 0);
+                sum_lo = __dp4a(yl, 0x01010101, sum_lo);
+                sum_hi = __dp4a(yh, 0x01010101, sum_hi);
             }
-            // Mins side, this unit's quarter: per-16 activation sums (bsums)
-            // times mins[group/2], groups 4g..4g+4 — exactly the oracle terms.
-            #pragma unroll
-            for (int gg = 0; gg < 4; gg++) {
-                int grp = g * 4 + gg;
-                int bsum = 0;
-                #pragma unroll
-                for (int l = 0; l < 16; l++) bsum += (int)y256[grp * 16 + l];
-                sumi += bsum * (int)mn[grp >> 1];
-            }
+            sumi += (int)mn[2 * g] * sum_lo + (int)mn[2 * g + 1] * sum_hi;
         }
         // Combine the 4 same-super-block lanes (g==0 collects g=1..3). Lanes
         // whose shuffle source crosses a group boundary read garbage, but only
@@ -2585,8 +2587,37 @@ fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
     match q {
         ProjQuant::Q8_0 => repack_q8_soa(bytes),
         ProjQuant::Q6K => pad_q6k_blocks(bytes),
-        ProjQuant::Q4K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
+        ProjQuant::Q4K => swz_q4k_blocks(bytes),
+        ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
     }
+}
+
+/// GPU-side Q4_K quant-byte swizzle (VRAM size unchanged, 144 B/sb): within each
+/// 32-byte nibble group g, the four stride-8 bytes an aux lane consumes
+/// (qs[g*32 + l], +8, +16, +24 for l in 0..8) are made CONTIGUOUS at
+/// swz[g*32 + l*4 ..], so `q4k_gemv` reads one aligned i32 per lane and feeds it
+/// straight to __dp4a (both nibble halves of the same word serve the group
+/// pair 2g / 2g+1). A pure byte permutation — every product still forms from
+/// the same operands into the same integer aux lane, so the gemv result is
+/// BIT-IDENTICAL. The 16-byte header (d, dmin, packed scales) is untouched.
+/// NOTE: this is the GEMV lane's layout only; `embed_gather_q4k` reads the
+/// stock wire (the embedding table is uploaded raw, not via repack_for_lane).
+pub(crate) fn swz_q4k_blocks(bytes: &[u8]) -> Vec<u8> {
+    const WIRE: usize = 144;
+    let blocks = bytes.len() / WIRE;
+    let mut out = bytes.to_vec();
+    for b in 0..blocks {
+        let src = &bytes[b * WIRE + 16..(b + 1) * WIRE];
+        let dst = &mut out[b * WIRE + 16..(b + 1) * WIRE];
+        for g in 0..4 {
+            for l in 0..8 {
+                for k in 0..4 {
+                    dst[g * 32 + l * 4 + k] = src[g * 32 + l + k * 8];
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Q6_K super-blocks are 210 B on the GGUF wire — not 16-byte aligned, which
