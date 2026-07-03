@@ -176,6 +176,359 @@ fn expert_rows_gpu(
     None
 }
 
+/// FAST mode (`CAMELID_DG_FAST=1`, cuda builds): batch the per-step FFN+MoE
+/// across ALL positions on the GPU so each weight is read once per step
+/// instead of once per position. NOT bit-exact (GPU f32 accumulation, GEMM
+/// batching) — the parity lane is the default; this exists for interactive
+/// latency. Token-closeness is the bar, like the SC GPU stage.
+fn dg_fast_enabled() -> bool {
+    cfg!(feature = "cuda")
+        && matches!(
+            std::env::var("CAMELID_DG_FAST").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        )
+}
+
+/// FAST-mode whole-layer FFN+MoE across all positions. Mirrors the
+/// per-position loop's math mechanically (same helpers, same accumulation
+/// formulas, same region-aware output scalar) but runs the six heavy matmuls
+/// as batched GPU GEMMs — dense gate/up/down over all `n` positions and the
+/// expert gate_up/down over all `n×k` (position, expert) pairs — so each
+/// weight tensor is read/streamed ONCE per step. Mutates `h` only after every
+/// GPU call has succeeded; `None` leaves the state untouched for the CPU
+/// fallback loop.
+#[cfg(feature = "cuda")]
+fn ffn_moe_layer_fast(
+    rt: &DgEncoderRuntime,
+    lw: &DgLayer,
+    h: &mut [Vec<f32>],
+    p: usize,
+    eps: f32,
+) -> Option<()> {
+    use rayon::prelude::*;
+    // Q4_K_M mixes the down-projection quants per layer (Q8_0 on some layers,
+    // Q5_0 on others); both have batched kernels. The gate/up sides are Q4_K
+    // on every layer of the tracked file.
+    let down_kind = |f: DgFormat| -> Option<cuda::DgExpertKind> {
+        match f {
+            DgFormat::Q8_0 => Some(cuda::DgExpertKind::Q80),
+            DgFormat::Q5_0 => Some(cuda::DgExpertKind::Q50),
+            _ => None,
+        }
+    };
+    if lw.ffn_gate.format != DgFormat::Q4K
+        || lw.ffn_up.format != DgFormat::Q4K
+        || lw.gate_up_exps.format != DgFormat::Q4K
+    {
+        return None;
+    }
+    let dense_down_kind = down_kind(lw.ffn_down.format)?;
+    let exp_down_kind = down_kind(lw.down_exps.format)?;
+    let hidden = h.first()?.len();
+    if !hidden.is_multiple_of(256) {
+        return None;
+    }
+    let n = h.len();
+    let k = rt.n_expert_used;
+    let n_ff_exp = rt.n_ff_exp;
+    let two_nff = 2 * n_ff_exp;
+    let ffn_dim = lw.ffn_gate.rows;
+    let inv = 1.0f32 / (hidden as f32).sqrt();
+    let prof = std::env::var("CAMELID_DG_STAGE_TIMINGS").is_ok();
+    let dbg_bail = |st: &str| {
+        if prof {
+            eprintln!("[dg-fast] BAIL {st}");
+        }
+    };
+    let t0 = std::time::Instant::now();
+    macro_rules! mark {
+        ($label:expr, $t:ident) => {
+            let now = std::time::Instant::now();
+            if prof {
+                eprint!("[dg-fast] {}={}ms ", $label, ($t.elapsed()).as_millis());
+            }
+            #[allow(unused)]
+            let $t = now;
+        };
+    }
+    let t = t0;
+
+    // ---- per-position prep (parallel; no h mutation): dense input act,
+    // router selection + normalized weights, MoE input act ----
+    struct Prep {
+        xq: DgActivation,
+        cur_q: DgActivation,
+        idx: Vec<usize>,
+        w_norm: Vec<f32>,
+    }
+    let preps: Vec<Prep> = h
+        .par_iter()
+        .map(|hp| {
+            let xn = refmath::rms_norm(hp, Some(&lw.ffn_norm), eps);
+            let xq = DgActivation::new(&xn);
+            let mut r = refmath::rms_norm(hp, None, eps);
+            for (rv, sv) in r.iter_mut().zip(&lw.gate_inp_scale) {
+                *rv = *rv * inv * sv;
+            }
+            let logits: Vec<f32> = (0..rt.n_expert)
+                .map(|e| refmath::vec_dot_f32(&lw.gate_inp[e * hidden..(e + 1) * hidden], &r))
+                .collect();
+            let mut probs = logits.clone();
+            refmath::softmax_row(&mut probs);
+            let order = argsort_desc_experts(&logits);
+            let idx: Vec<usize> = order[..k].iter().map(|&e| e as usize).collect();
+            let selected: Vec<f32> = idx.iter().map(|&e| probs[e]).collect();
+            let mut wsum = refmath::vec_sum_f32(&selected);
+            wsum = wsum.max(f32::from_bits(0x3880_0000));
+            let w_norm: Vec<f32> = idx
+                .iter()
+                .map(|&e| refmath::vdsp_div(probs[e], wsum))
+                .collect();
+            let cur_moe = refmath::rms_norm(hp, Some(&lw.pre_norm_2), eps);
+            let cur_q = DgActivation::new(&cur_moe);
+            Prep {
+                xq,
+                cur_q,
+                idx,
+                w_norm,
+            }
+        })
+        .collect();
+    mark!("prep", t);
+
+    // ---- SoA packing helpers ----
+    let bpr = hidden / 256;
+    fn pack_q8k_soa(acts: &[&DgActivation], bpr: usize) -> Option<(Vec<f32>, Vec<i8>)> {
+        let n = acts.len();
+        let mut scales = vec![0f32; n * bpr];
+        let mut quants = vec![0i8; n * bpr * 256];
+        for (pos, a) in acts.iter().enumerate() {
+            let blocks = a.q8_k.as_ref()?;
+            if blocks.len() != bpr {
+                return None;
+            }
+            for (b, blk) in blocks.iter().enumerate() {
+                scales[pos * bpr + b] = blk.d;
+                let off = (pos * bpr + b) * 256;
+                quants[off..off + 256].copy_from_slice(&blk.qs);
+            }
+        }
+        Some((scales, quants))
+    }
+    fn whole(w: &DgWire) -> Option<&[u8]> {
+        w.mmap.bytes(w.offset, w.rows * w.row_bytes()).ok()
+    }
+
+    // ---- dense branch: gate/up (Q4_K), geglu, down (Q8_0), post-norm ----
+    let xq_refs: Vec<&DgActivation> = preps.iter().map(|pr| &pr.xq).collect();
+    let (xs, xqn) = pack_q8k_soa(&xq_refs, bpr).or_else(|| {
+        dbg_bail("pack_xq");
+        None
+    })?;
+    let ident_base = vec![0i64; n];
+    let ident_pos: Vec<i32> = (0..n as i32).collect();
+    let gate = cuda::fast_gemm_id(
+        whole(&lw.ffn_gate)?,
+        (lw.ffn_gate.mmap.path(), lw.ffn_gate.offset),
+        cuda::DgExpertKind::Q4K,
+        &ident_base,
+        &ident_pos,
+        ffn_dim,
+        bpr,
+        &xs,
+        &xqn,
+    )?;
+    let up = cuda::fast_gemm_id(
+        whole(&lw.ffn_up)?,
+        (lw.ffn_up.mmap.path(), lw.ffn_up.offset),
+        cuda::DgExpertKind::Q4K,
+        &ident_base,
+        &ident_pos,
+        ffn_dim,
+        bpr,
+        &xs,
+        &xqn,
+    )
+    .or_else(|| {
+        dbg_bail("dense_gemm");
+        None
+    })?;
+    mark!("dense_gemm", t);
+    let dense_acts: Vec<DgActivation> = (0..n)
+        .into_par_iter()
+        .map(|pos| {
+            let g = &gate[pos * ffn_dim..(pos + 1) * ffn_dim];
+            let u = &up[pos * ffn_dim..(pos + 1) * ffn_dim];
+            let act: Vec<f32> = g.iter().zip(u).map(|(gv, uv)| dg_gelu(*gv) * uv).collect();
+            DgActivation::new(&act)
+        })
+        .collect();
+    let nb_dense = ffn_dim / 32;
+    let mut das = vec![0f32; n * nb_dense];
+    let mut daq = vec![0i8; n * nb_dense * 32];
+    for (pos, a) in dense_acts.iter().enumerate() {
+        if a.q8_0.len() != nb_dense {
+            dbg_bail("nb_dense");
+            return None;
+        }
+        for (b, blk) in a.q8_0.iter().enumerate() {
+            das[pos * nb_dense + b] = blk.scale;
+            let off = (pos * nb_dense + b) * 32;
+            daq[off..off + 32].copy_from_slice(&blk.quants);
+        }
+    }
+    let mlp_raw = cuda::fast_gemm_id(
+        whole(&lw.ffn_down)?,
+        (lw.ffn_down.mmap.path(), lw.ffn_down.offset),
+        dense_down_kind,
+        &ident_base,
+        &ident_pos,
+        hidden,
+        nb_dense,
+        &das,
+        &daq,
+    )
+    .or_else(|| {
+        dbg_bail("mlp");
+        None
+    })?;
+    let mlps: Vec<Vec<f32>> = (0..n)
+        .into_par_iter()
+        .map(|pos| {
+            refmath::rms_norm(
+                &mlp_raw[pos * hidden..(pos + 1) * hidden],
+                Some(&lw.post_norm_1),
+                eps,
+            )
+        })
+        .collect();
+    mark!("dense_down", t);
+
+    // ---- MoE branch: expert gate_up (Q4_K) + down (Q8_0) over (pos, slot)
+    // pairs ----
+    let cq_refs: Vec<&DgActivation> = preps.iter().map(|pr| &pr.cur_q).collect();
+    let (cs, cq) = pack_q8k_soa(&cq_refs, bpr).or_else(|| {
+        dbg_bail("pack_cq");
+        None
+    })?;
+    let n_pairs = n * k;
+    let mut gu_base = Vec::with_capacity(n_pairs);
+    let mut gu_pos = Vec::with_capacity(n_pairs);
+    let mut dn_base = Vec::with_capacity(n_pairs);
+    for (pos, prep) in preps.iter().enumerate() {
+        for &e in &prep.idx {
+            gu_base.push((e * two_nff) as i64);
+            gu_pos.push(pos as i32);
+            dn_base.push((e * hidden) as i64);
+        }
+    }
+    let gate_up = cuda::fast_gemm_id(
+        whole(&lw.gate_up_exps)?,
+        (lw.gate_up_exps.mmap.path(), lw.gate_up_exps.offset),
+        cuda::DgExpertKind::Q4K,
+        &gu_base,
+        &gu_pos,
+        two_nff,
+        bpr,
+        &cs,
+        &cq,
+    )
+    .or_else(|| {
+        dbg_bail("exp_gate_up");
+        None
+    })?;
+    mark!("exp_gate_up", t);
+    let hexp_acts: Vec<DgActivation> = (0..n_pairs)
+        .into_par_iter()
+        .map(|pair| {
+            let gu = &gate_up[pair * two_nff..(pair + 1) * two_nff];
+            let hexp: Vec<f32> = (0..n_ff_exp)
+                .map(|o| dg_gelu(gu[o]) * gu[o + n_ff_exp])
+                .collect();
+            DgActivation::new(&hexp)
+        })
+        .collect();
+    let nb_exp = n_ff_exp / 32;
+    let mut hs = vec![0f32; n_pairs * nb_exp];
+    let mut hq = vec![0i8; n_pairs * nb_exp * 32];
+    for (pair, a) in hexp_acts.iter().enumerate() {
+        if a.q8_0.len() != nb_exp {
+            dbg_bail("nb_exp");
+            return None;
+        }
+        for (b, blk) in a.q8_0.iter().enumerate() {
+            hs[pair * nb_exp + b] = blk.scale;
+            let off = (pair * nb_exp + b) * 32;
+            hq[off..off + 32].copy_from_slice(&blk.quants);
+        }
+    }
+    mark!("hexp", t);
+    let pair_ident: Vec<i32> = (0..n_pairs as i32).collect();
+    let down = cuda::fast_gemm_id(
+        whole(&lw.down_exps)?,
+        (lw.down_exps.mmap.path(), lw.down_exps.offset),
+        exp_down_kind,
+        &dn_base,
+        &pair_ident,
+        hidden,
+        nb_exp,
+        &hs,
+        &hq,
+    )
+    .or_else(|| {
+        dbg_bail("exp_down");
+        None
+    })?;
+    mark!("exp_down", t);
+
+    // ---- finalize (parallel; the only h mutation, after all GPU calls) ----
+    h.par_iter_mut().enumerate().for_each(|(pos, hp)| {
+        let prep = &preps[pos];
+        let mut moe_acc = vec![0f32; hidden];
+        for (slot, &e) in prep.idx.iter().enumerate() {
+            let pair = pos * k + slot;
+            let y = &down[pair * hidden..(pair + 1) * hidden];
+            let s_e = lw.down_exps_scale[e];
+            let w = prep.w_norm[slot];
+            for (a, yv) in moe_acc.iter_mut().zip(y) {
+                *a += yv * s_e * w;
+            }
+        }
+        let moe_out = refmath::rms_norm(&moe_acc, Some(&lw.post_norm_2), eps);
+        let mut combined = mlps[pos].clone();
+        for (cv, m) in combined.iter_mut().zip(&moe_out) {
+            *cv += m;
+        }
+        let ffn_out = refmath::rms_norm(&combined, Some(&lw.post_ffw_norm), eps);
+        for (a, b) in hp.iter_mut().zip(&ffn_out) {
+            *a += b;
+        }
+        let scale = if pos < p {
+            lw.enc_out_scale
+        } else {
+            lw.out_scale
+        };
+        for v in hp.iter_mut() {
+            *v *= scale;
+        }
+    });
+    mark!("finalize", t);
+    if prof {
+        eprintln!("total={}ms", t0.elapsed().as_millis());
+    }
+    Some(())
+}
+#[cfg(not(feature = "cuda"))]
+fn ffn_moe_layer_fast(
+    _rt: &DgEncoderRuntime,
+    _lw: &DgLayer,
+    _h: &mut [Vec<f32>],
+    _p: usize,
+    _eps: f32,
+) -> Option<()> {
+    None
+}
+
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
 // Expert-selection argsort matching the reference's `ggml_argsort_top_k`
@@ -1560,7 +1913,16 @@ impl DgEncoderRuntime {
             let mut moe_down_all = Vec::new();
             let mut moe_down_scaled_all = Vec::new();
             let mut ffn_block_out_all = Vec::new();
-            for (pos, hp) in h.iter_mut().enumerate() {
+            // FAST mode: run the whole layer's FFN+MoE as batched GPU GEMMs
+            // (weights read once per step, not once per position). Falls back
+            // to the per-position loop below on any failure; never taken when
+            // tracing (the trace buffers need the per-position intermediates).
+            let fast_done = !want_trace
+                && dg_fast_enabled()
+                && ffn_moe_layer_fast(self, lw, &mut h, p, eps).is_some();
+            let pos_range = if fast_done { 0..0 } else { 0..h.len() };
+            for pos in pos_range {
+                let hp = &mut h[pos];
                 let attn_resid = hp.clone();
                 let xn = refmath::rms_norm(&attn_resid, Some(&lw.ffn_norm), eps);
                 let xq = DgActivation::new(&xn);

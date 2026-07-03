@@ -265,6 +265,165 @@ extern "C" __global__ void q8_0_rows_gemv(
     out[r] = ((acc0[0] + acc0[1]) + (acc0[2] + acc0[3]))
         + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
 }
+
+// ---- FAST-mode batched-ID GEMM kernels (CAMELID_DG_FAST) -------------------
+// One thread per (pair, row): pair_base[pair] selects the row window (expert
+// offset, or 0 for dense), pair_pos[pair] selects the activation column. Same
+// per-row math as the parity kernels above; fast mode does not claim
+// bit-exactness (it exists to amortize weight reads across all positions).
+
+extern "C" __global__ void q4k_gemm_id(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,      // [P * bpr]
+    const signed char* __restrict__ act_quants, // [P * bpr * 256]
+    const long long* __restrict__ pair_base,   // [n_pairs] first row
+    const int* __restrict__ pair_pos,          // [n_pairs] activation index
+    int n_pairs, int rows_per, int bpr,
+    float* __restrict__ out)                   // [n_pairs * rows_per]
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_pairs * rows_per;
+    if (idx >= total) return;
+    int pair = (int)(idx / rows_per);
+    int r = (int)(idx % rows_per);
+    const unsigned char* rowp = wire + (pair_base[pair] + r) * (long long)bpr * 144;
+    const float* a_s = act_scales + (long long)pair_pos[pair] * bpr;
+    const signed char* a_q = act_quants + (long long)pair_pos[pair] * bpr * 256;
+    float sumf = 0.0f;
+    for (int i = 0; i < bpr; i++) {
+        const unsigned char* block = rowp + (long long)i * 144;
+        float yd = a_s[i];
+        const signed char* q8 = a_q + (long long)i * 256;
+        float d = yd * f16_bits_to_f32((unsigned short)block[0]
+            | ((unsigned short)block[1] << 8));
+        float dmin = yd * f16_bits_to_f32((unsigned short)block[2]
+            | ((unsigned short)block[3] << 8));
+        const unsigned char* sc = block + 4;
+        const unsigned char* qs = block + 16;
+        unsigned int utmp0 = (unsigned int)sc[0] | ((unsigned int)sc[1] << 8)
+            | ((unsigned int)sc[2] << 16) | ((unsigned int)sc[3] << 24);
+        unsigned int utmp1 = (unsigned int)sc[4] | ((unsigned int)sc[5] << 8)
+            | ((unsigned int)sc[6] << 16) | ((unsigned int)sc[7] << 24);
+        unsigned int utmp2 = (unsigned int)sc[8] | ((unsigned int)sc[9] << 8)
+            | ((unsigned int)sc[10] << 16) | ((unsigned int)sc[11] << 24);
+        unsigned int mins0 = utmp1 & 0x3f3f3f3fu;
+        unsigned int mins1 = ((utmp2 >> 4) & 0x0f0f0f0fu)
+            | (((utmp1 >> 6) & 0x03030303u) << 4);
+        unsigned int scw0 = utmp0 & 0x3f3f3f3fu;
+        unsigned int scw1 = (utmp2 & 0x0f0f0f0fu)
+            | (((utmp0 >> 6) & 0x03030303u) << 4);
+        long long prod = 0;
+        for (int g = 0; g < 8; g++) {
+            int bs = 0;
+            for (int t = 0; t < 32; t++) bs += q8[g * 32 + t];
+            prod += (long long)bs * kq4_byte(mins0, mins1, g);
+        }
+        sumf = fmaf(-dmin, (float)prod, sumf);
+        long long sumi1 = 0, sumi2 = 0;
+        for (int j = 0; j < 4; j++) {
+            const unsigned char* q4 = qs + j * 32;
+            const signed char* q8j = q8 + j * 64;
+            long long lo = 0, hi = 0;
+            for (int t = 0; t < 32; t++) {
+                lo += (long long)(q4[t] & 0xf) * q8j[t];
+                hi += (long long)(q4[t] >> 4) * q8j[32 + t];
+            }
+            sumi1 += lo * kq4_byte(scw0, scw1, 2 * j);
+            sumi2 += hi * kq4_byte(scw0, scw1, 2 * j + 1);
+        }
+        sumf = fmaf(d, (float)(sumi1 + sumi2), sumf);
+    }
+    out[idx] = sumf;
+}
+
+// Q5_0 x Q8_0 batched-ID GEMM: 22-byte blocks (f16 d, u32 qh, 16 nibble
+// bytes); weight w[idx] = ((nibble | (qh_bit << 4)) - 16). Same accumulator
+// structure as the Q8_0 kernel (q0_pair_dot shape).
+extern "C" __global__ void q5_0_gemm_id(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,
+    const signed char* __restrict__ act_quants,
+    const long long* __restrict__ pair_base,
+    const int* __restrict__ pair_pos,
+    int n_pairs, int rows_per, int nb,
+    float* __restrict__ out)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_pairs * rows_per;
+    if (idx >= total) return;
+    int pair = (int)(idx / rows_per);
+    int r = (int)(idx % rows_per);
+    const unsigned char* rowp = wire + (pair_base[pair] + r) * (long long)nb * 22;
+    const float* a_s = act_scales + (long long)pair_pos[pair] * nb;
+    const signed char* a_q = act_quants + (long long)pair_pos[pair] * nb * 32;
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < nb; i++) {
+        const unsigned char* block = rowp + (long long)i * 22;
+        float dw = f16_bits_to_f32((unsigned short)block[0]
+            | ((unsigned short)block[1] << 8));
+        unsigned int qh = (unsigned int)block[2] | ((unsigned int)block[3] << 8)
+            | ((unsigned int)block[4] << 16) | ((unsigned int)block[5] << 24);
+        const unsigned char* qs = block + 6;
+        float s = dw * a_s[i];
+        const signed char* yq = a_q + (long long)i * 32;
+        float* acc = (i & 1) ? acc1 : acc0;
+        for (int l = 0; l < 4; l++) {
+            int lane = 0;
+            for (int t = 0; t < 4; t++) {
+                int i0 = 4 * l + t;
+                int w0 = (int)((qs[i0] & 0x0f) | (((qh >> i0) & 1) << 4)) - 16;
+                lane += w0 * (int)yq[i0];
+                int i1 = 16 + 4 * l + t;
+                int w1 = (int)((qs[i1 - 16] >> 4) | (((qh >> i1) & 1) << 4)) - 16;
+                lane += w1 * (int)yq[i1];
+            }
+            acc[l] = fmaf((float)lane, s, acc[l]);
+        }
+    }
+    out[idx] = ((acc0[0] + acc0[1]) + (acc0[2] + acc0[3]))
+        + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+}
+
+extern "C" __global__ void q8_0_gemm_id(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,      // [P * nb]
+    const signed char* __restrict__ act_quants, // [P * nb * 32]
+    const long long* __restrict__ pair_base,
+    const int* __restrict__ pair_pos,
+    int n_pairs, int rows_per, int nb,
+    float* __restrict__ out)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_pairs * rows_per;
+    if (idx >= total) return;
+    int pair = (int)(idx / rows_per);
+    int r = (int)(idx % rows_per);
+    const unsigned char* rowp = wire + (pair_base[pair] + r) * (long long)nb * 34;
+    const float* a_s = act_scales + (long long)pair_pos[pair] * nb;
+    const signed char* a_q = act_quants + (long long)pair_pos[pair] * nb * 32;
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < nb; i++) {
+        const unsigned char* block = rowp + (long long)i * 34;
+        float dw = f16_bits_to_f32((unsigned short)block[0]
+            | ((unsigned short)block[1] << 8));
+        float s = dw * a_s[i];
+        const signed char* wq = (const signed char*)(block + 2);
+        const signed char* yq = a_q + (long long)i * 32;
+        float* acc = (i & 1) ? acc1 : acc0;
+        for (int l = 0; l < 4; l++) {
+            int lane = 0;
+            for (int t = 0; t < 4; t++) {
+                lane += (int)wq[4 * l + t] * (int)yq[4 * l + t];
+                lane += (int)wq[16 + 4 * l + t] * (int)yq[16 + 4 * l + t];
+            }
+            acc[l] = fmaf((float)lane, s, acc[l]);
+        }
+    }
+    out[idx] = ((acc0[0] + acc0[1]) + (acc0[2] + acc0[3]))
+        + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+}
 "#;
 
 struct Engine {
@@ -274,6 +433,16 @@ struct Engine {
     lm_func: CudaFunction,
     q4k_rows_func: CudaFunction,
     q80_rows_func: CudaFunction,
+    q4k_id_func: CudaFunction,
+    q80_id_func: CudaFunction,
+    q50_id_func: CudaFunction,
+    /// FAST-mode streaming scratch for tensors that miss the resident pool
+    /// (grown to the largest streamed tensor; one at a time).
+    scratch: Option<CudaSlice<u8>>,
+    /// Pinned (page-locked, write-combined) host staging for streamed uploads:
+    /// pageable-mmap → pinned memcpy + pinned → device DMA is several times
+    /// faster than a pageable `memcpy_htod`. Grown like `scratch`.
+    pinned: Option<cudarc::driver::PinnedHostSlice<u8>>,
     /// Resident transposed embedding (f16) for the SC matmul.
     sc_emb: Option<(CudaSlice<u16>, (usize, usize))>,
     /// Resident Q6_K lm_head weight (wire bytes).
@@ -323,6 +492,15 @@ fn build_engine() -> Result<Engine, String> {
     let q80_rows_func = m
         .load_function("q8_0_rows_gemv")
         .map_err(|e| format!("load q8_0_rows_gemv: {e}"))?;
+    let q4k_id_func = m
+        .load_function("q4k_gemm_id")
+        .map_err(|e| format!("load q4k_gemm_id: {e}"))?;
+    let q80_id_func = m
+        .load_function("q8_0_gemm_id")
+        .map_err(|e| format!("load q8_0_gemm_id: {e}"))?;
+    let q50_id_func = m
+        .load_function("q5_0_gemm_id")
+        .map_err(|e| format!("load q5_0_gemm_id: {e}"))?;
     Ok(Engine {
         stream,
         ctx,
@@ -330,6 +508,11 @@ fn build_engine() -> Result<Engine, String> {
         lm_func,
         q4k_rows_func,
         q80_rows_func,
+        q4k_id_func,
+        q80_id_func,
+        q50_id_func,
+        scratch: None,
+        pinned: None,
         sc_emb: None,
         lm_wire: None,
         expert_pool: std::collections::HashMap::new(),
@@ -515,6 +698,8 @@ pub(crate) enum DgExpertKind {
     Q4K,
     /// 34-byte blocks; activation is Q8_0 (scales [nb], quants [nb*32]).
     Q80,
+    /// 22-byte blocks; activation is Q8_0 (same layout as `Q80`). FAST mode only.
+    Q50,
 }
 
 /// MoE expert row-range GEMV on the VRAM-resident expert pool.
@@ -613,6 +798,8 @@ pub(crate) fn expert_rows_gemv_gpu(
     let func = match kind {
         DgExpertKind::Q4K => &eng.q4k_rows_func,
         DgExpertKind::Q80 => &eng.q80_rows_func,
+        // No single-activation Q5_0 kernel: the parity path never routes it.
+        DgExpertKind::Q50 => return None,
     };
     let run = || -> Result<Vec<f32>, String> {
         let s = eng.stream.clone();
@@ -656,6 +843,239 @@ pub(crate) fn expert_rows_gemv_gpu(
         Ok(v) => Some(v),
         Err(err) => {
             eprintln!("[dg-cuda] expert gemv failed ({err}); CPU fallback");
+            None
+        }
+    }
+}
+
+/// FAST-mode batched-ID GEMM (`CAMELID_DG_FAST`): every (pair, row) output in
+/// one launch. `pair_base[n]` selects the row window (expert offset, 0 for a
+/// dense tensor), `pair_pos[n]` selects the activation. The tensor computes
+/// from the resident pool when it fits the budget, else it streams through a
+/// reusable scratch upload (~tens of ms for a 272 MiB expert tensor — amortized
+/// over ALL pairs, which is the whole point vs per-position reads). Returns
+/// `[n_pairs * rows_per]` outputs or `None` (→ CPU fallback).
+/// Positioned read into `dst` (Windows `seek_read` / Unix `read_exact_at`).
+fn read_at_into(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < dst.len() {
+            let k = file.seek_read(&mut dst[done..], offset + done as u64)?;
+            if k == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "tensor read hit EOF",
+                ));
+            }
+            done += k;
+        }
+        Ok(())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(dst, offset)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fast_gemm_id(
+    tensor: &[u8],
+    src: (&std::path::Path, u64),
+    kind: DgExpertKind,
+    pair_base: &[i64],
+    pair_pos: &[i32],
+    rows_per: usize,
+    blocks_per_row: usize,
+    act_scales: &[f32],
+    act_quants: &[i8],
+) -> Option<Vec<f32>> {
+    if gate_off() {
+        return None;
+    }
+    let n_pairs = pair_base.len();
+    if n_pairs == 0 || n_pairs != pair_pos.len() {
+        return None;
+    }
+    let cell = ENGINE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().ok()?;
+    if guard.is_none() {
+        match build_engine() {
+            Ok(e) => *guard = Some(e),
+            Err(err) => {
+                eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
+                return None;
+            }
+        }
+    }
+    let eng = guard.as_mut()?;
+    let key = (tensor.as_ptr() as usize, tensor.len());
+    // Residency: pool if the budget allows (same accounting as the parity
+    // expert pool), else stream through the scratch buffer.
+    let mut streamed = false;
+    if !eng.expert_pool.contains_key(&key) && !eng.expert_rejected.contains(&key) {
+        if eng.expert_budget.is_none() {
+            let budget = match std::env::var("CAMELID_DG_EXPERT_VRAM_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(mb) => mb * 1024 * 1024,
+                None => {
+                    const RESERVE: u64 = 2200 * 1024 * 1024;
+                    let free = cudarc::driver::result::mem_get_info()
+                        .map(|(f, _)| f as u64)
+                        .unwrap_or(0);
+                    free.saturating_sub(RESERVE)
+                }
+            };
+            eprintln!(
+                "[dg-cuda] expert pool budget {:.2} GiB",
+                budget as f64 / (1u64 << 30) as f64
+            );
+            eng.expert_budget = Some(budget);
+        }
+        let budget = eng.expert_budget.unwrap();
+        if (tensor.len() as u64) <= budget {
+            let s = eng.stream.clone();
+            match s.alloc_zeros::<u8>(tensor.len()) {
+                Ok(mut dev) => {
+                    if s.memcpy_htod(tensor, &mut dev).is_ok() {
+                        eng.expert_budget = Some(budget - tensor.len() as u64);
+                        eng.expert_pool.insert(key, dev);
+                    } else {
+                        eng.expert_rejected.insert(key);
+                    }
+                }
+                Err(_) => {
+                    eng.expert_rejected.insert(key);
+                }
+            }
+        } else {
+            eng.expert_rejected.insert(key);
+        }
+    }
+    if !eng.expert_pool.contains_key(&key) {
+        streamed = true;
+        // Grow the scratch to fit and stream the tensor for this call.
+        let s = eng.stream.clone();
+        let need = tensor.len();
+        let cap_ok = eng
+            .scratch
+            .as_ref()
+            .map(|b| b.len() >= need)
+            .unwrap_or(false);
+        if !cap_ok {
+            match s.alloc_zeros::<u8>(need) {
+                Ok(b) => eng.scratch = Some(b),
+                Err(e) => {
+                    eprintln!("[dg-cuda] fast scratch alloc failed ({e}); CPU fallback");
+                    return None;
+                }
+            }
+        }
+        // Stage through pinned memory, filled by a DIRECT positioned file
+        // read. Under RAM pressure the mmap's demand paging re-reads evicted
+        // pages at random-fault speed (~0.6 GB/s observed); a sequential
+        // buffered read hits NVMe read-ahead speed instead, and the pinned
+        // buffer gives the htod full DMA rate. Falls back to the mmap slice.
+        let pin_ok = eng
+            .pinned
+            .as_ref()
+            .map(|pin| pin.len() >= need)
+            .unwrap_or(false);
+        if !pin_ok {
+            eng.pinned = unsafe { eng.ctx.alloc_pinned::<u8>(need) }.ok();
+        }
+        let staged: Option<&[u8]> = eng.pinned.as_mut().and_then(|pin| {
+            let dst = pin.as_mut_ptr().ok()?;
+            // SAFETY: pin.len() >= need (grown above).
+            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, need) };
+            let read_ok = std::fs::File::open(src.0)
+                .and_then(|f| read_at_into(&f, src.1, dst_slice))
+                .is_ok();
+            if !read_ok {
+                // SAFETY: as above; the mmap slice is the fallback source.
+                unsafe { std::ptr::copy_nonoverlapping(tensor.as_ptr(), dst, need) };
+            }
+            pin.as_slice().ok().map(|sl| &sl[..need])
+        });
+        let buf = eng.scratch.as_mut().unwrap();
+        let mut view = buf.slice_mut(0..need);
+        let copied = match staged {
+            Some(host) => s.memcpy_htod(host, &mut view),
+            None => s.memcpy_htod(tensor, &mut view),
+        };
+        if let Err(e) = copied {
+            eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
+            return None;
+        }
+    }
+    let func = match kind {
+        DgExpertKind::Q4K => &eng.q4k_id_func,
+        DgExpertKind::Q80 => &eng.q80_id_func,
+        DgExpertKind::Q50 => &eng.q50_id_func,
+    };
+    let run = || -> Result<Vec<f32>, String> {
+        let s = eng.stream.clone();
+        let mut sc_dev = s
+            .alloc_zeros::<f32>(act_scales.len())
+            .map_err(|e| format!("alloc act scales: {e}"))?;
+        s.memcpy_htod(act_scales, &mut sc_dev)
+            .map_err(|e| format!("upload act scales: {e}"))?;
+        let mut q_dev = s
+            .alloc_zeros::<i8>(act_quants.len())
+            .map_err(|e| format!("alloc act quants: {e}"))?;
+        s.memcpy_htod(act_quants, &mut q_dev)
+            .map_err(|e| format!("upload act quants: {e}"))?;
+        let mut base_dev = s
+            .alloc_zeros::<i64>(n_pairs)
+            .map_err(|e| format!("alloc pair base: {e}"))?;
+        s.memcpy_htod(pair_base, &mut base_dev)
+            .map_err(|e| format!("upload pair base: {e}"))?;
+        let mut pos_dev = s
+            .alloc_zeros::<i32>(n_pairs)
+            .map_err(|e| format!("alloc pair pos: {e}"))?;
+        s.memcpy_htod(pair_pos, &mut pos_dev)
+            .map_err(|e| format!("upload pair pos: {e}"))?;
+        let mut out_dev = s
+            .alloc_zeros::<f32>(n_pairs * rows_per)
+            .map_err(|e| format!("alloc out: {e}"))?;
+        let total = (n_pairs * rows_per) as u64;
+        let block = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((total as u32).div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let (np, rp, bp) = (n_pairs as i32, rows_per as i32, blocks_per_row as i32);
+        let mut b = s.launch_builder(func);
+        if streamed {
+            let buf = eng.scratch.as_ref().unwrap();
+            b.arg(buf);
+        } else {
+            b.arg(eng.expert_pool.get(&key).unwrap());
+        }
+        b.arg(&sc_dev)
+            .arg(&q_dev)
+            .arg(&base_dev)
+            .arg(&pos_dev)
+            .arg(&np)
+            .arg(&rp)
+            .arg(&bp)
+            .arg(&mut out_dev);
+        unsafe { b.launch(cfg) }.map_err(|e| format!("launch: {e}"))?;
+        let mut out = vec![0f32; n_pairs * rows_per];
+        s.memcpy_dtoh(&out_dev, &mut out)
+            .map_err(|e| format!("download: {e}"))?;
+        eng.ctx.synchronize().map_err(|e| format!("sync: {e}"))?;
+        Ok(out)
+    };
+    match run() {
+        Ok(v) => Some(v),
+        Err(err) => {
+            eprintln!("[dg-cuda] fast gemm failed ({err}); CPU fallback");
             None
         }
     }
@@ -767,6 +1187,158 @@ mod tests {
                     first + r,
                     gpu[r]
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fast_tests {
+    use super::*;
+
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// FAST batched-ID kernels vs the CPU reference dots on random data with
+    /// random (base, pos) pairs — per-row bit-identical (the kernels mirror
+    /// the scalar reductions; fast mode's non-bit-exact caveats are about
+    /// GEMM batching effects elsewhere, not these kernels). Skips without CUDA.
+    #[test]
+    fn fast_gemm_id_matches_cpu_dots() {
+        if gate_off() {
+            eprintln!("skipping: CUDA unavailable or gated off");
+            return;
+        }
+        let mut state: u64 = 0xfa57_f00d_5eed_0001;
+        let dummy = std::path::Path::new("unused-resident-path");
+
+        // 3 "experts" x 5 rows each, 2 activations, 4 random pairs.
+        let (n_exp, rows_per, n_acts) = (3usize, 5usize, 2usize);
+        let total_rows = n_exp * rows_per;
+        let pairs: Vec<(i64, i32)> = vec![(0, 0), (5, 1), (10, 0), (5, 0)];
+        let base: Vec<i64> = pairs.iter().map(|p| p.0).collect();
+        let pos: Vec<i32> = pairs.iter().map(|p| p.1).collect();
+
+        // ---- Q4_K (bpr superblocks of 256) ----
+        let bpr = 2usize;
+        let mut wire = vec![0u8; total_rows * bpr * 144];
+        for b in wire.iter_mut() {
+            *b = (xorshift(&mut state) & 0xff) as u8;
+        }
+        for sb in 0..total_rows * bpr {
+            wire[sb * 144 + 1] &= 0x3f;
+            wire[sb * 144 + 3] &= 0x3f;
+        }
+        let mut blocks: Vec<Vec<crate::inference::Q8KBlock>> = Vec::new();
+        let mut scales = vec![0f32; n_acts * bpr];
+        let mut quants = vec![0i8; n_acts * bpr * 256];
+        for a in 0..n_acts {
+            let mut act = Vec::new();
+            for b in 0..bpr {
+                let mut qs = [0i8; 256];
+                for q in qs.iter_mut() {
+                    *q = (xorshift(&mut state) & 0xff) as u8 as i8;
+                }
+                let d = (xorshift(&mut state) % 1000) as f32 / 333.0 + 0.001;
+                scales[a * bpr + b] = d;
+                quants[(a * bpr + b) * 256..(a * bpr + b + 1) * 256].copy_from_slice(&qs);
+                act.push(crate::inference::Q8KBlock { d, qs });
+            }
+            blocks.push(act);
+        }
+        let out = fast_gemm_id(
+            &wire,
+            (dummy, 0),
+            DgExpertKind::Q4K,
+            &base,
+            &pos,
+            rows_per,
+            bpr,
+            &scales,
+            &quants,
+        )
+        .expect("q4k id gemm");
+        for (pi, &(b, a)) in pairs.iter().enumerate() {
+            for r in 0..rows_per {
+                let row_i = b as usize + r;
+                let row = &wire[row_i * bpr * 144..(row_i + 1) * bpr * 144];
+                let cpu = super::super::refmath::q4_k_dot_arm(row, &blocks[a as usize]);
+                assert_eq!(
+                    cpu.to_bits(),
+                    out[pi * rows_per + r].to_bits(),
+                    "q4k pair {pi} row {r}"
+                );
+            }
+        }
+
+        // ---- Q8_0 and Q5_0 (nb 32-value blocks; shared activation form) ----
+        let nb = 4usize;
+        let mut q80_acts: Vec<Vec<crate::tensor::Q8_0Block>> = Vec::new();
+        let mut scales = vec![0f32; n_acts * nb];
+        let mut quants = vec![0i8; n_acts * nb * 32];
+        for a in 0..n_acts {
+            let mut act = Vec::new();
+            for b in 0..nb {
+                let mut qv = [0i8; 32];
+                for q in qv.iter_mut() {
+                    *q = (xorshift(&mut state) & 0xff) as u8 as i8;
+                }
+                let s = (xorshift(&mut state) % 1000) as f32 / 777.0 + 0.002;
+                scales[a * nb + b] = s;
+                quants[(a * nb + b) * 32..(a * nb + b + 1) * 32].copy_from_slice(&qv);
+                act.push(crate::tensor::Q8_0Block {
+                    scale: s,
+                    quants: qv,
+                });
+            }
+            q80_acts.push(act);
+        }
+        for (kind, wire_bytes, name) in [
+            (DgExpertKind::Q80, 34usize, "q8_0"),
+            (DgExpertKind::Q50, 22usize, "q5_0"),
+        ] {
+            let mut wire = vec![0u8; total_rows * nb * wire_bytes];
+            for b in wire.iter_mut() {
+                *b = (xorshift(&mut state) & 0xff) as u8;
+            }
+            for blk in 0..total_rows * nb {
+                wire[blk * wire_bytes + 1] &= 0x3f;
+            }
+            let out = fast_gemm_id(
+                &wire,
+                (dummy, 0),
+                kind,
+                &base,
+                &pos,
+                rows_per,
+                nb,
+                &scales,
+                &quants,
+            )
+            .unwrap_or_else(|| panic!("{name} id gemm"));
+            for (pi, &(b, a)) in pairs.iter().enumerate() {
+                for r in 0..rows_per {
+                    let row_i = b as usize + r;
+                    let row = &wire[row_i * nb * wire_bytes..(row_i + 1) * nb * wire_bytes];
+                    let cpu = match kind {
+                        DgExpertKind::Q80 => {
+                            super::super::refmath::q8_0_dot_arm(row, &q80_acts[a as usize])
+                        }
+                        DgExpertKind::Q50 => {
+                            super::super::refmath::q5_0_dot_arm(row, &q80_acts[a as usize])
+                        }
+                        DgExpertKind::Q4K => unreachable!(),
+                    };
+                    assert_eq!(
+                        cpu.to_bits(),
+                        out[pi * rows_per + r].to_bits(),
+                        "{name} pair {pi} row {r}"
+                    );
+                }
             }
         }
     }
