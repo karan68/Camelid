@@ -1959,6 +1959,17 @@ impl LlamaInferenceSession {
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
+        // Q5_K residency: 176-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks (the q5k_gemv
+        // kernel reads the wire bytes a super-block at a time). Q5_K_M promotes
+        // attn_v/ffn_down (and the tied lm_head) to Q6_K, so a Q5_K_M model is mixed
+        // Q5K+Q6K.
+        let is_q5k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q5K)
+                && t.q5_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
         // Q6_K residency: 210-byte super-block wire bytes materialized and the
         // contraction dimension a whole number of 256-value super-blocks (the q6k_gemv
         // kernel reads the wire bytes a super-block at a time). Q4_K_M promotes
@@ -1989,9 +2000,10 @@ impl LlamaInferenceSession {
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
         // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
-        // (Q4_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
-        let is_resident_quant =
-            |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t);
+        // (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
+        let is_resident_quant = |t: &CpuTensor| {
+            is_q8(t) || is_q4k(t) || is_q5k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t)
+        };
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
             .weights
@@ -10047,6 +10059,11 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if t.source_type == Some(GgufTensorType::Q5K) {
+            if let Some(w) = t.q5_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
         if t.source_type == Some(GgufTensorType::Q6K) {
             if let Some(w) = t.q6_k_wire_bytes.as_deref() {
                 return Some(w.as_slice());
@@ -10069,6 +10086,7 @@ fn build_resident_cuda_engine(
     fn proj_quant(t: &CpuTensor) -> ProjQuant {
         match t.source_type {
             Some(GgufTensorType::Q4K) if t.q4_k_wire_bytes.is_some() => ProjQuant::Q4K,
+            Some(GgufTensorType::Q5K) if t.q5_k_wire_bytes.is_some() => ProjQuant::Q5K,
             Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
             Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
             Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
