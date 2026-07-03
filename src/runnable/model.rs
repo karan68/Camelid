@@ -1143,6 +1143,9 @@ impl RunnableModel {
     /// i+1). CPU path runs the per-token decode with the LM head at each step;
     /// with `CAMELID_QWEN35_CUDA=1` the resident engine computes the same
     /// stream on the GPU. Fresh SSM/KV state per call.
+    // Only the env-driven #[ignore] harness tests call this — dead code on the
+    // plain lib target.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn qwen35_argmax_stream(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         if tokens.is_empty() {
             return Ok(Vec::new());
@@ -1169,6 +1172,7 @@ impl RunnableModel {
     }
 
     #[cfg(feature = "cuda")]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn qwen35_argmax_stream_cuda(&self, tokens: &[u32]) -> Result<Vec<u32>> {
         let max_pos: usize = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
             .ok()
@@ -1207,6 +1211,7 @@ impl RunnableModel {
     /// Item 5 harness: run the batched CPU prefill over `tokens` and return the
     /// wall-clock seconds (the marginal cost between two prefix lengths is the
     /// batched k-token verify cost).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn qwen35_prefill_timed(&self, tokens: &[u32]) -> Result<f64> {
         let started = std::time::Instant::now();
         let (_cache, _logits) = self.prefill_qwen35(tokens)?;

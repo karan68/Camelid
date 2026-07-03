@@ -2300,7 +2300,15 @@ impl CudaResidentKernels {
         let ordinal = crate::cuda::selected_device_ordinal();
         let ctx =
             CudaContext::new(ordinal).map_err(|e| format!("CudaContext::new({ordinal}): {e}"))?;
-        let stream = ctx.default_stream();
+        // A dedicated (non-default) stream: CUDA forbids stream capture on the
+        // legacy default stream (CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED at
+        // begin_capture), so the graphed decode path requires this. Ordering is
+        // unaffected: all engine work runs on THIS one stream, the offload copy
+        // stream already synchronizes via explicit events, and host-visible
+        // results go through ctx.synchronize() (device-wide).
+        let stream = ctx
+            .new_stream()
+            .map_err(|e| format!("engine stream: {e}"))?;
         let opts = CompileOptions {
             fmad: Some(false),
             arch: Some("compute_61"),
@@ -5864,11 +5872,19 @@ impl CudaResidentDecode {
             return Ok(None);
         }
         // Greedy decode: replay the captured CUDA graph when enabled (one launch for
-        // the whole ~600-kernel token), else the per-launch path. Both are byte-exact:
-        // the graph records the identical kernels reading the same device buffers.
-        // qwen35 (Ornith) hybrid SSM is force-serial: the captured graph freezes
-        // attention launch config and does not model the per-token recurrent SSM state
-        // mutation, so qwen35 always runs the per-launch forward_pass.
+        // the whole ~600-kernel token), else the per-launch path. STATUS 2026-07-03:
+        // capture is broken on this Windows/WDDM driver (576.83, CUDA 12.9) for BOTH
+        // the llama and qwen35 arches — begin_capture on the default stream returns
+        // CAPTURE_UNSUPPORTED (fixed by the dedicated engine stream), and recording
+        // then dies with CAPTURE_ISOLATION ("dependency created on uncaptured work in
+        // another stream") inside the common layer loop even after a pre-capture
+        // stream drain, in release builds deterministically (llama probe:
+        // full_forward_token_matches_cpu fails identically). The qwen35 guard below is
+        // kept so an env opt-in cannot silently fall back to the CPU lane on serve;
+        // the real launch-overhead fix is the device-side decode loop (resident
+        // embedding gather + resident rope tables reading d_sampled/d_position), which
+        // needs no capture at all. qwen35's SSM state itself is graph-compatible
+        // (stable engine-level buffers, no position launch scalars).
         if cuda_graphs_enabled() && self.qwen35.is_none() {
             return self
                 .forward_token_greedy_graphed(embedding, cos, sin, position, scale)
@@ -5905,21 +5921,34 @@ impl CudaResidentDecode {
         scale: f32,
     ) -> Result<u32, String> {
         use cudarc::driver::sys;
-        let map = |e: cudarc::driver::DriverError| format!("cuda graph: {e}");
+        let map = |step: &'static str| {
+            move |e: cudarc::driver::DriverError| format!("cuda graph {step}: {e}")
+        };
         let s = self.k.stream.clone();
         // Per-token inputs live in device buffers the (frozen) graph reads on replay.
-        s.memcpy_htod(embedding, &mut self.d_hidden).map_err(map)?;
-        s.memcpy_htod(cos, &mut self.d_cos).map_err(map)?;
-        s.memcpy_htod(sin, &mut self.d_sin).map_err(map)?;
+        s.memcpy_htod(embedding, &mut self.d_hidden)
+            .map_err(map("htod-emb"))?;
+        s.memcpy_htod(cos, &mut self.d_cos)
+            .map_err(map("htod-cos"))?;
+        s.memcpy_htod(sin, &mut self.d_sin)
+            .map_err(map("htod-sin"))?;
         s.memcpy_htod(&[position as i32], &mut self.d_position)
-            .map_err(map)?;
+            .map_err(map("htod-pos"))?;
 
         if self.decode_graph.is_none() {
             // Record the greedy forward (layer stack + output projection + argmax)
             // once. Stream capture records without executing, so this does not write
             // KV; the first real execution is the `launch()` below.
+            //
+            // Drain the stream first: the input uploads above may still be in
+            // flight (WDDM stages pageable H2D copies through driver-internal
+            // work), and capture beginning while they are pending records a
+            // dependency on uncaptured work — CUDA_ERROR_STREAM_CAPTURE_ISOLATION.
+            // (Debug builds masked this: the slower host let the copies complete
+            // before begin_capture.) One-time cost — replays skip this branch.
+            s.synchronize().map_err(map("pre-capture sync"))?;
             s.begin_capture(sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-                .map_err(map)?;
+                .map_err(map("begin"))?;
             let recorded = (|| -> Result<(), String> {
                 self.forward_pass(embedding, cos, sin, position, scale, true, true)?;
                 launch_argmax(
@@ -5929,7 +5958,7 @@ impl CudaResidentDecode {
                     self.vocab,
                     &mut self.d_sampled,
                 )
-                .map_err(map)?;
+                .map_err(map("argmax"))?;
                 Ok(())
             })();
             // Always end capture to leave the stream clean, then surface a record error.
@@ -5938,9 +5967,9 @@ impl CudaResidentDecode {
             let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0) };
             let captured = s.end_capture(flags);
             recorded?;
-            match captured.map_err(map)? {
+            match captured.map_err(map("end"))? {
                 Some(graph) => {
-                    graph.upload().map_err(map)?;
+                    graph.upload().map_err(map("upload"))?;
                     self.decode_graph = Some(SendCudaGraph(graph));
                 }
                 None => return Err("decode graph capture produced no graph".into()),
@@ -5952,10 +5981,11 @@ impl CudaResidentDecode {
             .expect("decode graph present")
             .0
             .launch()
-            .map_err(map)?;
+            .map_err(map("replay"))?;
         let mut out = [0u32; 1];
-        s.memcpy_dtoh(&self.d_sampled, &mut out).map_err(map)?;
-        self.k.ctx.synchronize().map_err(map)?;
+        s.memcpy_dtoh(&self.d_sampled, &mut out)
+            .map_err(map("dtoh"))?;
+        self.k.ctx.synchronize().map_err(map("sync"))?;
         Ok(out[0])
     }
 
