@@ -10,7 +10,7 @@ test runnable::model::gpu_ssm_layer_tests::qwen35_gpu_single_token_matches_cpu .
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 685 filtered out; finished in 253.12s
 
 ==PROF== Disconnected from process 27960
-[27960] camelid-3722b74a8cf48178.exe@127.0.0.1
+[27960] camelid-3722b74a8cf48178.exe(local)
   q4k_gemv (512, 1, 1)x(256, 1, 1), Context 1, Stream 7, Device 0, CC 8.6
     Section: GPU Speed Of Light Throughput
     ----------------------- ----------- ------------
