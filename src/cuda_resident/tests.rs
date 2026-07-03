@@ -2204,9 +2204,119 @@ fn q4k_gemv_matches_oracle() {
     );
 }
 
+// Build `rows*n_sb` synthetic Q5_K_M super-blocks (176 bytes each, row-major):
+// d(f16), dmin(f16), scales[12], qh[32], qs[128]. Like synth_q4k_wire the bytes need
+// not be a real quantization — the kernel and the oracle read the SAME bytes — so the
+// full qh[32]+qs[128] weight region is random (exercises every fifth-bit combination).
+fn synth_q5k_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
+    const WIRE: usize = 176;
+    let mut out = vec![0u8; rows * n_sb * WIRE];
+    for sb in 0..rows * n_sb {
+        let blk = &mut out[sb * WIRE..(sb + 1) * WIRE];
+        let d = (rng.next_f32().abs() * 0.05 + 0.001).min(0.2);
+        let dmin = (rng.next_f32().abs() * 0.05 + 0.001).min(0.2);
+        let db = crate::inference::f32_to_f16_bits(d).to_le_bytes();
+        let dmb = crate::inference::f32_to_f16_bits(dmin).to_le_bytes();
+        blk[0] = db[0];
+        blk[1] = db[1];
+        blk[2] = dmb[0];
+        blk[3] = dmb[1];
+        // scales[12] + qh[32] + qs[128] = bytes 4..176, fully random.
+        for b in blk.iter_mut().take(176).skip(4) {
+            *b = rng.next_u8();
+        }
+    }
+    out
+}
+
+// Bit-parity receipt for the Q5_K_M fused-dequant decode GEMV. Generates synthetic
+// Q5_K super-block weight bytes + a Q8_K-quantized activation, runs q5k_gemv on the
+// GPU, and asserts each output row reproduces the validated CPU oracle
+// `q5_k_wire_row_dot` on the SAME bytes. Q5_K is Q4_K plus a fifth (qh) bit, so the
+// kernel mirrors the same ordered f32 accumulation (8 main lanes + scalar mins) as
+// q4k_gemv — the result is expected BIT-IDENTICAL, within the same tiny ordered-f32
+// tolerance the q4k/q8 parity tests use.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn q5k_gemv_matches_oracle() {
+    let Some(k) = kernels() else {
+        return;
+    };
+    let rows = 96usize;
+    let n_sb = 3usize; // contraction dim = 3*256 = 768
+    let kdim = n_sb * 256;
+    let mut rng = Lcg(0x5b_5b_5b);
+
+    // Synthetic Q5_K weight wire bytes (rows*n_sb super-blocks). The kernel reads the
+    // RAW 176-byte wire layout directly (low nibbles + qh fifth bit + kmask scales
+    // expanded on the fly), so no host repack — the same bytes the resident upload
+    // passes through.
+    let wire = synth_q5k_wire(rows, n_sb, &mut rng);
+    let wsoa = wire.clone();
+
+    // Q8_K activation: quantize a random f32 row, then split into per-superblock
+    // scales (y.d) and the concatenated 256-wide i8 quants (y.qs).
+    let act: Vec<f32> = (0..kdim).map(|_| rng.next_f32()).collect();
+    let q8k = crate::inference::quantize_q8_k_blocks(&act);
+    assert_eq!(q8k.len(), n_sb);
+    let in_scales: Vec<f32> = q8k.iter().map(|b| b.d).collect();
+    let mut in_quants = vec![0i8; kdim];
+    for (b, blk) in q8k.iter().enumerate() {
+        in_quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+    }
+
+    // CPU oracle per output row.
+    const WIRE: usize = 176;
+    let row_bytes = n_sb * WIRE;
+    let mut expected = vec![0f32; rows];
+    for (r, slot) in expected.iter_mut().enumerate() {
+        let row_wire = &wire[r * row_bytes..(r + 1) * row_bytes];
+        *slot = crate::inference::q5_k_wire_row_dot(row_wire, &q8k);
+    }
+
+    // GPU.
+    let d_is = k.stream.clone_htod(&in_scales).unwrap();
+    let d_iq = k.stream.clone_htod(&in_quants).unwrap();
+    let d_w = k.stream.clone_htod(&wsoa).unwrap();
+    let mut d_out = k.stream.alloc_zeros::<f32>(rows).unwrap();
+    super::launch_q5k_gemv(
+        &k.stream,
+        &k.q5k_gemv,
+        &d_is,
+        &d_iq,
+        &d_w.slice(0..wsoa.len()),
+        rows,
+        n_sb,
+        &mut d_out,
+        0,
+    )
+    .unwrap();
+    let mut got = vec![0f32; rows];
+    k.stream.memcpy_dtoh(&d_out, &mut got).unwrap();
+    k.ctx.synchronize().unwrap();
+
+    let mut worst = 0f32;
+    let mut exact = 0usize;
+    for (g, e) in got.iter().zip(&expected) {
+        if g.to_bits() == e.to_bits() {
+            exact += 1;
+        }
+        let d = (g - e).abs() / e.abs().max(1.0);
+        if d > worst {
+            worst = d;
+        }
+    }
+    eprintln!(
+        "q5k_gemv_matches_oracle: {}/{} rows bit-identical, worst rel diff {:.3e}",
+        exact, rows, worst
+    );
+    assert!(
+        close(&got, &expected, 1e-4),
+        "q5k_gemv diverged from q5_k_wire_row_dot oracle (worst rel {worst:.3e})"
+    );
+}
+
 // Synthetic Q2_K weight wire bytes: rows*n_sb super-blocks of 84 bytes each
-// (scales[16] + qs[64] + d/dmin f16). Small positive f16 super-scales keep the
-// dequant products in a sane f32 range; scales + quants are fully random.
 fn synth_q2k_wire(rows: usize, n_sb: usize, rng: &mut Lcg) -> Vec<u8> {
     const WIRE: usize = 84;
     let mut out = vec![0u8; rows * n_sb * WIRE];
