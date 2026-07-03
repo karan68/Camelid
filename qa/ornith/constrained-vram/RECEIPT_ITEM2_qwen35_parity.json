@@ -4,7 +4,7 @@
   "lane": "ornith-9b-constrained-vram",
   "date": "2026-07-02T18:10:57.179Z",
   "reference": "llama.cpp acd79d6 llama-server -ngl 0 -ctk f32 -ctv f32 --no-repack (CPU)",
-  "model": "C:/Users/timto/Camelid/models/ornith-1.0-9b-Q8_0.gguf",
+  "model": "models/ornith-1.0-9b-Q8_0.gguf",
   "n_predict": 64,
   "sampling": "greedy (temperature 0, top_k 1, seed 0, cache_prompt false)",
   "method": "identical prompt token-ID arrays fed to both engines (isolates model forward from tokenization; tokenization itself certified separately by RECEIPT_ITEM1); engines never co-resident",

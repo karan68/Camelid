@@ -3,8 +3,8 @@
 # load at -c 16384 -ngl 99, run one 64-token greedy completion, record peak
 # nvidia-smi memory.used across load+decode, then kill. One quant per loop.
 set -uo pipefail
-BIN=/c/Users/timto/llama.cpp/build/bin/llama-server.exe
-MODELS=/c/Users/timto/Camelid/models
+BIN=${CAMELID_LLAMACPP_BIN:-$HOME/llama.cpp/build/bin}/llama-server.exe
+MODELS=${CAMELID_MODELS_DIR:-models}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/residency_16k_server.txt"
 : > "$OUT"

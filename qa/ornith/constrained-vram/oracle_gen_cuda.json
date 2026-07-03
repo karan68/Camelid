@@ -1,7 +1,7 @@
 {
   "schema": "camelid.fixture-corpus/v1",
   "oracle": "llama.cpp acd79d6 llama-server -ngl 99 (CUDA)",
-  "model": "C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf",
+  "model": "models/ornith-1.0-9b-Q4_K_M.gguf",
   "n_predict": 64,
   "sampling": "greedy (temperature 0, top_k 1, seed 0, cache_prompt false)",
   "date": "2026-07-02T18:13:39.774Z",

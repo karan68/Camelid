@@ -12,10 +12,10 @@ import { spawn, execSync } from 'child_process';
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const MODE = process.argv[2] === 'cuda' ? 'cuda' : 'cpu';
 const N_PREDICT = parseInt(process.env.CAMELID_PARITY_NPREDICT || '64', 10);
-const SERVER = 'C:/Users/timto/llama.cpp/build/bin/llama-server.exe';
+const SERVER = (process.env.CAMELID_LLAMACPP_BIN || 'llama.cpp/build/bin') + '/llama-server.exe';
 const MODEL = process.env.CAMELID_ORACLE_MODEL || (MODE === 'cuda'
-  ? 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf'
-  : 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q8_0.gguf');
+  ? (process.env.CAMELID_MODELS_DIR || 'models') + '/ornith-1.0-9b-Q4_K_M.gguf'
+  : (process.env.CAMELID_MODELS_DIR || 'models') + '/ornith-1.0-9b-Q8_0.gguf');
 const PORT = 8114;
 const fixtures = JSON.parse(fs.readFileSync(path.join(HERE, 'FIXTURES_five_prompt_parity.json'), 'utf8'));
 

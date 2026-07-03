@@ -5,8 +5,8 @@
 #   ./item4_pipeline.sh ppl <model.gguf> <ngl>  — perplexity of one model on the held-out coding slice
 # All tools are the pinned REF_QWEN35 build (acd79d6).
 set -euo pipefail
-BIN=/c/Users/timto/llama.cpp/build/bin
-MODELS=/c/Users/timto/Camelid/models
+BIN=${CAMELID_LLAMACPP_BIN:-$HOME/llama.cpp/build/bin}
+MODELS=${CAMELID_MODELS_DIR:-models}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 case "${1:-}" in

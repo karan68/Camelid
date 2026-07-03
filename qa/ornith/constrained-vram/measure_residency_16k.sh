@@ -4,8 +4,8 @@
 # to Camelid's sparse-KV design). Records peak nvidia-smi memory.used while a
 # short greedy generation runs, plus load success.
 set -uo pipefail
-BIN=/c/Users/timto/llama.cpp/build/bin
-MODELS=/c/Users/timto/Camelid/models
+BIN=${CAMELID_LLAMACPP_BIN:-$HOME/llama.cpp/build/bin}
+MODELS=${CAMELID_MODELS_DIR:-models}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 OUT="$HERE/residency_16k_measurements.txt"
 : > "$OUT"

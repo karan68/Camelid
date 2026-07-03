@@ -7,8 +7,8 @@ import path from 'path';
 import { spawn, execSync } from 'child_process';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const SERVER = 'C:/Users/timto/llama.cpp/build/bin/llama-server.exe';
-const MODEL = 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf';
+const SERVER = (process.env.CAMELID_LLAMACPP_BIN || 'llama.cpp/build/bin') + '/llama-server.exe';
+const MODEL = (process.env.CAMELID_MODELS_DIR || 'models') + '/ornith-1.0-9b-Q4_K_M.gguf';
 const PORT = 8114;
 const receipt = JSON.parse(fs.readFileSync(path.join(HERE, 'RECEIPT_ITEM2_qwen35_parity_cuda.json'), 'utf8'));
 const fixtures = JSON.parse(fs.readFileSync(path.join(HERE, 'FIXTURES_five_prompt_parity.json'), 'utf8'));

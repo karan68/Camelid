@@ -4,7 +4,7 @@
   "lane": "ornith-9b-constrained-vram",
   "date": "2026-07-02T17:26:53.072Z",
   "reference": "llama.cpp acd79d6 (REF_QWEN35) llama-tokenize",
-  "model": "C:/Users/timto/Camelid/models/ornith-1.0-9b-Q4_K_M.gguf",
+  "model": "models/ornith-1.0-9b-Q4_K_M.gguf",
   "modes": {
     "plain": {
       "cases": 45,

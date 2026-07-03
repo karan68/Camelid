@@ -7,7 +7,7 @@ import path from 'path';
 import { execFileSync } from 'child_process';
 
 const HERE = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const MODEL = 'C:/Users/timto/Camelid/models/ornith-1.0-9b-Q3_K_M.gguf';
+const MODEL = (process.env.CAMELID_MODELS_DIR || 'models') + '/ornith-1.0-9b-Q3_K_M.gguf';
 const CAMELID = path.resolve(HERE, '../../../target/release/camelid.exe');
 const traces = JSON.parse(fs.readFileSync(path.join(HERE, 'TRACES_agentic_20.json'), 'utf8')).traces;
 
