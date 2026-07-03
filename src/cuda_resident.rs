@@ -2741,7 +2741,7 @@ fn repack_for_lane(bytes: &[u8], q: ProjQuant) -> Vec<u8> {
         ProjQuant::Q8_0 => repack_q8_soa(bytes),
         ProjQuant::Q6K => pad_q6k_blocks(bytes),
         ProjQuant::Q4K => swz_q4k_blocks(bytes),
-    ProjQuant::Q5K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
+        ProjQuant::Q5K | ProjQuant::Q2K | ProjQuant::Q3K => bytes.to_vec(),
     }
 }
 
