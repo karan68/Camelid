@@ -1681,8 +1681,14 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     // than the lazy runtime map (otherwise chat stays locked until you chat â†’ deadlock).
     let runnable_serve_ready = runnable_serve_enabled()
         && model.is_some_and(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()));
+    // Same shape for the DiffusionGemma serve bridge: ready once the model is
+    // loaded with the lane enabled (the runtime loads eagerly at model load,
+    // but gate on enabled + arch so a heal-path gap cannot lock the UI).
+    let dg_serve_ready = dg_serve_enabled()
+        && model.is_some_and(|m| is_dg_serve_arch(m.gguf.architecture().unwrap_or_default()));
     let generation_ready = gemma4_available
         || runnable_serve_ready
+        || dg_serve_ready
         || model.is_some_and(loaded_model_generation_ready);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
