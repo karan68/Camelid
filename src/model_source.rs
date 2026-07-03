@@ -25,14 +25,22 @@ pub enum ModelSourceKind {
 pub struct ModelSourceManifest {
     pub id: String,
     pub kind: ModelSourceKind,
+    #[serde(skip_serializing)]
     pub root: PathBuf,
+    #[serde(skip_serializing)]
     pub weight_files: Vec<PathBuf>,
     pub tensor_descriptors: Vec<SafeTensorsTensorDescriptor>,
+    #[serde(skip_serializing)]
     pub config_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub tokenizer_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub tokenizer_config_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub special_tokens_map_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub generation_config_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub shard_index_path: Option<PathBuf>,
 }
 
@@ -41,6 +49,8 @@ pub struct SafeTensorsTensorDescriptor {
     pub name: String,
     pub dtype: String,
     pub shape: Vec<u64>,
+    pub shard_file: String,
+    #[serde(skip_serializing)]
     pub shard: PathBuf,
     pub data_offsets: [u64; 2],
 }
@@ -437,6 +447,7 @@ fn parse_safetensors_header(
             name: name.clone(),
             dtype: tensor.dtype,
             shape: tensor.shape,
+            shard_file: public_path_label(path),
             shard: path.to_path_buf(),
             data_offsets: tensor.data_offsets,
         });
@@ -695,6 +706,10 @@ mod tests {
             "lm_head.weight"
         );
         assert_eq!(inspection.manifest.tensor_descriptors[0].dtype, "BF16");
+        assert_eq!(
+            inspection.manifest.tensor_descriptors[0].shard_file,
+            "model-00002-of-00002.safetensors"
+        );
         assert_eq!(
             inspection.manifest.tensor_descriptors[1].name,
             "model.embed_tokens.weight"
@@ -1053,6 +1068,30 @@ mod tests {
         assert!(inspection.readiness.blockers[0]
             .message
             .contains("lm_head.weight in model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn serialized_hf_inspection_does_not_expose_local_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+        let json = serde_json::to_string(&inspection).unwrap();
+
+        assert_public_blocker_message_without_local_path(&json, dir.path());
+        assert!(!json.contains("root"));
+        assert!(!json.contains("weight_files"));
+        assert!(!json.contains("config_path"));
+        assert!(!json.contains("tokenizer_path"));
+        assert!(!json.contains("\"shard\""));
+        assert!(json.contains("shard_file"));
+        assert!(json.contains("model.safetensors"));
     }
 
     #[test]
