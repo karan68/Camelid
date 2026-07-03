@@ -1137,6 +1137,82 @@ impl RunnableModel {
     /// `decode_token_qwen35` over the prompt — causal attention means each position
     /// only depends on earlier ones, so batching by layer is bit-identical to the
     /// per-token order — and returns the LAST position's logits.
+    /// Item 5 (acceptance economics) harness: teacher-forced greedy argmax at
+    /// EVERY position of `tokens` — out[i] = argmax of the logits after
+    /// consuming tokens[0..=i] (the model's greedy prediction for position
+    /// i+1). CPU path runs the per-token decode with the LM head at each step;
+    /// with `CAMELID_QWEN35_CUDA=1` the resident engine computes the same
+    /// stream on the GPU. Fresh SSM/KV state per call.
+    pub(crate) fn qwen35_argmax_stream(&self, tokens: &[u32]) -> Result<Vec<u32>> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            if std::env::var("CAMELID_QWEN35_CUDA")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                return self.qwen35_argmax_stream_cuda(tokens);
+            }
+        }
+        let mut cache = Qwen35Cache::new(
+            self.qwen35.as_ref().expect("qwen35 runtime present"),
+            self.n_layers,
+        );
+        let mut out = Vec::with_capacity(tokens.len());
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let logits = self.decode_token_qwen35(tok, pos, &mut cache, true)?;
+            out.push(argmax(&logits));
+        }
+        Ok(out)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn qwen35_argmax_stream_cuda(&self, tokens: &[u32]) -> Result<Vec<u32>> {
+        let max_pos: usize = std::env::var("CAMELID_QWEN35_CUDA_MAXPOS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let mut guard = self
+            .cuda
+            .lock()
+            .map_err(|_| BackendError::InvalidTensorData("qwen35 cuda mutex poisoned".into()))?;
+        if guard.is_none() {
+            let e = self
+                .build_qwen35_resident(max_pos)
+                .map_err(BackendError::InvalidTensorData)?;
+            *guard = Some(e);
+        }
+        let engine = guard.as_mut().unwrap();
+        engine
+            .reset_qwen35_state()
+            .map_err(BackendError::InvalidTensorData)?;
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let mut out = Vec::with_capacity(tokens.len());
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let emb = self.token_embd.dequant_row(tok as usize, "token_embd")?;
+            let (cos, sin) = qwen35_rope_tables(pos, self.rope_base, self.rope_dim);
+            let next = engine
+                .forward_token(&emb, &cos, &sin, pos, scale, true)
+                .map_err(BackendError::InvalidTensorData)?
+                .ok_or_else(|| {
+                    BackendError::InvalidTensorData("no logits on argmax-stream step".into())
+                })?;
+            out.push(next);
+        }
+        Ok(out)
+    }
+
+    /// Item 5 harness: run the batched CPU prefill over `tokens` and return the
+    /// wall-clock seconds (the marginal cost between two prefix lengths is the
+    /// batched k-token verify cost).
+    pub(crate) fn qwen35_prefill_timed(&self, tokens: &[u32]) -> Result<f64> {
+        let started = std::time::Instant::now();
+        let (_cache, _logits) = self.prefill_qwen35(tokens)?;
+        Ok(started.elapsed().as_secs_f64())
+    }
+
     fn prefill_qwen35(&self, prompt: &[u32]) -> Result<(Qwen35Cache, Vec<f32>)> {
         let rt = self.qwen35.as_ref().expect("qwen35 runtime present");
         let m = prompt.len();

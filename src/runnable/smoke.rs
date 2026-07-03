@@ -493,4 +493,68 @@ mod tests {
             eprintln!("PARITY_GEN[{i}] {}", serde_json::to_string(&gen).unwrap());
         }
     }
+
+    /// Item 5 (acceptance economics) helper A: teacher-forced greedy argmax at
+    /// every position of each token sequence in the JSON file named by
+    /// `CAMELID_STREAM_FILE` (array of arrays of u32). Prints one
+    /// `ARGMAX[i] [...]` line per sequence. CPU by default; the resident GPU
+    /// engine with `CAMELID_QWEN35_CUDA=1`.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF + CAMELID_STREAM_FILE"]
+    fn ornith_qwen35_argmax_stream() {
+        let path = std::env::var("CAMELID_ORNITH_GGUF").expect("set CAMELID_ORNITH_GGUF");
+        let stream_file = std::env::var("CAMELID_STREAM_FILE").expect("set CAMELID_STREAM_FILE");
+        let token_sets: Vec<Vec<u32>> = serde_json::from_str(
+            &std::fs::read_to_string(&stream_file).expect("read CAMELID_STREAM_FILE"),
+        )
+        .expect("CAMELID_STREAM_FILE must be a JSON array of u32 arrays");
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        for (i, tokens) in token_sets.iter().enumerate() {
+            let started = std::time::Instant::now();
+            let stream = model.qwen35_argmax_stream(tokens).expect("argmax stream");
+            eprintln!(
+                "ARGMAX[{i}] len={} secs={:.1} {}",
+                stream.len(),
+                started.elapsed().as_secs_f64(),
+                serde_json::to_string(&stream).unwrap()
+            );
+        }
+    }
+
+    /// Item 5 helper B: batched-prefill marginal cost — the real CPU verify
+    /// cost for a k-token window. Times prefill at prefix length P and P+k for
+    /// k in {4,6,8,12} (3 reps printed raw for offline reduction). Prefix
+    /// tokens come from the first sequence in `CAMELID_STREAM_FILE`.
+    #[test]
+    #[ignore = "needs CAMELID_ORNITH_GGUF + CAMELID_STREAM_FILE"]
+    fn ornith_qwen35_verify_cost() {
+        let path = std::env::var("CAMELID_ORNITH_GGUF").expect("set CAMELID_ORNITH_GGUF");
+        let stream_file = std::env::var("CAMELID_STREAM_FILE").expect("set CAMELID_STREAM_FILE");
+        let token_sets: Vec<Vec<u32>> = serde_json::from_str(
+            &std::fs::read_to_string(&stream_file).expect("read CAMELID_STREAM_FILE"),
+        )
+        .expect("CAMELID_STREAM_FILE must be a JSON array of u32 arrays");
+        let prefix_len: usize = std::env::var("CAMELID_VERIFY_PREFIX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+        let tokens = &token_sets[0];
+        assert!(
+            tokens.len() >= prefix_len + 12,
+            "first stream sequence too short for prefix {prefix_len}+12"
+        );
+        let model = RunnableModel::load(&path).expect("load qwen35");
+        for rep in 0..3 {
+            let base = model
+                .qwen35_prefill_timed(&tokens[..prefix_len])
+                .expect("prefill base");
+            eprintln!("VERIFY_COST rep={rep} k=0 prefix={prefix_len} secs={base:.4}");
+            for k in [4usize, 6, 8, 12] {
+                let t = model
+                    .qwen35_prefill_timed(&tokens[..prefix_len + k])
+                    .expect("prefill P+k");
+                eprintln!("VERIFY_COST rep={rep} k={k} prefix={prefix_len} secs={t:.4}");
+            }
+        }
+    }
 }
