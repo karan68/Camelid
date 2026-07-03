@@ -103,6 +103,79 @@ fn lm_head_gpu(
     None
 }
 
+/// MoE expert row-range GEMV on the VRAM-resident expert pool — returns the
+/// `n_rows` outputs or `None` to fall back to the CPU rows loop. A no-op when
+/// the `cuda` feature is off. The GPU kernels mirror `q4_k_dot_scalar` /
+/// `q0_pair_dot` exactly (bit-identical outputs); only Q4_K and Q8_0 expert
+/// formats route here — anything else stays on CPU.
+#[cfg(feature = "cuda")]
+fn expert_rows_gpu(
+    wire: &DgWire,
+    first_row: usize,
+    n_rows: usize,
+    x: &DgActivation,
+) -> Option<Vec<f32>> {
+    let rb = wire.row_bytes();
+    // Whole-tensor slice: creating it faults no pages; only the one-time
+    // resident upload reads it.
+    let tensor = wire.mmap.bytes(wire.offset, wire.rows * rb).ok()?;
+    match wire.format {
+        DgFormat::Q4K => {
+            let blocks = x.q8_k.as_ref()?;
+            let bpr = wire.in_dim / 256;
+            if blocks.len() != bpr {
+                return None;
+            }
+            let mut scales = vec![0f32; bpr];
+            let mut quants = vec![0i8; bpr * 256];
+            for (b, blk) in blocks.iter().enumerate() {
+                scales[b] = blk.d;
+                quants[b * 256..(b + 1) * 256].copy_from_slice(&blk.qs);
+            }
+            cuda::expert_rows_gemv_gpu(
+                tensor,
+                cuda::DgExpertKind::Q4K,
+                first_row,
+                n_rows,
+                bpr,
+                &scales,
+                &quants,
+            )
+        }
+        DgFormat::Q8_0 => {
+            let nb = wire.in_dim / 32;
+            if x.q8_0.len() != nb {
+                return None;
+            }
+            let mut scales = vec![0f32; nb];
+            let mut quants = vec![0i8; nb * 32];
+            for (b, blk) in x.q8_0.iter().enumerate() {
+                scales[b] = blk.scale;
+                quants[b * 32..(b + 1) * 32].copy_from_slice(&blk.quants);
+            }
+            cuda::expert_rows_gemv_gpu(
+                tensor,
+                cuda::DgExpertKind::Q80,
+                first_row,
+                n_rows,
+                nb,
+                &scales,
+                &quants,
+            )
+        }
+        _ => None,
+    }
+}
+#[cfg(not(feature = "cuda"))]
+fn expert_rows_gpu(
+    _wire: &DgWire,
+    _first_row: usize,
+    _n_rows: usize,
+    _x: &DgActivation,
+) -> Option<Vec<f32>> {
+    None
+}
+
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
 // Expert-selection argsort matching the reference's `ggml_argsort_top_k`
@@ -269,6 +342,10 @@ struct DgWire {
     in_dim: usize,
     rows: usize,
     format: DgFormat,
+    /// Eligible for the CUDA expert pool (MoE expert tensors only): row-range
+    /// GEMVs may run on a VRAM-resident copy via kernels that mirror the CPU
+    /// reduction bit-for-bit. Never changes the math, only where it runs.
+    expert_pool: bool,
 }
 
 impl DgWire {
@@ -307,6 +384,7 @@ impl DgWire {
             in_dim,
             rows,
             format,
+            expert_pool: false,
         })
     }
 
@@ -345,6 +423,14 @@ impl DgWire {
                 first_row + n_rows,
                 self.rows
             )));
+        }
+        // Expert-pool tensors may compute on a VRAM-resident copy; the GPU
+        // kernels mirror the CPU reduction bit-for-bit, so this branch never
+        // changes any value — only where (and how fast) it is produced.
+        if self.expert_pool {
+            if let Some(y) = expert_rows_gpu(self, first_row, n_rows, x) {
+                return Ok(y);
+            }
         }
         let rb = self.row_bytes();
         let bytes = self
@@ -571,7 +657,7 @@ impl DgEncoderRuntime {
             } else {
                 None
             };
-            let layer = DgLayer {
+            let mut layer = DgLayer {
                 attn_norm: f32t(&t("attn_norm.weight"))?,
                 attn_q: wire(&t("attn_q.weight"), n_embd)?,
                 attn_k: wire(&t("attn_k.weight"), n_embd)?,
@@ -596,6 +682,10 @@ impl DgEncoderRuntime {
                 out_scale: scalar(&t("layer_output_scale.weight"))?,
                 enc_out_scale: scalar(&t("enc_layer_output_scale.weight"))?,
             };
+            // MoE expert tensors are eligible for the VRAM-resident expert
+            // pool (cuda feature; budget-gated at first use, CPU otherwise).
+            layer.gate_up_exps.expert_pool = true;
+            layer.down_exps.expert_pool = true;
             if layer.gate_up_exps.rows != 2 * n_ff_exp * n_expert {
                 return Err(BackendError::InvalidTensorData(format!(
                     "layer {l} gate_up_exps rows {} != 2*n_ff_exp*n_expert {}",

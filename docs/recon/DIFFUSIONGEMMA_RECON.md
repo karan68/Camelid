@@ -333,6 +333,93 @@ Phase 4 kernel facts:
    adds a signed zero per element to the canvas embedding. Camelid runs the
    full chain on step 0 to reproduce the ±0.0 pattern.
 
+## 8d. Phase 5 status — multi-canvas parity: PASSED, BIT-EXACT
+
+`DgEncoderRuntime::mc_generate` runs the reference's `run_turn` block-
+autoregressive loop (§7): per block, EB denoise over `[prefix | 256-token
+canvas]`, trim at the first EOG token or a stride-1/2 repetition (≥ 6 reps),
+commit the trimmed canvas to the prefix, re-seed `mt19937(seed)` and repeat
+until an end token, the block budget, or the ubatch guard. **Bit-exact at
+zero tolerance over a 2-block run** (prompt: the 41-token Andes-caravan
+message; UNIFIED phase, EB in-code defaults, seed 0): sealed bundle
+`target/dg-mc-loop-parity-20260616T011145Z/` (commit `999f6011`; oracle
+`scripts/dg-mc-loop.cpp` against the CPU-pure pin build, `GGML_BLAS=OFF
+GGML_METAL=OFF GGML_ACCELERATE=ON`, empty `mparams.devices`, wall ~7.26 h;
+Apple Silicon host).
+
+- block 0: prefix 41, 22 EB steps, cut 256 (full canvas) → committed; PASS.
+- block 1: prefix 297, 26 EB steps, cut 256 → committed; PASS.
+- EOG set (3 ids, derived from the GGUF and equal to the reference vocab's
+  set, fail-closed), per-block trim cut, commit-or-stop chaining, and the
+  ubatch budget guard all match; `executed_blocks` 2, stop reason `ubatch`,
+  512-token response byte-identical to the reference. Discrete outputs
+  exact; entropies bit-exact (atol=0/rtol=0).
+- Gate test: `tests/dg_mc_loop_parity.rs` (env-gated on `CAMELID_DG_GGUF`,
+  `CAMELID_DG_MC_REF`, `CAMELID_DG_MC_IDS`); forensics
+  `dg_mc_block0_diag`, `dg_block1_logit_ladder`, `dg_block1_step3_probe`.
+
+Phase 5 facts:
+
+1. **Block 0 is Phase 4 under the per-block re-seed** — it re-passed
+   unchanged; everything new was at block 1, where the prompt is
+   `original-prompt + committed-block-0-canvas` (re-prefill over the grown
+   prefix).
+2. **The block-1 divergence was a sort-tie order, not region math.** A
+   router-logit tie at block-1 step 3 ordered differently under the
+   portable sort than under the reference build's libc++ introsort,
+   swapping two MoE accumulation slots and seeding compounding FP drift.
+   Sealed fix: `src/dg_argsort.cpp` (+ `build.rs`) binds the platform
+   libc++ `std::sort` for the expert argsort and the eb_step entropy sort.
+   NOTE: the later Windows port (`c847894b`) removed this C++ shim in
+   favor of a pure-Rust sort that breaks exact ties by lower index — the
+   seal attaches to the shimmed revision; re-validate on ties (see the
+   README caveat).
+3. **RNG re-seeds per block with the same seed** (§7): each block's canvas
+   init and per-step `u`/renoise draws restart from `mt19937(seed)`; the
+   SC buffer is likewise fresh per block with `use_sc = 0.0` at step 0.
+
+## 8e. Windows x86_64 host + GPU (VRAM) evidence: PASSED (this-host contract)
+
+First model runs of the lane on a Windows host (2026-07-03; every prior
+run receipt was Apple Silicon). Sealed bundle
+`target/dg-windows-run-20260703T164114Z/` (see its `SUMMARY.md`): RTX 3060
+Laptop 6 GiB, 16 GiB RAM, the pinned 16,806,810,336-byte GGUF, canonical
+41-token Andes prompt, seed 0.
+
+- **CPU-pure determinism: PASS** (byte-identical run pair;
+  `CAMELID_DG_CUDA=0`, `CUDA_VISIBLE_DEVICES=-1`).
+- **GPU SC stage: 2.7× wall vs CPU** (200 s vs 551 s for load + 2 denoise
+  steps), deterministic (byte-identical pair), VRAM peak 1675 MiB. The SC
+  soft-embedding matmul accumulates in f32 on GPU and remains the one
+  non-bit-exact stage (documented; `CAMELID_DG_CUDA_SC=0` opts it out).
+- **MoE expert pool (VRAM-resident experts): bit-exact, proven in vivo.**
+  `ffn_gate_up_exps` (Q4_K) / `ffn_down_exps` (Q8_0) row-range GEMVs run on
+  resident device copies via kernels that mirror `q4_k_dot_scalar` /
+  `q0_pair_dot` exactly (unit gate `expert_gemv_gpu_bit_identical_to_cpu`);
+  an experts-on-GPU run (`CAMELID_DG_CUDA_SC=0`, 2.85 GiB of experts
+  resident ≈ 5 layers) produced output **byte-identical to the CPU-pure
+  leg**. Budget-gated (`CAMELID_DG_EXPERT_VRAM_MB`, default free-VRAM minus
+  a 2.2 GiB reserve), greedy whole-tensor residency, per-call CPU fallback.
+  Speed-neutral in this config; the win is capacity — resident expert bytes
+  leave the CPU mmap working set (model 16.8 GB > 15.7 GB usable RAM).
+  Full-GPU (SC + experts) VRAM peak: 4587 MiB of 6144.
+
+- **Multi-canvas end-to-end on Windows (GPU SC + expert pool):** a
+  natural-stop 2-block run completed in 7074 s — block 0 (prefix 41,
+  23 EB steps, cut 256 → committed), block 1 (prefix **297**, equal to the
+  Apple-sealed Phase 5 grown prefix, 25 steps, cut 256), stop `blocks`,
+  512 tokens, coherent output. The adaptive-stop step counts (23/25 vs
+  the sealed 22/26) differ as expected under the non-bit-exact SC stage
+  and the off-macOS sincos/tie-order notes below; the loop structure and
+  the committed-prefix chaining match.
+
+Scope of the claim: **this-host contract** — determinism, and GPU stages
+bit-exact against this host's CPU oracle. NOT a bitwise claim against the
+Apple-sealed §8–8d artifacts: off macOS, `libm_sincosf` is Rust
+`f32::sin/cos` (not `__sincosf_stret`) and the pure-Rust expert argsort
+breaks exact router-logit ties by lower index (the sealed runs bound the
+libc++ shim; see §8d note).
+
 ## 9. Phase 0 gate status
 
 - `tensor-inventory.json` + `metadata.json` exist; **zero** unclassified
