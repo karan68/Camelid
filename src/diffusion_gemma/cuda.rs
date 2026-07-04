@@ -367,11 +367,391 @@ extern "C" __global__ void q8_0_rows_gemv(
         + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
 }
 
-// ---- FAST-mode batched-ID GEMM kernels (CAMELID_DG_FAST) -------------------
-// One thread per (pair, row): pair_base[pair] selects the row window (expert
-// offset, or 0 for dense), pair_pos[pair] selects the activation column. Same
-// per-row math as the parity kernels above; fast mode does not claim
-// bit-exactness (it exists to amortize weight reads across all positions).
+// ---- FAST-mode GROUPED-TILE GEMM kernels (CAMELID_DG_FAST) -----------------
+// Grid: (x = 32-row tiles within a row window, y = pair GROUPS). Each group
+// is up to DG_TILE_P pairs sharing ONE pair_base (host-sorted by expert);
+// empty slots carry pos = -1. Block = (32 rows, DG_TILE_P pairs). The block
+// cooperatively stages a contiguous 32-row x chunk-of-blocks wire tile into
+// shared memory with linear coalesced loads (the ONLY coalescing/reuse
+// opportunity for uncached device-mapped host memory), then every (row, pair)
+// thread runs the EXACT scalar per-block reduction from shared — the per-row
+// float order is unchanged, so outputs stay bit-identical to the scalar
+// reference per row. Shared row strides are padded to an ODD word count
+// (bank-conflict-free). All threads reach every barrier (no early returns).
+//
+// Byte economics: one shared copy serves up to DG_TILE_P pairs, dividing
+// wire traffic by the group occupancy — the difference between ~32x PCIe
+// amplification and line rate on the zero-copy tier.
+#define DG_TILE_P 8
+#define DG_TILE_ROWS 32
+
+// Q4_K: 144B superblocks; stage 5 superblocks/row (720B -> padded 724B).
+extern "C" __global__ void q4k_gemm_tile(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,       // [n_acts * bpr]
+    const signed char* __restrict__ act_quants, // [n_acts * bpr * 256]
+    const long long* __restrict__ g_base,       // [n_groups]
+    const int* __restrict__ g_pos,              // [n_groups * DG_TILE_P]
+    const int* __restrict__ g_orig,             // [n_groups * DG_TILE_P]
+    int rows_per, int bpr,
+    float* __restrict__ out)
+{
+    const int SB_STAGE = 5;
+    const int ROW_STRIDE = 724; // 5*144 padded to odd word count (181 words)
+    extern __shared__ unsigned char tile[]; // [32 * ROW_STRIDE]
+    int tx = threadIdx.x; // row lane 0..31
+    int ty = threadIdx.y; // pair slot
+    int g = blockIdx.y;
+    int row = blockIdx.x * DG_TILE_ROWS + tx;
+    bool row_ok = row < rows_per;
+    int pos = g_pos[g * DG_TILE_P + ty];
+    bool pair_ok = pos >= 0;
+    long long base = g_base[g];
+    const int lin = ty * DG_TILE_ROWS + tx; // 0..255 linear tid
+    const int nthreads = DG_TILE_ROWS * DG_TILE_P;
+    float sumf = 0.0f;
+    for (int sb0 = 0; sb0 < bpr; sb0 += SB_STAGE) {
+        int nsb = min(SB_STAGE, bpr - sb0);
+        // Cooperative coalesced copy: for each of the 32 rows, copy nsb*144
+        // bytes as u32 words (row bytes are 16B-aligned for Q4_K).
+        int words_per_row = (nsb * 144) / 4;
+        int total_words = DG_TILE_ROWS * words_per_row;
+        for (int w = lin; w < total_words; w += nthreads) {
+            int r = w / words_per_row;
+            int wo = w % words_per_row;
+            int gr = blockIdx.x * DG_TILE_ROWS + r;
+            unsigned int val = 0u;
+            if (gr < rows_per) {
+                const unsigned char* src = wire
+                    + (base + gr) * (long long)bpr * 144
+                    + (long long)sb0 * 144;
+                val = *(const unsigned int*)(src + wo * 4);
+            }
+            *(unsigned int*)(tile + r * ROW_STRIDE + wo * 4) = val;
+        }
+        __syncthreads();
+        if (row_ok && pair_ok) {
+            const float* a_s = act_scales + (long long)pos * bpr;
+            const signed char* a_q = act_quants + (long long)pos * bpr * 256;
+            for (int i = 0; i < nsb; i++) {
+                const unsigned char* block = tile + tx * ROW_STRIDE + i * 144;
+                int sb = sb0 + i;
+                float yd = a_s[sb];
+                const signed char* q8 = a_q + (long long)sb * 256;
+                float d = yd * f16_bits_to_f32((unsigned short)block[0]
+                    | ((unsigned short)block[1] << 8));
+                float dmin = yd * f16_bits_to_f32((unsigned short)block[2]
+                    | ((unsigned short)block[3] << 8));
+                const unsigned char* sc = block + 4;
+                const unsigned char* qs = block + 16;
+                unsigned int utmp0 = (unsigned int)sc[0] | ((unsigned int)sc[1] << 8)
+                    | ((unsigned int)sc[2] << 16) | ((unsigned int)sc[3] << 24);
+                unsigned int utmp1 = (unsigned int)sc[4] | ((unsigned int)sc[5] << 8)
+                    | ((unsigned int)sc[6] << 16) | ((unsigned int)sc[7] << 24);
+                unsigned int utmp2 = (unsigned int)sc[8] | ((unsigned int)sc[9] << 8)
+                    | ((unsigned int)sc[10] << 16) | ((unsigned int)sc[11] << 24);
+                unsigned int mins0 = utmp1 & 0x3f3f3f3fu;
+                unsigned int mins1 = ((utmp2 >> 4) & 0x0f0f0f0fu)
+                    | (((utmp1 >> 6) & 0x03030303u) << 4);
+                unsigned int scw0 = utmp0 & 0x3f3f3f3fu;
+                unsigned int scw1 = (utmp2 & 0x0f0f0f0fu)
+                    | (((utmp0 >> 6) & 0x03030303u) << 4);
+                long long prod = 0;
+                for (int gg = 0; gg < 8; gg++) {
+                    int bs = 0;
+                    for (int t = 0; t < 32; t++) bs += q8[gg * 32 + t];
+                    prod += (long long)bs * kq4_byte(mins0, mins1, gg);
+                }
+                sumf = fmaf(-dmin, (float)prod, sumf);
+                long long sumi1 = 0, sumi2 = 0;
+                for (int j = 0; j < 4; j++) {
+                    const unsigned char* q4 = qs + j * 32;
+                    const signed char* q8j = q8 + j * 64;
+                    long long lo = 0, hi = 0;
+                    for (int t = 0; t < 32; t++) {
+                        lo += (long long)(q4[t] & 0xf) * q8j[t];
+                        hi += (long long)(q4[t] >> 4) * q8j[32 + t];
+                    }
+                    sumi1 += lo * kq4_byte(scw0, scw1, 2 * j);
+                    sumi2 += hi * kq4_byte(scw0, scw1, 2 * j + 1);
+                }
+                sumf = fmaf(d, (float)(sumi1 + sumi2), sumf);
+            }
+        }
+        __syncthreads();
+    }
+    if (row_ok && pair_ok) {
+        int orig = g_orig[g * DG_TILE_P + ty];
+        out[(long long)orig * rows_per + row] = sumf;
+    }
+}
+
+// Q8_0: 34B blocks; stage 20 blocks/row (680B -> padded 684B, 171 words odd).
+extern "C" __global__ void q8_0_gemm_tile(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,       // [n_acts * nb]
+    const signed char* __restrict__ act_quants, // [n_acts * nb * 32]
+    const long long* __restrict__ g_base,
+    const int* __restrict__ g_pos,
+    const int* __restrict__ g_orig,
+    int rows_per, int nb,
+    float* __restrict__ out)
+{
+    const int B_STAGE = 20;
+    const int ROW_STRIDE = 684;
+    extern __shared__ unsigned char tile[];
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int g = blockIdx.y;
+    int row = blockIdx.x * DG_TILE_ROWS + tx;
+    bool row_ok = row < rows_per;
+    int pos = g_pos[g * DG_TILE_P + ty];
+    bool pair_ok = pos >= 0;
+    long long base = g_base[g];
+    const int lin = ty * DG_TILE_ROWS + tx;
+    const int nthreads = DG_TILE_ROWS * DG_TILE_P;
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b0 = 0; b0 < nb; b0 += B_STAGE) {
+        int nbs = min(B_STAGE, nb - b0);
+        // Row bytes are 4B-aligned only at even block indices (34B blocks);
+        // stage starts land on b0 multiples of 20 (even) so u16 is the safe
+        // universal unit here: copy as u16 (rows are 2B-aligned always).
+        int hw_per_row = (nbs * 34) / 2;
+        int total_hw = DG_TILE_ROWS * hw_per_row;
+        for (int w = lin; w < total_hw; w += nthreads) {
+            int r = w / hw_per_row;
+            int wo = w % hw_per_row;
+            int gr = blockIdx.x * DG_TILE_ROWS + r;
+            unsigned short val = 0u;
+            if (gr < rows_per) {
+                const unsigned char* src = wire
+                    + (base + gr) * (long long)nb * 34
+                    + (long long)b0 * 34;
+                val = *(const unsigned short*)(src + wo * 2);
+            }
+            *(unsigned short*)(tile + r * ROW_STRIDE + wo * 2) = val;
+        }
+        __syncthreads();
+        if (row_ok && pair_ok) {
+            const float* a_s = act_scales + (long long)pos * nb;
+            const signed char* a_q = act_quants + (long long)pos * nb * 32;
+            for (int i = 0; i < nbs; i++) {
+                const unsigned char* block = tile + tx * ROW_STRIDE + i * 34;
+                int b = b0 + i;
+                float dw = f16_bits_to_f32((unsigned short)block[0]
+                    | ((unsigned short)block[1] << 8));
+                float s = dw * a_s[b];
+                const signed char* wq = (const signed char*)(block + 2);
+                const signed char* yq = a_q + (long long)b * 32;
+                float* acc = (b & 1) ? acc1 : acc0;
+                for (int l = 0; l < 4; l++) {
+                    int lane = 0;
+                    for (int t = 0; t < 4; t++) {
+                        lane += (int)wq[4 * l + t] * (int)yq[4 * l + t];
+                        lane += (int)wq[16 + 4 * l + t] * (int)yq[16 + 4 * l + t];
+                    }
+                    acc[l] = fmaf((float)lane, s, acc[l]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row_ok && pair_ok) {
+        int orig = g_orig[g * DG_TILE_P + ty];
+        out[(long long)orig * rows_per + row] =
+            ((acc0[0] + acc0[1]) + (acc0[2] + acc0[3]))
+            + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+    }
+}
+
+// Q5_0: 22B blocks; stage 30 blocks/row (660B, 165 words odd — no pad).
+extern "C" __global__ void q5_0_gemm_tile(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,
+    const signed char* __restrict__ act_quants,
+    const long long* __restrict__ g_base,
+    const int* __restrict__ g_pos,
+    const int* __restrict__ g_orig,
+    int rows_per, int nb,
+    float* __restrict__ out)
+{
+    const int B_STAGE = 30;
+    const int ROW_STRIDE = 660;
+    extern __shared__ unsigned char tile[];
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int g = blockIdx.y;
+    int row = blockIdx.x * DG_TILE_ROWS + tx;
+    bool row_ok = row < rows_per;
+    int pos = g_pos[g * DG_TILE_P + ty];
+    bool pair_ok = pos >= 0;
+    long long base = g_base[g];
+    const int lin = ty * DG_TILE_ROWS + tx;
+    const int nthreads = DG_TILE_ROWS * DG_TILE_P;
+    float acc0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float acc1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b0 = 0; b0 < nb; b0 += B_STAGE) {
+        int nbs = min(B_STAGE, nb - b0);
+        int hw_per_row = (nbs * 22) / 2;
+        int total_hw = DG_TILE_ROWS * hw_per_row;
+        for (int w = lin; w < total_hw; w += nthreads) {
+            int r = w / hw_per_row;
+            int wo = w % hw_per_row;
+            int gr = blockIdx.x * DG_TILE_ROWS + r;
+            unsigned short val = 0u;
+            if (gr < rows_per) {
+                const unsigned char* src = wire
+                    + (base + gr) * (long long)nb * 22
+                    + (long long)b0 * 22;
+                val = *(const unsigned short*)(src + wo * 2);
+            }
+            *(unsigned short*)(tile + r * ROW_STRIDE + wo * 2) = val;
+        }
+        __syncthreads();
+        if (row_ok && pair_ok) {
+            const float* a_s = act_scales + (long long)pos * nb;
+            const signed char* a_q = act_quants + (long long)pos * nb * 32;
+            for (int i = 0; i < nbs; i++) {
+                const unsigned char* block = tile + tx * ROW_STRIDE + i * 22;
+                int b = b0 + i;
+                float dw = f16_bits_to_f32((unsigned short)block[0]
+                    | ((unsigned short)block[1] << 8));
+                unsigned int qh = (unsigned int)block[2] | ((unsigned int)block[3] << 8)
+                    | ((unsigned int)block[4] << 16) | ((unsigned int)block[5] << 24);
+                const unsigned char* qs = block + 6;
+                float s = dw * a_s[b];
+                const signed char* yq = a_q + (long long)b * 32;
+                float* acc = (b & 1) ? acc1 : acc0;
+                for (int l = 0; l < 4; l++) {
+                    int lane = 0;
+                    for (int t = 0; t < 4; t++) {
+                        int i0 = 4 * l + t;
+                        int w0 = (int)((qs[i0] & 0x0f) | (((qh >> i0) & 1) << 4)) - 16;
+                        lane += w0 * (int)yq[i0];
+                        int i1 = 16 + 4 * l + t;
+                        int w1 = (int)((qs[i1 - 16] >> 4) | (((qh >> i1) & 1) << 4)) - 16;
+                        lane += w1 * (int)yq[i1];
+                    }
+                    acc[l] = fmaf((float)lane, s, acc[l]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (row_ok && pair_ok) {
+        int orig = g_orig[g * DG_TILE_P + ty];
+        out[(long long)orig * rows_per + row] =
+            ((acc0[0] + acc0[1]) + (acc0[2] + acc0[3]))
+            + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
+    }
+}
+
+// Q6_K: 210B superblocks (2B-aligned only); stage 3/row (630B -> padded 636).
+extern "C" __global__ void q6k_gemm_tile(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,
+    const signed char* __restrict__ act_quants,
+    const long long* __restrict__ g_base,
+    const int* __restrict__ g_pos,
+    const int* __restrict__ g_orig,
+    int rows_per, int bpr,
+    float* __restrict__ out)
+{
+    const int SB_STAGE = 3;
+    const int ROW_STRIDE = 636; // 3*210 padded to odd word count (159 words)
+    extern __shared__ unsigned char tile[];
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int g = blockIdx.y;
+    int row = blockIdx.x * DG_TILE_ROWS + tx;
+    bool row_ok = row < rows_per;
+    int pos = g_pos[g * DG_TILE_P + ty];
+    bool pair_ok = pos >= 0;
+    long long base = g_base[g];
+    const int lin = ty * DG_TILE_ROWS + tx;
+    const int nthreads = DG_TILE_ROWS * DG_TILE_P;
+    float sumf = 0.0f;
+    for (int sb0 = 0; sb0 < bpr; sb0 += SB_STAGE) {
+        int nsb = min(SB_STAGE, bpr - sb0);
+        int hw_per_row = (nsb * 210) / 2;
+        int total_hw = DG_TILE_ROWS * hw_per_row;
+        for (int w = lin; w < total_hw; w += nthreads) {
+            int r = w / hw_per_row;
+            int wo = w % hw_per_row;
+            int gr = blockIdx.x * DG_TILE_ROWS + r;
+            unsigned short val = 0u;
+            if (gr < rows_per) {
+                const unsigned char* src = wire
+                    + (base + gr) * (long long)bpr * 210
+                    + (long long)sb0 * 210;
+                val = *(const unsigned short*)(src + wo * 2);
+            }
+            *(unsigned short*)(tile + r * ROW_STRIDE + wo * 2) = val;
+        }
+        __syncthreads();
+        if (row_ok && pair_ok) {
+            const float* a_s = act_scales + (long long)pos * bpr;
+            const signed char* a_q = act_quants + (long long)pos * bpr * 256;
+            for (int i = 0; i < nsb; i++) {
+                const unsigned char* block = tile + tx * ROW_STRIDE + i * 210;
+                int sb = sb0 + i;
+                const unsigned char* ql = block;
+                const unsigned char* qh = block + 128;
+                const signed char* scales = (const signed char*)(block + 192);
+                float d_all = f16_bits_to_f32((unsigned short)block[208]
+                    | ((unsigned short)block[209] << 8));
+                const signed char* q8 = a_q + (long long)sb * 256;
+                float y_d = a_s[sb];
+                long long isum = 0;
+                for (int half = 0; half < 2; half++) {
+                    const unsigned char* qlh = ql + half * 64;
+                    const unsigned char* qhh = qh + half * 32;
+                    const signed char* q8h = q8 + half * 128;
+                    const signed char* sc = scales + half * 8;
+                    long long gs0 = 0, gs1 = 0, gs2 = 0, gs3 = 0,
+                        gs4 = 0, gs5 = 0, gs6 = 0, gs7 = 0;
+                    for (int l = 0; l < 32; l++) {
+                        int v0 = (qlh[l] & 0xF) | ((qhh[l] & 3) << 4);
+                        int v1 = (qlh[32 + l] & 0xF) | (((qhh[l] >> 2) & 3) << 4);
+                        int v2 = (qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4);
+                        int v3 = (qlh[32 + l] >> 4) | (((qhh[l] >> 6) & 3) << 4);
+                        if (l < 16) {
+                            gs0 += (long long)v0 * q8h[l];
+                            gs2 += (long long)v1 * q8h[32 + l];
+                            gs4 += (long long)v2 * q8h[64 + l];
+                            gs6 += (long long)v3 * q8h[96 + l];
+                        } else {
+                            gs1 += (long long)v0 * q8h[l];
+                            gs3 += (long long)v1 * q8h[32 + l];
+                            gs5 += (long long)v2 * q8h[64 + l];
+                            gs7 += (long long)v3 * q8h[96 + l];
+                        }
+                    }
+                    isum += gs0 * (long long)sc[0] + gs1 * (long long)sc[1]
+                        + gs2 * (long long)sc[2] + gs3 * (long long)sc[3]
+                        + gs4 * (long long)sc[4] + gs5 * (long long)sc[5]
+                        + gs6 * (long long)sc[6] + gs7 * (long long)sc[7];
+                }
+                long long isum_mins = 0;
+                for (int t = 0; t < 16; t++) {
+                    long long bs = 0;
+                    for (int l = 0; l < 16; l++) bs += q8[t * 16 + l];
+                    isum_mins += bs * (long long)scales[t];
+                }
+                sumf = fmaf(d_all * y_d, (float)(isum - 32 * isum_mins), sumf);
+            }
+        }
+        __syncthreads();
+    }
+    if (row_ok && pair_ok) {
+        int orig = g_orig[g * DG_TILE_P + ty];
+        out[(long long)orig * rows_per + row] = sumf;
+    }
+}
+
+// ---- legacy one-thread-per-output ID kernels (kept for reference; the
+// grouped-tile kernels above replaced them in dispatch) --------------------
 
 extern "C" __global__ void q4k_gemm_id(
     const unsigned char* __restrict__ wire,
@@ -709,10 +1089,10 @@ struct Engine {
     lm_func: CudaFunction,
     q4k_rows_func: CudaFunction,
     q80_rows_func: CudaFunction,
-    q4k_id_func: CudaFunction,
-    q80_id_func: CudaFunction,
-    q50_id_func: CudaFunction,
-    q6k_id_func: CudaFunction,
+    q4k_tile_func: CudaFunction,
+    q80_tile_func: CudaFunction,
+    q50_tile_func: CudaFunction,
+    q6k_tile_func: CudaFunction,
     attn_func: CudaFunction,
     lm_gemm_func: CudaFunction,
     sc_probs_func: CudaFunction,
@@ -749,6 +1129,16 @@ struct Engine {
     /// layer total). Without it the greedy expert uploads exhaust the budget
     /// first and the small HOT tensors re-stream every layer, every step.
     small_budget: Option<u64>,
+    /// ZERO-COPY tier: expert tensors pinned in DEVICE-MAPPED host RAM. GPU
+    /// kernels read them in place over PCIe (no staging, no per-step copies);
+    /// the disk is read once at first touch, then never again. The wrapped
+    /// `CudaSlice` values are deliberately never dropped (the engine static
+    /// lives for the process) — dropping would `cuMemFree` a HOST pointer.
+    host_pool: std::collections::HashMap<(usize, usize), CudaSlice<u8>>,
+    host_rejected: std::collections::HashSet<(usize, usize)>,
+    /// Remaining zero-copy byte budget (`CAMELID_DG_HOST_POOL_MB`, default
+    /// 8 GiB; 0 disables the tier).
+    host_budget: Option<u64>,
 }
 
 // SAFETY: the engine is only touched while holding ENGINE's mutex (the same
@@ -836,18 +1226,18 @@ fn build_engine() -> Result<Engine, String> {
     let q80_rows_func = m
         .load_function("q8_0_rows_gemv")
         .map_err(|e| format!("load q8_0_rows_gemv: {e}"))?;
-    let q4k_id_func = m
-        .load_function("q4k_gemm_id")
-        .map_err(|e| format!("load q4k_gemm_id: {e}"))?;
-    let q80_id_func = m
-        .load_function("q8_0_gemm_id")
-        .map_err(|e| format!("load q8_0_gemm_id: {e}"))?;
-    let q50_id_func = m
-        .load_function("q5_0_gemm_id")
-        .map_err(|e| format!("load q5_0_gemm_id: {e}"))?;
-    let q6k_id_func = m
-        .load_function("q6k_gemm_id")
-        .map_err(|e| format!("load q6k_gemm_id: {e}"))?;
+    let q4k_tile_func = m
+        .load_function("q4k_gemm_tile")
+        .map_err(|e| format!("load q4k_gemm_tile: {e}"))?;
+    let q80_tile_func = m
+        .load_function("q8_0_gemm_tile")
+        .map_err(|e| format!("load q8_0_gemm_tile: {e}"))?;
+    let q50_tile_func = m
+        .load_function("q5_0_gemm_tile")
+        .map_err(|e| format!("load q5_0_gemm_tile: {e}"))?;
+    let q6k_tile_func = m
+        .load_function("q6k_gemm_tile")
+        .map_err(|e| format!("load q6k_gemm_tile: {e}"))?;
     let attn_func = m
         .load_function("dg_attn")
         .map_err(|e| format!("load dg_attn: {e}"))?;
@@ -867,10 +1257,10 @@ fn build_engine() -> Result<Engine, String> {
         lm_func,
         q4k_rows_func,
         q80_rows_func,
-        q4k_id_func,
-        q80_id_func,
-        q50_id_func,
-        q6k_id_func,
+        q4k_tile_func,
+        q80_tile_func,
+        q50_tile_func,
+        q6k_tile_func,
         attn_func,
         lm_gemm_func,
         sc_probs_func,
@@ -885,6 +1275,9 @@ fn build_engine() -> Result<Engine, String> {
         expert_rejected: std::collections::HashSet::new(),
         expert_budget: None,
         small_budget: None,
+        host_pool: std::collections::HashMap::new(),
+        host_rejected: std::collections::HashSet::new(),
+        host_budget: None,
     })
 }
 
@@ -1285,6 +1678,42 @@ impl ReadAhead {
     }
 }
 
+/// ZERO-COPY tier: allocate DEVICE-MAPPED pinned host memory, fill it with
+/// the tensor's bytes via one direct file read (falling back to the mmap
+/// slice), and wrap the device-visible pointer for kernel arguments. GPU
+/// kernels then read the tensor in place over PCIe — no staging buffer, no
+/// per-step copy, and the disk is never touched again for this tensor.
+///
+/// The returned `CudaSlice` must NEVER be dropped (drop would `cuMemFree` a
+/// HOST allocation): entries live in the engine static for the process.
+fn host_map_tensor(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    src: (&std::path::Path, u64),
+    tensor: &[u8],
+) -> Result<CudaSlice<u8>, String> {
+    use cudarc::driver::{result, sys};
+    let need = tensor.len();
+    ctx.bind_to_thread().map_err(|e| format!("bind ctx: {e}"))?;
+    let hp = unsafe { result::malloc_host(need, sys::CU_MEMHOSTALLOC_DEVICEMAP) }
+        .map_err(|e| format!("malloc_host(DEVICEMAP): {e}"))?;
+    // SAFETY: hp names a fresh `need`-byte allocation owned here.
+    let dst = unsafe { std::slice::from_raw_parts_mut(hp as *mut u8, need) };
+    let read_ok = std::fs::File::open(src.0)
+        .and_then(|f| read_at_into(&f, src.1, dst))
+        .is_ok();
+    if !read_ok {
+        // One-time slow path: fault the bytes in from the mmap slice.
+        dst.copy_from_slice(tensor);
+    }
+    let mut dptr: sys::CUdeviceptr = 0;
+    unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dptr, hp, 0) }
+        .result()
+        .map_err(|e| format!("host devptr: {e}"))?;
+    // SAFETY: dptr is a valid device-visible mapping of `need` bytes.
+    Ok(unsafe { stream.upgrade_device_ptr::<u8>(dptr, need) })
+}
+
 /// Positioned read into `dst` (Windows `seek_read` / Unix `read_exact_at`).
 fn read_at_into(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -1382,7 +1811,55 @@ pub(crate) fn fast_gemm_id(
             eng.expert_rejected.insert(key);
         }
     }
-    if !eng.expert_pool.contains_key(&key) {
+    // ZERO-COPY tier: tensors that miss the VRAM pool live pinned in
+    // device-mapped host RAM — kernels read them in place over PCIe, and the
+    // disk drops out of the steady-state loop entirely.
+    if !eng.expert_pool.contains_key(&key)
+        && !eng.host_pool.contains_key(&key)
+        && !eng.host_rejected.contains(&key)
+    {
+        if eng.host_budget.is_none() {
+            // Modest default: pinned pages compete with the model mmap and the
+            // OS; over-pinning stalls cuMemHostAlloc for minutes before OOM.
+            // The grouped-tile kernels make the in-place PCIe reads coalesced
+            // and group-amortized, so a small pool still pays.
+            let mb = std::env::var("CAMELID_DG_HOST_POOL_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2560);
+            eng.host_budget = Some(mb * 1024 * 1024);
+            eprintln!(
+                "[dg-cuda] zero-copy host pool budget {:.2} GiB",
+                (mb * 1024 * 1024) as f64 / (1u64 << 30) as f64
+            );
+        }
+        let budget = eng.host_budget.unwrap();
+        if (tensor.len() as u64) <= budget {
+            match host_map_tensor(&eng.ctx, &eng.stream, src, tensor) {
+                Ok(dev) => {
+                    eng.host_budget = Some(budget - tensor.len() as u64);
+                    eng.host_pool.insert(key, dev);
+                    if eng.host_pool.len() % 10 == 0 || budget - (tensor.len() as u64) < (1 << 28) {
+                        eprintln!(
+                            "[dg-cuda] zero-copy resident: {} tensors, {:.2} GiB host budget left",
+                            eng.host_pool.len(),
+                            eng.host_budget.unwrap() as f64 / (1u64 << 30) as f64
+                        );
+                    }
+                }
+                Err(e) => {
+                    // A pin failure means the OS is already under lock pressure;
+                    // further attempts each stall for seconds. Kill the tier.
+                    eng.host_rejected.insert(key);
+                    eng.host_budget = Some(0);
+                    eprintln!("[dg-cuda] zero-copy map failed ({e}); tier disabled for this run");
+                }
+            }
+        } else {
+            eng.host_rejected.insert(key);
+        }
+    }
+    if !eng.expert_pool.contains_key(&key) && !eng.host_pool.contains_key(&key) {
         streamed = true;
         // Grow the scratch to fit and stream the tensor for this call.
         let s = eng.stream.clone();
@@ -1509,11 +1986,46 @@ pub(crate) fn fast_gemm_id(
         }
     }
     let func = match kind {
-        DgExpertKind::Q4K => &eng.q4k_id_func,
-        DgExpertKind::Q80 => &eng.q80_id_func,
-        DgExpertKind::Q50 => &eng.q50_id_func,
-        DgExpertKind::Q6K => &eng.q6k_id_func,
+        DgExpertKind::Q4K => &eng.q4k_tile_func,
+        DgExpertKind::Q80 => &eng.q80_tile_func,
+        DgExpertKind::Q50 => &eng.q50_tile_func,
+        DgExpertKind::Q6K => &eng.q6k_tile_func,
     };
+    // Shared-tile bytes per block: 32 rows x padded row stride (see kernels).
+    let tile_shared: u32 = match kind {
+        DgExpertKind::Q4K => 32 * 724,
+        DgExpertKind::Q80 => 32 * 684,
+        DgExpertKind::Q50 => 32 * 660,
+        DgExpertKind::Q6K => 32 * 636,
+    };
+    // Group pairs by identical row window (host-stable sort by base): one
+    // shared wire tile then serves up to DG_TILE_P pairs — the byte-traffic
+    // divisor that makes the zero-copy tier viable and cuts VRAM traffic on
+    // the MoE pair GEMMs.
+    const TILE_P: usize = 8;
+    let mut order: Vec<usize> = (0..n_pairs).collect();
+    order.sort_by_key(|&i| pair_base[i]);
+    let mut g_base: Vec<i64> = Vec::new();
+    let mut g_pos: Vec<i32> = Vec::new();
+    let mut g_orig: Vec<i32> = Vec::new();
+    let mut i = 0usize;
+    while i < n_pairs {
+        let b = pair_base[order[i]];
+        g_base.push(b);
+        let mut slot = 0usize;
+        while slot < TILE_P && i < n_pairs && pair_base[order[i]] == b {
+            g_pos.push(pair_pos[order[i]]);
+            g_orig.push(order[i] as i32);
+            i += 1;
+            slot += 1;
+        }
+        while slot < TILE_P {
+            g_pos.push(-1);
+            g_orig.push(-1);
+            slot += 1;
+        }
+    }
+    let n_groups = g_base.len();
     let run = || -> Result<Vec<f32>, String> {
         let s = eng.stream.clone();
         let mut sc_dev = s
@@ -1527,38 +2039,44 @@ pub(crate) fn fast_gemm_id(
         s.memcpy_htod(act_quants, &mut q_dev)
             .map_err(|e| format!("upload act quants: {e}"))?;
         let mut base_dev = s
-            .alloc_zeros::<i64>(n_pairs)
-            .map_err(|e| format!("alloc pair base: {e}"))?;
-        s.memcpy_htod(pair_base, &mut base_dev)
-            .map_err(|e| format!("upload pair base: {e}"))?;
+            .alloc_zeros::<i64>(n_groups)
+            .map_err(|e| format!("alloc group base: {e}"))?;
+        s.memcpy_htod(&g_base, &mut base_dev)
+            .map_err(|e| format!("upload group base: {e}"))?;
         let mut pos_dev = s
-            .alloc_zeros::<i32>(n_pairs)
-            .map_err(|e| format!("alloc pair pos: {e}"))?;
-        s.memcpy_htod(pair_pos, &mut pos_dev)
-            .map_err(|e| format!("upload pair pos: {e}"))?;
+            .alloc_zeros::<i32>(g_pos.len())
+            .map_err(|e| format!("alloc group pos: {e}"))?;
+        s.memcpy_htod(&g_pos, &mut pos_dev)
+            .map_err(|e| format!("upload group pos: {e}"))?;
+        let mut orig_dev = s
+            .alloc_zeros::<i32>(g_orig.len())
+            .map_err(|e| format!("alloc group orig: {e}"))?;
+        s.memcpy_htod(&g_orig, &mut orig_dev)
+            .map_err(|e| format!("upload group orig: {e}"))?;
         let mut out_dev = s
             .alloc_zeros::<f32>(n_pairs * rows_per)
             .map_err(|e| format!("alloc out: {e}"))?;
-        let total = (n_pairs * rows_per) as u64;
-        let block = 256u32;
         let cfg = LaunchConfig {
-            grid_dim: ((total as u32).div_ceil(block), 1, 1),
-            block_dim: (block, 1, 1),
-            shared_mem_bytes: 0,
+            grid_dim: ((rows_per as u32).div_ceil(32), n_groups as u32, 1),
+            block_dim: (32, TILE_P as u32, 1),
+            shared_mem_bytes: tile_shared,
         };
-        let (np, rp, bp) = (n_pairs as i32, rows_per as i32, blocks_per_row as i32);
+        let (rp, bp) = (rows_per as i32, blocks_per_row as i32);
         let mut b = s.launch_builder(func);
         if streamed {
             let buf = eng.scratch.as_ref().unwrap();
             b.arg(buf);
+        } else if let Some(dev) = eng.expert_pool.get(&key) {
+            b.arg(dev);
         } else {
-            b.arg(eng.expert_pool.get(&key).unwrap());
+            // Zero-copy tier: the kernel reads device-mapped host RAM in place.
+            b.arg(eng.host_pool.get(&key).unwrap());
         }
         b.arg(&sc_dev)
             .arg(&q_dev)
             .arg(&base_dev)
             .arg(&pos_dev)
-            .arg(&np)
+            .arg(&orig_dev)
             .arg(&rp)
             .arg(&bp)
             .arg(&mut out_dev);
@@ -1611,6 +2129,7 @@ pub(crate) fn fast_gemm_id(
                     let (nk, npath, noff, nlen) = ra.order[ra.cursor % order_len].clone();
                     scanned += 1;
                     if eng.expert_pool.contains_key(&nk)
+                        || eng.host_pool.contains_key(&nk)
                         || nlen == 0
                         || nlen > DG_PIN_CAP
                         || eng
