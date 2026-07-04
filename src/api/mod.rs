@@ -43,6 +43,7 @@ use crate::{
         LlamaOutputProjectionDiagnostic, LlamaQ8ScheduleTelemetry, LlamaSampler, SamplingConfig,
     },
     model::{DenseLlamaDims, LlamaFfnTensors, LlamaModelConfig, LlamaTensorBinding},
+    model_source::{inspect_model_source, ModelSourceInspection, ModelSourceKind},
     receipt::{
         self, LaneIdentity, ParityBlock, ParityReceipt, ReceiptResult, ReferenceIdentity,
         RECEIPT_SCHEMA_V1,
@@ -3453,6 +3454,8 @@ struct InspectBlocker {
 struct InspectModelResponse {
     architecture: Option<String>,
     quant: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<ModelSourceInspection>,
     /// Predicted lane (`supported` / `experimental_implemented` / `unsupported`).
     lane_class: ModelLaneClass,
     /// The exact typed blocker the load would hit â€” predicted WITHOUT binding
@@ -3462,10 +3465,38 @@ struct InspectModelResponse {
     blocker: Option<InspectBlocker>,
 }
 
-/// `POST /api/models/inspect` â€” header-only prediction of a GGUF's lane and the
-/// exact reason it would fail closed, WITHOUT loading weights, so the UI can warn
-/// before a multi-GB load attempt. Reads only the GGUF metadata header.
+/// `POST /api/models/inspect` â€” source-level readiness inspection. GGUF files keep
+/// the existing header-only lane prediction. Hugging Face SafeTensors directories
+/// return descriptor/readiness facts only and never become generation-ready here.
 async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
+    match inspect_model_source(&req.path) {
+        Ok(source) if source.manifest.kind == ModelSourceKind::HuggingFaceSafeTensors => {
+            return (
+                StatusCode::OK,
+                Json(InspectModelResponse {
+                    architecture: None,
+                    quant: None,
+                    source: Some(source),
+                    lane_class: ModelLaneClass::Unsupported,
+                    blocker: Some(InspectBlocker {
+                        code: "safetensors_generation_disabled",
+                        message: "Hugging Face SafeTensors directory inspection is readiness-only; generation remains disabled until tokenizer parity, tensor orientation, dtype decode, and one-token dense execution fixtures pass".to_string(),
+                    }),
+                }),
+            )
+                .into_response();
+        }
+        Ok(_) => {}
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                backend_error_code(&err),
+                err.to_string(),
+                Some("path"),
+            );
+        }
+    }
+
     let path = req.path.clone();
     let parsed = tokio::task::spawn_blocking(move || read_metadata(&path)).await;
     let gguf = match parsed {
@@ -3518,6 +3549,7 @@ async fn inspect_model(Json(req): Json<InspectModelRequest>) -> Response {
         Json(InspectModelResponse {
             architecture,
             quant,
+            source: None,
             lane_class,
             blocker,
         }),
