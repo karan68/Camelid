@@ -90,6 +90,11 @@ pub struct AppState {
     /// loaded. Additive, parallel to the optimized engine â€” see the runnable serve
     /// bridge near `runnable_chat_nonstreaming`.
     runnable_runtimes: Arc<RwLock<HashMap<String, Arc<RunnableServeRuntime>>>>,
+    /// DiffusionGemma serve runtimes, keyed by model id. Populated only when
+    /// `CAMELID_DG_SERVE` is set and a diffusion-gemma model is loaded. Additive,
+    /// parallel to the optimized engine (which keeps failing closed for this
+    /// arch by design) — see the bridge near `dg_chat_nonstreaming`.
+    dg_runtimes: Arc<RwLock<HashMap<String, Arc<DgServeRuntime>>>>,
     execution_plans: Arc<RwLock<HashMap<String, ExecutionPlan>>>,
     cached_weights: Arc<RwLock<HashMap<String, Arc<LlamaLoadedWeights>>>>,
     active_model_id: Arc<RwLock<Option<String>>>,
@@ -119,6 +124,7 @@ impl Default for AppState {
             loaded_models: Arc::new(RwLock::new(HashMap::new())),
             gemma4_runtimes: Arc::new(RwLock::new(HashMap::new())),
             runnable_runtimes: Arc::new(RwLock::new(HashMap::new())),
+            dg_runtimes: Arc::new(RwLock::new(HashMap::new())),
             execution_plans: Arc::new(RwLock::new(HashMap::new())),
             cached_weights: Arc::new(RwLock::new(HashMap::new())),
             active_model_id: Arc::new(RwLock::new(None)),
@@ -1675,8 +1681,14 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     // than the lazy runtime map (otherwise chat stays locked until you chat â†’ deadlock).
     let runnable_serve_ready = runnable_serve_enabled()
         && model.is_some_and(|m| is_runnable_serve_arch(m.gguf.architecture().unwrap_or_default()));
+    // Same shape for the DiffusionGemma serve bridge: ready once the model is
+    // loaded with the lane enabled (the runtime loads eagerly at model load,
+    // but gate on enabled + arch so a heal-path gap cannot lock the UI).
+    let dg_serve_ready = dg_serve_enabled()
+        && model.is_some_and(|m| is_dg_serve_arch(m.gguf.architecture().unwrap_or_default()));
     let generation_ready = gemma4_available
         || runnable_serve_ready
+        || dg_serve_ready
         || model.is_some_and(loaded_model_generation_ready);
     let execution_plans = state.execution_plans.read().await;
     let execution_plan = active_id_lock
@@ -4817,6 +4829,375 @@ async fn runnable_chat_streaming(
     Sse::new(events).into_response()
 }
 
+// ===================================================================================
+// DiffusionGemma serve bridge (additive, gated by CAMELID_DG_SERVE).
+//
+// The block-diffusion lane cannot run on the AR engine — `model.rs` fails closed for
+// this arch BY DESIGN and stays that way. This bridge mirrors the runnable-lane
+// pattern: a parallel per-model-id runtime map, a short-circuit at the top of
+// `chat_completions`, and dedicated handlers over `DgChat` (the Phase 6 bit-exact
+// chat wrapper). SINGLE-TURN: the DG chat template renders exactly one user message
+// (the parity-proven reference path), so the LAST user message wins and prior turns
+// are ignored. A denoise block is minutes of compute: steps per block come from
+// `CAMELID_DG_MAX_STEPS` (default: the reference 48 with adaptive early stop),
+// blocks per answer from `CAMELID_DG_MAX_BLOCKS` (default 1). The SSE stream emits
+// one content delta per COMMITTED BLOCK with keep-alive comments in between.
+// ===================================================================================
+
+/// The DiffusionGemma serve lane is gated behind `CAMELID_DG_SERVE` (1/true/yes).
+/// When off, a diffusion-gemma load stays metadata-only (fail-closed redirect).
+fn dg_serve_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_DG_SERVE").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+/// True for the DiffusionGemma architecture spellings the loader recognizes.
+fn is_dg_serve_arch(arch: &str) -> bool {
+    let a = arch.to_ascii_lowercase().replace(['-', '_'], "");
+    a == "diffusiongemma" || a == "gemmadiffusion"
+}
+
+/// Per-block denoise step override for serve (`CAMELID_DG_MAX_STEPS`); `None`
+/// keeps the reference default (48, adaptive early stop — ~40 min/block on a
+/// 6 GB-GPU laptop; 8-16 trades quality for interactive latency).
+fn dg_serve_steps() -> Option<i32> {
+    std::env::var("CAMELID_DG_MAX_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .map(|v| v.max(1))
+}
+
+/// Blocks per answer for serve (`CAMELID_DG_MAX_BLOCKS`, default 1, clamped 1..=8).
+/// Each block is a full 256-token canvas denoise.
+fn dg_serve_blocks() -> i32 {
+    std::env::var("CAMELID_DG_MAX_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 8)
+}
+
+/// Map the multi-canvas stop reason onto an OpenAI finish_reason: hitting the
+/// block budget or the ubatch guard is a truncation ("length"); a trim (EOG /
+/// repetition cut) is a natural stop.
+fn dg_finish_reason(stop: &str) -> &'static str {
+    match stop {
+        "blocks" | "ubatch" => "length",
+        _ => "stop",
+    }
+}
+
+/// A DiffusionGemma model wrapped for the serve path: the Phase 6 `DgChat`
+/// (render + tokenize + multi-canvas denoise + detokenize).
+pub struct DgServeRuntime {
+    chat: crate::diffusion_gemma::chat::DgChat,
+}
+
+impl DgServeRuntime {
+    fn load(path: &std::path::Path) -> std::result::Result<Self, BackendError> {
+        Ok(Self {
+            chat: crate::diffusion_gemma::chat::DgChat::load(path)?,
+        })
+    }
+}
+
+/// Resolve a DiffusionGemma serve runtime for the requested (or active) model id.
+async fn resolve_dg_runtime(
+    state: &AppState,
+    model: &Option<String>,
+) -> std::result::Result<Option<(String, Arc<DgServeRuntime>)>, Response> {
+    let id = match model.clone() {
+        Some(m) => m,
+        None => match state.active_model_id.read().await.clone() {
+            Some(m) => m,
+            None => return Ok(None),
+        },
+    };
+    if let Some(runtime) = state.dg_runtimes.read().await.get(&id).cloned() {
+        return Ok(Some((id, runtime)));
+    }
+    // Loaded as a diffusion-gemma arch but no runtime → fail clearly rather than
+    // letting the Llama path return its unsupported-architecture error.
+    let needs_dg = state
+        .loaded_models
+        .read()
+        .await
+        .get(&id)
+        .map(|m| is_dg_serve_arch(m.gguf.architecture().unwrap_or_default()))
+        .unwrap_or(false);
+    if needs_dg {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "model_not_ready",
+            format!(
+                "model '{id}' (DiffusionGemma) is loaded but its serve runtime is \
+                 unavailable; set CAMELID_DG_SERVE=1 and reload the model"
+            ),
+            None,
+        ));
+    }
+    Ok(None)
+}
+
+/// Load the DiffusionGemma serve runtime for a model id (blocking thread; the
+/// GGUF is lazy-mmapped so this is seconds, not a full read).
+async fn load_dg_serve_runtime(
+    state: &AppState,
+    id: &str,
+    model_path: &std::path::Path,
+) -> std::result::Result<(), BackendError> {
+    let load_path = model_path.to_path_buf();
+    let runtime = tokio::task::spawn_blocking(move || DgServeRuntime::load(&load_path))
+        .await
+        .map_err(|e| {
+            BackendError::InvalidModelMetadata(format!("dg serve load task panicked: {e}"))
+        })??;
+    state
+        .dg_runtimes
+        .write()
+        .await
+        .insert(id.to_string(), Arc::new(runtime));
+    tracing::info!(model = %id, "diffusion-gemma serve runtime loaded");
+    Ok(())
+}
+
+/// The last user message — the DG chat template is single-turn (the
+/// parity-proven reference path renders exactly one message).
+fn dg_last_user_message(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role.trim().eq_ignore_ascii_case("user"))
+        .map(|m| m.content.clone())
+}
+
+/// EB sampler params for a serve request: request `seed` (reference default 0)
+/// + the `CAMELID_DG_MAX_STEPS` override.
+fn dg_serve_params(seed: Option<u64>) -> crate::diffusion_gemma::DgEbParams {
+    let defaults = crate::diffusion_gemma::DgEbParams::default();
+    crate::diffusion_gemma::DgEbParams {
+        seed: seed.unwrap_or(0) as u32,
+        max_steps: dg_serve_steps().unwrap_or(defaults.max_steps),
+        ..defaults
+    }
+}
+
+/// Non-streaming chat for a DiffusionGemma model: render the single-turn chat
+/// template for the last user message, run the multi-canvas denoise loop,
+/// detokenize. Minutes of compute — the client waits on one response.
+async fn dg_chat_nonstreaming(
+    id: String,
+    runtime: Arc<DgServeRuntime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let Some(user_msg) = dg_last_user_message(&messages) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_parameter",
+            "the DiffusionGemma serve lane needs at least one user message".to_string(),
+            Some("messages"),
+        );
+    };
+    let params = dg_serve_params(req.seed);
+    let n_blocks = dg_serve_blocks();
+    let rt = runtime.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let prompt_tokens = rt.chat.render_prompt(&user_msg).map(|v| v.len())?;
+        rt.chat
+            .generate(&user_msg, &params, n_blocks, 1100, |_, _, _, _| {})
+            .map(|out| (prompt_tokens, out))
+    })
+    .await;
+    let (prompt_tokens, (text, stop, ids)) = match result {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                e.to_string(),
+                None,
+            )
+        }
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "generation_error",
+                format!("dg generation task panicked: {e}"),
+                None,
+            )
+        }
+    };
+    let body = serde_json::json!({
+        "id": "chatcmpl-diffusion-gemma",
+        "object": "chat.completion",
+        "created": unix_secs(),
+        "model": id,
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": text },
+            "finish_reason": dg_finish_reason(&stop),
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": ids.len(),
+            "total_tokens": prompt_tokens + ids.len(),
+        },
+        "camelid": { "lane": "diffusion_gemma", "stop": stop, "note": "single-turn template: last user message only" },
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Streaming chat for a DiffusionGemma model (SSE, OpenAI chunk shape): a role
+/// chunk, then ONE content delta per committed denoise block (a block is
+/// minutes of compute — SSE keep-alive comments cover the gaps), the
+/// finish_reason chunk, optional usage, `[DONE]`.
+async fn dg_chat_streaming(
+    id: String,
+    runtime: Arc<DgServeRuntime>,
+    req: &ChatCompletionRequest,
+) -> Response {
+    let messages = req.messages.clone().unwrap_or_default();
+    let Some(user_msg) = dg_last_user_message(&messages) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_parameter",
+            "the DiffusionGemma serve lane needs at least one user message".to_string(),
+            Some("messages"),
+        );
+    };
+    let params = dg_serve_params(req.seed);
+    let n_blocks = dg_serve_blocks();
+    let include_usage = stream_options_include_usage(req.stream_options.as_ref());
+    let created = unix_secs();
+
+    /// (prompt_tokens, text, stop, response ids) from a finished generation.
+    type DgDone = (usize, String, String, Vec<i32>);
+    enum StreamItem {
+        Block(Vec<i32>),
+        Done(DgDone),
+        Fail(String),
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
+    let rt = runtime.clone();
+    tokio::task::spawn_blocking(move || {
+        let send_tx = tx.clone();
+        let prompt_tokens = match rt.chat.render_prompt(&user_msg) {
+            Ok(ids) => ids.len(),
+            Err(e) => {
+                let _ = tx.send(StreamItem::Fail(e.to_string()));
+                return;
+            }
+        };
+        let result =
+            rt.chat
+                .generate_with_blocks(&user_msg, &params, n_blocks, 1100, |_b, committed| {
+                    let _ = send_tx.send(StreamItem::Block(committed.to_vec()));
+                });
+        match result {
+            Ok((text, stop, ids)) => {
+                let _ = tx.send(StreamItem::Done((prompt_tokens, text, stop, ids)));
+            }
+            Err(e) => {
+                let _ = tx.send(StreamItem::Fail(e.to_string()));
+            }
+        }
+    });
+
+    let rt = runtime.clone();
+    let events = async_stream::stream! {
+        let chunk = |delta: serde_json::Value, finish: Option<&str>| {
+            serde_json::json!({
+                "id": "chatcmpl-diffusion-gemma",
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": id,
+                "choices": [{ "index": 0, "delta": delta, "finish_reason": finish }],
+            })
+        };
+        yield Ok::<Event, std::convert::Infallible>(
+            Event::default().data(chunk(serde_json::json!({ "role": "assistant" }), None).to_string()),
+        );
+
+        // Incremental decode: the response is the concatenation of committed
+        // blocks; decode the whole accumulated id list each block (cheap next
+        // to a denoise) and emit only the new suffix.
+        let mut all_ids: Vec<i32> = Vec::new();
+        let mut emitted = 0usize;
+        let mut final_state: Option<std::result::Result<DgDone, String>> = None;
+
+        while let Some(item) = rx.recv().await {
+            match item {
+                StreamItem::Block(committed) => {
+                    all_ids.extend_from_slice(&committed);
+                    let decoded = rt.chat.decode_response(&all_ids).unwrap_or_default();
+                    if decoded.len() > emitted {
+                        let delta_text = decoded[emitted..].to_string();
+                        emitted = decoded.len();
+                        yield Ok(Event::default().data(
+                            chunk(serde_json::json!({ "content": delta_text }), None).to_string(),
+                        ));
+                    }
+                }
+                StreamItem::Done(done) => {
+                    final_state = Some(Ok(done));
+                    break;
+                }
+                StreamItem::Fail(e) => {
+                    final_state = Some(Err(e));
+                    break;
+                }
+            }
+        }
+
+        match final_state {
+            Some(Ok((prompt_tokens, text, stop, ids))) => {
+                // Any tail the block deltas missed (e.g. UTF-8 boundary).
+                if text.len() > emitted {
+                    yield Ok(Event::default().data(
+                        chunk(serde_json::json!({ "content": text[emitted..].to_string() }), None).to_string(),
+                    ));
+                }
+                yield Ok(Event::default().data(
+                    chunk(serde_json::json!({}), Some(dg_finish_reason(&stop))).to_string(),
+                ));
+                if include_usage {
+                    let usage = serde_json::json!({
+                        "id": "chatcmpl-diffusion-gemma",
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": id,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": ids.len(),
+                            "total_tokens": prompt_tokens + ids.len(),
+                        },
+                    });
+                    yield Ok(Event::default().data(usage.to_string()));
+                }
+            }
+            Some(Err(e)) => {
+                let err = serde_json::json!({ "error": { "message": e, "type": "generation_error" } });
+                yield Ok(Event::default().data(err.to_string()));
+            }
+            None => {}
+        }
+        yield Ok(Event::default().data("[DONE]"));
+    };
+    // A denoise block is minutes of silence; keep the SSE connection (and any
+    // proxies) alive with comment frames.
+    Sse::new(events)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(10))
+                .text("dg-denoising"),
+        )
+        .into_response()
+}
+
 /// Streaming Gemma 4 chat (SSE). Mirrors the OpenAI `chat.completion.chunk`
 /// shape: a role chunk, one content delta per generated token, a final
 /// finish_reason chunk, then `[DONE]`. Generation runs on a blocking thread and
@@ -5061,6 +5442,14 @@ async fn load_model_from_path_with_activation(
         load_runnable_serve_runtime(state, &id, &loaded.path).await?;
     }
 
+    // DiffusionGemma serve path (additive, gated by CAMELID_DG_SERVE): the AR
+    // engine keeps failing closed for this arch (`unsupported_runtime` carries
+    // the dedicated-lane redirect); the bridge loads the Phase 6 DgChat runtime
+    // so /v1/chat routes to the diffusion lane instead.
+    if dg_serve_enabled() && is_dg_serve_arch(loaded.gguf.architecture().unwrap_or_default()) {
+        load_dg_serve_runtime(state, &id, &loaded.path).await?;
+    }
+
     Ok(loaded)
 }
 
@@ -5163,6 +5552,7 @@ async fn unload_model(
         state.loaded_models.write().await.remove(&id);
         state.gemma4_runtimes.write().await.remove(&id);
         state.runnable_runtimes.write().await.remove(&id);
+        state.dg_runtimes.write().await.remove(&id);
         state.execution_plans.write().await.remove(&id);
         state.cached_weights.write().await.remove(&id);
         state.model_last_used.write().await.remove(&id);
@@ -6375,6 +6765,19 @@ async fn chat_completions(
                 return runnable_chat_streaming(id, runtime, &req).await;
             }
             return runnable_chat_nonstreaming(id, runtime, &req).await;
+        }
+        Ok(None) => {}
+        Err(resp) => return resp,
+    }
+    // DiffusionGemma serve path (additive, gated by CAMELID_DG_SERVE):
+    // short-circuits a diffusion-gemma model to the dedicated diffusion lane
+    // (block-level SSE; a denoise block is minutes of compute).
+    match resolve_dg_runtime(&state, &req.model).await {
+        Ok(Some((id, runtime))) => {
+            if req.stream.unwrap_or(false) {
+                return dg_chat_streaming(id, runtime, &req).await;
+            }
+            return dg_chat_nonstreaming(id, runtime, &req).await;
         }
         Ok(None) => {}
         Err(resp) => return resp,
