@@ -2401,6 +2401,100 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             },
         ],
         model_compatibility: vec![
+            // Ornith-1.0-9B CUDA-resident quant rows (constrained-VRAM lane).
+            // ORDER CONTRACT: these quant-suffixed rows MUST stay ahead of the
+            // bare-name "Ornith 1.0 9B" Q8_0 row below. The frontend exact-row
+            // matcher (findExactCompatibilityRowByIdentity) returns the FIRST
+            // ledger row whose normalized id matches any identity of the loaded
+            // model, and every Ornith quant emits the bare general.name identity
+            // — only the filename-derived name+quant identity distinguishes the
+            // files. The bare-name row itself must keep its id verbatim: the
+            // chat `--agent` gate (`active_tool_capable`) matches the
+            // server-assigned id (general.name) by exact string.
+            ModelCompatibilityTarget {
+                id: "ornith_1_0_9b_q4_k_m",
+                tool_capable: true,
+                family: "ornith",
+                quantization: "Q4_K_M",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "model-native/larger context beyond the tested single-session window, broader arbitrary templates beyond the native Ornith ChatML renderer, portability beyond a single 6GB-class GPU host, and durable repeated current-head bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_qwen35_bpe_mark_folding_deferred",
+                tensors_load: "validated_all_427_qwen35_tensors_fully_gpu_resident",
+                generation_runs: "runnable_serve_chat_plus_agent_eval_validated",
+                parity_audited: "cuda_5_prompt_pass_cross_backend_tolerance_attributed_near_ties_vs_llamacpp_acd79d6",
+                performance_measured: "cuda_device_decode_loop_18_8_toks_median_measured",
+                frontend_load_path_verified: "not_promoted",
+                frontend_readiness_gate: "green only when this exact qwen35 Q4_K_M row (ornith-1.0-9b-Q4_K_M.gguf, sha256 2711bf1e...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1 and CAMELID_QWEN35_CUDA=1",
+                tested_context: "short_serve_smoke_plus_agent_eval_read_list_write",
+                chat_template_renderer: "ornith-chatml-native",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "agent_eval_read_list_write",
+                latest_checked_result: "pass",
+                latest_checked_output: "camelid.agent_eval/v1 PASS (full 3-case battery)",
+                evidence: "qwen35 (Ornith-1.0-9B) Q4_K_M fully GPU-resident (CAMELID_QWEN35_CUDA=1): 5-prompt greedy parity vs the pinned llama.cpp acd79d6 CUDA oracle PASSES under the cross-backend tolerance policy — 2/5 token-identical at n=64 and every flip probed and attributed to soft positions with <=0.33-nat top-2 gaps where the oracle's own CPU-vs-CUDA backends also flip (qa/ornith/constrained-vram/RECEIPT_ITEM2_qwen35_parity_cuda.json, probes + oracle/camelid internal-variance controls committed alongside). The full read_file/list_dir/write_file agent battery passes on this exact file with a committed camelid.agent_eval/v1 PASS receipt (qa/agent-eval/ornith-1.0-9b-Q4_K_M-1783019779-PASS.json); tool_capable earned ONLY by that receipt. Decode throughput 18.8 tok/s median via the device-side decode loop (qa/ornith/constrained-vram profile CSVs). NOT model-native/larger context, NOT broader templates, NOT multi-session throughput claims.",
+                next_step: "preserve the CUDA parity + agent capability for this exact row; context-pack coverage, the frontend picker load path, and a normalized full-support bundle remain before any broader claim",
+            },
+            ModelCompatibilityTarget {
+                id: "ornith_1_0_9b_q3_k_m",
+                tool_capable: false,
+                family: "ornith",
+                quantization: "Q3_K_M",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "direct cross-engine parity receipt on this exact quant (current chain is via the parity-certified CPU oracle), an agent-eval battery for tool_capable, broader templates beyond the native Ornith ChatML renderer, portability, and durable repeated current-head bundles remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated_qwen35_bpe_mark_folding_deferred",
+                tensors_load: "validated_all_427_qwen35_tensors_fully_gpu_resident_q5k_head_upcast_q8_0",
+                generation_runs: "runnable_gpu_single_session_16k_maxpos_validated",
+                parity_audited: "gpu_greedy_matches_certified_cpu_oracle_solo_at_16k_maxpos",
+                performance_measured: "cuda_device_decode_loop_15_4_toks_median_measured",
+                frontend_load_path_verified: "not_promoted",
+                frontend_readiness_gate: "green only when this exact qwen35 Q3_K_M row (ornith-1.0-9b-Q3_K_M.gguf, sha256 16f54df5...) is loaded_now=true, generation_ready=true, matching active_model_id, served with CAMELID_RUNNABLE_SERVE=1 and CAMELID_QWEN35_CUDA=1",
+                tested_context: "single_session_16k_maxpos_residency_smoke",
+                chat_template_renderer: "ornith-chatml-native",
+                chat_template_shape_pack: "not_promoted",
+                chat_template_shape_pack_id: "not_selected",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "gpu_16k_residency_and_parity_smoke",
+                latest_checked_result: "pass",
+                latest_checked_output: "16K full residency 4747 MiB peak (1397 MiB headroom) + GPU==CPU-oracle greedy match",
+                evidence: "qwen35 (Ornith-1.0-9B) Q3_K_M, imatrix-quantized in-house from the sha256-pinned bf16 source with llama-quantize at the pinned acd79d6 reference (agentic-coding calibration corpus committed): fully GPU-resident at 16K context with 4747 MiB peak VRAM and 1397 MiB headroom on a 6144 MiB card, beating the llama.cpp figure for the same file via sparse KV over the 8 full-attention layers (qa/ornith/constrained-vram/RECEIPT_ITEM4_residency.json). GPU generation is greedy token-identical to the CPU runnable oracle (single-token + multi-token, identical to the certified Q8_0/Q4_K_M reference sequence); the CPU oracle itself is the lane certified greedy token-identical vs llama.cpp acd79d6 — a DOCUMENTED FRONTIER: no direct side-by-side llama.cpp receipt on this exact quant yet. Held-out coding perplexity 2.4693 vs Q6_K 2.3636 (QUANT_QUALITY_TABLE.md). Decode throughput 15.4 tok/s median via the device-side decode loop. The four q5_K tensors upcast losslessly to Q8_0 blocks at load.",
+                next_step: "mint a committed camelid.agent_eval/v1 PASS battery on this exact file to earn tool_capable, and a direct 5-prompt llama.cpp side-by-side parity receipt to close the documented frontier",
+            },
             // Ornith-1.0-9B (qwen35 hybrid gated-delta-net), runnable serve lane.
             // tool_capable earned by three committed camelid.agent_eval/v1 PASS
             // receipts (read_file / list_dir / write_file). The id matches the
@@ -12304,10 +12398,28 @@ mod tests {
             classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q8_0.gguf"),
             ModelLaneClass::Supported,
         );
+        // Non-catalog allowlisted artifact of a supported row (in-house requant
+        // with no HF catalog source) â†’ Supported.
+        assert_eq!(
+            classify_model_lane(Some("qwen35"), "ornith-1.0-9b-Q4_K_M.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen35"), "ornith-1.0-9b-Q3_K_M.gguf"),
+            ModelLaneClass::Supported,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen35"), "ornith-1.0-9b-Q8_0.gguf"),
+            ModelLaneClass::Supported,
+        );
         // Implemented architecture but NOT a supported exact artifact (different
         // quant/filename) â†’ experimental, never falsely supported.
         assert_eq!(
             classify_model_lane(Some("qwen3"), "Qwen3-0.6B-Q4_K_M.gguf"),
+            ModelLaneClass::ExperimentalImplemented,
+        );
+        assert_eq!(
+            classify_model_lane(Some("qwen35"), "ornith-1.0-9b-Q6_K.gguf"),
             ModelLaneClass::ExperimentalImplemented,
         );
         assert_eq!(
@@ -12574,6 +12686,13 @@ mod tests {
                 // acd79d6 (4 prompts) + tool_capable via 3 agent-eval PASS receipts.
                 // Short-chat/agent smoke only; no bounded-context/perf/full support.
                 "Ornith 1.0 9B",
+                // Ornith-1.0-9B CUDA-resident quant rows: Q4_K_M has a 5-prompt
+                // cross-backend-tolerance parity PASS vs llama.cpp acd79d6 CUDA
+                // (attributed near-ties) + a full agent-eval battery PASS on the
+                // exact file; Q3_K_M has 16K full-residency + GPU==CPU-oracle
+                // parity with a documented direct-cross-engine frontier.
+                "ornith_1_0_9b_q4_k_m",
+                "ornith_1_0_9b_q3_k_m",
             ])
         );
 
@@ -15593,8 +15712,20 @@ fn supported_compatibility_row_ids() -> &'static std::collections::HashSet<&'sta
     })
 }
 
+/// Supported exact rows whose GGUF artifact is NOT a curated-catalog download —
+/// in-house imatrix requants (and the side-loaded Q8_0) with no HF catalog
+/// source. Exact filename → compatibility row id; the row must still be
+/// `supported_*` in the ledger, so this stays fail-closed at the same trust
+/// level as the curated-catalog path (exact-artifact filename match).
+const NON_CATALOG_SUPPORTED_ARTIFACTS: &[(&str, &str)] = &[
+    ("ornith-1.0-9b-Q8_0.gguf", "Ornith 1.0 9B"),
+    ("ornith-1.0-9b-Q4_K_M.gguf", "ornith_1_0_9b_q4_k_m"),
+    ("ornith-1.0-9b-Q3_K_M.gguf", "ornith_1_0_9b_q3_k_m"),
+];
+
 /// True when `filename` is the exact GGUF artifact of a curated row whose
-/// `catalog_id` is a `supported_*` compatibility row. The ledger is exact-artifact
+/// `catalog_id` is a `supported_*` compatibility row, or an allowlisted
+/// non-catalog artifact of a `supported_*` row. The ledger is exact-artifact
 /// gated, so an exact-filename match is the honest server-side "is this a supported
 /// row?" test. Deliberately conservative: a supported model loaded under a
 /// non-curated filename classifies as experimental, never falsely as supported.
@@ -15603,6 +15734,9 @@ fn filename_is_supported_exact_row(filename: &str) -> bool {
     curated_catalog()
         .iter()
         .any(|c| c.filename == filename && supported.contains(c.catalog_id))
+        || NON_CATALOG_SUPPORTED_ARTIFACTS
+            .iter()
+            .any(|(artifact, row_id)| *artifact == filename && supported.contains(row_id))
 }
 
 /// Classify a model from real header metadata. `architecture` is the parsed
