@@ -1,4 +1,4 @@
-# 2026-07-05 — Llama 3.2 3B Q5_K_M CUDA API smoke and WebUI guard
+# 2026-07-05 - Llama 3.2 3B Q5_K_M CUDA API smoke and WebUI guard
 
 Scope: exact `Llama-3.2-3B-Instruct-Q5_K_M.gguf` local Windows CUDA smoke only. This note records that the runtime can load and answer API requests for this exact file when NVRTC is staged, and that the WebUI correctly remains blocked by the current support contract. It does not promote Q5_K_M support, broad K-quant support, WebUI unlock, production throughput, portability, context length, or neighboring rows.
 
