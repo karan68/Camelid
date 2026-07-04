@@ -1644,6 +1644,9 @@ pub(crate) fn expert_rows_gemv_gpu(
 /// of `path` into the raw pinned buffer at `ptr`.
 struct RaReq {
     key: (usize, usize),
+    /// Pinned ring buffer index this read fills (echoed in the done message
+    /// so completions may arrive out of order — QD2 protocol).
+    buf: usize,
     ptr: usize,
     len: usize,
     path: std::path::PathBuf,
@@ -1659,10 +1662,11 @@ struct RaReq {
 /// handoff is strictly dispatch → recv done (FIFO) → consume.
 struct ReadAhead {
     tx: std::sync::mpsc::Sender<RaReq>,
-    done_rx: std::sync::mpsc::Receiver<(usize, usize)>,
-    /// FIFO of (key, pinned-buffer index) dispatched and not yet consumed;
-    /// the single worker completes strictly in this order.
-    in_flight: std::collections::VecDeque<((usize, usize), usize)>,
+    done_rx: std::sync::mpsc::Receiver<((usize, usize), usize, bool)>,
+    /// Reads dispatched and not yet completed, keyed by tensor; the value is
+    /// the pinned-buffer index. TWO workers complete OUT OF ORDER — the done
+    /// message carries (key, buf, ok), so no FIFO assumption exists anywhere.
+    in_flight: std::collections::HashMap<(usize, usize), usize>,
     /// Reads that completed (drained non-blocking) and await consumption —
     /// by a host htod or by the device-prefetch DMA.
     ready: std::collections::HashMap<(usize, usize), usize>,
@@ -1678,29 +1682,46 @@ struct ReadAhead {
 impl ReadAhead {
     fn new(n_bufs: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<RaReq>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, usize)>();
-        std::thread::Builder::new()
-            .name("dg-readahead".into())
-            .spawn(move || {
-                while let Ok(req) = rx.recv() {
-                    // SAFETY: ptr/len name an exclusively-handed-off pinned
-                    // buffer region; the dispatcher does not touch it until
-                    // the done message for this key arrives.
-                    let dst =
-                        unsafe { std::slice::from_raw_parts_mut(req.ptr as *mut u8, req.len) };
-                    let ok = std::fs::File::open(&req.path)
-                        .and_then(|f| read_at_into(&f, req.off, dst))
-                        .is_ok();
-                    // A failed read reports key (ptr, 0) so the consumer
-                    // falls back to its own synchronous read.
-                    let _ = done_tx.send(if ok { req.key } else { (req.key.0, 0) });
-                }
-            })
-            .expect("spawn dg-readahead");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<((usize, usize), usize, bool)>();
+        // TWO readers: laptop NVMe gains ~15-35% at QD2 for these 200-285 MB
+        // sequential reads, and the Windows cache-manager copy parallelizes.
+        for w in 0..2 {
+            let rx = rx.clone();
+            let done_tx = done_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("dg-readahead-{w}"))
+                .spawn(move || {
+                    loop {
+                        // Take one request; the lock drops BEFORE the
+                        // blocking file I/O so the other worker can pull.
+                        let req = {
+                            let guard = match rx.lock() {
+                                Ok(g) => g,
+                                Err(_) => return,
+                            };
+                            match guard.recv() {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            }
+                        };
+                        // SAFETY: ptr/len name an exclusively-handed-off
+                        // pinned buffer region; the dispatcher does not touch
+                        // it until the done message for this key arrives.
+                        let dst =
+                            unsafe { std::slice::from_raw_parts_mut(req.ptr as *mut u8, req.len) };
+                        let ok = std::fs::File::open(&req.path)
+                            .and_then(|f| read_at_into(&f, req.off, dst))
+                            .is_ok();
+                        let _ = done_tx.send((req.key, req.buf, ok));
+                    }
+                })
+                .expect("spawn dg-readahead");
+        }
         Self {
             tx,
             done_rx,
-            in_flight: std::collections::VecDeque::new(),
+            in_flight: std::collections::HashMap::new(),
             ready: std::collections::HashMap::new(),
             free: (0..n_bufs).collect(),
             order: Vec::new(),
@@ -1709,57 +1730,49 @@ impl ReadAhead {
         }
     }
 
+    /// Route one done message: the buffer goes to `ready` on success or back
+    /// to `free` on a failed read (the consumer falls back to a sync read).
+    fn route_done(&mut self, key: (usize, usize), buf: usize, ok: bool) {
+        self.in_flight.remove(&key);
+        if ok {
+            self.ready.insert(key, buf);
+        } else {
+            self.free.push(buf);
+        }
+    }
+
     /// Drain every in-flight read (blocking) and reclaim the buffers,
     /// including any completed-but-unconsumed `ready` entries.
     fn drain(&mut self) {
-        while let Some((_, bi)) = self.in_flight.pop_front() {
-            let _ = self.done_rx.recv();
-            self.free.push(bi);
+        while !self.in_flight.is_empty() {
+            match self.done_rx.recv() {
+                Ok((k, b, ok)) => self.route_done(k, b, ok),
+                Err(_) => break,
+            }
         }
         for (_, bi) in self.ready.drain() {
             self.free.push(bi);
         }
     }
 
-    /// Non-blocking: move completed reads from the FIFO into `ready`.
+    /// Non-blocking: move completed reads into `ready`.
     fn drain_ready(&mut self) {
-        while let Ok(done) = self.done_rx.try_recv() {
-            if let Some((ik, ib)) = self.in_flight.pop_front() {
-                if ik == done {
-                    self.ready.insert(ik, ib);
-                } else {
-                    // Failed read (worker echoes (ptr, 0)) — reclaim.
-                    self.free.push(ib);
-                }
-            }
+        while let Ok((k, b, ok)) = self.done_rx.try_recv() {
+            self.route_done(k, b, ok);
         }
     }
 
     /// Blocking: wait until `key`'s read completes (it must be in `ready` or
-    /// somewhere in the FIFO). Returns the pinned buffer index, or None if
-    /// the read failed / was never dispatched.
+    /// `in_flight`). Returns the pinned buffer index, or None if the read
+    /// failed / was never dispatched.
     fn wait_ready(&mut self, key: (usize, usize)) -> Option<usize> {
         self.drain_ready();
         if let Some(bi) = self.ready.remove(&key) {
             return Some(bi);
         }
-        while self.in_flight.iter().any(|(k, _)| *k == key) {
+        while self.in_flight.contains_key(&key) {
             match self.done_rx.recv() {
-                Ok(done) => {
-                    if let Some((ik, ib)) = self.in_flight.pop_front() {
-                        if ik == done {
-                            if ik == key {
-                                return Some(ib);
-                            }
-                            self.ready.insert(ik, ib);
-                        } else {
-                            self.free.push(ib);
-                            if ik == key {
-                                return None; // our read failed
-                            }
-                        }
-                    }
-                }
+                Ok((k, b, ok)) => self.route_done(k, b, ok),
                 Err(_) => return None,
             }
         }
@@ -2189,6 +2202,7 @@ pub(crate) fn fast_gemm_id(
     // success and error paths (audit F3).
     let mut pf_out_slot: Option<((usize, usize), bool, CudaEvent, usize)> = None;
     let mut pf_fail_slot: Option<((usize, usize), usize)> = None;
+    #[allow(unused_mut)]
     let mut run = || -> Result<Vec<f32>, String> {
         let s = eng.stream.clone();
         let mut sc_dev = s
@@ -2379,6 +2393,7 @@ pub(crate) fn fast_gemm_id(
                         .tx
                         .send(RaReq {
                             key: nk,
+                            buf: bi,
                             ptr,
                             len: nlen,
                             path: npath,
@@ -2386,7 +2401,7 @@ pub(crate) fn fast_gemm_id(
                         })
                         .is_ok()
                     {
-                        ra.in_flight.push_back((nk, bi));
+                        ra.in_flight.insert(nk, bi);
                         ra.cursor += 1;
                     } else {
                         ra.free.push(bi);
@@ -2409,7 +2424,6 @@ pub(crate) fn fast_gemm_id(
 /// kernel). `q` is `[n*heads*hd]`, `k`/`v` are `[n*kv_heads*hd]` (post
 /// norm+RoPE, f32). Returns the pre-`attn_output` mix `[n*heads*hd]`, or
 /// `None` on any failure (→ CPU fallback).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dg_attention_gpu(
     q: &[f32],

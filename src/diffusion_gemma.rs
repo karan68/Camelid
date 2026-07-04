@@ -550,6 +550,13 @@ fn attn_layer_fast(
     p: usize,
     canvas_prompt_lo: i64,
     eps: f32,
+    /* absolute position of h[0] (0 = full pass, p = cached canvas-only) */
+    row0: usize,
+    /* cached-in prefix K/V to prepend, each [p*kv_dim] (post norm+rope) */
+    prefix_kv: Option<(&[f32], &[f32])>,
+    /* capture-out: written with the prefix [0..p*kv_dim] slices ONLY as the
+    last op before Some(()) — buffer written <=> layer fully succeeded */
+    capture: Option<(&mut Vec<f32>, &mut Vec<f32>)>,
 ) -> Option<()> {
     use rayon::prelude::*;
     if lw.attn_q.format != DgFormat::Q4K || lw.attn_k.format != DgFormat::Q4K {
@@ -568,11 +575,18 @@ fn attn_layer_fast(
     if !hidden.is_multiple_of(256) {
         return None;
     }
-    let n = h.len();
+    let n = h.len(); // rows materialized (c in cached mode)
+    let n_total = row0 + n; // full attention context
+    debug_assert!(prefix_kv.is_none() || capture.is_none());
     let q_dim = heads * head_dim;
     let kv_dim = kv_heads * head_dim;
     if !q_dim.is_multiple_of(256) {
         return None;
+    }
+    if let Some((pk, pv)) = prefix_kv {
+        if pk.len() != p * kv_dim || pv.len() != p * kv_dim || row0 != p {
+            return None; // malformed cache: caller bails the step
+        }
     }
 
     // Per-position input activation (parallel; no h mutation).
@@ -656,24 +670,41 @@ fn attn_layer_fast(
                 let s = &mut qp[hh * head_dim..(hh + 1) * head_dim];
                 s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.q_norm), eps));
             }
-            refmath::rope_neox(qp, heads, head_dim, pos, theta, rope_factors);
+            // Absolute positions feed RoPE (row0 = p in cached mode — the
+            // single most-likely-missed edit per the blueprint's trap list).
+            refmath::rope_neox(qp, heads, head_dim, row0 + pos, theta, rope_factors);
             for hh in 0..kv_heads {
                 let s = &mut kp[hh * head_dim..(hh + 1) * head_dim];
                 s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.k_norm), eps));
                 let sv = &mut vp[hh * head_dim..(hh + 1) * head_dim];
                 sv.copy_from_slice(&refmath::rms_norm(sv, None, eps));
             }
-            refmath::rope_neox(kp, kv_heads, head_dim, pos, theta, rope_factors);
+            refmath::rope_neox(kp, kv_heads, head_dim, row0 + pos, theta, rope_factors);
         });
 
-    // Attention (GPU kernel).
+    // Cached mode: full-context K/V = [cached prefix | fresh canvas].
+    let (k_ctx, v_ctx) = match prefix_kv {
+        Some((pk, pv)) => {
+            let mut kf = Vec::with_capacity(n_total * kv_dim);
+            kf.extend_from_slice(pk);
+            kf.extend_from_slice(&k_all);
+            let mut vf = Vec::with_capacity(n_total * kv_dim);
+            vf.extend_from_slice(pv);
+            vf.extend_from_slice(&v_all);
+            (kf, vf)
+        }
+        None => (k_all, v_all),
+    };
+
+    // Attention (GPU kernel): queries cover the materialized rows at
+    // absolute offset row0; K/V span the full context.
     let attn = cuda::dg_attention_gpu(
         &q_all,
-        &k_all,
-        &v_all,
+        &k_ctx,
+        &v_ctx,
+        n_total,
         n,
-        n,
-        0,
+        row0,
         heads,
         kv_heads,
         head_dim,
@@ -722,6 +753,15 @@ fn attn_layer_fast(
             *a += b;
         }
     });
+    if let Some((ck, cv)) = capture {
+        // Prefix rows only, written strictly AFTER the residual mutation —
+        // a written buffer certifies total layer success (the cache seal
+        // check relies on exactly this).
+        ck.clear();
+        ck.extend_from_slice(&k_ctx[..p * kv_dim]);
+        cv.clear();
+        cv.extend_from_slice(&v_ctx[..p * kv_dim]);
+    }
     Some(())
 }
 #[cfg(not(feature = "cuda"))]
@@ -740,6 +780,9 @@ fn attn_layer_fast(
     _p: usize,
     _canvas_prompt_lo: i64,
     _eps: f32,
+    _row0: usize,
+    _prefix_kv: Option<(&[f32], &[f32])>,
+    _capture: Option<(&mut Vec<f32>, &mut Vec<f32>)>,
 ) -> Option<()> {
     None
 }
@@ -1751,6 +1794,36 @@ pub struct DgScInput<'a> {
     pub use_sc: f32,
 }
 
+/// Wave 6: step-invariant prompt-side K/V for one EB block (fast mode only).
+/// Mask invariance: prompt queries attend causally over the prompt only
+/// (`k_pos <= q_pos < p` in the region mask), so prompt hiddens — and hence
+/// every layer's prompt K/V — are identical across all denoise steps of a
+/// block. Captured at the first step whose fast attention succeeded on EVERY
+/// layer; canvas-only steps prepend these to each layer's fresh canvas K/V.
+/// Layout per layer: `[p * kv_dim(l)]` f32 — K post k_norm + RoPE, V post
+/// v-norm (NO RoPE). kv_dim differs per layer (sliding vs global kv_heads).
+pub struct DgPrefixCache {
+    /// prompt length these entries were captured at
+    p: usize,
+    /// per layer `[p * kv_dim(l)]`
+    k: Vec<Vec<f32>>,
+    /// per layer `[p * kv_dim(l)]`
+    v: Vec<Vec<f32>>,
+}
+
+/// Internal mode selector for `unified_forward_impl`.
+enum DgFwdMode<'a> {
+    /// today's full `[prompt | canvas]` pass, bit-identical behavior
+    Full,
+    /// full pass, additionally capturing prefix K/V per layer into the
+    /// candidate cache (buffers written ONLY by a fully-successful
+    /// `attn_layer_fast`; empty buffer == that layer fell to CPU)
+    FullCapture(&'a mut DgPrefixCache),
+    /// canvas-only pass against a sealed cache; returns `Ok(None)` (bail)
+    /// if any layer's fast attention fails — caller re-runs the full pass
+    Cached(&'a DgPrefixCache),
+}
+
 /// Reference EB sampler parameters (`diffusion_eb_params` defaults at pin).
 pub struct DgEbParams {
     pub seed: u32,
@@ -1983,6 +2056,69 @@ impl DgEncoderRuntime {
         sc: Option<&DgScInput>,
         want_trace: bool,
     ) -> Result<DgUnifiedOut> {
+        Ok(self
+            .unified_forward_impl(prompt, canvas, sc, want_trace, DgFwdMode::Full)?
+            .expect("full-mode forward never bails"))
+    }
+
+    /// Wave-6 EB-step forward: [`unified_forward_sc`] plus a per-block
+    /// prefix-KV cache. FAST MODE ONLY — with `dg_fast_enabled()` false this
+    /// delegates verbatim (parity lane untouched). First step (or any step
+    /// with no sealed cache) runs the FULL forward, capturing every layer's
+    /// prompt K/V; the cache seals only if ALL layers captured (a layer that
+    /// fell to the CPU attention loop leaves its buffer empty). Sealed steps
+    /// run canvas-only. A cached-mode mid-step fast-attention failure drops
+    /// the cache and re-runs the step as a full forward (with re-capture).
+    pub fn unified_forward_step(
+        &self,
+        prompt: &[u32],
+        canvas: &[u32],
+        sc: Option<&DgScInput>,
+        cache: &mut Option<DgPrefixCache>,
+    ) -> Result<DgUnifiedOut> {
+        if !dg_fast_enabled() {
+            return self.unified_forward_sc(prompt, canvas, sc, false);
+        }
+        let p = prompt.len();
+        if let Some(cc) = cache.as_ref().filter(|cc| cc.p == p) {
+            if let Some(out) =
+                self.unified_forward_impl(prompt, canvas, sc, false, DgFwdMode::Cached(cc))?
+            {
+                return Ok(out);
+            }
+            // fast attention failed mid-step: fall through, drop, run full
+        }
+        *cache = None;
+        let mut cand = DgPrefixCache {
+            p,
+            k: vec![Vec::new(); self.n_layer],
+            v: vec![Vec::new(); self.n_layer],
+        };
+        let out = self
+            .unified_forward_impl(prompt, canvas, sc, false, DgFwdMode::FullCapture(&mut cand))?
+            .expect("full-mode forward never bails");
+        let sealed = (0..self.n_layer).all(|l| {
+            let kv = p * self.kv_dim_at(l);
+            cand.k[l].len() == kv && cand.v[l].len() == kv
+        });
+        if sealed {
+            *cache = Some(cand);
+        }
+        Ok(out)
+    }
+
+    /// Parameterized body of [`unified_forward_sc`]. `Ok(None)` is the
+    /// cached-mode mid-step bail (fast attention failed; the canvas-only `h`
+    /// cannot feed the CPU fallback loops) — only `DgFwdMode::Cached` can
+    /// return it.
+    fn unified_forward_impl(
+        &self,
+        prompt: &[u32],
+        canvas: &[u32],
+        sc: Option<&DgScInput>,
+        want_trace: bool,
+        mode: DgFwdMode<'_>,
+    ) -> Result<Option<DgUnifiedOut>> {
         let p = prompt.len();
         let c = canvas.len();
         let n = p + c;
@@ -1997,6 +2133,20 @@ impl DgEncoderRuntime {
                 "canvas length {c} != diffusion.canvas_length {}",
                 self.canvas_length
             )));
+        }
+        let (row0, cache_in, mut capture_out) = match mode {
+            DgFwdMode::Full => (0usize, None, None),
+            DgFwdMode::FullCapture(cap) => (0usize, None, Some(cap)),
+            DgFwdMode::Cached(cc) => (p, Some(cc), None),
+        };
+        // trace never coexists with the fast-mode variants
+        debug_assert!(!(want_trace && (cache_in.is_some() || capture_out.is_some())));
+        // number of leading PROMPT rows materialized in h (p full, 0 cached)
+        let p_rows = p - row0;
+        if let Some(cc) = cache_in {
+            if cc.p != p || cc.k.len() != self.n_layer || cc.v.len() != self.n_layer {
+                return Ok(None); // stale/malformed cache: caller re-runs full
+            }
         }
         let eps = self.eps;
         let hidden = self.n_embd;
@@ -2021,10 +2171,12 @@ impl DgEncoderRuntime {
 
         // embeddings: every row scaled by sqrt(n_embd); canvas rows add the
         // gated SC signal (when enabled) and then take the weightless
-        // rms_norm
-        let mut h: Vec<Vec<f32>> = Vec::with_capacity(n);
+        // rms_norm. Cached mode materializes ONLY canvas rows: `.skip(row0)`
+        // applies after `.enumerate()`, so `pos` stays ABSOLUTE and the body
+        // (region test, `sigs[pos - p]`) is byte-identical in both modes.
+        let mut h: Vec<Vec<f32>> = Vec::with_capacity(n - row0);
         let mut inp_scaled = Vec::with_capacity(if want_trace { n * hidden } else { 0 });
-        for (pos, &tok) in prompt.iter().chain(canvas.iter()).enumerate() {
+        for (pos, &tok) in prompt.iter().chain(canvas.iter()).enumerate().skip(row0) {
             let mut e = self.embed_row(tok)?;
             for v in e.iter_mut() {
                 *v *= embed_scale;
@@ -2075,6 +2227,12 @@ impl DgEncoderRuntime {
             // FAST mode: whole attention block (projections + masked
             // bidirectional attention + output projection) as batched GPU
             // work; the per-position loops below are skipped on success.
+            let prefix_l: Option<(&[f32], &[f32])> =
+                cache_in.map(|cc| (cc.k[l].as_slice(), cc.v[l].as_slice()));
+            let cap_l: Option<(&mut Vec<f32>, &mut Vec<f32>)> = match &mut capture_out {
+                Some(cap) => Some((&mut cap.k[l], &mut cap.v[l])),
+                None => None,
+            };
             let fast_attn = !want_trace
                 && dg_fast_enabled()
                 && attn_layer_fast(
@@ -2091,8 +2249,19 @@ impl DgEncoderRuntime {
                     p,
                     canvas_prompt_lo,
                     eps,
+                    row0,
+                    prefix_l,
+                    cap_l,
                 )
                 .is_some();
+            if !fast_attn && cache_in.is_some() {
+                // Cached mode cannot fall back: the CPU attention loops index
+                // h as the full [prompt|canvas] context, which a canvas-only
+                // h cannot feed. No h mutation has happened for this layer
+                // (attn_layer_fast mutates h only after every GPU call
+                // succeeded), so aborting the step here is clean.
+                return Ok(None);
+            }
             let qkv_range = if fast_attn { 0..0 } else { 0..h.len() };
             for pos in qkv_range {
                 let hp = &h[pos];
@@ -2232,7 +2401,7 @@ impl DgEncoderRuntime {
             // tracing (the trace buffers need the per-position intermediates).
             let fast_done = !want_trace
                 && dg_fast_enabled()
-                && ffn_moe_layer_fast(self, lw, &mut h, p, eps).is_some();
+                && ffn_moe_layer_fast(self, lw, &mut h, p_rows, eps).is_some();
             let pos_range = if fast_done { 0..0 } else { 0..h.len() };
             for pos in pos_range {
                 let hp = &mut h[pos];
@@ -2327,8 +2496,9 @@ impl DgEncoderRuntime {
                     ffn_block_out_all.extend_from_slice(hp);
                 }
                 // region-aware per-layer scalar: prompt rows take the encoder
-                // scalar, canvas rows the decoder scalar
-                let scale = if pos < p {
+                // scalar, canvas rows the decoder scalar. `pos` indexes h,
+                // whose leading prompt rows number p_rows (p full, 0 cached).
+                let scale = if pos < p_rows {
                     lw.enc_out_scale
                 } else {
                     lw.out_scale
@@ -2392,7 +2562,7 @@ impl DgEncoderRuntime {
         // activation to Q8_K and run one batched GPU GEMV (bit-close to the
         // CPU q6_k_dot) when available, else the per-position CPU matvec.
         let fast_logits = if !want_trace && dg_fast_enabled() {
-            lm_head_fast_gemm(self, &rns[p..], c, hidden)
+            lm_head_fast_gemm(self, &rns[p_rows..], c, hidden)
         } else {
             None
         };
@@ -2401,7 +2571,10 @@ impl DgEncoderRuntime {
         let canvas_acts: Vec<DgActivation> = if fast_capped {
             Vec::new()
         } else {
-            rns[p..].iter().map(|rn| DgActivation::new(rn)).collect()
+            rns[p_rows..]
+                .iter()
+                .map(|rn| DgActivation::new(rn))
+                .collect()
         };
         let gpu_logits = match fast_logits {
             Some(v) => Some(v),
@@ -2456,13 +2629,13 @@ impl DgEncoderRuntime {
             result_norm_all,
         });
 
-        Ok(DgUnifiedOut {
+        Ok(Some(DgUnifiedOut {
             n_prompt: p,
             n_canvas: c,
             n_vocab,
             logits,
             trace,
-        })
+        }))
     }
 
     /// One Entropy-Bound denoiser step's host math, transcribed from the
@@ -2626,6 +2799,11 @@ impl DgEncoderRuntime {
         let mut prev_argmax: Vec<i32> = vec![-1; c];
         let mut held = 0i32;
         let mut records = Vec::new();
+        // Wave 6 prefix-KV step cache: prompt K/V are step-invariant within
+        // one EB block, so the first fully-fast step captures them and later
+        // steps run canvas-only forwards. Local to this call => rebuilt per
+        // block (mc_generate grows the prefix between eb_generate calls).
+        let mut prefix_cache: Option<DgPrefixCache> = None;
 
         // Diagnostic-only executed-step cap (does NOT alter the temperature
         // schedule, which is driven by `s`): stop after this many steps so the
@@ -2642,7 +2820,8 @@ impl DgEncoderRuntime {
                 temp_inv: prev_temp_inv,
                 use_sc: if step_idx == 0 { 0.0 } else { 1.0 },
             };
-            let out = self.unified_forward_sc(prompt, &canvas_u32, Some(&sc_in), false)?;
+            let out =
+                self.unified_forward_step(prompt, &canvas_u32, Some(&sc_in), &mut prefix_cache)?;
             sc_buffer.copy_from_slice(&out.logits);
 
             let _t_eb = std::time::Instant::now();
@@ -2765,6 +2944,7 @@ impl DgEncoderRuntime {
     /// source (a diffusion model's full draft canvas exists from the first
     /// step and refines in place). Identical generation by construction.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     pub fn mc_generate_with_steps(
         &self,
         prompt: &[u32],
