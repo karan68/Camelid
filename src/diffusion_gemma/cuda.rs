@@ -1089,10 +1089,6 @@ struct Engine {
     lm_func: CudaFunction,
     q4k_rows_func: CudaFunction,
     q80_rows_func: CudaFunction,
-    q4k_id_func: CudaFunction,
-    q80_id_func: CudaFunction,
-    q50_id_func: CudaFunction,
-    q6k_id_func: CudaFunction,
     q4k_tile_func: CudaFunction,
     q80_tile_func: CudaFunction,
     q50_tile_func: CudaFunction,
@@ -1230,18 +1226,6 @@ fn build_engine() -> Result<Engine, String> {
     let q80_rows_func = m
         .load_function("q8_0_rows_gemv")
         .map_err(|e| format!("load q8_0_rows_gemv: {e}"))?;
-    let q4k_id_func = m
-        .load_function("q4k_gemm_id")
-        .map_err(|e| format!("load q4k_gemm_id: {e}"))?;
-    let q80_id_func = m
-        .load_function("q8_0_gemm_id")
-        .map_err(|e| format!("load q8_0_gemm_id: {e}"))?;
-    let q50_id_func = m
-        .load_function("q5_0_gemm_id")
-        .map_err(|e| format!("load q5_0_gemm_id: {e}"))?;
-    let q6k_id_func = m
-        .load_function("q6k_gemm_id")
-        .map_err(|e| format!("load q6k_gemm_id: {e}"))?;
     let q4k_tile_func = m
         .load_function("q4k_gemm_tile")
         .map_err(|e| format!("load q4k_gemm_tile: {e}"))?;
@@ -1273,10 +1257,6 @@ fn build_engine() -> Result<Engine, String> {
         lm_func,
         q4k_rows_func,
         q80_rows_func,
-        q4k_id_func,
-        q80_id_func,
-        q50_id_func,
-        q6k_id_func,
         q4k_tile_func,
         q80_tile_func,
         q50_tile_func,
