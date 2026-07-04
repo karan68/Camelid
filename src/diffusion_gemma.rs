@@ -529,6 +529,250 @@ fn ffn_moe_layer_fast(
     None
 }
 
+/// FAST-mode whole-layer attention block: qkv projections, per-head norms +
+/// RoPE (CPU — cheap and keeps the libm sincos semantics), the bidirectional
+/// masked attention (GPU kernel), and the output projection + residual.
+/// Mirrors the per-position path's math shape; not bit-exact (f32 GPU
+/// attention). Mutates `h` only after every GPU call has succeeded.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn attn_layer_fast(
+    lw: &DgLayer,
+    h: &mut [Vec<f32>],
+    heads: usize,
+    head_dim: usize,
+    kv_heads: usize,
+    group: usize,
+    theta: f32,
+    rope_factors: Option<&[f32]>,
+    sliding: bool,
+    win: usize,
+    p: usize,
+    canvas_prompt_lo: i64,
+    eps: f32,
+) -> Option<()> {
+    use rayon::prelude::*;
+    if lw.attn_q.format != DgFormat::Q4K || lw.attn_k.format != DgFormat::Q4K {
+        return None;
+    }
+    let v_kind = match lw.attn_v.as_ref().map(|w| w.format) {
+        None => None,
+        Some(DgFormat::Q4K) => Some(cuda::DgExpertKind::Q4K),
+        Some(DgFormat::Q6K) => Some(cuda::DgExpertKind::Q6K),
+        Some(_) => return None,
+    };
+    if lw.attn_output.format != DgFormat::Q4K {
+        return None;
+    }
+    let hidden = h.first()?.len();
+    if !hidden.is_multiple_of(256) {
+        return None;
+    }
+    let n = h.len();
+    let q_dim = heads * head_dim;
+    let kv_dim = kv_heads * head_dim;
+    if !q_dim.is_multiple_of(256) {
+        return None;
+    }
+
+    // Per-position input activation (parallel; no h mutation).
+    let acts: Vec<DgActivation> = h
+        .par_iter()
+        .map(|hp| {
+            let xn = refmath::rms_norm(hp, Some(&lw.attn_norm), eps);
+            DgActivation::new(&xn)
+        })
+        .collect();
+    let bpr = hidden / 256;
+    let mut xs = vec![0f32; n * bpr];
+    let mut xqn = vec![0i8; n * bpr * 256];
+    for (pos, a) in acts.iter().enumerate() {
+        let blocks = a.q8_k.as_ref()?;
+        if blocks.len() != bpr {
+            return None;
+        }
+        for (b, blk) in blocks.iter().enumerate() {
+            xs[pos * bpr + b] = blk.d;
+            let off = (pos * bpr + b) * 256;
+            xqn[off..off + 256].copy_from_slice(&blk.qs);
+        }
+    }
+    let ident_base = vec![0i64; n];
+    let ident_pos: Vec<i32> = (0..n as i32).collect();
+    fn whole(w: &DgWire) -> Option<&[u8]> {
+        w.mmap.bytes(w.offset, w.rows * w.row_bytes()).ok()
+    }
+
+    // Projections (batched GPU GEMMs).
+    let mut q_all = cuda::fast_gemm_id(
+        whole(&lw.attn_q)?,
+        (lw.attn_q.mmap.path(), lw.attn_q.offset),
+        cuda::DgExpertKind::Q4K,
+        &ident_base,
+        &ident_pos,
+        q_dim,
+        bpr,
+        &xs,
+        &xqn,
+    )?;
+    let mut k_all = cuda::fast_gemm_id(
+        whole(&lw.attn_k)?,
+        (lw.attn_k.mmap.path(), lw.attn_k.offset),
+        cuda::DgExpertKind::Q4K,
+        &ident_base,
+        &ident_pos,
+        kv_dim,
+        bpr,
+        &xs,
+        &xqn,
+    )?;
+    let mut v_all = match (lw.attn_v.as_ref(), v_kind) {
+        (Some(wv), Some(kind)) => cuda::fast_gemm_id(
+            whole(wv)?,
+            (wv.mmap.path(), wv.offset),
+            kind,
+            &ident_base,
+            &ident_pos,
+            kv_dim,
+            bpr,
+            &xs,
+            &xqn,
+        )?,
+        // V-less layer: V is the RAW K projection (pre-norm, pre-RoPE).
+        _ => k_all.clone(),
+    };
+
+    // Per-head norms + RoPE (parallel per position; mirrors the CPU path).
+    q_all
+        .par_chunks_mut(q_dim)
+        .zip(
+            k_all
+                .par_chunks_mut(kv_dim)
+                .zip(v_all.par_chunks_mut(kv_dim)),
+        )
+        .enumerate()
+        .for_each(|(pos, (qp, (kp, vp)))| {
+            for hh in 0..heads {
+                let s = &mut qp[hh * head_dim..(hh + 1) * head_dim];
+                s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.q_norm), eps));
+            }
+            refmath::rope_neox(qp, heads, head_dim, pos, theta, rope_factors);
+            for hh in 0..kv_heads {
+                let s = &mut kp[hh * head_dim..(hh + 1) * head_dim];
+                s.copy_from_slice(&refmath::rms_norm(s, Some(&lw.k_norm), eps));
+                let sv = &mut vp[hh * head_dim..(hh + 1) * head_dim];
+                sv.copy_from_slice(&refmath::rms_norm(sv, None, eps));
+            }
+            refmath::rope_neox(kp, kv_heads, head_dim, pos, theta, rope_factors);
+        });
+
+    // Attention (GPU kernel).
+    let attn = cuda::dg_attention_gpu(
+        &q_all,
+        &k_all,
+        &v_all,
+        n,
+        heads,
+        kv_heads,
+        head_dim,
+        group,
+        p,
+        win,
+        sliding,
+        canvas_prompt_lo,
+    )?;
+
+    // Output projection: quantize the attention mix, batched GEMM, post-norm
+    // + residual (the only h mutation, after all GPU calls).
+    let attn_acts: Vec<DgActivation> = attn.par_chunks(q_dim).map(DgActivation::new).collect();
+    let abpr = q_dim / 256;
+    let mut asx = vec![0f32; n * abpr];
+    let mut aqn = vec![0i8; n * abpr * 256];
+    for (pos, a) in attn_acts.iter().enumerate() {
+        let blocks = a.q8_k.as_ref()?;
+        if blocks.len() != abpr {
+            return None;
+        }
+        for (b, blk) in blocks.iter().enumerate() {
+            asx[pos * abpr + b] = blk.d;
+            let off = (pos * abpr + b) * 256;
+            aqn[off..off + 256].copy_from_slice(&blk.qs);
+        }
+    }
+    let o_all = cuda::fast_gemm_id(
+        whole(&lw.attn_output)?,
+        (lw.attn_output.mmap.path(), lw.attn_output.offset),
+        cuda::DgExpertKind::Q4K,
+        &ident_base,
+        &ident_pos,
+        hidden,
+        abpr,
+        &asx,
+        &aqn,
+    )?;
+    h.par_iter_mut().enumerate().for_each(|(pos, hp)| {
+        let on = refmath::rms_norm(
+            &o_all[pos * hidden..(pos + 1) * hidden],
+            Some(&lw.post_attn_norm),
+            eps,
+        );
+        for (a, b) in hp.iter_mut().zip(&on) {
+            *a += b;
+        }
+    });
+    Some(())
+}
+#[cfg(not(feature = "cuda"))]
+#[allow(clippy::too_many_arguments)]
+fn attn_layer_fast(
+    _lw: &DgLayer,
+    _h: &mut [Vec<f32>],
+    _heads: usize,
+    _head_dim: usize,
+    _kv_heads: usize,
+    _group: usize,
+    _theta: f32,
+    _rope_factors: Option<&[f32]>,
+    _sliding: bool,
+    _win: usize,
+    _p: usize,
+    _canvas_prompt_lo: i64,
+    _eps: f32,
+) -> Option<()> {
+    None
+}
+
+/// FAST-mode lm_head: flatten the canvas activations and run the tiled f16
+/// GEMM against the resident SC embedding transpose. `None` → the existing
+/// (parity-grade) lm_head paths.
+#[cfg(feature = "cuda")]
+fn lm_head_fast_gemm(
+    rt: &DgEncoderRuntime,
+    canvas_rns: &[Vec<f32>],
+    c: usize,
+    hidden: usize,
+) -> Option<Vec<f32>> {
+    let emb_t = rt.sc_emb_t().ok()?;
+    let n_vocab = rt.token_embd.rows;
+    let mut flat = Vec::with_capacity(c * hidden);
+    for rn in canvas_rns {
+        flat.extend_from_slice(rn);
+    }
+    // Softcapping fuses into the GEMM store (0.0 = none) — the caller must
+    // NOT re-apply the host softcap to these logits.
+    let cap = rt.final_logit_softcapping.unwrap_or(0.0);
+    cuda::lm_head_f16_gemm_gpu(emb_t, &flat, c, hidden, n_vocab, cap)
+}
+#[cfg(not(feature = "cuda"))]
+fn lm_head_fast_gemm(
+    _rt: &DgEncoderRuntime,
+    _canvas_rns: &[Vec<f32>],
+    _c: usize,
+    _hidden: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
 use crate::gguf::{read_metadata, GgufTensorDescriptor, GgufTensorType};
 
 // Expert-selection argsort matching the reference's `ggml_argsort_top_k`
@@ -1787,7 +2031,30 @@ impl DgEncoderRuntime {
             let mut ks: Vec<Vec<f32>> = Vec::with_capacity(n);
             let mut vs: Vec<Vec<f32>> = Vec::with_capacity(n);
             let _t_qkv = std::time::Instant::now();
-            for (pos, hp) in h.iter().enumerate() {
+            // FAST mode: whole attention block (projections + masked
+            // bidirectional attention + output projection) as batched GPU
+            // work; the per-position loops below are skipped on success.
+            let fast_attn = !want_trace
+                && dg_fast_enabled()
+                && attn_layer_fast(
+                    lw,
+                    &mut h,
+                    heads,
+                    head_dim,
+                    kv_heads,
+                    group,
+                    theta,
+                    rope_factors,
+                    sliding,
+                    win,
+                    p,
+                    canvas_prompt_lo,
+                    eps,
+                )
+                .is_some();
+            let qkv_range = if fast_attn { 0..0 } else { 0..h.len() };
+            for pos in qkv_range {
+                let hp = &h[pos];
                 let xn = refmath::rms_norm(hp, Some(&lw.attn_norm), eps);
                 let xq = DgActivation::new(&xn);
                 let mut q = lw.attn_q.matvec_dense(&xq)?;
@@ -1833,7 +2100,11 @@ impl DgEncoderRuntime {
                 }
             };
 
-            let mut v_cols: Vec<Vec<f32>> = vec![vec![0f32; n]; kv_heads * head_dim];
+            let mut v_cols: Vec<Vec<f32>> = if fast_attn {
+                Vec::new()
+            } else {
+                vec![vec![0f32; n]; kv_heads * head_dim]
+            };
             for (pp, vp) in vs.iter().enumerate() {
                 for (di, &val) in vp.iter().enumerate() {
                     v_cols[di][pp] = val;
@@ -1854,7 +2125,8 @@ impl DgEncoderRuntime {
             } else {
                 Vec::new()
             };
-            for pos in 0..n {
+            let attn_range = if fast_attn { 0..0 } else { 0..n };
+            for pos in attn_range {
                 let mut attn = vec![0f32; q_dim];
                 for hh in 0..heads {
                     let kvh = hh / group;
@@ -2073,12 +2345,27 @@ impl DgEncoderRuntime {
                 result_norm_all.extend_from_slice(rn);
             }
         }
-        // Canvas rows finish through the tied Q6_K lm_head. Quantize each canvas
-        // activation to Q8_K, then run one batched GPU GEMV (bit-close to the
+        // Canvas rows finish through the tied Q6_K lm_head. FAST mode runs a
+        // tiled f16 GEMM against the resident SC embedding transpose (shared
+        // VRAM slot, ~100x fewer weight reads); otherwise quantize each canvas
+        // activation to Q8_K and run one batched GPU GEMV (bit-close to the
         // CPU q6_k_dot) when available, else the per-position CPU matvec.
-        let canvas_acts: Vec<DgActivation> =
-            rns[p..].iter().map(|rn| DgActivation::new(rn)).collect();
-        let gpu_logits = lm_head_gpu(&self.token_embd, &canvas_acts, c, hidden);
+        let fast_logits = if !want_trace && dg_fast_enabled() {
+            lm_head_fast_gemm(self, &rns[p..], c, hidden)
+        } else {
+            None
+        };
+        // The fast GEMM fuses the softcap into its store; do not re-apply.
+        let fast_capped = fast_logits.is_some();
+        let canvas_acts: Vec<DgActivation> = if fast_capped {
+            Vec::new()
+        } else {
+            rns[p..].iter().map(|rn| DgActivation::new(rn)).collect()
+        };
+        let gpu_logits = match fast_logits {
+            Some(v) => Some(v),
+            None => lm_head_gpu(&self.token_embd, &canvas_acts, c, hidden),
+        };
         let mut logits = Vec::with_capacity(c * n_vocab);
         let softcap = |row: &mut [f32]| {
             if let Some(cap) = self.final_logit_softcapping {
@@ -2092,10 +2379,14 @@ impl DgEncoderRuntime {
         };
         match gpu_logits {
             Some(all) => {
-                for pos in 0..c {
-                    let mut row = all[pos * n_vocab..(pos + 1) * n_vocab].to_vec();
-                    softcap(&mut row);
-                    logits.extend_from_slice(&row);
+                if fast_capped {
+                    logits = all;
+                } else {
+                    for pos in 0..c {
+                        let mut row = all[pos * n_vocab..(pos + 1) * n_vocab].to_vec();
+                        softcap(&mut row);
+                        logits.extend_from_slice(&row);
+                    }
                 }
             }
             None => {

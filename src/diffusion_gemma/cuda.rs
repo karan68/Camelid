@@ -33,6 +33,9 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 // NVRTC has no cuda_fp16.h here, so f16->f32 is hand-rolled (mirrors the
 // resident engine's `f16_bits_to_f32`).
 const KERNEL: &str = r#"
+// NVRTC has no math.h: spell -inf via the bit pattern.
+#define DG_NEG_INF (__int_as_float(0xff800000))
+
 __device__ __forceinline__ float f16_bits_to_f32(unsigned short bits) {
     unsigned int sign = ((unsigned int)(bits & 0x8000u)) << 16;
     unsigned int exp = (bits & 0x7c00u) >> 10;
@@ -385,6 +388,181 @@ extern "C" __global__ void q5_0_gemm_id(
         + ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
 }
 
+// Q6_K x Q8_K batched-ID GEMM (210-byte superblocks; same decode as
+// q6k_gemv_q8k above, with the (pair_base, pair_pos) indexing).
+extern "C" __global__ void q6k_gemm_id(
+    const unsigned char* __restrict__ wire,
+    const float* __restrict__ act_scales,
+    const signed char* __restrict__ act_quants,
+    const long long* __restrict__ pair_base,
+    const int* __restrict__ pair_pos,
+    int n_pairs, int rows_per, int bpr,
+    float* __restrict__ out)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_pairs * rows_per;
+    if (idx >= total) return;
+    int pair = (int)(idx / rows_per);
+    int r = (int)(idx % rows_per);
+    const unsigned char* rowp = wire + (pair_base[pair] + r) * (long long)bpr * 210;
+    const float* a_s = act_scales + (long long)pair_pos[pair] * bpr;
+    const signed char* a_q = act_quants + (long long)pair_pos[pair] * bpr * 256;
+    float sumf = 0.0f;
+    for (int b = 0; b < bpr; b++) {
+        const unsigned char* block = rowp + (long long)b * 210;
+        const unsigned char* ql = block;
+        const unsigned char* qh = block + 128;
+        const signed char* scales = (const signed char*)(block + 192);
+        float d_all = f16_bits_to_f32((unsigned short)block[208]
+            | ((unsigned short)block[209] << 8));
+        const signed char* q8 = a_q + (long long)b * 256;
+        float y_d = a_s[b];
+        long long isum = 0;
+        for (int half = 0; half < 2; half++) {
+            const unsigned char* qlh = ql + half * 64;
+            const unsigned char* qhh = qh + half * 32;
+            const signed char* q8h = q8 + half * 128;
+            const signed char* sc = scales + half * 8;
+            long long gs0 = 0, gs1 = 0, gs2 = 0, gs3 = 0,
+                gs4 = 0, gs5 = 0, gs6 = 0, gs7 = 0;
+            for (int l = 0; l < 32; l++) {
+                int v0 = (qlh[l] & 0xF) | ((qhh[l] & 3) << 4);
+                int v1 = (qlh[32 + l] & 0xF) | (((qhh[l] >> 2) & 3) << 4);
+                int v2 = (qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4);
+                int v3 = (qlh[32 + l] >> 4) | (((qhh[l] >> 6) & 3) << 4);
+                if (l < 16) {
+                    gs0 += (long long)v0 * q8h[l];
+                    gs2 += (long long)v1 * q8h[32 + l];
+                    gs4 += (long long)v2 * q8h[64 + l];
+                    gs6 += (long long)v3 * q8h[96 + l];
+                } else {
+                    gs1 += (long long)v0 * q8h[l];
+                    gs3 += (long long)v1 * q8h[32 + l];
+                    gs5 += (long long)v2 * q8h[64 + l];
+                    gs7 += (long long)v3 * q8h[96 + l];
+                }
+            }
+            isum += gs0 * (long long)sc[0] + gs1 * (long long)sc[1]
+                + gs2 * (long long)sc[2] + gs3 * (long long)sc[3]
+                + gs4 * (long long)sc[4] + gs5 * (long long)sc[5]
+                + gs6 * (long long)sc[6] + gs7 * (long long)sc[7];
+        }
+        long long isum_mins = 0;
+        for (int t = 0; t < 16; t++) {
+            long long bs = 0;
+            for (int l = 0; l < 16; l++) bs += q8[t * 16 + l];
+            isum_mins += bs * (long long)scales[t];
+        }
+        sumf = fmaf(d_all * y_d, (float)(isum - 32 * isum_mins), sumf);
+    }
+    out[idx] = sumf;
+}
+
+// FAST-mode bidirectional diffusion attention: one block per (pos, head).
+// Mirrors the CPU path's math shape (raw QK dots -> masked softmax -> V mix)
+// with the region-aware mask: prompt queries are causal over the prompt
+// (SWA-clipped on sliding layers); canvas queries see everything on global
+// layers, and all canvas plus the last (n_swa - 1) prompt positions on
+// sliding layers. f32 throughout (fast mode: not bit-exact).
+extern "C" __global__ void dg_attn(
+    const float* __restrict__ q,   // [n * heads * hd]
+    const float* __restrict__ k,   // [n * kv_heads * hd]
+    const float* __restrict__ v,   // [n * kv_heads * hd]
+    float* __restrict__ out,       // [n * heads * hd]
+    int n, int heads, int kv_heads, int hd, int group,
+    int p, int win, int sliding, long long lo)
+{
+    int pos = blockIdx.x / heads;
+    int hh = blockIdx.x % heads;
+    if (pos >= n) return;
+    int kvh = hh / group;
+    extern __shared__ float row[]; // [n] scores
+    __shared__ float red[256];
+    const float* qh = q + ((long long)pos * heads + hh) * hd;
+    for (int kp = threadIdx.x; kp < n; kp += blockDim.x) {
+        bool ok;
+        if (pos >= p) {
+            ok = sliding ? (kp >= p || (long long)kp >= lo) : true;
+        } else {
+            ok = (kp <= pos) && (!sliding || kp + win > pos);
+        }
+        float s = DG_NEG_INF;
+        if (ok) {
+            const float* kk = k + ((long long)kp * kv_heads + kvh) * hd;
+            float acc = 0.0f;
+            for (int d = 0; d < hd; d++) acc += qh[d] * kk[d];
+            s = acc;
+        }
+        row[kp] = s;
+    }
+    __syncthreads();
+    float m = DG_NEG_INF;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, row[i]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s2 = blockDim.x >> 1; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2)
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s2]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float e = expf(row[i] - m);
+        row[i] = e;
+        sum += e;
+    }
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (int s2 = blockDim.x >> 1; s2 > 0; s2 >>= 1) {
+        if (threadIdx.x < s2) red[threadIdx.x] += red[threadIdx.x + s2];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    __syncthreads();
+    float* op = out + ((long long)pos * heads + hh) * hd;
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int kp = 0; kp < n; kp++) {
+            acc += row[kp] * v[((long long)kp * kv_heads + kvh) * hd + d];
+        }
+        op[d] = acc * inv;
+    }
+}
+
+// FAST-mode lm_head: tiled f32xf16 GEMM against the RESIDENT transposed
+// embedding (the SC stage's emb_t, [hidden][vocab] row-major — already the
+// B-matrix layout a GEMM wants, and already in VRAM). C[m*n] = A[m*k] x B[k*n].
+// cap > 0 fuses the final-logit softcapping (tanh(x/cap)*cap) into the store.
+extern "C" __global__ void lm_head_f16_gemm(
+    const float* __restrict__ a,
+    const unsigned short* __restrict__ bt,
+    float* __restrict__ cmat,
+    int m, int k, int n, float cap)
+{
+    __shared__ float As[16][16];
+    __shared__ float Bs[16][17];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int col = blockIdx.x * 16 + tx;
+    int rowc = blockIdx.y * 16 + ty;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < k; k0 += 16) {
+        As[ty][tx] = (rowc < m && (k0 + tx) < k) ? a[(long long)rowc * k + k0 + tx] : 0.0f;
+        int brow = k0 + ty;
+        Bs[ty][tx] = (brow < k && col < n)
+            ? f16_bits_to_f32(bt[(long long)brow * n + col])
+            : 0.0f;
+        __syncthreads();
+        for (int kk = 0; kk < 16; kk++) acc += As[ty][kk] * Bs[kk][tx];
+        __syncthreads();
+    }
+    if (rowc < m && col < n) {
+        if (cap > 0.0f) acc = tanhf(acc * (1.0f / cap)) * cap;
+        cmat[(long long)rowc * n + col] = acc;
+    }
+}
+
 extern "C" __global__ void q8_0_gemm_id(
     const unsigned char* __restrict__ wire,
     const float* __restrict__ act_scales,      // [P * nb]
@@ -436,6 +614,9 @@ struct Engine {
     q4k_id_func: CudaFunction,
     q80_id_func: CudaFunction,
     q50_id_func: CudaFunction,
+    q6k_id_func: CudaFunction,
+    attn_func: CudaFunction,
+    lm_gemm_func: CudaFunction,
     /// FAST-mode streaming scratch for tensors that miss the resident pool
     /// (grown to the largest streamed tensor; one at a time).
     scratch: Option<CudaSlice<u8>>,
@@ -443,6 +624,16 @@ struct Engine {
     /// pageable-mmap → pinned memcpy + pinned → device DMA is several times
     /// faster than a pageable `memcpy_htod`. Grown like `scratch`.
     pinned: Option<cudarc::driver::PinnedHostSlice<u8>>,
+    /// Second pinned buffer: the read-ahead worker fills this one with the
+    /// NEXT streamed tensor while `pinned` feeds the current htod.
+    pinned2: Option<cudarc::driver::PinnedHostSlice<u8>>,
+    /// Which pinned buffer the read-ahead worker owns right now (0/1).
+    ra_buf: usize,
+    /// Read-ahead pipeline (see `ReadAhead`): the per-step streamed-tensor
+    /// sequence is deterministic, so step 0 learns it and steps 1+ overlap
+    /// each tensor's FILE READ (the actual wall, ~10x the PCIe copy) with
+    /// the previous tensor's GPU work.
+    ra: Option<ReadAhead>,
     /// Resident transposed embedding (f16) for the SC matmul.
     sc_emb: Option<(CudaSlice<u16>, (usize, usize))>,
     /// Resident Q6_K lm_head weight (wire bytes).
@@ -455,6 +646,10 @@ struct Engine {
     /// Remaining expert-pool byte budget; `None` until first use (computed
     /// from free VRAM minus a reserve, or `CAMELID_DG_EXPERT_VRAM_MB`).
     expert_budget: Option<u64>,
+    /// Carve-out for SMALL tensors (attention/dense projections, ~40 MiB per
+    /// layer total). Without it the greedy expert uploads exhaust the budget
+    /// first and the small HOT tensors re-stream every layer, every step.
+    small_budget: Option<u64>,
 }
 
 // SAFETY: the engine is only touched while holding ENGINE's mutex (the same
@@ -463,8 +658,54 @@ unsafe impl Send for Engine {}
 
 static ENGINE: OnceLock<Mutex<Option<Engine>>> = OnceLock::new();
 
+/// Largest streamable tensor (pinned staging buffers are fixed at this cap;
+/// the biggest streamed DG tensor is ~285 MiB).
+const DG_PIN_CAP: usize = 300 * 1024 * 1024;
+
+/// Residency split: tensors under this size (attention/dense projections)
+/// draw from the small carve-out; expert tensors draw from the remainder.
+const DG_SMALL_TENSOR: usize = 32 * 1024 * 1024;
+/// Carve-out for the small hot tensors (all 30 layers' attn+dense ≈ 1.2 GiB).
+const DG_SMALL_BUDGET: u64 = 1300 * 1024 * 1024;
+
+/// Initialize the split pool budgets on first use.
+fn ensure_budgets(eng: &mut Engine) {
+    if eng.expert_budget.is_some() {
+        return;
+    }
+    let total = match std::env::var("CAMELID_DG_EXPERT_VRAM_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(mb) => mb * 1024 * 1024,
+        None => {
+            const RESERVE: u64 = 1700 * 1024 * 1024;
+            let free = cudarc::driver::result::mem_get_info()
+                .map(|(f, _)| f as u64)
+                .unwrap_or(0);
+            free.saturating_sub(RESERVE)
+        }
+    };
+    let small = total.min(DG_SMALL_BUDGET);
+    eng.small_budget = Some(small);
+    eng.expert_budget = Some(total - small);
+    eprintln!(
+        "[dg-cuda] pool budgets: {:.2} GiB experts + {:.2} GiB small tensors",
+        (total - small) as f64 / (1u64 << 30) as f64,
+        small as f64 / (1u64 << 30) as f64
+    );
+}
+
+/// Set once when the NVRTC engine build fails: every later GPU call must
+/// fail FAST to the CPU path. Without this, each of the thousands of
+/// per-step calls would retry the full kernel compile (~0.5 s each) and a
+/// broken kernel would run 20-30x SLOWER than plain CPU.
+static ENGINE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn gate_off() -> bool {
-    std::env::var("CAMELID_DG_CUDA").as_deref() == Ok("0") || !crate::cuda::is_available()
+    ENGINE_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("CAMELID_DG_CUDA").as_deref() == Ok("0")
+        || !crate::cuda::is_available()
 }
 
 fn build_engine() -> Result<Engine, String> {
@@ -501,6 +742,15 @@ fn build_engine() -> Result<Engine, String> {
     let q50_id_func = m
         .load_function("q5_0_gemm_id")
         .map_err(|e| format!("load q5_0_gemm_id: {e}"))?;
+    let q6k_id_func = m
+        .load_function("q6k_gemm_id")
+        .map_err(|e| format!("load q6k_gemm_id: {e}"))?;
+    let attn_func = m
+        .load_function("dg_attn")
+        .map_err(|e| format!("load dg_attn: {e}"))?;
+    let lm_gemm_func = m
+        .load_function("lm_head_f16_gemm")
+        .map_err(|e| format!("load lm_head_f16_gemm: {e}"))?;
     Ok(Engine {
         stream,
         ctx,
@@ -511,13 +761,20 @@ fn build_engine() -> Result<Engine, String> {
         q4k_id_func,
         q80_id_func,
         q50_id_func,
+        q6k_id_func,
+        attn_func,
+        lm_gemm_func,
         scratch: None,
         pinned: None,
+        pinned2: None,
+        ra_buf: 0,
+        ra: None,
         sc_emb: None,
         lm_wire: None,
         expert_pool: std::collections::HashMap::new(),
         expert_rejected: std::collections::HashSet::new(),
         expert_budget: None,
+        small_budget: None,
     })
 }
 
@@ -548,6 +805,7 @@ pub(crate) fn sc_soft_embedding_gpu(
         match build_engine() {
             Ok(e) => *guard = Some(e),
             Err(err) => {
+                ENGINE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
                 return None;
             }
@@ -628,6 +886,7 @@ pub(crate) fn lm_head_q6k_gpu(
         match build_engine() {
             Ok(e) => *guard = Some(e),
             Err(err) => {
+                ENGINE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
                 return None;
             }
@@ -700,6 +959,9 @@ pub(crate) enum DgExpertKind {
     Q80,
     /// 22-byte blocks; activation is Q8_0 (same layout as `Q80`). FAST mode only.
     Q50,
+    /// 210-byte superblocks; activation is Q8_K (same layout as `Q4K`).
+    /// FAST mode only (attn_v / lm_head class tensors).
+    Q6K,
 }
 
 /// MoE expert row-range GEMV on the VRAM-resident expert pool.
@@ -730,6 +992,7 @@ pub(crate) fn expert_rows_gemv_gpu(
         match build_engine() {
             Ok(e) => *guard = Some(e),
             Err(err) => {
+                ENGINE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
                 return None;
             }
@@ -741,27 +1004,9 @@ pub(crate) fn expert_rows_gemv_gpu(
         return None;
     }
     if !eng.expert_pool.contains_key(&key) {
-        // Initialize the pool budget on first use.
-        if eng.expert_budget.is_none() {
-            let budget = match std::env::var("CAMELID_DG_EXPERT_VRAM_MB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                Some(mb) => mb * 1024 * 1024,
-                None => {
-                    const RESERVE: u64 = 2200 * 1024 * 1024;
-                    let free = cudarc::driver::result::mem_get_info()
-                        .map(|(f, _)| f as u64)
-                        .unwrap_or(0);
-                    free.saturating_sub(RESERVE)
-                }
-            };
-            eprintln!(
-                "[dg-cuda] expert pool budget {:.2} GiB",
-                budget as f64 / (1u64 << 30) as f64
-            );
-            eng.expert_budget = Some(budget);
-        }
+        // Initialize the pool budgets on first use (expert tensors draw from
+        // the big-tensor share; see `ensure_budgets`).
+        ensure_budgets(eng);
         let budget = eng.expert_budget.unwrap();
         if (tensor.len() as u64) > budget {
             eng.expert_rejected.insert(key);
@@ -798,8 +1043,9 @@ pub(crate) fn expert_rows_gemv_gpu(
     let func = match kind {
         DgExpertKind::Q4K => &eng.q4k_rows_func,
         DgExpertKind::Q80 => &eng.q80_rows_func,
-        // No single-activation Q5_0 kernel: the parity path never routes it.
-        DgExpertKind::Q50 => return None,
+        // No single-activation Q5_0/Q6_K kernels: the parity path never
+        // routes them (fast-mode-only kinds).
+        DgExpertKind::Q50 | DgExpertKind::Q6K => return None,
     };
     let run = || -> Result<Vec<f32>, String> {
         let s = eng.stream.clone();
@@ -855,6 +1101,77 @@ pub(crate) fn expert_rows_gemv_gpu(
 /// reusable scratch upload (~tens of ms for a 272 MiB expert tensor — amortized
 /// over ALL pairs, which is the whole point vs per-position reads). Returns
 /// `[n_pairs * rows_per]` outputs or `None` (→ CPU fallback).
+/// A prefetch request to the read-ahead worker: read `len` bytes at `off`
+/// of `path` into the raw pinned buffer at `ptr`.
+struct RaReq {
+    key: (usize, usize),
+    ptr: usize,
+    len: usize,
+    path: std::path::PathBuf,
+    off: u64,
+}
+
+/// Read-ahead pipeline for streamed tensors. Two fixed pinned buffers
+/// alternate: one feeds the current htod while a worker thread fills the
+/// other with the NEXT streamed tensor's bytes (the streamed order repeats
+/// exactly every denoise step, learned on step 0). The worker does file I/O
+/// only — no CUDA — so there is no cross-thread context juggling; buffer
+/// handoff is strictly dispatch → recv done → consume.
+struct ReadAhead {
+    tx: std::sync::mpsc::Sender<RaReq>,
+    done_rx: std::sync::mpsc::Receiver<(usize, usize)>,
+    /// (key, pinned-buffer index) dispatched and not yet consumed.
+    in_flight: Option<((usize, usize), usize)>,
+    /// Learned per-step order of streamed tensors: (key, path, offset, len).
+    order: Vec<((usize, usize), std::path::PathBuf, u64, usize)>,
+    learned: bool,
+}
+
+impl ReadAhead {
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<RaReq>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, usize)>();
+        std::thread::Builder::new()
+            .name("dg-readahead".into())
+            .spawn(move || {
+                while let Ok(req) = rx.recv() {
+                    // SAFETY: ptr/len name an exclusively-handed-off pinned
+                    // buffer region; the dispatcher does not touch it until
+                    // the done message for this key arrives.
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(req.ptr as *mut u8, req.len) };
+                    let ok = std::fs::File::open(&req.path)
+                        .and_then(|f| read_at_into(&f, req.off, dst))
+                        .is_ok();
+                    // A failed read reports key (ptr, 0) so the consumer
+                    // falls back to its own synchronous read.
+                    let _ = done_tx.send(if ok { req.key } else { (req.key.0, 0) });
+                }
+            })
+            .expect("spawn dg-readahead");
+        Self {
+            tx,
+            done_rx,
+            in_flight: None,
+            order: Vec::new(),
+            learned: false,
+        }
+    }
+
+    /// The entry AFTER `key` in the learned order (wrapping), if any.
+    #[allow(clippy::type_complexity)]
+    fn next_after(
+        &self,
+        key: (usize, usize),
+    ) -> Option<&((usize, usize), std::path::PathBuf, u64, usize)> {
+        if !self.learned || self.order.is_empty() {
+            return None;
+        }
+        let i = self.order.iter().position(|(k, ..)| *k == key)?;
+        Some(&self.order[(i + 1) % self.order.len()])
+    }
+}
+
 /// Positioned read into `dst` (Windows `seek_read` / Unix `read_exact_at`).
 fn read_at_into(file: &std::fs::File, offset: u64, dst: &mut [u8]) -> std::io::Result<()> {
     #[cfg(windows)]
@@ -905,6 +1222,7 @@ pub(crate) fn fast_gemm_id(
         match build_engine() {
             Ok(e) => *guard = Some(e),
             Err(err) => {
+                ENGINE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
                 return None;
             }
@@ -915,34 +1233,29 @@ pub(crate) fn fast_gemm_id(
     // Residency: pool if the budget allows (same accounting as the parity
     // expert pool), else stream through the scratch buffer.
     let mut streamed = false;
+    let mut streamed_upload_done = false;
+    // (consumed key, pinned-buffer index) when a streamed upload used a
+    // pinned buffer — the post-sync prefetch dispatch reuses that buffer.
+    let mut stream_consumed: Option<((usize, usize), usize)> = None;
     if !eng.expert_pool.contains_key(&key) && !eng.expert_rejected.contains(&key) {
-        if eng.expert_budget.is_none() {
-            let budget = match std::env::var("CAMELID_DG_EXPERT_VRAM_MB")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                Some(mb) => mb * 1024 * 1024,
-                None => {
-                    const RESERVE: u64 = 2200 * 1024 * 1024;
-                    let free = cudarc::driver::result::mem_get_info()
-                        .map(|(f, _)| f as u64)
-                        .unwrap_or(0);
-                    free.saturating_sub(RESERVE)
-                }
-            };
-            eprintln!(
-                "[dg-cuda] expert pool budget {:.2} GiB",
-                budget as f64 / (1u64 << 30) as f64
-            );
-            eng.expert_budget = Some(budget);
-        }
-        let budget = eng.expert_budget.unwrap();
+        ensure_budgets(eng);
+        let is_small = tensor.len() < DG_SMALL_TENSOR;
+        let budget = if is_small {
+            eng.small_budget.unwrap()
+        } else {
+            eng.expert_budget.unwrap()
+        };
         if (tensor.len() as u64) <= budget {
             let s = eng.stream.clone();
             match s.alloc_zeros::<u8>(tensor.len()) {
                 Ok(mut dev) => {
                     if s.memcpy_htod(tensor, &mut dev).is_ok() {
-                        eng.expert_budget = Some(budget - tensor.len() as u64);
+                        let left = budget - tensor.len() as u64;
+                        if is_small {
+                            eng.small_budget = Some(left);
+                        } else {
+                            eng.expert_budget = Some(left);
+                        }
                         eng.expert_pool.insert(key, dev);
                     } else {
                         eng.expert_rejected.insert(key);
@@ -976,46 +1289,116 @@ pub(crate) fn fast_gemm_id(
             }
         }
         // Stage through pinned memory, filled by a DIRECT positioned file
-        // read. Under RAM pressure the mmap's demand paging re-reads evicted
-        // pages at random-fault speed (~0.6 GB/s observed); a sequential
-        // buffered read hits NVMe read-ahead speed instead, and the pinned
-        // buffer gives the htod full DMA rate. Falls back to the mmap slice.
-        let pin_ok = eng
-            .pinned
-            .as_ref()
-            .map(|pin| pin.len() >= need)
-            .unwrap_or(false);
-        if !pin_ok {
-            eng.pinned = unsafe { eng.ctx.alloc_pinned::<u8>(need) }.ok();
-        }
-        let staged: Option<&[u8]> = eng.pinned.as_mut().and_then(|pin| {
-            let dst = pin.as_mut_ptr().ok()?;
-            // SAFETY: pin.len() >= need (grown above).
-            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, need) };
-            let read_ok = std::fs::File::open(src.0)
-                .and_then(|f| read_at_into(&f, src.1, dst_slice))
-                .is_ok();
-            if !read_ok {
-                // SAFETY: as above; the mmap slice is the fallback source.
-                unsafe { std::ptr::copy_nonoverlapping(tensor.as_ptr(), dst, need) };
-            }
-            pin.as_slice().ok().map(|sl| &sl[..need])
-        });
-        let buf = eng.scratch.as_mut().unwrap();
-        let mut view = buf.slice_mut(0..need);
-        let copied = match staged {
-            Some(host) => s.memcpy_htod(host, &mut view),
-            None => s.memcpy_htod(tensor, &mut view),
-        };
-        if let Err(e) = copied {
-            eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
+        // read (mmap demand paging under RAM pressure runs at random-fault
+        // speed, ~0.6 GB/s observed; a sequential read + pinned DMA is far
+        // faster). The read-ahead worker overlaps the NEXT streamed tensor's
+        // read (the dominant cost) with this call's GPU work, alternating two
+        // fixed pinned buffers; the per-step sequence is learned on step 0.
+        if need > DG_PIN_CAP {
+            eprintln!("[dg-cuda] streamed tensor exceeds pin cap; CPU fallback");
             return None;
+        }
+        if eng.pinned.is_none() {
+            eng.pinned = unsafe { eng.ctx.alloc_pinned::<u8>(DG_PIN_CAP) }.ok();
+        }
+        if eng.pinned2.is_none() {
+            eng.pinned2 = unsafe { eng.ctx.alloc_pinned::<u8>(DG_PIN_CAP) }.ok();
+        }
+        if eng.ra.is_none() {
+            eng.ra = Some(ReadAhead::new());
+        }
+        // 1. Resolve the host bytes: a matching completed prefetch, else a
+        // synchronous read into whichever buffer the worker does not hold.
+        let mut ready_buf: Option<usize> = None;
+        {
+            let ra = eng.ra.as_mut().unwrap();
+            if let Some((k, bi)) = ra.in_flight {
+                if k == key {
+                    match ra.done_rx.recv() {
+                        Ok(done) if done == key => ready_buf = Some(bi),
+                        _ => {} // read failed → fall through to sync read
+                    }
+                    ra.in_flight = None;
+                } else {
+                    // Mispredict (should not happen once learned): reclaim
+                    // the buffer by draining the done message, then ignore it.
+                    let _ = ra.done_rx.recv();
+                    ra.in_flight = None;
+                }
+            }
+            // Learn the per-step sequence on the first pass.
+            if !ra.learned {
+                if ra.order.first().map(|(k, ..)| *k == key).unwrap_or(false) {
+                    ra.learned = true;
+                    eprintln!(
+                        "[dg-cuda] read-ahead learned {} streamed tensors/step",
+                        ra.order.len()
+                    );
+                } else {
+                    ra.order.push((key, src.0.to_path_buf(), src.1, need));
+                }
+            }
+        }
+        let use_buf = ready_buf.unwrap_or(eng.ra_buf);
+        if ready_buf.is_none() {
+            // Synchronous read into `use_buf` (the worker holds no buffer or
+            // holds the other one).
+            let pin = if use_buf == 0 {
+                eng.pinned.as_mut()
+            } else {
+                eng.pinned2.as_mut()
+            };
+            let read_ok = pin.is_some_and(|pin| {
+                let Ok(dst) = pin.as_mut_ptr() else {
+                    return false;
+                };
+                // SAFETY: PIN_CAP >= need (checked above).
+                let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, need) };
+                std::fs::File::open(src.0)
+                    .and_then(|f| read_at_into(&f, src.1, dst_slice))
+                    .is_ok()
+            });
+            if !read_ok {
+                // Last-resort: pageable upload straight from the mmap slice.
+                let buf = eng.scratch.as_mut().unwrap();
+                let mut view = buf.slice_mut(0..need);
+                if let Err(e) = s.memcpy_htod(tensor, &mut view) {
+                    eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
+                    return None;
+                }
+                eng.ra_buf = use_buf; // buffer unused; stays available
+                streamed_upload_done = true;
+            }
+        }
+        if !streamed_upload_done {
+            let pin = if use_buf == 0 {
+                eng.pinned.as_ref()
+            } else {
+                eng.pinned2.as_ref()
+            };
+            let host = pin
+                .and_then(|pin| pin.as_slice().ok())
+                .map(|sl| &sl[..need]);
+            let Some(host) = host else {
+                eprintln!("[dg-cuda] pinned staging unavailable; CPU fallback");
+                return None;
+            };
+            let buf = eng.scratch.as_mut().unwrap();
+            let mut view = buf.slice_mut(0..need);
+            if let Err(e) = s.memcpy_htod(host, &mut view) {
+                eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
+                return None;
+            }
+            // The other buffer is free for the worker after this call's sync.
+            eng.ra_buf = use_buf ^ 1;
+            stream_consumed = Some((key, use_buf));
         }
     }
     let func = match kind {
         DgExpertKind::Q4K => &eng.q4k_id_func,
         DgExpertKind::Q80 => &eng.q80_id_func,
         DgExpertKind::Q50 => &eng.q50_id_func,
+        DgExpertKind::Q6K => &eng.q6k_id_func,
     };
     let run = || -> Result<Vec<f32>, String> {
         let s = eng.stream.clone();
@@ -1072,10 +1455,230 @@ pub(crate) fn fast_gemm_id(
         eng.ctx.synchronize().map_err(|e| format!("sync: {e}"))?;
         Ok(out)
     };
-    match run() {
+    let result = run();
+    // Post-sync prefetch dispatch: the buffer this call consumed is free
+    // again (run() ends with a full sync); hand it to the read-ahead worker
+    // for the NEXT streamed tensor in the learned per-step order. The wrap
+    // at the sequence end prefetches the next STEP's first tensor across the
+    // attention/lm_head/sampler gap.
+    if result.is_ok() {
+        if let Some((ck, buf_idx)) = stream_consumed {
+            let next = eng
+                .ra
+                .as_ref()
+                .filter(|ra| ra.learned && ra.in_flight.is_none())
+                .and_then(|ra| ra.next_after(ck).cloned());
+            if let Some((nk, npath, noff, nlen)) = next {
+                if !eng.expert_pool.contains_key(&nk) && nlen > 0 && nlen <= DG_PIN_CAP {
+                    let ptr = if buf_idx == 0 {
+                        eng.pinned.as_mut().and_then(|p| p.as_mut_ptr().ok())
+                    } else {
+                        eng.pinned2.as_mut().and_then(|p| p.as_mut_ptr().ok())
+                    };
+                    if let (Some(ptr), Some(ra)) = (ptr, eng.ra.as_mut()) {
+                        if ra
+                            .tx
+                            .send(RaReq {
+                                key: nk,
+                                ptr: ptr as usize,
+                                len: nlen,
+                                path: npath,
+                                off: noff,
+                            })
+                            .is_ok()
+                        {
+                            ra.in_flight = Some((nk, buf_idx));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    match result {
         Ok(v) => Some(v),
         Err(err) => {
             eprintln!("[dg-cuda] fast gemm failed ({err}); CPU fallback");
+            None
+        }
+    }
+}
+
+/// FAST-mode bidirectional diffusion attention on the GPU (see the `dg_attn`
+/// kernel). `q` is `[n*heads*hd]`, `k`/`v` are `[n*kv_heads*hd]` (post
+/// norm+RoPE, f32). Returns the pre-`attn_output` mix `[n*heads*hd]`, or
+/// `None` on any failure (→ CPU fallback).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dg_attention_gpu(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    n: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    group: usize,
+    p: usize,
+    win: usize,
+    sliding: bool,
+    canvas_prompt_lo: i64,
+) -> Option<Vec<f32>> {
+    if gate_off() {
+        return None;
+    }
+    let cell = ENGINE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().ok()?;
+    if guard.is_none() {
+        match build_engine() {
+            Ok(e) => *guard = Some(e),
+            Err(err) => {
+                ENGINE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
+                return None;
+            }
+        }
+    }
+    let eng = guard.as_mut()?;
+    let run = || -> Result<Vec<f32>, String> {
+        let s = eng.stream.clone();
+        let mut q_dev = s
+            .alloc_zeros::<f32>(q.len())
+            .map_err(|e| format!("alloc q: {e}"))?;
+        s.memcpy_htod(q, &mut q_dev)
+            .map_err(|e| format!("upload q: {e}"))?;
+        let mut k_dev = s
+            .alloc_zeros::<f32>(k.len())
+            .map_err(|e| format!("alloc k: {e}"))?;
+        s.memcpy_htod(k, &mut k_dev)
+            .map_err(|e| format!("upload k: {e}"))?;
+        let mut v_dev = s
+            .alloc_zeros::<f32>(v.len())
+            .map_err(|e| format!("alloc v: {e}"))?;
+        s.memcpy_htod(v, &mut v_dev)
+            .map_err(|e| format!("upload v: {e}"))?;
+        let mut out_dev = s
+            .alloc_zeros::<f32>(n * heads * head_dim)
+            .map_err(|e| format!("alloc attn out: {e}"))?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n * heads) as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: (n * 4) as u32,
+        };
+        let (ni, hi, kvi, hdi, gi, pi, wi, sl) = (
+            n as i32,
+            heads as i32,
+            kv_heads as i32,
+            head_dim as i32,
+            group as i32,
+            p as i32,
+            win as i32,
+            sliding as i32,
+        );
+        let mut b = s.launch_builder(&eng.attn_func);
+        b.arg(&q_dev)
+            .arg(&k_dev)
+            .arg(&v_dev)
+            .arg(&mut out_dev)
+            .arg(&ni)
+            .arg(&hi)
+            .arg(&kvi)
+            .arg(&hdi)
+            .arg(&gi)
+            .arg(&pi)
+            .arg(&wi)
+            .arg(&sl)
+            .arg(&canvas_prompt_lo);
+        unsafe { b.launch(cfg) }.map_err(|e| format!("launch attn: {e}"))?;
+        let mut out = vec![0f32; n * heads * head_dim];
+        s.memcpy_dtoh(&out_dev, &mut out)
+            .map_err(|e| format!("download attn: {e}"))?;
+        eng.ctx.synchronize().map_err(|e| format!("sync: {e}"))?;
+        Ok(out)
+    };
+    match run() {
+        Ok(out) => Some(out),
+        Err(err) => {
+            eprintln!("[dg-cuda] attention failed ({err}); CPU fallback");
+            None
+        }
+    }
+}
+
+/// FAST-mode lm_head over the canvas rows: `logits[pos][v] = Σ_e h[pos][e] ×
+/// emb_t[e][v]` as a tiled f32×f16 GEMM against the SC stage's RESIDENT
+/// transposed embedding (uploaded once, shared with `sc_soft_embedding_gpu`
+/// via the same cache slot). Not bit-exact vs the Q6_K integer dot (f16
+/// weights, f32 accumulation) — FAST mode only.
+pub(crate) fn lm_head_f16_gemm_gpu(
+    emb_t: &[u16],
+    h_canvas: &[f32],
+    c: usize,
+    hidden: usize,
+    n_vocab: usize,
+    softcap: f32,
+) -> Option<Vec<f32>> {
+    if gate_off() {
+        return None;
+    }
+    debug_assert_eq!(emb_t.len(), hidden * n_vocab);
+    debug_assert_eq!(h_canvas.len(), c * hidden);
+    let cell = ENGINE.get_or_init(|| Mutex::new(None));
+    let mut guard = cell.lock().ok()?;
+    if guard.is_none() {
+        match build_engine() {
+            Ok(e) => *guard = Some(e),
+            Err(err) => {
+                ENGINE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[dg-cuda] engine build failed ({err}); CPU fallback");
+                return None;
+            }
+        }
+    }
+    let eng = guard.as_mut()?;
+    let mut run = || -> Result<Vec<f32>, String> {
+        let s = eng.stream.clone();
+        let key = (emb_t.as_ptr() as usize, emb_t.len());
+        if eng.sc_emb.as_ref().map(|(_, k)| *k != key).unwrap_or(true) {
+            let mut dev = s
+                .alloc_zeros::<u16>(emb_t.len())
+                .map_err(|e| format!("alloc emb_t: {e}"))?;
+            s.memcpy_htod(emb_t, &mut dev)
+                .map_err(|e| format!("upload emb_t: {e}"))?;
+            eng.sc_emb = Some((dev, key));
+        }
+        let emb_dev = &eng.sc_emb.as_ref().unwrap().0;
+        let mut a_dev = s
+            .alloc_zeros::<f32>(h_canvas.len())
+            .map_err(|e| format!("alloc h: {e}"))?;
+        s.memcpy_htod(h_canvas, &mut a_dev)
+            .map_err(|e| format!("upload h: {e}"))?;
+        let mut c_dev = s
+            .alloc_zeros::<f32>(c * n_vocab)
+            .map_err(|e| format!("alloc logits: {e}"))?;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_vocab as u32).div_ceil(16), (c as u32).div_ceil(16), 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let (mi, ki, ni) = (c as i32, hidden as i32, n_vocab as i32);
+        let mut b = s.launch_builder(&eng.lm_gemm_func);
+        b.arg(&a_dev)
+            .arg(emb_dev)
+            .arg(&mut c_dev)
+            .arg(&mi)
+            .arg(&ki)
+            .arg(&ni)
+            .arg(&softcap);
+        unsafe { b.launch(cfg) }.map_err(|e| format!("launch lm gemm: {e}"))?;
+        let mut out = vec![0f32; c * n_vocab];
+        s.memcpy_dtoh(&c_dev, &mut out)
+            .map_err(|e| format!("download logits: {e}"))?;
+        eng.ctx.synchronize().map_err(|e| format!("sync: {e}"))?;
+        Ok(out)
+    };
+    match run() {
+        Ok(v) => Some(v),
+        Err(err) => {
+            eprintln!("[dg-cuda] lm gemm failed ({err}); CPU fallback");
             None
         }
     }
@@ -1331,7 +1934,7 @@ mod fast_tests {
                         DgExpertKind::Q50 => {
                             super::super::refmath::q5_0_dot_arm(row, &q80_acts[a as usize])
                         }
-                        DgExpertKind::Q4K => unreachable!(),
+                        DgExpertKind::Q4K | DgExpertKind::Q6K => unreachable!(),
                     };
                     assert_eq!(
                         cpu.to_bits(),
