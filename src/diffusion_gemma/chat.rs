@@ -215,6 +215,37 @@ impl DgChat {
         Ok((text, stop, response))
     }
 
+    /// [`generate_with_blocks`](Self::generate_with_blocks) plus a PER-STEP
+    /// live preview: `on_preview(block, step_idx, draft_text)` fires after
+    /// every denoise step with the decoded argmax canvas — the whole answer
+    /// draft, visibly refining in place. Identical generation by construction.
+    pub fn generate_live(
+        &self,
+        user_message: &str,
+        params: &DgEbParams,
+        n_blocks: i32,
+        max_ubatch: i32,
+        mut on_preview: impl FnMut(usize, i32, String),
+        mut on_committed: impl FnMut(usize, &[i32]),
+    ) -> Result<(String, String, Vec<i32>)> {
+        let prompt = self.render_prompt(user_message)?;
+        let (_blocks, response, stop) = self.runtime.mc_generate_with_steps(
+            &prompt,
+            params,
+            n_blocks,
+            max_ubatch,
+            &self.eog,
+            |b, step, canvas| {
+                if let Ok(text) = self.decode_response(canvas) {
+                    on_preview(b, step, text);
+                }
+            },
+            |b, _prefix, _records, canvas, cut| on_committed(b, &canvas[..cut]),
+        )?;
+        let text = self.decode_response(&response)?;
+        Ok((text, stop, response))
+    }
+
     /// [`generate`](Self::generate) with a per-block committed-ids callback —
     /// the serve lane's block-level SSE source. `on_committed` receives the
     /// block index and the trimmed canvas ids that block committed (the

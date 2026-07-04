@@ -5076,6 +5076,11 @@ async fn dg_chat_streaming(
     /// (prompt_tokens, text, stop, response ids) from a finished generation.
     type DgDone = (usize, String, String, Vec<i32>);
     enum StreamItem {
+        /// Live draft: the FULL argmax canvas after a denoise step (a
+        /// diffusion answer exists in whole from step 0 and refines in
+        /// place). Sent as a non-standard delta field; standard OpenAI
+        /// clients ignore it.
+        Preview(usize, i32, String),
         Block(Vec<i32>),
         Done(DgDone),
         Fail(String),
@@ -5084,6 +5089,7 @@ async fn dg_chat_streaming(
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
         let send_tx = tx.clone();
+        let step_tx = tx.clone();
         let prompt_tokens = match rt.chat.render_prompt(&user_msg) {
             Ok(ids) => ids.len(),
             Err(e) => {
@@ -5091,11 +5097,18 @@ async fn dg_chat_streaming(
                 return;
             }
         };
-        let result =
-            rt.chat
-                .generate_with_blocks(&user_msg, &params, n_blocks, 1100, |_b, committed| {
-                    let _ = send_tx.send(StreamItem::Block(committed.to_vec()));
-                });
+        let result = rt.chat.generate_live(
+            &user_msg,
+            &params,
+            n_blocks,
+            1100,
+            |b, step, draft| {
+                let _ = step_tx.send(StreamItem::Preview(b, step, draft));
+            },
+            |_b, committed| {
+                let _ = send_tx.send(StreamItem::Block(committed.to_vec()));
+            },
+        );
         match result {
             Ok((text, stop, ids)) => {
                 let _ = tx.send(StreamItem::Done((prompt_tokens, text, stop, ids)));
@@ -5130,6 +5143,24 @@ async fn dg_chat_streaming(
 
         while let Some(item) = rx.recv().await {
             match item {
+                StreamItem::Preview(b, step, draft) => {
+                    // Live canvas frame: the whole forming answer, refreshed
+                    // per denoise step. Non-standard field — OpenAI-shaped
+                    // clients ignore it; aware UIs render the draft in place.
+                    yield Ok(Event::default().data(
+                        chunk(
+                            serde_json::json!({
+                                "camelid_canvas_preview": {
+                                    "block": b,
+                                    "step": step,
+                                    "text": draft,
+                                }
+                            }),
+                            None,
+                        )
+                        .to_string(),
+                    ));
+                }
                 StreamItem::Block(committed) => {
                     all_ids.extend_from_slice(&committed);
                     let decoded = rt.chat.decode_response(&all_ids).unwrap_or_default();

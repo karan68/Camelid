@@ -672,6 +672,8 @@ fn attn_layer_fast(
         &k_all,
         &v_all,
         n,
+        n,
+        0,
         heads,
         kv_heads,
         head_dim,
@@ -2500,46 +2502,58 @@ impl DgEncoderRuntime {
         let mut argmax = vec![0i32; c];
         let mut entropy = vec![0f32; c];
         let mut denoiser = vec![0i32; c];
-        for pos in 0..c {
-            let row = &logits[pos * n_vocab..(pos + 1) * n_vocab];
-            let mut m = f32::NEG_INFINITY;
-            let mut amax = 0i32;
-            for (v, &x) in row.iter().enumerate() {
-                let z = x * temp_inv;
-                if z > m {
-                    m = z;
-                    amax = v as i32;
-                }
-            }
-            // the reference's `expf(row[v] * temp_inv - m)` argument and its
-            // `H -= p * logf(p)` update both CONTRACT under clang's default
-            // -ffp-contract=on (fmadd / fmsub in the oracle's disassembly) —
-            // mirror the single-rounding forms
-            let neg_m = -m;
-            let mut zsum = 0.0f32;
-            for &x in row {
-                zsum += refmath::libm_expf(x.mul_add(temp_inv, neg_m));
-            }
-            let target = u[pos] * zsum;
-            let mut cum = 0.0f32;
-            let mut hent = 0.0f32;
-            let mut sampled = (n_vocab - 1) as i32;
-            let mut picked = false;
-            for (v, &x) in row.iter().enumerate() {
-                let e = refmath::libm_expf(x.mul_add(temp_inv, neg_m));
-                let pr = e / zsum;
-                if pr > 0.0 {
-                    hent = (-pr).mul_add(refmath::libm_logf(pr), hent);
-                }
-                cum += e;
-                if !picked && cum >= target {
-                    sampled = v as i32;
-                    picked = true;
-                }
-            }
-            argmax[pos] = amax;
-            entropy[pos] = hent;
-            denoiser[pos] = sampled;
+        // Row-parallel: every position's argmax/entropy/CDF walk is a fully
+        // independent serial chain over its own 262K logits, so distributing
+        // POSITIONS across threads is bit-identical to the serial loop (same
+        // per-row float order; each output written once). Single-threaded
+        // this loop was ~1.1s/step.
+        {
+            use rayon::prelude::*;
+            argmax
+                .par_iter_mut()
+                .zip(entropy.par_iter_mut().zip(denoiser.par_iter_mut()))
+                .enumerate()
+                .for_each(|(pos, (amax_out, (hent_out, samp_out)))| {
+                    let row = &logits[pos * n_vocab..(pos + 1) * n_vocab];
+                    let mut m = f32::NEG_INFINITY;
+                    let mut amax = 0i32;
+                    for (v, &x) in row.iter().enumerate() {
+                        let z = x * temp_inv;
+                        if z > m {
+                            m = z;
+                            amax = v as i32;
+                        }
+                    }
+                    // the reference's `expf(row[v] * temp_inv - m)` argument
+                    // and its `H -= p * logf(p)` update both CONTRACT under
+                    // clang's default -ffp-contract=on (fmadd / fmsub in the
+                    // oracle's disassembly) — mirror the single-rounding forms
+                    let neg_m = -m;
+                    let mut zsum = 0.0f32;
+                    for &x in row {
+                        zsum += refmath::libm_expf(x.mul_add(temp_inv, neg_m));
+                    }
+                    let target = u[pos] * zsum;
+                    let mut cum = 0.0f32;
+                    let mut hent = 0.0f32;
+                    let mut sampled = (n_vocab - 1) as i32;
+                    let mut picked = false;
+                    for (v, &x) in row.iter().enumerate() {
+                        let e = refmath::libm_expf(x.mul_add(temp_inv, neg_m));
+                        let pr = e / zsum;
+                        if pr > 0.0 {
+                            hent = (-pr).mul_add(refmath::libm_logf(pr), hent);
+                        }
+                        cum += e;
+                        if !picked && cum >= target {
+                            sampled = v as i32;
+                            picked = true;
+                        }
+                    }
+                    *amax_out = amax;
+                    *hent_out = hent;
+                    *samp_out = sampled;
+                });
         }
 
         // MI-bound position order: match the reference's `std::sort(order,
@@ -2600,6 +2614,10 @@ impl DgEncoderRuntime {
         let n_vocab = self.token_embd.rows;
         let c = self.canvas_length;
         let s = params.max_steps.max(1);
+        // Generation boundary: never let a previous generation's device
+        // logits feed this one's self-conditioning (audit F5).
+        #[cfg(feature = "cuda")]
+        cuda::dg_generation_reset();
         let draws = refrng::eb_draws(params.seed, n_vocab as i32, c, s as usize);
 
         let mut current_canvas: Vec<i32> = draws.canvas_init.clone();
@@ -2729,6 +2747,32 @@ impl DgEncoderRuntime {
         n_blocks: i32,
         max_ubatch: i32,
         eog: &std::collections::HashSet<i32>,
+        on_block: impl FnMut(usize, &[u32], &[DgEbStepRecord], &[i32], usize),
+    ) -> Result<(Vec<(Vec<i32>, usize)>, Vec<i32>, String)> {
+        self.mc_generate_with_steps(
+            prompt,
+            params,
+            n_blocks,
+            max_ubatch,
+            eog,
+            |_, _, _| {},
+            on_block,
+        )
+    }
+
+    /// [`mc_generate`] with a PER-STEP observer: `on_step(block, step_idx,
+    /// argmax_canvas)` fires after every denoise step — the live-preview
+    /// source (a diffusion model's full draft canvas exists from the first
+    /// step and refines in place). Identical generation by construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mc_generate_with_steps(
+        &self,
+        prompt: &[u32],
+        params: &DgEbParams,
+        n_blocks: i32,
+        max_ubatch: i32,
+        eog: &std::collections::HashSet<i32>,
+        mut on_step: impl FnMut(usize, i32, &[i32]),
         mut on_block: impl FnMut(usize, &[u32], &[DgEbStepRecord], &[i32], usize),
     ) -> Result<(Vec<(Vec<i32>, usize)>, Vec<i32>, String)> {
         let c = self.canvas_length;
@@ -2750,7 +2794,9 @@ impl DgEncoderRuntime {
                 break;
             }
 
-            let records = self.eb_generate(&prefix, params, |_, _| {})?;
+            let records = self.eb_generate(&prefix, params, |rec, _| {
+                on_step(b as usize, rec.step_idx, &rec.step.argmax)
+            })?;
             let final_canvas: Vec<i32> =
                 records
                     .last()
