@@ -492,6 +492,7 @@ impl LlamaLoadedWeights {
                 if matches!(
                     desc.tensor_type,
                     GgufTensorType::Q4K
+                        | GgufTensorType::Q5K
                         | GgufTensorType::Q6K
                         | GgufTensorType::Q2K
                         | GgufTensorType::Q3K
@@ -2148,6 +2149,17 @@ impl LlamaInferenceSession {
                 && t.rank() == 2
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
+        // Q5_K residency: 176-byte super-block wire bytes materialized and the
+        // contraction dimension a whole number of 256-value super-blocks (the q5k_gemv
+        // kernel reads the wire bytes a super-block at a time). Q5_K_M promotes
+        // attn_v/ffn_down (and the tied lm_head) to Q6_K, so a Q5_K_M model is mixed
+        // Q5K+Q6K.
+        let is_q5k = |t: &CpuTensor| {
+            t.source_type == Some(GgufTensorType::Q5K)
+                && t.q5_k_wire_bytes.is_some()
+                && t.rank() == 2
+                && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
+        };
         // Q6_K residency: 210-byte super-block wire bytes materialized and the
         // contraction dimension a whole number of 256-value super-blocks (the q6k_gemv
         // kernel reads the wire bytes a super-block at a time). Q4_K_M promotes
@@ -2178,9 +2190,10 @@ impl LlamaInferenceSession {
                 && t.dim(0).map(|k| k.is_multiple_of(256)).unwrap_or(false)
         };
         // A projection is resident-eligible if it is plain Q8_0 OR a K-quant lane
-        // (Q4_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
-        let is_resident_quant =
-            |t: &CpuTensor| is_q8(t) || is_q4k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t);
+        // (Q4_K / Q5_K / Q6_K / Q2_K / Q3_K). Q8_0 behavior is byte-identical to before.
+        let is_resident_quant = |t: &CpuTensor| {
+            is_q8(t) || is_q4k(t) || is_q5k(t) || is_q6k(t) || is_q2k(t) || is_q3k(t)
+        };
         // On a pipeline-sharded node only the owned layer range is materialized.
         let range = self
             .weights
@@ -7868,6 +7881,9 @@ fn linear_with_diagnostic_layouts_with_plan(
         if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
         }
+        if weight.source_type == Some(GgufTensorType::Q5K) && weight.q5_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q5_k_block_dot(input, weight, name);
+        }
         if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q6_k_block_dot(input, weight, name);
         }
@@ -7992,6 +8008,7 @@ struct BorrowedLinearWeight<'a> {
     q8_0_file_backing: Option<&'a Q8_0FileBacking>,
     tq2_0_wire_bytes: Option<&'a [u8]>,
     q4_k_wire_bytes: Option<&'a [u8]>,
+    q5_k_wire_bytes: Option<&'a [u8]>,
     q6_k_wire_bytes: Option<&'a [u8]>,
 }
 
@@ -8015,6 +8032,7 @@ impl<'a> BorrowedLinearWeight<'a> {
             q8_0_file_backing: weight.q8_0_file_backing.as_ref(),
             tq2_0_wire_bytes: weight.tq2_0_wire_bytes.as_deref().map(|v| v.as_slice()),
             q4_k_wire_bytes: weight.q4_k_wire_bytes.as_deref().map(|v| v.as_slice()),
+            q5_k_wire_bytes: weight.q5_k_wire_bytes.as_deref().map(|v| v.as_slice()),
             q6_k_wire_bytes: weight.q6_k_wire_bytes.as_deref().map(|v| v.as_slice()),
         })
     }
@@ -8185,6 +8203,11 @@ fn output_projection_with_layout_with_plan(
                 )));
             }
             let name = name.into();
+            // Tied Q5_K embed/lm_head: stream the Q5_K wire blocks (the wire-only load
+            // leaves no f32 to matmul over), mirroring the Q6_K tied path below.
+            if weight.source_type == Some(GgufTensorType::Q5K) && weight.q5_k_wire_bytes.is_some() {
+                return matmul_rhs_transposed_q5_k_block_dot(input, weight, name.as_str());
+            }
             // Tied Q6_K embed/lm_head: stream the Q6_K wire blocks instead of the generic
             // f32 matmul over the materialised embedding (which dominated decode at ~88%).
             if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
@@ -8274,6 +8297,9 @@ fn matmul_rhs_transposed_with_precision_with_plan(
         if weight.source_type == Some(GgufTensorType::Q4K) && weight.q4_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q4_k_block_dot(input, weight, name);
         }
+        if weight.source_type == Some(GgufTensorType::Q5K) && weight.q5_k_wire_bytes.is_some() {
+            return matmul_rhs_transposed_q5_k_block_dot(input, weight, name);
+        }
         if weight.source_type == Some(GgufTensorType::Q6K) && weight.q6_k_wire_bytes.is_some() {
             return matmul_rhs_transposed_q6_k_block_dot(input, weight, name);
         }
@@ -8335,6 +8361,11 @@ fn matmul_rhs_transposed_borrowed_with_precision_with_plan(
         if weight.source_type == Some(GgufTensorType::Q4K) {
             if let Some(wire) = weight.q4_k_wire_bytes {
                 return q4_k_block_dot_core(input, wire, output_width, input_width, name);
+            }
+        }
+        if weight.source_type == Some(GgufTensorType::Q5K) {
+            if let Some(wire) = weight.q5_k_wire_bytes {
+                return q5_k_block_dot_core(input, wire, output_width, input_width, name);
             }
         }
         if weight.source_type == Some(GgufTensorType::Q6K) {
@@ -10741,6 +10772,11 @@ fn build_resident_cuda_engine(
                 return Some(w.as_slice());
             }
         }
+        if t.source_type == Some(GgufTensorType::Q5K) {
+            if let Some(w) = t.q5_k_wire_bytes.as_deref() {
+                return Some(w.as_slice());
+            }
+        }
         if t.source_type == Some(GgufTensorType::Q6K) {
             if let Some(w) = t.q6_k_wire_bytes.as_deref() {
                 return Some(w.as_slice());
@@ -10763,6 +10799,7 @@ fn build_resident_cuda_engine(
     fn proj_quant(t: &CpuTensor) -> ProjQuant {
         match t.source_type {
             Some(GgufTensorType::Q4K) if t.q4_k_wire_bytes.is_some() => ProjQuant::Q4K,
+            Some(GgufTensorType::Q5K) if t.q5_k_wire_bytes.is_some() => ProjQuant::Q5K,
             Some(GgufTensorType::Q6K) if t.q6_k_wire_bytes.is_some() => ProjQuant::Q6K,
             Some(GgufTensorType::Q2K) if t.q2_k_wire_bytes.is_some() => ProjQuant::Q2K,
             Some(GgufTensorType::Q3K) if t.q3_k_wire_bytes.is_some() => ProjQuant::Q3K,
@@ -17200,6 +17237,17 @@ fn accumulate_transposed_linear_row_q4_k(input_row: &[f32], wire: &[u8], output:
     });
 }
 
+/// Per-input-row Q5_K accumulate (176 B/super-block, `q5_k_wire_row_dot`).
+fn accumulate_transposed_linear_row_q5_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
+    use rayon::prelude::*;
+    let row_bytes = (input_row.len() / Q6_K_VALUES_PER_BLOCK) * Q5_K_WIRE_BYTES_PER_BLOCK;
+    let q8 = quantize_q8_k_blocks(input_row);
+    output.par_iter_mut().enumerate().for_each(|(o, slot)| {
+        let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+        *slot = q5_k_wire_row_dot(w_row, &q8);
+    });
+}
+
 /// Per-input-row Q6_K accumulate (210 B/block, `q6_k_wire_row_dot`).
 fn accumulate_transposed_linear_row_q6_k(input_row: &[f32], wire: &[u8], output: &mut [f32]) {
     use rayon::prelude::*;
@@ -17370,6 +17418,78 @@ fn matmul_rhs_transposed_q4_k_block_dot(
     // Tied-embed/output transpose passes [in, out]; derive out_dim from the wire.
     let out_dim = wire.len() / row_bytes;
     q4_k_block_dot_core(input, wire, out_dim, in_dim, name)
+}
+
+/// Q5_K analogue of [`q4_k_block_dot_core`] (176 B/super-block, `q5_k_wire_row_dot`).
+/// Quantise each input row to Q8_K once, then dot it against the retained Q5_K wire
+/// super-blocks (rayon over the output dimension) with no f32 materialisation. Scalar
+/// dot only (no AVX2 sibling yet); the CPU parity oracle is [`q5_k_wire_row_dot`].
+fn q5_k_block_dot_core(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    if !in_dim.is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q5_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q5_K_WIRE_BYTES_PER_BLOCK;
+    if row_bytes == 0 || wire.len() != out_dim * row_bytes {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q5_K wire length {} != out_dim {out_dim} * row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    let n_rows = input.dim(0)?;
+    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+    let cols: Vec<Vec<f32>> = (0..out_dim)
+        .into_par_iter()
+        .map(|o| {
+            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+            preps
+                .iter()
+                .map(|q8| q5_k_wire_row_dot(w_row, q8))
+                .collect()
+        })
+        .collect();
+    let mut out = vec![0f32; n_rows * out_dim];
+    for (o, col) in cols.iter().enumerate() {
+        for (r, &v) in col.iter().enumerate() {
+            out[r * out_dim + o] = v;
+        }
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
+fn matmul_rhs_transposed_q5_k_block_dot(
+    input: &CpuTensor,
+    weight: &CpuTensor,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    let in_dim = input.dim(1)?;
+    let wire = weight.q5_k_wire_bytes.as_deref().ok_or_else(|| {
+        BackendError::RuntimeShapeMismatch("Q5_K weight missing wire bytes".to_string())
+    })?;
+    if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
+        return Err(BackendError::RuntimeShapeMismatch(format!(
+            "Q5_K block-dot requires in_dim multiple of 256, got {in_dim}"
+        )));
+    }
+    let row_bytes = (in_dim / Q6_K_VALUES_PER_BLOCK) * Q5_K_WIRE_BYTES_PER_BLOCK;
+    if row_bytes == 0 || wire.len() % row_bytes != 0 {
+        return Err(BackendError::InvalidTensorData(format!(
+            "Q5_K weight wire length {} not a multiple of row_bytes {row_bytes}",
+            wire.len()
+        )));
+    }
+    let out_dim = wire.len() / row_bytes;
+    q5_k_block_dot_core(input, wire, out_dim, in_dim, name)
 }
 
 /// Q6_K analogue of [`q4_k_block_dot_core`] (210 B/block, `q6_k_wire_row_dot`),
@@ -17636,6 +17756,7 @@ pub(crate) fn q4_0_wire_block_dequant(block_bytes: &[u8]) -> [f32; 32] {
 }
 
 pub(crate) const Q4_K_WIRE_BYTES_PER_BLOCK: usize = 144;
+pub(crate) const Q5_K_WIRE_BYTES_PER_BLOCK: usize = 176;
 pub(crate) const Q5_0_WIRE_BYTES_PER_BLOCK: usize = 22;
 
 /// Q4_KÃƒÆ’Ã¢â‚¬â€Q8_K dot of one weight row read straight from the GGUF wire bytes,
@@ -17736,7 +17857,108 @@ pub(crate) fn q4_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
     sumf + sums.iter().sum::<f32>()
 }
 
-/// Q2_K ÃƒÆ’Ã¢â‚¬â€ Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// Q5_K×Q8_K dot of one weight row read straight from the GGUF wire bytes,
+/// mirroring the reference generic kernel `ggml_vec_dot_q5_K_q8_K`. Q5_K is Q4_K
+/// plus a fifth bit per weight: the 176-byte super-block is d(f16), dmin(f16),
+/// scales[12] (the same packed 6-bit scale/min kmask scheme as Q4_K), qh[32] (one
+/// high bit per weight), qs[128] (low nibbles). The scale/min unpack, the per-16
+/// mins subtraction, and the 8-lane `d_w·d_act` main accumulation are identical to
+/// [`q4_k_wire_row_dot`]; only the weight rebuild folds the qh bit in (codes 0..31).
+/// This is the CPU oracle the future `q5k_gemv` CUDA kernel is validated against.
+#[allow(dead_code, clippy::needless_range_loop)]
+pub(crate) fn q5_k_wire_row_dot(weight_wire: &[u8], input: &[Q8KBlock]) -> f32 {
+    const WIRE: usize = Q5_K_WIRE_BYTES_PER_BLOCK;
+    let mut sums = [0f32; 8];
+    let mut sumf = 0f32;
+    for (i, y) in input.iter().enumerate() {
+        let block = &weight_wire[i * WIRE..(i + 1) * WIRE];
+        let d = f16_bits_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_bits_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales_raw = &block[4..16];
+        let qh = &block[16..48];
+        let qs = &block[48..176];
+
+        // Rebuild the 256 unsigned 5-bit weights (0..31): each qs byte's low then
+        // high nibble plus its bit from qh. The qh bit index advances per 32-group
+        // (u1/u2 = 1<<(2j) / 1<<(2j+1)), matching `Q5KBlock::dequantize` and the
+        // reference's `m <<= 1` per half.
+        let mut a = [0i8; Q6_K_VALUES_PER_BLOCK];
+        for j in 0..4 {
+            let q5 = &qs[j * 32..(j + 1) * 32];
+            let u1 = 1u8 << (2 * j);
+            let u2 = 1u8 << (2 * j + 1);
+            for l in 0..32 {
+                let low = (q5[l] & 0x0F) as i8 + if qh[l] & u1 != 0 { 16 } else { 0 };
+                let high = (q5[l] >> 4) as i8 + if qh[l] & u2 != 0 { 16 } else { 0 };
+                a[j * 64 + l] = low;
+                a[j * 64 + 32 + l] = high;
+            }
+        }
+
+        // Packed 6-bit (scale, min) unpack — identical kmask scheme to Q4_K.
+        let mut utmp = [0u32; 4];
+        utmp[0] = u32::from_le_bytes([scales_raw[0], scales_raw[1], scales_raw[2], scales_raw[3]]);
+        utmp[1] = u32::from_le_bytes([scales_raw[4], scales_raw[5], scales_raw[6], scales_raw[7]]);
+        utmp[2] =
+            u32::from_le_bytes([scales_raw[8], scales_raw[9], scales_raw[10], scales_raw[11]]);
+        const KMASK1: u32 = 0x3f3f3f3f;
+        const KMASK2: u32 = 0x0f0f0f0f;
+        const KMASK3: u32 = 0x03030303;
+        utmp[3] = ((utmp[2] >> 4) & KMASK2) | (((utmp[1] >> 6) & KMASK3) << 4);
+        let uaux = utmp[1] & KMASK1;
+        utmp[1] = (utmp[2] & KMASK2) | (((utmp[0] >> 6) & KMASK3) << 4);
+        utmp[2] = uaux;
+        utmp[0] &= KMASK1;
+        let scales: [u8; 8] = [
+            (utmp[0] & 0xff) as u8,
+            ((utmp[0] >> 8) & 0xff) as u8,
+            ((utmp[0] >> 16) & 0xff) as u8,
+            ((utmp[0] >> 24) & 0xff) as u8,
+            (utmp[1] & 0xff) as u8,
+            ((utmp[1] >> 8) & 0xff) as u8,
+            ((utmp[1] >> 16) & 0xff) as u8,
+            ((utmp[1] >> 24) & 0xff) as u8,
+        ];
+        let mins: [u8; 8] = [
+            (utmp[2] & 0xff) as u8,
+            ((utmp[2] >> 8) & 0xff) as u8,
+            ((utmp[2] >> 16) & 0xff) as u8,
+            ((utmp[2] >> 24) & 0xff) as u8,
+            (utmp[3] & 0xff) as u8,
+            ((utmp[3] >> 8) & 0xff) as u8,
+            ((utmp[3] >> 16) & 0xff) as u8,
+            ((utmp[3] >> 24) & 0xff) as u8,
+        ];
+
+        // mins side: Σ over the 16 per-16 activation sums × min of their group.
+        let mut sumi = 0i32;
+        for j in 0..16 {
+            let bsum: i32 = y.qs[j * 16..(j + 1) * 16].iter().map(|&q| q as i32).sum();
+            sumi += bsum * mins[j / 2] as i32;
+        }
+
+        // main side: per-32-group integer dots into 8 lanes.
+        let mut aux32 = [0i32; 8];
+        for j in 0..8 {
+            let scale = scales[j] as i32;
+            for k in 0..4 {
+                let off = j * 32 + k * 8;
+                for l in 0..8 {
+                    aux32[l] += scale * (y.qs[off + l] as i32) * (a[off + l] as i32);
+                }
+            }
+        }
+
+        let dd = d * y.d;
+        for l in 0..8 {
+            sums[l] += dd * aux32[l] as f32;
+        }
+        sumf -= dmin * y.d * sumi as f32;
+    }
+    sumf + sums.iter().sum::<f32>()
+}
+
+/// Q2_K × Q8_K dot of one weight row read straight from the GGUF wire bytes,
 /// mirroring the reference generic kernel `ggml_vec_dot_q2_K_q8_K`. Each 84-byte
 /// super-block is scales[16] (low nibble = quant scale, high nibble = min scale,
 /// one pair per 16-value sub-block), qs[64] (2-bit quants), d(f16), dmin(f16).
@@ -19527,6 +19749,12 @@ fn accumulate_transposed_linear_row_with_precision_with_plan(
         if weight.source_type == Some(GgufTensorType::Q4K) {
             if let Some(wire) = weight.q4_k_wire_bytes {
                 accumulate_transposed_linear_row_q4_k(input_row, wire, output);
+                return;
+            }
+        }
+        if weight.source_type == Some(GgufTensorType::Q5K) {
+            if let Some(wire) = weight.q5_k_wire_bytes {
+                accumulate_transposed_linear_row_q5_k(input_row, wire, output);
                 return;
             }
         }
