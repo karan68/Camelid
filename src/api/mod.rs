@@ -15924,7 +15924,36 @@ async fn install_catalog_model(Json(req): Json<InstallCatalogRequest>) -> Respon
     // error page to the output file and exiting 0 â€” which previously looked like an
     // instant successful download.
     match std::process::Command::new("curl")
-        .args(["-f", "-L", "-C", "-", "-o", &part_path, &url])
+        // Resilience flags for large multi-GB pulls over flaky/throttled CDNs:
+        //   --speed-limit/--speed-time: abort (exit 28) if throughput stays below
+        //     1 KiB/s for 30s. Without this, a silently stalled-but-still-Established
+        //     TCP connection makes curl wait on a dead stream forever, so the download
+        //     freezes mid-file and never recovers (the bug this fixes).
+        //   --retry/--retry-delay/--retry-all-errors: reconnect on transient errors
+        //     AND on that speed-abort (--retry-all-errors covers exit 28); `-C -`
+        //     resumes from the existing `.part` offset on each retry, so no bytes are
+        //     re-downloaded.
+        //   --connect-timeout caps a dead connect attempt.
+        .args([
+            "-f",
+            "-L",
+            "-C",
+            "-",
+            "--connect-timeout",
+            "30",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "30",
+            "--retry",
+            "10",
+            "--retry-delay",
+            "2",
+            "--retry-all-errors",
+            "-o",
+            &part_path,
+            &url,
+        ])
         .spawn()
     {
         Ok(child) => {
