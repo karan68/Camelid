@@ -1,6 +1,7 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -24,14 +25,34 @@ pub enum ModelSourceKind {
 pub struct ModelSourceManifest {
     pub id: String,
     pub kind: ModelSourceKind,
+    #[serde(skip_serializing)]
     pub root: PathBuf,
+    #[serde(skip_serializing)]
     pub weight_files: Vec<PathBuf>,
+    pub tensor_descriptors: Vec<SafeTensorsTensorDescriptor>,
+    #[serde(skip_serializing)]
     pub config_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub tokenizer_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub tokenizer_config_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub special_tokens_map_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub generation_config_path: Option<PathBuf>,
+    #[serde(skip_serializing)]
     pub shard_index_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SafeTensorsTensorDescriptor {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    pub shard_file: String,
+    #[serde(skip_serializing)]
+    pub shard: PathBuf,
+    pub data_offsets: [u64; 2],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -61,6 +82,13 @@ struct HfConfigProbe {
     architectures: Option<Vec<String>>,
     rope_scaling: Option<Value>,
     sliding_window: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SafeTensorsHeaderTensor {
+    dtype: String,
+    shape: Vec<u64>,
+    data_offsets: [u64; 2],
 }
 
 /// Inspect a local model source without constructing runtime weights.
@@ -96,6 +124,7 @@ fn inspect_gguf_file(path: &Path) -> ModelSourceInspection {
             kind: ModelSourceKind::Gguf,
             root: path.to_path_buf(),
             weight_files: vec![path.to_path_buf()],
+            tensor_descriptors: Vec::new(),
             config_path: None,
             tokenizer_path: None,
             tokenizer_config_path: None,
@@ -145,7 +174,7 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
         ));
     }
 
-    let weights_ready =
+    let (weights_ready, tensor_descriptors) =
         hf_weights_ready(&weight_files, shard_index_path.as_deref(), &mut blockers)?;
     blockers.push(blocker(
         "generation_disabled",
@@ -158,6 +187,7 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
             kind: ModelSourceKind::HuggingFaceSafeTensors,
             root: path.to_path_buf(),
             weight_files,
+            tensor_descriptors,
             config_path,
             tokenizer_path,
             tokenizer_config_path,
@@ -246,13 +276,22 @@ fn hf_weights_ready(
     weight_files: &[PathBuf],
     shard_index_path: Option<&Path>,
     blockers: &mut Vec<ModelSourceBlocker>,
-) -> Result<bool> {
+) -> Result<(bool, Vec<SafeTensorsTensorDescriptor>)> {
     if weight_files.is_empty() {
         blockers.push(blocker(
             "missing_safetensors_weights",
             "Hugging Face SafeTensors directories must include at least one .safetensors weight file",
         ));
-        return Ok(false);
+        return Ok((false, Vec::new()));
+    }
+
+    let mut ready = true;
+    let tensor_descriptors = inspect_safetensors_headers(weight_files, blockers)?;
+    if tensor_descriptors.is_empty() {
+        ready = false;
+    }
+    if !safetensors_dtypes_ready(&tensor_descriptors, blockers) {
+        ready = false;
     }
 
     if weight_files.len() > 1 && shard_index_path.is_none() {
@@ -260,7 +299,7 @@ fn hf_weights_ready(
             "missing_shard_index",
             "sharded SafeTensors directories must include model.safetensors.index.json before weights readiness can be reported",
         ));
-        return Ok(false);
+        ready = false;
     }
 
     if let Some(shard_index_path) = shard_index_path {
@@ -276,19 +315,180 @@ fn hf_weights_ready(
                     public_path_label(shard_index_path)
                 ),
             ));
-            return Ok(false);
+            return Ok((false, tensor_descriptors));
         };
-        if !hf_shard_index_weight_map_ready(&index, weight_files, blockers) {
-            return Ok(false);
+        if !hf_shard_index_weight_map_ready(&index, weight_files, &tensor_descriptors, blockers) {
+            ready = false;
         }
     }
 
-    Ok(true)
+    Ok((ready, tensor_descriptors))
+}
+
+fn inspect_safetensors_headers(
+    weight_files: &[PathBuf],
+    blockers: &mut Vec<ModelSourceBlocker>,
+) -> Result<Vec<SafeTensorsTensorDescriptor>> {
+    let mut tensor_descriptors = Vec::new();
+    let mut seen = BTreeMap::<String, String>::new();
+    for weight_file in weight_files {
+        match parse_safetensors_header(weight_file) {
+            Ok(file_descriptors) => {
+                if file_descriptors.is_empty() {
+                    blockers.push(blocker(
+                        "empty_safetensors_header",
+                        format!(
+                            "SafeTensors shard {} does not list any tensor descriptors",
+                            public_path_label(weight_file)
+                        ),
+                    ));
+                }
+                for descriptor in file_descriptors {
+                    if let Some(first_shard) = seen.insert(
+                        descriptor.name.clone(),
+                        public_path_label(&descriptor.shard),
+                    ) {
+                        blockers.push(blocker(
+                            "duplicate_safetensors_tensor",
+                            format!(
+                                "SafeTensors tensor {} appears in more than one shard: {}, {}",
+                                descriptor.name,
+                                first_shard,
+                                public_path_label(&descriptor.shard)
+                            ),
+                        ));
+                    }
+                    tensor_descriptors.push(descriptor);
+                }
+            }
+            Err(message) => blockers.push(blocker(
+                "invalid_safetensors_header",
+                format!(
+                    "SafeTensors shard {} has an invalid header: {}",
+                    public_path_label(weight_file),
+                    message
+                ),
+            )),
+        }
+    }
+    tensor_descriptors.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(tensor_descriptors)
+}
+
+fn parse_safetensors_header(
+    path: &Path,
+) -> std::result::Result<Vec<SafeTensorsTensorDescriptor>, String> {
+    let mut file = fs::File::open(path).map_err(|err| format!("could not open shard: {err}"))?;
+    let file_len = file
+        .metadata()
+        .map_err(|err| format!("could not stat shard: {err}"))?
+        .len();
+    if file_len < 8 {
+        return Err("file is shorter than the 8-byte SafeTensors header length".to_string());
+    }
+
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes)
+        .map_err(|err| format!("could not read header length: {err}"))?;
+    let header_len = u64::from_le_bytes(header_len_bytes);
+    let header_len = usize::try_from(header_len)
+        .map_err(|_| "header length does not fit this platform".to_string())?;
+    let header_end = 8u64
+        .checked_add(header_len as u64)
+        .ok_or_else(|| "header length overflows file offset arithmetic".to_string())?;
+    if header_end > file_len {
+        return Err("header length extends past end of file".to_string());
+    }
+
+    let mut header_bytes = vec![0u8; header_len];
+    file.read_exact(&mut header_bytes)
+        .map_err(|err| format!("could not read header JSON: {err}"))?;
+
+    let header = serde_json::from_slice::<Value>(&header_bytes)
+        .map_err(|err| format!("header JSON is invalid: {err}"))?;
+    let object = header
+        .as_object()
+        .ok_or_else(|| "header JSON must be an object".to_string())?;
+    let payload_len = file_len - header_end;
+    let mut descriptors = Vec::new();
+    for (name, value) in object {
+        if name == "__metadata__" {
+            continue;
+        }
+        let tensor = serde_json::from_value::<SafeTensorsHeaderTensor>(value.clone())
+            .map_err(|err| format!("tensor descriptor {name} is invalid: {err}"))?;
+        if tensor.data_offsets[0] > tensor.data_offsets[1] {
+            return Err(format!(
+                "tensor descriptor {name} has descending data_offsets"
+            ));
+        }
+        if tensor.data_offsets[1] > payload_len {
+            return Err(format!(
+                "tensor descriptor {name} data_offsets extend past shard payload"
+            ));
+        }
+        if let Some(dtype_size) = safetensors_dtype_size(&tensor.dtype) {
+            let element_count = tensor.shape.iter().try_fold(1u64, |acc, dim| {
+                acc.checked_mul(*dim).ok_or_else(|| {
+                    format!("tensor descriptor {name} shape element count overflows")
+                })
+            })?;
+            let expected_len = element_count
+                .checked_mul(dtype_size)
+                .ok_or_else(|| format!("tensor descriptor {name} byte length overflows"))?;
+            let actual_len = tensor.data_offsets[1] - tensor.data_offsets[0];
+            if actual_len != expected_len {
+                return Err(format!(
+                    "tensor descriptor {name} data_offsets length {actual_len} does not match shape/dtype byte length {expected_len}"
+                ));
+            }
+        }
+        descriptors.push(SafeTensorsTensorDescriptor {
+            name: name.clone(),
+            dtype: tensor.dtype,
+            shape: tensor.shape,
+            shard_file: public_path_label(path),
+            shard: path.to_path_buf(),
+            data_offsets: tensor.data_offsets,
+        });
+    }
+    Ok(descriptors)
+}
+
+fn safetensors_dtype_size(dtype: &str) -> Option<u64> {
+    match dtype {
+        "F32" => Some(4),
+        "F16" | "BF16" => Some(2),
+        _ => None,
+    }
+}
+
+fn safetensors_dtypes_ready(
+    tensor_descriptors: &[SafeTensorsTensorDescriptor],
+    blockers: &mut Vec<ModelSourceBlocker>,
+) -> bool {
+    let unsupported = tensor_descriptors
+        .iter()
+        .filter(|descriptor| !matches!(descriptor.dtype.as_str(), "F32" | "F16" | "BF16"))
+        .map(|descriptor| format!("{}:{}", descriptor.name, descriptor.dtype))
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return true;
+    }
+    blockers.push(blocker(
+        "unsupported_safetensors_dtype",
+        format!(
+            "only F32, F16, and BF16 SafeTensors descriptors are in scope for this readiness slice; unsupported tensors: {}",
+            unsupported.join(", ")
+        ),
+    ));
+    false
 }
 
 fn hf_shard_index_weight_map_ready(
     index: &Value,
     weight_files: &[PathBuf],
+    tensor_descriptors: &[SafeTensorsTensorDescriptor],
     blockers: &mut Vec<ModelSourceBlocker>,
 ) -> bool {
     let Some(weight_map) = index.get("weight_map").and_then(Value::as_object) else {
@@ -313,6 +513,8 @@ fn hf_shard_index_weight_map_ready(
     let mut missing = BTreeSet::new();
     let mut invalid = BTreeSet::new();
     let mut invalid_filenames = BTreeSet::new();
+    let mut missing_tensors = BTreeSet::new();
+    let tensors_by_shard = safetensors_tensors_by_shard(tensor_descriptors);
     for (tensor_name, shard_name) in weight_map {
         let Some(shard_name) = shard_name.as_str() else {
             invalid.insert(tensor_name.as_str());
@@ -324,6 +526,13 @@ fn hf_shard_index_weight_map_ready(
         }
         if !available.contains(shard_name) {
             missing.insert(shard_name);
+            continue;
+        }
+        if !tensors_by_shard
+            .get(shard_name)
+            .is_some_and(|tensors| tensors.contains(tensor_name.as_str()))
+        {
+            missing_tensors.insert(format!("{tensor_name} in {shard_name}"));
         }
     }
 
@@ -357,8 +566,33 @@ fn hf_shard_index_weight_map_ready(
         ));
         return false;
     }
+    if !missing_tensors.is_empty() {
+        blockers.push(blocker(
+            "shard_index_tensor_not_found",
+            format!(
+                "model.safetensors.index.json references tensors not found in the listed shard headers: {}",
+                missing_tensors.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        ));
+        return false;
+    }
 
     true
+}
+
+fn safetensors_tensors_by_shard(
+    tensor_descriptors: &[SafeTensorsTensorDescriptor],
+) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut tensors_by_shard = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for descriptor in tensor_descriptors {
+        if let Some(shard_name) = descriptor.shard.file_name().and_then(|name| name.to_str()) {
+            tensors_by_shard
+                .entry(shard_name)
+                .or_default()
+                .insert(descriptor.name.as_str());
+        }
+    }
+    tensors_by_shard
 }
 
 fn is_plain_safetensors_shard_filename(value: &str) -> bool {
@@ -440,8 +674,16 @@ mod tests {
         fs::write(dir.path().join("tokenizer_config.json"), "{}").unwrap();
         fs::write(dir.path().join("special_tokens_map.json"), "{}").unwrap();
         fs::write(dir.path().join("generation_config.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "BF16", &[1, 1])],
+        );
         fs::write(
             dir.path().join("model.safetensors.index.json"),
             r#"{"weight_map":{"model.embed_tokens.weight":"model-00001-of-00002.safetensors","lm_head.weight":"model-00002-of-00002.safetensors"}}"#,
@@ -458,6 +700,21 @@ mod tests {
         assert!(inspection.manifest.config_path.is_some());
         assert!(inspection.manifest.tokenizer_path.is_some());
         assert!(inspection.manifest.shard_index_path.is_some());
+        assert_eq!(inspection.manifest.tensor_descriptors.len(), 2);
+        assert_eq!(
+            inspection.manifest.tensor_descriptors[0].name,
+            "lm_head.weight"
+        );
+        assert_eq!(inspection.manifest.tensor_descriptors[0].dtype, "BF16");
+        assert_eq!(
+            inspection.manifest.tensor_descriptors[0].shard_file,
+            "model-00002-of-00002.safetensors"
+        );
+        assert_eq!(
+            inspection.manifest.tensor_descriptors[1].name,
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(inspection.manifest.tensor_descriptors[1].shape, vec![1, 1]);
         assert!(inspection.readiness.metadata_ready);
         assert!(inspection.readiness.tokenizer_ready);
         assert!(inspection.readiness.weights_ready);
@@ -469,7 +726,11 @@ mod tests {
     fn missing_tokenizer_fixture_has_precise_blocker() {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
-        fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F16", &[1, 1])],
+        );
 
         let inspection = inspect_model_source(dir.path()).unwrap();
 
@@ -487,8 +748,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "F32", &[1, 1])],
+        );
 
         let inspection = inspect_model_source(dir.path()).unwrap();
 
@@ -503,8 +772,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "F32", &[1, 1])],
+        );
         fs::write(dir.path().join("model.safetensors.index.json"), "not json").unwrap();
 
         let inspection = inspect_model_source(dir.path()).unwrap();
@@ -528,8 +805,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "F32", &[1, 1])],
+        );
         fs::write(dir.path().join("model.safetensors.index.json"), "{}").unwrap();
 
         let inspection = inspect_model_source(dir.path()).unwrap();
@@ -546,8 +831,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "F32", &[1, 1])],
+        );
         fs::write(
             dir.path().join("model.safetensors.index.json"),
             r#"{"weight_map":{"model.embed_tokens.weight":"model-00003-of-00003.safetensors"}}"#,
@@ -571,7 +864,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("config.json"), "not json").unwrap();
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
 
         let inspection = inspect_model_source(dir.path()).unwrap();
 
@@ -597,7 +894,11 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
 
         let inspection = inspect_model_source(dir.path()).unwrap();
 
@@ -615,8 +916,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "F32", &[1, 1])],
+        );
         fs::write(
             dir.path().join("model.safetensors.index.json"),
             r#"{"weight_map":{"model.embed_tokens.weight":"../private/model-00001-of-00002.safetensors","lm_head.weight":"C:\\private\\model-00002-of-00002.safetensors"}}"#,
@@ -644,8 +953,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_llama_config(dir.path());
         fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
-        fs::write(dir.path().join("model-00001-of-00002.safetensors"), b"").unwrap();
-        fs::write(dir.path().join("model-00002-of-00002.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00002.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        write_safetensors_file(
+            dir.path(),
+            "model-00002-of-00002.safetensors",
+            &[("lm_head.weight", "F32", &[1, 1])],
+        );
         fs::write(
             dir.path().join("model.safetensors.index.json"),
             r#"{"weight_map":{"z.weight":42,"a.weight":false}}"#,
@@ -670,11 +987,137 @@ mod tests {
         fs::create_dir(&model_dir).unwrap();
         write_llama_config(&model_dir);
         fs::write(model_dir.join("tokenizer.json"), "{}").unwrap();
-        fs::write(model_dir.join("model.safetensors"), b"").unwrap();
+        write_safetensors_file(
+            &model_dir,
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
 
         let inspection = inspect_model_source(&model_dir).unwrap();
 
         assert_eq!(inspection.manifest.id, "Meta-Llama-3.1-8B-Instruct");
+    }
+
+    #[test]
+    fn invalid_safetensors_header_blocks_weight_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(dir.path().join("model.safetensors"), b"too short").unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert!(inspection.manifest.tensor_descriptors.is_empty());
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_safetensors_header", "generation_disabled"],
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("model.safetensors"));
+    }
+
+    #[test]
+    fn unsupported_safetensors_dtype_blocks_weight_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "I64", &[1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_eq!(inspection.manifest.tensor_descriptors.len(), 1);
+        assert_blocker_codes(
+            &inspection,
+            &["unsupported_safetensors_dtype", "generation_disabled"],
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("model.embed_tokens.weight:I64"));
+    }
+
+    #[test]
+    fn shard_index_tensor_missing_from_header_blocks_weight_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model-00001-of-00001.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+        fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"lm_head.weight":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["shard_index_tensor_not_found", "generation_disabled"],
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("lm_head.weight in model-00001-of-00001.safetensors"));
+    }
+
+    #[test]
+    fn serialized_hf_inspection_does_not_expose_local_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+        let json = serde_json::to_string(&inspection).unwrap();
+
+        assert_public_blocker_message_without_local_path(&json, dir.path());
+        assert!(!json.contains("root"));
+        assert!(!json.contains("weight_files"));
+        assert!(!json.contains("config_path"));
+        assert!(!json.contains("tokenizer_path"));
+        assert!(!json.contains("\"shard\""));
+        assert!(json.contains("shard_file"));
+        assert!(json.contains("model.safetensors"));
+    }
+
+    #[test]
+    fn safetensors_shape_dtype_offset_mismatch_blocks_weight_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config(dir.path());
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        let header = serde_json::json!({
+            "model.embed_tokens.weight": {
+                "dtype": "F32",
+                "shape": [2],
+                "data_offsets": [0, 4]
+            }
+        });
+        write_safetensors_bytes(dir.path(), "model.safetensors", &header, &[0, 0, 0, 0]);
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.weights_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_safetensors_header", "generation_disabled"],
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("does not match shape/dtype byte length 8"));
     }
 
     #[test]
@@ -706,6 +1149,45 @@ mod tests {
             r#"{"model_type":"llama","architectures":["LlamaForCausalLM"]}"#,
         )
         .unwrap();
+    }
+
+    fn write_safetensors_file(root: &Path, name: &str, tensors: &[(&str, &str, &[u64])]) {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        let mut payload = Vec::new();
+        for (tensor_name, dtype, shape) in tensors {
+            let byte_len = tensor_byte_len(dtype, shape);
+            header.insert(
+                (*tensor_name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + byte_len],
+                }),
+            );
+            payload.resize(payload.len() + usize::try_from(byte_len).unwrap(), 0);
+            offset += byte_len;
+        }
+        write_safetensors_bytes(root, name, &Value::Object(header), &payload);
+    }
+
+    fn write_safetensors_bytes(root: &Path, name: &str, header: &Value, payload: &[u8]) {
+        let header = serde_json::to_vec(header).unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(payload);
+        fs::write(root.join(name), file).unwrap();
+    }
+
+    fn tensor_byte_len(dtype: &str, shape: &[u64]) -> u64 {
+        let element_size = match dtype {
+            "F16" | "BF16" => 2,
+            "F32" | "I32" => 4,
+            "I64" => 8,
+            other => panic!("test fixture does not know dtype {other}"),
+        };
+        shape.iter().product::<u64>() * element_size
     }
 
     fn assert_blocker_codes(inspection: &ModelSourceInspection, expected: &[&str]) {
