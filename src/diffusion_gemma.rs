@@ -742,6 +742,29 @@ fn attn_layer_fast(
     None
 }
 
+/// FAST-mode fused SC (device softmax over the resident previous-step
+/// logits). A no-op when the `cuda` feature is off.
+#[cfg(feature = "cuda")]
+fn sc_soft_fused(
+    temp_inv: f32,
+    embed_scale: f32,
+    c: usize,
+    hidden: usize,
+    n_vocab: usize,
+) -> Option<Vec<f32>> {
+    cuda::sc_soft_fused_gpu(temp_inv, embed_scale, c, hidden, n_vocab)
+}
+#[cfg(not(feature = "cuda"))]
+fn sc_soft_fused(
+    _temp_inv: f32,
+    _embed_scale: f32,
+    _c: usize,
+    _hidden: usize,
+    _n_vocab: usize,
+) -> Option<Vec<f32>> {
+    None
+}
+
 /// FAST-mode lm_head: flatten the canvas activations and run the tiled f16
 /// GEMM against the resident SC embedding transpose. `None` → the existing
 /// (parity-grade) lm_head paths.
@@ -1834,27 +1857,39 @@ impl DgEncoderRuntime {
         let mut d_g: Vec<f32> = Vec::new();
         let mut d_sig: Vec<f32> = Vec::new();
 
+        // FAST mode: fused device path — softmax+f16 straight from the
+        // device-resident previous-step logits into the soft matmul (no host
+        // softmax, no 134 MB probs upload). Falls through to the plain paths.
+        let fused = if dg_fast_enabled() {
+            sc_soft_fused(sc.temp_inv, embed_scale, c, hidden, n_vocab)
+        } else {
+            None
+        };
         // probs = softmax(scale(sc_logits, temp_inv)) per position, then the
         // F16 src1 conversion (ggml quantizes src1 rows to the f16 vec_dot
         // type). Gathered for all positions so the soft-embedding matmul can
-        // run as one batched GPU kernel.
-        let mut probs_f16_all = vec![0u16; c * n_vocab];
-        for pos in 0..c {
-            let mut probs: Vec<f32> = sc.logits[pos * n_vocab..(pos + 1) * n_vocab]
-                .iter()
-                .map(|&x| x * sc.temp_inv)
-                .collect();
-            refmath::softmax_row(&mut probs);
-            for (v, &p) in probs.iter().enumerate() {
-                probs_f16_all[pos * n_vocab + v] = crate::tensor::f32_to_f16_bits(p);
+        // run as one batched GPU kernel. Skipped entirely on the fused path.
+        let mut probs_f16_all = Vec::new();
+        let soft_all = match fused {
+            Some(v) => Some(v),
+            None => {
+                probs_f16_all = vec![0u16; c * n_vocab];
+                for pos in 0..c {
+                    let mut probs: Vec<f32> = sc.logits[pos * n_vocab..(pos + 1) * n_vocab]
+                        .iter()
+                        .map(|&x| x * sc.temp_inv)
+                        .collect();
+                    refmath::softmax_row(&mut probs);
+                    for (v, &p) in probs.iter().enumerate() {
+                        probs_f16_all[pos * n_vocab + v] = crate::tensor::f32_to_f16_bits(p);
+                    }
+                }
+                // soft[pos] = (embT @ probs[pos]) * sqrt(n_embd). GPU when
+                // available (f32 reduction — NOT bit-identical to the CPU f16
+                // emulation); else the reference per-row f16 dot below.
+                sc_soft_gpu(emb_t, &probs_f16_all, c, hidden, n_vocab, embed_scale)
             }
-        }
-
-        // soft[pos] = (embT @ probs[pos]) * sqrt(n_embd). GPU when available
-        // (f32 reduction — NOT bit-identical to the CPU f16 emulation, but this
-        // matmul is ~87% of a multi-step denoise step); else the reference
-        // per-row f16 dot.
-        let soft_all = sc_soft_gpu(emb_t, &probs_f16_all, c, hidden, n_vocab, embed_scale);
+        };
 
         for pos in 0..c {
             let soft: Vec<f32> = match &soft_all {
@@ -1973,10 +2008,14 @@ impl DgEncoderRuntime {
         // ~1.9e11-MAC soft-embedding matmul entirely. Bit-identical: every
         // embedding row is left unchanged either way (the reference's step-0
         // graph likewise contributes nothing).
+        let _t_sc = std::time::Instant::now();
         let sigs = match sc {
             Some(sc_in) if sc_in.use_sc != 0.0 => Some(self.sc_signal(sc_in, c)?),
             _ => None,
         };
+        if sigs.is_some() && std::env::var("CAMELID_DG_STAGE_TIMINGS").is_ok() {
+            eprintln!("[dg-prof] sc={}ms", _t_sc.elapsed().as_millis());
+        }
 
         // embeddings: every row scaled by sqrt(n_embd); canvas rows add the
         // gated SC signal (when enabled) and then take the weightless
@@ -2588,6 +2627,7 @@ impl DgEncoderRuntime {
             let out = self.unified_forward_sc(prompt, &canvas_u32, Some(&sc_in), false)?;
             sc_buffer.copy_from_slice(&out.logits);
 
+            let _t_eb = std::time::Instant::now();
             let step = Self::eb_step(
                 &out.logits,
                 n_vocab,
@@ -2599,6 +2639,9 @@ impl DgEncoderRuntime {
                 &draws.u[step_idx as usize],
                 &draws.renoise[step_idx as usize],
             );
+            if std::env::var("CAMELID_DG_STAGE_TIMINGS").is_ok() {
+                eprintln!("[dg-prof] eb_step={}ms", _t_eb.elapsed().as_millis());
+            }
 
             current_canvas = step.next_canvas.clone();
             held = if prev_argmax == step.argmax {
