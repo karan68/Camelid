@@ -26,7 +26,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 
@@ -942,21 +942,25 @@ extern "C" __global__ void q6k_gemm_id(
 // (SWA-clipped on sliding layers); canvas queries see everything on global
 // layers, and all canvas plus the last (n_swa - 1) prompt positions on
 // sliding layers. f32 throughout (fast mode: not bit-exact).
+// q_off: queries cover positions [q_off, q_off + nq) of the full n-position
+// context (prefix-KV cached mode passes q_off = p with canvas-only queries;
+// the full pass uses q_off = 0, nq = n). K/V always span all n positions.
 extern "C" __global__ void dg_attn(
-    const float* __restrict__ q,   // [n * heads * hd]
+    const float* __restrict__ q,   // [nq * heads * hd]
     const float* __restrict__ k,   // [n * kv_heads * hd]
     const float* __restrict__ v,   // [n * kv_heads * hd]
-    float* __restrict__ out,       // [n * heads * hd]
-    int n, int heads, int kv_heads, int hd, int group,
+    float* __restrict__ out,       // [nq * heads * hd]
+    int n, int nq, int q_off, int heads, int kv_heads, int hd, int group,
     int p, int win, int sliding, long long lo)
 {
-    int pos = blockIdx.x / heads;
+    int lpos = blockIdx.x / heads;
     int hh = blockIdx.x % heads;
-    if (pos >= n) return;
+    if (lpos >= nq) return;
+    int pos = q_off + lpos;
     int kvh = hh / group;
     extern __shared__ float row[]; // [n] scores
     __shared__ float red[256];
-    const float* qh = q + ((long long)pos * heads + hh) * hd;
+    const float* qh = q + ((long long)lpos * heads + hh) * hd;
     for (int kp = threadIdx.x; kp < n; kp += blockDim.x) {
         bool ok;
         if (pos >= p) {
@@ -999,7 +1003,7 @@ extern "C" __global__ void dg_attn(
     }
     float inv = 1.0f / red[0];
     __syncthreads();
-    float* op = out + ((long long)pos * heads + hh) * hd;
+    float* op = out + ((long long)lpos * heads + hh) * hd;
     for (int d = threadIdx.x; d < hd; d += blockDim.x) {
         float acc = 0.0f;
         for (int kp = 0; kp < n; kp++) {
@@ -1104,6 +1108,14 @@ struct Engine {
     /// FAST-mode streaming scratch for tensors that miss the resident pool
     /// (grown to the largest streamed tensor; one at a time).
     scratch: Option<CudaSlice<u8>>,
+    /// Second device scratch: the copy stream DMAs the NEXT streamed tensor
+    /// here while the current one computes (device-side double buffering).
+    scratch2: Option<CudaSlice<u8>>,
+    /// Dedicated copy stream for device-prefetch DMAs.
+    copy_stream: Option<Arc<CudaStream>>,
+    /// In-flight device prefetch: (key, into-scratch2?, DMA event, pinned buf
+    /// index held until the event completes).
+    dev_pf: Option<((usize, usize), bool, cudarc::driver::CudaEvent, usize)>,
     /// Pinned (page-locked) host staging ring for streamed uploads. The
     /// read-ahead worker fills upcoming buffers while the current one feeds
     /// the htod; a deeper ring keeps the disk continuously busy.
@@ -1172,7 +1184,9 @@ fn ensure_budgets(eng: &mut Engine) {
     {
         Some(mb) => mb * 1024 * 1024,
         None => {
-            const RESERVE: u64 = 1700 * 1024 * 1024;
+            // Must cover: SC emb 1.47G + scratch 0.3G + scratch2 0.3G +
+            // persistent logits 0.27G + probs 0.13G + transients.
+            const RESERVE: u64 = 2600 * 1024 * 1024;
             let free = cudarc::driver::result::mem_get_info()
                 .map(|(f, _)| f as u64)
                 .unwrap_or(0);
@@ -1205,6 +1219,25 @@ fn build_engine() -> Result<Engine, String> {
     let ordinal = crate::cuda::selected_device_ordinal();
     let ctx = CudaContext::new(ordinal).map_err(|e| format!("CudaContext::new({ordinal}): {e}"))?;
     let stream = ctx.default_stream();
+    // Retain the CUDA mempool across syncs: the default release threshold (0)
+    // hands every freed block back to the OS at each synchronization, and
+    // this engine allocates ~1,700 transient buffers per denoise step — each
+    // would re-page through WDDM kernel mode. Best-effort (harmless if the
+    // driver refuses).
+    unsafe {
+        use cudarc::driver::sys;
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool, ordinal as i32) == sys::CUresult::CUDA_SUCCESS
+            && !pool.is_null()
+        {
+            let mut threshold: u64 = u64::MAX;
+            let _ = sys::cuMemPoolSetAttribute(
+                pool,
+                sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                &mut threshold as *mut u64 as *mut core::ffi::c_void,
+            );
+        }
+    }
     let opts = CompileOptions {
         fmad: Some(false),
         arch: Some("compute_61"),
@@ -1267,6 +1300,9 @@ fn build_engine() -> Result<Engine, String> {
         sc_gemm_func,
         last_logits: None,
         scratch: None,
+        scratch2: None,
+        copy_stream: None,
+        dev_pf: None,
         pin_bufs: Vec::new(),
         ra: None,
         sc_emb: None,
@@ -1608,6 +1644,9 @@ pub(crate) fn expert_rows_gemv_gpu(
 /// of `path` into the raw pinned buffer at `ptr`.
 struct RaReq {
     key: (usize, usize),
+    /// Pinned ring buffer index this read fills (echoed in the done message
+    /// so completions may arrive out of order — QD2 protocol).
+    buf: usize,
     ptr: usize,
     len: usize,
     path: std::path::PathBuf,
@@ -1623,10 +1662,14 @@ struct RaReq {
 /// handoff is strictly dispatch → recv done (FIFO) → consume.
 struct ReadAhead {
     tx: std::sync::mpsc::Sender<RaReq>,
-    done_rx: std::sync::mpsc::Receiver<(usize, usize)>,
-    /// FIFO of (key, pinned-buffer index) dispatched and not yet consumed;
-    /// the single worker completes strictly in this order.
-    in_flight: std::collections::VecDeque<((usize, usize), usize)>,
+    done_rx: std::sync::mpsc::Receiver<((usize, usize), usize, bool)>,
+    /// Reads dispatched and not yet completed, keyed by tensor; the value is
+    /// the pinned-buffer index. TWO workers complete OUT OF ORDER — the done
+    /// message carries (key, buf, ok), so no FIFO assumption exists anywhere.
+    in_flight: std::collections::HashMap<(usize, usize), usize>,
+    /// Reads that completed (drained non-blocking) and await consumption —
+    /// by a host htod or by the device-prefetch DMA.
+    ready: std::collections::HashMap<(usize, usize), usize>,
     /// Pinned-buffer indices free for dispatch or synchronous use.
     free: Vec<usize>,
     /// Learned per-step order of streamed tensors: (key, path, offset, len).
@@ -1639,29 +1682,47 @@ struct ReadAhead {
 impl ReadAhead {
     fn new(n_bufs: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<RaReq>();
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, usize)>();
-        std::thread::Builder::new()
-            .name("dg-readahead".into())
-            .spawn(move || {
-                while let Ok(req) = rx.recv() {
-                    // SAFETY: ptr/len name an exclusively-handed-off pinned
-                    // buffer region; the dispatcher does not touch it until
-                    // the done message for this key arrives.
-                    let dst =
-                        unsafe { std::slice::from_raw_parts_mut(req.ptr as *mut u8, req.len) };
-                    let ok = std::fs::File::open(&req.path)
-                        .and_then(|f| read_at_into(&f, req.off, dst))
-                        .is_ok();
-                    // A failed read reports key (ptr, 0) so the consumer
-                    // falls back to its own synchronous read.
-                    let _ = done_tx.send(if ok { req.key } else { (req.key.0, 0) });
-                }
-            })
-            .expect("spawn dg-readahead");
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<((usize, usize), usize, bool)>();
+        // TWO readers: laptop NVMe gains ~15-35% at QD2 for these 200-285 MB
+        // sequential reads, and the Windows cache-manager copy parallelizes.
+        for w in 0..2 {
+            let rx = rx.clone();
+            let done_tx = done_tx.clone();
+            std::thread::Builder::new()
+                .name(format!("dg-readahead-{w}"))
+                .spawn(move || {
+                    loop {
+                        // Take one request; the lock drops BEFORE the
+                        // blocking file I/O so the other worker can pull.
+                        let req = {
+                            let guard = match rx.lock() {
+                                Ok(g) => g,
+                                Err(_) => return,
+                            };
+                            match guard.recv() {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            }
+                        };
+                        // SAFETY: ptr/len name an exclusively-handed-off
+                        // pinned buffer region; the dispatcher does not touch
+                        // it until the done message for this key arrives.
+                        let dst =
+                            unsafe { std::slice::from_raw_parts_mut(req.ptr as *mut u8, req.len) };
+                        let ok = std::fs::File::open(&req.path)
+                            .and_then(|f| read_at_into(&f, req.off, dst))
+                            .is_ok();
+                        let _ = done_tx.send((req.key, req.buf, ok));
+                    }
+                })
+                .expect("spawn dg-readahead");
+        }
         Self {
             tx,
             done_rx,
-            in_flight: std::collections::VecDeque::new(),
+            in_flight: std::collections::HashMap::new(),
+            ready: std::collections::HashMap::new(),
             free: (0..n_bufs).collect(),
             order: Vec::new(),
             learned: false,
@@ -1669,12 +1730,53 @@ impl ReadAhead {
         }
     }
 
-    /// Drain every in-flight read (blocking) and reclaim the buffers.
+    /// Route one done message: the buffer goes to `ready` on success or back
+    /// to `free` on a failed read (the consumer falls back to a sync read).
+    fn route_done(&mut self, key: (usize, usize), buf: usize, ok: bool) {
+        self.in_flight.remove(&key);
+        if ok {
+            self.ready.insert(key, buf);
+        } else {
+            self.free.push(buf);
+        }
+    }
+
+    /// Drain every in-flight read (blocking) and reclaim the buffers,
+    /// including any completed-but-unconsumed `ready` entries.
     fn drain(&mut self) {
-        while let Some((_, bi)) = self.in_flight.pop_front() {
-            let _ = self.done_rx.recv();
+        while !self.in_flight.is_empty() {
+            match self.done_rx.recv() {
+                Ok((k, b, ok)) => self.route_done(k, b, ok),
+                Err(_) => break,
+            }
+        }
+        for (_, bi) in self.ready.drain() {
             self.free.push(bi);
         }
+    }
+
+    /// Non-blocking: move completed reads into `ready`.
+    fn drain_ready(&mut self) {
+        while let Ok((k, b, ok)) = self.done_rx.try_recv() {
+            self.route_done(k, b, ok);
+        }
+    }
+
+    /// Blocking: wait until `key`'s read completes (it must be in `ready` or
+    /// `in_flight`). Returns the pinned buffer index, or None if the read
+    /// failed / was never dispatched.
+    fn wait_ready(&mut self, key: (usize, usize)) -> Option<usize> {
+        self.drain_ready();
+        if let Some(bi) = self.ready.remove(&key) {
+            return Some(bi);
+        }
+        while self.in_flight.contains_key(&key) {
+            match self.done_rx.recv() {
+                Ok((k, b, ok)) => self.route_done(k, b, ok),
+                Err(_) => return None,
+            }
+        }
+        self.ready.remove(&key)
     }
 }
 
@@ -1776,9 +1878,14 @@ pub(crate) fn fast_gemm_id(
     // expert pool), else stream through the scratch buffer.
     let mut streamed = false;
     let mut streamed_upload_done = false;
-    // (consumed key, pinned-buffer index) when a streamed upload used a
-    // pinned buffer — the post-sync prefetch dispatch reuses that buffer.
-    let mut stream_consumed: Option<((usize, usize), usize)> = None;
+    // (consumed key, Some(pinned-buffer index) when a host buffer fed this
+    // call's htod; None on a device-prefetch hit). Drives the post-run
+    // pipeline refill and buffer recycling.
+    let mut stream_consumed: Option<((usize, usize), Option<usize>)> = None;
+    // Device-prefetch state for this call: the wire bytes may already sit in
+    // scratch2 (or scratch) from the copy stream.
+    let mut wire_in_scratch2 = false;
+    let mut dev_hit = false;
     if !eng.expert_pool.contains_key(&key) && !eng.expert_rejected.contains(&key) {
         ensure_budgets(eng);
         let is_small = tensor.len() < DG_SMALL_TENSOR;
@@ -1861,16 +1968,19 @@ pub(crate) fn fast_gemm_id(
     }
     if !eng.expert_pool.contains_key(&key) && !eng.host_pool.contains_key(&key) {
         streamed = true;
-        // Grow the scratch to fit and stream the tensor for this call.
         let s = eng.stream.clone();
         let need = tensor.len();
-        let cap_ok = eng
-            .scratch
-            .as_ref()
-            .map(|b| b.len() >= need)
-            .unwrap_or(false);
-        if !cap_ok {
-            match s.alloc_zeros::<u8>(need) {
+        // Audit F6: the cap bail must precede any scratch (re)allocation — a
+        // regrow drops a scratch a pending prefetch DMA may still write.
+        if need > DG_PIN_CAP {
+            eprintln!("[dg-cuda] streamed tensor exceeds pin cap; CPU fallback");
+            return None;
+        }
+        // Fixed-cap scratch (the prefetch pipeline alternates scratch and
+        // scratch2, so both must fit any streamed tensor). Allocated once;
+        // never regrown (see the cap bail above).
+        if eng.scratch.is_none() {
+            match s.alloc_zeros::<u8>(DG_PIN_CAP) {
                 Ok(b) => eng.scratch = Some(b),
                 Err(e) => {
                     eprintln!("[dg-cuda] fast scratch alloc failed ({e}); CPU fallback");
@@ -1884,10 +1994,6 @@ pub(crate) fn fast_gemm_id(
         // faster). The read-ahead ring overlaps upcoming tensors' reads (the
         // dominant cost) with GPU work; the per-step sequence is learned on
         // step 0 and the pipeline refills after every call.
-        if need > DG_PIN_CAP {
-            eprintln!("[dg-cuda] streamed tensor exceeds pin cap; CPU fallback");
-            return None;
-        }
         while eng.pin_bufs.len() < DG_RA_BUFS {
             match unsafe { eng.ctx.alloc_pinned::<u8>(DG_PIN_CAP) } {
                 Ok(b) => eng.pin_bufs.push(b),
@@ -1900,22 +2006,43 @@ pub(crate) fn fast_gemm_id(
         if eng.ra.is_none() {
             eng.ra = Some(ReadAhead::new(DG_RA_BUFS));
         }
-        // 1. Resolve the host bytes: the front of the prefetch FIFO if it is
-        // this tensor (the common steady-state case), else a synchronous
-        // read into a free buffer.
+        if eng.copy_stream.is_none() {
+            eng.copy_stream = eng.ctx.new_stream().ok();
+        }
+        // The device-prefetch target alternates against the scratch the
+        // current call reads; both sized to the pin cap once.
+        if eng.scratch2.is_none() {
+            eng.scratch2 = eng.stream.alloc_zeros::<u8>(DG_PIN_CAP).ok();
+        }
+        // 0. Device-prefetch hit: the copy stream already DMA'd this tensor
+        // into a device scratch during the PREVIOUS call's kernel — wait the
+        // event (usually already done), release the pinned buffer, and skip
+        // all host work for this tensor.
+        if let Some((k, s2, ev, pinbuf)) = eng.dev_pf.take() {
+            let _ = ev.synchronize();
+            if let Some(ra) = eng.ra.as_mut() {
+                ra.free.push(pinbuf);
+            }
+            if k == key {
+                wire_in_scratch2 = s2;
+                dev_hit = true;
+                stream_consumed = Some((key, None));
+            }
+        }
+        // 1. Resolve the host bytes: a completed read-ahead (non-blocking
+        // drain, then targeted wait), else a synchronous read.
         let mut ready_buf: Option<usize> = None;
         {
             let ra = eng.ra.as_mut().unwrap();
-            if let Some(&(k, bi)) = ra.in_flight.front() {
-                if k == key {
-                    ra.in_flight.pop_front();
-                    match ra.done_rx.recv() {
-                        Ok(done) if done == key => ready_buf = Some(bi),
-                        _ => ra.free.push(bi), // read failed → sync fallback
-                    }
-                } else {
-                    // Mispredict (block-boundary or order change): drain the
-                    // whole pipeline and restart it after this call.
+            if !dev_hit {
+                ra.drain_ready();
+                if let Some(bi) = ra.ready.remove(&key) {
+                    ready_buf = Some(bi);
+                } else if ra.in_flight.iter().any(|(k, _)| *k == key) {
+                    ready_buf = ra.wait_ready(key);
+                } else if !ra.in_flight.is_empty() || !ra.ready.is_empty() {
+                    // Mispredicted pipeline (block boundary / order change):
+                    // reset it; the refill below restarts from this key.
                     ra.drain();
                 }
             }
@@ -1933,56 +2060,58 @@ pub(crate) fn fast_gemm_id(
                 }
             }
         }
-        let sync_buf = if ready_buf.is_none() {
-            let ra = eng.ra.as_mut().unwrap();
-            let Some(bi) = ra.free.pop() else {
-                eprintln!("[dg-cuda] pinned ring exhausted; CPU fallback");
-                return None;
+        if !dev_hit {
+            let sync_buf = if ready_buf.is_none() {
+                let ra = eng.ra.as_mut().unwrap();
+                let Some(bi) = ra.free.pop() else {
+                    eprintln!("[dg-cuda] pinned ring exhausted; CPU fallback");
+                    return None;
+                };
+                Some(bi)
+            } else {
+                None
             };
-            Some(bi)
-        } else {
-            None
-        };
-        let use_buf = ready_buf.or(sync_buf).unwrap();
-        if ready_buf.is_none() {
-            let read_ok = {
-                let pin = &mut eng.pin_bufs[use_buf];
-                match pin.as_mut_ptr() {
-                    Ok(dst) => {
-                        // SAFETY: DG_PIN_CAP >= need (checked above).
-                        let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, need) };
-                        std::fs::File::open(src.0)
-                            .and_then(|f| read_at_into(&f, src.1, dst_slice))
-                            .is_ok()
+            let use_buf = ready_buf.or(sync_buf).unwrap();
+            if ready_buf.is_none() {
+                let read_ok = {
+                    let pin = &mut eng.pin_bufs[use_buf];
+                    match pin.as_mut_ptr() {
+                        Ok(dst) => {
+                            // SAFETY: DG_PIN_CAP >= need (checked above).
+                            let dst_slice = unsafe { std::slice::from_raw_parts_mut(dst, need) };
+                            std::fs::File::open(src.0)
+                                .and_then(|f| read_at_into(&f, src.1, dst_slice))
+                                .is_ok()
+                        }
+                        Err(_) => false,
                     }
-                    Err(_) => false,
+                };
+                if !read_ok {
+                    // Last-resort: pageable upload straight from the mmap slice.
+                    eng.ra.as_mut().unwrap().free.push(use_buf);
+                    let buf = eng.scratch.as_mut().unwrap();
+                    let mut view = buf.slice_mut(0..need);
+                    if let Err(e) = s.memcpy_htod(tensor, &mut view) {
+                        eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
+                        return None;
+                    }
+                    streamed_upload_done = true;
                 }
-            };
-            if !read_ok {
-                // Last-resort: pageable upload straight from the mmap slice.
-                eng.ra.as_mut().unwrap().free.push(use_buf);
+            }
+            if !streamed_upload_done {
+                let host = eng.pin_bufs[use_buf].as_slice().ok().map(|sl| &sl[..need]);
+                let Some(host) = host else {
+                    eprintln!("[dg-cuda] pinned staging unavailable; CPU fallback");
+                    return None;
+                };
                 let buf = eng.scratch.as_mut().unwrap();
                 let mut view = buf.slice_mut(0..need);
-                if let Err(e) = s.memcpy_htod(tensor, &mut view) {
+                if let Err(e) = s.memcpy_htod(host, &mut view) {
                     eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
                     return None;
                 }
-                streamed_upload_done = true;
+                stream_consumed = Some((key, Some(use_buf)));
             }
-        }
-        if !streamed_upload_done {
-            let host = eng.pin_bufs[use_buf].as_slice().ok().map(|sl| &sl[..need]);
-            let Some(host) = host else {
-                eprintln!("[dg-cuda] pinned staging unavailable; CPU fallback");
-                return None;
-            };
-            let buf = eng.scratch.as_mut().unwrap();
-            let mut view = buf.slice_mut(0..need);
-            if let Err(e) = s.memcpy_htod(host, &mut view) {
-                eprintln!("[dg-cuda] fast stream upload failed ({e}); CPU fallback");
-                return None;
-            }
-            stream_consumed = Some((key, use_buf));
         }
     }
     let func = match kind {
@@ -2026,7 +2155,55 @@ pub(crate) fn fast_gemm_id(
         }
     }
     let n_groups = g_base.len();
-    let run = || -> Result<Vec<f32>, String> {
+    // Device-prefetch plan: if the NEXT streamed tensor's host bytes are
+    // already read (non-blocking check), its DMA is enqueued on the copy
+    // stream right after this call's kernel launch — the transfer hides
+    // under the kernel + dtoh instead of serializing before the next one.
+    let mut pf_plan: Option<((usize, usize), bool, usize, usize)> = None;
+    if streamed && eng.copy_stream.is_some() && eng.scratch2.is_some() {
+        let next: Option<((usize, usize), usize)> = {
+            let ra = eng.ra.as_mut().unwrap();
+            ra.drain_ready();
+            if ra.learned && !ra.order.is_empty() {
+                ra.order.iter().position(|(k, ..)| *k == key).and_then(|i| {
+                    let len_o = ra.order.len();
+                    (1..len_o).find_map(|step| {
+                        let (nk, _, _, nlen) = &ra.order[(i + step) % len_o];
+                        if ra.ready.contains_key(nk) && *nlen <= DG_PIN_CAP {
+                            Some((*nk, *nlen))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            } else {
+                None
+            }
+        };
+        if let Some((nk, nlen)) = next {
+            if !eng.expert_pool.contains_key(&nk) && !eng.host_pool.contains_key(&nk) {
+                if let Some(pb) = eng.ra.as_mut().unwrap().ready.remove(&nk) {
+                    // Target the scratch the CURRENT call is NOT reading.
+                    pf_plan = Some((nk, !wire_in_scratch2, pb, nlen));
+                }
+            }
+        }
+    }
+    // Scratches leave the engine for the call so the wire read (immutable)
+    // and the prefetch DMA target (mutable) borrow disjoint locals.
+    let mut scratch_a = eng.scratch.take();
+    let mut scratch_b = eng.scratch2.take();
+    let (wire_scratch, pf_dst) = if wire_in_scratch2 {
+        (scratch_b.as_ref(), scratch_a.as_mut())
+    } else {
+        (scratch_a.as_ref(), scratch_b.as_mut())
+    };
+    // Prefetch outcome slots: written inside run(), consumed after — on BOTH
+    // success and error paths (audit F3).
+    let mut pf_out_slot: Option<((usize, usize), bool, CudaEvent, usize)> = None;
+    let mut pf_fail_slot: Option<((usize, usize), usize)> = None;
+    #[allow(unused_mut)]
+    let mut run = || -> Result<Vec<f32>, String> {
         let s = eng.stream.clone();
         let mut sc_dev = s
             .alloc_zeros::<f32>(act_scales.len())
@@ -2064,8 +2241,7 @@ pub(crate) fn fast_gemm_id(
         let (rp, bp) = (rows_per as i32, blocks_per_row as i32);
         let mut b = s.launch_builder(func);
         if streamed {
-            let buf = eng.scratch.as_ref().unwrap();
-            b.arg(buf);
+            b.arg(wire_scratch.ok_or_else(|| "scratch missing".to_string())?);
         } else if let Some(dev) = eng.expert_pool.get(&key) {
             b.arg(dev);
         } else {
@@ -2081,24 +2257,84 @@ pub(crate) fn fast_gemm_id(
             .arg(&bp)
             .arg(&mut out_dev);
         unsafe { b.launch(cfg) }.map_err(|e| format!("launch: {e}"))?;
+        // Enqueue the planned device prefetch on the copy stream — it runs
+        // concurrently with this call's kernel and dtoh. The target scratch
+        // is the one the current kernel is NOT reading, and its previous
+        // reader fully synced, so the async write cannot race. Audit F3/F4:
+        // the outcome is written to CAPTURED SLOTS (not the return value) so
+        // an error later in this closure still installs the tracking event —
+        // an enqueued DMA must never be left orphaned; and an event failure
+        // after a successful enqueue synchronizes the copy stream before the
+        // buffer is handed back.
+        if let Some((nk, into_s2, pb, nlen)) = pf_plan.take() {
+            let cs = eng.copy_stream.as_ref().unwrap().clone();
+            let host = eng.pin_bufs[pb].as_slice().ok();
+            let enq = match (host, pf_dst) {
+                (Some(host), Some(dst)) => {
+                    let mut view = dst.slice_mut(0..nlen);
+                    cs.memcpy_htod(&host[..nlen], &mut view).is_ok()
+                }
+                _ => false,
+            };
+            if enq {
+                if let Ok(ev) = eng.ctx.new_event(None) {
+                    if ev.record(&cs).is_ok() {
+                        pf_out_slot = Some((nk, into_s2, ev, pb));
+                    }
+                }
+            }
+            if pf_out_slot.is_none() {
+                if enq {
+                    // The DMA is in flight with no event: drain it before the
+                    // buffer can be reused (F4).
+                    let _ = cs.synchronize();
+                }
+                pf_fail_slot = Some((nk, pb));
+            }
+        }
         let mut out = vec![0f32; n_pairs * rows_per];
         s.memcpy_dtoh(&out_dev, &mut out)
             .map_err(|e| format!("download: {e}"))?;
-        eng.ctx.synchronize().map_err(|e| format!("sync: {e}"))?;
+        // Main-stream sync only: the copy stream's prefetch keeps running
+        // past this call and is waited via its event at consumption.
+        s.synchronize().map_err(|e| format!("sync: {e}"))?;
         Ok(out)
     };
     let result = run();
-    // Post-sync prefetch dispatch: the buffer this call consumed is free
-    // again (run() ends with a full sync); hand it to the read-ahead worker
-    // for the NEXT streamed tensor in the learned per-step order. The wrap
-    // at the sequence end prefetches the next STEP's first tensor across the
+    // Restore the scratches taken for the call, then unpack the prefetch
+    // outcome. All bookkeeping below runs on BOTH success and failure paths
+    // (audit F1-F4): buffers must always return to a tracked set.
+    eng.scratch = scratch_a;
+    eng.scratch2 = scratch_b;
+    if let Some((nk, pb)) = pf_fail_slot.take() {
+        if let Some(ra) = eng.ra.as_mut() {
+            ra.ready.insert(nk, pb);
+        }
+    }
+    if pf_out_slot.is_some() {
+        eng.dev_pf = pf_out_slot.take();
+    }
+    // Audit F2: a plan consumed from `ready` but never enqueued (run() erred
+    // before the enqueue point) must be reinstated.
+    if let Some((nk, _, pb, _)) = pf_plan.take() {
+        if let Some(ra) = eng.ra.as_mut() {
+            ra.ready.insert(nk, pb);
+        }
+    }
+    // Audit F1: the consumed host buffer returns to the free ring even when
+    // run() failed — otherwise each transient failure permanently eats one
+    // of the 4 ring buffers and the stream silently degrades to CPU.
+    if let Some((_, Some(bi))) = stream_consumed {
+        if let Some(ra) = eng.ra.as_mut() {
+            ra.free.push(bi);
+        }
+    }
+    // Post-sync prefetch dispatch: refill the read-ahead pipeline for
+    // upcoming streamed tensors in the learned per-step order. The wrap at
+    // the sequence end prefetches the next STEP's first tensor across the
     // attention/lm_head/sampler gap.
     if result.is_ok() {
-        if let Some((ck, buf_idx)) = stream_consumed {
-            // The consumed buffer is free again (run() ends with a full sync).
-            if let Some(ra) = eng.ra.as_mut() {
-                ra.free.push(buf_idx);
-            }
+        if let Some((ck, _)) = stream_consumed {
             // Refill the pipeline: dispatch reads for upcoming streamed
             // tensors (skipping pool-resident entries) while free buffers
             // remain. The cursor wraps, so the sequence end prefetches the
@@ -2128,17 +2364,17 @@ pub(crate) fn fast_gemm_id(
                     }
                     let (nk, npath, noff, nlen) = ra.order[ra.cursor % order_len].clone();
                     scanned += 1;
+                    let already_staged = {
+                        let ra = eng.ra.as_ref().unwrap();
+                        ra.in_flight.iter().any(|(k, _)| *k == nk)
+                            || ra.ready.contains_key(&nk)
+                            || eng.dev_pf.as_ref().map(|(k, ..)| *k == nk).unwrap_or(false)
+                    };
                     if eng.expert_pool.contains_key(&nk)
                         || eng.host_pool.contains_key(&nk)
                         || nlen == 0
                         || nlen > DG_PIN_CAP
-                        || eng
-                            .ra
-                            .as_ref()
-                            .unwrap()
-                            .in_flight
-                            .iter()
-                            .any(|(k, _)| *k == nk)
+                        || already_staged
                     {
                         eng.ra.as_mut().unwrap().cursor += 1;
                         continue;
@@ -2157,6 +2393,7 @@ pub(crate) fn fast_gemm_id(
                         .tx
                         .send(RaReq {
                             key: nk,
+                            buf: bi,
                             ptr,
                             len: nlen,
                             path: npath,
@@ -2164,7 +2401,7 @@ pub(crate) fn fast_gemm_id(
                         })
                         .is_ok()
                     {
-                        ra.in_flight.push_back((nk, bi));
+                        ra.in_flight.insert(nk, bi);
                         ra.cursor += 1;
                     } else {
                         ra.free.push(bi);
@@ -2193,6 +2430,8 @@ pub(crate) fn dg_attention_gpu(
     k: &[f32],
     v: &[f32],
     n: usize,
+    nq: usize,
+    q_off: usize,
     heads: usize,
     kv_heads: usize,
     head_dim: usize,
@@ -2236,15 +2475,17 @@ pub(crate) fn dg_attention_gpu(
         s.memcpy_htod(v, &mut v_dev)
             .map_err(|e| format!("upload v: {e}"))?;
         let mut out_dev = s
-            .alloc_zeros::<f32>(n * heads * head_dim)
+            .alloc_zeros::<f32>(nq * heads * head_dim)
             .map_err(|e| format!("alloc attn out: {e}"))?;
         let cfg = LaunchConfig {
-            grid_dim: ((n * heads) as u32, 1, 1),
+            grid_dim: ((nq * heads) as u32, 1, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: (n * 4) as u32,
         };
-        let (ni, hi, kvi, hdi, gi, pi, wi, sl) = (
+        let (ni, nqi, qo, hi, kvi, hdi, gi, pi, wi, sl) = (
             n as i32,
+            nq as i32,
+            q_off as i32,
             heads as i32,
             kv_heads as i32,
             head_dim as i32,
@@ -2259,6 +2500,8 @@ pub(crate) fn dg_attention_gpu(
             .arg(&v_dev)
             .arg(&mut out_dev)
             .arg(&ni)
+            .arg(&nqi)
+            .arg(&qo)
             .arg(&hi)
             .arg(&kvi)
             .arg(&hdi)
@@ -2268,7 +2511,7 @@ pub(crate) fn dg_attention_gpu(
             .arg(&sl)
             .arg(&canvas_prompt_lo);
         unsafe { b.launch(cfg) }.map_err(|e| format!("launch attn: {e}"))?;
-        let mut out = vec![0f32; n * heads * head_dim];
+        let mut out = vec![0f32; nq * heads * head_dim];
         s.memcpy_dtoh(&out_dev, &mut out)
             .map_err(|e| format!("download attn: {e}"))?;
         eng.ctx.synchronize().map_err(|e| format!("sync: {e}"))?;
@@ -2364,6 +2607,21 @@ pub(crate) fn lm_head_f16_gemm_gpu(
         Err(err) => {
             eprintln!("[dg-cuda] lm gemm failed ({err}); CPU fallback");
             None
+        }
+    }
+}
+
+/// Generation-boundary reset (audit F5): a stale `last_logits` buffer from a
+/// PREVIOUS generation must never feed a new one's self-conditioning — step 0
+/// skips SC, so a transient lm_head fallback at step 0 would otherwise leave
+/// the old buffer alive for step 1 to consume (silent cross-request
+/// corruption in serve). Call at every `eb_generate` entry.
+pub(crate) fn dg_generation_reset() {
+    if let Some(cell) = ENGINE.get() {
+        if let Ok(mut guard) = cell.lock() {
+            if let Some(eng) = guard.as_mut() {
+                eng.last_logits = None;
+            }
         }
     }
 }

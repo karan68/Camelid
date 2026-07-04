@@ -1650,14 +1650,28 @@ async fn main() -> anyhow::Result<()> {
                 params.max_steps, max_blocks
             );
             let t1 = std::time::Instant::now();
-            let (text, stop, ids) = chat.generate(
+            // CAMELID_DG_LIVE=1: print the forming answer after every denoise
+            // step — the whole draft exists from step 0 and refines in place.
+            let live = std::env::var("CAMELID_DG_LIVE").as_deref() == Ok("1");
+            let (text, stop, ids) = chat.generate_live(
                 &prompt,
                 &params,
                 max_blocks,
                 max_ubatch,
-                |b, prefix_len, steps, cut| {
+                |b, step, draft| {
+                    if live {
+                        let one_line = draft.replace('\n', " ");
+                        let preview: String = one_line.chars().take(160).collect();
+                        eprintln!(
+                            "[dg-live b{b} s{step} {:.0}s] {preview}",
+                            t1.elapsed().as_secs_f32()
+                        );
+                    }
+                },
+                |b, committed| {
                     eprintln!(
-                        "[dg] block {b}: prefix={prefix_len} steps={steps} cut={cut} ({:.0}s)",
+                        "[dg] block {b}: committed {} tokens ({:.0}s)",
+                        committed.len(),
                         t1.elapsed().as_secs_f32()
                     );
                 },
