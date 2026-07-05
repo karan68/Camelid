@@ -315,8 +315,12 @@ pub fn plan_for_model_with_platform(
     } else if quant_type == "Q8_0"
         && platform.cuda_resident_active
         && is_gpu_runnable_arch(gguf)
-        && env_flag_enabled("CAMELID_GPU_RUNNABLE_TIER")
+        && !env_flag_disabled("CAMELID_GPU_RUNNABLE_TIER")
     {
+        // On by DEFAULT: an uncurated but architecturally-compatible Q8_0 model should just run
+        // on the GPU without the user having to opt in. This is safe because admission is gated
+        // at runtime by the GPU-vs-CPU parity self-check — a model that is not bit-exact falls
+        // back to the CPU reference path. Opt out with CAMELID_GPU_RUNNABLE_TIER=0 (forces CPU).
         reasons.push(
             "non-curated Q8_0 on a resident-capable dense arch: GPU-runnable tier (NOT a \
              supported row) — resident path admitted subject to the runtime parity self-check"
@@ -1351,32 +1355,22 @@ mod tests {
     }
 
     #[test]
-    fn gpu_runnable_tier_admits_uncurated_q8_llama_only_when_flag_on() {
+    fn gpu_runnable_tier_admits_uncurated_q8_llama_by_default_optout_forces_cpu() {
         let _guard = env_lock();
         clear_profile_env();
-        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
         // Uncurated: neither general.name ("hub") nor the filename maps to a support row.
         let uncurated = fixture("hub");
         let path = PathBuf::from("/models/my-custom-llama-Q8_0.gguf");
-        // Flag OFF (default): fails closed to CPU, unchanged from prior behavior.
-        let off = plan_for_model_with_platform(
-            &path,
-            &uncurated,
-            Some(8),
-            cuda_platform("windows", "x86_64", &["avx2"]),
-        );
-        assert_eq!(off.plan.selected_backend, "cpu_reference");
-        // Flag ON: admitted to the GPU-runnable tier with an honest, distinct label; the
-        // support_level stays unknown_or_unvalidated (never claims a supported row).
-        env::set_var("CAMELID_GPU_RUNNABLE_TIER", "1");
+        // DEFAULT (unset): admitted to the GPU-runnable tier with an honest, distinct label; the
+        // support_level stays unknown_or_unvalidated (never claims a supported row). Admission is
+        // gated at runtime by the parity self-check, so default-on is safe.
+        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
         let on = plan_for_model_with_platform(
             &path,
             &uncurated,
             Some(8),
             cuda_platform("windows", "x86_64", &["avx2"]),
         );
-        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
-        clear_profile_env();
         assert_eq!(
             on.plan.selected_backend,
             "cuda_resident_q8_runtime_runnable_unvalidated"
@@ -1385,6 +1379,17 @@ mod tests {
             on.plan.support_level, "unknown_or_unvalidated",
             "the runnable tier must never claim a supported row"
         );
+        // Explicit opt-out (=0): forced back to the safe CPU reference path.
+        env::set_var("CAMELID_GPU_RUNNABLE_TIER", "0");
+        let off = plan_for_model_with_platform(
+            &path,
+            &uncurated,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
+        clear_profile_env();
+        assert_eq!(off.plan.selected_backend, "cpu_reference");
     }
 
     #[test]
@@ -1393,15 +1398,17 @@ mod tests {
         clear_profile_env();
         let curated = fixture("Llama 3.2 1B Instruct");
         let path = PathBuf::from("/models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+        // Tier ON (default, unset).
         env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
-        let off = plan_for_model_with_platform(
+        let on = plan_for_model_with_platform(
             &path,
             &curated,
             Some(8),
             cuda_platform("windows", "x86_64", &["avx2"]),
         );
-        env::set_var("CAMELID_GPU_RUNNABLE_TIER", "1");
-        let on = plan_for_model_with_platform(
+        // Tier opted out (=0).
+        env::set_var("CAMELID_GPU_RUNNABLE_TIER", "0");
+        let off = plan_for_model_with_platform(
             &path,
             &curated,
             Some(8),
@@ -1409,8 +1416,9 @@ mod tests {
         );
         env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
         clear_profile_env();
-        // A curated row takes the supported plan and is byte-for-byte identical whether
-        // the tier flag is on or off — the tier is a pure additive else-branch.
+        // A curated row takes the supported plan and is byte-for-byte identical whether the tier
+        // is on (default) or opted out — the tier is a pure additive else-branch after the
+        // curated arm, so it can never alter a supported row.
         assert_eq!(on.plan.selected_backend, "cuda_resident_q8_runtime");
         assert_eq!(on.plan.selected_backend, off.plan.selected_backend);
         assert_eq!(on.plan.support_level, off.plan.support_level);
