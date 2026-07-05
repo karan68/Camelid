@@ -252,6 +252,29 @@ fn is_llama3_bpe_signature(token_texts: &[String]) -> bool {
         && token_texts.get(128_009).map(String::as_str) == Some("<|eot_id|>")
 }
 
+/// Resolve the GPT-2/BPE pre-tokenizer dialect from `tokenizer.ggml.pre`. The three
+/// known dialects differ only in the split regex (digit grouping / mark folding); the
+/// byte-BPE merge step is identical (verified against llama.cpp llama-vocab.cpp). When
+/// the key is ABSENT, recover llama-bpe iff the vocab carries the Llama-3 signature —
+/// some Llama-3 GGUF conversions omit the key, and llama.cpp then silently mis-tokenizes
+/// them under a raw GPT-2 fallback ("GENERATION QUALITY WILL BE DEGRADED"). An
+/// explicit-but-unknown `pre`, or a missing key without the signature (e.g. a de-labeled
+/// Qwen), is refused. Extracted from `from_gguf` so the decision is unit-testable.
+fn resolve_gpt2_pre_tokenizer(
+    pre: Option<&str>,
+    token_texts: &[String],
+) -> Result<BpePreTokenizer> {
+    match pre {
+        Some("llama-bpe") => Ok(BpePreTokenizer::Llama3),
+        Some("qwen2") => Ok(BpePreTokenizer::Qwen2),
+        Some("qwen35") => Ok(BpePreTokenizer::Qwen35),
+        None if is_llama3_bpe_signature(token_texts) => Ok(BpePreTokenizer::Llama3),
+        other => Err(BackendError::UnsupportedTokenizer(format!(
+            "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35"
+        ))),
+    }
+}
+
 impl Tokenizer {
     pub fn from_gguf(file: &GgufFile) -> Result<Self> {
         let model_name = file
@@ -280,32 +303,7 @@ impl Tokenizer {
         }
 
         let bpe_pre_tokenizer = if model == TokenizerModel::Gpt2Bpe {
-            let pre_tokenizer = file.metadata_string("tokenizer.ggml.pre");
-            match pre_tokenizer {
-                Some("llama-bpe") => BpePreTokenizer::Llama3,
-                // Qwen2/Qwen3 differ from llama-bpe only in digit grouping
-                // (single digit vs runs of three); the byte-BPE merge step is
-                // identical. Verified against llama.cpp llama-vocab.cpp.
-                Some("qwen2") => BpePreTokenizer::Qwen2,
-                // Qwen3.5 / Ornith: same single-digit split as qwen2; its `\p{M}`
-                // mark-folding is a documented deferral (see `BpePreTokenizer::Qwen35`).
-                Some("qwen35") => BpePreTokenizer::Qwen35,
-                // Some GGUF conversions of Llama 3 omit `tokenizer.ggml.pre` entirely.
-                // llama.cpp then warns "missing pre-tokenizer type, using: 'default'"
-                // and silently tokenizes WRONG (raw GPT-2 splitting). When the key is
-                // absent AND the vocab carries the exact Llama-3 tiktoken special-token
-                // signature (only that family places these markers at these ids),
-                // recover the correct llama-bpe pre-tokenizer — the byte-BPE merges are
-                // identical across the GPT-2/BPE dialects, so only the split regex is
-                // fixed. An explicit-but-unknown `pre`, or a non-Llama-3 vocab (e.g. a
-                // Qwen GGUF that lost its `pre`), fails the signature and stays refused.
-                None if is_llama3_bpe_signature(&token_texts) => BpePreTokenizer::Llama3,
-                other => {
-                    return Err(BackendError::UnsupportedTokenizer(format!(
-                        "unsupported GPT-2/BPE pre-tokenizer {other:?}; currently supported: llama-bpe, qwen2, qwen35"
-                    )))
-                }
-            }
+            resolve_gpt2_pre_tokenizer(file.metadata_string("tokenizer.ggml.pre"), &token_texts)?
         } else {
             BpePreTokenizer::default()
         };
@@ -1361,6 +1359,45 @@ mod tests {
         assert!(!is_llama3_bpe_signature(&missing));
     }
 
+    #[test]
+    fn resolve_gpt2_pre_tokenizer_gates_the_missing_pre_recovery() {
+        use super::{resolve_gpt2_pre_tokenizer, BpePreTokenizer};
+        let mut sig = vec![String::new(); 128_256];
+        sig[128_000] = "<|begin_of_text|>".to_string();
+        sig[128_001] = "<|end_of_text|>".to_string();
+        sig[128_006] = "<|start_header_id|>".to_string();
+        sig[128_007] = "<|end_header_id|>".to_string();
+        sig[128_009] = "<|eot_id|>".to_string();
+        let no_sig = vec!["x".to_string(); 128_256];
+
+        // Explicit dialects resolve regardless of the vocab.
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("llama-bpe"), &no_sig),
+            Ok(BpePreTokenizer::Llama3)
+        ));
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("qwen2"), &no_sig),
+            Ok(BpePreTokenizer::Qwen2)
+        ));
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(Some("qwen35"), &no_sig),
+            Ok(BpePreTokenizer::Qwen35)
+        ));
+
+        // Missing pre + Llama-3 signature => recovered as Llama3 (the fix).
+        assert!(matches!(
+            resolve_gpt2_pre_tokenizer(None, &sig),
+            Ok(BpePreTokenizer::Llama3)
+        ));
+
+        // Missing pre WITHOUT the signature => still refused (guards a de-labeled Qwen).
+        assert!(resolve_gpt2_pre_tokenizer(None, &no_sig).is_err());
+
+        // An explicit-but-unknown pre is refused EVEN WITH the signature — we only
+        // rescue an absent key, never override a stated (if unrecognized) dialect.
+        assert!(resolve_gpt2_pre_tokenizer(Some("smaug-bpe"), &sig).is_err());
+    }
+
     // Parity gate for the missing-`pre` Llama-3 rescue: the exact Meta-Llama-3-8B GGUF
     // that omits tokenizer.ggml.pre must tokenize BYTE-IDENTICALLY to a known-good
     // pre=llama-bpe Llama-3 GGUF. Ignored by default (needs the multi-GB models); run
@@ -1376,12 +1413,27 @@ mod tests {
             .expect("set CAMELID_LLAMA3_REFERENCE_GGUF");
         let ga = crate::gguf::read_metadata(&a).expect("read missing-pre gguf");
         let gb = crate::gguf::read_metadata(&b).expect("read reference gguf");
+        // Guard against a tautological pass: the reference MUST carry an explicit
+        // pre=llama-bpe (a genuine oracle), and the file under test MUST actually omit
+        // the key (so it drives the recovery branch, not the normal path). Without
+        // these, pointing both env vars at missing-pre files would pass trivially.
+        assert_eq!(
+            gb.metadata_string("tokenizer.ggml.pre"),
+            Some("llama-bpe"),
+            "CAMELID_LLAMA3_REFERENCE_GGUF must be an explicit pre=llama-bpe oracle"
+        );
+        assert_eq!(
+            ga.metadata_string("tokenizer.ggml.pre"),
+            None,
+            "CAMELID_LLAMA3_MISSING_PRE_GGUF must actually omit tokenizer.ggml.pre"
+        );
         let ta = Tokenizer::from_gguf(&ga)
             .expect("missing-pre Llama-3 gguf must now load (llama-bpe recovered)");
         let tb = Tokenizer::from_gguf(&gb).expect("reference gguf loads");
-        // Strings that EXERCISE the pre-tokenizer (the only thing recovery decides):
-        // contractions, multi-digit runs (llama-bpe groups 3s, qwen groups singles),
-        // whitespace, unicode, and the chat markers.
+        // This proves the RECOVERED tokenizer equals an explicit pre=llama-bpe oracle
+        // over strings that exercise the split regex (contractions, multi-digit runs,
+        // whitespace, unicode, chat markers). The llama-bpe-vs-qwen digit-grouping
+        // discrimination itself is covered by qwen2_pretokenizer_splits_digits_singly.
         let battery = [
             "It's a test, don't you think? We'll see.",
             "1234567890 and 42 plus 007 and 100000",
