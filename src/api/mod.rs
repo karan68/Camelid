@@ -7993,21 +7993,13 @@ async fn prepare_generation(
     })?;
 
     let context_length = config.context_length as usize;
-    if let Some(max_tokens) = requested_max_tokens {
-        if token_ids.len() + max_tokens as usize > context_length {
-            return Err(api_error(
-                StatusCode::BAD_REQUEST,
-                "context_length_exceeded",
-                format!(
-                    "prompt token count {} plus max_tokens {} exceeds context length {}",
-                    token_ids.len(),
-                    max_tokens,
-                    config.context_length
-                ),
-                Some("max_tokens"),
-            ));
-        }
-    } else if token_ids.len() >= context_length {
+    // A response limit (max_tokens) is an UPPER BOUND, not a demand: clamp it to
+    // the room left in the context window instead of rejecting. This makes the
+    // common "response limit == full context" case (e.g. an 8192 limit on an
+    // 8192-context model) generate up to the remaining room automatically rather
+    // than erroring. The only genuine failure is a prompt that already fills the
+    // whole context, leaving no room to generate even a single token.
+    if token_ids.len() >= context_length {
         return Err(api_error(
             StatusCode::BAD_REQUEST,
             "context_length_exceeded",
@@ -8021,11 +8013,16 @@ async fn prepare_generation(
     }
 
     let available_max_tokens = (context_length - token_ids.len()) as u32;
-    let max_tokens = requested_max_tokens.unwrap_or_else(|| {
-        req.default_max_tokens_cap
+    let max_tokens = match requested_max_tokens {
+        // Clamp an explicit request down to whatever actually fits.
+        Some(requested) => requested.min(available_max_tokens),
+        // No explicit limit: use the caller's default cap (itself bounded by the
+        // available room), or fill the remaining context.
+        None => req
+            .default_max_tokens_cap
             .map(|cap| cap.min(available_max_tokens))
-            .unwrap_or(available_max_tokens)
-    });
+            .unwrap_or(available_max_tokens),
+    };
     if let Some(index) = req.camelid_dense_diagnostic_generated_index {
         if index >= max_tokens {
             return Err(api_error(

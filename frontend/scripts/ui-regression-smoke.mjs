@@ -250,8 +250,14 @@ const { validateResponseLength, validateSendBudget, verifiedContextBound, slider
   assert.equal(amber.level, 'caution', 'value above verified bound but under model max is amber')
   assert.match(amber.message, /allowed, untested/, 'amber copy must state allowed-but-untested')
   assert.equal(validateResponseLength({ value: 1024, contextLength: 131072, verifiedBound: 2048 }).level, 'ok')
-  const send = validateSendBudget({ promptTokens: 60, maxTokens: 50, contextLength: 64 })
-  assert.equal(send.level, 'error', 'send budget must mirror the backend rule: prompt + max_tokens > context fails')
+  // The response limit is an upper bound the backend clamps to fit, so an
+  // overshoot that still leaves prompt room is a non-blocking notice, not a block.
+  const clamped = validateSendBudget({ promptTokens: 60, maxTokens: 50, contextLength: 64 })
+  assert.equal(clamped.level, 'notice', 'over-limit but room-remaining must be a non-blocking notice (backend clamps)')
+  assert.notEqual(clamped.level, 'error', 'send must not be blocked when the response can be auto-limited to fit')
+  // A prompt that already fills the whole context leaves no room — the one genuine error.
+  const noRoom = validateSendBudget({ promptTokens: 64, maxTokens: 50, contextLength: 64 })
+  assert.equal(noRoom.level, 'error', 'a prompt that fills the context has no room to generate and must error')
   const bound = verifiedContextBound({ model_compatibility: [{ id: 'llama32_3b_instruct_q8_0', family: 'llama_bpe_decoder', quantization: 'Q8_0', status: 'supported_exact_row_smoke', bounded_context_512_pack: 'validated_bounded_pack', bounded_context_512_window: 512, bounded_context_2048_pack: 'validated_third_pack', bounded_context_2048_window: 2048, bounded_context_4096_pack: 'not_promoted', bounded_context_4096_window: 4096 }] }, { id: 'llama32_3b_instruct_q8_0', name: 'x', quant: 'Q8_0', model_path: '/tmp/Llama-3.2-3B-Instruct-Q8_0.gguf' })
   assert.equal(bound, 2048, 'verified bound is the max VALIDATED pack window, never an unvalidated one')
   assert.ok(Math.abs(tokensToSlider(sliderToTokens(0.5)) - 0.5) < 0.03, 'log slider mapping round-trips')

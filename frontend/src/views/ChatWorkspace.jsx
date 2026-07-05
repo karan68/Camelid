@@ -342,10 +342,10 @@ export default function ChatWorkspace({
     return `${model.name} · Not loaded`
   }
 
-  /* Send-time budget check (Phase 9): mirrors the backend's real rule —
-     prompt_tokens + max_tokens must fit the context or the request gets a
-     typed context_length_exceeded error (verified: the backend rejects, it
-     does not clamp). Prompt size is a client estimate, labeled as such. */
+  /* Send-time budget check: the response limit is an upper bound the backend
+     clamps to the context's remaining room, so an overshoot is a non-blocking
+     notice — only a prompt that fills the whole context is a hard error. Prompt
+     size is a client estimate, labeled as such. */
   const estimatedPromptTokens = useMemo(() => {
     const history = visibleMessages.map((m) => String(m.content || '')).join(' ')
     const text = `${history} ${composer}`
@@ -481,6 +481,11 @@ export default function ChatWorkspace({
       {sendBudget.level === 'error' && (
         <p className="cxcomposer__budget-error" role="alert">
           <span aria-hidden="true">✕</span> {sendBudget.message}
+        </p>
+      )}
+      {sendBudget.level === 'notice' && (
+        <p className="cxcomposer__budget-notice">
+          <span aria-hidden="true">ⓘ</span> {sendBudget.message}
         </p>
       )}
       <div className={`cxcomposer__status is-${statusTone}`} role="status" aria-live="polite" title={`${runtimeStatusCopy} ${supportStatusCopy} ${readinessFinePrint}`}>
