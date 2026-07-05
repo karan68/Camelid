@@ -51,16 +51,17 @@ export function sliderToTokens(position) {
   return value
 }
 
-/* Validation states, priority-ordered. Red = the request will fail (the
-   backend returns typed context_length_exceeded, it does not clamp); amber =
+/* Validation states, priority-ordered. A response limit above the model context
+   is a non-blocking caution now — the backend auto-limits (clamps) it to the room
+   left after the prompt, it does not reject. amber =
    allowed but beyond the verified row's tested context; slate stays for
    support states elsewhere. */
 export function validateResponseLength({ value, contextLength = null, verifiedBound = null, modelName = 'the loaded model' }) {
   if (contextLength !== null && value > contextLength) {
     return {
-      level: 'error',
+      level: 'caution',
       code: 'over_model_context',
-      message: `Exceeds ${modelName}’s ${contextLength.toLocaleString()}-token context — the backend rejects this with a typed context_length_exceeded error. Lower the limit below ${contextLength.toLocaleString()}, or load a longer-context model.`,
+      message: `Exceeds ${modelName}’s ${contextLength.toLocaleString()}-token context — the backend auto-limits each response to the room left after the prompt, so replies may be shorter than this. Load a longer-context model for full-length replies.`,
     }
   }
   if (verifiedBound !== null && value > verifiedBound) {
