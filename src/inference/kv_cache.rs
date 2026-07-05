@@ -263,8 +263,8 @@ impl LlamaKvCache {
         // dominant, otherwise-uncapped allocation. Project the bytes of the ACTUAL
         // (post-rounding) growth and refuse BEFORE the `resize` below — the host ceiling
         // must never be discovered by OOMing mid-generation. Budget is
-        // `CAMELID_MAX_KV_CACHE_BYTES`, else a fraction of available physical RAM
-        // (Windows); unbounded where neither is known.
+        // `CAMELID_MAX_KV_CACHE_BYTES`, else max(80% of available, 25% of total) physical
+        // RAM (Windows); unbounded where neither is known.
         let projected_bytes =
             (target_sequence_length as u64).saturating_mul(self.kv_bytes_per_token());
         if projected_bytes > self.kv_budget_bytes {
@@ -525,18 +525,29 @@ const KV_CACHE_BUDGET_LIMIT_ENV: &str = "CAMELID_MAX_KV_CACHE_BYTES";
 /// is set — leaves headroom for activations + the OS so a long-context request fails
 /// closed instead of pushing the host into paging / OOM.
 const KV_CACHE_BUDGET_AVAILABLE_PERCENT: u64 = 80;
+/// Floor for the auto-budget, as a share of *total* physical RAM. `available` is a live
+/// reading that dips sharply right when a large model's weights fault into the working
+/// set during the forward pass — exactly when a session's KV cache is first sized.
+/// Without a floor the budget can collapse to a few MB with gigabytes actually free and
+/// refuse even a short generation (observed: a 44 MB budget with 5.4 GB free while an 8B
+/// generated on CPU → spurious `generation_step_failed`). A fraction of total RAM is a
+/// stable floor: still far below a runaway-context ceiling, but always enough for normal
+/// generation. The `available`-based value still governs when RAM is genuinely healthy.
+const KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT: u64 = 25;
 
 /// Resolve a new session's KV-cache memory budget (bytes): an explicit
 /// `CAMELID_MAX_KV_CACHE_BYTES` wins (deterministic, for tuning or controlled runs);
-/// otherwise a fraction of available physical RAM (Windows `GlobalMemoryStatusEx`).
+/// otherwise `max(80% of available, 25% of total)` physical RAM (Windows
+/// `GlobalMemoryStatusEx`).
 fn resolve_kv_cache_budget_bytes() -> u64 {
     let env_value = env::var(KV_CACHE_BUDGET_LIMIT_ENV).ok();
     kv_cache_budget_from(env_value.as_deref(), crate::gait::host_ram_status())
 }
 
 /// Pure budget policy (extracted so it is testable without mutating process env or
-/// querying the host): a parseable non-empty env override wins; else a fraction of
-/// available RAM; else (no env, no RAM probe — e.g. off Windows) unbounded.
+/// querying the host): a parseable non-empty env override wins; else the larger of
+/// 80%-of-available and a 25%-of-total floor (the floor guards against a transient
+/// collapse in `available`); else (no env, no RAM probe — e.g. off Windows) unbounded.
 fn kv_cache_budget_from(env_value: Option<&str>, ram: Option<(u64, u64)>) -> u64 {
     if let Some(trimmed) = env_value.map(str::trim) {
         if !trimmed.is_empty() {
@@ -546,8 +557,10 @@ fn kv_cache_budget_from(env_value: Option<&str>, ram: Option<(u64, u64)>) -> u64
         }
     }
     match ram {
-        Some((_total, available)) => {
-            available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100
+        Some((total, available)) => {
+            let by_available = available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100;
+            let floor = total.saturating_mul(KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT) / 100;
+            by_available.max(floor)
         }
         None => u64::MAX,
     }
@@ -627,17 +640,41 @@ mod tests {
             kv_cache_budget_from(Some(" 4096 "), Some((32 << 30, 16 << 30))),
             4096
         );
-        // Unparseable / empty env falls through to the RAM fraction.
+        // Unparseable / empty env falls through to the RAM policy. Here available is
+        // healthy (20 of 32 GiB) so 80%-of-available (16 GiB) dominates the 25%-of-total
+        // floor (8 GiB).
         assert_eq!(
-            kv_cache_budget_from(Some("not-a-number"), Some((32 << 30, 10 << 30))),
-            (10u64 << 30) * KV_CACHE_BUDGET_AVAILABLE_PERCENT / 100
+            kv_cache_budget_from(Some("not-a-number"), Some((32 << 30, 20 << 30))),
+            (20u64 << 30) * KV_CACHE_BUDGET_AVAILABLE_PERCENT / 100
         );
         assert_eq!(
-            kv_cache_budget_from(None, Some((32 << 30, 10 << 30))),
-            (10u64 << 30) * KV_CACHE_BUDGET_AVAILABLE_PERCENT / 100
+            kv_cache_budget_from(None, Some((32 << 30, 20 << 30))),
+            (20u64 << 30) * KV_CACHE_BUDGET_AVAILABLE_PERCENT / 100
         );
         // No env and no RAM probe (e.g. off Windows) -> unbounded (env remains the gate).
         assert_eq!(kv_cache_budget_from(None, None), u64::MAX);
+    }
+
+    #[test]
+    fn budget_floor_prevents_self_starvation_on_transient_low_available() {
+        // A large model's weights faulting into the working set can crater `available`
+        // right when a session's KV cache is sized. Without the floor the budget would be
+        // 0.8 * 50 MiB = 40 MiB and refuse even a short generation on a machine with
+        // gigabytes actually free; the 25%-of-total floor keeps it usable.
+        let total = 16u64 << 30;
+        let available = 50u64 << 20; // 50 MiB — the pathological transient reading
+        let budget = kv_cache_budget_from(None, Some((total, available)));
+        let floor = total * KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT / 100; // 4 GiB
+        assert_eq!(budget, floor, "floor must govern when available collapses");
+        assert!(
+            budget > available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100,
+            "floor must exceed the collapsed available-based value"
+        );
+        // An explicit override still wins over the floor (deterministic controlled runs).
+        assert_eq!(
+            kv_cache_budget_from(Some("1048576"), Some((total, available))),
+            1_048_576
+        );
     }
 
     /// On macOS the host RAM probe now returns `Some`, so the no-env path resolves to
@@ -662,10 +699,9 @@ mod tests {
         );
         if let Some((total, available)) = ram {
             assert!(available <= total, "available must not exceed total");
-            assert_eq!(
-                budget,
-                available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100
-            );
+            let by_available = available.saturating_mul(KV_CACHE_BUDGET_AVAILABLE_PERCENT) / 100;
+            let floor = total.saturating_mul(KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT) / 100;
+            assert_eq!(budget, by_available.max(floor));
         }
         // An explicit override still wins verbatim over the live RAM reading.
         assert_eq!(kv_cache_budget_from(Some("4096"), ram), 4096);
