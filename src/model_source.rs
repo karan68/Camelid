@@ -21,10 +21,12 @@ pub enum ModelSourceKind {
     HuggingFaceSafeTensors,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelSourceManifest {
     pub id: String,
     pub kind: ModelSourceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_config: Option<HfLlamaConfigSummary>,
     #[serde(skip_serializing)]
     pub root: PathBuf,
     #[serde(skip_serializing)]
@@ -42,6 +44,22 @@ pub struct ModelSourceManifest {
     pub generation_config_path: Option<PathBuf>,
     #[serde(skip_serializing)]
     pub shard_index_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct HfLlamaConfigSummary {
+    pub model_type: String,
+    pub architectures: Vec<String>,
+    pub hidden_size: u32,
+    pub num_hidden_layers: u32,
+    pub intermediate_size: u32,
+    pub num_attention_heads: u32,
+    pub num_key_value_heads: u32,
+    pub max_position_embeddings: u32,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub vocab_size: u32,
+    pub tie_word_embeddings: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -70,7 +88,7 @@ pub struct ModelSourceBlocker {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelSourceInspection {
     pub manifest: ModelSourceManifest,
     pub readiness: ModelSourceReadiness,
@@ -80,6 +98,16 @@ pub struct ModelSourceInspection {
 struct HfConfigProbe {
     model_type: Option<String>,
     architectures: Option<Vec<String>>,
+    hidden_size: Option<u32>,
+    num_hidden_layers: Option<u32>,
+    intermediate_size: Option<u32>,
+    num_attention_heads: Option<u32>,
+    num_key_value_heads: Option<u32>,
+    max_position_embeddings: Option<u32>,
+    rms_norm_eps: Option<f32>,
+    rope_theta: Option<f32>,
+    vocab_size: Option<u32>,
+    tie_word_embeddings: Option<bool>,
     rope_scaling: Option<Value>,
     sliding_window: Option<Value>,
 }
@@ -122,6 +150,7 @@ fn inspect_gguf_file(path: &Path) -> ModelSourceInspection {
         manifest: ModelSourceManifest {
             id: source_id(path),
             kind: ModelSourceKind::Gguf,
+            hf_config: None,
             root: path.to_path_buf(),
             weight_files: vec![path.to_path_buf()],
             tensor_descriptors: Vec::new(),
@@ -155,15 +184,15 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
     let weight_files = safetensors_files(path)?;
 
     let mut blockers = Vec::new();
-    let metadata_ready = config_path
+    let (metadata_ready, hf_config) = config_path
         .as_ref()
-        .map(|config_path| hf_config_ready(config_path, &mut blockers))
+        .map(|config_path| hf_config_summary(config_path, &mut blockers))
         .unwrap_or_else(|| {
             blockers.push(blocker(
                 "missing_config_json",
                 "Hugging Face SafeTensors directories must include config.json",
             ));
-            false
+            (false, None)
         });
 
     let tokenizer_ready = tokenizer_path.is_some();
@@ -185,6 +214,7 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
         manifest: ModelSourceManifest {
             id: source_id(path),
             kind: ModelSourceKind::HuggingFaceSafeTensors,
+            hf_config,
             root: path.to_path_buf(),
             weight_files,
             tensor_descriptors,
@@ -205,7 +235,10 @@ fn inspect_hugging_face_safetensors_dir(path: &Path) -> Result<ModelSourceInspec
     })
 }
 
-fn hf_config_ready(config_path: &Path, blockers: &mut Vec<ModelSourceBlocker>) -> bool {
+fn hf_config_summary(
+    config_path: &Path,
+    blockers: &mut Vec<ModelSourceBlocker>,
+) -> (bool, Option<HfLlamaConfigSummary>) {
     let Ok(bytes) = fs::read(config_path) else {
         blockers.push(blocker(
             "config_json_unreadable",
@@ -214,7 +247,7 @@ fn hf_config_ready(config_path: &Path, blockers: &mut Vec<ModelSourceBlocker>) -
                 public_path_label(config_path)
             ),
         ));
-        return false;
+        return (false, None);
     };
     let Ok(config) = serde_json::from_slice::<HfConfigProbe>(&bytes) else {
         blockers.push(blocker(
@@ -224,7 +257,7 @@ fn hf_config_ready(config_path: &Path, blockers: &mut Vec<ModelSourceBlocker>) -
                 public_path_label(config_path)
             ),
         ));
-        return false;
+        return (false, None);
     };
 
     if config.model_type.as_deref() != Some("llama") {
@@ -235,23 +268,28 @@ fn hf_config_ready(config_path: &Path, blockers: &mut Vec<ModelSourceBlocker>) -
                 config.model_type
             ),
         ));
-        return false;
+        return (false, None);
     }
 
-    if let Some(architectures) = config.architectures.as_ref() {
-        if !architectures
-            .iter()
-            .any(|architecture| architecture == "LlamaForCausalLM")
-        {
-            blockers.push(blocker(
-                "unsupported_architecture",
-                format!(
-                    "only LlamaForCausalLM SafeTensors configs are in scope for the first readiness slice; got {:?}",
-                    architectures
-                ),
-            ));
-            return false;
-        }
+    let Some(architectures) = config.architectures.clone() else {
+        blockers.push(blocker(
+            "missing_config_field",
+            "Hugging Face config.json is missing required field architectures",
+        ));
+        return (false, None);
+    };
+    if !architectures
+        .iter()
+        .any(|architecture| architecture == "LlamaForCausalLM")
+    {
+        blockers.push(blocker(
+            "unsupported_architecture",
+            format!(
+                "only LlamaForCausalLM SafeTensors configs are in scope for this readiness slice; got {:?}",
+                architectures
+            ),
+        ));
+        return (false, None);
     }
 
     if config.sliding_window.is_some() {
@@ -259,17 +297,170 @@ fn hf_config_ready(config_path: &Path, blockers: &mut Vec<ModelSourceBlocker>) -
             "unsupported_sliding_window_attention",
             "sliding-window attention needs an explicit Camelid runtime mapping before SafeTensors metadata can be ready",
         ));
-        return false;
+        return (false, None);
     }
 
     if config.rope_scaling.is_some() {
         blockers.push(blocker(
-            "rope_scaling_metadata_only",
-            "rope_scaling is parsed as metadata only; context support still requires Camelid RoPE mapping plus prompt-pack evidence",
+            "unsupported_rope_scaling",
+            "rope_scaling needs an explicit Camelid HF config mapping before SafeTensors metadata can be ready",
         ));
+        return (false, None);
     }
 
-    true
+    let Some(hidden_size) = required_hf_u32(&config, "hidden_size", config.hidden_size, blockers)
+    else {
+        return (false, None);
+    };
+    let Some(num_hidden_layers) = required_hf_u32(
+        &config,
+        "num_hidden_layers",
+        config.num_hidden_layers,
+        blockers,
+    ) else {
+        return (false, None);
+    };
+    let Some(intermediate_size) = required_hf_u32(
+        &config,
+        "intermediate_size",
+        config.intermediate_size,
+        blockers,
+    ) else {
+        return (false, None);
+    };
+    let Some(num_attention_heads) = required_hf_u32(
+        &config,
+        "num_attention_heads",
+        config.num_attention_heads,
+        blockers,
+    ) else {
+        return (false, None);
+    };
+    let Some(num_key_value_heads) = required_hf_u32(
+        &config,
+        "num_key_value_heads",
+        config.num_key_value_heads,
+        blockers,
+    ) else {
+        return (false, None);
+    };
+    let Some(max_position_embeddings) = required_hf_u32(
+        &config,
+        "max_position_embeddings",
+        config.max_position_embeddings,
+        blockers,
+    ) else {
+        return (false, None);
+    };
+    let Some(vocab_size) = required_hf_u32(&config, "vocab_size", config.vocab_size, blockers)
+    else {
+        return (false, None);
+    };
+    let Some(rms_norm_eps) =
+        required_hf_f32(&config, "rms_norm_eps", config.rms_norm_eps, blockers)
+    else {
+        return (false, None);
+    };
+    let Some(rope_theta) = required_hf_f32(&config, "rope_theta", config.rope_theta, blockers)
+    else {
+        return (false, None);
+    };
+    let Some(tie_word_embeddings) = config.tie_word_embeddings else {
+        blockers.push(blocker(
+            "missing_config_field",
+            "Hugging Face config.json is missing required field tie_word_embeddings",
+        ));
+        return (false, None);
+    };
+
+    if hidden_size % num_attention_heads != 0 {
+        blockers.push(blocker(
+            "invalid_attention_geometry",
+            format!(
+                "hidden_size {hidden_size} must be divisible by num_attention_heads {num_attention_heads} before SafeTensors metadata can be ready"
+            ),
+        ));
+        return (false, None);
+    }
+    if num_key_value_heads > num_attention_heads {
+        blockers.push(blocker(
+            "invalid_attention_geometry",
+            format!(
+                "num_key_value_heads {num_key_value_heads} must be <= num_attention_heads {num_attention_heads} before SafeTensors metadata can be ready"
+            ),
+        ));
+        return (false, None);
+    }
+
+    (
+        true,
+        Some(HfLlamaConfigSummary {
+            model_type: "llama".to_string(),
+            architectures,
+            hidden_size,
+            num_hidden_layers,
+            intermediate_size,
+            num_attention_heads,
+            num_key_value_heads,
+            max_position_embeddings,
+            rms_norm_eps,
+            rope_theta,
+            vocab_size,
+            tie_word_embeddings,
+        }),
+    )
+}
+
+fn required_hf_u32(
+    _config: &HfConfigProbe,
+    field: &'static str,
+    value: Option<u32>,
+    blockers: &mut Vec<ModelSourceBlocker>,
+) -> Option<u32> {
+    match value {
+        Some(value) if value > 0 => Some(value),
+        Some(_) => {
+            blockers.push(blocker(
+                "invalid_config_field",
+                format!("Hugging Face config.json field {field} must be greater than zero"),
+            ));
+            None
+        }
+        None => {
+            blockers.push(blocker(
+                "missing_config_field",
+                format!("Hugging Face config.json is missing required field {field}"),
+            ));
+            None
+        }
+    }
+}
+
+fn required_hf_f32(
+    _config: &HfConfigProbe,
+    field: &'static str,
+    value: Option<f32>,
+    blockers: &mut Vec<ModelSourceBlocker>,
+) -> Option<f32> {
+    match value {
+        Some(value) if value.is_finite() && value > 0.0 => Some(value),
+        Some(_) => {
+            blockers.push(blocker(
+                "invalid_config_field",
+                format!(
+                    "Hugging Face config.json field {field} must be finite and greater than zero"
+                ),
+            ));
+            None
+        }
+        None => {
+            blockers.push(blocker(
+                "missing_config_field",
+                format!("Hugging Face config.json is missing required field {field}"),
+            ));
+            None
+        }
+    }
 }
 
 fn hf_weights_ready(
@@ -698,6 +889,15 @@ mod tests {
         );
         assert_eq!(inspection.manifest.weight_files.len(), 2);
         assert!(inspection.manifest.config_path.is_some());
+        let hf_config = inspection.manifest.hf_config.as_ref().unwrap();
+        assert_eq!(hf_config.hidden_size, 16);
+        assert_eq!(hf_config.num_hidden_layers, 2);
+        assert_eq!(hf_config.intermediate_size, 64);
+        assert_eq!(hf_config.num_attention_heads, 4);
+        assert_eq!(hf_config.num_key_value_heads, 2);
+        assert_eq!(hf_config.max_position_embeddings, 128);
+        assert_eq!(hf_config.vocab_size, 32000);
+        assert!(!hf_config.tie_word_embeddings);
         assert!(inspection.manifest.tokenizer_path.is_some());
         assert!(inspection.manifest.shard_index_path.is_some());
         assert_eq!(inspection.manifest.tensor_descriptors.len(), 2);
@@ -908,6 +1108,86 @@ mod tests {
         assert_blocker_codes(
             &inspection,
             &["unsupported_model_type", "generation_disabled"],
+        );
+    }
+
+    #[test]
+    fn missing_required_hf_config_field_blocks_metadata_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"llama","architectures":["LlamaForCausalLM"],"hidden_size":16}"#,
+        )
+        .unwrap();
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.metadata_ready);
+        assert!(inspection.manifest.hf_config.is_none());
+        assert_blocker_codes(
+            &inspection,
+            &["missing_config_field", "generation_disabled"],
+        );
+        assert!(inspection.readiness.blockers[0]
+            .message
+            .contains("num_hidden_layers"));
+    }
+
+    #[test]
+    fn invalid_hf_attention_geometry_blocks_metadata_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config_with_overrides(
+            dir.path(),
+            &[
+                ("hidden_size", serde_json::json!(18)),
+                ("num_attention_heads", serde_json::json!(4)),
+            ],
+        );
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.metadata_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["invalid_attention_geometry", "generation_disabled"],
+        );
+    }
+
+    #[test]
+    fn rope_scaling_config_blocks_metadata_readiness_until_mapped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_llama_config_with_overrides(
+            dir.path(),
+            &[(
+                "rope_scaling",
+                serde_json::json!({"type":"linear","factor":2.0}),
+            )],
+        );
+        fs::write(dir.path().join("tokenizer.json"), "{}").unwrap();
+        write_safetensors_file(
+            dir.path(),
+            "model.safetensors",
+            &[("model.embed_tokens.weight", "F32", &[1, 1])],
+        );
+
+        let inspection = inspect_model_source(dir.path()).unwrap();
+
+        assert!(!inspection.readiness.metadata_ready);
+        assert_blocker_codes(
+            &inspection,
+            &["unsupported_rope_scaling", "generation_disabled"],
         );
     }
 
@@ -1144,9 +1424,36 @@ mod tests {
     }
 
     fn write_llama_config(root: &Path) {
+        write_llama_config_with_overrides(root, &[]);
+    }
+
+    fn write_llama_config_with_overrides(root: &Path, overrides: &[(&str, Value)]) {
+        let mut config = serde_json::Map::from_iter([
+            ("model_type".to_string(), serde_json::json!("llama")),
+            (
+                "architectures".to_string(),
+                serde_json::json!(["LlamaForCausalLM"]),
+            ),
+            ("hidden_size".to_string(), serde_json::json!(16)),
+            ("num_hidden_layers".to_string(), serde_json::json!(2)),
+            ("intermediate_size".to_string(), serde_json::json!(64)),
+            ("num_attention_heads".to_string(), serde_json::json!(4)),
+            ("num_key_value_heads".to_string(), serde_json::json!(2)),
+            (
+                "max_position_embeddings".to_string(),
+                serde_json::json!(128),
+            ),
+            ("rms_norm_eps".to_string(), serde_json::json!(0.00001)),
+            ("rope_theta".to_string(), serde_json::json!(10000.0)),
+            ("vocab_size".to_string(), serde_json::json!(32000)),
+            ("tie_word_embeddings".to_string(), serde_json::json!(false)),
+        ]);
+        for (key, value) in overrides {
+            config.insert((*key).to_string(), value.clone());
+        }
         fs::write(
             root.join("config.json"),
-            r#"{"model_type":"llama","architectures":["LlamaForCausalLM"]}"#,
+            serde_json::to_vec(&Value::Object(config)).unwrap(),
         )
         .unwrap();
     }
