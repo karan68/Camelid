@@ -7432,9 +7432,17 @@ pub async fn replay_receipt_request(
         default_max_tokens_cap: None,
         json_object_mode: false,
     };
-    let prepared = match prepare_generation(&state, session_request).await {
-        Ok(prepared) => prepared,
-        Err(response) => return Err(response_error_text(response).await),
+    let prepared = {
+        // Serialize the GPU-runnable-tier parity probe (fired inside prepare_generation) with
+        // every other decode: the probe drives the process-global single-slot resident CUDA
+        // engine, so without the lock it could evict a concurrently-running decode's engine
+        // mid-sequence. Scoped to just the probe; this is the standalone receipt-replay path,
+        // whose subsequent decode keeps its prior (unlocked) behavior.
+        let _gen_guard = state.generation_lock.clone().lock_owned().await;
+        match prepare_generation(&state, session_request).await {
+            Ok(prepared) => prepared,
+            Err(response) => return Err(response_error_text(response).await),
+        }
     };
     let generated = match generate_decoded_tokens_blocking(prepared).await {
         Ok(generated) => generated,
@@ -7465,7 +7473,13 @@ async fn validate_generation_request(
     state: &AppState,
     req: GenerationSessionRequest,
 ) -> std::result::Result<GenerationSessionSummary, Response> {
-    let prepared = prepare_generation(state, req).await?;
+    // Serialize the GPU-runnable-tier parity probe (fired inside prepare_generation) with every
+    // other decode — it drives the process-global single-slot resident CUDA engine. See the note
+    // in replay_receipt_request. This path validates/creates a session and does not itself decode.
+    let prepared = {
+        let _gen_guard = state.generation_lock.clone().lock_owned().await;
+        prepare_generation(state, req).await?
+    };
 
     Ok(GenerationSessionSummary {
         id: format!(
@@ -8058,13 +8072,56 @@ async fn prepare_generation(
     // Pin the GPU resident-decode engine cache to the model identity (not the
     // per-load weights Arc pointer), so every request for this model reuses the
     // uploaded weights instead of rebuilding the engine each time.
-    {
+    let resident_cache_key = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         model.id.hash(&mut hasher);
-        session.set_resident_cache_key(hasher.finish());
-    }
+        let key = hasher.finish();
+        session.set_resident_cache_key(key);
+        key
+    };
     timings.session_create = session_create_started.elapsed().as_millis();
+
+    // GPU-runnable tier: an uncurated model whose plan routed it onto the resident path
+    // (its `selected_backend` carries the `_runnable_unvalidated` label) is admitted to the
+    // GPU only after a one-time parity self-check — greedy decode on the resident GPU path
+    // must be token-identical to the CPU reference. The verdict is cached per model and the
+    // resident-eligibility choke point consults it, so a FAIL runs the model on CPU. Runs on
+    // a blocking thread (it builds engines + decodes) and is awaited so the verdict is set
+    // BEFORE this request generates. Curated rows never take this branch.
+    if crate::inference::resident_decode_cuda_active() {
+        let is_runnable_tier = {
+            let plans = state.execution_plans.read().await;
+            plans
+                .get(&model.id)
+                .map(|plan| plan.selected_backend.contains("_runnable_unvalidated"))
+                .unwrap_or(false)
+        };
+        if is_runnable_tier {
+            let probe_weights = std::sync::Arc::clone(&session.weights);
+            let probe_config = config.clone();
+            let probe_label = model.id.clone();
+            // Fail CLOSED: if the probe closure panics (an uncurated, arbitrary model can hit
+            // an unwrap/index deep in the resident engine build or a CUDA kernel), the panic
+            // is caught by `spawn_blocking` and surfaced as `Err(JoinError)`. `unwrap_or(false)`
+            // turns that into a FAILED verdict, and we record it so the choke point forbids the
+            // resident path — otherwise a missing verdict would leave the model admitted to the
+            // GPU unvalidated. A normal FAIL is already recorded inside the probe itself.
+            let probe_passed = tokio::task::spawn_blocking(move || {
+                crate::inference::ensure_resident_parity_verdict(
+                    &probe_config,
+                    &probe_weights,
+                    resident_cache_key,
+                    &probe_label,
+                )
+            })
+            .await
+            .unwrap_or(false);
+            if !probe_passed {
+                crate::inference::record_resident_parity_fail(resident_cache_key);
+            }
+        }
+    }
 
     let collect_dense_diagnostics = req.camelid_dense_diagnostics.unwrap_or(false)
         || req.camelid_dense_diagnostic_generated_index.is_some();

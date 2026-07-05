@@ -312,6 +312,21 @@ pub fn plan_for_model_with_platform(
                 );
             safe_q8_plan()
         }
+    } else if quant_type == "Q8_0"
+        && platform.cuda_resident_active
+        && is_gpu_runnable_arch(gguf)
+        && !env_flag_disabled("CAMELID_GPU_RUNNABLE_TIER")
+    {
+        // On by DEFAULT: an uncurated but architecturally-compatible Q8_0 model should just run
+        // on the GPU without the user having to opt in. This is safe because admission is gated
+        // at runtime by the GPU-vs-CPU parity self-check — a model that is not bit-exact falls
+        // back to the CPU reference path. Opt out with CAMELID_GPU_RUNNABLE_TIER=0 (forces CPU).
+        reasons.push(
+            "non-curated Q8_0 on a resident-capable dense arch: GPU-runnable tier (NOT a \
+             supported row) — resident path admitted subject to the runtime parity self-check"
+                .into(),
+        );
+        cuda_resident_q8_runnable_plan()
     } else if quant_type == "Q4_K_M" {
         select_kquant_plan(&platform, &mut reasons)
     } else {
@@ -766,6 +781,49 @@ fn cuda_resident_q8_plan() -> (
         "q8_0_cuda_resident_decode",
         "retained_q8_reference_path",
     )
+}
+
+/// Plan labels for the GPU-runnable tier: a Q8_0 model on a resident-capable dense
+/// architecture that is NOT a curated supported exact-row. Byte-for-byte the same GPU
+/// route as [`cuda_resident_q8_plan`], but every label carries a `_runnable_unvalidated`
+/// suffix so telemetry, receipts, and the UI can never mistake it for a supported row.
+/// The support_level stays `unknown_or_unvalidated`; admission to this tier is gated at
+/// runtime by a GPU-vs-CPU parity self-check (see `inference.rs`), which falls the model
+/// back to the CPU reference path if the resident output is not token-identical.
+fn cuda_resident_q8_runnable_plan() -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    (
+        "cuda_resident_q8_runtime_runnable_unvalidated",
+        "cuda_resident_q8_0_wire",
+        "q8_0_cuda_resident_prefill_runnable_unvalidated",
+        "resident_single_shot_prefill",
+        "q8_0_cuda_resident_decode_runnable_unvalidated",
+        "retained_q8_reference_path",
+    )
+}
+
+/// Architectures the CUDA resident engine implements token-identically to the CPU
+/// reference, and for which the GPU-runnable tier is eligible when a model is Q8_0 but
+/// not a curated support row. Deliberately narrow — dense llama/qwen/mistral only; MoE
+/// (expert routing) and not-yet-resident archs (gemma/phi/ssm/qwen35) are excluded so we
+/// never route a model the resident dense kernel cannot run under a GPU label. The
+/// runtime `resident_decode_eligible` check + the parity self-check are the backstops.
+fn is_gpu_runnable_arch(gguf: &GgufFile) -> bool {
+    let arch = gguf.architecture().unwrap_or("");
+    if !matches!(arch, "llama" | "qwen2" | "qwen3" | "mistral") {
+        return false;
+    }
+    // Exclude MoE: the resident dense kernel does not implement expert routing. A missing
+    // key means dense (the common case); a present non-zero expert_count means MoE.
+    gguf.metadata_u32(&format!("{arch}.expert_count"))
+        .map(|experts| experts == 0)
+        .unwrap_or(true)
 }
 
 /// Plan labels for a mixed K-quant (Q4_K_M = Q4_K + Q6_K) model. K-quant 2-D linears
@@ -1294,6 +1352,77 @@ mod tests {
             outcome.plan.selected_backend, "cpu_reference",
             "a recognizable 8B with a junk general.name must not fail closed to CPU"
         );
+    }
+
+    #[test]
+    fn gpu_runnable_tier_admits_uncurated_q8_llama_by_default_optout_forces_cpu() {
+        let _guard = env_lock();
+        clear_profile_env();
+        // Uncurated: neither general.name ("hub") nor the filename maps to a support row.
+        let uncurated = fixture("hub");
+        let path = PathBuf::from("/models/my-custom-llama-Q8_0.gguf");
+        // DEFAULT (unset): admitted to the GPU-runnable tier with an honest, distinct label; the
+        // support_level stays unknown_or_unvalidated (never claims a supported row). Admission is
+        // gated at runtime by the parity self-check, so default-on is safe.
+        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
+        let on = plan_for_model_with_platform(
+            &path,
+            &uncurated,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        assert_eq!(
+            on.plan.selected_backend,
+            "cuda_resident_q8_runtime_runnable_unvalidated"
+        );
+        assert_eq!(
+            on.plan.support_level, "unknown_or_unvalidated",
+            "the runnable tier must never claim a supported row"
+        );
+        // Explicit opt-out (=0): forced back to the safe CPU reference path.
+        env::set_var("CAMELID_GPU_RUNNABLE_TIER", "0");
+        let off = plan_for_model_with_platform(
+            &path,
+            &uncurated,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
+        clear_profile_env();
+        assert_eq!(off.plan.selected_backend, "cpu_reference");
+    }
+
+    #[test]
+    fn gpu_runnable_tier_never_changes_a_curated_row() {
+        let _guard = env_lock();
+        clear_profile_env();
+        let curated = fixture("Llama 3.2 1B Instruct");
+        let path = PathBuf::from("/models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+        // Tier ON (default, unset).
+        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
+        let on = plan_for_model_with_platform(
+            &path,
+            &curated,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        // Tier opted out (=0).
+        env::set_var("CAMELID_GPU_RUNNABLE_TIER", "0");
+        let off = plan_for_model_with_platform(
+            &path,
+            &curated,
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        env::remove_var("CAMELID_GPU_RUNNABLE_TIER");
+        clear_profile_env();
+        // A curated row takes the supported plan and is byte-for-byte identical whether the tier
+        // is on (default) or opted out — the tier is a pure additive else-branch after the
+        // curated arm, so it can never alter a supported row.
+        assert_eq!(on.plan.selected_backend, "cuda_resident_q8_runtime");
+        assert_eq!(on.plan.selected_backend, off.plan.selected_backend);
+        assert_eq!(on.plan.support_level, off.plan.support_level);
+        assert_eq!(on.plan.decode_path, off.plan.decode_path);
     }
 
     #[test]

@@ -2111,6 +2111,16 @@ impl LlamaInferenceSession {
         if self.resident_paths_disabled {
             bail!("resident paths disabled for this session (CPU-authoritative KV required)");
         }
+        // GPU-runnable tier: an uncurated model is admitted to the resident path only after
+        // it passes the one-time parity self-check. A recorded FAIL forbids the resident
+        // path here — the single choke point — so no `set_resident_paths_disabled` site can
+        // accidentally re-admit it. Curated rows never record a verdict, so this is a no-op
+        // for them.
+        if let Some(key) = self.resident_cache_key {
+            if resident_parity_forbids(key) {
+                bail!("GPU-runnable-tier parity self-check failed for this model; CPU reference");
+            }
+        }
         if !resident_decode_metal_enabled() && !resident_decode_cuda_enabled() {
             bail!("neither CAMELID_METAL_RESIDENT_DECODE nor CAMELID_CUDA_RESIDENT_DECODE enabled");
         }
@@ -10649,6 +10659,189 @@ fn resident_cuda_drafter_cache() -> &'static std::sync::Mutex<Option<ResidentCud
     static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<ResidentCudaSlot>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Per-model verdict of the GPU-runnable-tier parity self-check, keyed by the model-id
+/// hash (the same key the resident engine uses). `true` = the resident GPU path was
+/// token-identical to the CPU reference on the probe, so the model may use the GPU;
+/// `false` = it diverged, so the resident/GPU paths must be disabled for it. Populated
+/// once per model per process by [`ensure_resident_parity_verdict`].
+fn resident_parity_verdicts() -> &'static std::sync::Mutex<std::collections::HashMap<u64, bool>> {
+    static VERDICTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, bool>>> =
+        std::sync::OnceLock::new();
+    VERDICTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when the GPU-runnable-tier parity self-check recorded a FAILED verdict for this
+/// model id, so its resident/GPU paths must be disabled and it must run on the CPU
+/// reference. A missing verdict (curated rows never probe, or not yet probed) returns
+/// false — the caller's normal path decision stands.
+pub fn resident_parity_forbids(model_cache_key: u64) -> bool {
+    resident_parity_verdicts()
+        .lock()
+        .map(|verdicts| verdicts.get(&model_cache_key) == Some(&false))
+        .unwrap_or(false)
+}
+
+/// Record a FAILED parity verdict for a model id, forcing its resident/GPU paths off. This is
+/// the fail-closed backstop for when the parity probe cannot record its own verdict — e.g. the
+/// probe closure panicked (an uncurated model can hit an unwrap/index deep in the resident
+/// engine build) and was surfaced as a `spawn_blocking` `JoinError`, so the normal in-probe
+/// `insert` never ran. Without this, a missing verdict reads as "not forbidden" and the model
+/// would reach the GPU unvalidated. Idempotent; keyed per model so curated rows are unaffected.
+pub fn record_resident_parity_fail(model_cache_key: u64) {
+    if let Ok(mut verdicts) = resident_parity_verdicts().lock() {
+        verdicts.insert(model_cache_key, false);
+    }
+}
+
+/// Greedy-decode `n` tokens from `prompt` on a throwaway session built from `weights`,
+/// with the resident/GPU path enabled or disabled. Isolated by construction: a fresh
+/// session + KV cache, and a caller-supplied `probe_cache_key` distinct from the model's
+/// real engine key so the GPU leg never leaves KV state on the model's real slot. Drives
+/// the SAME `generate_next_token_with_history` primitive the real decode loop uses (which
+/// internally dispatches resident-GPU vs CPU on `resident_paths_disabled`), so the two
+/// legs differ only in that dispatch.
+fn run_greedy_probe(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    probe_cache_key: u64,
+    prompt: &[u32],
+    n: usize,
+    resident_enabled: bool,
+) -> Result<Vec<u32>> {
+    let mut session = LlamaInferenceSession::new(config.clone(), Arc::clone(weights))?;
+    session.set_resident_cache_key(probe_cache_key);
+    session.set_resident_paths_disabled(!resident_enabled);
+    let mut history: Vec<u32> = prompt.to_vec();
+    let mut input: Vec<u32> = prompt.to_vec();
+    let mut tokens = Vec::with_capacity(n);
+    for _ in 0..n {
+        let step =
+            session.generate_next_token_with_history(&input, LlamaSampler::Greedy, &history)?;
+        tokens.push(step.next_token_id);
+        history.push(step.next_token_id);
+        input.clear();
+        input.push(step.next_token_id);
+    }
+    Ok(tokens)
+}
+
+/// Whether the resident CUDA engine actually engaged during the probe's GPU leg — i.e. the
+/// process-global single-slot cache now holds an engine under the probe's key. If the GPU leg
+/// silently fell back to the CPU path (e.g. the model does not fit in VRAM, or an eligibility
+/// gate declined), the slot is NOT keyed to the probe and a token match would be a meaningless
+/// CPU-vs-CPU "pass". The caller treats "did not engage" as a FAIL so it never certifies the
+/// GPU-runnable tier for a model the resident engine never actually ran. Read while holding the
+/// generation lock (the caller does) so no concurrent decode has evicted the slot.
+#[cfg(feature = "cuda")]
+fn resident_probe_engaged(probe_key: u64) -> bool {
+    resident_cuda_cache()
+        .lock()
+        .map(|guard| guard.as_ref().map(|slot| slot.key) == Some(probe_key as usize))
+        .unwrap_or(false)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn resident_probe_engaged(_probe_key: u64) -> bool {
+    // No resident CUDA engine exists without the cuda feature, and the probe is never triggered
+    // in that build (the runnable-tier plan requires an active resident CUDA engine). Dead but
+    // must compile; `true` keeps a would-be CPU-only probe from being spuriously failed.
+    true
+}
+
+/// The GPU-runnable-tier parity self-check: decide ONCE per model (cached) whether an
+/// uncurated model may use the resident/GPU path. Greedy-decodes a fixed probe prompt on
+/// the CPU reference and on the resident GPU path and requires BIT-EXACT token identity
+/// (the resident Q8_0 kernels are `--fmad=false` CPU-mirrors, so any divergence is a real
+/// bug for that model's architecture). The GPU leg runs under a probe-specific engine key
+/// so the model's real slot is rebuilt clean by the first real request. Fails closed to
+/// CPU (returns false) on any error. Callers gate `resident_paths_disabled` on the result
+/// via [`resident_parity_forbids`]. Should be called only when the resident path is
+/// actually available (`resident_decode_cuda_active`), else the GPU leg is just the CPU
+/// path and the check is a trivial pass.
+pub fn ensure_resident_parity_verdict(
+    config: &LlamaModelConfig,
+    weights: &Arc<LlamaLoadedWeights>,
+    model_cache_key: u64,
+    model_label: &str,
+) -> bool {
+    if let Ok(verdicts) = resident_parity_verdicts().lock() {
+        if let Some(&verdict) = verdicts.get(&model_cache_key) {
+            return verdict;
+        }
+    }
+    // A short, tokenizer-independent probe spanning a spread of the vocabulary rather than a
+    // trivial [1,2,3,4] run (which can greedy-decode into a degenerate repeat that hides a real
+    // divergence), decoded far enough to catch KV-accumulation drift, not just the first logit.
+    // Content is irrelevant — only GPU-vs-CPU token agreement matters. Every id is < 32k, valid
+    // for every arch this tier admits (llama/qwen2/qwen3/mistral, vocab >= 32k); a hypothetical
+    // smaller vocab would make the embedding lookup error, which fails closed below.
+    const PROBE_PROMPT: [u32; 8] = [1, 2, 13, 128, 512, 2048, 8192, 29871];
+    const PROBE_TOKENS: usize = 16;
+    // Distinct key so the probe's GPU engine build never occupies the model's real slot.
+    let probe_key = model_cache_key ^ 0x9E37_79B9_7F4A_7C15;
+    let verdict = match (
+        run_greedy_probe(
+            config,
+            weights,
+            probe_key,
+            &PROBE_PROMPT,
+            PROBE_TOKENS,
+            false,
+        ),
+        run_greedy_probe(
+            config,
+            weights,
+            probe_key,
+            &PROBE_PROMPT,
+            PROBE_TOKENS,
+            true,
+        ),
+    ) {
+        (Ok(cpu), Ok(gpu)) => {
+            // The GPU leg must have actually run on the resident engine; otherwise the token
+            // match is a meaningless CPU-vs-CPU pass and certifying the tier would be dishonest.
+            let engaged = resident_probe_engaged(probe_key);
+            let artifact = crate::cuda_parity::ParityArtifact::evaluate(
+                model_label.to_string(),
+                "gpu_runnable_parity_probe",
+                crate::cuda_parity::ToleranceGate::bit_exact(),
+                cpu,
+                gpu,
+            );
+            let passed = artifact.passed();
+            if !engaged {
+                eprintln!(
+                    "[gpu-runnable] parity self-check for {model_label}: the resident GPU path \
+                     never engaged during the probe (silent CPU fallback — e.g. the model does \
+                     not fit in VRAM); NOT certifying the GPU-runnable tier, this model runs on \
+                     the CPU reference path."
+                );
+            } else if !passed {
+                eprintln!(
+                    "[gpu-runnable] parity self-check FAILED for {model_label}: resident GPU \
+                     output diverged from the CPU reference (first divergence at token {:?}); \
+                     this model will run on the CPU reference path.",
+                    artifact.comparison.first_divergence
+                );
+            }
+            engaged && passed
+        }
+        (cpu, gpu) => {
+            eprintln!(
+                "[gpu-runnable] parity self-check could not run for {model_label} (cpu_ok={}, \
+                 gpu_ok={}); failing closed to the CPU reference path.",
+                cpu.is_ok(),
+                gpu.is_ok()
+            );
+            false
+        }
+    };
+    if let Ok(mut verdicts) = resident_parity_verdicts().lock() {
+        verdicts.insert(model_cache_key, verdict);
+    }
+    verdict
 }
 
 /// Speculative coexistence reserve, in bytes. When > 0, a draft model is in play and the
