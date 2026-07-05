@@ -1,6 +1,6 @@
 [package]
 name = "camelid-desktop"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 rust-version = "1.89"
 description = "Camelid Desktop — additive native Windows chat app that embeds the camelid engine as a loopback sidecar"

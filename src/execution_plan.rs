@@ -855,14 +855,24 @@ fn requested_profile() -> (ExecutionProfile, String) {
 }
 
 fn exact_model_row(model_path: &Path, gguf: &GgufFile) -> String {
-    gguf.model_name()
-        .map(|value| value.to_string())
-        .or_else(|| {
-            model_path
-                .file_name()
-                .map(|v| v.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| "unknown".into())
+    let from_name = gguf.model_name().map(|value| value.to_string());
+    let from_file = model_path
+        .file_name()
+        .map(|v| v.to_string_lossy().to_string());
+    // Prefer the GGUF `general.name`, but if it does NOT map to a recognized support row
+    // while the FILENAME does, use the filename. Some GGUF conversions ship a junk
+    // `general.name` (e.g. "hub") that would otherwise shadow a perfectly recognizable
+    // filename and drop a known, validated model onto the slow cpu_reference path
+    // instead of its GPU lane. This only ever UPGRADES an unrecognized name to a
+    // recognized row — it never overrides a name that already matches a row.
+    if let (Some(name), Some(file)) = (&from_name, &from_file) {
+        if support_level(name) == "unknown_or_unvalidated"
+            && support_level(file) != "unknown_or_unvalidated"
+        {
+            return file.clone();
+        }
+    }
+    from_name.or(from_file).unwrap_or_else(|| "unknown".into())
 }
 
 fn support_level(row: &str) -> String {
@@ -1232,6 +1242,58 @@ mod tests {
         ] {
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn junk_general_name_falls_back_to_recognizable_filename() {
+        // A junk general.name ("hub", from some conversions) maps to no support row; it
+        // must defer to a recognizable filename so the model reaches its validated row
+        // instead of failing closed — and must never override a name that already matches.
+        let row = exact_model_row(
+            &PathBuf::from("/models/Meta-Llama-3-8B-Instruct.Q8_0.gguf"),
+            &fixture("hub"),
+        );
+        assert!(
+            is_supported_exact_q8_row(&row),
+            "junk general.name must fall back to the recognized filename; got {row:?}"
+        );
+        // Junk name AND unrecognizable filename stays unrecognized.
+        assert_eq!(
+            support_level(&exact_model_row(
+                &PathBuf::from("/models/mystery.gguf"),
+                &fixture("hub")
+            )),
+            "unknown_or_unvalidated"
+        );
+        // A recognized general.name is never overridden by an unrelated filename.
+        assert_eq!(
+            exact_model_row(
+                &PathBuf::from("/models/whatever.gguf"),
+                &fixture("Llama 3.2 1B Instruct")
+            ),
+            "Llama 3.2 1B Instruct"
+        );
+    }
+
+    #[test]
+    fn junk_named_recognizable_8b_takes_gpu_lane_not_cpu() {
+        let _guard = env_lock();
+        clear_profile_env();
+        let outcome = plan_for_model_with_platform(
+            &PathBuf::from("/models/Meta-Llama-3-8B-Instruct.Q8_0.gguf"),
+            &fixture("hub"),
+            Some(8),
+            cuda_platform("windows", "x86_64", &["avx2"]),
+        );
+        clear_profile_env();
+        assert_eq!(
+            outcome.plan.exact_model_row,
+            "Meta-Llama-3-8B-Instruct.Q8_0.gguf"
+        );
+        assert_ne!(
+            outcome.plan.selected_backend, "cpu_reference",
+            "a recognizable 8B with a junk general.name must not fail closed to CPU"
+        );
     }
 
     #[test]
