@@ -3676,7 +3676,7 @@ async fn streaming_completion_accepts_advanced_sampling_controls() {
 }
 
 #[tokio::test]
-async fn streaming_completion_rejects_context_overflow_before_loading_weights() {
+async fn streaming_completion_rejects_when_prompt_fills_context_before_loading_weights() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tiny-short-context.gguf");
     write_generation_gguf_with_options(
@@ -3722,7 +3722,75 @@ async fn streaming_completion_rejects_context_overflow_before_loading_weights() 
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "context_length_exceeded");
-    assert_eq!(body["error"]["param"], "max_tokens");
+    // The prompt ("hello" -> [BOS, hello]) is exactly the 2-token context, so it
+    // fills the window with no room to generate at all: rejected with param
+    // "prompt". (An over-large max_tokens on a NON-filling prompt is CLAMPED, not
+    // rejected -- see completion_clamps_over_limit_max_tokens_to_context below.)
+    assert_eq!(body["error"]["param"], "prompt");
+}
+
+#[tokio::test]
+async fn completion_clamps_over_limit_max_tokens_to_context() {
+    // A response limit larger than the room left in the context is an upper bound,
+    // not a demand: the request must succeed and generate up to the remaining room,
+    // never reject. Regression guard for the v0.2.2 auto-fit fix.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tiny-clamp.gguf");
+    write_generation_gguf_with_options(
+        &path,
+        GenerationFixtureOptions {
+            context_length: 8,
+            include_tokenizer: true,
+            truncate_payload: false,
+        },
+    );
+
+    let app = camelid::api::router();
+    let load_body = serde_json::json!({"path": path, "id": "tiny-clamp"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Prompt "hello" -> [BOS, hello] = 2 tokens in an 8-token context, leaving room
+    // for 6. max_tokens is absurdly large; it must be clamped to the room, not
+    // rejected as it was before the auto-fit fix.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"tiny-clamp","prompt":"hello","max_tokens":1000000}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an over-limit max_tokens must clamp and generate, not reject: {body}"
+    );
+    let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+    assert!(
+        (1..=6).contains(&completion_tokens),
+        "generation must be clamped to the room left in the context (<=6), got {completion_tokens}: {body}"
+    );
 }
 
 #[tokio::test]

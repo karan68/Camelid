@@ -51,16 +51,17 @@ export function sliderToTokens(position) {
   return value
 }
 
-/* Validation states, priority-ordered. Red = the request will fail (the
-   backend returns typed context_length_exceeded, it does not clamp); amber =
+/* Validation states, priority-ordered. A response limit above the model context
+   is a non-blocking caution now — the backend auto-limits (clamps) it to the room
+   left after the prompt, it does not reject. amber =
    allowed but beyond the verified row's tested context; slate stays for
    support states elsewhere. */
 export function validateResponseLength({ value, contextLength = null, verifiedBound = null, modelName = 'the loaded model' }) {
   if (contextLength !== null && value > contextLength) {
     return {
-      level: 'error',
+      level: 'caution',
       code: 'over_model_context',
-      message: `Exceeds ${modelName}’s ${contextLength.toLocaleString()}-token context — the backend rejects this with a typed context_length_exceeded error. Lower the limit below ${contextLength.toLocaleString()}, or load a longer-context model.`,
+      message: `Exceeds ${modelName}’s ${contextLength.toLocaleString()}-token context — the backend auto-limits each response to the room left after the prompt, so replies may be shorter than this. Load a longer-context model for full-length replies.`,
     }
   }
   if (verifiedBound !== null && value > verifiedBound) {
@@ -73,15 +74,26 @@ export function validateResponseLength({ value, contextLength = null, verifiedBo
   return { level: 'ok', code: 'ok', message: '' }
 }
 
-/* Send-time check mirrors the backend’s actual rule:
-   prompt_tokens + max_tokens must fit the context (typed error otherwise). */
+/* Send-time budget check. The response limit is an UPPER BOUND: the backend
+   clamps it to the room left in the context window, so exceeding it is a
+   non-blocking notice, not an error. The only hard failure is a prompt that
+   already fills the whole context (no room to generate), which the backend
+   rejects with context_length_exceeded. Prompt size is a client estimate. */
 export function validateSendBudget({ promptTokens, maxTokens, contextLength }) {
   if (contextLength === null || !Number.isFinite(promptTokens)) return { level: 'ok' }
-  if (promptTokens + maxTokens > contextLength) {
+  if (promptTokens >= contextLength) {
     return {
       level: 'error',
-      code: 'context_length_exceeded',
-      message: `Prompt (~${promptTokens.toLocaleString()} tokens, estimated) plus the ${maxTokens.toLocaleString()}-token response limit exceeds the ${contextLength.toLocaleString()}-token context. Lower the response limit in Settings or shorten the prompt.`,
+      code: 'prompt_fills_context',
+      message: `This prompt (~${promptTokens.toLocaleString()} tokens, estimated) fills the model’s ${contextLength.toLocaleString()}-token context, leaving no room for a reply. Shorten the prompt or load a longer-context model.`,
+    }
+  }
+  if (promptTokens + maxTokens > contextLength) {
+    const room = contextLength - promptTokens
+    return {
+      level: 'notice',
+      code: 'response_auto_limited',
+      message: `Response will be auto-limited to ~${room.toLocaleString()} tokens to fit the ${contextLength.toLocaleString()}-token context.`,
     }
   }
   return { level: 'ok' }
