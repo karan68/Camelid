@@ -34,6 +34,8 @@ fn main() {
         println!(
             "cargo:rustc-link-arg-bin=camelid=/EXPORT:AmdPowerXpressRequestHighPerformance,DATA"
         );
+        // Windows' default 1 MiB stack overflows while Clap builds this binary's CLI.
+        println!("cargo:rustc-link-arg-bin=camelid=/STACK:8388608");
     }
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     if target_os != "linux" || target_arch != "x86_64" {
