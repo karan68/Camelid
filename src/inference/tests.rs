@@ -10,6 +10,40 @@ fn assert_close(actual: f32, expected: f32) {
 }
 
 #[test]
+fn resident_parity_forbids_reflects_the_cached_verdict() {
+    // A key unlikely to collide with other parallel tests sharing the process-global map.
+    let key = 0x5A5A_A5A5_1234_5678_u64;
+    assert!(!resident_parity_forbids(key), "no verdict -> not forbidden");
+    resident_parity_verdicts().lock().unwrap().insert(key, true);
+    assert!(
+        !resident_parity_forbids(key),
+        "PASS verdict -> not forbidden"
+    );
+    resident_parity_verdicts()
+        .lock()
+        .unwrap()
+        .insert(key, false);
+    assert!(resident_parity_forbids(key), "FAIL verdict -> forbidden");
+    // The fail-closed backstop (used when the probe panics) records a FAIL for a fresh key.
+    let panic_key = 0x1357_9BDF_2468_ACE0_u64;
+    assert!(
+        !resident_parity_forbids(panic_key),
+        "unprobed -> not forbidden"
+    );
+    record_resident_parity_fail(panic_key);
+    assert!(
+        resident_parity_forbids(panic_key),
+        "recorded FAIL -> forbidden"
+    );
+    // Do not leak state to other tests.
+    resident_parity_verdicts().lock().unwrap().remove(&key);
+    resident_parity_verdicts()
+        .lock()
+        .unwrap()
+        .remove(&panic_key);
+}
+
+#[test]
 #[allow(clippy::needless_range_loop)]
 fn test_row_dispatch_adversarial_parity() {
     let _env_guard = env_lock();
