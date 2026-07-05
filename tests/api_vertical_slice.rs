@@ -3788,7 +3788,7 @@ async fn completion_clamps_over_limit_max_tokens_to_context() {
     );
     let completion_tokens = body["usage"]["completion_tokens"].as_u64().unwrap_or(0);
     assert!(
-        completion_tokens >= 1 && completion_tokens <= 6,
+        (1..=6).contains(&completion_tokens),
         "generation must be clamped to the room left in the context (<=6), got {completion_tokens}: {body}"
     );
 }
