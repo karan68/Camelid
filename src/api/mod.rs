@@ -3174,6 +3174,57 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 evidence: "exact row Qwen3-4B-Q8_0.gguf (explicit head_dim path): token-AND-text-identical to llama.cpp at 1/5/50 on confident probes (capital-of-France, say-hello, 2+2). The 'Name a primary color.' probe is a documented macOS first-token near-tie; on the Windows 9632 comparator it also matched (both 'Red'). macOS bundle qa/evidence-bundles/qwen3-4b-q8-chatml-parity-20260614T054617Z-head-368ed9b; Windows bundle qa/evidence-bundles/qwen3-4b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass, cpu_reference + x86_q8 AVX2).",
                 next_step: "add WebUI smoke and normalized context/perf evidence on Windows before any broader claim",
             },
+            // Qwen3-4B Q4_K_M (mixed Q4_K + Q6_K) — first Q4_K_M dense row promoted to
+            // runtime support-contract recognition. The GPU-resident CUDA decode lane
+            // (q4k_gemv + q6k_gemv, wire-only blocks) is token-AND-text-identical to
+            // llama.cpp; a default-on CPU K-quant block-dot lane also decodes this file.
+            // ID IS FILENAME-ANCHORED (`qwen3_4b_q4_k_m` = normalized Qwen3-4B-Q4_K_M.gguf):
+            // this GGUF's general.name carries a cosmetic "Awq" token ("Qwen3 4B Instruct
+            // Awq", file_type 15 name inference), so a name+quant id would never match under
+            // the frontend exact-row identity matcher; the clean filename identity does and
+            // cannot collide with the Q8_0 row (distinct quant token).
+            ModelCompatibilityTarget {
+                id: "qwen3_4b_q4_k_m",
+                tool_capable: false,
+                family: "qwen3",
+                quantization: "Q4_K_M",
+                status: "supported_exact_row_smoke",
+                support_scope: "exact_row_chatml_thinking_disabled_gpu_resident_smoke_only",
+                full_support_status: "blocked_pending_normalized_full_support",
+                full_support_blockers: "other Qwen3 sizes/variants/quants, other K-quant files (Q5_K_M / Q4_K_S / etc.), base variants, Qwen3-MoE (A3B), a committed CPU K-quant ChatML full-parity bundle (only the GPU lane is ChatML-proven; the CPU block-dot lane is raw-completion confident-probe parity), an agent-eval receipt for tool_capable, thinking-mode token-parity, model-native/larger context beyond the short-chat envelope, production throughput, and WebUI smoke remain missing",
+                metadata_parses: "validated",
+                tokenizer_works: "validated",
+                tensors_load: "validated_216_q4_k_plus_37_q6_k_wire_only_fully_gpu_resident_36_of_36_layers",
+                generation_runs: "cuda_resident_kquant_decode_plus_default_on_cpu_kquant_block_dot",
+                parity_audited: "chatml_thinking_disabled_token_and_text_parity_1_5_50_pass_gpu_resident_cuda_vs_llamacpp_acd79d6_plus_cpu_kquant_block_dot_raw_completion_confident_probe_parity_near_ties_documented",
+                performance_measured: "cuda_device_decode_loop_19_44_toks_median_measured_not_a_throughput_claim",
+                frontend_load_path_verified: "not_promoted",
+                frontend_readiness_gate: "green only when this exact Qwen3-4B-Q4_K_M.gguf row (sha256 7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5) plus Q4_K_M quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id on the CUDA-resident decode lane",
+                tested_context: "chatml_1_5_50_token_short_chat_smoke_gpu_resident",
+                chat_template_renderer: "qwen3_chatml_thinking_disabled",
+                chat_template_shape_pack: "not_started",
+                chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
+                bounded_context_512_pack: "not_promoted",
+                bounded_context_512_pack_id: "not_selected",
+                bounded_context_window: 512,
+                bounded_context_1024_pack: "not_promoted",
+                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_window: 1024,
+                bounded_context_2048_pack: "not_promoted",
+                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_window: 2048,
+                bounded_context_4096_pack: "not_promoted",
+                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_window: 4096,
+                bounded_context_8192_pack: "not_promoted",
+                bounded_context_8192_pack_id: "not_selected",
+                bounded_context_8192_window: 8192,
+                latest_checked_bucket: "windows_cuda_resident_kquant_chatml_parity",
+                latest_checked_result: "pass",
+                latest_checked_output: "qa/evidence-bundles/qwen3-4b-q4_k_m-windows-cuda-resident-parity-20260628T003317Z-head-0dccbf74/README.md",
+                evidence: "exact row Qwen3-4B-Q4_K_M.gguf (sha256 7485fe6f…, 2.32 GiB): mixed K-quant (216 Q4_K + 37 Q6_K + 145 F32 norms; attn_v / ffn_down / tied token_embd(lm_head) are Q6_K, q/k/o/gate/up are Q4_K, so one run drives BOTH q4k_gemv and q6k_gemv). GPU-resident CUDA decode (36/36 layers VRAM-resident, ~4.92 GB peak) is token-AND-text-identical to pinned llama.cpp acd79d6 at 1/5/50 tokens on all 3 ChatML thinking-disabled prompts (the 'primary color' near-tie PASSES here), with cross-engine prompt-token parity — bundle qa/evidence-bundles/qwen3-4b-q4_k_m-windows-cuda-resident-parity-20260628T003317Z-head-0dccbf74 (all_pass=true), harness scripts/chat-parity-qwen3-kquant.mjs. A default-on CPU K-quant block-dot lane (CAMELID_X86_Q4K_DECODE, Q4_K AVX2 + Q6_K 8-lane scalar, wire-only) also decodes this file: raw-completion confident probes (capital-of-France, fibonacci) token-identical to llama.cpp to depth 50, with a documented benign f32 near-tie on 2+2 — bundle qa/evidence-bundles/qwen3-4b-q4_k_m-windows-cpu-kquant-decode-parity-20260628T015051Z-head-a86fb46b. NOT claimed: other Qwen3 sizes/quants, other K-quant files, CPU ChatML full parity, model-native/larger context, thinking-mode, tool_capable (no agent-eval receipt), or any GPU-vs-GPU / Q8-vs-Q4 throughput claim.",
+                next_step: "add a CPU K-quant ChatML full-parity bundle, an agent-eval receipt for tool_capable, and bounded context-pack + WebUI smoke evidence before any broader claim",
+            },
             ModelCompatibilityTarget {
                 id: "qwen3_8b_instruct_q8_0",
                 tool_capable: false,
@@ -12770,6 +12821,11 @@ mod tests {
                 "qwen3_1_7b_instruct_q8_0",
                 "qwen3_4b_instruct_q8_0",
                 "qwen3_8b_instruct_q8_0",
+                // Qwen3-4B Q4_K_M (mixed Q4_K + Q6_K): GPU-resident CUDA decode
+                // token+text-identical to llama.cpp acd79d6 at 1/5/50 (ChatML, thinking
+                // disabled) + a default-on CPU K-quant block-dot confident-probe lane.
+                // Filename-anchored id (general.name carries a cosmetic "Awq" token).
+                "qwen3_4b_q4_k_m",
                 "tinyllama_1_1b_chat_q8_0",
                 // Ornith-1.0-9B (qwen35 hybrid gated-delta-net) runnable serve lane:
                 // exact-row serve smoke + greedy token-identical parity vs llama.cpp

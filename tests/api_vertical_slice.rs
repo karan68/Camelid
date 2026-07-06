@@ -882,6 +882,26 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .contains("No broad Mixtral"));
 
+    // Qwen3-4B Q4_K_M promoted to supported exact-row smoke (GPU-resident CUDA lane).
+    let qwen3_4b_q4km = compatibility
+        .iter()
+        .find(|item| item["id"] == "qwen3_4b_q4_k_m")
+        .unwrap();
+    assert_eq!(qwen3_4b_q4km["status"], "supported_exact_row_smoke");
+    assert_eq!(qwen3_4b_q4km["family"], "qwen3");
+    assert_eq!(qwen3_4b_q4km["quantization"], "Q4_K_M");
+    // No agent-eval receipt exists for this row, so it is NOT tool_capable.
+    assert_eq!(qwen3_4b_q4km["tool_capable"], false);
+    assert_eq!(qwen3_4b_q4km["latest_checked_result"], "pass");
+    assert!(qwen3_4b_q4km["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("all_pass=true"));
+    assert!(qwen3_4b_q4km["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("qwen3-4b-q4_k_m-windows-cuda-resident-parity"));
+
     for (id, filename) in [
         ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
         ("gemma2_9b_it_q8_0", "gemma-2-9b-it-Q8_0.gguf"),

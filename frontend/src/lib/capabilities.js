@@ -597,6 +597,15 @@ function getModelCapabilityFields(model, catalogItem) {
       if (name) fields.push(`${name} ${rawQuant}`)
     }
   }
+  // A model loaded via `--model <full path>` exposes only an absolute path, so no bare
+  // filename reaches the matcher — and worse for a GGUF whose general.name is polluted
+  // (e.g. the cosmetic "Awq" token some Q4_K_M files carry, making the name+quant combo
+  // junk too). Add the BASENAME of any path-like field so the clean filename identity
+  // (e.g. "Qwen3-4B-Q4_K_M.gguf" -> qwen3_4b_q4_k_m) still resolves. Additive only.
+  for (const pathLike of [model?.model_path, model?.path]) {
+    const base = pathBasename(pathLike)
+    if (base) fields.push(base)
+  }
   return fields.filter(Boolean).map((value) => String(value))
 }
 
