@@ -6,16 +6,16 @@ Run the smallest meaningful validation lane for your change. If a change affects
 
 ## Current support-surface alignment rule
 
-Every public surface should tell the same four-row story:
+Every public surface should tell the same exact-row support story:
 
 - TinyLlama 1.1B Chat Q8_0 is the supported current gate, with checked 512-context/template/RSS evidence.
 - Llama 3.2 1B Instruct Q8_0 has verified bounded support through checked 512/1024/2048/4096/8192 context packs where row-specific PASS artifacts are cited, plus a supported metadata-Jinja row-template renderer path for the recognized Llama 3 template shape; the latest 8192 pack is `qa/evidence-bundles/llama32-1b-context-8192-current-head-20260513T183501Z-head-aaf9207d1669/manifest.json`. Llama 3.2 3B Instruct Q8_0 remains supported as exact-row smoke through checked 512/1024/2048 bounded context packs where row-specific PASS artifacts are cited.
 - Llama 3 8B Instruct Q8_0 has verified bounded support through checked bounded 512/1024/2048 context packs where row-specific PASS artifacts are cited; the 1024/2048 buckets are backed by `qa/evidence-bundles/llama3-8b-context-1024-2048-current-head-20260509T041451Z-head-8e26be0a73c0/manifest.json` for source/runtime head `8e26be0a73c0`, and older 1024/2048 bundles remain historical source-head evidence.
+- Mistral 7B Instruct v0.3 Q8_0 is supported exact-row smoke only: `Mistral-7B-Instruct-v0.3.Q8_0.gguf` has tokenizer/template, 1-token, broader 50-token, checked 512/1024/2048/4096/8192 context, GPU-vs-CPU greedy parity, and support-promotion API/WebUI smoke evidence at `qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json`.
 - Current-head language requires a fresh canonical PASS after later runtime/source commits; broad/full support for every non-TinyLlama row still requires model-native/larger context beyond checked packs, arbitrary-template evidence, throughput, portability, and durable normalized current-head bundles.
 
 Next-family public language is locked to row-by-row evidence, not family-wide support:
 
-- Mistral 7B Instruct: “In active validation for `Mistral-7B-Instruct-v0.3.Q8_0.gguf`; not supported yet.”
 - Mixtral 8x7B Instruct: “Bounded one-token backend MoE runtime evidence exists for `Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf`; later-generation/API/WebUI/frontend readiness is not yet established.”
 - Qwen 2.5 7B Instruct: “Planned exact-row candidate for `Qwen2.5-7B-Instruct-Q8_0.gguf`; not supported yet.”
 - Gemma 2 9B Instruct: “Planned exact-row candidate for `gemma-2-9b-it-Q8_0.gguf`; not supported yet.”

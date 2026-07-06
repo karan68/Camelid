@@ -15,6 +15,7 @@ for (const manifestPath of manifestPaths) {
   await validateBundle(manifestPath)
 }
 await validateMixtralBlockerReconciliation(rootDir, manifestPaths)
+await validateMistralSupportPromotionLedger(rootDir, manifestPaths)
 
 if (failures.length > 0) {
   console.error(`public evidence claim check failed with ${failures.length} finding(s):`)
@@ -23,6 +24,68 @@ if (failures.length > 0) {
 }
 
 console.log(`public evidence claim check passed: ${checkedBundles} manifest(s), ${checkedSummaries} summary file(s)`)
+
+async function validateMistralSupportPromotionLedger(root, manifestPaths) {
+  if ((relative(process.cwd(), root).replace(/\\/g, '/') || '.') !== 'qa/evidence-bundles') return
+
+  const manifests = []
+  for (const manifestPath of manifestPaths) manifests.push({ path: manifestPath, json: await readJson(manifestPath) })
+  const promotion = manifests.find(({ json }) => {
+    return json?.row === 'Mistral-7B-Instruct-v0.3.Q8_0.gguf' && json?.validation_kind === 'mistral_support_promotion_api_webui_smoke'
+  })
+  if (!promotion) {
+    fail('qa/evidence-bundles', 'Mistral support ledger requires the support-promotion API/WebUI smoke manifest')
+    return
+  }
+
+  validateMistralSupportPromotionManifest(evidenceBundlePath(promotion.path), promotion.json)
+  await validateMistralSupportSurfaceText()
+}
+
+function validateMistralSupportPromotionManifest(bundleRel, manifest) {
+  if (manifest.passed !== true) fail(bundleRel, 'Mistral support-promotion manifest must record passed=true')
+  if (manifest.smoke_exit !== 0) fail(bundleRel, 'Mistral support-promotion manifest must record smoke_exit=0')
+  if (!String(manifest.support_claim || '').includes('supported_exact_row_smoke')) {
+    fail(bundleRel, 'Mistral support-promotion manifest support_claim must include supported_exact_row_smoke')
+  }
+  const contract = manifest.expected_contract || {}
+  if (contract.compatibility_row !== 'mistral_7b_instruct_v0_3_q8_0') fail(bundleRel, 'Mistral support-promotion compatibility_row must match the exact row id')
+  if (contract.compatibility_status !== 'supported_exact_row_smoke') fail(bundleRel, 'Mistral support-promotion compatibility_status must be supported_exact_row_smoke')
+  if (contract.contract_supported !== true) fail(bundleRel, 'Mistral support-promotion contract_supported must be true')
+  if (!/^enabled/i.test(String(contract.webui_chat || ''))) fail(bundleRel, 'Mistral support-promotion webui_chat must be enabled for the exact row')
+  if (manifest.observed?.capabilities_row_status !== 'supported_exact_row_smoke') fail(bundleRel, 'Mistral support-promotion observed capabilities row status must be supported_exact_row_smoke')
+  if (!String(manifest.observed?.execution_plan_support_level || '').includes('supported_exact_row_smoke')) {
+    fail(bundleRel, 'Mistral support-promotion execution plan support level must include supported_exact_row_smoke')
+  }
+}
+
+async function validateMistralSupportSurfaceText() {
+  const required = new Map([
+    ['README.md', ['Mistral 7B Instruct v0.3 | Q8_0', 'Exact-row smoke + bounded context 512']],
+    ['STATUS.md', ['Mistral 7B Instruct v0.3 Q8_0 is promoted to supported exact-row smoke', 'mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json']],
+    ['ROADMAP.md', ['Mistral 7B Instruct v0.3 Q8_0 is supported as exact-row smoke', 'support-promotion API/WebUI smoke bundle']],
+    ['COMPATIBILITY.md', ['Mistral-7B-Instruct-v0.3.Q8_0.gguf is supported exact-row smoke', 'mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json']],
+    ['docs/VALIDATION_MATRIX.md', ['Mistral 7B Instruct v0.3 Q8_0 is supported exact-row smoke only', 'mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json']],
+    ['docs/release/CORRECTNESS_v0.1.md', ['Camelid v0.1 has exact-row smoke correctness proof for the exact Mistral-7B-Instruct-v0.3 Q8_0 row', 'mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json']],
+    ['qa/evidence-bundles/README.md', ['mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/', 'No blocker for exact-row smoke support']],
+    ['src/api/mod.rs', ['id: "mistral_7b_instruct_v0_3_q8_0"', 'status: "supported_exact_row_smoke"']],
+  ])
+  const stalePatterns = [
+    /Mistral(?:-|\s)7B[^\n]{0,260}(?:remains active exact-row validation only|remains evidence-only active validation|active validation only|not supported yet|support is not promoted|support remains fail-closed|row fail-closed)/i,
+    /Mistral(?:-|\s)7B[^\n]{0,260}active_validation_unsupported/i,
+    /Mistral(?:-|\s)7B[^\n]{0,260}fail-closed API\/WebUI\/RSS evidence/i,
+  ]
+
+  for (const [path, snippets] of required) {
+    const text = await readText(path)
+    for (const snippet of snippets) {
+      if (!text.includes(snippet)) fail(path, `Mistral support ledger text must include ${JSON.stringify(snippet)}`)
+    }
+    for (const pattern of stalePatterns) {
+      if (pattern.test(text)) fail(path, `Mistral support ledger text still matches stale fail-closed wording ${pattern}`)
+    }
+  }
+}
 
 async function validateBundle(manifestPath) {
   const bundleDir = manifestPath.slice(0, -'/manifest.json'.length)
@@ -746,6 +809,15 @@ async function readJson(path) {
   } catch (error) {
     fail(relative(process.cwd(), path), `failed to read JSON: ${error.message}`)
     return null
+  }
+}
+
+async function readText(path) {
+  try {
+    return await readFile(path, 'utf8')
+  } catch (error) {
+    fail(path, `failed to read text: ${error.message}`)
+    return ''
   }
 }
 
