@@ -890,8 +890,13 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
     assert_eq!(qwen3_4b_q4km["status"], "supported_exact_row_smoke");
     assert_eq!(qwen3_4b_q4km["family"], "qwen3");
     assert_eq!(qwen3_4b_q4km["quantization"], "Q4_K_M");
-    // No agent-eval receipt exists for this row, so it is NOT tool_capable.
-    assert_eq!(qwen3_4b_q4km["tool_capable"], false);
+    // tool_capable earned via a committed agent-eval PASS receipt (Qwen3's native
+    // tool template holds up at Q4_K_M; the Llama-3.2-3B-Q4_K_M sibling FAILs the battery).
+    assert_eq!(qwen3_4b_q4km["tool_capable"], true);
+    assert!(qwen3_4b_q4km["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("Qwen3-4B-Q4_K_M-1783378260-PASS.json"));
     assert_eq!(qwen3_4b_q4km["latest_checked_result"], "pass");
     assert!(qwen3_4b_q4km["evidence"]
         .as_str()
