@@ -1,7 +1,7 @@
 
 running 1 test
 test runnable::model::gpu_ssm_layer_tests::qwen35_gpu_single_token_matches_cpu has been running for over 60 seconds
-==PROF== Connected to process 27960 (C:\Users\timto\cam-ornith\target\debug\deps\camelid-3722b74a8cf48178.exe)
+==PROF== Connected to process 27960 (<home>\cam-ornith\target\debug\deps\camelid-3722b74a8cf48178.exe)
 ==PROF== Profiling "q4k_gemv": 0%
 ==WARNING== Backing up device memory in system memory. Kernel replay might be slow. Consider using "--replay-mode application" to avoid memory save-and-restore.
 ....50%....100% - 7 passes

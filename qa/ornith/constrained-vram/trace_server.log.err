@@ -7,7 +7,7 @@
 0.00.122.956 I srv          init: using 15 threads for HTTP server
 0.00.123.184 I srv         start: binding port with default address family
 0.00.130.099 I srv  llama_server: loading model
-0.00.130.118 I srv    load_model: loading model 'C:\Users\timto\Camelid\models\ornith-1.0-9b-Q4_K_M.gguf'
+0.00.130.118 I srv    load_model: loading model '<home>\Camelid\models\ornith-1.0-9b-Q4_K_M.gguf'
 0.00.130.186 I common_init_result: fitting params to device memory ...
 0.00.130.186 I common_init_result: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
 0.01.109.705 W common_fit_params: failed to fit params to free device memory: n_gpu_layers already set by user to 99, abort

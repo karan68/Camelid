@@ -14,15 +14,15 @@
   `llama-bench --help` / `llama-speculative --help` before the first real run (see -Validate).
 #>
 param(
-  [string]$BinDir   = "C:\Users\timto\llama.cpp\build\bin",
-  [string]$Target   = "C:\Users\timto\models\Qwen3-4B-Q8_0.gguf",
-  [string]$Draft    = "C:\Users\timto\camelid-dltest\models\Qwen3-0.6B-Q8_0.gguf",
-  [string]$Prompts  = "C:\Users\timto\Camelid\qa\speed\prompts.json",
+  [string]$BinDir   = "$env:USERPROFILE\llama.cpp\build\bin",
+  [string]$Target   = "$env:USERPROFILE\models\Qwen3-4B-Q8_0.gguf",
+  [string]$Draft    = "$env:USERPROFILE\camelid-dltest\models\Qwen3-0.6B-Q8_0.gguf",
+  [string]$Prompts  = "$env:USERPROFILE\Camelid\qa\speed\prompts.json",
   [int]$Reps        = 5,         # llama-bench repetitions (after warmup); raise for tighter stddev
   [int]$DraftMax    = 8,         # matches Camelid MAX_VERIFY_K = 8
   [int]$DraftMin    = 1,
   [int]$NgenSpec    = 128,
-  [string]$OutRoot  = "C:\Users\timto\Camelid\qa\evidence-bundles",
+  [string]$OutRoot  = "$env:USERPROFILE\Camelid\qa\evidence-bundles",
   [int]$PinClock    = 0,         # if >0, attempt nvidia-smi -lgc <PinClock> (needs admin); 0 = leave clocks free
   [switch]$Validate,             # only print the binaries' --help + env, do not benchmark
   [switch]$RawOnly,
@@ -43,7 +43,7 @@ function Get-Env {
   $logical = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
   $ramGb = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
   $nvcc = (& nvcc --version | Select-String "release").ToString().Trim()
-  $commit = (& git -C "C:\Users\timto\llama.cpp" rev-parse HEAD).Trim()
+  $commit = (& git -C "$env:USERPROFILE\llama.cpp" rev-parse HEAD).Trim()
   # Brief Phase 1: record the matmul backend state so a reviewer knows which CUDA GEMM
   # path was exercised. These env vars force MMQ (quantized int8 tensor-core kernels) or
   # cuBLAS; unset means llama.cpp's heuristic (the documented default) chose at init.

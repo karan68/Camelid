@@ -3,9 +3,13 @@ set -euo pipefail
 
 # Public-repo privacy guard: keep private operator paths, key paths, host commands,
 # raw SSH failures, and validation-host details out of tracked files.
+# Covers Unix (/Users/<name>, /home/<name>) AND Windows home paths in both raw
+# (C:\Users\<name>) and JSON-escaped (C:\\Users\\<name>) form — the latter was a
+# blind spot that let Windows agent-eval receipts leak the operator home dir.
 patterns=(
   '/Users''/[^/]+'
   '/home/ubuntu'
+  '[A-Za-z]:\\+Users\\+'
   'Documents''/cert'
   'ssh ''-i'
   'ssh: connect to host'

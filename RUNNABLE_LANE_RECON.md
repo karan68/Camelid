@@ -128,7 +128,7 @@ Reuses without modification: `gguf::*`, `tensor::{decode_*, f16_bits_to_f32, mat
 
 ## 6. Working-environment note
 
-This dev box is **Windows 11 + RTX 3060 Laptop**, not the Mac mini/USB setup in the spec's "working-environment guards" section. Models are local at `C:\Users\timto\Camelid\models\` (TinyLlama-1.1B Q8_0, Llama-3.2-1B/3B Q8_0, Qwen3 0.6/1.7/4/8B Q8_0, DiffusionGemma Q4_K_M — gives F32/Q8_0 and a Q4_K_M sample on disk). The Mac/USB mount guards are **N/A here**; runnable is f32 and memory-heavy, so watch RAM on the larger models. No external-mount preflight needed on this box.
+This dev box is **Windows 11 + RTX 3060 Laptop**, not the Mac mini/USB setup in the spec's "working-environment guards" section. Models are local at `<home>\Camelid\models\` (TinyLlama-1.1B Q8_0, Llama-3.2-1B/3B Q8_0, Qwen3 0.6/1.7/4/8B Q8_0, DiffusionGemma Q4_K_M — gives F32/Q8_0 and a Q4_K_M sample on disk). The Mac/USB mount guards are **N/A here**; runnable is f32 and memory-heavy, so watch RAM on the larger models. No external-mount preflight needed on this box.
 
 ---
 

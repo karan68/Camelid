@@ -13,7 +13,7 @@
     "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU 6144MiB",
     "driver": "576.83",
     "os": "Windows 11 Home build 26220",
-    "binaries_dir": "C:\\Users\\timto\\llama.cpp\\build\\bin",
+    "binaries_dir": "<home>\\llama.cpp\\build\\bin",
     "tools_built_at_pin": ["llama-imatrix.exe", "llama-perplexity.exe", "llama-tokenize.exe"],
     "justification": "REFERENCE_PIN_QWEN35.md — conductor's 'acd79d6 cannot load qwen35' premise refuted (binary-level LLM_ARCH_QWEN35 + merged G-PARITY 4/4 + CUDA smoke); upstream sweep acd79d6..origin/master (228 commits, 2026-07-02) found zero qwen35/SSM CUDA correctness fixes"
   },

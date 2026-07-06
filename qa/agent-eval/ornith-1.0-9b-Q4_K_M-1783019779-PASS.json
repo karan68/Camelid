@@ -46,13 +46,13 @@
       "tool_results": [
         {
           "ok": true,
-          "output": "wrote 11 bytes to \\\\?\\C:\\Users\\timto\\AppData\\Local\\Temp\\camelid-agent-eval-258968\\greeting.txt",
+          "output": "wrote 11 bytes to <home>\\AppData\\Local\\Temp\\camelid-agent-eval-258968\\greeting.txt",
           "tool": "write_file"
         }
       ]
     }
   ],
-  "gguf": "\\\\?\\C:\\Users\\timto\\Camelid\\models\\ornith-1.0-9b-Q4_K_M.gguf",
+  "gguf": "<home>\\Camelid\\models\\ornith-1.0-9b-Q4_K_M.gguf",
   "gguf_bytes": 5629108416,
   "host_loadavg_1m": null,
   "model_id": "Ornith 1.0 9B",

@@ -1,7 +1,7 @@
 $ErrorActionPreference = 'Continue'
-$bin = 'C:\Users\timto\llama.cpp\build\bin\llama-cli.exe'
-$models = 'C:\Users\timto\Camelid\models'
-$here = 'C:\Users\timto\cam-ornith\qa\ornith\constrained-vram'
+$bin = '$env:USERPROFILE\llama.cpp\build\bin\llama-cli.exe'
+$models = '$env:USERPROFILE\Camelid\models'
+$here = '$env:USERPROFILE\cam-ornith\qa\ornith\constrained-vram'
 $out = Join-Path $here 'residency_16k_part2.txt'
 "# 16K residency measurements $(Get-Date -Format o)" | Out-File -FilePath $out -Encoding utf8
 foreach ($q in @('Q3_K_M','IQ4_XS')) {

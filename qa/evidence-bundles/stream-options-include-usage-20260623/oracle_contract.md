@@ -8,7 +8,7 @@ terminal usage chunk they expect.
 
 - **Oracle: llama.cpp `llama-server`, pinned reference commit `acd79d6`**
   (`acd79d603` — `jinja : add count/d/e filter aliases (#24606)`), built locally at
-  `C:\Users\timto\llama.cpp\build\bin\llama-server.exe`.
+  `<home>\llama.cpp\build\bin\llama-server.exe`.
 - This commit **implements** `stream_options.include_usage`
   (`tools/server/server-task.cpp:262-263`, `:914-926`), so it is the canonical
   oracle per the spec's precedence rule #1. OpenAI live capture was **not** used
