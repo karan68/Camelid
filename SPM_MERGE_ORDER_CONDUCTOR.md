@@ -30,7 +30,7 @@ pristine main `a323abb0` vs llama-server `acd79d6`:
   `acd79d6`. **Reference to be regenerated from the pinned build at re-cert; upstream
   drift recorded here as a note, not chased.**
 
-Artifacts: `C:\Users\timto\cam-attnblk\target\attn-blocked-dot-work\flag{off,on,off-main}\tinyllama-pack\`
+Artifacts: `<home>\cam-attnblk\target\attn-blocked-dot-work\flag{off,on,off-main}\tinyllama-pack\`
 plus the May bundle `qa/evidence-bundles/tinyllama-broader-template-context-perf-rss-20260505T044519Z-head-864e07b51f36/`.
 
 ## Reference semantics: llama.cpp SPM at `acd79d6` (normative for both gates)

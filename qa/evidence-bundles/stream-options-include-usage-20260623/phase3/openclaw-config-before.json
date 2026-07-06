@@ -1,7 +1,7 @@
 {
   "agents": {
     "defaults": {
-      "workspace": "C:\\Users\\timto\\.openclaw\\workspace",
+      "workspace": "<home>\\.openclaw\\workspace",
       "model": {
         "primary": "camelid/qwen3-4b"
       },

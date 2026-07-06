@@ -12346,10 +12346,12 @@ fn kv_head_major_layout_is_bitwise_identical_to_position_major() {
 /// outputs are bitwise-identical. Skips when the 3B GGUF is absent (CI).
 #[test]
 fn decode_linear_binder_matches_cascade_on_real_3b_weights() {
-    let model = std::env::var("CAMELID_3B_GGUF").unwrap_or_else(|_| {
-        r"C:\Users\timto\Camelid\models\Llama-3.2-3B-Instruct-Q8_0.gguf".to_string()
-    });
-    let model = std::path::PathBuf::from(model);
+    // Opt-in: set CAMELID_3B_GGUF to a 3B GGUF path to run this. No hardcoded
+    // default (a hardcoded operator path leaks the home dir and isn't portable).
+    let Some(model) = std::env::var_os("CAMELID_3B_GGUF").map(std::path::PathBuf::from) else {
+        eprintln!("skipping: set CAMELID_3B_GGUF to the 3B GGUF path to run this test");
+        return;
+    };
     if !model.exists() {
         eprintln!("skipping: 3B GGUF not present at {}", model.display());
         return;

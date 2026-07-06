@@ -18,7 +18,7 @@
       ]
     }
   ],
-  "gguf": "\\\\?\\C:\\Users\\timto\\Camelid\\models\\ornith-1.0-9b-Q8_0.gguf",
+  "gguf": "<home>\\Camelid\\models\\ornith-1.0-9b-Q8_0.gguf",
   "gguf_bytes": 9527500992,
   "host_loadavg_1m": null,
   "model_id": "Ornith 1.0 9B",

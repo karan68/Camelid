@@ -61,7 +61,7 @@ KV present in GGUF. To be diffed in Phase 2 *if* the arch build is authorized.
 Deferred — requires a running model; `ollama` is not installed on this box and no engine path exists.
 
 ## 0.4 Oracle availability (G-ORACLE) — **YES (correction to brief)**
-Pinned comparator: llama.cpp `acd79d6` (build 9632) at `C:\Users\timto\llama.cpp`.
+Pinned comparator: llama.cpp `acd79d6` (build 9632) at `<home>\llama.cpp`.
 `src/llama-arch.cpp` defines `LLM_ARCH_QWEN35 = "qwen35"` and `LLM_ARCH_QWEN35MOE`, plus
 `LLM_TENSOR_SSM_ALPHA // qwen3.5`. The arch is wired in the pin → **the Supported/parity lane is
 NOT oracle-blocked**. (Forward-pass smoke against the actual GGUF still to be run to fully certify

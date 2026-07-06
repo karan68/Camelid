@@ -18,7 +18,7 @@
       ]
     }
   ],
-  "gguf": "\\\\?\\C:\\Users\\timto\\Camelid\\models\\Qwen3-4B-Q8_0.gguf",
+  "gguf": "<home>\\Camelid\\models\\Qwen3-4B-Q8_0.gguf",
   "gguf_bytes": 4280404704,
   "host_loadavg_1m": null,
   "model_id": "Qwen3 4B Instruct",

@@ -9,7 +9,7 @@ Date: 2026-07-02.
 | field | value |
 |---|---|
 | `REF_QWEN35` commit | `acd79d6` ("jinja : add count/d/e filter aliases (#24606)"), llama.cpp build 9632 |
-| Build location | `C:\Users\timto\llama.cpp\build\bin\` (`llama-cli.exe`, `llama-server.exe`, `llama-quantize.exe`, `llama-imatrix.exe`, `llama-perplexity.exe`, `llama-tokenize.exe`, `llama-speculative.exe`) |
+| Build location | `<home>\llama.cpp\build\bin\` (`llama-cli.exe`, `llama-server.exe`, `llama-quantize.exe`, `llama-imatrix.exe`, `llama-perplexity.exe`, `llama-tokenize.exe`, `llama-speculative.exe`) |
 | Compiler | MSVC 19.44.35228.0, Windows AMD64 |
 | Build flags | `CMAKE_BUILD_TYPE=Release`, `GGML_CUDA=ON`, `GGML_CUDA_FA=ON`, `GGML_CUDA_COMPRESSION_MODE=size`, generator Ninja |
 | CUDA backend | `ggml-cuda.dll` present; CUDA toolkit 12.9 |
@@ -60,7 +60,7 @@ force re-validation of the entire bringup for zero identified correctness benefi
 
 **Decision: `REF_QWEN35` := `acd79d6` CUDA build.** This also collapses the conductor's
 dual-pin bookkeeping in practice: the legacy pin and `REF_QWEN35` are the same commit in
-two build configurations (legacy CPU-only reference at `C:\Users\timto\tools\llama-cpp\`
+two build configurations (legacy CPU-only reference at `<home>\tools\llama-cpp\`
 build b9632, used by the TinyLlama/llama-family lanes; CUDA build above for qwen35).
 Receipts still name which binary they used; "never mix pins in one receipt" is preserved
 trivially.
@@ -78,7 +78,7 @@ the repo's LFS OIDs, independently recomputed locally after download.
 | `ornith-1.0-9b-Q6_K.gguf` | 7,359,259,072 | `33b6f6a3e3f05078438e12df8a4b55c8acf78ceadcc639d2af1cf35a026e8387` (HF LFS oid; local recompute pending download) | HF pristine (Item 6 verifier weights) |
 | `ornith-1.0-9b-bf16.gguf` | 17,920,696,512 | `27bc753487eed85539c3aef63dd602b79cd060401b928c9ff7d30d5556eca260` (HF LFS oid; local recompute pending download) | HF pristine (Item 4 quant-production source) |
 
-All files under `C:\Users\timto\Camelid\models\`. This table is finalized in
+All files under `<home>\Camelid\models\`. This table is finalized in
 `qa/ornith/constrained-vram/RECEIPT_ITEM0_reference.json` once local recomputes of the
 two downloads complete.
 

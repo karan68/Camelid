@@ -55,7 +55,7 @@ the cross-engine comparison against Camelid is filled in once Phase 2 lands.
 ## Reproduce
 
 ```
-git -C C:\Users\timto\llama.cpp checkout acd79d603cb2e1c84c0886137b80f1ad649b6857
+git -C <home>\llama.cpp checkout acd79d603cb2e1c84c0886137b80f1ad649b6857
 # rebuild (Ninja + CUDA arch 86), then:
 pwsh qa/speed/llamacpp-baseline.ps1 -Reps 5
 ```

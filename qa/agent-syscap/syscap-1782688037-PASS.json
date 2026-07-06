@@ -37,7 +37,7 @@
     {
       "name": "sandbox_escape_refused",
       "input": "cwd=..\\..\\..",
-      "observed": "path ..\\..\\.. escapes the sandbox root \\\\?\\C:\\Users\\timto\\AppData\\Local\\Temp\\camelid-agent-syscap-4476",
+      "observed": "path ..\\..\\.. escapes the sandbox root <home>\\AppData\\Local\\Temp\\camelid-agent-syscap-4476",
       "verdict": "PASS"
     },
     {

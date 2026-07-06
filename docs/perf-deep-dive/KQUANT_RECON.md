@@ -17,18 +17,18 @@ GPU engine exists and is fully wired; no Q4_K_M parity receipt exists yet. One r
 |---|---|
 | Host | i7-11800H (8C/16T, Tiger Lake, AVX2/AVX-512/VNNI), ~16 GiB DDR4 |
 | GPU | RTX 3060 Laptop 6 GiB (sm_86), Win11 |
-| llama.cpp source pin | `acd79d6` — **CONFIRMED** present at `C:\Users\timto\llama.cpp` (HEAD = acd79d6 "jinja : add count/d/e filter aliases (#24606)") |
-| llama.cpp binaries | `C:\Users\timto\tools\llama-cpp\` — `llama-bench.exe`, `llama-cli.exe` present (build provenance vs acd79d6 to be re-verified in Phase 1 via `--version`) |
-| Branch / base | `feat/kquant-decode-conductor` from committed `3812a1f7` (v0.1.8); isolated worktree `C:\Users\timto\cam-kquant` so the uncommitted WARP work in the main checkout is untouched |
+| llama.cpp source pin | `acd79d6` — **CONFIRMED** present at `<home>\llama.cpp` (HEAD = acd79d6 "jinja : add count/d/e filter aliases (#24606)") |
+| llama.cpp binaries | `<home>\tools\llama-cpp\` — `llama-bench.exe`, `llama-cli.exe` present (build provenance vs acd79d6 to be re-verified in Phase 1 via `--version`) |
+| Branch / base | `feat/kquant-decode-conductor` from committed `3812a1f7` (v0.1.8); isolated worktree `<home>\cam-kquant` so the uncommitted WARP work in the main checkout is untouched |
 
 ### Models
 
 | Model | Role | Present? | Path / size / SHA-256 |
 |---|---|---|---|
 | Llama-3.2-3B-Instruct-Q4_K_M | **primary** | **NO** | only `Camelid/models/Llama-3.2-3B-Instruct-Q8_0.gguf` exists — Q4_K_M must be downloaded (~2 GB) |
-| Qwen3-4B-Q4_K_M | secondary | **YES** | `C:\Users\timto\models\Qwen3-4B-Q4_K_M.gguf`, 2,497,280,256 B, SHA-256 `7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5` |
-| Qwen3-0.6B-Q4_K_M | extra | YES | `C:\Users\timto\models\Qwen3-0.6B-Q4_K_M.gguf` (396,704,416 B) |
-| Qwen3-8B-Q4_K_M | extra | YES | `C:\Users\timto\models\Qwen3-8B-Q4_K_M.gguf` (5,027,783,488 B) |
+| Qwen3-4B-Q4_K_M | secondary | **YES** | `<home>\models\Qwen3-4B-Q4_K_M.gguf`, 2,497,280,256 B, SHA-256 `7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5` |
+| Qwen3-0.6B-Q4_K_M | extra | YES | `<home>\models\Qwen3-0.6B-Q4_K_M.gguf` (396,704,416 B) |
+| Qwen3-8B-Q4_K_M | extra | YES | `<home>\models\Qwen3-8B-Q4_K_M.gguf` (5,027,783,488 B) |
 
 **Phase-1 consequence:** the secondary model is ready to certify *now*; the primary needs a
 download before its receipt can be minted.

@@ -21,7 +21,7 @@
 [CmdletBinding()]
 param(
   [string]$Bin = '',
-  [string]$Model = 'C:\Users\timto\models\Llama-3.2-3B-Instruct-Q8_0.gguf',
+  [string]$Model = '$env:USERPROFILE\models\Llama-3.2-3B-Instruct-Q8_0.gguf',
   [string]$PromptsJson = ''
 )
 $ErrorActionPreference = 'Stop'

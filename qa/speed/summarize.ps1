@@ -81,7 +81,7 @@ if ($tgTarget) {
 W "## Reproduce"
 W ""
 W '```'
-W "git -C C:\Users\timto\llama.cpp checkout $($m.llamacpp_commit)"
+W "git -C $env:USERPROFILE\llama.cpp checkout $($m.llamacpp_commit)"
 W "# rebuild (Ninja + CUDA arch 86), then:"
 W "pwsh qa/speed/llamacpp-baseline.ps1 -Reps $($m.cells[0].repetitions)"
 W '```'

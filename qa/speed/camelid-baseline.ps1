@@ -22,13 +22,13 @@
   and records lossless_match; a mismatch is a correctness failure, not a faster number.
 #>
 param(
-  [string]$Bin      = "C:\Users\timto\Camelid\target\release\camelid.exe",
-  [string]$Target   = "C:\Users\timto\models\Qwen3-4B-Q8_0.gguf",
-  [string]$Draft    = "C:\Users\timto\camelid-dltest\models\Qwen3-0.6B-Q8_0.gguf",
-  [string]$Prompts  = "C:\Users\timto\Camelid\qa\speed\prompts.json",
+  [string]$Bin      = "$env:USERPROFILE\Camelid\target\release\camelid.exe",
+  [string]$Target   = "$env:USERPROFILE\models\Qwen3-4B-Q8_0.gguf",
+  [string]$Draft    = "$env:USERPROFILE\camelid-dltest\models\Qwen3-0.6B-Q8_0.gguf",
+  [string]$Prompts  = "$env:USERPROFILE\Camelid\qa\speed\prompts.json",
   [int]$Reps        = 5,
   [int]$Ngen        = 128,
-  [string]$OutRoot  = "C:\Users\timto\Camelid\qa\evidence-bundles",
+  [string]$OutRoot  = "$env:USERPROFILE\Camelid\qa\evidence-bundles",
   [switch]$Probe,                # single GPU-engagement probe, no bundle
   [switch]$RawOnly,
   [switch]$SpecOnly
@@ -67,8 +67,8 @@ function Parse-Bench($stdout) {
 function Get-Env {
   $smi = & nvidia-smi --query-gpu=name,driver_version,memory.total,clocks.max.sm,clocks.current.sm --format=csv,noheader,nounits 2>$null
   $p = ($smi -split ",").Trim()
-  $commit = (& git -C "C:\Users\timto\Camelid" rev-parse HEAD).Trim()
-  $dirty  = [bool]((& git -C "C:\Users\timto\Camelid" status --porcelain) )
+  $commit = (& git -C "$env:USERPROFILE\Camelid" rev-parse HEAD).Trim()
+  $dirty  = [bool]((& git -C "$env:USERPROFILE\Camelid" status --porcelain) )
   [PSCustomObject]@{
     gpu_name=$p[0]; driver=$p[1]; vram_total_mib=$p[2]; clocks_max_sm_mhz=$p[3]; clocks_cur_sm_mhz=$p[4]
     cpu=(Get-CimInstance Win32_Processor|Select-Object -First 1).Name
