@@ -177,6 +177,84 @@ fn encodes_llama3_real_prompts_like_llama_cpp_when_available() {
 }
 
 #[test]
+fn tinyllama_edge_reference_pack_records_required_prompt_shapes_and_tokens() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/tokenizer/tinyllama-chat-template-edge-cases.json"
+    ))
+    .unwrap();
+
+    assert_eq!(fixture["schema"], "camelid.tokenizer_reference_pack.v1");
+    assert_eq!(fixture["row_id"], "tinyllama_1_1b_chat_q8_0");
+    assert_eq!(
+        fixture["tokenizer_fixture_id"],
+        "tinyllama-chat-template-edge-cases-v1"
+    );
+    assert_eq!(
+        fixture["reference"]["evidence_bundle"],
+        "qa/evidence-bundles/tinyllama-broader-template-context-perf-rss-20260505T044519Z-head-864e07b51f36/manifest.json"
+    );
+
+    let cases = fixture["cases"].as_object().unwrap();
+    for name in [
+        "trailing_whitespace",
+        "special_control_chars",
+        "multiline_chat",
+        "assistant_final_eos",
+        "multiline_whitespace",
+    ] {
+        let case = &cases[name];
+        assert_eq!(case["prompt_tokens_match"], true, "case {name}");
+        assert_eq!(case["add_special"], false, "case {name}");
+        assert_eq!(case["parse_special"], true, "case {name}");
+        assert_eq!(
+            case["tokens"].as_array().unwrap().len(),
+            case["reference_prompt_token_count"].as_u64().unwrap() as usize,
+            "case {name}"
+        );
+    }
+
+    assert!(cases["multiline_whitespace"]["expected_prompt"]
+        .as_str()
+        .unwrap()
+        .contains("\n\n  Indented line two.  </s>"));
+    assert!(cases["assistant_final_eos"]["expected_prompt"]
+        .as_str()
+        .unwrap()
+        .ends_with("elid</s>\n"));
+}
+
+#[test]
+fn encodes_tinyllama_edge_reference_pack_like_llama_cpp_when_available() {
+    let Some(tokenizer) = load_real_tinyllama_tokenizer() else {
+        return;
+    };
+
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/tokenizer/tinyllama-chat-template-edge-cases.json"
+    ))
+    .unwrap();
+    let cases = fixture["cases"].as_object().unwrap();
+
+    for (name, case) in cases {
+        let text = case["expected_prompt"].as_str().unwrap();
+        let add_special = case["add_special"].as_bool().unwrap();
+        let parse_special = case["parse_special"].as_bool().unwrap();
+        let expected: Vec<u32> = case["tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u32)
+            .collect();
+
+        assert_eq!(
+            tokenizer.encode(text, add_special, parse_special).unwrap(),
+            expected,
+            "TinyLlama tokenizer/chat-template edge parity failed for {name}; expected IDs are from fixtures/tokenizer/tinyllama-chat-template-edge-cases.json backed by the committed llama.cpp parity reports"
+        );
+    }
+}
+
+#[test]
 fn mistral_reference_pack_records_required_prompt_shapes_and_tokens() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../fixtures/tokenizer/mistral-7b-instruct-v0.3-reference-pack.json"
@@ -538,6 +616,22 @@ fn load_real_llama3_tokenizer() -> Option<(Tokenizer, Vec<String>)> {
         .unwrap();
     let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
     Some((tokenizer, token_texts))
+}
+
+fn load_real_tinyllama_tokenizer() -> Option<Tokenizer> {
+    let path = std::env::var("TINYLLAMA_GGUF")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf"));
+    if !path.exists() {
+        eprintln!(
+            "skipping real TinyLlama tokenizer parity; set TINYLLAMA_GGUF or place the artifact at {}",
+            path.display()
+        );
+        return None;
+    }
+
+    let gguf = read_metadata(&path).unwrap();
+    Some(Tokenizer::from_gguf(&gguf).unwrap())
 }
 
 fn load_real_mistral_tokenizer() -> Option<Tokenizer> {
