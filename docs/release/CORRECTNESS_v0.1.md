@@ -98,13 +98,11 @@ Boundary:
 
 The 1024/2048 packs are tied to source/runtime head `8e26be0a73c0`. Lazy-Q8 hot-path artifacts are measurement evidence, not speed/support expansion. The claim does not extend to model-native/larger contexts beyond 2048, arbitrary templates, production throughput, portability, neighboring rows, or broad 8B/Llama support.
 
-## Unsupported Correctness Claims
-
 ### Mistral-7B-Instruct-v0.3 Q8_0
 
-Correctness status:
+Public correctness claim:
 
-Evidence-only. There is strong row-specific parity/context bring-up evidence, but v0.1 must not call this row supported because the API/WebUI support-surface manifest is fail-closed.
+Camelid v0.1 has exact-row smoke correctness proof for the exact Mistral-7B-Instruct-v0.3 Q8_0 row: tokenizer/template, 1-token generation, broader five-prompt/50-token parity, bounded 512/1024/2048 and checked 4096/8192 context packs, GPU-vs-CPU greedy parity, and the support-promotion API/WebUI smoke bundle agree on `supported_exact_row_smoke` for this row.
 
 Evidence:
 
@@ -112,11 +110,13 @@ Evidence:
 - `qa/evidence-bundles/mistral-7b-v0.3-q8-broader-50tok-ubuntu-20260509T000633Z-head-d330e97ae992/manifest.json`
 - `qa/evidence-bundles/mistral-7b-v0.3-q8-context-512-1024-2048-ubuntu-20260508T203513Z-head-86ad5390d265/manifest.json`
 - `qa/evidence-bundles/mistral-7b-v0.3-q8-context-4096-8192-ubuntu-20260509T005229Z-head-9e3c64f2cfab/manifest.json`
-- `qa/evidence-bundles/mistral-7b-v0.3-q8-api-webui-rss-current-head-20260513T1935Z-head-9a296ea/manifest.json`
+- `qa/evidence-bundles/mistral-7b-v0.3-q8-support-promotion-20260605T090914Z-head-d7b1699/manifest.json`
 
-Reason support is rejected:
+Boundary:
 
-The API/WebUI/RSS manifest records `support_claim` as none, expected `compatibility_status=active_validation_unsupported`, `contract_supported=false`, and WebUI chat blocked. That directly conflicts with later prose that says Mistral is supported. v0.1 should resolve the conflict conservatively.
+This is exact-row smoke support only. The claim does not extend to broad Mistral-family support, neighboring Mistral variants, other quants, arbitrary templates beyond the row-scoped renderer and shapes, model-native/larger context beyond the checked packs, production throughput, portability, or full support.
+
+## Unsupported Correctness Claims
 
 ### Mixtral-8x7B-Instruct-v0.1 Q8_0
 
