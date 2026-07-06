@@ -140,7 +140,7 @@ async fn models_reports_public_loaded_model_list_shape() {
         "partial_llama_server_models_read_only"
     );
     assert_eq!(body["camelid"]["scope"], "loaded_models_only");
-    assert!(body["camelid"]["unsupported"]
+    assert!(!body["camelid"]["unsupported"]
         .as_array()
         .unwrap()
         .iter()
@@ -197,14 +197,165 @@ async fn llama_server_read_only_routes_reject_router_mode_query_params() {
 }
 
 #[tokio::test]
+async fn llama_server_models_load_alias_loads_local_model_with_redacted_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.gguf");
+    write_tokenizer_gguf(&path, "llama", true, false, true);
+
+    let app = camelid::api::router();
+    let load_body = serde_json::json!({"model": path, "id": "tiny-tokenizer"});
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(load_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"]["id"], "tiny-tokenizer");
+    assert_eq!(body["data"]["path"], Value::Null);
+    assert_eq!(body["data"]["status"]["value"], "loaded");
+    assert_eq!(body["data"]["camelid"]["model_path_redacted"], true);
+    assert_eq!(
+        body["camelid"]["compatibility"],
+        "partial_llama_server_models_load_local_path"
+    );
+    assert_eq!(body["camelid"]["model_path_redacted"], true);
+    assert!(body["camelid"]["unsupported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item == "models_autoload"));
+    assert!(!body.to_string().contains(path.to_str().unwrap()));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["data"][0]["id"], "tiny-tokenizer");
+    assert_eq!(body["data"][0]["path"], Value::Null);
+}
+
+#[tokio::test]
+async fn llama_server_models_load_alias_rejects_router_mode_fields() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"tiny.gguf","autoload":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "body");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("autoload"));
+}
+
+#[tokio::test]
+async fn llama_server_models_load_alias_rejects_ambiguous_model_and_path() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"model":"a.gguf","path":"b.gguf"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "ambiguous_model_path");
+    assert_eq!(body["error"]["param"], "model");
+}
+
+#[tokio::test]
+async fn llama_server_models_load_alias_redacts_failed_local_path() {
+    let private_path = "C:/Users/example/private/missing.gguf";
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model": private_path}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let serialized = body.to_string();
+    assert_eq!(body["error"]["param"], "model");
+    assert!(!serialized.contains(private_path));
+    assert!(!serialized.contains("C:/Users/"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("failed to load requested local GGUF path"));
+}
+
+#[tokio::test]
+async fn llama_server_models_load_alias_requires_model_or_path() {
+    let app = camelid::api::router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/models/load")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "missing_model_path");
+    assert_eq!(body["error"]["param"], "model");
+}
+
+#[tokio::test]
 async fn native_compatibility_routes_fail_closed_with_typed_errors() {
     let cases = [
-        (
-            "POST",
-            "/models/load",
-            "unsupported_llama_server_models_load",
-            "model",
-        ),
         (
             "POST",
             "/models/unload",
@@ -459,11 +610,11 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("currently loaded Camelid models")
+                .contains("POST /models/load is a narrow local-path alias")
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("POST /models/load")
+                .contains("currently loaded Camelid models")
     }));
     assert!(body["api_features"].as_array().unwrap().iter().any(|item| {
         item["id"] == "llama_server_props"
@@ -518,7 +669,7 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
             && item["notes"]
                 .as_str()
                 .unwrap()
-                .contains("POST /models/load")
+                .contains("Unsupported /models/load router-mode fields")
             && item["notes"]
                 .as_str()
                 .unwrap()
