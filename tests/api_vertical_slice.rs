@@ -902,6 +902,24 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .contains("qwen3-4b-q4_k_m-windows-cuda-resident-parity"));
 
+    // Llama-3.2-3B K-quant rows promoted (GPU-resident raw-decode parity). Ids are the
+    // normalized-filename form so the frontend exact-row matcher resolves them (the
+    // llama-bpe branch only knows the Q8_0 quant and would quant-mismatch).
+    for (id, quant) in [
+        ("llama_3_2_3b_instruct_q4_k_m", "Q4_K_M"),
+        ("llama_3_2_3b_instruct_q5_k_m", "Q5_K_M"),
+    ] {
+        let row = compatibility
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap_or_else(|| panic!("{id} row must be advertised"));
+        assert_eq!(row["status"], "supported_exact_row_smoke");
+        assert_eq!(row["family"], "llama_bpe_decoder");
+        assert_eq!(row["quantization"], quant);
+        assert_eq!(row["tool_capable"], false);
+        assert_eq!(row["latest_checked_result"], "pass");
+    }
+
     for (id, filename) in [
         ("qwen25_7b_instruct_q8_0", "Qwen2.5-7B-Instruct-Q8_0.gguf"),
         ("gemma2_9b_it_q8_0", "gemma-2-9b-it-Q8_0.gguf"),
