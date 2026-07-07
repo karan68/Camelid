@@ -26,6 +26,7 @@
 
 import { writeFile, mkdir, readFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import http from 'node:http'
 
 const args = parseArgs(process.argv.slice(2))
 const camelidBase = (args.get('camelid') || 'http://127.0.0.1:8185').replace(/\/$/, '')
@@ -37,6 +38,16 @@ const comparatorLabel = args.get('comparator') || 'llama.cpp /completion'
 const outPath = args.get('out') || null
 const tokenCounts = (args.get('token-counts') || '1,5,50').split(',').map((s) => Number.parseInt(s.trim(), 10))
 const STOP = new Set((args.get('stop') || '128009,128001,128000').split(',').map((s) => Number.parseInt(s.trim(), 10)))
+// Node's global fetch (undici) has a ~5-min headersTimeout that fires when a CPU-only
+// llama.cpp holds the connection during a multi-thousand-token f32 prefill. node:http
+// has no such cap, so postJson uses it with a generous idle-timeout (default 30 min).
+const requestTimeoutMs = Number.parseInt(args.get('request-timeout-ms') || '1800000', 10)
+// Decoupled modes so the two engines never need to be loaded at once (safe on
+// small-RAM hosts): --reference-out captures the llama.cpp oracle to a file and
+// exits (no camelid); --reference-in compares camelid against that committed file
+// (no llama.cpp). Run them in two phases, killing each server before the next.
+const referenceOutPath = args.get('reference-out') || null
+const referenceInPath = args.get('reference-in') || null
 // variant/proof_chain default to the K-quant framing this harness was first written
 // for; pass --variant / --proof-chain for other lanes (e.g. a Q8_0 GPU-resident row)
 // so the emitted parity JSON doesn't carry wrong-quant labels.
@@ -62,14 +73,42 @@ if (args.get('prompts-file')) {
 }
 PROMPTS = PROMPTS.filter(Boolean)
 
-async function postJson(base, path, body) {
-  const res = await fetch(`${base}${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
+function postJson(base, path, body) {
+  // node:http (not global fetch) so a long CPU-only llama.cpp prefill doesn't trip
+  // undici's headersTimeout; the socket idle-timeout is the only cap (requestTimeoutMs).
+  return new Promise((resolve, reject) => {
+    const u = new URL(`${base}${path}`)
+    const data = JSON.stringify(body)
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) },
+      },
+      (res) => {
+        let buf = ''
+        res.setEncoding('utf8')
+        res.on('data', (c) => (buf += c))
+        res.on('end', () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`${base}${path} -> HTTP ${res.statusCode}: ${buf.slice(0, 300)}`))
+          } else {
+            try {
+              resolve(JSON.parse(buf))
+            } catch {
+              reject(new Error(`${base}${path} -> non-JSON response: ${buf.slice(0, 200)}`))
+            }
+          }
+        })
+      },
+    )
+    req.setTimeout(requestTimeoutMs, () => req.destroy(new Error(`${base}${path} -> idle timeout after ${requestTimeoutMs}ms`)))
+    req.on('error', reject)
+    req.write(data)
+    req.end()
   })
-  if (!res.ok) throw new Error(`${base}${path} -> HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-  return res.json()
 }
 
 async function encodeCamelid(text) {
@@ -109,12 +148,31 @@ function arraysEqual(a, b) {
 }
 
 async function main() {
+  // Phase 1 (--reference-out): capture the llama.cpp oracle ALONE, then exit — no
+  // camelid loaded, so the two engines never coexist in memory.
+  if (referenceOutPath) {
+    const captured = {}
+    for (let i = 0; i < PROMPTS.length; i++) {
+      for (const n of tokenCounts) {
+        captured[`${i}|${n}`] = await referenceCompletion(PROMPTS[i], n)
+        process.stderr.write(`captured reference ${i}|${n}\n`)
+      }
+    }
+    await mkdir(dirname(referenceOutPath), { recursive: true })
+    await writeFile(referenceOutPath, JSON.stringify(captured, null, 2))
+    process.stderr.write(`wrote reference oracle ${referenceOutPath}\n`)
+    return
+  }
+  // Phase 2 (--reference-in): compare camelid (live) vs the committed oracle — no
+  // llama.cpp loaded. Live mode (neither flag) keeps the original both-live behavior.
+  const referenceMap = referenceInPath ? JSON.parse(await readFile(referenceInPath, 'utf8')) : null
   const results = []
   let allPass = true
-  for (const prompt of PROMPTS) {
+  for (let i = 0; i < PROMPTS.length; i++) {
+    const prompt = PROMPTS[i]
     const perCount = {}
     for (const n of tokenCounts) {
-      const ref = await referenceCompletion(prompt, n)
+      const ref = referenceMap ? referenceMap[`${i}|${n}`] : await referenceCompletion(prompt, n)
       const camText = await camelidCompletion(prompt, n)
       const camTokens = await encodeCamelid(camText)
       const refContentTokens = [...ref.tokens]
