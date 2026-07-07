@@ -907,6 +907,31 @@ async fn capabilities_report_support_contract_and_planned_lanes() {
         .unwrap()
         .contains("qwen3-4b-q4_k_m-windows-cuda-resident-parity"));
 
+    // Qwen3-4B Q8_0 bounded-context ladder 512/1024/2048 promoted (raw-decode parity
+    // vs llama.cpp acd79d603). 4096/8192 stay not_promoted (oracle-prefill infra limit).
+    let qwen3_4b_q8 = compatibility
+        .iter()
+        .find(|item| item["id"] == "qwen3_4b_instruct_q8_0")
+        .unwrap();
+    assert_eq!(
+        qwen3_4b_q8["bounded_context_512_pack"],
+        "validated_bounded_pack"
+    );
+    assert_eq!(
+        qwen3_4b_q8["bounded_context_1024_pack"],
+        "validated_second_pack"
+    );
+    assert_eq!(
+        qwen3_4b_q8["bounded_context_2048_pack"],
+        "validated_third_pack"
+    );
+    assert_eq!(qwen3_4b_q8["bounded_context_4096_pack"], "not_promoted");
+    assert_eq!(qwen3_4b_q8["bounded_context_8192_pack"], "not_promoted");
+    assert!(qwen3_4b_q8["evidence"]
+        .as_str()
+        .unwrap()
+        .contains("qwen3-4b-q8-context-512-2048"));
+
     // Llama-3.2-3B K-quant rows promoted (GPU-resident raw-decode parity). Ids are the
     // normalized-filename form so the frontend exact-row matcher resolves them (the
     // llama-bpe branch only knows the Q8_0 quant and would quant-mismatch).

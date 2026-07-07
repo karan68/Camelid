@@ -3240,18 +3240,18 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 performance_measured: "not_promoted",
                 frontend_load_path_verified: "api_smoke_validated_webui_follow_up",
                 frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
-                tested_context: "chatml_1_5_50_token_short_chat_smoke_confident_probes",
+                tested_context: "chatml_1_5_50_token_short_chat_smoke_confident_probes_plus_bounded_512_1024_2048_context_raw_decode_parity",
                 chat_template_renderer: "qwen3_chatml_thinking_disabled",
                 chat_template_shape_pack: "not_started",
                 chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
-                bounded_context_512_pack: "not_promoted",
-                bounded_context_512_pack_id: "not_selected",
+                bounded_context_512_pack: "validated_bounded_pack",
+                bounded_context_512_pack_id: "qwen3-4b-context-512-2048-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_promoted",
-                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_pack: "validated_second_pack",
+                bounded_context_1024_pack_id: "qwen3-4b-context-512-2048-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "not_promoted",
-                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_pack: "validated_third_pack",
+                bounded_context_2048_pack_id: "qwen3-4b-context-512-2048-v1",
                 bounded_context_2048_window: 2048,
                 bounded_context_4096_pack: "not_promoted",
                 bounded_context_4096_pack_id: "not_selected",
@@ -3259,11 +3259,11 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "windows_x86_64_chatml_parity",
+                latest_checked_bucket: "windows_cuda_resident_bounded_context_512_1024_2048_raw_decode_parity",
                 latest_checked_result: "pass",
-                latest_checked_output: "qa/evidence-bundles/qwen3-4b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23/README.md",
-                evidence: "exact row Qwen3-4B-Q8_0.gguf (explicit head_dim path): token-AND-text-identical to llama.cpp at 1/5/50 on confident probes (capital-of-France, say-hello, 2+2). The 'Name a primary color.' probe is a documented macOS first-token near-tie; on the Windows 9632 comparator it also matched (both 'Red'). macOS bundle qa/evidence-bundles/qwen3-4b-q8-chatml-parity-20260614T054617Z-head-368ed9b; Windows bundle qa/evidence-bundles/qwen3-4b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass, cpu_reference + x86_q8 AVX2).",
-                next_step: "add WebUI smoke and normalized context/perf evidence on Windows before any broader claim",
+                latest_checked_output: "qa/evidence-bundles/qwen3-4b-q8-context-512-2048-20260706T233000Z-head-eabe9dac74fa/manifest.json",
+                evidence: "exact row Qwen3-4B-Q8_0.gguf (explicit head_dim path): token-AND-text-identical to llama.cpp at 1/5/50 on confident probes (capital-of-France, say-hello, 2+2). The 'Name a primary color.' probe is a documented macOS first-token near-tie; on the Windows 9632 comparator it also matched (both 'Red'). macOS bundle qa/evidence-bundles/qwen3-4b-q8-chatml-parity-20260614T054617Z-head-368ed9b; Windows bundle qa/evidence-bundles/qwen3-4b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass, cpu_reference + x86_q8 AVX2). BOUNDED CONTEXT 512/1024/2048 (446/968/2013 Qwen3 tokens): camelid GPU-resident decode (cuda_resident_q8) is token-AND-text-identical to pinned llama.cpp acd79d603 at 1/5/50 generated tokens on all 3 buckets — bundle qa/evidence-bundles/qwen3-4b-q8-context-512-2048-20260706T233000Z-head-eabe9dac74fa (all_pass=true), harness scripts/raw-decode-parity.mjs. NOT claimed: 4096/8192 buckets (blocked by the harness HTTP timeout on this box's CPU-only llama.cpp oracle prefill, an oracle-side infra limit — NOT a parity failure), model-native/larger context, other Qwen3 sizes/quants, or throughput.",
+                next_step: "extend the context ladder to 4096/8192 (needs a resident-capable / timeout-tolerant oracle) and add WebUI smoke before any broader claim",
             },
             // Qwen3-4B Q4_K_M (mixed Q4_K + Q6_K) — first Q4_K_M dense row promoted to
             // runtime support-contract recognition. The GPU-resident CUDA decode lane
@@ -12611,9 +12611,15 @@ mod tests {
                 target.evidence.contains("windows-x86-chatml-parity"),
                 "{id} evidence should cite the Windows bundle"
             );
-            // ChatML short-chat smoke only â€” no bounded context pack is promoted.
+            // Only Qwen3-4B Q8_0 has a promoted bounded-context ladder (512/1024/2048);
+            // the other three qwen3 rows stay ChatML short-chat smoke only.
+            let expected_ctx512 = if id == "qwen3_4b_instruct_q8_0" {
+                "validated_bounded_pack"
+            } else {
+                "not_promoted"
+            };
             assert_eq!(
-                target.bounded_context_512_pack, "not_promoted",
+                target.bounded_context_512_pack, expected_ctx512,
                 "{id} ctx512"
             );
         }
