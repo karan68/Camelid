@@ -73,6 +73,100 @@ pub struct SafeTensorsTensorDescriptor {
     pub data_offsets: [u64; 2],
 }
 
+/// Dense LLaMA tensor roles resolved from a Hugging Face SafeTensors manifest —
+/// the HF-name counterpart to the GGUF `LlamaTensorBinding`. It holds the source
+/// descriptors (name/dtype/shape/shard) for each role and deliberately does NOT
+/// open the shards, decode, transpose, or reinterpret any tensor. Orientation and
+/// dtype decode are proven in a later slice, so resolving roles here keeps
+/// SafeTensors generation gated while making the name→role mapping testable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HfLlamaTensorRoles {
+    pub token_embedding: SafeTensorsTensorDescriptor,
+    pub output_norm: SafeTensorsTensorDescriptor,
+    pub output: SafeTensorsTensorDescriptor,
+    /// True when `lm_head.weight` is absent and the output projection is tied to
+    /// `model.embed_tokens.weight` (config `tie_word_embeddings`).
+    pub output_is_tied_embedding: bool,
+    pub layers: Vec<HfLlamaLayerRoles>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HfLlamaLayerRoles {
+    pub attention_norm: SafeTensorsTensorDescriptor,
+    pub attention_q: SafeTensorsTensorDescriptor,
+    pub attention_k: SafeTensorsTensorDescriptor,
+    pub attention_v: SafeTensorsTensorDescriptor,
+    pub attention_output: SafeTensorsTensorDescriptor,
+    pub ffn_norm: SafeTensorsTensorDescriptor,
+    pub ffn_gate: SafeTensorsTensorDescriptor,
+    pub ffn_up: SafeTensorsTensorDescriptor,
+    pub ffn_down: SafeTensorsTensorDescriptor,
+}
+
+/// Resolve the dense LLaMA tensor roles from a Hugging Face SafeTensors tensor
+/// set, using `config` for the layer count and `tie_word_embeddings` for the
+/// output projection. Fails closed with a typed [`BackendError::TensorNotFound`]
+/// naming the first missing role (including an untied model that has no
+/// `lm_head.weight`). Descriptor-level only: it does not open shards or validate
+/// orientation, so it never makes the model runnable.
+pub fn resolve_hf_llama_tensor_roles(
+    descriptors: &[SafeTensorsTensorDescriptor],
+    config: &crate::model::LlamaModelConfig,
+    tie_word_embeddings: bool,
+) -> Result<HfLlamaTensorRoles> {
+    let by_name: BTreeMap<&str, &SafeTensorsTensorDescriptor> =
+        descriptors.iter().map(|d| (d.name.as_str(), d)).collect();
+    let required = |name: &str| -> Result<SafeTensorsTensorDescriptor> {
+        by_name
+            .get(name)
+            .map(|descriptor| (*descriptor).clone())
+            .ok_or_else(|| {
+                BackendError::TensorNotFound(format!(
+                    "Hugging Face SafeTensors model is missing required tensor {name}"
+                ))
+            })
+    };
+
+    let token_embedding = required("model.embed_tokens.weight")?;
+    let output_norm = required("model.norm.weight")?;
+    let (output, output_is_tied_embedding) = match by_name.get("lm_head.weight") {
+        Some(descriptor) => ((*descriptor).clone(), false),
+        None if tie_word_embeddings => (token_embedding.clone(), true),
+        None => {
+            return Err(BackendError::TensorNotFound(
+                "Hugging Face SafeTensors model has no lm_head.weight and config.json \
+                 tie_word_embeddings is false, so the output projection is unresolved"
+                    .to_string(),
+            ))
+        }
+    };
+
+    let mut layers = Vec::with_capacity(config.block_count as usize);
+    for layer in 0..config.block_count {
+        layers.push(HfLlamaLayerRoles {
+            attention_norm: required(&format!("model.layers.{layer}.input_layernorm.weight"))?,
+            attention_q: required(&format!("model.layers.{layer}.self_attn.q_proj.weight"))?,
+            attention_k: required(&format!("model.layers.{layer}.self_attn.k_proj.weight"))?,
+            attention_v: required(&format!("model.layers.{layer}.self_attn.v_proj.weight"))?,
+            attention_output: required(&format!("model.layers.{layer}.self_attn.o_proj.weight"))?,
+            ffn_norm: required(&format!(
+                "model.layers.{layer}.post_attention_layernorm.weight"
+            ))?,
+            ffn_gate: required(&format!("model.layers.{layer}.mlp.gate_proj.weight"))?,
+            ffn_up: required(&format!("model.layers.{layer}.mlp.up_proj.weight"))?,
+            ffn_down: required(&format!("model.layers.{layer}.mlp.down_proj.weight"))?,
+        });
+    }
+
+    Ok(HfLlamaTensorRoles {
+        token_embedding,
+        output_norm,
+        output,
+        output_is_tied_embedding,
+        layers,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ModelSourceReadiness {
     pub metadata_ready: bool,
@@ -1517,5 +1611,139 @@ mod tests {
             !message.contains("/var/") && !message.contains("/private/"),
             "blocker message leaked a private temp path: {message}"
         );
+    }
+
+    fn tiny_hf_summary() -> HfLlamaConfigSummary {
+        HfLlamaConfigSummary {
+            model_type: "llama".to_string(),
+            architectures: vec!["LlamaForCausalLM".to_string()],
+            hidden_size: 16,
+            num_hidden_layers: 2,
+            intermediate_size: 64,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            vocab_size: 32,
+            tie_word_embeddings: false,
+        }
+    }
+
+    fn descriptor(name: &str) -> SafeTensorsTensorDescriptor {
+        SafeTensorsTensorDescriptor {
+            name: name.to_string(),
+            dtype: "F32".to_string(),
+            shape: vec![1, 1],
+            shard_file: "model.safetensors".to_string(),
+            shard: PathBuf::from("model.safetensors"),
+            data_offsets: [0, 4],
+        }
+    }
+
+    /// Every dense-LLaMA tensor name for an `layers`-layer HF model; `lm_head` optional.
+    fn complete_hf_tensor_names(layers: u32, with_lm_head: bool) -> Vec<String> {
+        let mut names = vec![
+            "model.embed_tokens.weight".to_string(),
+            "model.norm.weight".to_string(),
+        ];
+        if with_lm_head {
+            names.push("lm_head.weight".to_string());
+        }
+        for layer in 0..layers {
+            names.extend([
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                format!("model.layers.{layer}.self_attn.q_proj.weight"),
+                format!("model.layers.{layer}.self_attn.k_proj.weight"),
+                format!("model.layers.{layer}.self_attn.v_proj.weight"),
+                format!("model.layers.{layer}.self_attn.o_proj.weight"),
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+            ]);
+        }
+        names
+    }
+
+    fn descriptors_for(names: &[String]) -> Vec<SafeTensorsTensorDescriptor> {
+        names.iter().map(|name| descriptor(name)).collect()
+    }
+
+    #[test]
+    fn from_hf_config_maps_dense_llama_fields() {
+        let config = crate::model::LlamaModelConfig::from_hf_config(&tiny_hf_summary());
+        assert_eq!(config.context_length, 128);
+        assert_eq!(config.embedding_length, 16);
+        assert_eq!(config.block_count, 2);
+        assert_eq!(config.feed_forward_length, 64);
+        assert_eq!(config.attention_head_count, 4);
+        assert_eq!(config.attention_head_count_kv, 2);
+        // head_dim = hidden_size / num_attention_heads = 16 / 4 = 4.
+        assert_eq!(config.rope_dimension_count, Some(4));
+        assert_eq!(config.rope_freq_base, Some(10_000.0));
+        assert_eq!(config.rms_norm_epsilon, 1e-5);
+        assert_eq!(config.vocab_size, Some(32));
+        // Out-of-scope shapes stay unset; the model is not made runnable here.
+        assert_eq!(config.rope_scaling_type, None);
+        assert_eq!(config.attention_key_length, None);
+        assert!(!config.rope_neox_pairing);
+        assert!(config.file_type.is_none());
+        assert!(config.moe.is_none());
+        assert!(config.gemma4.is_none());
+        assert!(config.qwen35.is_none());
+        // The derived config must pass the same dense-dims gate the GGUF path uses.
+        crate::model::DenseLlamaDims::from_config(&config).unwrap();
+    }
+
+    #[test]
+    fn resolve_hf_llama_tensor_roles_resolves_complete_two_layer_model() {
+        let config = crate::model::LlamaModelConfig::from_hf_config(&tiny_hf_summary());
+        let descriptors = descriptors_for(&complete_hf_tensor_names(2, true));
+        let roles = resolve_hf_llama_tensor_roles(&descriptors, &config, false).unwrap();
+        assert_eq!(roles.token_embedding.name, "model.embed_tokens.weight");
+        assert_eq!(roles.output_norm.name, "model.norm.weight");
+        assert_eq!(roles.output.name, "lm_head.weight");
+        assert!(!roles.output_is_tied_embedding);
+        assert_eq!(roles.layers.len(), 2);
+        assert_eq!(
+            roles.layers[1].attention_q.name,
+            "model.layers.1.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            roles.layers[0].ffn_down.name,
+            "model.layers.0.mlp.down_proj.weight"
+        );
+    }
+
+    #[test]
+    fn resolve_hf_llama_tensor_roles_ties_output_to_embedding_when_lm_head_absent() {
+        let config = crate::model::LlamaModelConfig::from_hf_config(&tiny_hf_summary());
+        let descriptors = descriptors_for(&complete_hf_tensor_names(2, false));
+        let roles = resolve_hf_llama_tensor_roles(&descriptors, &config, true).unwrap();
+        assert!(roles.output_is_tied_embedding);
+        assert_eq!(roles.output.name, "model.embed_tokens.weight");
+    }
+
+    #[test]
+    fn resolve_hf_llama_tensor_roles_rejects_untied_missing_lm_head() {
+        let config = crate::model::LlamaModelConfig::from_hf_config(&tiny_hf_summary());
+        let descriptors = descriptors_for(&complete_hf_tensor_names(2, false));
+        let err = resolve_hf_llama_tensor_roles(&descriptors, &config, false).unwrap_err();
+        assert!(matches!(err, BackendError::TensorNotFound(_)));
+        assert!(err.to_string().contains("lm_head.weight"));
+    }
+
+    #[test]
+    fn resolve_hf_llama_tensor_roles_reports_the_missing_layer_tensor() {
+        let config = crate::model::LlamaModelConfig::from_hf_config(&tiny_hf_summary());
+        let mut names = complete_hf_tensor_names(2, true);
+        names.retain(|name| name != "model.layers.1.mlp.up_proj.weight");
+        let err =
+            resolve_hf_llama_tensor_roles(&descriptors_for(&names), &config, false).unwrap_err();
+        assert!(matches!(err, BackendError::TensorNotFound(_)));
+        assert!(err
+            .to_string()
+            .contains("model.layers.1.mlp.up_proj.weight"));
     }
 }

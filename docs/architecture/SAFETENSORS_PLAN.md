@@ -285,6 +285,16 @@ The mapper must preserve orientation metadata. Do not silently transpose until a
 5. Add a `tokenizers`-backed tokenizer adapter behind a feature flag and parity tests for a tiny tokenizer fixture before exposing runtime readiness.
 6. Only after GGUF Phase 7 correctness is stable, attempt a small local HF dense model load path that reports metadata/readiness first, then one-token generation.
 
+## 2026-07-07 Progress
+
+Milestones 1–4 have landed at the descriptor/config level; generation stays gated (milestones 5–6 are unstarted):
+
+- `model_source::inspect_model_source` reports HF SafeTensors metadata/tokenizer/weights readiness with `generation_ready = false`, rejecting non-`llama` `model_type`, non-`LlamaForCausalLM` architecture, `rope_scaling`, and sliding-window attention (milestones 1–2 plus the validation half of 3).
+- `LlamaModelConfig::from_hf_config` maps a validated `HfLlamaConfigSummary` onto the dense Camelid config (milestone 3). It is total because the summary is pre-validated, and it does not make the model runnable.
+- `model_source::resolve_hf_llama_tensor_roles` is the table-driven HF-name → dense-role binder with tied-output handling and typed `TensorNotFound` fail-closed (milestone 4). It resolves descriptors only — no shard open, dtype decode, or orientation/transpose.
+
+Still gated before generation (milestones 5–6): SafeTensors dtype decode (F32/F16/BF16 → `CpuTensor`), tensor orientation/permutation against Camelid's matmul convention (HF stores Q/K un-permuted, so the `from_hf_config` RoPE-pairing choice must be revisited here), a `tokenizers` adapter with parity fixtures, and one-token dense execution.
+
 ## Non-Goals For Now
 
 - No network downloads by default.

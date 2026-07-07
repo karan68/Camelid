@@ -221,6 +221,58 @@ impl LlamaModelConfig {
             qwen35,
         })
     }
+
+    /// Build a dense-LLaMA runtime config from a validated Hugging Face
+    /// SafeTensors `config.json` summary — the HF-name counterpart to
+    /// [`Self::from_gguf`].
+    ///
+    /// The summary is produced by [`crate::model_source::inspect_model_source`],
+    /// which has already rejected every out-of-scope shape before a summary can
+    /// exist (non-`llama` `model_type`, non-`LlamaForCausalLM` architecture,
+    /// `rope_scaling`, sliding-window attention, and missing/invalid fields), so
+    /// this mapping is total: it renames the HF fields onto the dense Camelid
+    /// config and derives the per-head RoPE dimension. It does NOT make the model
+    /// runnable — SafeTensors generation stays gated until dtype decode, tensor
+    /// orientation, tokenizer parity, and one-token execution land.
+    pub fn from_hf_config(summary: &crate::model_source::HfLlamaConfigSummary) -> Self {
+        // LLaMA rotates the full per-head dimension; the summary guarantees
+        // `hidden_size % num_attention_heads == 0`, so this divides exactly.
+        let head_dim = summary.hidden_size / summary.num_attention_heads;
+        Self {
+            context_length: summary.max_position_embeddings,
+            embedding_length: summary.hidden_size,
+            block_count: summary.num_hidden_layers,
+            feed_forward_length: summary.intermediate_size,
+            attention_head_count: summary.num_attention_heads,
+            attention_head_count_kv: summary.num_key_value_heads,
+            rope_dimension_count: Some(head_dim),
+            rope_freq_base: Some(summary.rope_theta),
+            // rope_scaling is rejected upstream, so the dense config carries none.
+            rope_scaling_type: None,
+            rope_scaling_factor: None,
+            rope_scaling_original_context_length: None,
+            rope_scaling_low_freq_factor: None,
+            rope_scaling_high_freq_factor: None,
+            rms_norm_epsilon: summary.rms_norm_eps,
+            vocab_size: Some(summary.vocab_size),
+            // Runtime-only GGUF hint; absent for a SafeTensors source.
+            file_type: None,
+            // HF LlamaForCausalLM keeps head_dim == hidden_size / head_count, so
+            // there is no explicit per-head override to carry.
+            attention_key_length: None,
+            // Deferred, and coupled to the (not-yet-implemented) SafeTensors weight
+            // loader: HF stores Q/K un-permuted, so the future decode slice must
+            // either permute Q/K at load (matching llama.cpp's GGUF conversion,
+            // which is why the dense-path default is `false`) or flip this to NEOX
+            // split-half. Left `false` to match the canonical permute-at-load path;
+            // it MUST be revisited together with tensor orientation before
+            // generation is enabled for a SafeTensors source.
+            rope_neox_pairing: false,
+            moe: None,
+            gemma4: None,
+            qwen35: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
