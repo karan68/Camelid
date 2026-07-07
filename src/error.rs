@@ -36,6 +36,22 @@ pub enum BackendError {
     #[error("runtime shape mismatch: {0}")]
     RuntimeShapeMismatch(String),
 
+    // The env name is mirrored as a literal here (kept in sync with
+    // `KV_CACHE_BUDGET_LIMIT_ENV` in `src/inference/kv_cache.rs`) so the
+    // user-facing message names the override knob without threading the const
+    // through the variant. Message wording is load-bearing: the serve path
+    // surfaces it in the generation-error body.
+    #[error(
+        "KV cache growth to {positions} positions needs {needed_bytes} \
+         bytes of f32 K+V, above the {budget_bytes} byte budget for this host; reduce the prompt/context \
+         length or set CAMELID_MAX_KV_CACHE_BYTES deliberately for a controlled run"
+    )]
+    KvCacheBudgetExceeded {
+        positions: usize,
+        needed_bytes: u64,
+        budget_bytes: u64,
+    },
+
     #[error("invalid model metadata: {0}")]
     InvalidModelMetadata(String),
 

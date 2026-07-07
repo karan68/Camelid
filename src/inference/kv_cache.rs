@@ -268,12 +268,11 @@ impl LlamaKvCache {
         let projected_bytes =
             (target_sequence_length as u64).saturating_mul(self.kv_bytes_per_token());
         if projected_bytes > self.kv_budget_bytes {
-            return Err(BackendError::RuntimeShapeMismatch(format!(
-                "KV cache growth to {target_sequence_length} positions needs {projected_bytes} \
-                 bytes of f32 K+V, above the {} byte budget for this host; reduce the prompt/context \
-                 length or set {KV_CACHE_BUDGET_LIMIT_ENV} deliberately for a controlled run",
-                self.kv_budget_bytes
-            )));
+            return Err(BackendError::KvCacheBudgetExceeded {
+                positions: target_sequence_length,
+                needed_bytes: projected_bytes,
+                budget_bytes: self.kv_budget_bytes,
+            });
         }
         let values = target_sequence_length
             .checked_mul(self.plan.layer_count)
@@ -610,11 +609,12 @@ mod tests {
         assert_eq!(cache.allocated_sequence_length, 100);
         // One token over: refused BEFORE any new allocation.
         let err = cache.ensure_position_capacity(101).unwrap_err();
-        let msg = err.to_string();
         assert!(
-            msg.contains("budget"),
-            "message should explain the budget: {msg}"
+            matches!(err, BackendError::KvCacheBudgetExceeded { .. }),
+            "over-budget growth must be the typed KV budget error, got: {err:?}"
         );
+        // The user-facing message still names the override env so the operator sees the knob.
+        let msg = err.to_string();
         assert!(
             msg.contains(KV_CACHE_BUDGET_LIMIT_ENV),
             "message should name the override env: {msg}"

@@ -1294,21 +1294,13 @@ fn prefill_layer_major_scoped_q8_cache_reuses_file_reads_across_chunks() {
     );
 }
 
-/// End-to-end proof that the KV predict-and-abort budget guard fires through the
-/// real forward path, not only at the `ensure_position_capacity` unit seam: a
-/// prefill whose positions would exceed the session's KV byte budget returns a
-/// typed error and never grows the cache past the budget, so the host ceiling is
-/// refused up front instead of being discovered by OOMing mid-generation. This is
-/// the session-level counterpart to the `kv_cache.rs` cache-unit tests and closes
-/// the behavioral gap flagged in
-/// `qa/validation-notes/2026-06-25-capability-context-host-limits.md`.
-#[test]
-fn prefill_fails_closed_when_kv_budget_exceeded() {
-    let _env_guard = env_lock();
-    let _q8_guard = crate::test_support::q8_file_state_lock();
-    clear_dense_diagnostic_env();
-    let _ = q8_0_file_read_stats();
-
+/// Builds a minimal single-layer synthetic session (embedding 32, one KV head,
+/// head_dim 32, `context_length` positions) for the KV-budget guard tests. The
+/// weights are shape-valid but numerically trivial: these tests exercise only the
+/// KV growth/refusal path, not output correctness. The backing temp file is
+/// returned alongside the session because the q8 file-backed attention weight
+/// reads it lazily during the forward pass, so it must outlive the session.
+fn tiny_kv_budget_session(context_length: u32) -> (LlamaInferenceSession, tempfile::NamedTempFile) {
     let mut temp_file = tempfile::NamedTempFile::new().unwrap();
     for _ in 0..32 {
         temp_file
@@ -1318,10 +1310,8 @@ fn prefill_fails_closed_when_kv_budget_exceeded() {
     }
     temp_file.flush().unwrap();
 
-    // context_length is generous (16) so the *budget*, not the context-length cap,
-    // is the reason the prefill is refused. One layer / one KV head / head_dim 32.
     let config = LlamaModelConfig {
-        context_length: 16,
+        context_length,
         embedding_length: 32,
         block_count: 1,
         feed_forward_length: 32,
@@ -1379,7 +1369,28 @@ fn prefill_fails_closed_when_kv_budget_exceeded() {
             decode_bindings: DecodeLinearBindings::default(),
         }],
     };
-    let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+    let session = LlamaInferenceSession::new(config, weights).unwrap();
+    (session, temp_file)
+}
+
+/// End-to-end proof that the KV predict-and-abort budget guard fires through the
+/// real forward path, not only at the `ensure_position_capacity` unit seam: a
+/// prefill whose positions would exceed the session's KV byte budget returns a
+/// typed error and never grows the cache past the budget, so the host ceiling is
+/// refused up front instead of being discovered by OOMing mid-generation. This is
+/// the session-level counterpart to the `kv_cache.rs` cache-unit tests and closes
+/// the behavioral gap flagged in
+/// `qa/validation-notes/2026-06-25-capability-context-host-limits.md`.
+#[test]
+fn prefill_fails_closed_when_kv_budget_exceeded() {
+    let _env_guard = env_lock();
+    let _q8_guard = crate::test_support::q8_file_state_lock();
+    clear_dense_diagnostic_env();
+    let _ = q8_0_file_read_stats();
+
+    // context_length is generous (16) so the *budget*, not the context-length cap,
+    // is the reason the prefill is refused.
+    let (mut session, _temp_file) = tiny_kv_budget_session(16);
 
     // Budget for at most two f32 tokens (2 * 32 * 2 * 4 = 512 bytes). Overriding
     // the resolved budget on the constructed cache keeps the test independent of
@@ -1392,14 +1403,14 @@ fn prefill_fails_closed_when_kv_budget_exceeded() {
     let err = session
         .forward_prefill_layer_major_timed_fast(&[0, 1, 0, 1, 0], 1)
         .unwrap_err();
-    let msg = err.to_string();
     assert!(
-        msg.contains("budget"),
-        "the forward error must explain the KV budget: {msg}"
+        matches!(err, crate::BackendError::KvCacheBudgetExceeded { .. }),
+        "prefill over budget must return the typed KV budget error, got: {err:?}"
     );
+    // The message still names the override env so the operator sees the knob.
     assert!(
-        msg.contains("CAMELID_MAX_KV_CACHE_BYTES"),
-        "the forward error must name the override env: {msg}"
+        err.to_string().contains("CAMELID_MAX_KV_CACHE_BYTES"),
+        "the forward error must name the override env: {err}"
     );
     // Fail-closed invariants that hold whether the prefill sizes the cache in one
     // batch or grows it token-by-token: the full over-budget length is never
@@ -1434,77 +1445,9 @@ fn decode_fails_closed_when_kv_budget_exceeded_mid_generation() {
     clear_dense_diagnostic_env();
     let _ = q8_0_file_read_stats();
 
-    let mut temp_file = tempfile::NamedTempFile::new().unwrap();
-    for _ in 0..32 {
-        temp_file
-            .write_all(&f32_to_f16_bits(1.0).to_le_bytes())
-            .unwrap();
-        temp_file.write_all(&[0_u8; Q8_0_BLOCK_VALUES]).unwrap();
-    }
-    temp_file.flush().unwrap();
-
     // context_length 16 (< 512 => grow chunk 1, so allocated length tracks the
-    // position exactly); one layer / one KV head / head_dim 32.
-    let config = LlamaModelConfig {
-        context_length: 16,
-        embedding_length: 32,
-        block_count: 1,
-        feed_forward_length: 32,
-        attention_head_count: 1,
-        attention_head_count_kv: 1,
-        rope_dimension_count: Some(32),
-        rope_freq_base: Some(10_000.0),
-        rope_scaling_type: None,
-        rope_scaling_factor: None,
-        rope_scaling_original_context_length: None,
-        rope_scaling_low_freq_factor: None,
-        rope_scaling_high_freq_factor: None,
-        rms_norm_epsilon: 1.0e-5,
-        vocab_size: Some(2),
-        file_type: None,
-        rope_neox_pairing: false,
-        attention_key_length: None,
-        moe: None,
-        gemma4: None,
-        qwen35: None,
-    };
-    let dense_vector = |name: &str| CpuTensor::from_f32(name, vec![32], vec![1.0; 32]).unwrap();
-    let dense_matrix =
-        |name: &str| CpuTensor::from_f32(name, vec![32, 32], vec![0.0; 32 * 32]).unwrap();
-    let attention_q = CpuTensor::q8_0_file_backed_linear(
-        "blk.0.attn_q.weight",
-        TensorShape { dims: vec![32, 32] },
-        Q8_0FileBacking::new(temp_file.path().to_path_buf(), 0, 32),
-    );
-    let weights = LlamaLoadedWeights {
-        token_embedding: CpuTensor::from_f32(
-            "token_embd.weight",
-            vec![2, 32],
-            (0..64).map(|idx| idx as f32 * 0.001).collect(),
-        )
-        .unwrap(),
-        output_norm: dense_vector("output_norm.weight"),
-        output: None,
-        rope_freqs: None,
-        layer_range: None,
-        output_projection_binding: DecodeBindingCell::default(),
-        layers: vec![LlamaLayerWeights {
-            attention_norm: dense_vector("blk.0.attn_norm.weight"),
-            attention_q,
-            attention_k: dense_matrix("blk.0.attn_k.weight"),
-            attention_v: dense_matrix("blk.0.attn_v.weight"),
-            attention_output: dense_matrix("blk.0.attn_output.weight"),
-            attention_q_norm: None,
-            attention_k_norm: None,
-            ffn_norm: dense_vector("blk.0.ffn_norm.weight"),
-            ffn_gate: dense_matrix("blk.0.ffn_gate.weight"),
-            ffn_up: dense_matrix("blk.0.ffn_up.weight"),
-            ffn_down: dense_matrix("blk.0.ffn_down.weight"),
-            moe_router: None,
-            decode_bindings: DecodeLinearBindings::default(),
-        }],
-    };
-    let mut session = LlamaInferenceSession::new(config, weights).unwrap();
+    // position exactly).
+    let (mut session, _temp_file) = tiny_kv_budget_session(16);
 
     // Two decode steps with no effective budget cap.
     session.kv_cache.kv_budget_bytes = u64::MAX;
@@ -1518,14 +1461,13 @@ fn decode_fails_closed_when_kv_budget_exceeded_mid_generation() {
     // grow the cache, so the decode must fail closed mid-generation.
     session.kv_cache.kv_budget_bytes = allocated_bytes;
     let err = session.forward_single_token(0).unwrap_err();
-    let msg = err.to_string();
     assert!(
-        msg.contains("budget"),
-        "the mid-generation error must explain the KV budget: {msg}"
+        matches!(err, crate::BackendError::KvCacheBudgetExceeded { .. }),
+        "the mid-generation refusal must be the typed KV budget error, got: {err:?}"
     );
     assert!(
-        msg.contains("CAMELID_MAX_KV_CACHE_BYTES"),
-        "the mid-generation error must name the override env: {msg}"
+        err.to_string().contains("CAMELID_MAX_KV_CACHE_BYTES"),
+        "the mid-generation error must name the override env: {err}"
     );
     assert_eq!(
         session.kv_cache.position, 2,
