@@ -290,10 +290,10 @@ The mapper must preserve orientation metadata. Do not silently transpose until a
 Milestones 1–4 have landed at the descriptor/config level; generation stays gated (milestones 5–6 are unstarted):
 
 - `model_source::inspect_model_source` reports HF SafeTensors metadata/tokenizer/weights readiness with `generation_ready = false`, rejecting non-`llama` `model_type`, non-`LlamaForCausalLM` architecture, `rope_scaling`, and sliding-window attention (milestones 1–2 plus the validation half of 3).
-- `LlamaModelConfig::from_hf_config` maps a validated `HfLlamaConfigSummary` onto the dense Camelid config (milestone 3). It is total because the summary is pre-validated, and it does not make the model runnable.
-- `model_source::resolve_hf_llama_tensor_roles` is the table-driven HF-name → dense-role binder with tied-output handling and typed `TensorNotFound` fail-closed (milestone 4). It resolves descriptors only — no shard open, dtype decode, or orientation/transpose.
+- `HfLlamaConfigSummary::to_llama_config` maps a validated summary onto the dense Camelid config (milestone 3), honoring an explicit HF `head_dim` when set. It is total because the summary is pre-validated, and it does not make the model runnable. (Lives on the summary in `model_source` so `model` does not depend on `model_source`.)
+- `model_source::resolve_hf_llama_tensor_roles` is the table-driven HF-name → dense-role binder: tied-output handling, typed `TensorNotFound` for a missing role, and orientation-tolerant shape validation against the dense dims (`RuntimeShapeMismatch` for a mis-shaped tensor) (milestone 4). Descriptor-level only — no shard open, dtype decode, or transpose.
 
-Still gated before generation (milestones 5–6): SafeTensors dtype decode (F32/F16/BF16 → `CpuTensor`), tensor orientation/permutation against Camelid's matmul convention (HF stores Q/K un-permuted, so the `from_hf_config` RoPE-pairing choice must be revisited here), a `tokenizers` adapter with parity fixtures, and one-token dense execution.
+Still gated before generation (milestones 5–6): SafeTensors dtype decode (F32/F16/BF16 → `CpuTensor`), tensor orientation/permutation against Camelid's matmul convention (HF stores Q/K un-permuted, so the `to_llama_config` RoPE-pairing choice must be revisited here), a `tokenizers` adapter with parity fixtures, and one-token dense execution.
 
 ## Non-Goals For Now
 
