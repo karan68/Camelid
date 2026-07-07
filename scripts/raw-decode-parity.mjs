@@ -37,6 +37,13 @@ const comparatorLabel = args.get('comparator') || 'llama.cpp /completion'
 const outPath = args.get('out') || null
 const tokenCounts = (args.get('token-counts') || '1,5,50').split(',').map((s) => Number.parseInt(s.trim(), 10))
 const STOP = new Set((args.get('stop') || '128009,128001,128000').split(',').map((s) => Number.parseInt(s.trim(), 10)))
+// variant/proof_chain default to the K-quant framing this harness was first written
+// for; pass --variant / --proof-chain for other lanes (e.g. a Q8_0 GPU-resident row)
+// so the emitted parity JSON doesn't carry wrong-quant labels.
+const variant = args.get('variant') || 'kquant_gpu_resident'
+const proofChain =
+  args.get('proof-chain') ||
+  'camelid GPU-resident CUDA decode (q4k_gemv/q6k_gemv) == llama.cpp, raw-prompt token+text parity. No chat template, no f32 diagnostics. K-quant has no camelid CPU decode path yet (Phase 2), so llama.cpp is the direct reference.'
 
 let PROMPTS
 if (args.get('prompts-file')) {
@@ -131,12 +138,12 @@ async function main() {
 
   const report = {
     schema: 'camelid.raw_decode_parity.v1',
-    variant: 'kquant_gpu_resident',
+    variant,
     row_id: rowId,
     display_name: displayName,
     mode: 'raw_completion_greedy',
     comparator: comparatorLabel,
-    proof_chain: 'camelid GPU-resident CUDA decode (q4k_gemv/q6k_gemv) == llama.cpp, raw-prompt token+text parity. No chat template, no f32 diagnostics. K-quant has no camelid CPU decode path yet (Phase 2), so llama.cpp is the direct reference.',
+    proof_chain: proofChain,
     camelid_base: camelidBase,
     llama_base: llamaBase,
     token_counts: tokenCounts,
