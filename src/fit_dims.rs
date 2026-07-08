@@ -324,8 +324,13 @@ pub fn start_background(curated: Vec<(String, String, u64)>) {
 /// only, the same cheap path `/api/models/inspect` uses). `None` for a non-GGUF, an
 /// unreadable header, a non-dense/unknown architecture, or implausible dims.
 pub fn dims_from_gguf_file(path: &Path) -> Option<ModelDims> {
-    let gguf = crate::gguf::read_metadata(path).ok()?;
-    let config = crate::model::LlamaModelConfig::from_gguf(&gguf).ok()?;
+    dims_from_gguf(&crate::gguf::read_metadata(path).ok()?)
+}
+
+/// Map a parsed GGUF's metadata to dense-Llama KV dims, or `None` for a
+/// non-dense/unknown architecture or implausible values.
+fn dims_from_gguf(gguf: &crate::gguf::GgufFile) -> Option<ModelDims> {
+    let config = crate::model::LlamaModelConfig::from_gguf(gguf).ok()?;
     let dims = crate::model::DenseLlamaDims::from_config(&config).ok()?;
     let dims = ModelDims {
         layers: dims.block_count as u64,
@@ -364,10 +369,11 @@ pub fn is_safe_hf_component(s: &str) -> bool {
 }
 
 /// Fetch a model's KV dims from its GGUF header over the network. GGUF stores all
-/// metadata + tensor-info at the file start, so we range-fetch a header slice into a
-/// temp file whose *length* is set to the real size (the unfetched tail is sparse
-/// zeros the parser never reads — it only validates tensor offsets against the
-/// length), then reuse the trusted on-disk parser. Blocking; call off the executor.
+/// metadata + tensor-info at the file start, so we range-fetch a header slice and
+/// parse it directly, telling the trusted parser the model's true full length so
+/// its tensor-offset bounds checks still hold. We do NOT extend the temp file to
+/// the full size: on NTFS that allocates the whole (multi-GB) length on disk even
+/// though only the header is fetched. Blocking; call off the executor.
 fn fetch_header_dims(repo_id: &str, filename: &str, full_size: u64) -> FetchOutcome {
     // Skip inputs we shouldn't fetch: unknown size, split-model shards, and any
     // unsafe repo/filename we'd interpolate into a URL.
@@ -384,7 +390,7 @@ fn fetch_header_dims(repo_id: &str, filename: &str, full_size: u64) -> FetchOutc
     // The temp path must be unique per (repo, filename): different repos routinely
     // ship the same filename, and `in_flight` dedup is keyed by the full pair, so
     // those fetch concurrently. Filename alone would collide into one temp file and
-    // race set_len/parse/remove_file. Hash the full key for a collision-free name.
+    // race the write/parse/remove. Hash the full key for a collision-free name.
     let token = {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(repo_id, &mut hasher);
@@ -408,14 +414,12 @@ fn fetch_header_dims(repo_id: &str, filename: &str, full_size: u64) -> FetchOutc
         let _ = std::fs::remove_file(&tmp);
         return FetchOutcome::FetchError;
     }
-    // Extend the temp file to the real size so the parser's tensor-offset bounds
-    // checks pass; the tail is sparse zeros and is never read.
-    if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
-        let _ = f.set_len(full_size);
-    }
-    let dims = dims_from_gguf_file(&tmp);
+    // Parse the header prefix directly, validating tensor offsets against the real
+    // full length. No file extension, so no disk is allocated for the unfetched
+    // body.
+    let parsed = crate::gguf::read_metadata_with_len(&tmp, full_size);
     let _ = std::fs::remove_file(&tmp);
-    match dims {
+    match parsed.ok().as_ref().and_then(dims_from_gguf) {
         Some(d) => FetchOutcome::Resolved(d),
         // Fetched fine but not dense-parseable → negative (don't re-fetch).
         None => FetchOutcome::Unparseable,
@@ -676,6 +680,60 @@ mod tests {
         let dims = dims_from_gguf_file(&path).expect("minimal llama fixture should parse");
         assert_eq!(
             dims,
+            ModelDims {
+                layers: 4,
+                kv_heads: 8,
+                head_dim: 8,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_metadata_with_len_parses_a_header_prefix_without_the_body() {
+        // The same minimal llama header, but we persist ONLY the header prefix (no
+        // tensor data) and declare the true full length — exactly what the header
+        // range-fetch does, and without extending the file to the full size on disk.
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(b"GGUF");
+        push_u32(&mut hdr, 3);
+        push_i64(&mut hdr, 1);
+        push_i64(&mut hdr, 8);
+        kv_str(&mut hdr, "general.architecture", "llama");
+        kv_u32(&mut hdr, "llama.context_length", 4096);
+        kv_u32(&mut hdr, "llama.embedding_length", 64);
+        kv_u32(&mut hdr, "llama.block_count", 4);
+        kv_u32(&mut hdr, "llama.feed_forward_length", 128);
+        kv_u32(&mut hdr, "llama.attention.head_count", 8);
+        kv_u32(&mut hdr, "llama.attention.head_count_kv", 8);
+        kv_u32(&mut hdr, "llama.vocab_size", 1000);
+        push_str(&mut hdr, "token_embd.weight");
+        push_u32(&mut hdr, 2);
+        push_i64(&mut hdr, 4);
+        push_i64(&mut hdr, 2);
+        push_i32(&mut hdr, 0);
+        push_u64(&mut hdr, 0);
+        while !hdr.len().is_multiple_of(32) {
+            hdr.push(0);
+        }
+        // The tensor body we deliberately never write nor fetch.
+        let full_len = hdr.len() as u64 + 4 * 2 * 4;
+
+        let dir =
+            std::env::temp_dir().join(format!("camelid-fitdims-prefix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prefix-llama.gguf");
+        std::fs::write(&path, &hdr).unwrap(); // header prefix only
+
+        // The ordinary stat-based parser rejects it — the tensor data runs past the
+        // truncated EOF...
+        assert!(crate::gguf::read_metadata(&path).is_err());
+        // ...but validating against the declared full length parses the prefix, with
+        // no disk allocated for the absent body.
+        let gguf = crate::gguf::read_metadata_with_len(&path, full_len)
+            .expect("header prefix should parse against the declared full length");
+        assert_eq!(
+            dims_from_gguf(&gguf).unwrap(),
             ModelDims {
                 layers: 4,
                 kv_heads: 8,
