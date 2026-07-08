@@ -92,6 +92,8 @@ Prefill scales monotonically to logical cores (+21% at 16 vs 8); decode peaks ~6
 **Benchmark plan.** `cpu-prefill-matrix.mjs` default vs `CAMELID_X86_Q8_MATMUL_OWNER=ffn_down,attn,ffn` — require a measured prefill+decode gain on THIS host before promotion.
 **Rollback plan.** Flag default-off; revert is removing the route. No default changes until proven on both hosts.
 
+**STATUS UPDATE (2026-07-08, STAMPEDE Phase 3):** built and landed as PR #345 (v1 AVX2 4x4 / v2 VNNI 4x4 / v3 VNNI 4x8); re-validated at the llama.cpp b9918 pin (+12.3% 3B / +11.9% 4B prefill, engaged-checked paired sweep) and the default was FLIPPED on win-x86_64 ONLY per D15 — the both-host rule above is honored by cfg-scoping the flip to the measured host class (other targets stay Off; explicit CAMELID_X86_Q8_MATMUL_OWNER=off is the rollback). A batched Q4_K prefill owner (CAMELID_X86_KQUANT_MATMUL_OWNER, opt-in) extends the same idea to K-quant rows.
+
 **Why not now (P0)?** It's a multi-slice refactor (~6 role paths), and beating the team's existing (regressing) SIMD attempt requires careful register-tiling + profiling — not a one-session small patch. Highest-confidence lever; right next investment.
 
 ---

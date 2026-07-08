@@ -86,7 +86,16 @@ const report = {
   facts: FACTS, decode_tokens: DECODE_TOKENS, repeats: REPEATS, threads: THREADS, llama_ctx: LLAMA_CTX,
   cuda_visible_devices: process.env.CUDA_VISIBLE_DEVICES ?? '(unset!)',
   host: process.env.BENCH_HOST || 'win i7-11800H', camelid_head: process.env.CAMELID_HEAD || null,
-  llama_pin: process.env.LLAMA_PIN || 'acd79d6', repeats_detail: [], parity: {},
+  llama_pin: process.env.LLAMA_PIN || 'acd79d6',
+  // Flag provenance: which owner lanes the camelid child inherited (the whole
+  // A/B claim of a receipt hangs on these — record them, don't infer from
+  // filenames).
+  flags_env: {
+    CAMELID_X86_Q8_MATMUL_OWNER: process.env.CAMELID_X86_Q8_MATMUL_OWNER ?? '(unset: platform default)',
+    CAMELID_X86_KQUANT_MATMUL_OWNER: process.env.CAMELID_X86_KQUANT_MATMUL_OWNER ?? '(unset: off)',
+    CAMELID_WIN_PIN: process.env.CAMELID_WIN_PIN ?? '(unset: off)',
+  },
+  repeats_detail: [], parity: {},
 }
 let llama, camelid
 try {

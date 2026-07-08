@@ -3393,15 +3393,16 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
 
     for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
         let row_bytes = (in_dim / 256) * 144;
-        // Deterministic wire: small finite f16 d/dmin, arbitrary scale/min and
-        // nibble bytes (every bit pattern is structurally valid Q4_K).
+        // Deterministic wire: small finite f16 d/dmin, adversarial scale/min
+        // and nibble bytes over the FULL 0..=255 range (every bit pattern is
+        // structurally valid Q4_K; the kmask unpack caps live scales at 63).
         let wire: Vec<u8> = (0..out_dim * row_bytes)
             .map(|i| match i % 144 {
                 0 => 0x66,
                 1 => 0x2e, // d ~= 0.1
                 2 => 0x99,
                 3 => 0x24, // dmin ~= 0.018
-                pos => ((i * 31 + pos * 7 + 11) % 251) as u8,
+                pos => ((i * 31 + pos * 7 + 11) % 256) as u8,
             })
             .collect();
         for n_rows in [4usize, 5, 13, 64, 67] {
@@ -3413,7 +3414,15 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
             std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
             let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
             std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+            reset_q8_schedule_telemetry();
             let owner = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
+            // Engaged-check: if the dispatch silently stopped firing, the
+            // "owner" leg would be the base path and this test would pass
+            // vacuously.
+            assert!(
+                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken > 0,
+                "owner leg did not dispatch the owner arm (n_rows={n_rows}) — vacuous comparison"
+            );
             std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
             assert_eq!(owner.data.len(), base.data.len());
             for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
@@ -3425,6 +3434,36 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
             }
         }
     }
+}
+
+/// D15: the Q8 matmul owner default is scoped to exactly win-x86_64 — pin it
+/// so a default regression (either direction, on any target) fails loudly.
+#[test]
+fn q8_matmul_owner_default_scope_is_win_x86_64_only() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER");
+    let default_scope_on = super::q8_runtime::Q8RuntimeFlags::from_env()
+        .q8_matmul_owner
+        .is_on();
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    assert!(
+        default_scope_on,
+        "D15: owner default must be All on win-x86_64"
+    );
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    assert!(
+        !default_scope_on,
+        "owner default must stay Off on non-win-x86_64 targets"
+    );
+    std::env::set_var("CAMELID_X86_Q8_MATMUL_OWNER", "off");
+    assert!(
+        !super::q8_runtime::Q8RuntimeFlags::from_env()
+            .q8_matmul_owner
+            .is_on(),
+        "explicit =off must always win"
+    );
+    std::env::remove_var("CAMELID_X86_Q8_MATMUL_OWNER");
 }
 
 /// Scalar-vs-AVX2 twin for the owner's lifted main-side superblock dot.

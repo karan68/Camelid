@@ -17682,6 +17682,11 @@ fn matmul_rhs_transposed_q4_k_block_dot(
 /// (opt-in until receipts flip it): `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`.
 /// Honors the bench sweep's uncached-plan bypass so in-process A/B configs
 /// take effect (the same fake-null trap as the Q8 owner sweep).
+/// Scope notes: the flag is honored on every arch (the scalar twin is
+/// byte-identical too — the X86_ prefix is naming convention, not a gate),
+/// and rows ≥ 4 batched forwards INCLUDE the CPU spec-decode chunk verify
+/// (2..=8 rows), not just prompt prefill — byte-identity keeps the lossless
+/// verify contract intact there.
 fn x86_kquant_matmul_owner_enabled() -> bool {
     #[cfg(test)]
     {
@@ -17708,9 +17713,11 @@ unsafe impl Send for KQuantOwnerOutPtr {}
 unsafe impl Sync for KQuantOwnerOutPtr {}
 
 /// Main-side Q4_K×Q8_K superblock dot (exact integers), AVX2 body — the same
-/// instruction sequence as `refmath::q4_k_dot_avx2`'s main loop. Kept as the
-/// twin-test oracle for the v2 vector-accumulate kernel (production uses
-/// [`q4_k_owner_weight_row_block_avx2`]).
+/// instruction sequence as `refmath::q4_k_dot_avx2`'s main loop. Not used in
+/// production (that is [`q4_k_owner_weight_row_block_avx2`]); retained with
+/// its scalar twin test as an executable record of the per-chunk-hsum form
+/// that the v2 kernel's associativity argument starts from. v2's own contract
+/// is pinned end-to-end by the bitwise owner-vs-block-dot test.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(not(test), allow(dead_code))]
 #[target_feature(enable = "avx2")]
@@ -17758,12 +17765,16 @@ fn q4_k_owner_main_side_scalar(qs: &[u8], q8: &[i8], scales: &[u8; 8]) -> (i64, 
 /// v2 inner: one weight row × a block of input rows, AVX2. Per superblock the
 /// nibble expansion is hoisted once across the whole row block, and the
 /// main-side dot accumulates in i32 vector lanes with ONE horizontal sum per
-/// cell — every intermediate is exact integer math with proven headroom
-/// (|maddubs pair| ≤ 3810; ×255 scale ×4 chunks ≤ 15.5M per lane; hsum ≤ 124M
-/// — all ≪ i32::MAX), and integer addition is associative, so the per-cell
-/// total equals the per-chunk-hsum path bit for bit. The f32 chain per cell is
-/// verbatim `q4_k_dot_arm` order: per superblock mins-side `(-dmin).mul_add`
-/// then main-side `d.mul_add`, ascending superblocks (i outer, row inner).
+/// cell — every intermediate is exact integer math with proven headroom:
+/// q8 lanes are in [-127, 127] (`quantize_q8_k_blocks` uses iscale = -127/max
+/// plus a .min(127) clamp, so -128 is unreachable) ⇒ |maddubs pair| ≤ 2·15·127
+/// = 3810, no i16 saturation (the raw instruction bound would be 3840 at
+/// q8 = -128); madd lane ≤ 7620; × the post-kmask 6-bit scale cap of 63 ⇒
+/// ≤ 480,060; vacc lane over 8 adds ≤ 3.85M; hsum ≤ 30.8M ≈ 1.4% of i32::MAX.
+/// Integer addition is associative, so the per-cell total equals the
+/// per-chunk-hsum path bit for bit. The f32 chain per cell is verbatim
+/// `q4_k_dot_arm` order: per superblock mins-side `(-dmin).mul_add` then
+/// main-side `d.mul_add`, ascending superblocks (i outer, row inner).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(clippy::too_many_arguments)]
