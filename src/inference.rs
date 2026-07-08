@@ -43,6 +43,7 @@ mod spec_tree_lossless;
 pub mod speculative;
 pub mod suffix_decoding;
 pub mod token_recycling;
+mod win_pin;
 
 #[cfg(test)]
 use diagnostic_config::diagnostic_zero_delta_value;
@@ -4732,6 +4733,7 @@ fn build_prefill_thread_pool() -> Option<rayon::ThreadPool> {
     match rayon::ThreadPoolBuilder::new()
         .num_threads(target)
         .thread_name(|i| format!("camelid-prefill-{i}"))
+        .start_handler(|i| win_pin::pin_pool_worker("prefill", i))
         .build()
     {
         Ok(pool) => {
@@ -4880,6 +4882,7 @@ fn build_decode_thread_pool() -> Option<rayon::ThreadPool> {
     match rayon::ThreadPoolBuilder::new()
         .num_threads(target)
         .thread_name(|i| format!("camelid-decode-{i}"))
+        .start_handler(|i| win_pin::pin_pool_worker("decode", i))
         .build()
     {
         Ok(pool) => {
