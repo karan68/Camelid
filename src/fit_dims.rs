@@ -41,6 +41,11 @@ const ENTRY_TTL_SECS: u64 = 60 * 60 * 24 * 30;
 const FETCH_BACKOFF_SECS: u64 = 60 * 30;
 /// Max concurrent header fetches — bounds bandwidth and subprocess count.
 const MAX_CONCURRENT_FETCHES: usize = 4;
+/// curl connect timeout — a stalled TCP/TLS handshake must not hold a permit.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// curl overall timeout — a slow/hung transfer must release its permit and in-flight
+/// slot in bounded time (the outcome is a retriable transient error).
+const FETCH_MAX_TIME_SECS: u64 = 60;
 /// Bytes of the file head to fetch — covers metadata (incl. 128k-vocab tokenizer
 /// arrays) plus tensor-info for current catalog models; a too-small fetch simply
 /// fails to parse and the caller falls back to the estimate.
@@ -214,14 +219,22 @@ impl DimsResolver {
         }
         let permits = Arc::clone(&self.permits);
         tokio::spawn(async move {
+            // Release the in-flight slot no matter how this task ends — a permit
+            // error, or a panic anywhere in the fetch/parse/record path. Without
+            // this, a panicking fetch would pin the key and `should_fetch` would
+            // return false for it for the whole process lifetime. The happy path
+            // also clears it in `record` (atomically with the cache write); this is
+            // the panic/early-return safety net.
+            let slot = InFlightGuard {
+                resolver: self,
+                key: key.clone(),
+            };
             let permit = match permits.acquire_owned().await {
                 Ok(p) => p,
-                Err(_) => {
-                    self.clear_in_flight(&key);
-                    return;
-                }
+                Err(_) => return,
             };
             tokio::task::spawn_blocking(move || {
+                let _slot = slot;
                 let outcome = fetch_header_dims(&repo_id, &filename, size);
                 self.record(&key, outcome);
                 drop(permit);
@@ -318,6 +331,19 @@ pub fn start_background(curated: Vec<(String, String, u64)>) {
     resolver.warm(curated);
 }
 
+/// RAII marker that clears a key's in-flight slot on drop, so an early return or a
+/// panic in the spawned fetch task can never pin the key for the process lifetime.
+struct InFlightGuard {
+    resolver: &'static DimsResolver,
+    key: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.resolver.clear_in_flight(&self.key);
+    }
+}
+
 // --- GGUF header fetch + parse ---------------------------------------------
 
 /// Read a GGUF's KV dimensions from a local file WITHOUT loading weights (header
@@ -404,7 +430,16 @@ fn fetch_header_dims(repo_id: &str, filename: &str, full_size: u64) -> FetchOutc
     let range_end = HEADER_BYTES.min(full_size).saturating_sub(1);
     let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
     let fetched = std::process::Command::new("curl")
-        .args(["-fsSL", "-r", &format!("0-{range_end}"), "-o"])
+        .args([
+            "-fsSL",
+            "--connect-timeout",
+            &CONNECT_TIMEOUT_SECS.to_string(),
+            "--max-time",
+            &FETCH_MAX_TIME_SECS.to_string(),
+            "-r",
+            &format!("0-{range_end}"),
+            "-o",
+        ])
         .arg(&tmp)
         .arg(&url)
         .status()
@@ -741,6 +776,23 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_flight_guard_releases_the_slot_on_drop() {
+        // A panic or early return in the spawned fetch task must not pin the key: the
+        // RAII guard clears the in-flight marker regardless of how the task ends.
+        let resolver = global();
+        let key = "test-fitdims/in-flight-guard.gguf".to_string();
+        resolver.inner.lock().unwrap().in_flight.insert(key.clone());
+        assert!(resolver.inner.lock().unwrap().in_flight.contains(&key));
+        {
+            let _slot = InFlightGuard {
+                resolver,
+                key: key.clone(),
+            };
+        } // drop here
+        assert!(!resolver.inner.lock().unwrap().in_flight.contains(&key));
     }
 
     #[test]
