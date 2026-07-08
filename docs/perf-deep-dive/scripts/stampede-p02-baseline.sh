@@ -7,7 +7,8 @@ set -uo pipefail
 cd "$(dirname "$0")/../../.."   # repo root
 
 export CAMELID_BIN="$PWD/target/release/camelid.exe"
-export LLAMA_SERVER_BIN="/c/Users/timto/tools/llama-cpp-b9918/llama-server.exe"
+export LLAMA_SERVER_BIN="${LLAMA_SERVER_BIN:-$HOME/tools/llama-cpp-b9918/llama-server.exe}"
+MODELS_DIR="${MODELS_DIR:-$HOME/models}"
 export LLAMA_PIN="b9918-0512ef1e5"
 export CAMELID_HEAD="$(git rev-parse --short HEAD)"
 export CUDA_VISIBLE_DEVICES=-1
@@ -26,12 +27,12 @@ run_row () { # name model_path
 }
 
 # primary
-run_row llama3b-q8    "C:/Users/timto/models/Llama-3.2-3B-Instruct-Q8_0.gguf"
+run_row llama3b-q8    "$MODELS_DIR/Llama-3.2-3B-Instruct-Q8_0.gguf"
 # secondary
-run_row qwen3-4b-q8   "C:/Users/timto/models/Qwen3-4B-Q8_0.gguf"
-run_row qwen3-06b-q8  "C:/Users/timto/models/Qwen3-0.6B-Q8_0.gguf"
+run_row qwen3-4b-q8   "$MODELS_DIR/Qwen3-4B-Q8_0.gguf"
+run_row qwen3-06b-q8  "$MODELS_DIR/Qwen3-0.6B-Q8_0.gguf"
 # K-quant rows (KQUANT conductor receipts exist)
-run_row llama3b-q4km  "C:/Users/timto/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-run_row qwen3-4b-q4km "C:/Users/timto/models/Qwen3-4B-Q4_K_M.gguf"
+run_row llama3b-q4km  "$MODELS_DIR/Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+run_row qwen3-4b-q4km "$MODELS_DIR/Qwen3-4B-Q4_K_M.gguf"
 
 echo "ALL ROWS DONE -> $OUTDIR" >&2

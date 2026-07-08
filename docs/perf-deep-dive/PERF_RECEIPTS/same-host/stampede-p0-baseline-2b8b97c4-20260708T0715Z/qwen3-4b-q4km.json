@@ -1,6 +1,6 @@
 {
   "generated_utc": "2026-07-08T14:23:07.877Z",
-  "model": "C:/Users/timto/models/Qwen3-4B-Q4_K_M.gguf",
+  "model": "<home>/models/Qwen3-4B-Q4_K_M.gguf",
   "model_id": "qwen3-4b-q4km",
   "facts": 24,
   "decode_tokens": 64,
