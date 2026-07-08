@@ -202,6 +202,78 @@ pub fn advisory_footprint(weight_bytes: u64) -> FitInputs {
     }
 }
 
+/// Bytes-per-number of the KV cache, by execution path. The runtime stores KV as
+/// f32 on the CPU path and f16 (half) on the GPU-resident path — mirror that so the
+/// estimate matches what the engine actually allocates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvDtype {
+    /// CPU path — f32 (4 bytes).
+    F32,
+    /// GPU-resident path — f16 (2 bytes).
+    F16,
+}
+
+impl KvDtype {
+    /// Bytes per stored KV element.
+    pub fn bytes(self) -> u64 {
+        match self {
+            KvDtype::F32 => 4,
+            KvDtype::F16 => 2,
+        }
+    }
+}
+
+/// The architecture dimensions the KV-cache size depends on. Read from GGUF
+/// metadata (`block_count`, `attention.head_count_kv`, `head_dim`) — never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelDims {
+    pub layers: u64,
+    pub kv_heads: u64,
+    pub head_dim: u64,
+}
+
+/// Default context the advisor sizes the KV cache at — a "normal use" budget. KV
+/// grows linearly with context, and a model's *trained* max (e.g. 131072) would
+/// materialize a KV cache larger than the weights, so the advisory sizes at this
+/// fixed, realistic length rather than the theoretical max. The runtime's own KV
+/// predict-and-abort guard governs longer conversations.
+pub const ADVISORY_CONTEXT_TOKENS: u64 = 4096;
+
+/// Coarse, bounded allowance for activations + framework scratch beyond weights
+/// and KV. Small next to weights/KV for single-sequence decode; a fixed margin
+/// keeps a "fits" verdict from being optimistic without pretending precision.
+pub const ACTIVATION_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Exact KV-cache bytes for `dims` at `context_tokens` and dtype `kv`. Mirrors the
+/// runtime `kv_bytes_per_token` (`src/inference/kv_cache.rs`):
+/// `layers × kv_heads × head_dim × 2 (K+V) × dtype_bytes`, times `context_tokens`.
+pub fn kv_bytes(dims: ModelDims, context_tokens: u64, kv: KvDtype) -> u64 {
+    dims.layers
+        .saturating_mul(dims.kv_heads)
+        .saturating_mul(dims.head_dim)
+        .saturating_mul(2) // K + V
+        .saturating_mul(kv.bytes())
+        .saturating_mul(context_tokens)
+}
+
+/// Build an **exact** footprint from real model dimensions: weights (on-disk size)
+/// plus KV at `context_tokens` plus a bounded activation/scratch margin. Use this
+/// wherever GGUF metadata is available (on-disk models, the load guard) instead of
+/// the coarse [`advisory_footprint`] pad.
+pub fn exact_footprint(
+    weight_bytes: u64,
+    dims: ModelDims,
+    context_tokens: u64,
+    kv: KvDtype,
+) -> FitInputs {
+    let kv_and_scratch =
+        kv_bytes(dims, context_tokens, kv).saturating_add(ACTIVATION_SCRATCH_BYTES);
+    FitInputs {
+        weight_bytes,
+        kv_bytes_at_ctx: kv_and_scratch,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +432,81 @@ mod tests {
     fn verdict_serializes_to_snake_case() {
         let json = serde_json::to_string(&FitVerdict::FitsWithOffload).unwrap();
         assert_eq!(json, "\"fits_with_offload\"");
+    }
+
+    #[test]
+    fn kv_bytes_matches_runtime_vectors_at_one_token_f32() {
+        // These are the exact per-token figures kv_cache.rs asserts, so our estimate
+        // is correct by construction against the engine's own math.
+        // TinyLlama: 22 layers * 4 kv * 64 head_dim -> 45,056 B/token.
+        let tiny = ModelDims {
+            layers: 22,
+            kv_heads: 4,
+            head_dim: 64,
+        };
+        assert_eq!(kv_bytes(tiny, 1, KvDtype::F32), 45_056);
+        // Llama 3.2 3B: 28 * 8 * 128 -> 229,376 B/token.
+        let l3b = ModelDims {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        assert_eq!(kv_bytes(l3b, 1, KvDtype::F32), 229_376);
+    }
+
+    #[test]
+    fn kv_bytes_scales_linearly_with_context() {
+        let d = ModelDims {
+            layers: 22,
+            kv_heads: 4,
+            head_dim: 64,
+        };
+        assert_eq!(kv_bytes(d, 4096, KvDtype::F32), 45_056 * 4096);
+        assert_eq!(kv_bytes(d, 0, KvDtype::F32), 0);
+    }
+
+    #[test]
+    fn kv_f16_is_exactly_half_of_f32() {
+        let d = ModelDims {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        assert_eq!(
+            kv_bytes(d, 100, KvDtype::F16) * 2,
+            kv_bytes(d, 100, KvDtype::F32)
+        );
+    }
+
+    #[test]
+    fn exact_footprint_is_weights_plus_kv_plus_margin() {
+        let d = ModelDims {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let f = exact_footprint(3_000_000_000, d, 4096, KvDtype::F16);
+        let expected_kv = kv_bytes(d, 4096, KvDtype::F16) + ACTIVATION_SCRATCH_BYTES;
+        assert_eq!(f.weight_bytes, 3_000_000_000);
+        assert_eq!(f.kv_bytes_at_ctx, expected_kv);
+        assert_eq!(f.footprint_bytes(), 3_000_000_000 + expected_kv);
+    }
+
+    #[test]
+    fn exact_kv_for_a_big_model_at_default_context_is_bounded() {
+        // Llama-3 8B (32 layers, 8 kv, 128 head_dim) f16 KV at 4096 tokens is ~512 MiB
+        // — the KV term is modest at normal context; the trained-max context is NOT
+        // used here (that would be many GiB), which is the whole point of the default.
+        let d = ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let kv = kv_bytes(d, ADVISORY_CONTEXT_TOKENS, KvDtype::F16);
+        assert_eq!(kv, 32 * 8 * 128 * 2 * 2 * 4096); // exact
+        assert!(
+            kv < 1024 * 1024 * 1024,
+            "KV at default ctx should be < 1 GiB, got {kv}"
+        );
     }
 }

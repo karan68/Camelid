@@ -3683,12 +3683,15 @@ fn best_fitting_catalog_suggestion(hw: &crate::capability::HardwareProfile) -> O
 }
 
 /// Pure advisory message for a pre-load fit check: `Some(message)` when `hw` won't
-/// fit `size_bytes`, else `None`. Split from the IO wrapper so it is unit-testable
-/// with a synthetic host.
-fn fit_preload_message(hw: &crate::capability::HardwareProfile, size_bytes: u64) -> Option<String> {
-    if crate::fit::assess(hw, &crate::fit::advisory_footprint(size_bytes))
-        != crate::fit::FitVerdict::WontFit
-    {
+/// fit `footprint`, else `None`. `size_bytes` is the on-disk size, used only for the
+/// human-readable number. Split from the IO wrapper so it is unit-testable with a
+/// synthetic host and footprint.
+fn fit_preload_message(
+    hw: &crate::capability::HardwareProfile,
+    footprint: &crate::fit::FitInputs,
+    size_bytes: u64,
+) -> Option<String> {
+    if crate::fit::assess(hw, footprint) != crate::fit::FitVerdict::WontFit {
         return None;
     }
     let base = format!(
@@ -3704,11 +3707,28 @@ fn fit_preload_message(hw: &crate::capability::HardwareProfile, size_bytes: u64)
     })
 }
 
-/// Env + filesystem wrapper around [`fit_preload_message`]. Reads the real file
-/// size and the cached host profile, returning a typed 422 only when the model
-/// won't fit. Returns `None` (proceed unchanged) on the `CAMELID_SKIP_FIT_CHECK=1`
-/// override, a missing/zero-size file, or any non-`WontFit` verdict — so this is a
-/// pure fail-fast convenience, never a new gate on the `Fits*`/`Unknown` paths.
+/// Read the KV-relevant dimensions from a GGUF's metadata WITHOUT loading weights
+/// (header-only, the same cheap path `/api/models/inspect` uses). `None` for a
+/// non-GGUF, an unreadable header, or a non-dense/unknown architecture — callers
+/// then fall back to the coarse size-based estimate.
+fn read_model_dims(path: &std::path::Path) -> Option<crate::fit::ModelDims> {
+    let gguf = crate::gguf::read_metadata(path).ok()?;
+    let config = crate::model::LlamaModelConfig::from_gguf(&gguf).ok()?;
+    let dims = crate::model::DenseLlamaDims::from_config(&config).ok()?;
+    Some(crate::fit::ModelDims {
+        layers: dims.block_count as u64,
+        kv_heads: dims.attention_head_count_kv as u64,
+        head_dim: dims.head_dim as u64,
+    })
+}
+
+/// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
+/// memory and computes an **exact** footprint from the GGUF's real dimensions
+/// (weights + KV at a normal-use context + a bounded scratch margin) whenever the
+/// header parses, falling back to the coarse size pad otherwise. Returns a typed
+/// 422 only on a `WontFit` verdict; `None` (proceed unchanged) on the
+/// `CAMELID_SKIP_FIT_CHECK=1` override, a missing/zero-size file, or any
+/// `Fits*`/`Unknown` verdict — a fail-fast convenience, never a new hard gate.
 fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
     if std::env::var("CAMELID_SKIP_FIT_CHECK")
         .ok()
@@ -3722,8 +3742,23 @@ fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
     if size == 0 {
         return None;
     }
-    let hw = crate::capability::HardwareProfile::cached();
-    let message = fit_preload_message(hw, size)?;
+    // Live probe (not the cached startup snapshot): free VRAM/RAM shift as other
+    // apps run or a model is already loaded, and this decision must reflect *now*.
+    let hw = crate::capability::HardwareProfile::detect();
+    // Exact footprint from the GGUF's real dims when the header parses; else the pad.
+    let footprint = match read_model_dims(path) {
+        Some(dims) => {
+            // KV is stored f16 on the GPU-resident path, f32 on the CPU path.
+            let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+                crate::fit::KvDtype::F16
+            } else {
+                crate::fit::KvDtype::F32
+            };
+            crate::fit::exact_footprint(size, dims, crate::fit::ADVISORY_CONTEXT_TOKENS, kv_dtype)
+        }
+        None => crate::fit::advisory_footprint(size),
+    };
+    let message = fit_preload_message(&hw, &footprint, size)?;
     Some(api_error(
         StatusCode::UNPROCESSABLE_ENTITY,
         "model_too_large_for_host",
@@ -16638,7 +16673,8 @@ mod catalog_fit_tests {
     fn preload_message_suggests_a_fitting_alternative_for_an_oversized_model() {
         // 8 GB RAM, no GPU: a 40 GB model won't fit → actionable message.
         let hw = host(false, 0, 8 * GIB, 5 * GIB);
-        let msg = super::fit_preload_message(&hw, 40 * GIB).expect("won't fit -> message");
+        let fp = crate::fit::advisory_footprint(40 * GIB);
+        let msg = super::fit_preload_message(&hw, &fp, 40 * GIB).expect("won't fit -> message");
         assert!(msg.contains("larger than this machine"));
         assert!(msg.contains("camelid pull"));
         assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"));
@@ -16647,14 +16683,35 @@ mod catalog_fit_tests {
     #[test]
     fn preload_message_is_none_when_the_model_fits() {
         let hw = host(false, 0, 64 * GIB, 48 * GIB);
-        assert!(super::fit_preload_message(&hw, 2 * GIB).is_none());
+        let fp = crate::fit::advisory_footprint(2 * GIB);
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB).is_none());
     }
 
     #[test]
     fn preload_message_is_none_on_unprobed_host() {
         // Unknown verdict must never hard-block a load.
         let hw = host(false, 0, 0, 0);
-        assert!(super::fit_preload_message(&hw, 40 * GIB).is_none());
+        let fp = crate::fit::advisory_footprint(40 * GIB);
+        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB).is_none());
+    }
+
+    #[test]
+    fn preload_message_fires_from_an_exact_dims_footprint() {
+        // 4 GB RAM host, no GPU: a 5 GB-weights model's EXACT footprint (weights + KV
+        // at the default context + scratch) exceeds the budget → typed message.
+        let hw = host(false, 0, 4 * GIB, 3 * GIB);
+        let dims = crate::fit::ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let fp = crate::fit::exact_footprint(
+            5 * GIB,
+            dims,
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F32,
+        );
+        assert!(super::fit_preload_message(&hw, &fp, 5 * GIB).is_some());
     }
 
     #[test]

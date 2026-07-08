@@ -223,6 +223,34 @@ total)`), so the advisor and the runtime guard agree.
 - No evidence bundle minted (no screenshot gate requested); the UI line is covered
   by `vite build` and the API/CLI by the Rust suite.
 
+### Slice 5 — Exact KV footprint at the load guard — ✅ DONE
+
+Replaces the flat 25% pad with the **real** KV formula *where it gates* (the load
+guard), following the "only exact data may block" principle.
+
+- `src/fit.rs`: `ModelDims { layers, kv_heads, head_dim }`, `KvDtype {F16,F32}`,
+  `kv_bytes(dims, ctx, dtype)` = `layers × kv_heads × head_dim × 2 × dtype_bytes ×
+  ctx` — the exact mirror of `kv_cache.rs::kv_bytes_per_token`. `exact_footprint`
+  = weights + KV(ctx) + a bounded `ACTIVATION_SCRATCH_BYTES` (512 MiB). Default
+  assessment context `ADVISORY_CONTEXT_TOKENS = 4096` (KV scales linearly, so the
+  trained max is *not* used — the runtime KV guard governs longer chats).
+- **Tested against the engine's own vectors:** `kv_bytes` returns exactly 45,056
+  (TinyLlama) / 229,376 (Llama 3.2 3B) B/token — the same figures `kv_cache.rs`
+  asserts — so it is correct by construction. Plus context-linearity and
+  f16 = ½·f32 tests.
+- Load guard (`fit_preload_guard`): now probes **live** memory
+  (`HardwareProfile::detect()`, not the cached snapshot) and computes an **exact**
+  footprint via `read_model_dims` (header-only `gguf::read_metadata` →
+  `LlamaModelConfig::from_gguf` → `DenseLlamaDims::from_config`), picking f16 KV on
+  a GPU host / f32 on CPU. Falls back to the coarse pad when the header can't be
+  parsed (non-GGUF / unknown arch). The catalog **badge stays on the pad** (it's
+  advisory, un-gated) — pre-download exact dims (build-time table / header
+  range-fetch) are the Phase-2/3 follow-ups.
+- Gates: `cargo test --lib` → **694 passed, 0 failed**; fmt + clippy(lib) clean.
+  Live-verified end-to-end: `POST /api/models/load` on a 40 GB file →
+  `422 model_too_large_for_host` with the actionable "largest that fits" message;
+  catalog chips unchanged (no regression).
+
 ## 9. UX placement decision (locked)
 
 The verdict is most valuable **at model-selection time**, embedded in the
