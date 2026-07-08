@@ -791,6 +791,20 @@ pub struct LlamaServerModelListCamelid {
 }
 
 #[derive(Debug, Serialize)]
+pub struct LlamaServerModelLoadResponse {
+    pub data: LlamaServerModelListItem,
+    pub camelid: LlamaServerModelLoadCamelid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LlamaServerModelLoadCamelid {
+    pub compatibility: &'static str,
+    pub scope: &'static str,
+    pub model_path_redacted: bool,
+    pub unsupported: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct LlamaServerPropsResponse {
     pub default_generation_settings: LlamaServerDefaultGenerationSettings,
     pub total_slots: u32,
@@ -859,6 +873,15 @@ pub struct LlamaServerPropsCamelid {
 pub struct LlamaServerReadOnlyQuery {
     #[serde(flatten)]
     pub unsupported_fields: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LlamaServerModelsLoadRequest {
+    pub model: Option<PathBuf>,
+    pub path: Option<PathBuf>,
+    pub id: Option<String>,
+    #[serde(flatten)]
+    pub unsupported_fields: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1461,7 +1484,7 @@ pub fn router_with_state(state: AppState) -> Router {
         .route("/detokenize", post(llama_server_detokenize))
         .route("/apply-template", post(llama_server_apply_template))
         .route("/models", get(llama_server_models))
-        .route("/models/load", post(unsupported_llama_server_models_load))
+        .route("/models/load", post(llama_server_models_load))
         .route(
             "/models/unload",
             post(unsupported_llama_server_models_unload),
@@ -1750,7 +1773,6 @@ async fn llama_server_models(
                 "router_model_cache_listing",
                 "models_reload",
                 "models_autoload",
-                "models_load",
                 "models_unload",
                 "multimodal_architecture_metadata",
             ],
@@ -1759,12 +1781,103 @@ async fn llama_server_models(
     .into_response()
 }
 
-async fn unsupported_llama_server_models_load() -> Response {
-    unsupported_route(
-        "unsupported_llama_server_models_load",
-        "POST /models/load is not supported yet; Camelid keeps native llama-server router-mode model loading separate from the stable /api/models/load path until cache listing, autoload, and support-contract behavior are implemented and tested",
-        Some("model"),
-    )
+async fn llama_server_models_load(
+    State(state): State<AppState>,
+    payload: std::result::Result<Json<LlamaServerModelsLoadRequest>, JsonRejection>,
+) -> Response {
+    let Json(req) = match payload {
+        Ok(payload) => payload,
+        Err(err) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_json",
+                format!("invalid /models/load JSON request: {err}"),
+                Some("body"),
+            )
+        }
+    };
+
+    if !req.unsupported_fields.is_empty() {
+        let mut fields: Vec<_> = req.unsupported_fields.keys().cloned().collect();
+        fields.sort();
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "unsupported_parameter",
+            format!(
+                "unsupported /models/load field(s): {}. Camelid supports only a narrow local load alias with model/path plus optional id; router-mode cache, reload, autoload, and model-management semantics remain unsupported.",
+                fields.join(", ")
+            ),
+            Some("body"),
+        );
+    }
+
+    if req.model.is_some() && req.path.is_some() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "ambiguous_model_path",
+            "POST /models/load accepts either `model` or `path`, not both; send one local GGUF path for the narrow load alias.".to_string(),
+            Some("model"),
+        );
+    }
+
+    let Some(path) = req.model.or(req.path) else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "missing_model_path",
+            "POST /models/load requires a local GGUF path in `model` or `path`; router cache names and autoload semantics are not supported.".to_string(),
+            Some("model"),
+        );
+    };
+
+    match load_model_from_path(&state, path, req.id).await {
+        Ok(loaded) => {
+            let item = LlamaServerModelListItem {
+                id: loaded.id.clone(),
+                path: None,
+                status: LlamaServerModelStatus {
+                    value: "loaded",
+                    args: Vec::new(),
+                },
+                architecture: LlamaServerModelArchitecture {
+                    input_modalities: vec!["text"],
+                    output_modalities: vec!["text"],
+                },
+                camelid: LlamaServerModelCamelid {
+                    generation_ready: loaded_model_generation_ready(&loaded),
+                    model_path_redacted: true,
+                },
+            };
+            Json(LlamaServerModelLoadResponse {
+                data: item,
+                camelid: LlamaServerModelLoadCamelid {
+                    compatibility: "partial_llama_server_models_load_local_path",
+                    scope: "single_local_model_load_alias",
+                    model_path_redacted: true,
+                    unsupported: vec![
+                        "router_model_cache_listing",
+                        "models_reload",
+                        "models_autoload",
+                        "models_unload",
+                        "multimodal_architecture_metadata",
+                        "full_llama_server_model_management",
+                    ],
+                },
+            })
+            .into_response()
+        }
+        Err(err) => llama_server_models_load_error(err),
+    }
+}
+
+fn llama_server_models_load_error(err: BackendError) -> Response {
+    let code = backend_error_code(&err);
+    let message = match err {
+        BackendError::Io { source, .. } => {
+            format!("failed to load requested local GGUF path: {source}")
+        }
+        other => other.to_string(),
+    };
+    api_error(StatusCode::BAD_REQUEST, code, message, Some("model"))
 }
 
 async fn unsupported_llama_server_models_unload() -> Response {
@@ -3509,7 +3622,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "llama_server_models",
                 status: "partial",
-                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. Router-mode query params such as reload/autoload/model selection, cache listing, POST /models/load, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
+                notes: "GET /models returns a privacy-safe read-only list of currently loaded Camelid models with redacted paths and text-only architecture metadata. POST /models/load is a narrow local-path alias over Camelid's stable /api/models/load path and returns a redacted compatibility response. Router-mode query params such as reload/autoload/model selection, cache listing, POST /models/unload, multimodal metadata, and full llama-server model-management parity remain unsupported.",
             },
             SupportItem {
                 id: "llama_server_props",
@@ -3534,7 +3647,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
             SupportItem {
                 id: "fail_closed_native_compatibility_routes",
                 status: "unsupported",
-                notes: "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/load, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /completion modes remain typed parameter errors.",
+                notes: "Native /infill, /metrics, /embedding, /embeddings, /v1/embeddings, /v1/messages, /rerank, /reranking, /v1/rerank, /v1/reranking, /v1/responses, POST /models/unload, POST /slots, and slot cache actions return typed not_implemented errors until real route semantics and backend support exist. Unsupported /models/load router-mode fields and /completion modes remain typed parameter errors.",
             },
             SupportItem {
                 id: "multi_choice_generation",
