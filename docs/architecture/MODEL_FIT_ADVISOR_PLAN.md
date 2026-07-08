@@ -190,19 +190,27 @@ total)`), so the advisor and the runtime guard agree.
 - JSON is **additive** (`fit`, `task_tags` new keys) — no frontend change yet;
   the WebUI ignores them until Slice 3.
 
-### Slice 3 — UX surfaces
-- **WebUI:** in `CatalogLaneBrowse.jsx`, add a fit chip beside the lane chip —
-  `✓ Fits · ⚠ Needs offload/quant · ✗ Too big for this machine · (unknown)`.
-  Copy is advisory and separate from the lane/support chip. Download stays
-  **un-gated** (parity with today's line ~67 stance); the chip informs, it does
-  not block.
-- **CLI:** `print_catalog` in `src/catalog.rs` gains a fit column when a
-  `HardwareProfile` is available.
-- **Load guard (fail-fast, friendly):** in the `load_model` handler behind
-  `POST /api/models/load` (`src/api/mod.rs:1475`), when a curated row assesses
-  `WontFit`, return a **typed** advisory error naming the best-fitting
-  alternative — *before* the existing mid-load `VramShortfall`/KV abort. This is
-  additive: unknown/`Fits*` paths are unchanged.
+### Slice 3 — UX surfaces — ✅ DONE
+- **WebUI** (`CatalogLaneBrowse.jsx`): a dedicated **"This machine:"** advisory
+  line per curated row — `Fits your machine` / `Fits (GPU + RAM offload)` /
+  `Fits (CPU)` / `Too big for this machine` — plus `· best for <tags>`. Kept on
+  its **own line**, visually distinct from the lane/support chip (fit axis ≠
+  support axis); `wont_fit` uses the existing `catalog-row-error` style, others
+  `catalog-row-faint`. `unknown`/experimental rows show nothing. Download stays
+  **un-gated** — the line informs, it does not block. `vite build` ✅.
+- **CLI** (`print_catalog`, `src/catalog.rs`): a `FIT (this host)` column via
+  `FitVerdict::cli_label()` (`fits` / `fits (offload)` / `fits (CPU)` / `too big`
+  / `unknown`), hardware probed once.
+- **Load guard** (`load_model`, `POST /api/models/load`): `fit_preload_guard`
+  stats the file, and on a `WontFit` verdict returns a typed **422
+  `model_too_large_for_host`** naming the largest catalog row that *does* fit —
+  **before** the long load / mid-load OOM. Fires only on `WontFit` from a probed
+  host; `Unknown`/`Fits*` and a `CAMELID_SKIP_FIT_CHECK=1` override proceed
+  unchanged, so it is a fail-fast convenience, not a new hard gate. Pure decision
+  split into testable `fit_preload_message` + `best_fitting_catalog_suggestion`.
+- Tests: 4 new (`preload_message_*`, `best_fitting_suggestion_*`) → 9 in
+  `catalog_fit_tests`. Gates: `cargo fmt` ✅ · `cargo clippy --lib` ✅ ·
+  `cargo test --lib` → **688 passed, 0 failed** ✅ · frontend `vite build` ✅.
 
 ### Slice 4 — Docs/ledger alignment
 - Cross-link this plan from `ROADMAP.md`; note in `COMPATIBILITY.md` that the fit

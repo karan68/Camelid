@@ -41,6 +41,25 @@ function laneChip(lane) {
   return <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
 }
 
+/* Capacity advisory for THIS host (fit axis, NOT a support claim — kept on its own
+   line, never merged into the lane/support chip). `item.fit` is the backend
+   FitVerdict; `unknown`/missing (e.g. unprobed host, experimental rows) shows
+   nothing rather than guessing. */
+function fitLabel(fit) {
+  switch (fit) {
+    case 'fits_resident':
+      return 'Fits your machine'
+    case 'fits_with_offload':
+      return 'Fits (GPU + RAM offload)'
+    case 'cpu_only_ok':
+      return 'Fits (CPU)'
+    case 'wont_fit':
+      return 'Too big for this machine'
+    default:
+      return null
+  }
+}
+
 function CatalogRow({
   item,
   capabilities,
@@ -158,6 +177,14 @@ function CatalogRow({
         </div>
         {laneChip(lane)}
       </div>
+      {item.group !== 'experimental' && fitLabel(item.fit) ? (
+        <p className={item.fit === 'wont_fit' ? 'catalog-row-error' : 'catalog-row-faint'}>
+          This machine: {fitLabel(item.fit)}
+          {Array.isArray(item.task_tags) && item.task_tags.length
+            ? ` · best for ${item.task_tags.join(', ')}`
+            : ''}
+        </p>
+      ) : null}
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
 
       {installed ? (

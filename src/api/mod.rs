@@ -3668,7 +3668,77 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
     }
 }
 
+/// The largest curated row that has a positive fit on `hw`, as a ready-to-run
+/// suggestion string. `None` when nothing in the catalog fits (or the host is
+/// unprobed). Used to make the pre-load "too big" error actionable.
+fn best_fitting_catalog_suggestion(hw: &crate::capability::HardwareProfile) -> Option<String> {
+    curated_catalog()
+        .into_iter()
+        .filter(|item| {
+            crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes))
+                .is_positive_fit()
+        })
+        .max_by_key(|item| item.size_bytes)
+        .map(|item| format!("{} (`camelid pull {}`)", item.name, item.catalog_id))
+}
+
+/// Pure advisory message for a pre-load fit check: `Some(message)` when `hw` won't
+/// fit `size_bytes`, else `None`. Split from the IO wrapper so it is unit-testable
+/// with a synthetic host.
+fn fit_preload_message(hw: &crate::capability::HardwareProfile, size_bytes: u64) -> Option<String> {
+    if crate::fit::assess(hw, &crate::fit::advisory_footprint(size_bytes))
+        != crate::fit::FitVerdict::WontFit
+    {
+        return None;
+    }
+    let base = format!(
+        "This model (~{:.1} GB) is larger than this machine can hold in memory.",
+        size_bytes as f64 / 1e9
+    );
+    Some(match best_fitting_catalog_suggestion(hw) {
+        Some(alt) => format!(
+            "{base} The largest catalog model that fits here is {alt}. \
+             Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+        ),
+        None => format!("{base} Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."),
+    })
+}
+
+/// Env + filesystem wrapper around [`fit_preload_message`]. Reads the real file
+/// size and the cached host profile, returning a typed 422 only when the model
+/// won't fit. Returns `None` (proceed unchanged) on the `CAMELID_SKIP_FIT_CHECK=1`
+/// override, a missing/zero-size file, or any non-`WontFit` verdict — so this is a
+/// pure fail-fast convenience, never a new gate on the `Fits*`/`Unknown` paths.
+fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
+    if std::env::var("CAMELID_SKIP_FIT_CHECK")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        == Some("1")
+    {
+        return None;
+    }
+    let size = std::fs::metadata(path).ok()?.len();
+    if size == 0 {
+        return None;
+    }
+    let hw = crate::capability::HardwareProfile::cached();
+    let message = fit_preload_message(hw, size)?;
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "model_too_large_for_host",
+        message,
+        Some("path"),
+    ))
+}
+
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
+    // Advisory fail-fast (fit axis, never a support claim): steer away from a
+    // near-certain OOM before the expensive load. Overridable via
+    // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
+    if let Some(resp) = fit_preload_guard(&req.path) {
+        return resp;
+    }
     match load_model_from_path(&state, req.path, req.id).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
@@ -16562,6 +16632,39 @@ mod catalog_fit_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn preload_message_suggests_a_fitting_alternative_for_an_oversized_model() {
+        // 8 GB RAM, no GPU: a 40 GB model won't fit → actionable message.
+        let hw = host(false, 0, 8 * GIB, 5 * GIB);
+        let msg = super::fit_preload_message(&hw, 40 * GIB).expect("won't fit -> message");
+        assert!(msg.contains("larger than this machine"));
+        assert!(msg.contains("camelid pull"));
+        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"));
+    }
+
+    #[test]
+    fn preload_message_is_none_when_the_model_fits() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        assert!(super::fit_preload_message(&hw, 2 * GIB).is_none());
+    }
+
+    #[test]
+    fn preload_message_is_none_on_unprobed_host() {
+        // Unknown verdict must never hard-block a load.
+        let hw = host(false, 0, 0, 0);
+        assert!(super::fit_preload_message(&hw, 40 * GIB).is_none());
+    }
+
+    #[test]
+    fn best_fitting_suggestion_picks_something_on_a_big_host_and_never_panics_on_tiny() {
+        let big = host(false, 0, 64 * GIB, 48 * GIB);
+        let s = super::best_fitting_catalog_suggestion(&big).expect("a row fits a 64 GB host");
+        assert!(s.contains("camelid pull"));
+        // On a tiny host only small rows fit (or none) — must not panic either way.
+        let tiny = host(false, 0, 4 * GIB, 3 * GIB);
+        let _ = super::best_fitting_catalog_suggestion(&tiny);
     }
 }
 

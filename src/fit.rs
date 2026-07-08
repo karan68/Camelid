@@ -77,6 +77,18 @@ impl FitVerdict {
             FitVerdict::FitsResident | FitVerdict::FitsWithOffload | FitVerdict::CpuOnlyOk
         )
     }
+
+    /// Short human label for a CLI column or terse log. UI surfaces (WebUI) author
+    /// their own copy; this is the terminal-facing wording.
+    pub fn cli_label(self) -> &'static str {
+        match self {
+            FitVerdict::FitsResident => "fits",
+            FitVerdict::FitsWithOffload => "fits (offload)",
+            FitVerdict::CpuOnlyOk => "fits (CPU)",
+            FitVerdict::WontFit => "too big",
+            FitVerdict::Unknown => "unknown",
+        }
+    }
 }
 
 /// The footprint of a model to assess, in bytes.

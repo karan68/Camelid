@@ -182,13 +182,21 @@ fn download(item: &CatalogItem, models_dir: &Path) -> anyhow::Result<PathBuf> {
 
 fn print_catalog(entries: &[CatalogItem]) {
     eprintln!("Supported models (download into ./models):\n");
-    eprintln!("  {:<28} {:<8} {:>8}  NAME", "ID", "QUANT", "SIZE");
+    // Annotate each row with a capacity verdict for THIS host (fit axis only — not
+    // a support claim). Probed once, reused across rows.
+    let hw = crate::capability::HardwareProfile::cached();
+    eprintln!(
+        "  {:<28} {:<8} {:>8}  {:<15} NAME",
+        "ID", "QUANT", "SIZE", "FIT (this host)"
+    );
     for item in entries {
+        let verdict = crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes));
         eprintln!(
-            "  {:<28} {:<8} {:>6.1} GB  {}",
+            "  {:<28} {:<8} {:>6.1} GB  {:<15} {}",
             item.catalog_id,
             item.quant,
             item.size_bytes as f64 / 1e9,
+            verdict.cli_label(),
             item.name,
         );
     }
