@@ -225,11 +225,22 @@ impl KvDtype {
 
 /// The architecture dimensions the KV-cache size depends on. Read from GGUF
 /// metadata (`block_count`, `attention.head_count_kv`, `head_dim`) — never guessed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModelDims {
     pub layers: u64,
     pub kv_heads: u64,
     pub head_dim: u64,
+}
+
+impl ModelDims {
+    /// Sanity bounds so a mis-parsed or adversarial header can't drive absurd KV
+    /// math. Comfortably covers every real dense LLM (largest today ~140 layers,
+    /// ~128 kv heads, 256 head_dim) with wide headroom.
+    pub fn is_plausible(self) -> bool {
+        (1..=400).contains(&self.layers)
+            && (1..=256).contains(&self.kv_heads)
+            && (1..=2048).contains(&self.head_dim)
+    }
 }
 
 /// Default context the advisor sizes the KV cache at — a "normal use" budget. KV
@@ -508,5 +519,58 @@ mod tests {
             kv < 1024 * 1024 * 1024,
             "KV at default ctx should be < 1 GiB, got {kv}"
         );
+    }
+
+    #[test]
+    fn model_dims_plausibility_bounds() {
+        assert!(ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128
+        }
+        .is_plausible());
+        assert!(ModelDims {
+            layers: 1,
+            kv_heads: 1,
+            head_dim: 1
+        }
+        .is_plausible());
+        // Zero or absurd values (a mis-parsed header) are rejected.
+        assert!(!ModelDims {
+            layers: 0,
+            kv_heads: 8,
+            head_dim: 128
+        }
+        .is_plausible());
+        assert!(!ModelDims {
+            layers: 32,
+            kv_heads: 0,
+            head_dim: 128
+        }
+        .is_plausible());
+        assert!(!ModelDims {
+            layers: 100_000,
+            kv_heads: 8,
+            head_dim: 128
+        }
+        .is_plausible());
+        assert!(!ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 999_999
+        }
+        .is_plausible());
+    }
+
+    #[test]
+    fn model_dims_serde_round_trips() {
+        let d = ModelDims {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        let back: ModelDims = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
     }
 }

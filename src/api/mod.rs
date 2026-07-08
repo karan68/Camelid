@@ -3715,11 +3715,41 @@ fn read_model_dims(path: &std::path::Path) -> Option<crate::fit::ModelDims> {
     let gguf = crate::gguf::read_metadata(path).ok()?;
     let config = crate::model::LlamaModelConfig::from_gguf(&gguf).ok()?;
     let dims = crate::model::DenseLlamaDims::from_config(&config).ok()?;
-    Some(crate::fit::ModelDims {
+    let dims = crate::fit::ModelDims {
         layers: dims.block_count as u64,
         kv_heads: dims.attention_head_count_kv as u64,
         head_dim: dims.head_dim as u64,
-    })
+    };
+    // Reject a mis-parsed header that yielded absurd dims rather than trust it.
+    dims.is_plausible().then_some(dims)
+}
+
+/// A GGUF filename that is one shard of a split export (e.g.
+/// `model.shard-00001-of-00005.gguf` or `model-00001-of-00003.gguf`) is not a
+/// standalone loadable model, so we make no fit claim for it.
+fn is_gguf_shard(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    let Some(idx) = lower.find("-of-") else {
+        return false;
+    };
+    let left_is_num = lower[..idx]
+        .rsplit('-')
+        .next()
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    let right_is_num = lower[idx + 4..]
+        .split(['-', '.'])
+        .next()
+        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+    left_is_num && right_is_num
+}
+
+/// A Hugging Face repo id / filename we will safely interpolate into a resolve
+/// URL: non-empty, no path traversal, only expected URL-path characters.
+fn is_safe_hf_component(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
 }
 
 /// Fetch a model's KV dimensions from its GGUF **header only** over the network,
@@ -3740,7 +3770,12 @@ fn remote_model_dims(
     /// catalog models, while keeping the per-row cost small (never the weights). A
     /// too-small fetch just fails to parse and the caller falls back to the estimate.
     const HEADER_BYTES: u64 = 12 * 1024 * 1024;
-    if full_size == 0 {
+    // Skip files we shouldn't fetch: unknown size, split-model shards (not a
+    // standalone model), and any unsafe repo/filename we'd put into a URL.
+    if full_size == 0 || is_gguf_shard(filename) {
+        return None;
+    }
+    if !is_safe_hf_component(repo_id) || filename.contains('/') || !is_safe_hf_component(filename) {
         return None;
     }
     let safe: String = filename
@@ -3773,12 +3808,67 @@ fn remote_model_dims(
 
 /// Process-wide cache of remote header dims, keyed by `repo/filename`. A stored
 /// `None` records a prior failed/unavailable fetch so we don't hammer the Hub.
+/// Successful entries are persisted to disk (see [`fit_dims_cache_path`]) so a
+/// server restart doesn't re-fetch every header.
 type RemoteDimsCache =
     std::sync::Mutex<std::collections::HashMap<String, Option<crate::fit::ModelDims>>>;
 
+/// Where the on-disk dims cache lives. Honors `CAMELID_FIT_DIMS_CACHE` (tests use
+/// it for isolation); otherwise the per-user OS cache dir, else the temp dir.
+fn fit_dims_cache_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("CAMELID_FIT_DIMS_CACHE") {
+        return std::path::PathBuf::from(p);
+    }
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache"))
+            })
+    };
+    base.unwrap_or_else(std::env::temp_dir)
+        .join("camelid")
+        .join("fit-dims-cache.json")
+}
+
+/// Read the persisted (successful) dims map from `path`. Missing or corrupt → empty.
+fn read_dims_cache_file(
+    path: &std::path::Path,
+) -> std::collections::HashMap<String, crate::fit::ModelDims> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the successful dims map to `path` (best-effort; creates the parent dir).
+fn write_dims_cache_file(
+    path: &std::path::Path,
+    map: &std::collections::HashMap<String, crate::fit::ModelDims>,
+) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(map) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
 fn remote_dims_cache() -> &'static RemoteDimsCache {
     static CACHE: std::sync::OnceLock<RemoteDimsCache> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    CACHE.get_or_init(|| {
+        // Seed from the on-disk cache so restarts reuse previously-read headers.
+        // Skipped under test to keep the global cache hermetic.
+        let mut map = std::collections::HashMap::new();
+        if !cfg!(test) {
+            for (k, v) in read_dims_cache_file(&fit_dims_cache_path()) {
+                map.insert(k, Some(v));
+            }
+        }
+        std::sync::Mutex::new(map)
+    })
 }
 
 fn remote_dims_key(repo_id: &str, filename: &str) -> String {
@@ -3798,6 +3888,16 @@ fn cached_remote_dims(repo_id: &str, filename: &str) -> Option<Option<crate::fit
 fn store_remote_dims(repo_id: &str, filename: &str, dims: Option<crate::fit::ModelDims>) {
     if let Ok(mut map) = remote_dims_cache().lock() {
         map.insert(remote_dims_key(repo_id, filename), dims);
+        // Persist the successful subset so a restart doesn't re-fetch. Failures
+        // (`None`) stay memory-only so a transient error retries next run. Skipped
+        // under test to avoid touching the real user cache.
+        if dims.is_some() && !cfg!(test) {
+            let persist: std::collections::HashMap<String, crate::fit::ModelDims> = map
+                .iter()
+                .filter_map(|(k, v)| v.map(|d| (k.clone(), d)))
+                .collect();
+            write_dims_cache_file(&fit_dims_cache_path(), &persist);
+        }
     }
 }
 
@@ -17034,6 +17134,50 @@ mod catalog_fit_tests {
             crate::fit::KvDtype::F32, // CPU host
         );
         assert_eq!(fp_exact, expected);
+    }
+
+    #[test]
+    fn shard_filenames_are_detected() {
+        assert!(super::is_gguf_shard("model.shard-00001-of-00005.gguf"));
+        assert!(super::is_gguf_shard("Meta-Llama-70B-00001-of-00003.gguf"));
+        assert!(!super::is_gguf_shard("Qwen3-0.6B-Q8_0.gguf"));
+        assert!(!super::is_gguf_shard("Llama-3.2-1B-Instruct-Q8_0.gguf"));
+        assert!(!super::is_gguf_shard("something-of-value.gguf")); // "-of-" but not numeric
+    }
+
+    #[test]
+    fn unsafe_hf_components_are_rejected() {
+        assert!(super::is_safe_hf_component("Qwen/Qwen3-0.6B-GGUF"));
+        assert!(super::is_safe_hf_component("Model-Q8_0.gguf"));
+        assert!(!super::is_safe_hf_component("")); // empty
+        assert!(!super::is_safe_hf_component("../../etc/passwd")); // traversal
+        assert!(!super::is_safe_hf_component("repo/../x")); // traversal
+        assert!(!super::is_safe_hf_component("bad name.gguf?x=1")); // space + query char
+    }
+
+    #[test]
+    fn dims_cache_file_round_trips_and_tolerates_missing_corrupt() {
+        let dir =
+            std::env::temp_dir().join(format!("camelid-fit-cache-test-{}", std::process::id()));
+        let path = dir.join("dims.json");
+        // Missing file → empty (no panic).
+        assert!(super::read_dims_cache_file(&path).is_empty());
+        // Write then read back.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf".to_string(),
+            crate::fit::ModelDims {
+                layers: 28,
+                kv_heads: 8,
+                head_dim: 128,
+            },
+        );
+        super::write_dims_cache_file(&path, &map);
+        assert_eq!(super::read_dims_cache_file(&path), map);
+        // Corrupt content → empty (no panic).
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(super::read_dims_cache_file(&path).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
