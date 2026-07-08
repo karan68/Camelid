@@ -60,6 +60,28 @@ function fitLabel(fit) {
   }
 }
 
+/* A small CPU/chip glyph so the capacity chip reads as "your hardware" — distinct
+   from the support/lane chips. A check (fits) or cross (too big) sits in the die. */
+function FitIcon({ bad }) {
+  const stroke = 'currentColor'
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="4.5" y="4.5" width="7" height="7" rx="1.2" stroke={stroke} strokeWidth="1.3" />
+      {bad ? (
+        <path d="M6.4 6.4l3.2 3.2M9.6 6.4l-3.2 3.2" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" />
+      ) : (
+        <path d="M6 8.2l1.4 1.4L10 6.6" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+      )}
+      <path
+        d="M6.5 2.6v1.9M9.5 2.6v1.9M6.5 11.5v1.9M9.5 11.5v1.9M2.6 6.5h1.9M2.6 9.5h1.9M11.5 6.5h1.9M11.5 9.5h1.9"
+        stroke={stroke}
+        strokeWidth="1.1"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
 function CatalogRow({
   item,
   capabilities,
@@ -178,12 +200,22 @@ function CatalogRow({
         {laneChip(lane)}
       </div>
       {item.group !== 'experimental' && fitLabel(item.fit) ? (
-        <p className={item.fit === 'wont_fit' ? 'catalog-row-error' : 'catalog-row-faint'}>
-          This machine: {fitLabel(item.fit)}
-          {Array.isArray(item.task_tags) && item.task_tags.length
-            ? ` · best for ${item.task_tags.join(', ')}`
-            : ''}
-        </p>
+        <div className="catalog-fit-row">
+          <span className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}`}>
+            <FitIcon bad={item.fit === 'wont_fit'} />
+            {fitLabel(item.fit)}
+          </span>
+          {Array.isArray(item.task_tags) && item.task_tags.length ? (
+            <span className="catalog-fit-tags">
+              <span className="catalog-fit-tags-label">best for</span>
+              {item.task_tags.map((tag) => (
+                <span key={tag} className="catalog-fit-tag">
+                  {tag}
+                </span>
+              ))}
+            </span>
+          ) : null}
+        </div>
       ) : null}
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
 
