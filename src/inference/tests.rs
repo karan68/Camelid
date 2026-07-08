@@ -3436,6 +3436,80 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
     }
 }
 
+/// STAMPEDE Phase 3 Lane B sibling: the batched Q6_K prefill owner must be
+/// bitwise identical to the per-cell block-dot path — its f32 shape (8 lane
+/// accumulators, final left-fold) is the bits-sensitive part KQUANT_RECON
+/// flagged, so this is the load-bearing check.
+#[test]
+fn q6_k_owner_prefill_bitwise_matches_block_dot_core() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+
+    for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
+        let row_bytes = (in_dim / 256) * 210;
+        // Deterministic wire over the full byte range; d f16 fixed small.
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| match i % 210 {
+                208 => 0x66,
+                209 => 0x2e, // d ~= 0.1
+                pos => ((i * 29 + pos * 11 + 3) % 256) as u8,
+            })
+            .collect();
+        for n_rows in [4usize, 5, 13, 64, 67] {
+            let input_data: Vec<f32> = (0..n_rows * in_dim)
+                .map(|i| ((i as f32) * 0.29).cos() * 2.5 - 0.4)
+                .collect();
+            let input =
+                CpuTensor::from_f32("q6k-owner-in", vec![n_rows, in_dim], input_data).unwrap();
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            let base = q6_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+            reset_q8_schedule_telemetry();
+            let owner = q6_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
+            assert!(
+                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken > 0,
+                "owner leg did not dispatch (n_rows={n_rows}) — vacuous comparison"
+            );
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            assert_eq!(owner.data.len(), base.data.len());
+            for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
+                );
+            }
+        }
+    }
+}
+
+/// Scalar-vs-AVX2 twin for the Q6_K owner's lifted integer lane dot.
+#[test]
+fn q6_k_owner_aux32_scalar_matches_avx2() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for salt in 0..4usize {
+            let a: Vec<i8> = (0..256)
+                .map(|i| ((((i * 17 + salt * 5) % 64) as i16) - 32) as i8)
+                .collect();
+            let scales: Vec<u8> = (0..16)
+                .map(|j| ((j * 37 + salt * 13) % 256) as u8)
+                .collect();
+            let q8: Vec<i8> = (0..256)
+                .map(|i| (((i * 23 + salt * 11) % 255) as i16 - 127) as i8)
+                .collect();
+            let scalar = q6_k_owner_aux32_scalar(&a, &scales, &q8);
+            // SAFETY: avx2 confirmed present above.
+            let simd = unsafe { q6_k_owner_aux32_avx2(&a, &scales, &q8) };
+            assert_eq!(scalar, simd, "aux32 twin diverged (salt={salt})");
+        }
+    }
+}
+
 /// D15: the Q8 matmul owner default is scoped to exactly win-x86_64 — pin it
 /// so a default regression (either direction, on any target) fails loudly.
 #[test]
