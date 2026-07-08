@@ -199,10 +199,12 @@ function CatalogRow({
         </div>
         {laneChip(lane)}
       </div>
-      {item.group !== 'experimental' && fitLabel(item.fit) ? (
+      {fitLabel(item.fit) ? (
         <div className="catalog-fit-row">
           <span
-            className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}`}
+            className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}${
+              item.fit_confidence === 'approx' ? ' catalog-fit-chip--estimate' : ''
+            }`}
             title={
               item.fit_confidence === 'exact'
                 ? "Sized from the model's real dimensions (KV cache computed exactly)"

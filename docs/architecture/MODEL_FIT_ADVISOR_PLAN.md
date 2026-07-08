@@ -285,6 +285,53 @@ downloading the weights.
   `vite build` clean; network path live-verified (gated test
   `CAMELID_TEST_REMOTE_DIMS=1`).
 
+### Slice 7 — `DimsResolver`: consolidate + harden the dims layer — ✅ DONE
+
+Slice 6 shipped the capability but the caching/fetch plumbing was scattered
+across `api/mod.rs` as a set of free functions (`store_remote_dims`,
+`cached_remote_dims`, `remote_dims_cache`, ...) with three real defects. Slice 7
+extracts one owner — `src/fit_dims.rs` (`DimsResolver`, a `OnceLock` singleton) —
+and fixes them:
+
+- **No write amplification.** The old path rewrote the *entire* JSON cache on
+  every successful fetch (O(n²) over a warm cycle). The resolver marks entries
+  dirty and a single debounced writer (`flush_loop`, 2 s coalescing window,
+  `spawn_blocking`) persists once per burst.
+- **In-flight de-duplication + bounded concurrency.** An `in_flight` set drops
+  duplicate requests before they spawn, and a `tokio::Semaphore`
+  (`MAX_CONCURRENT_FETCHES = 4`) caps live curls. The old code could spawn a
+  fetch per GET per row; the fan-out is now structurally impossible.
+- **GET is side-effect-free.** `get_catalog` no longer warms curated rows on read.
+  Curated dims are warmed exactly once at server startup (`start_background`);
+  HF-search rows still schedule at most `HF_DIMS_WARM_LIMIT = 5` bounded,
+  de-duplicated fetches. `schedule()` is sync and non-blocking (spawns; never
+  awaits a permit on the request path).
+- **Bounded, versioned, TTL cache.** `DiskCache { version, entries }`
+  (`CACHE_SCHEMA_VERSION = 1`) — a version bump or parse error loads as empty
+  (self-healing). `ENTRY_TTL_SECS = 30 days` expiry, LRU eviction at
+  `MAX_ENTRIES = 512`. The pre-versioned flat-map cache is read as empty and
+  rewritten in the new shape on first flush.
+- **Honest negatives.** An unparseable header (e.g. a non-dense architecture) is
+  cached as `dims: None` with a `FETCH_BACKOFF_SECS = 30 min` backoff, so failing
+  rows are attempted once and then left alone instead of re-fetched every run.
+- **Honest confidence on HF rows.** `from_hf` now reports `fit_confidence:
+  "unknown"` (was `"approx"`) when it has no dims, matching `fit: unknown`; the
+  WebUI renders an explicit dashed `~` estimate chip only for the genuine
+  `approx` (curated-pad) state.
+- **CI covers the parser.** A hermetic fixture test builds a minimal in-memory
+  GGUF header and asserts `dims_from_gguf_file` extracts `{layers, kv_heads,
+  head_dim}` — the network path is no longer the only coverage.
+
+Live-verified on an RTX 4060 host: fresh start warmed **11 exact / 4 approx** (the
+4 approx are all Gemma-4 E2B/E4B/12B/26B-A4B rows — non-dense-Llama metadata,
+correctly cached as negatives, not network failures); a restart served **11 exact
+within ~1.5 s from disk with zero re-fetch**; disk cache persisted as
+`{version:1, entries:{…}}` with 11 positive + 4 negative entries.
+
+- Gates: `cargo test --lib` → **707 passed, 0 failed**;
+  `cargo clippy --all-targets --all-features -- -D warnings` clean;
+  `cargo fmt --all -- --check` clean; `vite build` clean.
+
 ## 9. UX placement decision (locked)
 
 The verdict is most valuable **at model-selection time**, embedded in the
