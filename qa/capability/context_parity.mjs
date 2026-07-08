@@ -7,10 +7,12 @@
 // original 8192 context) are correct across the whole context, token-for-token.
 //
 // SAFETY (conductor §9 predict-and-abort): the f32 CPU KV cache is the dominant,
-// UNCAPPED memory term and Camelid does NOT pre-flight it (it would OOM mid-generation
-// at src/inference/kv_cache.rs:135-136). So THIS harness projects KV bytes =
-// target_tokens * kv_bytes_per_token and ABORTS before requesting an unsafe context —
-// the host is never discovered by crashing it.
+// otherwise-uncapped memory term. Camelid now guards it in-engine (`ensure_position_capacity`
+// in src/inference/kv_cache.rs projects the KV growth bytes and refuses over-budget with a
+// typed error before allocating), so an oversized context fails closed instead of OOMing
+// mid-generation. This harness independently projects KV bytes =
+// target_tokens * kv_bytes_per_token and ABORTS before requesting an unsafe context, so the
+// run never even reaches the engine guard — the host is never discovered by crashing it.
 //
 // Usage (repo root; release camelid + Windows llama.cpp build):
 //   node qa/capability/context_parity.mjs --gguf models/Llama-3.2-1B-Instruct-Q8_0.gguf \
