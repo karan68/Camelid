@@ -3189,6 +3189,11 @@ fn run_bench_owner_sweep(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(max_tokens >= 1, "--max-tokens must be at least 1");
     anyhow::ensure!(rounds >= 1, "--rounds must be at least 1");
+    // The sweep mutates owner env keys between configs in-process; without
+    // this bypass the process-lifetime runtime-plan caches would freeze the
+    // first config and every later one would silently measure it (fake null).
+    // Must be set before the first inference resolves the plan.
+    std::env::set_var("CAMELID_BENCH_UNCACHED_RUNTIME_PLAN", "1");
     configure_rayon_threads(threads)?;
     camelid::capability::HardwareProfile::detect().log();
 
@@ -3221,10 +3226,15 @@ fn run_bench_owner_sweep(
         "CAMELID_X86_Q8_MATMUL_OWNER_VNNI",
         "CAMELID_X86_Q8_MATMUL_OWNER_4X8",
     ];
-    let configs: &[(&str, &[(&str, &str)])] = &[
-        ("off", &[]),
+    // (label, owner_expected_to_fire, env). "off" is EXPLICIT since D15 made
+    // the owner default-on for win-x86_64 — an empty env would measure the
+    // default (owner on), not the baseline.
+    type SweepConfig<'a> = (&'a str, bool, &'a [(&'a str, &'a str)]);
+    let configs: &[SweepConfig] = &[
+        ("off", false, &[("CAMELID_X86_Q8_MATMUL_OWNER", "off")]),
         (
             "owner_avx2",
+            true,
             &[
                 ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
                 ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "0"),
@@ -3232,6 +3242,7 @@ fn run_bench_owner_sweep(
         ),
         (
             "owner_vnni4x4",
+            true,
             &[
                 ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
                 ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
@@ -3240,6 +3251,7 @@ fn run_bench_owner_sweep(
         ),
         (
             "owner_vnni4x8",
+            true,
             &[
                 ("CAMELID_X86_Q8_MATMUL_OWNER", "all"),
                 ("CAMELID_X86_Q8_MATMUL_OWNER_VNNI", "1"),
@@ -3265,9 +3277,10 @@ fn run_bench_owner_sweep(
     );
     for round in 0..total_rounds {
         let measured = round >= warmup_rounds;
-        for (label, envs) in configs {
+        for (label, owner_expected, envs) in configs {
             apply(envs);
             camelid::inference::reset_stage_timings();
+            camelid::inference::reset_q8_schedule_telemetry();
             let run = generate_run(
                 &config,
                 &weights,
@@ -3276,6 +3289,17 @@ fn run_bench_owner_sweep(
                 &sampler,
                 max_tokens,
             )?;
+            // Engaged-check: an owner-on config that never dispatched the
+            // owner arm (e.g. env mutation swallowed by a cached plan, or the
+            // planner disabled the repack) would measure a fake null. Applies
+            // to warmup rounds too — fail fast.
+            let owner_taken =
+                camelid::inference::snapshot_q8_schedule_telemetry().matmul_owner_prefill_taken;
+            anyhow::ensure!(
+                *owner_expected == (owner_taken > 0),
+                "engaged-check failed for config '{label}': owner_expected={owner_expected} \
+                 but owner_prefill_taken={owner_taken} — the sweep would mint a fake receipt"
+            );
             if !measured {
                 continue;
             }
@@ -3292,7 +3316,7 @@ fn run_bench_owner_sweep(
                 0.0
             };
             let rec = serde_json::json!({
-                "schema": "camelid.bench-owner-sweep/v1",
+                "schema": "camelid.bench-owner-sweep/v2",
                 "round": round - warmup_rounds,
                 "config": label,
                 "model": model_label,
@@ -3301,6 +3325,7 @@ fn run_bench_owner_sweep(
                 "prefill_ms": r3(run.prefill_ms),
                 "prefill_tok_s": r3(prefill_tok_s),
                 "decode_tok_s": r3(decode_tok_s),
+                "owner_prefill_taken": owner_taken,
             });
             println!("{}", serde_json::to_string(&rec)?);
         }

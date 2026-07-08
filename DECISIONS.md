@@ -656,3 +656,26 @@ is driven by the real derivable gates — runtime offline or the backend not
 advertising `hf_catalog_install`/`model_downloads`. Per-row implementability is
 still decided at load time by the inspect-first typed-blocker flow (fail-closed,
 rendered verbatim).
+
+## D15 - Q8 prefill GEMM owner: default ON, win-x86_64 only (2026-07-08)
+
+**Decision:** `CAMELID_X86_Q8_MATMUL_OWNER` defaults to `All` on Windows x86_64 and
+stays `Off` everywhere else. Explicit rollback: `CAMELID_X86_Q8_MATMUL_OWNER=off`.
+The variant inside the owner is unchanged (4x8 AVX-512 VNNI when the CPU has it,
+AVX2 4x4 otherwise; both bit-exact with twin tests).
+
+**Basis (receipts):** re-validated at the llama.cpp b9918 re-pin on main 582781da with
+the hardened paired in-process sweep, now carrying an ENGAGED-CHECK (the sweep aborts
+if an owner-on config never dispatches the owner arm, and the per-record
+`owner_prefill_taken` counts are in the receipt — off=0, owner=280): 3B Q8 prefill
+26.97 -> 30.30 tok/s (+12.3%, CI [1.115,1.133], 8/8 rounds), Qwen3-4B 20.00 -> 22.40
+(+11.9%, CI [1.113,1.126], 8/8). Bit-exactness unchanged from the #345 twin tests.
+`PERF_RECEIPTS/same-host/q8-prefill-owner-b9918-revalidation-20260708/`.
+
+**Treaty note (Tim-visible, not buried):** BENCHMARK_TREATY.md asks for a both-host
+(Windows + Ubuntu) win before promoting a default; the Ubuntu host remains
+PENDING/paused per Tim's earlier call. This flip follows the D13 precedent instead:
+single-host receipts promote a default that is cfg-SCOPED to exactly the host class
+that was measured (win-x86_64), leaving every other target Off. If the treaty should
+bind even scoped flips, revert by deleting the cfg branch in
+`Q8MatmulOwnerScope::from_env`.

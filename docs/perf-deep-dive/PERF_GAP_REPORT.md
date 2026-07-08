@@ -52,6 +52,16 @@ templates/near-ties — informational only, not a Camelid parity gate).
 byte-identical. Decode row above is superseded; receipts
 `same-host/stampede-p20-qkv-gqa-{OFF,ON}-*-20260708.json`.
 
+**Update 2026-07-08 (STAMPEDE Phase 3):** (a) the Q8 prefill GEMM owner re-validated at b9918 with
+an engaged-checked paired sweep (+12.3% 3B / +11.9% 4B, every CI excluding 1.0) and its default
+FLIPPED on win-x86_64 (D15) — 3B Q8 prefill default path is now ~30.3 tok/s (0.55–0.59× of llama);
+(b) NEW batched Q4_K prefill owner (`CAMELID_X86_KQUANT_MATMUL_OWNER`, opt-in): 3B Q4_K_M prefill
+14.94 → **22.39 (+50%)**, 0.15× → 0.23×, bitwise twin-tested, e2e byte-identical; measurement
+harness fix: `bench-owner-sweep` had been silently measuring the first-resolved cached plan for
+every config (fake-null trap) — uncached-plan bypass + per-config engaged-check landed, and the
+per-record `owner_prefill_taken` counts are now part of every sweep receipt. Q4_K_M residual gap =
+Q6_K layers (no owner yet) + the dot itself (repack/AVX-512 escalation staged).
+
 ## Headline gap table (2026-06-21 pin `acd79d6` — HISTORICAL, superseded above)
 
 | Model | Quant | HW | Stage | Camelid | llama.cpp | Gap | Suspected cause | Evidence | Proposed fix | Parity risk | Difficulty |

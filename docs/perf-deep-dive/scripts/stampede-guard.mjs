@@ -46,11 +46,14 @@ if (typeof bTxt === 'string' && typeof cTxt === 'string') {
 }
 
 const failed = checks.some(c => c.status === 'FAIL')
+// Receipts are privacy-scrubbed before commit (<home> placeholder), so compare
+// the model FILENAME, not the raw path (either separator style).
+const modelName = p => (p ?? '').split(/[\\/]/).pop()
 const report = {
   schema: 'camelid.stampede-guard/v1',
   baseline: files[0], candidate: files[1], tolerance: TOL,
   baseline_model: base.model, candidate_model: cand.model,
-  model_match: base.model === cand.model,
+  model_match: modelName(base.model) === modelName(cand.model),
   checks, verdict: failed ? 'FAIL' : 'PASS',
 }
 if (!report.model_match) { report.verdict = 'FAIL'; report.note = 'baseline and candidate measured different models' }

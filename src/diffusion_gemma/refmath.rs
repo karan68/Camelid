@@ -401,7 +401,7 @@ fn bsums16(y: &crate::inference::Q8KBlock) -> [i32; 16] {
 /// Horizontal sum of the eight i32 lanes of an AVX2 vector.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn hsum_i32_8(v: std::arch::x86_64::__m256i) -> i32 {
+pub(crate) unsafe fn hsum_i32_8(v: std::arch::x86_64::__m256i) -> i32 {
     use std::arch::x86_64::*;
     let lo = _mm256_castsi256_si128(v);
     let hi = _mm256_extracti128_si256(v, 1);
