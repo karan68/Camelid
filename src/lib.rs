@@ -13,6 +13,7 @@ pub mod diffusion_gemma;
 pub mod distributed;
 pub mod error;
 pub mod execution_plan;
+pub mod fit;
 pub mod gait;
 pub mod gemma4_distributed;
 pub mod gemma4_runtime;
