@@ -3722,6 +3722,95 @@ fn read_model_dims(path: &std::path::Path) -> Option<crate::fit::ModelDims> {
     })
 }
 
+/// Fetch a model's KV dimensions from its GGUF **header only** over the network,
+/// without downloading the weights. GGUF stores all metadata + tensor-info at the
+/// start of the file, so we range-fetch a generous header slice, write it into a
+/// temp file whose *length* is set to the model's real size (the unfetched tail is
+/// sparse zeros that `read_metadata` never reads — it only validates tensor offsets
+/// against the length), then reuse the trusted on-disk parser. `None` on any
+/// network/parse failure so callers fall back to the coarse estimate. The result is
+/// meant to be cached (see [`cached_remote_dims`]).
+fn remote_model_dims(
+    repo_id: &str,
+    filename: &str,
+    full_size: u64,
+) -> Option<crate::fit::ModelDims> {
+    /// How much of the file head to fetch — comfortably covers metadata (incl. the
+    /// tokenizer arrays, largest for 128k-vocab Llama rows) + tensor-info for current
+    /// catalog models, while keeping the per-row cost small (never the weights). A
+    /// too-small fetch just fails to parse and the caller falls back to the estimate.
+    const HEADER_BYTES: u64 = 12 * 1024 * 1024;
+    if full_size == 0 {
+        return None;
+    }
+    let safe: String = filename
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let tmp = std::env::temp_dir().join(format!("camelid-hdr-{}-{safe}", std::process::id()));
+    let range_end = HEADER_BYTES.min(full_size).saturating_sub(1);
+    let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
+    let ok = std::process::Command::new("curl")
+        .args(["-fsSL", "-r", &format!("0-{range_end}"), "-o"])
+        .arg(&tmp)
+        .arg(&url)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let dims = if ok {
+        // Extend the temp file to the real size so the parser's tensor-offset bounds
+        // checks pass; the tail is sparse zeros and is never read.
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&tmp) {
+            let _ = f.set_len(full_size);
+        }
+        read_model_dims(&tmp)
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&tmp);
+    dims
+}
+
+/// Process-wide cache of remote header dims, keyed by `repo/filename`. A stored
+/// `None` records a prior failed/unavailable fetch so we don't hammer the Hub.
+type RemoteDimsCache =
+    std::sync::Mutex<std::collections::HashMap<String, Option<crate::fit::ModelDims>>>;
+
+fn remote_dims_cache() -> &'static RemoteDimsCache {
+    static CACHE: std::sync::OnceLock<RemoteDimsCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remote_dims_key(repo_id: &str, filename: &str) -> String {
+    format!("{repo_id}/{filename}")
+}
+
+/// Cached dims lookup: `Some(entry)` when a fetch has been attempted (`entry` may be
+/// `None` = it failed), `None` when never attempted (so a warm can be scheduled).
+fn cached_remote_dims(repo_id: &str, filename: &str) -> Option<Option<crate::fit::ModelDims>> {
+    remote_dims_cache()
+        .lock()
+        .ok()?
+        .get(&remote_dims_key(repo_id, filename))
+        .copied()
+}
+
+fn store_remote_dims(repo_id: &str, filename: &str, dims: Option<crate::fit::ModelDims>) {
+    if let Ok(mut map) = remote_dims_cache().lock() {
+        map.insert(remote_dims_key(repo_id, filename), dims);
+    }
+}
+
+/// True unless the operator opted out of the background header fetches that upgrade
+/// catalog fit badges from `approx` to `exact` (`CAMELID_NO_REMOTE_DIMS=1`).
+fn remote_dims_enabled() -> bool {
+    std::env::var("CAMELID_NO_REMOTE_DIMS")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        != Some("1")
+}
+
 /// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
 /// memory and computes an **exact** footprint from the GGUF's real dimensions
 /// (weights + KV at a normal-use context + a bounded scratch margin) whenever the
@@ -15612,12 +15701,43 @@ pub struct CatalogItemView {
     /// Advisory "best for" positioning (e.g. `general`, `reasoning`, `coding`,
     /// `tools`) — curated, not benchmarked. Empty for experimental rows.
     pub task_tags: Vec<String>,
+    /// Confidence of the `fit` estimate: `"exact"` when computed from the model's
+    /// real GGUF dimensions (KV cache sized precisely), `"approx"` when from the
+    /// coarse size-based heuristic.
+    pub fit_confidence: &'static str,
+}
+
+/// Footprint + confidence for a curated row: an **exact** footprint (weights + KV
+/// sized from the model's real GGUF dims) when those dims are cached, else the
+/// coarse size pad. Dims are warmed in the background by [`get_catalog`], so a row
+/// starts `approx` and upgrades to `exact` once its header has been read.
+fn curated_footprint(
+    item: &CatalogItem,
+    hw: &crate::capability::HardwareProfile,
+) -> (crate::fit::FitInputs, &'static str) {
+    if let Some(Some(dims)) = cached_remote_dims(item.repo_id, item.filename) {
+        let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+            crate::fit::KvDtype::F16
+        } else {
+            crate::fit::KvDtype::F32
+        };
+        let fp = crate::fit::exact_footprint(
+            item.size_bytes,
+            dims,
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            kv_dtype,
+        );
+        (fp, "exact")
+    } else {
+        (crate::fit::advisory_footprint(item.size_bytes), "approx")
+    }
 }
 
 impl CatalogItemView {
     /// Build a view for a curated row: authoritative architecture, lane predicted
     /// from the real `(architecture, quant)` via `runnable::oracle_qualified`.
     fn from_curated(item: &CatalogItem, hw: &crate::capability::HardwareProfile) -> Self {
+        let (footprint, fit_confidence) = curated_footprint(item, hw);
         CatalogItemView {
             catalog_id: item.catalog_id.to_string(),
             name: item.name.to_string(),
@@ -15632,16 +15752,40 @@ impl CatalogItemView {
             oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
             group: "curated",
             arch_detected: true,
-            fit: crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes)),
+            fit: crate::fit::assess(hw, &footprint),
             task_tags: item.task_tags.iter().map(|t| t.to_string()).collect(),
+            fit_confidence,
         }
     }
 
     /// Build a view for a live Hugging Face result. Architecture/quant are filename
     /// guesses (`arch_detected: false`); `oracle_qualified` is forced `false` so the
     /// experimental row is never predicted Compatible/Supported on a guess alone.
-    fn from_hf(file: crate::hf_browse::HfGgufFile) -> Self {
+    /// Capacity is orthogonal to verification: when this file's real GGUF header has
+    /// been read (cached), we give an honest `exact` fit even for an unverified row;
+    /// otherwise we make **no** fit claim (`Unknown`) rather than guess on a filename.
+    fn from_hf(
+        file: crate::hf_browse::HfGgufFile,
+        hw: &crate::capability::HardwareProfile,
+    ) -> Self {
         let catalog_id = format!("hf::{}::{}", file.repo_id, file.filename);
+        let (fit, fit_confidence) = match cached_remote_dims(&file.repo_id, &file.filename) {
+            Some(Some(dims)) => {
+                let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+                    crate::fit::KvDtype::F16
+                } else {
+                    crate::fit::KvDtype::F32
+                };
+                let fp = crate::fit::exact_footprint(
+                    file.size_bytes,
+                    dims,
+                    crate::fit::ADVISORY_CONTEXT_TOKENS,
+                    kv_dtype,
+                );
+                (crate::fit::assess(hw, &fp), "exact")
+            }
+            _ => (crate::fit::FitVerdict::Unknown, "approx"),
+        };
         CatalogItemView {
             catalog_id,
             name: file.filename.clone(),
@@ -15656,9 +15800,9 @@ impl CatalogItemView {
             oracle_qualified: false,
             group: "experimental",
             arch_detected: false,
-            // Experimental (filename-guess) rows never carry a fit or task claim.
-            fit: crate::fit::FitVerdict::Unknown,
+            fit,
             task_tags: Vec::new(),
+            fit_confidence,
         }
     }
 }
@@ -16315,6 +16459,25 @@ async fn get_catalog(
         .map(|item| CatalogItemView::from_curated(item, hw))
         .collect();
 
+    // Warm the remote-dims cache in the background so later catalog renders upgrade
+    // these rows from `approx` to `exact` (header-only fetch — no weights). Never
+    // blocks this response; a failed fetch caches as `None` to avoid re-hammering.
+    if remote_dims_enabled() {
+        for item in curated_catalog() {
+            if cached_remote_dims(item.repo_id, item.filename).is_none() {
+                let (repo, file, size) = (
+                    item.repo_id.to_string(),
+                    item.filename.to_string(),
+                    item.size_bytes,
+                );
+                tokio::task::spawn_blocking(move || {
+                    let dims = remote_model_dims(&repo, &file, size);
+                    store_remote_dims(&repo, &file, dims);
+                });
+            }
+        }
+    }
+
     let mut items = curated;
     let mut next_cursor = None;
 
@@ -16329,13 +16492,39 @@ async fn get_catalog(
                     .iter()
                     .map(|c| (c.repo_id.to_string(), c.filename.to_string()))
                     .collect();
+                // Warm dims for the experimental page too so a random Hugging Face
+                // model shows an honest capacity fit on the next render — header-only,
+                // never blocking, cached, opt-out via env. **Bounded** to the top few
+                // rows: a query can return 100+ files, and warming all of them would
+                // fan out into a huge fetch storm.
+                if remote_dims_enabled() {
+                    const HF_DIMS_WARM_LIMIT: usize = 5;
+                    let mut warmed = 0usize;
+                    for f in &page.files {
+                        if warmed >= HF_DIMS_WARM_LIMIT {
+                            break;
+                        }
+                        let key = (f.repo_id.clone(), f.filename.clone());
+                        if curated_files.contains(&key)
+                            || cached_remote_dims(&f.repo_id, &f.filename).is_some()
+                        {
+                            continue;
+                        }
+                        warmed += 1;
+                        let (repo, file, size) = (key.0, key.1, f.size_bytes);
+                        tokio::task::spawn_blocking(move || {
+                            let dims = remote_model_dims(&repo, &file, size);
+                            store_remote_dims(&repo, &file, dims);
+                        });
+                    }
+                }
                 items.extend(
                     page.files
                         .into_iter()
                         .filter(|f| {
                             !curated_files.contains(&(f.repo_id.clone(), f.filename.clone()))
                         })
-                        .map(CatalogItemView::from_hf),
+                        .map(|f| CatalogItemView::from_hf(f, hw)),
                 );
             }
             // Offline / Hub error: keep curated-only rather than failing the page.
@@ -16630,10 +16819,39 @@ mod catalog_fit_tests {
             architecture: "llama".to_string(),
             quant: "Q4_K_M".to_string(),
         };
-        let view = CatalogItemView::from_hf(file);
+        // No cached header dims for this repo → no fit claim (Unknown), untagged.
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let view = CatalogItemView::from_hf(file, &hw);
         assert_eq!(view.fit, FitVerdict::Unknown);
         assert!(view.task_tags.is_empty());
         assert_eq!(view.group, "experimental");
+        assert_eq!(view.fit_confidence, "approx");
+    }
+
+    #[test]
+    fn hf_row_gets_an_exact_fit_once_its_header_dims_are_cached() {
+        let hw = host(false, 0, 4 * GIB, 3 * GIB);
+        let (repo, filename) = ("someone/Huge-Model-GGUF", "Huge-Model-Q8_0.gguf");
+        // Cache real dims for a genuinely too-big model → honest exact WontFit even on
+        // an unverified HF row (capacity is orthogonal to verification).
+        let dims = crate::fit::ModelDims {
+            layers: 80,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        super::store_remote_dims(repo, filename, Some(dims));
+        let file = crate::hf_browse::HfGgufFile {
+            repo_id: repo.to_string(),
+            filename: filename.to_string(),
+            size_bytes: 20 * GIB,
+            downloads: 0,
+            likes: 0,
+            architecture: "llama".to_string(),
+            quant: "Q8_0".to_string(),
+        };
+        let view = CatalogItemView::from_hf(file, &hw);
+        assert_eq!(view.fit_confidence, "exact");
+        assert_eq!(view.fit, FitVerdict::WontFit);
     }
 
     #[test]
@@ -16715,6 +16933,38 @@ mod catalog_fit_tests {
     }
 
     #[test]
+    fn remote_model_dims_reads_a_real_gguf_header_when_enabled() {
+        // Network-gated: self-skips offline / in normal CI. Enable with
+        // CAMELID_TEST_REMOTE_DIMS=1 to verify the header range-fetch end to end.
+        if std::env::var("CAMELID_TEST_REMOTE_DIMS").ok().as_deref() != Some("1") {
+            return;
+        }
+        // Qwen3-0.6B is the smallest curated model (~639 MB); fetch its header only.
+        let dims =
+            super::remote_model_dims("Qwen/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf", 639_446_688)
+                .expect("remote header dims should parse from a real GGUF");
+        assert!(
+            dims.layers >= 1 && dims.layers <= 64,
+            "layers={}",
+            dims.layers
+        );
+        assert!(dims.kv_heads >= 1, "kv_heads={}", dims.kv_heads);
+        assert!(dims.head_dim >= 1, "head_dim={}", dims.head_dim);
+        eprintln!("Qwen3-0.6B header dims: {dims:?}");
+
+        // Also a 128k-vocab Llama row (biggest metadata) to confirm HEADER_BYTES is
+        // large enough for the worst case; otherwise it would fall back to the pad.
+        let llama = super::remote_model_dims(
+            "unsloth/Llama-3.2-1B-Instruct-GGUF",
+            "Llama-3.2-1B-Instruct-Q8_0.gguf",
+            1_321_082_528,
+        )
+        .expect("Llama 3.2 1B header dims should parse within HEADER_BYTES");
+        assert!(llama.layers >= 1 && llama.kv_heads >= 1 && llama.head_dim >= 1);
+        eprintln!("Llama-3.2-1B header dims: {llama:?}");
+    }
+
+    #[test]
     fn best_fitting_suggestion_picks_something_on_a_big_host_and_never_panics_on_tiny() {
         let big = host(false, 0, 64 * GIB, 48 * GIB);
         let s = super::best_fitting_catalog_suggestion(&big).expect("a row fits a 64 GB host");
@@ -16722,6 +16972,68 @@ mod catalog_fit_tests {
         // On a tiny host only small rows fit (or none) — must not panic either way.
         let tiny = host(false, 0, 4 * GIB, 3 * GIB);
         let _ = super::best_fitting_catalog_suggestion(&tiny);
+    }
+
+    fn fake_item(repo: &'static str, filename: &'static str) -> CatalogItem {
+        CatalogItem {
+            catalog_id: "test_row",
+            name: "Test Row",
+            repo_id: repo,
+            filename,
+            size_bytes: 8_000_000_000,
+            downloads: 0,
+            likes: 0,
+            quant: "Q8_0",
+            architecture: "llama",
+            license: "test",
+            task_tags: &["general"],
+        }
+    }
+
+    #[test]
+    fn remote_dims_cache_round_trips() {
+        let (repo, file) = ("test/round-trip-repo", "round-trip.gguf");
+        assert!(super::cached_remote_dims(repo, file).is_none());
+        let dims = crate::fit::ModelDims {
+            layers: 28,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        super::store_remote_dims(repo, file, Some(dims));
+        assert_eq!(super::cached_remote_dims(repo, file), Some(Some(dims)));
+        // A failed fetch caches as None so we don't re-hammer the Hub.
+        super::store_remote_dims(repo, file, None);
+        assert_eq!(super::cached_remote_dims(repo, file), Some(None));
+    }
+
+    #[test]
+    fn curated_footprint_is_exact_when_dims_cached_else_approx() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        // approx: dims not cached → coarse size pad.
+        let approx_item = fake_item("test/uncached-repo", "uncached.gguf");
+        let (fp_approx, conf) = super::curated_footprint(&approx_item, &hw);
+        assert_eq!(conf, "approx");
+        assert_eq!(
+            fp_approx,
+            crate::fit::advisory_footprint(approx_item.size_bytes)
+        );
+        // exact: cache real dims → confidence flips and the KV is sized precisely.
+        let exact_item = fake_item("test/cached-repo", "cached.gguf");
+        let dims = crate::fit::ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        super::store_remote_dims("test/cached-repo", "cached.gguf", Some(dims));
+        let (fp_exact, conf) = super::curated_footprint(&exact_item, &hw);
+        assert_eq!(conf, "exact");
+        let expected = crate::fit::exact_footprint(
+            exact_item.size_bytes,
+            dims,
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F32, // CPU host
+        );
+        assert_eq!(fp_exact, expected);
     }
 }
 

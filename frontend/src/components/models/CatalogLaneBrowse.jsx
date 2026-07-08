@@ -201,8 +201,16 @@ function CatalogRow({
       </div>
       {item.group !== 'experimental' && fitLabel(item.fit) ? (
         <div className="catalog-fit-row">
-          <span className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}`}>
+          <span
+            className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}`}
+            title={
+              item.fit_confidence === 'exact'
+                ? "Sized from the model's real dimensions (KV cache computed exactly)"
+                : 'Estimate — upgrades to exact once the model header has been read'
+            }
+          >
             <FitIcon bad={item.fit === 'wont_fit'} />
+            {item.fit_confidence === 'approx' ? '~ ' : ''}
             {fitLabel(item.fit)}
           </span>
           {Array.isArray(item.task_tags) && item.task_tags.length ? (

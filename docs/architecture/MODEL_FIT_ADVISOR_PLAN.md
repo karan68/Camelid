@@ -251,6 +251,40 @@ guard), following the "only exact data may block" principle.
   `422 model_too_large_for_host` with the actionable "largest that fits" message;
   catalog chips unchanged (no regression).
 
+### Slice 6 — Exact pre-download badge via GGUF header range-fetch (Phase 2 + 3) — ✅ DONE
+
+Makes the catalog badge **exact** (not just the coarse pad) by reading each
+model's real dimensions from its GGUF **header only**, over the network, without
+downloading the weights.
+
+- **The trick** (`remote_model_dims`): GGUF stores all metadata + tensor-info at
+  the file start. Range-fetch a `HEADER_BYTES = 12 MiB` head (covers 128k-vocab
+  Llama metadata), write it to a temp file whose *length* is `set_len` to the real
+  size (sparse zero tail — `read_metadata` only validates tensor offsets against
+  the length, never reads the tail), then reuse the **trusted parser unchanged**.
+  A too-small/failed fetch → `None` → the caller keeps the pad. Live-verified:
+  Qwen3-0.6B → 28/8/128, Llama-3.2-1B → 16/8/64.
+- **Cache + confidence:** a process-wide `RemoteDimsCache` (keyed `repo/filename`,
+  stores `None` on failure to avoid re-hammering). `CatalogItemView` gains
+  `fit_confidence` (`"exact"` | `"approx"`). `curated_footprint` uses exact dims
+  when cached, else the pad. WebUI shows a `~` marker + tooltip on `approx`.
+- **Phase 2 (curated):** `get_catalog` background-warms all 15 curated rows
+  (`spawn_blocking`, never blocks the response). Rows start `approx` and upgrade to
+  `exact` as headers land. Live-verified: exact count climbed 0 → 3 → 12 across
+  renders; Llama 3.2 1B rendered exact "Fits your machine".
+- **Phase 3 (arbitrary Hugging Face rows):** `from_hf` gives an honest **exact**
+  fit once a header is cached (capacity is orthogonal to verification), else
+  `Unknown` — never a filename guess. The warm here is **bounded** to the top
+  `HF_DIMS_WARM_LIMIT = 5` rows (a query can return 100+ files; the first naive
+  version fanned out 119 fetches — fixed). Live-verified: HF rows upgraded to
+  `exact` with only ~11 concurrent fetches, not 119.
+- **Data cost / control:** header fetches are `12 MiB` each, cached for the process
+  lifetime, opt-out via `CAMELID_NO_REMOTE_DIMS=1`. Follow-ups: a disk cache (so
+  restarts don't re-fetch) and truly on-demand HF fetch (per row the user opens).
+- Gates: `cargo test --lib` → **698 passed, 0 failed**; fmt + clippy(lib) clean;
+  `vite build` clean; network path live-verified (gated test
+  `CAMELID_TEST_REMOTE_DIMS=1`).
+
 ## 9. UX placement decision (locked)
 
 The verdict is most valuable **at model-selection time**, embedded in the
