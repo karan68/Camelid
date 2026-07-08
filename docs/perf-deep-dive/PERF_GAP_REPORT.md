@@ -45,6 +45,13 @@ templates/near-ties — informational only, not a Camelid parity gate).
    time; even the all-cold bound is 5.5%. Phase 4 (spinning pool) is **KILLED** per its own gate
    (`stampede-p04-region-census-2b8b97c4-20260708.md`).
 
+**Update 2026-07-08 (STAMPEDE Phase 2.0 shipped):** parallelizing the GQA QKV decode branch
+(win-x86_64 defaults; flag `CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE`, default-on) moved 3B Q8 decode
+8.15 → **11.17** (+37%, same-run A/B) and Qwen3-4B Q8 6.43 → **8.56** (+33% vs P0 receipt) —
+**Camelid CPU decode is now AHEAD of llama.cpp b9918 on both rows (1.21× / 1.17×)**, greedy text
+byte-identical. Decode row above is superseded; receipts
+`same-host/stampede-p20-qkv-gqa-{OFF,ON}-*-20260708.json`.
+
 ## Headline gap table (2026-06-21 pin `acd79d6` — HISTORICAL, superseded above)
 
 | Model | Quant | HW | Stage | Camelid | llama.cpp | Gap | Suspected cause | Evidence | Proposed fix | Parity risk | Difficulty |

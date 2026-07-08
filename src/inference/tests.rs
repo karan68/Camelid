@@ -3285,6 +3285,104 @@ fn q8_attention_qkv_decode_group_chunking_matches_unchunked_triplet_projection()
 }
 
 #[test]
+fn q8_attention_qkv_gqa_parallel_decode_bitwise_matches_serial_triplet_projection() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    // An ambient serial-decode toggle would silently turn the parallel leg
+    // into serial-vs-serial and prove nothing — clear it explicitly.
+    std::env::remove_var("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE");
+
+    // GQA shape: q wider than k/v (the unequal-width branch under test).
+    let kv_width = X86_Q8_PACKED_ROWS4_DECODE_PARALLEL_MIN_OUTPUTS;
+    let q_width = kv_width * 3;
+    let blocks_per_row = 2;
+    let input_width = blocks_per_row * Q8_0_BLOCK_VALUES;
+    let make_packed = |rows: usize, salt: usize| {
+        let row_blocks: Vec<Q8_0Block> = (0..rows * blocks_per_row)
+            .map(|idx| Q8_0Block {
+                scale: 0.05 + ((idx + salt) % 11) as f32 * 0.003,
+                quants: std::array::from_fn(|lane| {
+                    (((idx + salt) * 13 + lane * 7) as i16 % 127 - 63) as i8
+                }),
+            })
+            .collect();
+        Q8_0PackedRows4::from_rows(
+            rows,
+            blocks_per_row,
+            Q8_0PackedRows4Interleave::I8,
+            &row_blocks,
+        )
+        .unwrap()
+    };
+    let q_packed = make_packed(q_width, 0);
+    let k_packed = make_packed(kv_width, 5);
+    let v_packed = make_packed(kv_width, 9);
+    let input: Vec<f32> = (0..input_width)
+        .map(|idx| (idx as f32 - 17.0) * 0.0625)
+        .collect();
+    let quantized_input = quantize_q8_0_row(&input);
+
+    for decode_group_chunking in [false, true] {
+        std::env::set_var("CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE", "0");
+        let (q_expected, k_expected, v_expected) =
+            q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
+                &q_packed,
+                &k_packed,
+                &v_packed,
+                q_width,
+                kv_width,
+                kv_width,
+                &quantized_input.blocks,
+                decode_group_chunking,
+            )
+            .unwrap();
+        std::env::set_var("CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE", "1");
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            // Guard against silent serial-vs-serial degradation: the parallel
+            // leg must actually satisfy the helper's parallel predicate for
+            // every width in play (kv_width is the narrowest).
+            assert!(
+                should_parallelize_x86_q8_packed_rows4_decode_output(kv_width),
+                "parallel precondition not met — test would degrade to serial-vs-serial"
+            );
+        });
+        let (q_actual, k_actual, v_actual) = pool
+            .install(|| {
+                q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
+                    &q_packed,
+                    &k_packed,
+                    &v_packed,
+                    q_width,
+                    kv_width,
+                    kv_width,
+                    &quantized_input.blocks,
+                    decode_group_chunking,
+                )
+            })
+            .unwrap();
+
+        // The lane's contract is BYTE-identical output, not close output.
+        assert_eq!(
+            q_actual.data, q_expected.data,
+            "q diverged (chunking={decode_group_chunking})"
+        );
+        assert_eq!(
+            k_actual.data, k_expected.data,
+            "k diverged (chunking={decode_group_chunking})"
+        );
+        assert_eq!(
+            v_actual.data, v_expected.data,
+            "v diverged (chunking={decode_group_chunking})"
+        );
+    }
+    std::env::remove_var("CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE");
+}
+
+#[test]
 fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();

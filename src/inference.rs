@@ -12807,6 +12807,26 @@ fn x86_q8_packed_rows4_serial_decode_enabled() -> bool {
     q8_0_env_flag_enabled_default_off("CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE")
 }
 
+fn x86_q8_qkv_gqa_parallel_decode_enabled() -> bool {
+    // DEFAULT ON: the unequal-width (GQA) QKV decode branch previously ran all
+    // three projections on one thread. The parallel path computes each packed
+    // rows4 group with the same kernel in the same per-group order (and still
+    // honors CAMELID_X86_Q8_PACKED_ROWS4_SERIAL_DECODE via the shared
+    // projection helper), so outputs are byte-identical. Explicit rollback:
+    // `CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE=0`.
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE")
+    }
+    #[cfg(not(test))]
+    {
+        static QKV_GQA_PARALLEL_DECODE_ENABLED: OnceLock<bool> = OnceLock::new();
+        *QKV_GQA_PARALLEL_DECODE_ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE")
+        })
+    }
+}
+
 #[allow(dead_code)]
 fn mac_q8_ffn_down_decode_group_chunking_enabled() -> bool {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -13939,6 +13959,38 @@ fn q8_0_packed_rows4_single_input_projection_triplet_from_quantized(
                 use_hoisted_avx2,
             ));
         }
+    } else if x86_q8_qkv_gqa_parallel_decode_enabled() {
+        // GQA (q_width != kv width): the fused triplet walk above cannot zip the
+        // three outputs, but each projection is an independent packed rows4
+        // matvec — run them through the shared decode projection helper, which
+        // parallelizes over row groups per matrix (or stays serial under the
+        // global serial-decode toggle / below the width floor). Byte-identity
+        // vs the serial loops below: on every default path the helper computes
+        // each group with the same kernel in the same per-group order; on the
+        // opt-in linux rawptr-AVX2 path it selects a bit-equivalent kernel
+        // instead (exact i32 dots + the identical sequential f32 scale stage),
+        // so no configuration changes output bytes. Scheduling-only caveat:
+        // the helper sizes chunks with the FFN-down groups-per-chunk knob, not
+        // CAMELID_X86_Q8_ATTENTION_QKV_DECODE_GROUPS_PER_CHUNK (both default
+        // 16; chunk size never affects values).
+        q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+            q_packed,
+            quantized_input,
+            &mut q_output,
+            decode_group_chunking,
+        )?;
+        q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+            k_packed,
+            quantized_input,
+            &mut k_output,
+            decode_group_chunking,
+        )?;
+        q8_0_packed_rows4_single_input_projection_into_with_decode_chunking(
+            v_packed,
+            quantized_input,
+            &mut v_output,
+            decode_group_chunking,
+        )?;
     } else {
         for (group_idx, q_chunk) in q_output.chunks_exact_mut(4).enumerate().take(q_groups) {
             let group_start = group_idx * blocks_per_row;
