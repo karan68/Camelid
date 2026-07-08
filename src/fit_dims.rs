@@ -381,7 +381,20 @@ fn fetch_header_dims(repo_id: &str, filename: &str, full_size: u64) -> FetchOutc
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let tmp = std::env::temp_dir().join(format!("camelid-hdr-{}-{safe}", std::process::id()));
+    // The temp path must be unique per (repo, filename): different repos routinely
+    // ship the same filename, and `in_flight` dedup is keyed by the full pair, so
+    // those fetch concurrently. Filename alone would collide into one temp file and
+    // race set_len/parse/remove_file. Hash the full key for a collision-free name.
+    let token = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(repo_id, &mut hasher);
+        std::hash::Hash::hash(filename, &mut hasher);
+        std::hash::Hasher::finish(&hasher)
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "camelid-hdr-{}-{token:016x}-{safe}",
+        std::process::id()
+    ));
     let range_end = HEADER_BYTES.min(full_size).saturating_sub(1);
     let url = format!("https://huggingface.co/{repo_id}/resolve/main/{filename}");
     let fetched = std::process::Command::new("curl")
