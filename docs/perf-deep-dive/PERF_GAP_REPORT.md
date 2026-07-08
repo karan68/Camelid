@@ -6,7 +6,53 @@ Blunt, evidence-first. Every number traces to `PERF_RECEIPTS/`. Same model, same
 - **Camelid** `ce7dceb6` (release: `target-cpu=x86-64-v3`, fat-LTO). **llama.cpp** `acd79d6` (Release; CPU = AVX-512+FMA+tinyBLAS+REPACK+OpenMP; CUDA = FA+graphs, arch 86).
 - **Models:** Llama-3.2-3B-Instruct-Q8_0 (primary, shared on disk), Qwen3-4B-Q8_0, Qwen3-0.6B-Q8_0. SHA-256 in `PERF_RECEIPTS/env/model-sha256.txt`.
 
-## Headline gap table
+## 2026-07-08 re-pin — STAMPEDE Phase 0 (CURRENT)
+
+**Pins:** Camelid `2b8b97c4` (main; release build) vs llama.cpp **b9918 `0512ef1e5`** (official
+prebuilt win-cpu-x64, Clang 20.1.8 — same provenance as the old pin). Env receipt:
+`PERF_RECEIPTS/env/environment-b9918-20260708.md`. Full receipts:
+`PERF_RECEIPTS/same-host/stampede-p0-baseline-2b8b97c4-20260708T0715Z/` (cpu-baseline-medN,
+REPEATS=5, CUDA_VISIBLE_DEVICES=-1, cache-defeated, greedy; llama-bench cross-check in same dir).
+
+| Model | Quant | Stage | Camelid | llama.cpp | Ratio | was (June pin) | movement |
+|---|---|---|---:|---:|---:|---:|---|
+| Llama-3.2-3B | Q8_0 | prefill | 22.85 | 51.46 | **0.44×** | 0.80× (23.73/30.6) | llama +68% (repack GEMM); gap WIDENED |
+| Llama-3.2-3B | Q8_0 | decode | 7.79 | 8.71 | **0.89×** | 0.66× (5.97/9.08) | Camelid +30% (#362 defaults); llama −4% |
+| Qwen3-4B | Q8_0 | prefill | 15.85 | 34.48 | **0.46×** | ≈0.62× | gap widened |
+| Qwen3-4B | Q8_0 | decode | 6.43 | 7.67 | **0.84×** | — | close |
+| Qwen3-0.6B | Q8_0 | prefill | 110.41 | 263.44 | **0.42×** | — | gap widened |
+| Qwen3-0.6B | Q8_0 | decode | 49.5 | 45.89 | **1.08×** | ~0.61× | **Camelid AHEAD** |
+| Llama-3.2-3B | Q4_K_M | prefill | 13.72 | 90.76 | **0.15×** | (no prior row) | widest gap in matrix |
+| Llama-3.2-3B | Q4_K_M | decode | 12.9 | 15.2 | **0.85×** | — | close |
+| Qwen3-4B | Q4_K_M | prefill | 10.42 | 66.41 | **0.16×** | — | K-quant prefill has no owner |
+| Qwen3-4B | Q4_K_M | decode | 11.51 | 11.73 | **0.98×** | — | ~parity |
+
+llama-bench cross-check (true CPU, `-t 8 -p 512 -n 128 -r 3`): 3B Q8 pp512 55.38 / tg128 9.34;
+3B Q4_K_M pp512 96.14 / tg128 15.16 — server-level numbers track bench within the usual ~5–8%.
+Greedy decode text: Camelid ≡ llama on both Llama-3B rows; Qwen3 rows diverge (own chat
+templates/near-ties — informational only, not a Camelid parity gate).
+
+**The blunt read at the new pin:**
+1. **Decode is nearly closed** (0.84–1.08×). The June "0.66×, no cheap win" framing is obsolete:
+   the #362 win-default promotion landed +30% after the report was written. Remaining decode gap
+   ≈ one lever (see P0.4 census: GQA QKV decode is single-threaded — `src/inference.rs:13942`,
+   ~13.7% of the weight stream on one thread; parallelizing it is parity-safe and modeled ≈ +20%).
+2. **Prefill is the campaign.** Uniform 0.42–0.46× on Q8_0 and a brutal 0.15–0.16× on Q4_K_M
+   (llama's K-quant repack prefill outruns even its Q8; Camelid's K-quant lane ships a decode
+   owner but NO prefill owner). Phase 3 (tiled GEMM owner) is top priority and must cover
+   K-quants, not just Q8.
+3. **Fork-join is NOT the decode story:** 169 real regions/token × 2.76 µs (hot) ≈ 0.4% of token
+   time; even the all-cold bound is 5.5%. Phase 4 (spinning pool) is **KILLED** per its own gate
+   (`stampede-p04-region-census-2b8b97c4-20260708.md`).
+
+**Update 2026-07-08 (STAMPEDE Phase 2.0 shipped):** parallelizing the GQA QKV decode branch
+(win-x86_64 defaults; flag `CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE`, default-on) moved 3B Q8 decode
+8.15 → **11.17** (+37%, same-run A/B) and Qwen3-4B Q8 6.43 → **8.56** (+33% vs P0 receipt) —
+**Camelid CPU decode is now AHEAD of llama.cpp b9918 on both rows (1.21× / 1.17×)**, greedy text
+byte-identical. Decode row above is superseded; receipts
+`same-host/stampede-p20-qkv-gqa-{OFF,ON}-*-20260708.json`.
+
+## Headline gap table (2026-06-21 pin `acd79d6` — HISTORICAL, superseded above)
 
 | Model | Quant | HW | Stage | Camelid | llama.cpp | Gap | Suspected cause | Evidence | Proposed fix | Parity risk | Difficulty |
 |---|---|---|---|---:|---:|---:|---|---|---|---|---|
