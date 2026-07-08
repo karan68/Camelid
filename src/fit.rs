@@ -21,15 +21,15 @@
 
 use crate::capability::HardwareProfile;
 
-/// Share of *available* host RAM the advisor treats as usable, mirroring the
-/// KV-cache budget policy in `src/inference/kv_cache.rs`
-/// (`KV_CACHE_BUDGET_AVAILABLE_PERCENT`) so the advisor and the runtime guard
-/// agree on what "usable RAM" means.
+/// Share of *available* host RAM the advisor treats as usable. Mirrors the *value*
+/// of `KV_CACHE_BUDGET_AVAILABLE_PERCENT` in `src/inference/kv_cache.rs` — an
+/// independent constant kept in sync by convention (see [`usable_host_ram_bytes`]
+/// for how the two policies relate), not a shared symbol.
 const USABLE_RAM_AVAILABLE_PERCENT: u64 = 80;
-/// Floor as a share of *total* host RAM, mirroring
-/// `KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT` — guards against a transient dip in the
-/// live `available` reading (which drops sharply as weights fault into the
-/// working set) collapsing the budget below what a normal run needs.
+/// Floor as a share of *total* host RAM, mirroring the *value* of
+/// `KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT`. Guards against a transient dip in the live
+/// `available` reading (which drops sharply as weights fault into the working set)
+/// collapsing the budget below what a normal run needs.
 const USABLE_RAM_TOTAL_FLOOR_PERCENT: u64 = 25;
 
 /// The advisor's verdict for a single (model footprint, host) pair.
@@ -111,8 +111,17 @@ impl FitInputs {
 }
 
 /// The usable host-RAM budget in bytes, or `None` when RAM is unknown
-/// (`host_ram_total_bytes == 0`). Mirrors the KV-cache budget policy:
-/// `max(80% of available, 25% of total)`.
+/// (`host_ram_total_bytes == 0`). Applies the same `max(80% of available, 25% of
+/// total)` formula as the KV-cache budget in `kv_cache.rs`, but is an independent
+/// reimplementation, not the same guard. Two intentional differences:
+///
+/// - Source: the advisor reads [`HardwareProfile`] RAM (probed on Windows and Linux;
+///   `(0, 0)` / unknown on macOS), whereas the KV guard reads `gait::host_ram_status`
+///   (probed on Windows and macOS; unprobed on Linux). So on Linux the advisor
+///   enforces a budget while the KV guard is unbounded; on macOS it is the reverse.
+/// - Unprobed RAM: the KV guard fails *open* (unbounded); the advisor abstains here
+///   with `None` (surfaced as [`FitVerdict::Unknown`]) rather than assert a capacity
+///   it cannot measure.
 fn usable_host_ram_bytes(hw: &HardwareProfile) -> Option<u64> {
     if hw.host_ram_total_bytes == 0 {
         return None;

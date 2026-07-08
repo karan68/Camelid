@@ -301,11 +301,12 @@ and fixes them:
   duplicate requests before they spawn, and a `tokio::Semaphore`
   (`MAX_CONCURRENT_FETCHES = 4`) caps live curls. The old code could spawn a
   fetch per GET per row; the fan-out is now structurally impossible.
-- **GET is side-effect-free.** `get_catalog` no longer warms curated rows on read.
-  Curated dims are warmed exactly once at server startup (`start_background`);
-  HF-search rows still schedule at most `HF_DIMS_WARM_LIMIT = 5` bounded,
-  de-duplicated fetches. `schedule()` is sync and non-blocking (spawns; never
-  awaits a permit on the request path).
+- **Reads are side-effect-free for curated rows.** `get_catalog` no longer warms
+  curated rows on read — their dims are warmed exactly once at server startup
+  (`start_background`). The HF-search branch is *not* side-effect-free: it schedules
+  at most `HF_DIMS_WARM_LIMIT = 5` bounded, de-duplicated background fetches.
+  `schedule()` is sync and non-blocking (spawns; never awaits a permit on the
+  request path).
 - **Bounded, versioned, TTL cache.** `DiskCache { version, entries }`
   (`CACHE_SCHEMA_VERSION = 1`) — a version bump or parse error loads as empty
   (self-healing). `ENTRY_TTL_SECS = 30 days` expiry, LRU eviction at
@@ -331,6 +332,50 @@ within ~1.5 s from disk with zero re-fetch**; disk cache persisted as
 - Gates: `cargo test --lib` → **707 passed, 0 failed**;
   `cargo clippy --all-targets --all-features -- -D warnings` clean;
   `cargo fmt --all -- --check` clean; `vite build` clean.
+
+### Slice 8 — review-round hardening + honest invariants — ✅ DONE
+
+Fixes from a second review pass, each verified against the fork (not the stale
+tree):
+
+- **Header-fetch robustness (`fit_dims.rs`).** Unique per-`(repo, filename)` temp
+  name (was filename-only → concurrent same-name fetches from different repos
+  raced one temp file); no `set_len` disk-allocation trick (parse the header
+  prefix against the declared full length via `gguf::read_metadata_with_len` —
+  `set_len` is *not* sparse on NTFS and would allocate the model's full size);
+  `curl --connect-timeout/--max-time` so a hung transfer can't hold a permit
+  forever; an RAII `InFlightGuard` clears the in-flight slot even if the fetch
+  task panics or early-returns.
+- **Guard off the async worker.** `fit_preload_guard` (blocking `metadata` + GGUF
+  read + `HardwareProfile::detect`, which inits a CUDA context on GPU hosts) now
+  runs under `spawn_blocking`, consistent with the header fetches; a panic in the
+  probe is non-fatal (falls through to the load).
+- **Honest RAM-budget docs (`fit.rs`).** The advisor's `max(80% available, 25% of
+  total)` mirrors the *values* of the KV-cache budget constants but is an
+  independent reimplementation over `HardwareProfile`. Documented the two real,
+  intentional divergences from the KV runtime guard: (1) different RAM source —
+  advisor probes Windows+Linux (unknown on macOS), the KV guard probes
+  Windows+macOS (unprobed on Linux), so the two enforce on *opposite* non-Windows
+  platforms; (2) on unprobed RAM the KV guard fails open (unbounded) while the
+  advisor abstains (`Unknown`).
+- **Cached badge vs live guard (documented).** The catalog badge uses the cached
+  startup hardware snapshot; the load guard re-probes live. After a model loads
+  and consumes VRAM a badge may still read "fits" while the guard returns 422. The
+  badge is a static capacity *hint*, not a reservation; the guard is
+  authoritative. Re-probing per GET would re-init CUDA on every catalog request.
+
+**Compatibility note (`POST /api/models/load`).** The advisor adds a fail-fast
+path: a request that previously always attempted the load can now return
+`422 model_too_large_for_host` on a `WontFit` verdict from a *probed* host. This
+is a behavior change on a stable endpoint. It is overridable — `CAMELID_SKIP_FIT_CHECK=1`
+restores the unconditional load-attempt behavior (covered by
+`skip_fit_check_override_matches_only_the_exact_flag`). It never fires on an
+unprobed host (`Unknown` is never `WontFit`), and the authoritative
+`VramShortfall`/`KvCache` guards remain the hard net after the load begins.
+
+- Gates: `cargo test --lib` → **710 passed, 0 failed**;
+  `cargo clippy --all-targets --all-features -- -D warnings` clean;
+  `cargo fmt --all -- --check` clean.
 
 ## 9. UX placement decision (locked)
 

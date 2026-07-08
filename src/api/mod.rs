@@ -3725,13 +3725,17 @@ fn fit_preload_message(
 /// 422 only on a `WontFit` verdict; `None` (proceed unchanged) on the
 /// `CAMELID_SKIP_FIT_CHECK=1` override, a missing/zero-size file, or any
 /// `Fits*`/`Unknown` verdict — a fail-fast convenience, never a new hard gate.
+/// Whether the load-time fit preflight is overridden off. `CAMELID_SKIP_FIT_CHECK=1`
+/// restores the pre-advisor behavior: `POST /api/models/load` attempts the load
+/// unconditionally, letting the authoritative `VramShortfall`/`KvCache` guards be
+/// the only gate. Exactly the trimmed value `"1"` enables the override; anything
+/// else (including unset) keeps the preflight on.
+fn fit_check_skipped(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
 fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
-    if std::env::var("CAMELID_SKIP_FIT_CHECK")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        == Some("1")
-    {
+    if fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
         return None;
     }
     let size = std::fs::metadata(path).ok()?.len();
@@ -3767,7 +3771,16 @@ async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequ
     // Advisory fail-fast (fit axis, never a support claim): steer away from a
     // near-certain OOM before the expensive load. Overridable via
     // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
-    if let Some(resp) = fit_preload_guard(&req.path) {
+    //
+    // The guard does blocking I/O (metadata + GGUF header read) and a live hardware
+    // probe (HardwareProfile::detect initializes a CUDA context on GPU hosts), so run
+    // it on a blocking thread rather than stalling the async worker — consistent with
+    // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
+    // fall through to the load, where VramShortfall/KvCache remain the hard net.
+    let guard_path = req.path.clone();
+    if let Ok(Some(resp)) =
+        tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path)).await
+    {
         return resp;
     }
     match load_model_from_path(&state, req.path, req.id).await {
@@ -16359,6 +16372,12 @@ async fn get_catalog(
 
     // Curated group: filter by query exactly as before, always emitted first.
     // The fit verdict is host-specific, so probe (cached) once and annotate each row.
+    //
+    // Deliberate: the badge uses the cached startup snapshot, while the load-time
+    // guard (`fit_preload_guard`) re-probes live. So after a model loads and consumes
+    // VRAM, a badge may still read "fits" while the guard now rejects with 422. The
+    // badge is a static capacity hint, not a live reservation; the guard is
+    // authoritative. Re-probing on every GET would re-init CUDA per request.
     let hw = crate::capability::HardwareProfile::cached();
     let curated: Vec<CatalogItemView> = curated_catalog()
         .iter()
@@ -16373,8 +16392,10 @@ async fn get_catalog(
         .map(|item| CatalogItemView::from_curated(item, hw))
         .collect();
 
-    // (Curated dims are warmed once at server startup via `fit_dims::start_background`,
-    // never as a side-effect of serving this page.)
+    // Serving this page is side-effect-free for the *curated* rows: their dims are
+    // warmed once at server startup via `fit_dims::start_background`, never here. The
+    // Hugging Face search branch below is not side-effect-free — it schedules a
+    // bounded, de-duplicated set of background header fetches (see HF_DIMS_WARM_LIMIT).
     let mut items = curated;
     let mut next_cursor = None;
 
@@ -16831,6 +16852,20 @@ mod catalog_fit_tests {
         // On a tiny host only small rows fit (or none) — must not panic either way.
         let tiny = host(false, 0, 4 * GIB, 3 * GIB);
         let _ = super::best_fitting_catalog_suggestion(&tiny);
+    }
+
+    #[test]
+    fn skip_fit_check_override_matches_only_the_exact_flag() {
+        // The override restores the pre-advisor load-attempt behavior. It must engage
+        // for exactly `1` (trimmed) and nothing else, so the preflight can't be turned
+        // off by an unrelated or malformed value.
+        assert!(super::fit_check_skipped(Some("1")));
+        assert!(super::fit_check_skipped(Some("  1  ")));
+        assert!(!super::fit_check_skipped(Some("0")));
+        assert!(!super::fit_check_skipped(Some("true")));
+        assert!(!super::fit_check_skipped(Some("11")));
+        assert!(!super::fit_check_skipped(Some("")));
+        assert!(!super::fit_check_skipped(None));
     }
 
     #[test]
