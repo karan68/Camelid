@@ -3382,6 +3382,75 @@ fn q8_attention_qkv_gqa_parallel_decode_bitwise_matches_serial_triplet_projectio
     std::env::remove_var("CAMELID_X86_Q8_QKV_GQA_PARALLEL_DECODE");
 }
 
+/// STAMPEDE Phase 3 Lane B: the batched Q4_K prefill owner must be bitwise
+/// identical to the per-cell block-dot path — tile-aligned and ragged row
+/// counts, multiple in/out shapes, deterministic wire bytes.
+#[test]
+fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+
+    for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
+        let row_bytes = (in_dim / 256) * 144;
+        // Deterministic wire: small finite f16 d/dmin, arbitrary scale/min and
+        // nibble bytes (every bit pattern is structurally valid Q4_K).
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| match i % 144 {
+                0 => 0x66,
+                1 => 0x2e, // d ~= 0.1
+                2 => 0x99,
+                3 => 0x24, // dmin ~= 0.018
+                pos => ((i * 31 + pos * 7 + 11) % 251) as u8,
+            })
+            .collect();
+        for n_rows in [4usize, 5, 13, 64, 67] {
+            let input_data: Vec<f32> = (0..n_rows * in_dim)
+                .map(|i| ((i as f32) * 0.37).sin() * 3.0 - 0.8)
+                .collect();
+            let input =
+                CpuTensor::from_f32("owner-test-in", vec![n_rows, in_dim], input_data).unwrap();
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+            let owner = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            assert_eq!(owner.data.len(), base.data.len());
+            for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
+                );
+            }
+        }
+    }
+}
+
+/// Scalar-vs-AVX2 twin for the owner's lifted main-side superblock dot.
+#[test]
+fn q4_k_owner_main_side_scalar_matches_avx2() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for salt in 0..4usize {
+            let qs: Vec<u8> = (0..128)
+                .map(|i| ((i * 37 + salt * 13 + 5) % 256) as u8)
+                .collect();
+            let q8: Vec<i8> = (0..256)
+                .map(|i| (((i * 29 + salt * 7) % 255) as i16 - 127) as i8)
+                .collect();
+            let scales: [u8; 8] = std::array::from_fn(|g| ((g * 23 + salt * 3 + 1) % 64) as u8);
+            let scalar = q4_k_owner_main_side_scalar(&qs, &q8, &scales);
+            // SAFETY: avx2 confirmed present above.
+            let simd = unsafe { q4_k_owner_main_side_avx2(&qs, &q8, &scales) };
+            assert_eq!(scalar, simd, "main-side twin diverged (salt={salt})");
+        }
+    }
+}
+
 #[test]
 fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
     let _env_guard = env_lock();

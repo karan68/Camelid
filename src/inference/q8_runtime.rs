@@ -5,12 +5,12 @@ use crate::Result;
 
 pub(super) const X86_Q8_PACKED_ROWS4_MATMUL_GROUPS_PER_CHUNK_DEFAULT: usize = 8;
 
-/// Lane 1 — scope of the unified tiled Q8_0 PREFILL GEMM owner. `Off` is the shipping
-/// default. The owner is a bit-exact, role-agnostic drop-in for the per-projection prefill
-/// block-dot: it reuses the proven 4x4 register microkernel but flips the loop nest so each
-/// weight band stays L1/L2-resident while every input row streams against it (the
-/// arithmetic-intensity fix for the bandwidth-bound host). Promotion to a non-`Off` default
-/// requires a measured both-host prefill win (Windows + Ubuntu) per the benchmark treaty.
+/// Lane 1 — scope of the unified tiled Q8_0 PREFILL GEMM owner. The owner is a bit-exact,
+/// role-agnostic drop-in for the per-projection prefill block-dot: it reuses the proven 4x4
+/// register microkernel but flips the loop nest so each weight band stays L1/L2-resident
+/// while every input row streams against it (the arithmetic-intensity fix for the
+/// bandwidth-bound host). Default: `All` on win-x86_64 (D15, b9918 re-validation receipts),
+/// `Off` elsewhere — each other host still owes its own receipt per the benchmark treaty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Q8MatmulOwnerScope {
     Off,
@@ -26,7 +26,22 @@ impl Q8MatmulOwnerScope {
                 "ffn_down" | "ffn-down" | "ffndown" => Self::FfnDown,
                 _ => Self::Off,
             },
-            Err(_) => Self::Off,
+            // DEFAULT ON for win-x86_64 only (D15): re-validated at the b9918
+            // pin with the engaged-checked paired sweep — +12.3% (3B) /
+            // +11.9% (4B) prefill, CI excludes 1.0, 8/8 rounds, bit-exact.
+            // Other targets keep Off pending their own host receipts (the
+            // BENCHMARK_TREATY both-host rule is scoped, not waived).
+            // Explicit rollback: CAMELID_X86_Q8_MATMUL_OWNER=off.
+            Err(_) => {
+                #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+                {
+                    Self::All
+                }
+                #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+                {
+                    Self::Off
+                }
+            }
         }
     }
 
@@ -108,6 +123,20 @@ pub(super) struct ResolvedRuntimePlan {
     pub(super) q8_packed_rows4_matmul_schedule: Q8PackedRows4MatmulSchedule,
 }
 
+/// In-process benchmark sweeps (`bench-owner-sweep`) mutate the owner env
+/// keys between configs; the process-lifetime plan caches below would
+/// silently ignore that — every config after the first would measure the
+/// first-resolved plan (a fake null). `CAMELID_BENCH_UNCACHED_RUNTIME_PLAN=1`
+/// (itself read once) makes both resolvers re-read the env per call.
+/// Sweep-only escape hatch: normal runs pay one cached-bool branch.
+/// (In test builds every resolver is uncached already, so this has no
+/// callers there — hence the cfg_attr.)
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn bench_uncached_runtime_plan() -> bool {
+    static BYPASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BYPASS.get_or_init(|| q8_0_env_flag_enabled_default_off("CAMELID_BENCH_UNCACHED_RUNTIME_PLAN"))
+}
+
 impl ResolvedRuntimePlan {
     pub(super) fn from_env() -> Result<Self> {
         // Resolve ONCE per process outside tests: the ~20 env flags below are
@@ -121,6 +150,9 @@ impl ResolvedRuntimePlan {
         }
         #[cfg(not(test))]
         {
+            if bench_uncached_runtime_plan() {
+                return Self::from_env_uncached();
+            }
             static RESOLVED: std::sync::OnceLock<ResolvedRuntimePlan> = std::sync::OnceLock::new();
             if let Some(plan) = RESOLVED.get() {
                 return Ok(*plan);
@@ -154,6 +186,9 @@ impl Q8RuntimeFlags {
         }
         #[cfg(not(test))]
         {
+            if bench_uncached_runtime_plan() {
+                return Self::from_env_uncached();
+            }
             static RESOLVED: std::sync::OnceLock<Q8RuntimeFlags> = std::sync::OnceLock::new();
             if let Some(flags) = RESOLVED.get() {
                 return *flags;
