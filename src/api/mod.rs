@@ -2427,7 +2427,7 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
         hf_catalog_install: true,
         execution_plan,
         support_contract: SupportContract {
-            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
+            current_gate: "Current exact-row support: TinyLlama Q8_0 current gate; Llama 3.2 1B Instruct Q8_0 has checked bounded 512/1024/2048/4096/8192 packs; Llama 3.2 3B Instruct Q8_0 is supported_exact_row_smoke with canonical Ubuntu main-lane API/WebUI refresh at source head e9f926ed1a65 plus checked bounded 512/1024/2048 packs; and Llama 3 8B Instruct Q8_0 has checked bounded 512/1024/2048 packs where row-specific PASS artifacts exist. Mistral 7B Instruct v0.3 Q8_0 is supported_exact_row_smoke: checked tokenizer/template, parity (including GPU-vs-CPU greedy continuations on the exact row), bounded 512/1024/2048/4096/8192 context artifacts, and a support-promotion API/WebUI smoke bundle. Mixtral-8x7B-Instruct-v0.1.Q8_0.gguf has bounded one-token backend MoE runtime evidence only; later 5-token/API/WebUI/RSS promotion-candidate artifacts are superseded by Gate 9A 50-token divergence and a longer-continuation hang, so broad/API/WebUI/frontend readiness remains unsupported. The dense Qwen3 Q8_0 ChatML rows (0.6B/1.7B/4B/8B Instruct, thinking disabled) are supported_exact_row_smoke: qwen2 BPE pre-tokenizer + ChatML renderer, per-head QK-norm + NEOX RoPE, and token+text parity vs llama.cpp at 1/5/50 on macOS/Ubuntu and on Windows x86_64 CPU (cpu_reference + the x86_q8 AVX2 runtime-repack path, bit-identical), and additionally on Windows CUDA: the 0.6B/1.7B/4B rows fully VRAM-resident and the 8B row via the VRAM+host-RAM offload split (RTX 3060 Laptop 6 GB, driver 576.83, CUDA 12.9; GPU decode+single-shot prefill token+text identical to cpu_reference/llama.cpp at 1/5/50); 1.7B additionally has GPU-resident decode+prefill and a 15,373-token single-shot prefill lane on macOS, and thinking-mode is opt-in (leading-trace parity only). The 4B row additionally carries checked bounded-context packs 512/1024/2048/4096/8192 and the 1.7B row 512/1024/2048/4096 (fully-GPU-resident raw-decode greedy parity vs llama.cpp acd79d603 at 50 tokens; the 1.7B 8192 bucket is held as a documented benign near-tie). These are exact bounded lanes only; no model-native/larger context beyond the checked packs, arbitrary-template behavior, production throughput, portability, neighboring-row, or broad-family support is implied.",
             support_policy: "A model, tokenizer, quantization, API feature, or context length is supported only after tests, docs, and real-model evidence exist for that lane.",
             unsupported_policy: "Unsupported combinations should return typed errors instead of silently falling back to best-effort behavior.",
         },
@@ -3311,30 +3311,30 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
                 performance_measured: "not_promoted",
                 frontend_load_path_verified: "api_smoke_validated_webui_follow_up",
                 frontend_readiness_gate: "green only when this exact GGUF row plus Q8_0 quant match /api/capabilities and the runtime reports loaded_now=true, generation_ready=true, and matching active_model_id",
-                tested_context: "chatml_1_5_50_token_short_chat_plus_macos_15373_token_single_shot_prefill",
+                tested_context: "chatml_1_5_50_token_short_chat_plus_macos_15373_token_single_shot_prefill_plus_bounded_512_1024_2048_4096_context_raw_decode_parity",
                 chat_template_renderer: "qwen3_chatml_thinking_disabled",
                 chat_template_shape_pack: "not_started",
                 chat_template_shape_pack_id: "qwen3-chatml-chat-template-pack-v1",
-                bounded_context_512_pack: "not_promoted",
-                bounded_context_512_pack_id: "not_selected",
+                bounded_context_512_pack: "validated_bounded_pack",
+                bounded_context_512_pack_id: "qwen3-1p7b-context-512-4096-v1",
                 bounded_context_window: 512,
-                bounded_context_1024_pack: "not_promoted",
-                bounded_context_1024_pack_id: "not_selected",
+                bounded_context_1024_pack: "validated_second_pack",
+                bounded_context_1024_pack_id: "qwen3-1p7b-context-512-4096-v1",
                 bounded_context_1024_window: 1024,
-                bounded_context_2048_pack: "not_promoted",
-                bounded_context_2048_pack_id: "not_selected",
+                bounded_context_2048_pack: "validated_third_pack",
+                bounded_context_2048_pack_id: "qwen3-1p7b-context-512-4096-v1",
                 bounded_context_2048_window: 2048,
-                bounded_context_4096_pack: "not_promoted",
-                bounded_context_4096_pack_id: "not_selected",
+                bounded_context_4096_pack: "validated_fourth_pack",
+                bounded_context_4096_pack_id: "qwen3-1p7b-context-512-4096-v1",
                 bounded_context_4096_window: 4096,
                 bounded_context_8192_pack: "not_promoted",
                 bounded_context_8192_pack_id: "not_selected",
                 bounded_context_8192_window: 8192,
-                latest_checked_bucket: "windows_x86_64_chatml_parity",
+                latest_checked_bucket: "gpu_resident_bounded_context_512_1024_2048_4096_raw_decode_parity_plus_disclosed_8192_near_tie",
                 latest_checked_result: "pass",
-                latest_checked_output: "qa/evidence-bundles/qwen3-1.7b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23/README.md",
-                evidence: "exact row Qwen3-1.7B-Q8_0.gguf: token-AND-text-identical to llama.cpp at 1/5/50 (ChatML, thinking disabled) on macOS/Ubuntu and Windows x86_64 CPU (cpu_reference + x86_q8 AVX2). macOS bundles qa/evidence-bundles/qwen3-1.7b-q8-chatml-parity-20260614T021844Z-head-f41e374 and qwen3-1.7b-q8-gpu-resident-bigctx-parity-20260614T171846Z-head-f97a896 (GPU-resident decode+prefill; 15,373-token single-shot prefill); thinking-mode leading-trace parity qwen3-1.7b-q8-thinking-enabled-parity-*. Windows bundle qa/evidence-bundles/qwen3-1.7b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass).",
-                next_step: "add WebUI smoke on Windows and re-prove the large-context lane on Windows before widening the platform claim",
+                latest_checked_output: "qa/evidence-bundles/qwen3-1p7b-q8-context-512-4096-20260708T025128Z-head-bf802df44ecd/manifest.json",
+                evidence: "exact row Qwen3-1.7B-Q8_0.gguf: token-AND-text-identical to llama.cpp at 1/5/50 (ChatML, thinking disabled) on macOS/Ubuntu and Windows x86_64 CPU (cpu_reference + x86_q8 AVX2). macOS bundles qa/evidence-bundles/qwen3-1.7b-q8-chatml-parity-20260614T021844Z-head-f41e374 and qwen3-1.7b-q8-gpu-resident-bigctx-parity-20260614T171846Z-head-f97a896 (GPU-resident decode+prefill; 15,373-token single-shot prefill); thinking-mode leading-trace parity qwen3-1.7b-q8-thinking-enabled-parity-*. Windows bundle qa/evidence-bundles/qwen3-1.7b-q8-windows-x86-chatml-parity-20260616T155745Z-head-fdae7a23 (all_pass). BOUNDED CONTEXT 512/1024/2048/4096 (446/968/2013/4088 Qwen3 tokens): camelid fully-GPU-resident CUDA decode (28 layers VRAM-resident; VRAM-sized resident KV cap 25266 pos, so every bucket fits resident) is token-AND-text-identical to pinned llama.cpp acd79d603 at 50 generated tokens on all four buckets (a contiguous strict prefix) — bundle qa/evidence-bundles/qwen3-1p7b-q8-context-512-4096-20260708T025128Z-head-bf802df44ecd, harness scripts/raw-decode-parity.mjs (single-model runs: oracle captured alone then killed). The bundle records the FULL 5-bucket sweep (sweep_all_pass=false): the 8192 bucket (8253 tokens) diverges at a documented benign greedy near-tie where BOTH engines reach the correct hidden code CMLD-8192 but camelid phrases it one token longer (gen-index 16: camelid ' the' vs oracle 'CMLD'); the 4B-Q8_0 sibling is token-identical at 8192, so this is the smaller 1.7B faltering at the longest context, not a camelid decode error — but not token-identical, so 8192 is NOT claimed. NOT claimed: the 8192 bucket, model-native/larger context beyond 4096, other Qwen3 sizes/quants, full-trace thinking-mode token-parity, or throughput.",
+                next_step: "resolve or attribute the 8192 near-tie to extend the contiguous ladder past 4096; add WebUI smoke on Windows before widening the platform claim",
             },
             ModelCompatibilityTarget {
                 id: "qwen3_4b_instruct_q8_0",
@@ -12724,13 +12724,15 @@ mod tests {
                 target.evidence.contains("windows-x86-chatml-parity"),
                 "{id} evidence should cite the Windows bundle"
             );
-            // Only Qwen3-4B Q8_0 has a promoted bounded-context ladder (512/1024/2048);
-            // the other three qwen3 rows stay ChatML short-chat smoke only.
-            let expected_ctx512 = if id == "qwen3_4b_instruct_q8_0" {
-                "validated_bounded_pack"
-            } else {
-                "not_promoted"
-            };
+            // Qwen3-4B Q8_0 (512-8192) and Qwen3-1.7B Q8_0 (512-4096 contiguous; 8192 is a
+            // documented benign near-tie) have promoted bounded-context ladders; the 0.6B
+            // and 8B rows stay ChatML short-chat smoke only.
+            let expected_ctx512 =
+                if id == "qwen3_4b_instruct_q8_0" || id == "qwen3_1_7b_instruct_q8_0" {
+                    "validated_bounded_pack"
+                } else {
+                    "not_promoted"
+                };
             assert_eq!(
                 target.bounded_context_512_pack, expected_ctx512,
                 "{id} ctx512"
