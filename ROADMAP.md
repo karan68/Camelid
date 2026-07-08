@@ -272,6 +272,14 @@ Portability and packaging should remain explicit:
 - no implied portable model-path assumptions without documentation
 - no release packaging claim before reproducible setup instructions exist
 
+### Model fit advisor (capacity axis)
+
+A **capacity** signal, deliberately separate from the support ledger: it estimates whether the *local machine* can load/run a catalog row, and never implies parity or support. See [`docs/architecture/MODEL_FIT_ADVISOR_PLAN.md`](docs/architecture/MODEL_FIT_ADVISOR_PLAN.md).
+
+- The verdict (`fits_resident` / `fits_with_offload` / `cpu_only_ok` / `wont_fit` / `unknown`) is derived from the detected `HardwareProfile` and the row's on-disk weight footprint; it is advisory, never a support claim, and degrades to `unknown` (never a failure) on hosts whose memory cannot be probed.
+- It informs but never enforces: catalog download stays un-gated, and the pre-load fail-fast (`model_too_large_for_host`) fires only on a `wont_fit` verdict from a probed host and is overridable with `CAMELID_SKIP_FIT_CHECK=1`.
+- The authoritative capacity guards remain the runtime VRAM headroom check (mid-load) and the KV predict-and-abort budget (mid-generation); the advisor never relaxes them.
+
 ## Promotion rules
 
 A row may move forward only when all of the following are true:

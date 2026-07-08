@@ -212,11 +212,16 @@ total)`), so the advisor and the runtime guard agree.
   `catalog_fit_tests`. Gates: `cargo fmt` ✅ · `cargo clippy --lib` ✅ ·
   `cargo test --lib` → **688 passed, 0 failed** ✅ · frontend `vite build` ✅.
 
-### Slice 4 — Docs/ledger alignment
-- Cross-link this plan from `ROADMAP.md`; note in `COMPATIBILITY.md` that the fit
-  axis is capacity-only and does not widen support.
-- Optional evidence bundle under `qa/` if a UI badge screenshot gate is wanted
-  (matches the existing `frontend-3b-catalog-*-badge` bundle pattern).
+### Slice 4 — Docs/ledger alignment — ✅ DONE
+- `ROADMAP.md`: added a **Model fit advisor (capacity axis)** lane under *Active
+  roadmap lanes*, cross-linking this plan and stating the capacity ≠ support
+  discipline (advisory verdict, un-gated download, overridable fail-fast, runtime
+  guards stay authoritative).
+- `COMPATIBILITY.md`: added a **Capacity rule** to *Governing rules* — the fit
+  advisor is capacity-only, never implies parity/validation/support, does not
+  appear in `model_compatibility`, and cannot promote any row.
+- No evidence bundle minted (no screenshot gate requested); the UI line is covered
+  by `vite build` and the API/CLI by the Rust suite.
 
 ## 9. UX placement decision (locked)
 
