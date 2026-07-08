@@ -15465,6 +15465,9 @@ pub struct CatalogItem {
     /// inferred from the filename). Drives the catalog's predicted lane.
     pub architecture: &'static str,
     pub license: &'static str,
+    /// Advisory "best for" positioning for the Models tab (curated, not
+    /// benchmarked). Constrained to: `general`, `reasoning`, `coding`, `tools`.
+    pub task_tags: &'static [&'static str],
 }
 
 /// A catalog item plus its predicted runnable lane, so the Models tab can show which
@@ -15497,12 +15500,19 @@ pub struct CatalogItemView {
     pub group: &'static str,
     /// Whether `architecture` is authoritative (curated) vs a filename guess (live).
     pub arch_detected: bool,
+    /// Capacity advisory: whether THIS host can load/run the row (fit axis only —
+    /// never a support/parity claim). `Unknown` for experimental rows and for hosts
+    /// whose memory cannot be probed.
+    pub fit: crate::fit::FitVerdict,
+    /// Advisory "best for" positioning (e.g. `general`, `reasoning`, `coding`,
+    /// `tools`) — curated, not benchmarked. Empty for experimental rows.
+    pub task_tags: Vec<String>,
 }
 
 impl CatalogItemView {
     /// Build a view for a curated row: authoritative architecture, lane predicted
     /// from the real `(architecture, quant)` via `runnable::oracle_qualified`.
-    fn from_curated(item: &CatalogItem) -> Self {
+    fn from_curated(item: &CatalogItem, hw: &crate::capability::HardwareProfile) -> Self {
         CatalogItemView {
             catalog_id: item.catalog_id.to_string(),
             name: item.name.to_string(),
@@ -15517,6 +15527,8 @@ impl CatalogItemView {
             oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
             group: "curated",
             arch_detected: true,
+            fit: crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes)),
+            task_tags: item.task_tags.iter().map(|t| t.to_string()).collect(),
         }
     }
 
@@ -15539,6 +15551,9 @@ impl CatalogItemView {
             oracle_qualified: false,
             group: "experimental",
             arch_detected: false,
+            // Experimental (filename-guess) rows never carry a fit or task claim.
+            fit: crate::fit::FitVerdict::Unknown,
+            task_tags: Vec::new(),
         }
     }
 }
@@ -15556,6 +15571,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "llama3.2",
+            task_tags: &["general", "tools"],
         },
         CatalogItem {
             catalog_id: "llama32_3b_instruct_q8_0",
@@ -15568,6 +15584,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "llama3.2",
+            task_tags: &["general", "tools"],
         },
         CatalogItem {
             catalog_id: "tinyllama_1_1b_chat_q8_0",
@@ -15582,6 +15599,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "other",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "llama3_8b_instruct_q8_0",
@@ -15594,6 +15612,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "llama3",
+            task_tags: &["general", "reasoning"],
         },
         CatalogItem {
             catalog_id: "mistral_7b_instruct_v0_3_q8_0",
@@ -15606,6 +15625,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "apache-2.0",
+            task_tags: &["general", "coding"],
         },
         CatalogItem {
             catalog_id: "qwen3_0_6b_instruct_q8_0",
@@ -15618,6 +15638,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "qwen3_1_7b_instruct_q8_0",
@@ -15630,6 +15651,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["general", "reasoning"],
         },
         CatalogItem {
             catalog_id: "qwen3_4b_instruct_q8_0",
@@ -15642,6 +15664,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
             catalog_id: "qwen3_8b_instruct_q8_0",
@@ -15654,6 +15677,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
             catalog_id: "gemma4_e4b_it_q8_0",
@@ -15666,6 +15690,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "gemma4_e2b_it_q8_0",
@@ -15678,6 +15703,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "gemma4_12b_it_q8_0",
@@ -15690,6 +15716,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["general", "reasoning"],
         },
         CatalogItem {
             catalog_id: "gemma4_26b_a4b_it_q4_0",
@@ -15702,6 +15729,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q4_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["reasoning"],
         },
         CatalogItem {
             catalog_id: "gemma3_1b_it_q8_0",
@@ -15714,6 +15742,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma3",
             license: "gemma",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "phi3_mini_4k_instruct_q8_0",
@@ -15726,6 +15755,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "phi3",
             license: "mit",
+            task_tags: &["reasoning", "coding"],
         },
     ]
 }
@@ -16165,6 +16195,8 @@ async fn get_catalog(
     let trimmed = query.trim();
 
     // Curated group: filter by query exactly as before, always emitted first.
+    // The fit verdict is host-specific, so probe (cached) once and annotate each row.
+    let hw = crate::capability::HardwareProfile::cached();
     let curated: Vec<CatalogItemView> = curated_catalog()
         .iter()
         .filter(|item| {
@@ -16175,7 +16207,7 @@ async fn get_catalog(
                     || item.filename.to_lowercase().contains(&qs)
             }
         })
-        .map(CatalogItemView::from_curated)
+        .map(|item| CatalogItemView::from_curated(item, hw))
         .collect();
 
     let mut items = curated;
@@ -16428,6 +16460,108 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
         (StatusCode::OK, "Download canceled").into_response()
     } else {
         (StatusCode::NOT_FOUND, "Download not found").into_response()
+    }
+}
+
+#[cfg(test)]
+mod catalog_fit_tests {
+    use super::{curated_catalog, CatalogItem, CatalogItemView};
+    use crate::capability::{HardwareProfile, SimdCaps};
+    use crate::fit::FitVerdict;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn host(cuda: bool, vram_free: u64, ram_total: u64, ram_free: u64) -> HardwareProfile {
+        HardwareProfile {
+            cuda_available: cuda,
+            cuda_device_count: if cuda { 1 } else { 0 },
+            cuda_device_name: None,
+            cuda_compute_capability: None,
+            cuda_tensor_cores: false,
+            cuda_vram_total_bytes: vram_free,
+            cuda_vram_free_bytes: vram_free,
+            cpu_logical_cores: 8,
+            host_ram_total_bytes: ram_total,
+            host_ram_free_bytes: ram_free,
+            simd: SimdCaps::default(),
+        }
+    }
+
+    fn row(id: &str) -> CatalogItem {
+        curated_catalog()
+            .into_iter()
+            .find(|c| c.catalog_id == id)
+            .expect("known catalog row")
+    }
+
+    #[test]
+    fn curated_view_carries_task_tags_and_a_verdict() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let item = row("tinyllama_1_1b_chat_q8_0");
+        let view = CatalogItemView::from_curated(&item, &hw);
+        assert_eq!(view.task_tags, vec!["general".to_string()]);
+        // ~1.1 GB model on a 64 GB CPU host → comfortably CPU-only.
+        assert_eq!(view.fit, FitVerdict::CpuOnlyOk);
+    }
+
+    #[test]
+    fn curated_huge_model_wont_fit_tiny_cpu_host() {
+        // 8 GB total RAM, no GPU → budget ~ max(80% of 5=4, 25% of 8=2)=4 GB;
+        // the ~8.5 GB Llama-3 8B (+overhead) cannot fit.
+        let hw = host(false, 0, 8 * GIB, 5 * GIB);
+        let item = row("llama3_8b_instruct_q8_0");
+        let view = CatalogItemView::from_curated(&item, &hw);
+        assert_eq!(view.fit, FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn experimental_from_hf_is_unknown_and_untagged() {
+        let file = crate::hf_browse::HfGgufFile {
+            repo_id: "someone/Some-Model-GGUF".to_string(),
+            filename: "Some-Model-Q4_K_M.gguf".to_string(),
+            size_bytes: 2 * GIB,
+            downloads: 10,
+            likes: 1,
+            architecture: "llama".to_string(),
+            quant: "Q4_K_M".to_string(),
+        };
+        let view = CatalogItemView::from_hf(file);
+        assert_eq!(view.fit, FitVerdict::Unknown);
+        assert!(view.task_tags.is_empty());
+        assert_eq!(view.group, "experimental");
+    }
+
+    #[test]
+    fn unknown_host_never_reports_wont_fit_for_any_curated_row() {
+        // macOS-style: RAM unprobed (0) and no CUDA → advisory-blind, never WontFit.
+        let hw = host(false, 0, 0, 0);
+        for item in curated_catalog() {
+            let view = CatalogItemView::from_curated(&item, &hw);
+            assert_eq!(
+                view.fit,
+                FitVerdict::Unknown,
+                "row {} must be Unknown on an unprobed host",
+                view.catalog_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_curated_row_is_tagged_within_the_allowed_set() {
+        for item in curated_catalog() {
+            assert!(
+                !item.task_tags.is_empty(),
+                "curated row {} must carry at least one task tag",
+                item.catalog_id
+            );
+            for tag in item.task_tags {
+                assert!(
+                    matches!(*tag, "general" | "reasoning" | "coding" | "tools"),
+                    "row {} has unexpected task tag {tag}",
+                    item.catalog_id
+                );
+            }
+        }
     }
 }
 

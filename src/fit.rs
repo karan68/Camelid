@@ -167,6 +167,29 @@ pub fn assess(hw: &HardwareProfile, m: &FitInputs) -> FitVerdict {
     assess_with_headroom(hw, m, crate::cuda_vram::min_headroom_mib())
 }
 
+/// Advisory allowance, as a percent of weight bytes, for everything resident
+/// beyond the weights at a modest default context: the KV cache, activations, and
+/// scratch. This is a deliberately coarse, deliberately *conservative* (slightly
+/// over-estimating) heuristic for the **pre-download** badge — the exact KV cost
+/// is architecture- and context-specific and is enforced at runtime by the KV
+/// predict-and-abort guard (`src/inference/kv_cache.rs`). Over-estimating keeps a
+/// "fits" badge safe rather than optimistic. A per-architecture bound is a future
+/// refinement; a flat pad avoids inventing per-model dimensions we cannot know
+/// before the GGUF is on disk.
+pub const ADVISORY_OVERHEAD_PERCENT: u64 = 25;
+
+/// Build [`FitInputs`] for a catalog row from its known weight footprint
+/// (`CatalogItem.size_bytes`), padding by [`ADVISORY_OVERHEAD_PERCENT`] to stand
+/// in for KV + activations at a modest context. The pad is carried in
+/// `kv_bytes_at_ctx`; it is an estimate, not a measured KV size.
+pub fn advisory_footprint(weight_bytes: u64) -> FitInputs {
+    let overhead = weight_bytes.saturating_mul(ADVISORY_OVERHEAD_PERCENT) / 100;
+    FitInputs {
+        weight_bytes,
+        kv_bytes_at_ctx: overhead,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

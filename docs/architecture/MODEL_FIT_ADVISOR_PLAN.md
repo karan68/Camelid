@@ -161,15 +161,34 @@ total)`), so the advisor and the runtime guard agree.
   `cargo test --lib fit::` → **13 passed** ✅. (Full `--all-features` clippy/test
   is the pre-merge gate; the CUDA build is long and run separately.)
 
-### Slice 2 — Catalog metadata + API field
-- Add `params` + `task_tags` to `CatalogItem` and the ~16 curated rows
-  (`curated_catalog()`), sourced from each model card (cited in code comments).
-- Add `fit: FitVerdict` (+ optional `task_tags`) to `CatalogItemView`; populate
-  in `from_curated` using `HardwareProfile::detect()` (cached at startup like the
-  existing hardware log). `from_hf` → `fit: Unknown`.
-- API tests mirroring the existing `capabilities_*` tests: assert curated rows
-  carry a verdict and experimental rows stay `Unknown`; assert an unknown-RAM
-  host never yields `WontFit`.
+### Slice 2 — Catalog metadata + API field — ✅ DONE
+- Added `task_tags: &'static [&'static str]` to `CatalogItem` and all **15**
+  curated rows (`curated_catalog()`), constrained to `general` / `reasoning` /
+  `coding` / `tools`. Advisory positioning, **not** benchmarked (documented as
+  such on the field).
+- **`params` dropped (honest deviation):** authoritative parameter counts are not
+  available pre-download without loading the GGUF, and `size_bytes` is already the
+  exact weight footprint the fit math needs — so a hand-entered `params` would add
+  hallucinated precision for no gain. Deferred; revisit only if a UI needs a
+  human "size" label beyond `size_bytes`.
+- Added `fit: FitVerdict` + `task_tags: Vec<String>` to `CatalogItemView`.
+  `from_curated(item, hw)` computes `fit` via `fit::assess(hw,
+  fit::advisory_footprint(size_bytes))`; `from_hf` → `fit: Unknown`, empty tags.
+- **KV term (finalizes open Q1):** `fit::advisory_footprint` pads weight bytes by
+  a flat, conservative `ADVISORY_OVERHEAD_PERCENT = 25` to stand in for KV +
+  activations at a modest context (over-estimating keeps a "fits" badge safe). A
+  per-architecture bound is a documented future refinement; a flat pad avoids
+  inventing per-model dims we cannot know pre-download.
+- Hardware is probed once via a new `HardwareProfile::cached()` (`OnceLock`) so the
+  catalog handler does not re-probe CUDA per request.
+- API tests (`catalog_fit_tests`, 5): curated rows carry tags + a verdict; a huge
+  model won't fit a tiny host; experimental rows stay `Unknown`+untagged; an
+  unprobed host yields `Unknown` for **every** row (never `WontFit`); all tags are
+  in the allowed set.
+- Gates: `cargo fmt --all -- --check` ✅ · `cargo clippy --lib -- -D warnings` ✅ ·
+  `cargo test --lib` → **684 passed, 0 failed** (18 new/relevant among them) ✅.
+- JSON is **additive** (`fit`, `task_tags` new keys) — no frontend change yet;
+  the WebUI ignores them until Slice 3.
 
 ### Slice 3 — UX surfaces
 - **WebUI:** in `CatalogLaneBrowse.jsx`, add a fit chip beside the lane chip —
