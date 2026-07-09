@@ -9024,6 +9024,8 @@ async fn generate_decoded_tokens_blocking(
     let started = Instant::now();
     let test_sleep = generation_step_test_sleep_duration();
     let handle = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _decode_probe = decode_probe::enter();
         if let Some(duration) = test_sleep {
             std::thread::sleep(duration);
         }
@@ -9130,6 +9132,8 @@ async fn generate_stream_step_blocking(
     } = request;
     let test_sleep = generation_step_test_sleep_duration();
     let handle = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _decode_probe = decode_probe::enter();
         if let Some(duration) = test_sleep {
             std::thread::sleep(duration);
         }
@@ -9268,6 +9272,47 @@ fn generation_step_test_sleep_duration() -> Option<Duration> {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|millis| *millis > 0)
         .map(Duration::from_millis)
+}
+
+/// Test-only concurrency probe for the blocking decode workers. Counts how
+/// many decode tasks are live on the blocking pool at once, independent of
+/// `generation_lock` guard lifetime — the guard and the compute it guards are
+/// decoupled (the orphan-decode hazard), so the lock's own state cannot be
+/// used to observe overlap. Tests reset the probe under `test_support::env_lock`
+/// and assert `max_seen() <= 1` (the invariant the lock is supposed to provide).
+#[cfg(test)]
+pub(crate) mod decode_probe {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    static MAX_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) struct ProbeGuard;
+
+    impl Drop for ProbeGuard {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn enter() -> ProbeGuard {
+        let now = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        MAX_SEEN.fetch_max(now, Ordering::SeqCst);
+        ProbeGuard
+    }
+
+    pub(crate) fn reset() {
+        ACTIVE.store(0, Ordering::SeqCst);
+        MAX_SEEN.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn active() -> usize {
+        ACTIVE.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_seen() -> usize {
+        MAX_SEEN.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(not(test))]
@@ -12031,6 +12076,227 @@ mod tests {
             1,
             "generation_lock must serialize decoding: never more than one decode in flight",
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Engine-inversion Phase 0 repro harness (P0-T1 / P0-T2 / P0-T3).
+    //
+    // `generation_lock_serializes_decoding` above proves guards serialize; it
+    // says nothing about the compute those guards are supposed to cover. The
+    // decode runs on `spawn_blocking`, which cannot be aborted, so any event
+    // that drops the handler frame (client disconnect, the server's own
+    // generation timeout) releases the lock while the decode keeps running.
+    // These tests assert the DESIRED invariant — the lock is never free while
+    // a decode is live, and two decodes never overlap — using the test-only
+    // `decode_probe` counters inside the blocking closures. On the unfixed
+    // tree they FAIL; that failure is the Gate 0 receipt.
+    // ---------------------------------------------------------------------
+
+    struct OrphanObservation {
+        /// Decodes still live at the moment the next request acquired the lock.
+        orphans_at_next_acquire: usize,
+        /// Peak concurrent decodes over the whole scenario.
+        max_concurrent: usize,
+        /// Error response from the follow-up request B, if it failed.
+        request_b_error: Option<String>,
+    }
+
+    fn orphan_test_prepared(model: &str) -> PreparedGeneration {
+        let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        let mut prepared = prepared_for_cache("tiny", model, vec![1, 2], session);
+        // The shared test tokenizer has an empty vocab, which fails the decode-
+        // to-text tail of a SUCCESSFUL generation; give request B a real (if
+        // tiny) vocab matching tiny_config's vocab_size of 3.
+        let mut tokenizer = test_tokenizer();
+        tokenizer.tokens = (0..3u32)
+            .map(|id| Token {
+                id,
+                text: format!("t{id}"),
+                score: 0.0,
+                kind: TokenKind::Normal,
+            })
+            .collect();
+        tokenizer.token_to_id = tokenizer
+            .tokens
+            .iter()
+            .map(|token| (token.text.clone(), token.id))
+            .collect();
+        prepared.tokenizer = Arc::new(tokenizer);
+        prepared
+    }
+
+    /// Runs "request B" the way the non-streaming handlers do — acquire the
+    /// generation lock, decode, drop the guard — and reports what the probe
+    /// saw. Callers must have cleared the test-sleep hook so B is fast.
+    async fn run_request_b_and_observe(state: &AppState) -> OrphanObservation {
+        let guard_b = state.generation_lock.clone().lock_owned().await;
+        let orphans_at_next_acquire = decode_probe::active();
+        let result_b = generate_decoded_tokens_blocking(orphan_test_prepared("model-b.gguf")).await;
+        drop(guard_b);
+        let request_b_error = match result_b {
+            Ok(_) => None,
+            Err(response) => {
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                    .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+                Some(format!("{status}: {body}"))
+            }
+        };
+        OrphanObservation {
+            orphans_at_next_acquire,
+            max_concurrent: decode_probe::max_seen(),
+            request_b_error,
+        }
+    }
+
+    /// Waits for every live decode worker to exit so a failing scenario cannot
+    /// leak an orphan (and a probe underflow) into sibling tests.
+    async fn drain_decode_probe() {
+        let started = Instant::now();
+        while decode_probe::active() != 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "decode worker never finished; probe would poison later tests",
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn assert_no_orphan_overlap(observed: OrphanObservation, scenario: &str) {
+        assert!(
+            observed.request_b_error.is_none(),
+            "{scenario}: request B should decode normally, got {:?}",
+            observed.request_b_error,
+        );
+        assert_eq!(
+            observed.orphans_at_next_acquire, 0,
+            "{scenario}: generation_lock was acquired while a previous request's \
+             decode was still running on the blocking pool (orphaned compute)",
+        );
+        assert!(
+            observed.max_concurrent <= 1,
+            "{scenario}: two decodes overlapped (max concurrent = {}) — the exact \
+             corruption class generation_lock exists to prevent",
+            observed.max_concurrent,
+        );
+    }
+
+    /// P0-T2 — deterministic: the server's own generation timeout returns a 503
+    /// but `tokio::time::timeout` only drops the JoinHandle; the blocking decode
+    /// is detached, not stopped. The handler frame then drops the lock guard and
+    /// the next request decodes concurrently with the orphan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_timeout_must_not_orphan_decode() {
+        let _env_guard = crate::test_support::env_lock();
+        decode_probe::reset();
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "100");
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
+
+        let state = AppState::default();
+
+        // Request A, exactly as the non-streaming handlers run it: guard held
+        // in the async frame across the decode await (see chat_completions).
+        let guard_a = state.generation_lock.clone().lock_owned().await;
+        let result_a = generate_decoded_tokens_blocking(orphan_test_prepared("model-a.gguf")).await;
+        assert!(
+            result_a.is_err(),
+            "request A must hit the generation timeout"
+        );
+        // The handler returns the 503; its frame drops the guard.
+        drop(guard_a);
+
+        // Request B arrives right after the 503.
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        let observed = run_request_b_and_observe(&state).await;
+
+        drain_decode_probe().await;
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+        assert_no_orphan_overlap(observed, "P0-T2 generation timeout");
+    }
+
+    /// P0-T1 — client disconnect mid non-streaming request: hyper drops the
+    /// handler future at its await point (modeled by aborting a task with the
+    /// handler's exact shape), releasing the guard while the decode runs on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn client_disconnect_must_not_orphan_decode() {
+        let _env_guard = crate::test_support::env_lock();
+        decode_probe::reset();
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
+
+        let state = AppState::default();
+
+        let lock = state.generation_lock.clone();
+        let handler_a = tokio::spawn(async move {
+            let _guard = lock.lock_owned().await;
+            let _ = generate_decoded_tokens_blocking(orphan_test_prepared("model-a.gguf")).await;
+        });
+
+        // Wait until A's decode is actually live on the blocking pool, then
+        // "disconnect": drop the handler future.
+        let started = Instant::now();
+        while decode_probe::active() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "request A's decode never reached the blocking pool",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handler_a.abort();
+        let _ = handler_a.await;
+
+        // Request B right after the disconnect.
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        let observed = run_request_b_and_observe(&state).await;
+
+        drain_decode_probe().await;
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+        assert_no_orphan_overlap(observed, "P0-T1 client disconnect");
+    }
+
+    /// P0-T3 — client disconnect mid SSE stream: dropping the response body
+    /// drops the `async_stream` generator (and the guard it holds) between
+    /// polls while the current token step is still on the blocking pool. The
+    /// orphan window is one step, and it overlaps the next request's decode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_disconnect_must_not_orphan_decode_step() {
+        let _env_guard = crate::test_support::env_lock();
+        decode_probe::reset();
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
+
+        let state = AppState::default();
+        let guard_a = state.generation_lock.clone().lock_owned().await;
+        let response =
+            stream_completion(orphan_test_prepared("model-a.gguf"), true, guard_a, false);
+
+        // Drive the SSE body the way a client does. The reader task polls the
+        // stream into its first token step; aborting it is the hangup — the
+        // body (and generator, and guard) drop mid-step.
+        let reader = tokio::spawn(async move {
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        });
+        let started = Instant::now();
+        while decode_probe::active() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "stream A's token step never reached the blocking pool",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        reader.abort();
+        let _ = reader.await;
+
+        // Request B right after the disconnect.
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        let observed = run_request_b_and_observe(&state).await;
+
+        drain_decode_probe().await;
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+        assert_no_orphan_overlap(observed, "P0-T3 stream disconnect");
     }
 
     fn completion_request_with(
