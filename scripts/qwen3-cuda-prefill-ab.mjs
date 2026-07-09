@@ -55,12 +55,23 @@ async function chat(userContent) {
   })
   if (!res.ok) throw new Error(`chat -> HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
   const body = await res.json()
-  return body.choices[0].message.content
+  const content = body.choices?.[0]?.message?.content
+  if (typeof content !== 'string') {
+    // A missing/undefined content would be silently DROPPED by JSON.stringify,
+    // shrinking the corpus and letting a parity diff pass vacuously (the probe
+    // fake-null: a mid-run script/server anomaly once produced two 4-key
+    // corpora that "matched"). Fail loudly instead.
+    throw new Error(`chat -> message.content is ${typeof content}: ${JSON.stringify(body).slice(0, 300)}`)
+  }
+  return content
 }
 
 async function main() {
   const out = {}
   for (const p of PROMPTS) out[p] = await chat(p)
+  // Corpus-size stamp: lets callers assert the expected prompt count instead of
+  // trusting two possibly-equally-truncated corpora to diff clean.
+  console.error(`[ab-probe] corpus prompts=${PROMPTS.length} depth_tokens=${depthTokens}`)
   console.log(JSON.stringify(out, null, 2))
 }
 

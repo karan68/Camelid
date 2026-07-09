@@ -91,14 +91,27 @@ stop_server() { # kill THIS server by PID, wait for exit + port free
 }
 trap stop_server EXIT
 
+# A truncated corpus must never diff clean: if BOTH legs lose the same prompt
+# (e.g. the probe script is swapped mid-run by a concurrent checkout — observed
+# 2026-07-09, the Rung B "divergence" artifact), two 4-key corpora would pass
+# byte-identity while claiming 5-prompt coverage. Assert the key count.
+check_corpus() { # json-file expected-keys label
+  local got
+  got=$(node -p 'Object.keys(JSON.parse(require("fs").readFileSync(process.argv[1]))).length' "$1" 2>/dev/null)
+  if [ "$got" != "$2" ]; then
+    echo "  !! $3 corpus has ${got:-unreadable} keys, expected $2 — receipt VOID (probe/harness anomaly)"
+    return 1
+  fi
+}
+
 run_leg() { # name model-basename extra_env depth_tokens ready_s
   local name="$1" model extra_env="$3" depth="$4" ready="${5:-240}"
   model=$(find_model "$2")
   echo "=== leg $name ==="
   if [ -z "$model" ]; then echo "  !! model $2 not found — leg FAILED (coverage gap)"; FAILED=1; return; fi
   require_ram "$model" || { FAILED=1; return; }
-  local ab_args=""
-  [ "$depth" != "0" ] && ab_args="--depth-tokens $depth"
+  local ab_args="" want_keys=4
+  [ "$depth" != "0" ] && { ab_args="--depth-tokens $depth"; want_keys=5; }
 
   # ---- OFF ----
   start_server "CAMELID_RESIDENT_TRACE=1 $extra_env" "$model" "$OUTDIR/$name.off.log" "$ready" || { FAILED=1; return; }
@@ -120,6 +133,9 @@ run_leg() { # name model-basename extra_env depth_tokens ready_s
     return
   fi
   echo "  on-leg trace: overlap ENGAGED confirmed"
+
+  check_corpus "$OUTDIR/$name.off.json" "$want_keys" "OFF" || { FAILED=1; return; }
+  check_corpus "$OUTDIR/$name.on.json" "$want_keys" "ON" || { FAILED=1; return; }
 
   # ---- byte diff ----
   if diff -q "$OUTDIR/$name.off.json" "$OUTDIR/$name.on.json" >/dev/null; then
