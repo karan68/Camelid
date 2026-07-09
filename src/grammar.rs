@@ -437,6 +437,9 @@ enum Schema {
     Enum(Arc<Vec<Vec<u8>>>),
     Object(Arc<ObjectSchema>),
     Array(Arc<Schema>),
+    /// A `type` union whose members start with distinct bytes (e.g. the OpenAI
+    /// nullable pattern `["string","null"]`); the first value byte selects the member.
+    Union(Arc<Vec<Schema>>),
 }
 
 #[derive(Debug)]
@@ -510,53 +513,114 @@ fn compile_node(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
             .ok_or_else(|| serr("`enum` must be an array"))?;
         return compile_string_literals(arr, "enum");
     }
-    let ty = match map.get("type") {
+    let types: Vec<&str> = match map.get("type") {
         None => {
             return Err(serr(
                 "schema must declare a `type` (untyped/any schemas are not supported yet)",
             ))
         }
-        Some(serde_json::Value::String(s)) => s.as_str(),
-        Some(_) => {
-            return Err(serr(
-                "`type` must be a single string (type unions are not supported yet)",
-            ))
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(items)) => {
+            if items.is_empty() {
+                return Err(serr("`type` array must be non-empty"));
+            }
+            items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .ok_or_else(|| serr("`type` array entries must be strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
         }
+        Some(_) => return Err(serr("`type` must be a string or an array of type strings")),
     };
+    // Validate keywords once against the union of the member types' allowed keys, so a
+    // nullable object like {"type":["object","null"], "properties":{...}} keeps its
+    // object keywords without the `null` member rejecting them.
+    let mut allowed: Vec<&str> = Vec::new();
+    for &ty in &types {
+        for &key in type_allowed_keys(ty) {
+            if !allowed.contains(&key) {
+                allowed.push(key);
+            }
+        }
+    }
+    reject_unknown(map, &allowed)?;
+    if types.len() == 1 {
+        return compile_typed(types[0], map);
+    }
+    // A multi-type union (e.g. the OpenAI nullable pattern ["string","null"]): compile
+    // each member reusing the surrounding keywords, and require distinct start bytes so
+    // a single lookahead selects the branch.
+    let mut members = Vec::with_capacity(types.len());
+    for &ty in &types {
+        members.push(compile_typed(ty, map)?);
+    }
+    ensure_disjoint_start_bytes(&members)?;
+    Ok(Schema::Union(Arc::new(members)))
+}
+
+/// Compile a single JSON `type` (with its surrounding keywords) into a node. Keyword
+/// validation is the caller's responsibility (done once over the union of members).
+fn compile_typed(
+    ty: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Schema, SchemaError> {
     match ty {
-        "object" => {
-            reject_unknown(
-                map,
-                &["type", "properties", "required", "additionalProperties"],
-            )?;
-            compile_object(map)
-        }
-        "array" => {
-            reject_unknown(map, &["type", "items"])?;
-            compile_array(map)
-        }
-        "string" => {
-            reject_unknown(map, &["type"])?;
-            Ok(Schema::Str)
-        }
-        "integer" => {
-            reject_unknown(map, &["type"])?;
-            Ok(Schema::Integer)
-        }
-        "number" => {
-            reject_unknown(map, &["type"])?;
-            Ok(Schema::Number)
-        }
-        "boolean" => {
-            reject_unknown(map, &["type"])?;
-            Ok(Schema::Bool)
-        }
-        "null" => {
-            reject_unknown(map, &["type"])?;
-            Ok(Schema::Null)
-        }
+        "object" => compile_object(map),
+        "array" => compile_array(map),
+        "string" => Ok(Schema::Str),
+        "integer" => Ok(Schema::Integer),
+        "number" => Ok(Schema::Number),
+        "boolean" => Ok(Schema::Bool),
+        "null" => Ok(Schema::Null),
         other => Err(serr(format!("unsupported `type`: {other}"))),
     }
+}
+
+/// The keywords a given type is allowed to carry (beyond annotations).
+fn type_allowed_keys(ty: &str) -> &'static [&'static str] {
+    match ty {
+        "object" => &["type", "properties", "required", "additionalProperties"],
+        "array" => &["type", "items"],
+        _ => &["type"],
+    }
+}
+
+/// The distinct bytes a value matching `schema` may begin with.
+fn first_bytes(schema: &Schema) -> Vec<u8> {
+    match schema {
+        Schema::Str => vec![b'"'],
+        Schema::Enum(cands) => cands.iter().filter_map(|c| c.first().copied()).collect(),
+        Schema::Integer | Schema::Number => {
+            let mut bytes = vec![b'-'];
+            bytes.extend(b'0'..=b'9');
+            bytes
+        }
+        Schema::Bool => vec![b't', b'f'],
+        Schema::Null => vec![b'n'],
+        Schema::Object(_) => vec![b'{'],
+        Schema::Array(_) => vec![b'['],
+        Schema::Union(members) => members.iter().flat_map(first_bytes).collect(),
+    }
+}
+
+/// A `type` union is supported only when its members start with disjoint bytes, so a
+/// single lookahead byte selects the branch (true for every `["T","null"]` nullable
+/// union). Overlapping shapes (e.g. integer + number) are rejected fail-closed.
+fn ensure_disjoint_start_bytes(members: &[Schema]) -> Result<(), SchemaError> {
+    let mut seen = [false; 256];
+    for member in members {
+        for b in first_bytes(member) {
+            if seen[b as usize] {
+                return Err(serr(
+                    "ambiguous `type` union: members share a starting byte; only unions of distinct value shapes (e.g. [\"string\",\"null\"]) are supported",
+                ));
+            }
+            seen[b as usize] = true;
+        }
+    }
+    Ok(())
 }
 
 fn compile_string_literals(
@@ -906,6 +970,17 @@ impl SchemaState {
                     self.mode = SchemaMode::Enum { cands, viable, pos };
                 }
                 Ok(())
+            }
+            Schema::Union(members) => {
+                // Distinct start bytes are guaranteed at compile time, so at most one
+                // member can begin with `b`. `start_value` is side-effect-free on Err,
+                // so trying members in turn is safe.
+                for member in members.iter() {
+                    if self.start_value(member.clone(), b).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(())
             }
         }
     }
@@ -1548,5 +1623,62 @@ mod tests {
         assert!(s.accepts(b"{\"a\":\"x\"}"));
         // A schema outside the subset is an error, not a panic or a silent pass.
         assert!(ConstraintSpec::from_schema(&json!({"type": "string"})).is_err());
+    }
+
+    #[test]
+    fn nullable_type_union_accepts_value_or_null() {
+        use serde_json::json;
+        // The OpenAI nullable pattern: a required-but-nullable property via ["T","null"].
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"name": {"type": ["string", "null"]}},
+            "required": ["name"]
+        }));
+        assert!(schema_complete(&s, r#"{"name":"bob"}"#));
+        assert!(schema_complete(&s, r#"{"name":null}"#)); // null satisfies the required field
+
+        // Neither a number nor a bad literal is a string-or-null.
+        assert!(!schema_prefix(&s, r#"{"name":5"#));
+        assert!(!schema_prefix(&s, r#"{"name":t"#));
+    }
+
+    #[test]
+    fn nullable_integer_and_object_unions() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "age": {"type": ["integer", "null"]},
+                "meta": {
+                    "type": ["object", "null"], "additionalProperties": false,
+                    "properties": {"k": {"type": "string"}}, "required": ["k"]
+                }
+            },
+            "required": ["age", "meta"]
+        }));
+        assert!(schema_complete(&s, r#"{"age":30,"meta":{"k":"v"}}"#));
+        assert!(schema_complete(&s, r#"{"age":null,"meta":null}"#));
+        assert!(schema_complete(&s, r#"{"age":5,"meta":null}"#));
+        // The nullable object's object branch still enforces its required `k`.
+        assert!(!schema_complete(&s, r#"{"age":null,"meta":{}}"#));
+        // The integer branch still forbids a fraction.
+        assert!(!schema_prefix(&s, r#"{"age":1.5"#));
+    }
+
+    #[test]
+    fn ambiguous_type_union_is_rejected() {
+        use serde_json::json;
+        // integer + number share a starting byte, so one lookahead can't disambiguate.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"x": {"type": ["integer", "number"]}}, "required": ["x"]
+        }))
+        .is_err());
+        // A single-element type array is a degenerate (accepted) union.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"x": {"type": ["string"]}}, "required": ["x"]
+        }))
+        .is_ok());
     }
 }
