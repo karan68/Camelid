@@ -9892,8 +9892,8 @@ fn generate_token_ids(
     } else {
         Vec::new()
     };
-    let mut grammar: Option<crate::grammar::JsonState> =
-        json_grammar_active.then(crate::grammar::JsonState::new);
+    let mut grammar: Option<crate::grammar::ConstraintState> =
+        json_grammar_active.then(crate::grammar::ConstraintState::new_json);
     let mut grammar_mask: Vec<bool> = vec![
         false;
         if json_grammar_active {

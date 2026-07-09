@@ -367,6 +367,53 @@ impl JsonState {
     }
 }
 
+/// Dispatch across the constrained-decoding backends the decode loop can drive.
+///
+/// The loop needs only three operations — [`ConstraintState::accepts`] to mask a
+/// candidate token, [`ConstraintState::advance`] to commit the chosen token's
+/// bytes, and [`ConstraintState::is_done`] to know when the constrained value is
+/// complete — so every backend exposes exactly that surface and the loop never has
+/// to know which one is active. Today the only backend is the JSON-object grammar;
+/// JSON Schema and GBNF are follow-ups that add variants here without touching the
+/// decode loop.
+#[derive(Clone, Debug)]
+pub enum ConstraintState {
+    /// `response_format: {"type":"json_object"}` — any valid JSON object.
+    Json(JsonState),
+}
+
+impl ConstraintState {
+    /// Construct the JSON-object constraint (the `json_object` response format).
+    pub fn new_json() -> Self {
+        Self::Json(JsonState::new())
+    }
+
+    /// Would appending `bytes` keep the output a valid prefix of the constrained
+    /// value? Used to mask a candidate token without mutating the live state.
+    pub fn accepts(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Json(state) => state.accepts(bytes),
+        }
+    }
+
+    /// Commit one byte of the chosen token. `Err(())` means the byte cannot extend
+    /// the constrained value; the per-step mask guarantees this never happens for a
+    /// token the loop actually selected.
+    #[allow(clippy::result_unit_err)]
+    pub fn advance(&mut self, b: u8) -> Result<(), ()> {
+        match self {
+            Self::Json(state) => state.advance(b),
+        }
+    }
+
+    /// True once the constrained value is complete (the model may stop).
+    pub fn is_done(&self) -> bool {
+        match self {
+            Self::Json(state) => state.is_done(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +546,34 @@ mod tests {
         assert!(st.accepts(b"]}")); // close array then object
         assert!(st.accepts(b",2")); // continue the array
         assert!(!st.accepts(b"}")); // can't close the object while inside the array
+    }
+
+    #[test]
+    fn constraint_state_json_delegates_to_json_state() {
+        // ConstraintState::Json must behave exactly like the underlying JsonState
+        // so the Slice 1 seam is a pure pass-through (zero behavior change).
+        let mut c = ConstraintState::new_json();
+        assert!(!c.is_done());
+        // Same masking decisions as a bare JsonState at the top level.
+        assert!(c.accepts(b"{"));
+        assert!(!c.accepts(b"["));
+        for &b in br#"{"a":1}"# {
+            c.advance(b).unwrap();
+        }
+        assert!(c.is_done());
+        // Once done, only trailing whitespace is accepted.
+        assert!(c.accepts(b"  \n"));
+        assert!(!c.accepts(b"{"));
+
+        // Cross-check: the enum agrees byte-for-byte with a directly driven state.
+        let mut c2 = ConstraintState::new_json();
+        let mut st = JsonState::new();
+        for &b in br#"{"k":[1,2]}"# {
+            assert_eq!(c2.accepts(&[b]), st.accepts(&[b]));
+            c2.advance(b).unwrap();
+            st.advance(b).unwrap();
+        }
+        assert_eq!(c2.is_done(), st.is_done());
+        assert!(c2.is_done());
     }
 }
