@@ -3462,6 +3462,176 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
     }
 }
 
+/// STAMPEDE Lane B v5: the 8-row repack owner must be bitwise identical to
+/// the per-cell block-dot path — including the ragged tail (out_dim % 8 != 0)
+/// and multi-row-block shapes. On hosts without avx512vnni the repack path
+/// legitimately never engages (asserted) and the comparison covers the
+/// fallback instead.
+#[test]
+fn q4_k_repack8_owner_bitwise_matches_block_dot_core() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+
+    for (in_dim, out_dim) in [(512usize, 96usize), (768, 40), (512, 19)] {
+        let row_bytes = (in_dim / 256) * 144;
+        // d/dmin VARY PER ROW (finite f16s, sign included): uniform values
+        // would mask a per-row lane permutation in the pack's d/dmin arrays
+        // (review finding). Exponent nibbles stay in a finite range.
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| {
+                let row = i / row_bytes;
+                match i % 144 {
+                    0 => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
+                    1 => 0x28 | ((row % 8) as u8) | ((((row / 8) % 2) as u8) << 7),
+                    2 => ((i as u32).wrapping_mul(0x9E37_79B9) >> 24) as u8,
+                    3 => 0x20 | (((row + 3) % 8) as u8),
+                    _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
+                }
+            })
+            .collect();
+        let superblocks = in_dim / 256;
+        let pack_rows = out_dim / 8 * 8;
+        let pack = crate::tensor::Q4KPackedRows8::from_q4_k_wire(
+            pack_rows,
+            superblocks,
+            &wire[..pack_rows * row_bytes],
+        )
+        .unwrap();
+        for n_rows in [4usize, 13, 65] {
+            let input_data: Vec<f32> = (0..n_rows * in_dim)
+                .map(|i| ((i as f32) * 0.41).sin() * 2.0 - 0.6)
+                .collect();
+            let input =
+                CpuTensor::from_f32("repack8-in", vec![n_rows, in_dim], input_data).unwrap();
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+            reset_q8_schedule_telemetry();
+            let owner = q4_k_block_dot_core_with_repack(
+                &input,
+                &wire,
+                out_dim,
+                in_dim,
+                "owner",
+                Some(&pack),
+            )
+            .unwrap();
+            let telemetry = snapshot_q8_schedule_telemetry();
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            assert!(telemetry.kquant_owner_prefill_taken > 0);
+            // Engaged-check: the repack path must run exactly when the host
+            // has the features (the pack is passed in explicitly here).
+            assert_eq!(
+                q8_owner_avx512vnni_available(),
+                telemetry.kquant_owner_repack8_taken > 0,
+                "repack8 engagement mismatch (n_rows={n_rows}, out_dim={out_dim})"
+            );
+            assert_eq!(owner.data.len(), base.data.len());
+            for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
+                );
+            }
+        }
+    }
+}
+
+/// Lane B v5 repack round-trip: the packed block must reproduce the wire's
+/// d/dmin/scales/mins and nibble bytes exactly (straight byte permutation).
+#[test]
+fn q4_k_repack8_round_trip_matches_wire() {
+    let rows = 16usize;
+    let superblocks = 2usize;
+    let row_bytes = superblocks * 144;
+    let wire: Vec<u8> = (0..rows * row_bytes)
+        .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let pack = crate::tensor::Q4KPackedRows8::from_q4_k_wire(rows, superblocks, &wire).unwrap();
+    for row_group in 0..rows / 8 {
+        for sb in 0..superblocks {
+            let gb = &pack.blocks[row_group * superblocks + sb];
+            for r in 0..8 {
+                let src = ((row_group * 8 + r) * superblocks + sb) * 144;
+                let d =
+                    crate::tensor::f16_bits_to_f32(u16::from_le_bytes([wire[src], wire[src + 1]]));
+                let dmin = crate::tensor::f16_bits_to_f32(u16::from_le_bytes([
+                    wire[src + 2],
+                    wire[src + 3],
+                ]));
+                assert_eq!(gb.d[r].to_bits(), d.to_bits());
+                assert_eq!(gb.dmin[r].to_bits(), dmin.to_bits());
+                let (scales, mins) =
+                    crate::tensor::q4_k_unpack_kmask_scales(&wire[src + 4..src + 16]);
+                for g in 0..8 {
+                    assert_eq!(gb.scales[g][r], scales[g]);
+                    assert_eq!(gb.mins[g][r], mins[g]);
+                }
+                for c in 0..4 {
+                    for qc in 0..8 {
+                        for b in 0..4 {
+                            assert_eq!(
+                                gb.qs[c * 256 + qc * 32 + r * 4 + b],
+                                wire[src + 16 + c * 32 + qc * 4 + b],
+                                "nibble byte mismatch (r={r}, c={c}, qc={qc}, b={b})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Lane B v5 budget policy: degrade, never refuse — budget 0 denies the build,
+/// output stays bit-identical via the single-row inner.
+#[test]
+fn q4_k_repack8_budget_zero_degrades_bit_identically() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _env_guard = env_lock();
+        clear_dense_diagnostic_env();
+        let in_dim = 512usize;
+        let out_dim = 32usize;
+        let row_bytes = (in_dim / 256) * 144;
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let input_data: Vec<f32> = (0..8 * in_dim).map(|i| ((i as f32) * 0.3).cos()).collect();
+        let input = CpuTensor::from_f32("budget-in", vec![8usize, in_dim], input_data).unwrap();
+        let mut weight = CpuTensor::from_f32(
+            "budget-w",
+            vec![out_dim, in_dim],
+            vec![0f32; out_dim * in_dim],
+        )
+        .unwrap();
+        weight.source_type = Some(GgufTensorType::Q4K);
+        weight.q4_k_wire_bytes = Some(std::sync::Arc::new(wire.clone()));
+
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+        let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+        std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8", "1");
+        std::env::set_var("CAMELID_X86_KQUANT_REPACK8_BUDGET_MIB", "0");
+        reset_q8_schedule_telemetry();
+        let denied = matmul_rhs_transposed_q4_k_block_dot(&input, &weight, "denied").unwrap();
+        let telemetry = snapshot_q8_schedule_telemetry();
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+        std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8");
+        std::env::remove_var("CAMELID_X86_KQUANT_REPACK8_BUDGET_MIB");
+        if q8_owner_avx512vnni_available() {
+            assert_eq!(telemetry.kquant_owner_repack8_built, 0);
+            assert!(telemetry.kquant_owner_repack8_budget_denied > 0);
+        }
+        assert_eq!(telemetry.kquant_owner_repack8_taken, 0);
+        for (a, b) in denied.data.iter().zip(base.data.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+}
+
 /// STAMPEDE Phase 3 Lane B sibling: the batched Q6_K prefill owner must be
 /// bitwise identical to the per-cell block-dot path — its f32 shape (8 lane
 /// accumulators, final left-fold) is the bits-sensitive part KQUANT_RECON
