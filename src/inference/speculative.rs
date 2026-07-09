@@ -304,6 +304,111 @@ impl ModelDrafter {
     }
 }
 
+/// STAMPEDE Phase 5 (P5.2) — the acceptance-gated RUN-LENGTH latch, extracted
+/// verbatim from the bench-speculative tree lane so the GPU-verified and
+/// CPU-verified rounds (and, staged, the serve loop) drive ONE policy instead
+/// of divergent copies.
+///
+/// Policy (measured on this box, 3B Q8, see the tree-lane receipts): while
+/// speculating, draw the FULL budget every round; only a RUN of `exit_run`
+/// consecutive rounds each accepting fewer than `productive_drafts` drafts
+/// latches speculation OFF (run-length, not EWMA — real-text acceptance is
+/// bursty). While OFF, skip speculation entirely (~1.0× floor); every
+/// `low_reprobe` skips, spend ONE full-budget probe and re-latch ON when it
+/// accepts ≥ `enter_drafts`. Warm-up rounds always speculate so a stream's
+/// true acceptance is observed before the latch may turn off. Anchor-only
+/// misses and engine-readiness misses must NOT be reported (they are not
+/// acceptance measurements).
+#[derive(Debug, Clone)]
+pub struct SpecLatch {
+    /// A round accepting >= this many DRAFTS (the +1 bonus excluded) is "productive".
+    pub productive_drafts: u32,
+    /// Consecutive non-productive VERIFIED rounds before latching OFF.
+    /// 4, not 2: repetitive text strings together 2-3 sub-productive rounds
+    /// mid-list; exiting early erodes the win (measured: EXIT_RUN=2 cut
+    /// repetitive below 1.2×).
+    pub exit_run: u32,
+    /// A re-probe accepting >= this many drafts re-latches ON.
+    pub enter_drafts: u32,
+    /// Verified rounds before the latch may turn off.
+    pub warmup_rounds: u64,
+    /// Consecutive skips between full-budget re-probes (rare on purpose: a
+    /// novel stream pays ~1 wasted verify per this many tokens).
+    pub low_reprobe: u32,
+    rounds_done: u64,
+    consecutive_skips: u32,
+    nonproductive_run: u32,
+    speculating: bool,
+}
+
+impl Default for SpecLatch {
+    fn default() -> Self {
+        Self {
+            productive_drafts: 2,
+            exit_run: 4,
+            enter_drafts: 2,
+            warmup_rounds: 1,
+            low_reprobe: 64,
+            rounds_done: 0,
+            consecutive_skips: 0,
+            nonproductive_run: 0,
+            // Start latched ON so warm-up measures true acceptance.
+            speculating: true,
+        }
+    }
+}
+
+impl SpecLatch {
+    /// Should this round draft at the full budget? `false` = skip speculation
+    /// (plain decode step); callers must then report the skip via
+    /// [`SpecLatch::note_skip`].
+    pub fn should_speculate(&self) -> bool {
+        self.rounds_done < self.warmup_rounds
+            || self.speculating
+            || self.consecutive_skips >= self.low_reprobe
+    }
+
+    /// Record a skipped (non-drafted) round.
+    pub fn note_skip(&mut self) {
+        self.consecutive_skips = self.consecutive_skips.saturating_add(1);
+    }
+
+    /// Record a VERIFIED round's accepted-draft count (the +1 bonus token
+    /// excluded). Never call for anchor-only or engine-miss rounds.
+    pub fn note_verified(&mut self, accepted_drafts: u32) {
+        self.consecutive_skips = 0;
+        if accepted_drafts >= self.productive_drafts {
+            self.nonproductive_run = 0;
+            if !self.speculating && accepted_drafts >= self.enter_drafts {
+                self.speculating = true;
+            }
+        } else {
+            self.nonproductive_run = self.nonproductive_run.saturating_add(1);
+            if self.speculating && self.nonproductive_run >= self.exit_run {
+                self.speculating = false;
+                self.nonproductive_run = 0;
+            }
+        }
+        self.rounds_done = self.rounds_done.saturating_add(1);
+    }
+
+    pub fn speculating(&self) -> bool {
+        self.speculating
+    }
+
+    pub fn rounds_done(&self) -> u64 {
+        self.rounds_done
+    }
+
+    pub fn consecutive_skips(&self) -> u32 {
+        self.consecutive_skips
+    }
+
+    pub fn nonproductive_run(&self) -> u32 {
+        self.nonproductive_run
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,5 +457,80 @@ mod tests {
         assert_eq!(accepted_draft_prefix(&[1, 2, 3], &[1, 9, 3, 4]), 1);
         assert_eq!(accepted_draft_prefix(&[1, 2, 3], &[9, 9, 9, 9]), 0);
         assert_eq!(accepted_draft_prefix(&[], &[5]), 0);
+    }
+
+    #[test]
+    fn spec_latch_warmup_always_speculates() {
+        let latch = SpecLatch::default();
+        assert!(latch.should_speculate());
+    }
+
+    #[test]
+    fn spec_latch_exits_after_run_of_nonproductive_rounds() {
+        let mut latch = SpecLatch::default();
+        // Warm-up round (counts as verified).
+        latch.note_verified(0);
+        // Three more non-productive rounds reach exit_run = 4.
+        for _ in 0..2 {
+            latch.note_verified(1);
+            assert!(latch.should_speculate(), "run not yet complete");
+        }
+        latch.note_verified(0);
+        assert!(
+            !latch.speculating(),
+            "4 consecutive non-productive rounds must latch off"
+        );
+        assert!(!latch.should_speculate());
+    }
+
+    #[test]
+    fn spec_latch_productive_round_resets_the_run() {
+        let mut latch = SpecLatch::default();
+        latch.note_verified(0);
+        latch.note_verified(1);
+        latch.note_verified(0);
+        // Productive round resets before the run reaches exit_run.
+        latch.note_verified(3);
+        latch.note_verified(0);
+        latch.note_verified(0);
+        latch.note_verified(1);
+        assert!(
+            latch.speculating(),
+            "run must restart after a productive round"
+        );
+    }
+
+    #[test]
+    fn spec_latch_reprobe_after_low_reprobe_skips_and_reenters() {
+        let mut latch = SpecLatch::default();
+        for _ in 0..4 {
+            latch.note_verified(0);
+        }
+        assert!(!latch.should_speculate());
+        for _ in 0..63 {
+            latch.note_skip();
+            assert!(!latch.should_speculate());
+        }
+        latch.note_skip();
+        assert!(latch.should_speculate(), "64th skip earns a re-probe");
+        // Probe lands >= enter_drafts: re-latch ON.
+        latch.note_verified(2);
+        assert!(latch.speculating());
+        assert!(latch.should_speculate());
+    }
+
+    #[test]
+    fn spec_latch_failed_reprobe_stays_off() {
+        let mut latch = SpecLatch::default();
+        for _ in 0..4 {
+            latch.note_verified(0);
+        }
+        for _ in 0..64 {
+            latch.note_skip();
+        }
+        assert!(latch.should_speculate());
+        latch.note_verified(0);
+        assert!(!latch.speculating());
+        assert!(!latch.should_speculate(), "failed probe resumes skipping");
     }
 }
