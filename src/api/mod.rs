@@ -10149,12 +10149,17 @@ fn generate_token_ids(
                     any_allowed |= *slot;
                 }
                 // Fail closed if no token can extend the constrained value and
-                // stopping is not yet allowed. Invariant: this only arises when the
-                // tokenizer lacks a token for a required byte. Byte-fallback
-                // tokenizers (Llama/Qwen/Gemma) cover every byte, so it never fires
-                // for them; but sampling a fully-masked (all -inf) distribution would
-                // otherwise emit an invalid token or NaN, so we surface a typed error
-                // instead.
+                // stopping is not yet allowed. This arises when the next required byte
+                // is only reachable through a multibyte-UTF-8 fragment token:
+                // `grammar_token_bytes` decodes each token in isolation and drops
+                // incomplete UTF-8, so a byte-level-BPE / byte-fallback fragment decodes
+                // to "" and is masked out above (having a byte token is not enough — it
+                // must survive an in-isolation decode). Non-ASCII `enum`/`const` literals,
+                // which would force exactly such a byte, are rejected at schema-compile
+                // time (a request-time 400), so in practice this only guards free-form
+                // values on pathological tokenizers; sampling a fully-masked (all -inf)
+                // distribution would otherwise emit an invalid token or NaN, so we
+                // surface a typed error instead.
                 if !any_allowed {
                     return Err(Box::new(api_error(
                         StatusCode::UNPROCESSABLE_ENTITY,

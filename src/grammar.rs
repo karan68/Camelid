@@ -656,7 +656,21 @@ fn compile_string_literals(
     let mut encodings = Vec::with_capacity(values.len());
     for value in values {
         match value {
-            serde_json::Value::String(_) => {
+            serde_json::Value::String(s) => {
+                // Constrained decoding matches the value's exact UTF-8 bytes, but the
+                // per-token byte table (`grammar_token_bytes`) decodes each token in
+                // isolation and drops incomplete UTF-8: a byte-level-BPE / byte-fallback
+                // tokenizer emits a multibyte character as byte fragments, each of which
+                // decodes alone to "" and is masked out. A non-ASCII literal could
+                // therefore never be produced and the automaton would dead-end
+                // mid-generation. Reject it here so an unenforceable literal is an honest
+                // request-time 400, not a constraint that compiles and then fails closed
+                // in the middle of decoding.
+                if !s.is_ascii() {
+                    return Err(serr(format!(
+                        "`{keyword}` member {s:?} contains non-ASCII characters; constrained string values are ASCII-only"
+                    )));
+                }
                 let encoded = serde_json::to_vec(value)
                     .map_err(|e| serr(format!("`{keyword}` member is not serializable: {e}")))?;
                 encodings.push(encoded);
@@ -1734,5 +1748,31 @@ mod tests {
             "properties": {"k": {"const": "x", "type": "string"}}, "required": ["k"]
         }));
         assert!(schema_complete(&s, r#"{"k":"x"}"#));
+    }
+
+    #[test]
+    fn non_ascii_enum_or_const_is_rejected() {
+        use serde_json::json;
+        // A non-ASCII literal cannot be enforced byte-for-byte: byte-level-BPE and
+        // byte-fallback tokenizers emit a multibyte character as byte fragments that
+        // decode in isolation to "" and are masked out, so the value could never be
+        // produced. It must fail closed at compile time (a request-time 400) rather than
+        // dead-ending mid-generation. `\u{e9}` = 'é', `\u{2103}` = '℃'.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"city": {"enum": ["caf\u{e9}", "berlin"]}}, "required": ["city"]
+        }))
+        .is_err());
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"unit": {"const": "\u{2103}"}}, "required": ["unit"]
+        }))
+        .is_err());
+        // A pure-ASCII enum/const is unaffected.
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"unit": {"enum": ["celsius", "fahrenheit"]}}, "required": ["unit"]
+        }));
+        assert!(schema_complete(&s, r#"{"unit":"celsius"}"#));
     }
 }
