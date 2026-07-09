@@ -6,7 +6,7 @@ Recon + architect design captured 2026-07-09. Anchors are src/cuda_resident.rs a
 
 # STAMPEDE Phase 6 — Implementation Plan: Multi-Stream Overlap for CUDA Resident Decode
 
-All anchors: `C:/Users/timto/Camelid/src/cuda_resident.rs` at main 41d47433 unless noted.
+All anchors: `src/cuda_resident.rs` at main 41d47433 unless noted.
 
 ## 1. Scope and non-goals
 
@@ -94,7 +94,7 @@ Secondary risk, stated for completeness: none from parity (kernels unchanged, di
 
 ## Files touched
 
-- `C:/Users/timto/Camelid/src/cuda_resident.rs` — `StreamOverlap` struct + field, `cuda_streams_enabled()`, `forward_pass` stream threading (attn block 5563–5804, FFN block 6079–6240).
-- `C:/Users/timto/Camelid/scripts/validate-cuda-streams.sh` (new, cloned from `validate-cuda-prefill-row.sh`).
-- `C:/Users/timto/Camelid/docs/perf-deep-dive/STAMPEDE_CONDUCTOR.md` — Phase 6 ledger row (line 167) + graph-vs-live decision receipt.
-- `C:/Users/timto/Camelid/qa/perf/` — bench + parity receipts.
+- `src/cuda_resident.rs` — `StreamOverlap` struct + field, `cuda_streams_enabled()`, `forward_pass` stream threading (attn block 5563–5804, FFN block 6079–6240).
+- `scripts/validate-cuda-streams.sh` (new, cloned from `validate-cuda-prefill-row.sh`).
+- `docs/perf-deep-dive/STAMPEDE_CONDUCTOR.md` — Phase 6 ledger row (line 167) + graph-vs-live decision receipt.
+- `qa/perf/` — bench + parity receipts.
