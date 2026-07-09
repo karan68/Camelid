@@ -28,10 +28,14 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub ffn_gate_up_decode_consumer_activation_us: u64,
     pub ffn_gate_up_decode_consumer_tensor_us: u64,
     pub ffn_decode_chain_taken: u64,
-    pub ffn_decode_chain_total_us: u64,
-    pub ffn_decode_chain_input_quantize_us: u64,
-    pub ffn_decode_chain_activation_quantize_us: u64,
-    pub ffn_decode_chain_down_us: u64,
+    // Chain stage timings accumulate NANOseconds: the per-call stages (a single
+    // row quantize is tens of ns) sit far below 1µs, so microsecond truncation
+    // recorded 0 forever on a fast box — underreporting real cost in perf work
+    // and making "the instrumentation is wired" untestable.
+    pub ffn_decode_chain_total_ns: u64,
+    pub ffn_decode_chain_input_quantize_ns: u64,
+    pub ffn_decode_chain_activation_quantize_ns: u64,
+    pub ffn_decode_chain_down_ns: u64,
     pub activation_pack_calls: u64,
     pub activation_pack_rows: u64,
     pub activation_pack_bytes_requested: u64,
@@ -127,10 +131,10 @@ pub(super) static Q8_SCHED_FFN_GATE_UP_DECODE_FUSED_ACTIVATION_TAKEN: AtomicU64 
 pub(super) static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_TAKEN: AtomicU64 = AtomicU64::new(0);
-pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US: AtomicU64 = AtomicU64::new(0);
-pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
-pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US: AtomicU64 = AtomicU64::new(0);
-pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US: AtomicU64 = AtomicU64::new(0);
+pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_NS: AtomicU64 = AtomicU64::new(0);
+pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_NS: AtomicU64 = AtomicU64::new(0);
+pub(super) static Q8_SCHED_FFN_DECODE_CHAIN_DOWN_NS: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_ACTIVATION_PACK_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_ACTIVATION_PACK_ROWS: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -204,10 +208,10 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_ACTIVATION_US.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US.store(0, Ordering::Relaxed);
-    Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_NS.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_NS.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_NS.store(0, Ordering::Relaxed);
+    Q8_SCHED_FFN_DECODE_CHAIN_DOWN_NS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_CALLS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_ROWS.store(0, Ordering::Relaxed);
     Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED.store(0, Ordering::Relaxed);
@@ -311,12 +315,12 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
         ffn_gate_up_decode_consumer_tensor_us: Q8_SCHED_FFN_GATE_UP_DECODE_CONSUMER_TENSOR_US
             .load(Ordering::Relaxed),
         ffn_decode_chain_taken: Q8_SCHED_FFN_DECODE_CHAIN_TAKEN.load(Ordering::Relaxed),
-        ffn_decode_chain_total_us: Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_US.load(Ordering::Relaxed),
-        ffn_decode_chain_input_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_US
+        ffn_decode_chain_total_ns: Q8_SCHED_FFN_DECODE_CHAIN_TOTAL_NS.load(Ordering::Relaxed),
+        ffn_decode_chain_input_quantize_ns: Q8_SCHED_FFN_DECODE_CHAIN_INPUT_QUANTIZE_NS
             .load(Ordering::Relaxed),
-        ffn_decode_chain_activation_quantize_us: Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_US
+        ffn_decode_chain_activation_quantize_ns: Q8_SCHED_FFN_DECODE_CHAIN_ACTIVATION_QUANTIZE_NS
             .load(Ordering::Relaxed),
-        ffn_decode_chain_down_us: Q8_SCHED_FFN_DECODE_CHAIN_DOWN_US.load(Ordering::Relaxed),
+        ffn_decode_chain_down_ns: Q8_SCHED_FFN_DECODE_CHAIN_DOWN_NS.load(Ordering::Relaxed),
         activation_pack_calls: Q8_SCHED_ACTIVATION_PACK_CALLS.load(Ordering::Relaxed),
         activation_pack_rows: Q8_SCHED_ACTIVATION_PACK_ROWS.load(Ordering::Relaxed),
         activation_pack_bytes_requested: Q8_SCHED_ACTIVATION_PACK_BYTES_REQUESTED
