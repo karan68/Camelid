@@ -18,7 +18,7 @@ orphan — the exact corruption class the lock exists to prevent.
 | Phase | Scope | Status | Receipts |
 |---|---|---|---|
 | 0 | Repro harness P0-T1/T2/T3 + R1 lane recon | **DONE — GATE 0 GO** | qa/evidence-bundles/engine-inversion-gate0-orphan-repro-20260709T134304Z-head-ffada00f/ + docs/recon/ENGINE_INVERSION_R1_LANE_RECON.md |
-| 1 | Cancellation plumbing (token + deadline + guard rides with compute) | IMPLEMENTED — Gate 1 validation running | P0 tests flipped to PASS; suite/fmt/clippy/parity/perf pending |
+| 1 | Cancellation plumbing (token + deadline + guard rides with compute) | **DONE — GATE 1 PASS** | qa/evidence-bundles/engine-inversion-gate1-cancellation-20260709T142537Z-head-0668b206/ |
 | 2 | Engine inversion (engine worker thread, bounded queue, lock removal) | pending Gate 1 | — |
 | 3 | Streaming over events (no per-token spawn_blocking) | pending Gate 2 | — |
 | 4 | Re-certification (parity, receipts, perf, compat) | pending Gate 3 | — |
@@ -79,7 +79,12 @@ expected failure cannot leak an orphan or a probe underflow into sibling tests).
   own requests only** (process-global Engine, per-kernel-op locking) — does NOT
   touch main-engine state, so the mission proceeds; fix filed as a separate task
   outside this mission (see ENGINE_INVERSION_R1_LANE_RECON.md).
-- GATE 1..4: pending.
+- GATE 1: **PASS** (2026-07-09, head 0668b206). P0 tests flipped with assertions
+  unchanged; suite 675/675; fmt+clippy clean; TinyLlama-Q8_0 + Llama-3.2-1B-Q8_0
+  canonical outputs byte-identical pre/post on the default lane (Mistral row not
+  on host — substitution disclosed, carried to Phase 4); perf within noise.
+  Receipt: qa/evidence-bundles/engine-inversion-gate1-cancellation-20260709T142537Z-head-0668b206/.
+- GATE 2..4: pending.
 
 ## Phase 1 implementation record (2026-07-09)
 
