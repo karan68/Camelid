@@ -19,8 +19,8 @@ orphan — the exact corruption class the lock exists to prevent.
 |---|---|---|---|
 | 0 | Repro harness P0-T1/T2/T3 + R1 lane recon | **DONE — GATE 0 GO** | qa/evidence-bundles/engine-inversion-gate0-orphan-repro-20260709T134304Z-head-ffada00f/ + docs/recon/ENGINE_INVERSION_R1_LANE_RECON.md |
 | 1 | Cancellation plumbing (token + deadline + guard rides with compute) | **DONE — GATE 1 PASS** | qa/evidence-bundles/engine-inversion-gate1-cancellation-20260709T142537Z-head-0668b206/ |
-| 2 | Engine inversion (engine worker thread, bounded queue, lock removal) | pending Gate 1 | — |
-| 3 | Streaming over events (no per-token spawn_blocking) | pending Gate 2 | — |
+| 2 | Engine inversion (engine worker thread, bounded queue, lock removal) | **DONE — GATE 2 PASS** (commits 93dc20c3 + d50e0ab4) | qa/evidence-bundles/engine-inversion-gate2-inversion-20260709T153035Z-head-d50e0ab4/ |
+| 3 | Streaming over events (no per-token spawn_blocking) | **IMPLEMENTED in 2b**; Gate 3 golden-transcript matrix captured identical in the Gate 2 bundle; residual scope: prompt-cache Mutex → engine-owned (deferred cleanup, cache is already engine-thread-only) | see Gate 2 bundle `parity/` stream sections |
 | 4 | Re-certification (parity, receipts, perf, compat) | pending Gate 3 | — |
 | 5 | Multi-slot recon memo (expected KILL/defer) | pending | — |
 
@@ -84,7 +84,23 @@ expected failure cannot leak an orphan or a probe underflow into sibling tests).
   canonical outputs byte-identical pre/post on the default lane (Mistral row not
   on host — substitution disclosed, carried to Phase 4); perf within noise.
   Receipt: qa/evidence-bundles/engine-inversion-gate1-cancellation-20260709T142537Z-head-0668b206/.
-- GATE 2..4: pending.
+- GATE 2: **PASS** (2026-07-09, head d50e0ab4). Lock deleted; serialization by
+  construction (one engine worker). Suite 677/677; invariant tests
+  (single-job, D3-prep, typed queue-full, stream-timeout payload) green;
+  full-matrix parity byte-identical (greedy+sampled/seeded, stream+nonstream,
+  cache hit+miss, resident-CUDA + deterministic-CPU, TinyLlama + Llama-1B);
+  10-min disconnect-storm soak: 0 garble / 0 panics / 0 unexpected 5xx / RSS
+  flat; TTFT under queued load 12.4ms vs 2892ms baseline (~233x). Receipt:
+  qa/evidence-bundles/engine-inversion-gate2-inversion-20260709T153035Z-head-d50e0ab4/.
+- GATE 3: golden-transcript matrix (greedy+temp, cache hit+miss, CPU+CUDA
+  lanes) captured byte-identical at the Gate-2 head (same bundle, `parity/`
+  stream sections — canonicalization strips only uuids, so "identical modulo
+  timing" is met as literal identity). Disconnect-mid-stream cancellation
+  within ≤1 step is enforced by P0-T3. Residual Phase-3 scope carried to a
+  cleanup item: move `cached_prompt_prefix`'s Mutex to plain engine-owned
+  state (it is already touched only from engine jobs).
+- GATE 4: pending (full supported-row re-cert + Mistral replay on a host that
+  has the row + llama-server compat pass + STATUS/DECISIONS updates).
 
 ## Phase 1 implementation record (2026-07-09)
 
