@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
+mod engine;
+
 use crate::{
     execution_plan::{plan_for_model, ExecutionPlan, PlannerEnv},
     gguf::{read_metadata, GgufFile, GgufTensorDescriptor, GgufTensorType},
@@ -102,14 +104,15 @@ pub struct AppState {
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
-    /// Serializes token generation across requests. The CUDA-resident Q8 runtime
-    /// keeps KV / decode state in GPU-resident buffers that are reached through
-    /// shared `Arc`s under read locks, so two decodes running at once clobber each
-    /// other's state â€” producing garbled "word-salad" output, non-deterministic
-    /// greedy decoding, and an intermittent out-of-bounds slice panic in the
-    /// worker. This lock is held for the full duration of every generation,
-    /// including the entire SSE stream, so only one decode is ever in flight.
+    /// TRANSITIONAL (engine-inversion Phase 2): serializes the lock-based
+    /// STREAMING path against engine jobs while streaming still runs in the
+    /// SSE generator. Non-streaming decodes now execute on the engine worker
+    /// thread (see `engine::EngineHandle`), whose jobs hold this lock only as
+    /// a bridge. Deleted when streaming moves onto the engine.
     generation_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The engine worker: the single thread where decode compute and
+    /// resident-GPU-state mutations execute (see api/engine.rs).
+    engine: engine::EngineHandle,
     planner_env: PlannerEnv,
     configured_threads: Option<usize>,
     /// Server-wide default for opt-in thinking mode (`serve --enable-thinking`).
@@ -133,6 +136,7 @@ impl Default for AppState {
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
             generation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
             default_enable_thinking: false,
@@ -291,6 +295,10 @@ pub struct HealthResponse {
     /// True when the gemma4 serve path is built (CAMELID_GEMMA4_SERVE) and a gemma4
     /// runtime is loaded for the active model.
     pub gemma4_available: bool,
+    /// Engine-queue backpressure gauge: generation jobs accepted and not yet
+    /// finished (queued + running). Bounded by CAMELID_QUEUE_DEPTH; beyond the
+    /// bound requests get a typed 503 (`engine_queue_full`).
+    pub engine_queue_depth: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -909,6 +917,9 @@ pub struct LlamaServerSlotCamelid {
     pub compatibility: &'static str,
     pub generation_ready: bool,
     pub status: &'static str,
+    /// Engine-queue backpressure gauge: generation jobs accepted and not yet
+    /// finished (queued + running). See `HealthResponse::engine_queue_depth`.
+    pub engine_queue_depth: usize,
     pub unsupported: Vec<&'static str>,
 }
 
@@ -1389,11 +1400,6 @@ struct PreparedGeneration {
     sampling: SamplingConfig,
     /// Stop signal + deadline observed at the top of every decode step.
     cancel: GenerationCancel,
-    /// The generation lock, moved INTO the blocking decode so the lock is
-    /// held by the compute itself, not by an abandonable async frame. Freed
-    /// exactly when the decode finishes (or is returned to a multi-choice
-    /// caller for the next choice).
-    gen_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// When set, collect per-token logprobs each step (chosen + this many top
     /// alternatives). Forces the full-host-logits decode path (no GPU greedy-fast).
     logprobs_top_n: Option<usize>,
@@ -1818,6 +1824,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         backend,
         model_family,
         gemma4_available,
+        engine_queue_depth: state.engine.depth(),
     })
 }
 
@@ -2196,6 +2203,7 @@ async fn llama_server_slots(
                 compatibility: "partial_llama_server_slots_read_only",
                 generation_ready,
                 status,
+                engine_queue_depth: state.engine.depth(),
                 unsupported: vec![
                     "post_slots",
                     "slot_cache_save_restore_erase",
@@ -2281,22 +2289,16 @@ async fn llama_server_completion(
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
         json_object_mode: false,
     };
-    // Serialize generation so only one decode runs against the shared
-    // CUDA-resident KV state at a time (see AppState::generation_lock).
-    let gen_guard = state.generation_lock.clone().lock_owned().await;
-    let mut prepared = match prepare_generation(&state, req).await {
+    // Prep runs OUTSIDE any serialization (D3); the decode runs on the engine
+    // worker, and CancelOnDrop stops it within one step on client disconnect.
+    let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
-
-    // The lock rides the blocking decode itself (PreparedGeneration.gen_guard);
-    // CancelOnDrop stops the decode within one step on client disconnect.
-    prepared.gen_guard = Some(gen_guard);
     let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
-    let (_gen_lease, generated) = generate_decoded_tokens_blocking(prepared).await;
-    match generated {
+    match generate_decoded_tokens_blocking(&state, prepared).await {
         Ok(generated) => {
             let finish_reason = generated.finish_reason;
             (
@@ -6836,44 +6838,102 @@ async fn create_generation_session(
     }
 }
 
+/// Every choice of an n>1 request, prepared upfront (KV caches allocate
+/// lazily, so n prepared sessions cost weights-Arc clones, not n KV buffers),
+/// sharing ONE cancel signal so a dropped handler stops whichever choice is
+/// decoding.
+struct PreparedMultiChoice {
+    prepared: Vec<PreparedGeneration>,
+    cancel: GenerationCancel,
+    model_id: String,
+    prompt_token_count: usize,
+}
+
+async fn prepare_multi_choice(
+    state: &AppState,
+    req: GenerationSessionRequest,
+    n_choices: u32,
+    base_seed: u64,
+) -> std::result::Result<PreparedMultiChoice, Response> {
+    let cancel = GenerationCancel::unbounded();
+    let mut prepared_choices = Vec::with_capacity(n_choices as usize);
+    for index in 0..n_choices {
+        let mut req_choice = req.clone();
+        // Each choice is its own generation with a distinct, reproducible seed
+        // (base seed offset by the choice index), so n>1 yields independent
+        // samples that still reproduce exactly for a fixed request seed.
+        req_choice.n = None;
+        req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
+        let mut prepared = prepare_generation(state, req_choice).await?;
+        prepared.cancel = cancel.clone();
+        prepared_choices.push(prepared);
+    }
+    let first = prepared_choices
+        .first()
+        .expect("n_choices >= 1 guarantees at least one prepared choice");
+    let model_id = first.model_id.clone();
+    let prompt_token_count = first.token_ids.len();
+    Ok(PreparedMultiChoice {
+        prepared: prepared_choices,
+        cancel,
+        model_id,
+        prompt_token_count,
+    })
+}
+
+/// Run every choice sequentially inside ONE engine job. The transitional
+/// streaming bridge lock is held across ALL choices, preserving the
+/// pre-inversion "lock spans every choice" coverage.
+async fn run_multi_choice_on_engine(
+    state: &AppState,
+    choices: PreparedMultiChoice,
+) -> std::result::Result<Vec<GeneratedText>, Box<Response>> {
+    let gen_lock = state.generation_lock.clone();
+    let prepared_choices = choices.prepared;
+    match state
+        .engine
+        .run_exclusive(move || {
+            let _bridge = gen_lock.blocking_lock();
+            let mut generated = Vec::with_capacity(prepared_choices.len());
+            for prepared in prepared_choices {
+                generated.push(run_decode_job_serialized(prepared)?);
+            }
+            Ok(generated)
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => Err(engine_post_error_response(err)),
+    }
+}
+
 /// Non-streaming multi-choice (`n` > 1) text completion. Mirrors
 /// `chat_completions_multi_choice`: each choice is an independent, reproducibly
 /// seeded generation; `camelid` diagnostics mirror the first choice; usage counts
 /// the prompt once and sums completion tokens. Streaming and receipts are rejected
-/// upstream. The generation lock is passed in and rides every choice's decode.
+/// upstream. All n decodes run inside ONE engine job (one queue slot), so no
+/// other request interleaves between choices.
 async fn completions_multi_choice(
     state: &AppState,
     req: GenerationSessionRequest,
     n_choices: u32,
-    gen_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Response {
     let base_seed = req.seed.unwrap_or(0);
-    let mut choices = Vec::with_capacity(n_choices as usize);
+    let prepared_choices = match prepare_multi_choice(state, req, n_choices, base_seed).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let _cancel_on_drop = CancelOnDrop(prepared_choices.cancel.token.clone());
+    let model_id = prepared_choices.model_id.clone();
+    let prompt_token_count = prepared_choices.prompt_token_count;
+    let results = match run_multi_choice_on_engine(state, prepared_choices).await {
+        Ok(results) => results,
+        Err(response) => return *response,
+    };
+    let mut choices = Vec::with_capacity(results.len());
     let mut total_completion_tokens = 0usize;
-    let mut prompt_token_count = 0usize;
-    let mut model_id = String::new();
     let mut first_diagnostics: Option<GenerationDiagnostics> = None;
-    // The lock spans every choice: it rides each choice's blocking decode and
-    // is handed back between choices, so no other request interleaves.
-    let mut gen_guard = Some(gen_guard);
-    for index in 0..n_choices {
-        let mut req_choice = req.clone();
-        req_choice.n = None;
-        req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
-        let mut prepared = match prepare_generation(state, req_choice).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
-        model_id = prepared.model_id.clone();
-        prompt_token_count = prepared.token_ids.len();
-        prepared.gen_guard = gen_guard.take();
-        let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
-        let (returned_guard, result) = generate_decoded_tokens_blocking(prepared).await;
-        gen_guard = returned_guard;
-        let generated = match result {
-            Ok(generated) => generated,
-            Err(response) => return *response,
-        };
+    for (index, generated) in results.into_iter().enumerate() {
         let finish_reason = generated.finish_reason;
         total_completion_tokens += generated.completion_tokens;
         let text = generated.text.clone();
@@ -6891,7 +6951,7 @@ async fn completions_multi_choice(
             });
         }
         choices.push(CompletionChoice {
-            index,
+            index: index as u32,
             text,
             finish_reason,
             // Logprobs are rejected upstream for n>1.
@@ -7049,33 +7109,31 @@ async fn completions(
     let stream = req.stream.unwrap_or(false);
     // Serialize generation so only one decode runs against the shared
     // CUDA-resident KV state at a time (see AppState::generation_lock).
-    let gen_guard = state.generation_lock.clone().lock_owned().await;
     if n_choices > 1 {
-        // Non-streaming independent multi-choice generation. The guard is
-        // threaded through every choice's blocking decode, so the lock still
-        // spans every choice — held by the compute, not this frame.
-        return completions_multi_choice(&state, req, n_choices, gen_guard).await;
+        // Non-streaming independent multi-choice generation: all n choices
+        // run inside ONE engine job, so no other request interleaves.
+        return completions_multi_choice(&state, req, n_choices).await;
     }
-    let mut prepared = match prepare_generation(&state, req).await {
+    // Prep runs OUTSIDE any serialization (D3); see chat_completions.
+    let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
+        // Streaming still serializes via the transitional lock (Phase 2b/3).
+        let gen_guard = state.generation_lock.clone().lock_owned().await;
         return stream_completion(prepared, false, gen_guard, false);
     }
 
-    // The lock rides the blocking decode itself (PreparedGeneration.gen_guard):
-    // dropping this handler future (client disconnect) can no longer free it
-    // mid-decode, and CancelOnDrop stops the decode within one step.
-    prepared.gen_guard = Some(gen_guard);
+    // The decode runs on the engine worker; CancelOnDrop stops it within one
+    // step if this handler frame is dropped (client disconnect).
     let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
     let effective_max_tokens = prepared.max_tokens;
-    let (_gen_lease, generated) = generate_decoded_tokens_blocking(prepared).await;
-    match generated {
+    match generate_decoded_tokens_blocking(&state, prepared).await {
         Ok(generated) => {
             let camelid_receipt = match receipt_stamp {
                 Some(stamp) => {
@@ -7149,53 +7207,36 @@ async fn completions(
 /// choice is a full generation (its own prefill + decode) â€” a capability, not a
 /// throughput claim. `camelid` diagnostics mirror the first choice; usage counts
 /// the prompt once and sums completion tokens across choices. Streaming and
-/// receipts are rejected upstream for this path. The caller holds the generation
-/// lock across the await, so it spans every choice.
+/// receipts are rejected upstream for this path. All n decodes run inside ONE
+/// engine job (one queue slot), so no other request interleaves between choices.
 async fn chat_completions_multi_choice(
     state: &AppState,
     req: GenerationSessionRequest,
     n_choices: u32,
-    gen_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Response {
     let base_seed = req.seed.unwrap_or(0);
-    let mut choices = Vec::with_capacity(n_choices as usize);
+    let prepared_choices = match prepare_multi_choice(state, req, n_choices, base_seed).await {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let _cancel_on_drop = CancelOnDrop(prepared_choices.cancel.token.clone());
+    let model_id = prepared_choices.model_id.clone();
+    let prompt_token_count = prepared_choices.prompt_token_count;
+    let results = match run_multi_choice_on_engine(state, prepared_choices).await {
+        Ok(results) => results,
+        Err(response) => return *response,
+    };
+    // Disclose the serve lane once — every choice ran the same model.
+    let lane = match state.loaded_models.read().await.get(&model_id) {
+        Some(model) if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented => {
+            Some("experimental")
+        }
+        _ => None,
+    };
+    let mut choices = Vec::with_capacity(results.len());
     let mut total_completion_tokens = 0usize;
-    let mut prompt_token_count = 0usize;
-    let mut model_id = String::new();
-    let mut lane: Option<&'static str> = None;
     let mut first_diagnostics: Option<GenerationDiagnostics> = None;
-    // The lock spans every choice: it rides each choice's blocking decode and
-    // is handed back between choices, so no other request interleaves.
-    let mut gen_guard = Some(gen_guard);
-    for index in 0..n_choices {
-        let mut req_choice = req.clone();
-        // Each choice is its own generation with a distinct, reproducible seed
-        // (base seed offset by the choice index), so n>1 yields independent
-        // samples that still reproduce exactly for a fixed request seed.
-        req_choice.n = None;
-        req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
-        let mut prepared = match prepare_generation(state, req_choice).await {
-            Ok(prepared) => prepared,
-            Err(response) => return response,
-        };
-        model_id = prepared.model_id.clone();
-        prompt_token_count = prepared.token_ids.len();
-        prepared.gen_guard = gen_guard.take();
-        let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
-        let (returned_guard, result) = generate_decoded_tokens_blocking(prepared).await;
-        gen_guard = returned_guard;
-        let generated = match result {
-            Ok(generated) => generated,
-            Err(response) => return *response,
-        };
-        lane = match state.loaded_models.read().await.get(&model_id) {
-            Some(model)
-                if classify_loaded_model(model) == ModelLaneClass::ExperimentalImplemented =>
-            {
-                Some("experimental")
-            }
-            _ => None,
-        };
+    for (index, generated) in results.into_iter().enumerate() {
         let content = if lane.is_some() {
             generated.text.trim().to_string()
         } else {
@@ -7217,7 +7258,7 @@ async fn chat_completions_multi_choice(
             });
         }
         choices.push(ChatCompletionChoice {
-            index,
+            index: index as u32,
             message: ChatCompletionMessage {
                 role: "assistant",
                 content,
@@ -7443,31 +7484,33 @@ async fn chat_completions(
     let stream = req.stream.unwrap_or(false);
     // Serialize generation so only one decode runs against the shared
     // CUDA-resident KV state at a time (see AppState::generation_lock).
-    let gen_guard = state.generation_lock.clone().lock_owned().await;
     if n_choices > 1 {
-        // Non-streaming independent multi-choice generation. The guard is
-        // threaded through every choice's blocking decode, so the lock still
-        // spans every choice — held by the compute, not this frame.
-        return chat_completions_multi_choice(&state, req, n_choices, gen_guard).await;
+        // Non-streaming independent multi-choice generation: all n choices
+        // run inside ONE engine job, so no other request interleaves.
+        return chat_completions_multi_choice(&state, req, n_choices).await;
     }
-    let mut prepared = match prepare_generation(&state, req).await {
+    // Prep runs OUTSIDE any serialization (D3): tokenization and template
+    // rendering never stall behind another request's decode. The GPU-runnable
+    // parity probe inside prepare_generation serializes via its own engine job.
+    let prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
     if stream {
+        // Streaming still serializes via the transitional lock until it moves
+        // onto the engine (Phase 2b/3); engine decode jobs hold the same lock
+        // as a bridge, so streams and engine decodes never overlap.
+        let gen_guard = state.generation_lock.clone().lock_owned().await;
         return stream_completion(prepared, true, gen_guard, include_usage);
     }
 
-    // The lock rides the blocking decode itself (PreparedGeneration.gen_guard):
-    // dropping this handler future (client disconnect) can no longer free it
-    // mid-decode, and CancelOnDrop stops the decode within one step.
-    prepared.gen_guard = Some(gen_guard);
+    // The decode runs on the engine worker; CancelOnDrop stops it within one
+    // step if this handler frame is dropped (client disconnect).
     let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
     let effective_max_tokens = prepared.max_tokens;
-    let (_gen_lease, generated) = generate_decoded_tokens_blocking(prepared).await;
-    match generated {
+    match generate_decoded_tokens_blocking(&state, prepared).await {
         Ok(generated) => {
             let camelid_receipt = match receipt_stamp {
                 Some(stamp) => {
@@ -7806,23 +7849,15 @@ pub async fn replay_receipt_request(
         default_max_tokens_cap: None,
         json_object_mode: false,
     };
-    let prepared = {
-        // Serialize the GPU-runnable-tier parity probe (fired inside prepare_generation) with
-        // every other decode: the probe drives the process-global single-slot resident CUDA
-        // engine, so without the lock it could evict a concurrently-running decode's engine
-        // mid-sequence. Scoped to just the probe; this is the standalone receipt-replay path,
-        // whose subsequent decode keeps its prior (unlocked) behavior.
-        let _gen_guard = state.generation_lock.clone().lock_owned().await;
-        match prepare_generation(&state, session_request).await {
-            Ok(prepared) => prepared,
-            Err(response) => return Err(response_error_text(response).await),
-        }
+    // Prep needs no lock: the GPU-runnable-tier parity probe inside
+    // prepare_generation serializes via its own engine job. The replay decode
+    // itself now runs as an engine job too — closing the pre-inversion hole
+    // where a receipt replay decoded UNLOCKED next to a live request.
+    let prepared = match prepare_generation(&state, session_request).await {
+        Ok(prepared) => prepared,
+        Err(response) => return Err(response_error_text(response).await),
     };
-    // Replay decode keeps its prior UNLOCKED behavior (gen_guard: None from
-    // prepare_generation) — see the probe-scoped lock note above. Phase 2 of
-    // the engine-inversion mission routes this through the engine queue.
-    let (_gen_lease, result) = generate_decoded_tokens_blocking(prepared).await;
-    let generated = match result {
+    let generated = match generate_decoded_tokens_blocking(&state, prepared).await {
         Ok(generated) => generated,
         Err(response) => return Err(response_error_text(*response).await),
     };
@@ -7851,13 +7886,10 @@ async fn validate_generation_request(
     state: &AppState,
     req: GenerationSessionRequest,
 ) -> std::result::Result<GenerationSessionSummary, Response> {
-    // Serialize the GPU-runnable-tier parity probe (fired inside prepare_generation) with every
-    // other decode — it drives the process-global single-slot resident CUDA engine. See the note
-    // in replay_receipt_request. This path validates/creates a session and does not itself decode.
-    let prepared = {
-        let _gen_guard = state.generation_lock.clone().lock_owned().await;
-        prepare_generation(state, req).await?
-    };
+    // Prep needs no lock: the GPU-runnable-tier parity probe inside
+    // prepare_generation serializes via its own engine job. This path
+    // validates/creates a session and does not itself decode.
+    let prepared = prepare_generation(state, req).await?;
 
     Ok(GenerationSessionSummary {
         id: format!(
@@ -8479,22 +8511,31 @@ async fn prepare_generation(
             let probe_weights = std::sync::Arc::clone(&session.weights);
             let probe_config = config.clone();
             let probe_label = model.id.clone();
-            // Fail CLOSED: if the probe closure panics (an uncurated, arbitrary model can hit
-            // an unwrap/index deep in the resident engine build or a CUDA kernel), the panic
-            // is caught by `spawn_blocking` and surfaced as `Err(JoinError)`. `unwrap_or(false)`
-            // turns that into a FAILED verdict, and we record it so the choke point forbids the
-            // resident path — otherwise a missing verdict would leave the model admitted to the
-            // GPU unvalidated. A normal FAIL is already recorded inside the probe itself.
-            let probe_passed = tokio::task::spawn_blocking(move || {
-                crate::inference::ensure_resident_parity_verdict(
-                    &probe_config,
-                    &probe_weights,
-                    resident_cache_key,
-                    &probe_label,
-                )
-            })
-            .await
-            .unwrap_or(false);
+            // The probe drives the process-global single-slot resident CUDA
+            // engine, so it runs as an ENGINE JOB — serialized against every
+            // decode by construction (prep itself holds no lock).
+            //
+            // Fail CLOSED on panic: an uncurated, arbitrary model can hit an
+            // unwrap/index deep in the resident engine build or a CUDA kernel.
+            // The catch_unwind is INSIDE the job so a panic becomes a FAILED
+            // verdict; an engine post/await failure (queue full, shutdown) is
+            // a retryable 503 instead — it must NOT record a durable FAIL for
+            // a probe that never ran.
+            let probe_passed = state
+                .engine
+                .run_exclusive(move || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::inference::ensure_resident_parity_verdict(
+                            &probe_config,
+                            &probe_weights,
+                            resident_cache_key,
+                            &probe_label,
+                        )
+                    }))
+                    .unwrap_or(false)
+                })
+                .await
+                .map_err(|err| *engine_post_error_response(err))?;
             if !probe_passed {
                 crate::inference::record_resident_parity_fail(resident_cache_key);
             }
@@ -8585,7 +8626,6 @@ async fn prepare_generation(
         speculative,
         telemetry: Some(telemetry_start),
         cancel: GenerationCancel::unbounded(),
-        gen_guard: None,
     })
 }
 
@@ -9142,60 +9182,98 @@ fn parse_logit_bias(
     Ok(parsed)
 }
 
-/// Runs the blocking decode with guard/compute lifetime equivalence: the
-/// generation-lock guard (if any) is moved INTO the blocking closure, so a
-/// dropped handler future (client disconnect) or an expired deadline can never
-/// free the lock while the decode is still running. The wall-clock timeout is
-/// enforced INSIDE the decode loop (see `GenerationCancel`) and the handle is
-/// always awaited — never detached. Returns the guard alongside the result so
-/// multi-choice callers can keep the lock across choices.
-async fn generate_decoded_tokens_blocking(
-    mut prepared: PreparedGeneration,
-) -> (
-    Option<tokio::sync::OwnedMutexGuard<()>>,
-    std::result::Result<GeneratedText, Box<Response>>,
-) {
-    let timeout = match generation_timeout_duration() {
-        Ok(timeout) => timeout,
-        Err(response) => return (prepared.gen_guard.take(), Err(response)),
-    };
-    prepared.cancel.arm(timeout);
-    let cancel = prepared.cancel.clone();
-    let test_sleep = generation_step_test_sleep_duration();
-    let handle = tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        let _decode_probe = decode_probe::enter();
-        if let Some(duration) = test_sleep {
-            std::thread::sleep(duration);
-        }
-        let gen_guard = prepared.gen_guard.take();
-        let result = generate_decoded_tokens(prepared);
-        (gen_guard, result)
-    });
-    match handle.await {
-        Ok((gen_guard, result)) => {
-            // Â§4 safe-boot: a decode ran to completion under the applied gait
-            // without wedging the host, so clear the in-progress marker. Cheap
-            // and idempotent (a no-op after the first call, or when no gait was
-            // applied), so it is safe on the hot path. Not marked when the
-            // decode was cancelled or timed out — those did not prove a healthy
-            // full decode (same coverage as the old timeout branch).
-            if cancel.tripped().is_none() {
-                crate::gait::sentinel::mark_healthy();
-            }
-            (gen_guard, result)
-        }
-        Err(err) => (
-            // A panicked decode released the guard during unwind (same exposure
-            // as the pre-inversion code); nothing to hand back.
-            None,
-            Err(Box::new(api_error(
+/// Map an engine post/await failure onto the typed error envelope. QueueFull
+/// is the explicit backpressure signal (D2): the bounded queue rejected the
+/// job, the client should retry shortly. Unavailable covers engine shutdown
+/// and a job whose result channel was lost (e.g. the job panicked and the
+/// engine contained it).
+fn engine_post_error_response(err: engine::EnginePostError) -> Box<Response> {
+    match err {
+        engine::EnginePostError::QueueFull => {
+            let mut response = api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "generation_worker_failed",
-                format!("generation worker failed before completing the request: {err}"),
+                "engine_queue_full",
+                format!(
+                    "the generation queue is full; retry shortly (depth is bounded by {})",
+                    engine::QUEUE_DEPTH_ENV
+                ),
                 None,
-            ))),
-        ),
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                "1".parse().expect("static header"),
+            );
+            Box::new(response)
+        }
+        engine::EnginePostError::Unavailable => Box::new(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "generation_worker_failed",
+            "generation worker failed before completing the request".to_string(),
+            None,
+        )),
+    }
+}
+
+/// The blocking decode body, run ON THE ENGINE THREAD under the transitional
+/// streaming bridge lock. Compute serialization is the engine thread itself;
+/// the wall-clock timeout is enforced inside the decode loop (see
+/// `GenerationCancel`), so the job always runs to a clean stop — it is never
+/// detached.
+fn run_decode_job(
+    gen_lock: Arc<tokio::sync::Mutex<()>>,
+    prepared: PreparedGeneration,
+) -> std::result::Result<GeneratedText, Box<Response>> {
+    // TRANSITIONAL: hold the generation lock for the job's duration so engine
+    // decodes and the (still lock-based) streaming path never overlap. Safe
+    // here: the engine thread runs outside any async runtime, and no engine
+    // job caller holds this lock while awaiting the engine (deadlock-free by
+    // ordering). Removed when streaming moves onto the engine.
+    let _bridge = gen_lock.blocking_lock();
+    run_decode_job_serialized(prepared)
+}
+
+/// The decode body proper — caller must already be the exclusive compute owner
+/// (the engine thread, holding the streaming bridge).
+fn run_decode_job_serialized(
+    mut prepared: PreparedGeneration,
+) -> std::result::Result<GeneratedText, Box<Response>> {
+    #[cfg(test)]
+    let _decode_probe = decode_probe::enter();
+    // Arm the deadline before the test-sleep hook: the sleep stands in for a
+    // slow decode step and must count against the wall-clock budget.
+    let timeout = generation_timeout_duration()?;
+    prepared.cancel.arm(timeout);
+    if let Some(duration) = generation_step_test_sleep_duration() {
+        std::thread::sleep(duration);
+    }
+    let cancel = prepared.cancel.clone();
+    let result = generate_decoded_tokens(prepared);
+    // Â§4 safe-boot: a decode ran to completion under the applied gait without
+    // wedging the host, so clear the in-progress marker. Cheap and idempotent.
+    // Not marked when the decode was cancelled or timed out — those did not
+    // prove a healthy full decode.
+    if cancel.tripped().is_none() {
+        crate::gait::sentinel::mark_healthy();
+    }
+    result
+}
+
+/// Post the blocking decode to the engine worker and await its result. If the
+/// calling handler frame is dropped (client disconnect), `CancelOnDrop` stops
+/// the running decode within one step; the job itself is never detached from
+/// the engine's serialization.
+async fn generate_decoded_tokens_blocking(
+    state: &AppState,
+    prepared: PreparedGeneration,
+) -> std::result::Result<GeneratedText, Box<Response>> {
+    let gen_lock = state.generation_lock.clone();
+    match state
+        .engine
+        .run_exclusive(move || run_decode_job(gen_lock, prepared))
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => Err(engine_post_error_response(err)),
     }
 }
 
@@ -9459,7 +9537,12 @@ pub(crate) mod decode_probe {
 
     impl Drop for ProbeGuard {
         fn drop(&mut self) {
-            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            // Saturating: a guard leaked past its test (e.g. a detached
+            // stream step finishing after `reset()` zeroed the counter) must
+            // never underflow the gauge for later tests.
+            let _ = ACTIVE.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                Some(value.saturating_sub(1))
+            });
         }
     }
 
@@ -12320,17 +12403,30 @@ mod tests {
         prepared
     }
 
-    /// Runs "request B" the way the non-streaming handlers do — acquire the
-    /// generation lock, ride it on the blocking decode, hold CancelOnDrop —
-    /// and reports what the probe saw. Callers must have cleared the
-    /// test-sleep hook so B is fast.
+    /// Runs "request B" the way the non-streaming handlers do — post the
+    /// decode to the engine worker with CancelOnDrop in the frame — and
+    /// reports what the probe saw at the moment B became the exclusive
+    /// compute owner (engine thread + transitional streaming bridge).
+    /// Callers must have cleared the test-sleep hook so B is fast.
     async fn run_request_b_and_observe(state: &AppState) -> OrphanObservation {
-        let guard_b = state.generation_lock.clone().lock_owned().await;
-        let orphans_at_next_acquire = decode_probe::active();
-        let mut prepared_b = orphan_test_prepared("model-b.gguf");
-        prepared_b.gen_guard = Some(guard_b);
+        let prepared_b = orphan_test_prepared("model-b.gguf");
         let _cancel_on_drop = CancelOnDrop(prepared_b.cancel.token.clone());
-        let (_gen_lease, result_b) = generate_decoded_tokens_blocking(prepared_b).await;
+        let gen_lock = state.generation_lock.clone();
+        let outcome = state
+            .engine
+            .run_exclusive(move || {
+                // Exactly `run_decode_job`, with the probe sampled at the
+                // moment this request becomes the exclusive compute owner.
+                let _bridge = gen_lock.blocking_lock();
+                let orphans_at_next_acquire = decode_probe::active();
+                let result = run_decode_job_serialized(prepared_b);
+                (orphans_at_next_acquire, result)
+            })
+            .await;
+        let (orphans_at_next_acquire, result_b) = match outcome {
+            Ok(observed) => observed,
+            Err(err) => (usize::MAX, Err(engine_post_error_response(err))),
+        };
         let request_b_error = match result_b {
             Ok(_) => None,
             Err(response) => {
@@ -12388,6 +12484,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn generation_timeout_must_not_orphan_decode() {
         let _env_guard = crate::test_support::env_lock();
+        // Wait out any probe leaked by a prior test (e.g. a detached stream
+        // step still finishing) before resetting the gauge.
+        drain_decode_probe().await;
         decode_probe::reset();
         std::env::set_var(GENERATION_TIMEOUT_ENV, "100");
         std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
@@ -12395,18 +12494,14 @@ mod tests {
         let state = AppState::default();
 
         // Request A, exactly as the non-streaming handlers run it (see
-        // chat_completions): the guard rides the blocking decode.
-        let guard_a = state.generation_lock.clone().lock_owned().await;
-        let mut prepared_a = orphan_test_prepared("model-a.gguf");
-        prepared_a.gen_guard = Some(guard_a);
+        // chat_completions): the decode is an engine job.
+        let prepared_a = orphan_test_prepared("model-a.gguf");
         let _cancel_on_drop_a = CancelOnDrop(prepared_a.cancel.token.clone());
-        let (gen_lease_a, result_a) = generate_decoded_tokens_blocking(prepared_a).await;
+        let result_a = generate_decoded_tokens_blocking(&state, prepared_a).await;
         assert!(
             result_a.is_err(),
             "request A must hit the generation timeout"
         );
-        // The handler returns the 503; its frame drops the (returned) lease.
-        drop(gen_lease_a);
 
         // Request B arrives right after the 503.
         std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
@@ -12424,21 +12519,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn client_disconnect_must_not_orphan_decode() {
         let _env_guard = crate::test_support::env_lock();
+        // Wait out any probe leaked by a prior test (e.g. a detached stream
+        // step still finishing) before resetting the gauge.
+        drain_decode_probe().await;
         decode_probe::reset();
         std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
         std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
 
         let state = AppState::default();
 
-        let lock = state.generation_lock.clone();
+        let state_for_a = state.clone();
         let handler_a = tokio::spawn(async move {
-            // Exact handler shape (see chat_completions): guard rides the
-            // decode, CancelOnDrop fires if this frame is dropped.
-            let gen_guard = lock.lock_owned().await;
-            let mut prepared = orphan_test_prepared("model-a.gguf");
-            prepared.gen_guard = Some(gen_guard);
+            // Exact handler shape (see chat_completions): the decode is an
+            // engine job; CancelOnDrop fires if this frame is dropped.
+            let prepared = orphan_test_prepared("model-a.gguf");
             let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
-            let _ = generate_decoded_tokens_blocking(prepared).await;
+            let _ = generate_decoded_tokens_blocking(&state_for_a, prepared).await;
         });
 
         // Wait until A's decode is actually live on the blocking pool, then
@@ -12470,6 +12566,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn stream_disconnect_must_not_orphan_decode_step() {
         let _env_guard = crate::test_support::env_lock();
+        // Wait out any probe leaked by a prior test (e.g. a detached stream
+        // step still finishing) before resetting the gauge.
+        drain_decode_probe().await;
         decode_probe::reset();
         std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
         std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
@@ -13843,7 +13942,8 @@ mod tests {
         let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
         let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
-        let (_gen_lease, result) = generate_decoded_tokens_blocking(prepared).await;
+        let state = AppState::default();
+        let result = generate_decoded_tokens_blocking(&state, prepared).await;
 
         std::env::remove_var(GENERATION_TIMEOUT_ENV);
         std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
@@ -15619,7 +15719,6 @@ mod tests {
             speculative: None,
             telemetry: None,
             cancel: GenerationCancel::unbounded(),
-            gen_guard: None,
         }
     }
 
