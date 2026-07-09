@@ -10129,6 +10129,7 @@ fn generate_token_ids(
         let grammar_allowed: Option<&[bool]> = match grammar.as_ref() {
             Some(state) => {
                 let done = state.is_done();
+                let mut any_allowed = false;
                 for (id, slot) in grammar_mask.iter_mut().enumerate() {
                     let bytes = grammar_token_bytes
                         .get(id)
@@ -10141,6 +10142,22 @@ fn generate_token_ids(
                     } else {
                         state.accepts(bytes)
                     };
+                    any_allowed |= *slot;
+                }
+                // Fail closed if no token can extend the constrained value and
+                // stopping is not yet allowed. Invariant: this only arises when the
+                // tokenizer lacks a token for a required byte. Byte-fallback
+                // tokenizers (Llama/Qwen/Gemma) cover every byte, so it never fires
+                // for them; but sampling a fully-masked (all -inf) distribution would
+                // otherwise emit an invalid token or NaN, so we surface a typed error
+                // instead.
+                if !any_allowed {
+                    return Err(Box::new(api_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "constraint_unsatisfiable",
+                        "the response_format constraint cannot be satisfied by this model's tokenizer (no token can produce the next required byte)".to_string(),
+                        Some("response_format"),
+                    )));
                 }
                 Some(grammar_mask.as_slice())
             }
