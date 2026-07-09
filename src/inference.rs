@@ -68,11 +68,9 @@ use q8_runtime::{
     Q8MatmulOwnerScope, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
 // All remaining callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so
-// this import is unused on other targets.
-#[cfg_attr(
-    not(any(target_arch = "aarch64", target_os = "macos")),
-    allow(unused_imports)
-)]
+// this import is unused on other targets — including aarch64-linux (verified by cross-check:
+// the dotprod dispatch callers are macOS-gated), hence the allow applies everywhere but macOS.
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use q8_runtime::q8_0_env_flag_disabled;
 use q8_telemetry::*;
 pub use q8_telemetry::{
@@ -17952,6 +17950,11 @@ fn q4_k_owner_prefill_tiled(
     let use_vnni = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
     #[cfg(not(target_arch = "x86_64"))]
     let use_vnni = false;
+    // Per-inner engaged signal: without it a VNNI A/B leg on a non-VNNI host
+    // silently measures the AVX2 inner (vacuous comparison).
+    if use_vnni {
+        Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // (1) Parallel Q8_K quantize + per-superblock activation group sums.
     let preps: Vec<(Vec<Q8KBlock>, Vec<[i32; 8]>)> = (0..n_rows)

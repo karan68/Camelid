@@ -43,6 +43,7 @@ pub struct LlamaQ8ScheduleTelemetry {
     pub q8_gemm_compute_us: u64,
     pub matmul_owner_prefill_taken: u64,
     pub kquant_owner_prefill_taken: u64,
+    pub kquant_owner_vnni_taken: u64,
     pub conservative_tail_rows: u64,
     pub ffn_down_gemm4_prefill_candidates: u64,
     pub ffn_down_gemm4_prefill_reject_plan_off: u64,
@@ -138,6 +139,7 @@ pub(super) static Q8_SCHED_ACTIVATION_QUANTIZE_PACK_US: AtomicU64 = AtomicU64::n
 pub(super) static Q8_SCHED_Q8_GEMM_COMPUTE_US: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN: AtomicU64 = AtomicU64::new(0);
+pub(super) static Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_CONSERVATIVE_TAIL_ROWS: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 pub(super) static Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF: AtomicU64 = AtomicU64::new(0);
@@ -211,6 +213,7 @@ pub fn reset_q8_schedule_telemetry() {
     Q8_SCHED_Q8_GEMM_COMPUTE_US.store(0, Ordering::Relaxed);
     Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.store(0, Ordering::Relaxed);
+    Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.store(0, Ordering::Relaxed);
     Q8_SCHED_CONSERVATIVE_TAIL_ROWS.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES.store(0, Ordering::Relaxed);
     Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_REJECT_PLAN_OFF.store(0, Ordering::Relaxed);
@@ -317,6 +320,7 @@ pub fn snapshot_q8_schedule_telemetry() -> LlamaQ8ScheduleTelemetry {
         q8_gemm_compute_us: Q8_SCHED_Q8_GEMM_COMPUTE_US.load(Ordering::Relaxed),
         matmul_owner_prefill_taken: Q8_SCHED_MATMUL_OWNER_PREFILL_TAKEN.load(Ordering::Relaxed),
         kquant_owner_prefill_taken: Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.load(Ordering::Relaxed),
+        kquant_owner_vnni_taken: Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.load(Ordering::Relaxed),
         conservative_tail_rows: Q8_SCHED_CONSERVATIVE_TAIL_ROWS.load(Ordering::Relaxed),
         ffn_down_gemm4_prefill_candidates: Q8_SCHED_FFN_DOWN_GEMM4_PREFILL_CANDIDATES
             .load(Ordering::Relaxed),

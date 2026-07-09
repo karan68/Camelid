@@ -93,6 +93,7 @@ const report = {
   flags_env: {
     CAMELID_X86_Q8_MATMUL_OWNER: process.env.CAMELID_X86_Q8_MATMUL_OWNER ?? '(unset: platform default)',
     CAMELID_X86_KQUANT_MATMUL_OWNER: process.env.CAMELID_X86_KQUANT_MATMUL_OWNER ?? '(unset: off)',
+    CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI: process.env.CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI ?? '(unset: on-when-owner-on)',
     CAMELID_WIN_PIN: process.env.CAMELID_WIN_PIN ?? '(unset: off)',
   },
   repeats_detail: [], parity: {},
