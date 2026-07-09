@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -893,6 +893,121 @@ fn parse_safetensors_header(
         });
     }
     Ok(descriptors)
+}
+
+/// Decode one SafeTensors descriptor's bytes into a dense f32
+/// [`crate::tensor::CpuTensor`].
+///
+/// Reuses the GGUF F32/F16/BF16 decoders so a SafeTensors weight and its GGUF
+/// twin decode identically. Does not transpose or reinterpret axes, and does not
+/// make the source generation-ready (orientation and tokenizer parity are later
+/// slices).
+pub fn decode_safetensors_tensor(
+    descriptor: &SafeTensorsTensorDescriptor,
+) -> Result<crate::tensor::CpuTensor> {
+    let dtype = descriptor.dtype.as_str();
+    // F32/F16/BF16 only; other dtypes are a typed rejection until a source needs them.
+    if !matches!(dtype, "F32" | "F16" | "BF16") {
+        return Err(BackendError::UnsupportedTensorType(format!(
+            "SafeTensors tensor {} has dtype {}; the decode slice supports F32, F16, and BF16",
+            descriptor.name, descriptor.dtype
+        )));
+    }
+
+    let span = descriptor.data_offsets[1]
+        .checked_sub(descriptor.data_offsets[0])
+        .ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "SafeTensors tensor {} has descending data_offsets",
+                descriptor.name
+            ))
+        })?;
+    let span = usize::try_from(span).map_err(|_| {
+        BackendError::InvalidTensorData(format!(
+            "SafeTensors tensor {} byte length does not fit this platform",
+            descriptor.name
+        ))
+    })?;
+
+    let dims = descriptor
+        .shape
+        .iter()
+        .map(|&dim| {
+            usize::try_from(dim).map_err(|_| {
+                BackendError::InvalidTensorData(format!(
+                    "SafeTensors tensor {} shape dimension {dim} does not fit this platform",
+                    descriptor.name
+                ))
+            })
+        })
+        .collect::<Result<Vec<usize>>>()?;
+
+    let mut expected_elements: usize = 1;
+    for &dim in &dims {
+        expected_elements = expected_elements.checked_mul(dim).ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "SafeTensors tensor {} element count overflows usize",
+                descriptor.name
+            ))
+        })?;
+    }
+
+    let bytes = read_safetensors_tensor_bytes(descriptor, span)?;
+
+    let data = match dtype {
+        "F32" => crate::tensor::decode_f32_tensor(&descriptor.name, &bytes, expected_elements)?,
+        "F16" => crate::tensor::decode_f16_tensor(&descriptor.name, &bytes, expected_elements)?,
+        "BF16" => crate::tensor::decode_bf16_tensor(&descriptor.name, &bytes, expected_elements)?,
+        _ => unreachable!("dtype is guarded to F32/F16/BF16 above"),
+    };
+
+    crate::tensor::CpuTensor::from_f32(descriptor.name.clone(), dims, data)
+}
+
+/// Read one tensor's raw payload bytes from its shard. `data_offsets` are
+/// relative to the payload (after the 8-byte length + JSON header), so the
+/// header length is re-read here.
+fn read_safetensors_tensor_bytes(
+    descriptor: &SafeTensorsTensorDescriptor,
+    span: usize,
+) -> Result<Vec<u8>> {
+    let mut file = fs::File::open(&descriptor.shard).map_err(|source| BackendError::Io {
+        path: descriptor.shard.clone(),
+        source,
+    })?;
+    let mut header_len_bytes = [0u8; 8];
+    file.read_exact(&mut header_len_bytes)
+        .map_err(|source| BackendError::Io {
+            path: descriptor.shard.clone(),
+            source,
+        })?;
+    let header_len = u64::from_le_bytes(header_len_bytes);
+    let payload_start = 8u64.checked_add(header_len).ok_or_else(|| {
+        BackendError::InvalidTensorData(format!(
+            "SafeTensors shard {} header length overflows file offset arithmetic",
+            public_path_label(&descriptor.shard)
+        ))
+    })?;
+    let absolute = payload_start
+        .checked_add(descriptor.data_offsets[0])
+        .ok_or_else(|| {
+            BackendError::InvalidTensorData(format!(
+                "SafeTensors tensor {} absolute offset overflows file offset arithmetic",
+                descriptor.name
+            ))
+        })?;
+    file.seek(SeekFrom::Start(absolute))
+        .map_err(|source| BackendError::Io {
+            path: descriptor.shard.clone(),
+            source,
+        })?;
+    let mut bytes = vec![0u8; span];
+    file.read_exact(&mut bytes)
+        .map_err(|source| BackendError::Io {
+            path: descriptor.shard.clone(),
+            source,
+        })?;
+    Ok(bytes)
 }
 
 fn safetensors_dtype_size(dtype: &str) -> Option<u64> {
@@ -1959,5 +2074,148 @@ mod tests {
         let err = resolve_hf_llama_tensor_roles(&descriptors, &config, false).unwrap_err();
         assert!(matches!(err, BackendError::RuntimeShapeMismatch(_)));
         assert!(err.to_string().contains("model.embed_tokens.weight"));
+    }
+
+    /// Write a SafeTensors shard with real per-tensor payload bytes and return
+    /// its path (the readiness fixtures above only need zero-filled payloads).
+    fn write_safetensors_with_payload(
+        root: &Path,
+        name: &str,
+        tensors: &[(&str, &str, &[u64], &[u8])],
+    ) -> PathBuf {
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        let mut payload = Vec::new();
+        for (tensor_name, dtype, shape, bytes) in tensors {
+            let byte_len = bytes.len() as u64;
+            header.insert(
+                (*tensor_name).to_string(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": shape,
+                    "data_offsets": [offset, offset + byte_len],
+                }),
+            );
+            payload.extend_from_slice(bytes);
+            offset += byte_len;
+        }
+        write_safetensors_bytes(root, name, &Value::Object(header), &payload);
+        root.join(name)
+    }
+
+    fn f32_payload(values: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn u16_payload(bits: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(bits.len() * 2);
+        for value in bits {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn decodes_f32_tensor_bytes_into_cpu_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let values = [1.0f32, -2.5, 3.25, 0.0];
+        let path = write_safetensors_with_payload(
+            dir.path(),
+            "model.safetensors",
+            &[(
+                "model.embed_tokens.weight",
+                "F32",
+                &[2, 2],
+                &f32_payload(&values),
+            )],
+        );
+        let descriptors = parse_safetensors_header(&path).unwrap();
+        let tensor = decode_safetensors_tensor(&descriptors[0]).unwrap();
+        assert_eq!(tensor.name, "model.embed_tokens.weight");
+        assert_eq!(tensor.shape.dims, vec![2, 2]);
+        assert_eq!(tensor.data, values);
+    }
+
+    #[test]
+    fn decodes_f16_tensor_bytes_into_cpu_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        // IEEE half bit patterns: 1.0, 2.0, -2.0, 0.5.
+        let bits = [0x3C00u16, 0x4000, 0xC000, 0x3800];
+        let path = write_safetensors_with_payload(
+            dir.path(),
+            "model.safetensors",
+            &[("lm_head.weight", "F16", &[4], &u16_payload(&bits))],
+        );
+        let descriptors = parse_safetensors_header(&path).unwrap();
+        let tensor = decode_safetensors_tensor(&descriptors[0]).unwrap();
+        assert_eq!(tensor.shape.dims, vec![4]);
+        assert_eq!(tensor.data, vec![1.0, 2.0, -2.0, 0.5]);
+    }
+
+    #[test]
+    fn decodes_bf16_tensor_bytes_into_cpu_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        // bfloat16 is the high 16 bits of the f32 pattern: 1.0, -2.0, 0.5, 4.0.
+        let bits = [0x3F80u16, 0xC000, 0x3F00, 0x4080];
+        let path = write_safetensors_with_payload(
+            dir.path(),
+            "model.safetensors",
+            &[("lm_head.weight", "BF16", &[4], &u16_payload(&bits))],
+        );
+        let descriptors = parse_safetensors_header(&path).unwrap();
+        let tensor = decode_safetensors_tensor(&descriptors[0]).unwrap();
+        assert_eq!(tensor.shape.dims, vec![4]);
+        assert_eq!(tensor.data, vec![1.0, -2.0, 0.5, 4.0]);
+    }
+
+    #[test]
+    fn decode_reads_the_correct_shard_slice_for_a_later_tensor() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = [9.0f32, 9.0];
+        let second = [1.5f32, -3.0, 7.0];
+        let path = write_safetensors_with_payload(
+            dir.path(),
+            "model.safetensors",
+            &[
+                (
+                    "model.embed_tokens.weight",
+                    "F32",
+                    &[2],
+                    &f32_payload(&first),
+                ),
+                ("lm_head.weight", "F32", &[3], &f32_payload(&second)),
+            ],
+        );
+        let descriptors = parse_safetensors_header(&path).unwrap();
+        // Descriptors are sorted by name, so lm_head precedes model.embed_tokens;
+        // decode each by name to prove offsets, not order, drive the byte slice.
+        let lm_head = descriptors
+            .iter()
+            .find(|d| d.name == "lm_head.weight")
+            .unwrap();
+        let embed = descriptors
+            .iter()
+            .find(|d| d.name == "model.embed_tokens.weight")
+            .unwrap();
+        assert_eq!(decode_safetensors_tensor(lm_head).unwrap().data, second);
+        assert_eq!(decode_safetensors_tensor(embed).unwrap().data, first);
+    }
+
+    #[test]
+    fn decode_rejects_an_unsupported_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_safetensors_with_payload(
+            dir.path(),
+            "model.safetensors",
+            &[("some.int.tensor", "I32", &[1], &[0u8, 0, 0, 0])],
+        );
+        let descriptors = parse_safetensors_header(&path).unwrap();
+        let err = decode_safetensors_tensor(&descriptors[0]).unwrap_err();
+        assert!(matches!(err, BackendError::UnsupportedTensorType(_)));
+        assert!(err.to_string().contains("I32"));
     }
 }

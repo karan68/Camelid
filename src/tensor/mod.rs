@@ -4027,7 +4027,11 @@ pub fn cpu_tensor_from_gguf_bytes(
     }
 }
 
-fn decode_f32_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_f32_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
     if bytes.len() != expected_elements * 4 {
         return Err(BackendError::InvalidTensorData(format!(
             "tensor {name} f32 byte length {} does not match expected {}",
@@ -4041,7 +4045,11 @@ fn decode_f32_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Resu
         .collect())
 }
 
-fn decode_f16_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_f16_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
     if bytes.len() != expected_elements * 2 {
         return Err(BackendError::InvalidTensorData(format!(
             "tensor {name} f16 byte length {} does not match expected {}",
@@ -4059,7 +4067,11 @@ fn decode_f16_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Resu
         .collect())
 }
 
-fn decode_bf16_tensor(name: &str, bytes: &[u8], expected_elements: usize) -> Result<Vec<f32>> {
+pub(crate) fn decode_bf16_tensor(
+    name: &str,
+    bytes: &[u8],
+    expected_elements: usize,
+) -> Result<Vec<f32>> {
     if bytes.len() != expected_elements * 2 {
         return Err(BackendError::InvalidTensorData(format!(
             "tensor {name} bf16 byte length {} does not match expected {}",
