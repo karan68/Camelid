@@ -1647,6 +1647,17 @@ pub async fn serve(
     tracing::info!(%addr, "camelid server listening");
     let url = format!("http://{addr}");
 
+    // Warm the model-fit dimension cache in the background: header-only reads
+    // (never weights), disk-cached across restarts, de-duplicated, and globally
+    // rate-limited. This is why catalog fit badges can be *exact* without any
+    // per-request fetching. Best-effort; opt out with CAMELID_NO_REMOTE_DIMS=1.
+    crate::fit_dims::start_background(
+        curated_catalog()
+            .iter()
+            .map(|c| (c.repo_id.to_string(), c.filename.to_string(), c.size_bytes))
+            .collect(),
+    );
+
     // Warm the generation path BEFORE telling the user we're ready. The GPU resident
     // engine (NVRTC kernel compile + multi-GB weight upload + first prefill) is built
     // lazily on the first generation â€” a one-time cost of several seconds. If it lands
@@ -3760,7 +3771,110 @@ fn capabilities_response_with_plan(execution_plan: Option<ExecutionPlan>) -> Cap
     }
 }
 
+/// The largest curated row that has a positive fit on `hw`, as a ready-to-run
+/// suggestion string. `None` when nothing in the catalog fits (or the host is
+/// unprobed). Used to make the pre-load "too big" error actionable.
+fn best_fitting_catalog_suggestion(hw: &crate::capability::HardwareProfile) -> Option<String> {
+    curated_catalog()
+        .into_iter()
+        .filter(|item| {
+            crate::fit::assess(hw, &crate::fit::advisory_footprint(item.size_bytes))
+                .is_positive_fit()
+        })
+        .max_by_key(|item| item.size_bytes)
+        .map(|item| format!("{} (`camelid pull {}`)", item.name, item.catalog_id))
+}
+
+/// Pure advisory message for a pre-load fit check: `Some(message)` when `hw` won't
+/// fit `footprint`, else `None`. `size_bytes` is the on-disk size, used only for the
+/// human-readable number. Split from the IO wrapper so it is unit-testable with a
+/// synthetic host and footprint.
+fn fit_preload_message(
+    hw: &crate::capability::HardwareProfile,
+    footprint: &crate::fit::FitInputs,
+    size_bytes: u64,
+) -> Option<String> {
+    if crate::fit::assess(hw, footprint) != crate::fit::FitVerdict::WontFit {
+        return None;
+    }
+    let base = format!(
+        "This model (~{:.1} GB) is larger than this machine can hold in memory.",
+        size_bytes as f64 / 1e9
+    );
+    Some(match best_fitting_catalog_suggestion(hw) {
+        Some(alt) => format!(
+            "{base} The largest catalog model that fits here is {alt}. \
+             Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."
+        ),
+        None => format!("{base} Set CAMELID_SKIP_FIT_CHECK=1 to attempt the load anyway."),
+    })
+}
+
+/// Env + filesystem wrapper around [`fit_preload_message`]. Probes **live** host
+/// memory and computes an **exact** footprint from the GGUF's real dimensions
+/// (weights + KV at a normal-use context + a bounded scratch margin) whenever the
+/// header parses, falling back to the coarse size pad otherwise. Returns a typed
+/// 422 only on a `WontFit` verdict; `None` (proceed unchanged) on the
+/// `CAMELID_SKIP_FIT_CHECK=1` override, a missing/zero-size file, or any
+/// `Fits*`/`Unknown` verdict — a fail-fast convenience, never a new hard gate.
+/// Whether the load-time fit preflight is overridden off. `CAMELID_SKIP_FIT_CHECK=1`
+/// restores the pre-advisor behavior: `POST /api/models/load` attempts the load
+/// unconditionally, letting the authoritative `VramShortfall`/`KvCache` guards be
+/// the only gate. Exactly the trimmed value `"1"` enables the override; anything
+/// else (including unset) keeps the preflight on.
+fn fit_check_skipped(raw: Option<&str>) -> bool {
+    raw.map(str::trim) == Some("1")
+}
+
+fn fit_preload_guard(path: &std::path::Path) -> Option<Response> {
+    if fit_check_skipped(std::env::var("CAMELID_SKIP_FIT_CHECK").ok().as_deref()) {
+        return None;
+    }
+    let size = std::fs::metadata(path).ok()?.len();
+    if size == 0 {
+        return None;
+    }
+    // Live probe (not the cached startup snapshot): free VRAM/RAM shift as other
+    // apps run or a model is already loaded, and this decision must reflect *now*.
+    let hw = crate::capability::HardwareProfile::detect();
+    // Exact footprint from the GGUF's real dims when the header parses; else the pad.
+    let footprint = match crate::fit_dims::dims_from_gguf_file(path) {
+        Some(dims) => {
+            // KV is stored f16 on the GPU-resident path, f32 on the CPU path.
+            let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+                crate::fit::KvDtype::F16
+            } else {
+                crate::fit::KvDtype::F32
+            };
+            crate::fit::exact_footprint(size, dims, crate::fit::ADVISORY_CONTEXT_TOKENS, kv_dtype)
+        }
+        None => crate::fit::advisory_footprint(size),
+    };
+    let message = fit_preload_message(&hw, &footprint, size)?;
+    Some(api_error(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "model_too_large_for_host",
+        message,
+        Some("path"),
+    ))
+}
+
 async fn load_model(State(state): State<AppState>, Json(req): Json<LoadModelRequest>) -> Response {
+    // Advisory fail-fast (fit axis, never a support claim): steer away from a
+    // near-certain OOM before the expensive load. Overridable via
+    // CAMELID_SKIP_FIT_CHECK=1; only fires on a WontFit verdict from a probed host.
+    //
+    // The guard does blocking I/O (metadata + GGUF header read) and a live hardware
+    // probe (HardwareProfile::detect initializes a CUDA context on GPU hosts), so run
+    // it on a blocking thread rather than stalling the async worker — consistent with
+    // how the header fetches use spawn_blocking. A panic in the probe is non-fatal: we
+    // fall through to the load, where VramShortfall/KvCache remain the hard net.
+    let guard_path = req.path.clone();
+    if let Ok(Some(resp)) =
+        tokio::task::spawn_blocking(move || fit_preload_guard(&guard_path)).await
+    {
+        return resp;
+    }
     match load_model_from_path(&state, req.path, req.id).await {
         Ok(loaded) => (StatusCode::OK, Json(loaded)).into_response(),
         // Fail closed with the exact typed reason and a stable, switchable code.
@@ -16106,6 +16220,9 @@ pub struct CatalogItem {
     /// inferred from the filename). Drives the catalog's predicted lane.
     pub architecture: &'static str,
     pub license: &'static str,
+    /// Advisory "best for" positioning for the Models tab (curated, not
+    /// benchmarked). Constrained to: `general`, `reasoning`, `coding`, `tools`.
+    pub task_tags: &'static [&'static str],
 }
 
 /// A catalog item plus its predicted runnable lane, so the Models tab can show which
@@ -16138,12 +16255,56 @@ pub struct CatalogItemView {
     pub group: &'static str,
     /// Whether `architecture` is authoritative (curated) vs a filename guess (live).
     pub arch_detected: bool,
+    /// Capacity advisory: whether THIS host can load/run the row (fit axis only —
+    /// never a support/parity claim). `Unknown` for experimental rows and for hosts
+    /// whose memory cannot be probed.
+    pub fit: crate::fit::FitVerdict,
+    /// Advisory "best for" positioning (e.g. `general`, `reasoning`, `coding`,
+    /// `tools`) — curated, not benchmarked. Empty for experimental rows.
+    pub task_tags: Vec<String>,
+    /// Confidence of the `fit` estimate: `"exact"` when computed from the model's
+    /// real GGUF dimensions (KV cache sized precisely), `"approx"` when from the
+    /// coarse size-based heuristic.
+    pub fit_confidence: &'static str,
+}
+
+/// Footprint + confidence for a curated row: an **exact** footprint (weights + KV
+/// sized from the model's real GGUF dims) when `dims` are known, else the coarse
+/// size pad. Pure: the caller supplies the resolved dims (from `fit_dims`), so this
+/// is unit-testable without the global resolver.
+fn curated_footprint(
+    size_bytes: u64,
+    dims: Option<crate::fit::ModelDims>,
+    hw: &crate::capability::HardwareProfile,
+) -> (crate::fit::FitInputs, &'static str) {
+    match dims {
+        Some(dims) => {
+            let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+                crate::fit::KvDtype::F16
+            } else {
+                crate::fit::KvDtype::F32
+            };
+            let fp = crate::fit::exact_footprint(
+                size_bytes,
+                dims,
+                crate::fit::ADVISORY_CONTEXT_TOKENS,
+                kv_dtype,
+            );
+            (fp, "exact")
+        }
+        None => (crate::fit::advisory_footprint(size_bytes), "approx"),
+    }
 }
 
 impl CatalogItemView {
     /// Build a view for a curated row: authoritative architecture, lane predicted
     /// from the real `(architecture, quant)` via `runnable::oracle_qualified`.
-    fn from_curated(item: &CatalogItem) -> Self {
+    fn from_curated(item: &CatalogItem, hw: &crate::capability::HardwareProfile) -> Self {
+        let (footprint, fit_confidence) = curated_footprint(
+            item.size_bytes,
+            crate::fit_dims::global().lookup(item.repo_id, item.filename),
+            hw,
+        );
         CatalogItemView {
             catalog_id: item.catalog_id.to_string(),
             name: item.name.to_string(),
@@ -16158,14 +16319,41 @@ impl CatalogItemView {
             oracle_qualified: crate::runnable::oracle_qualified(item.architecture, item.quant),
             group: "curated",
             arch_detected: true,
+            fit: crate::fit::assess(hw, &footprint),
+            task_tags: item.task_tags.iter().map(|t| t.to_string()).collect(),
+            fit_confidence,
         }
     }
 
     /// Build a view for a live Hugging Face result. Architecture/quant are filename
     /// guesses (`arch_detected: false`); `oracle_qualified` is forced `false` so the
     /// experimental row is never predicted Compatible/Supported on a guess alone.
-    fn from_hf(file: crate::hf_browse::HfGgufFile) -> Self {
+    /// Capacity is orthogonal to verification: when this file's real GGUF header has
+    /// been read (cached), we give an honest `exact` fit even for an unverified row;
+    /// otherwise we make **no** fit claim (`Unknown`) rather than guess on a filename.
+    fn from_hf(
+        file: crate::hf_browse::HfGgufFile,
+        hw: &crate::capability::HardwareProfile,
+    ) -> Self {
         let catalog_id = format!("hf::{}::{}", file.repo_id, file.filename);
+        let (fit, fit_confidence) =
+            match crate::fit_dims::global().lookup(&file.repo_id, &file.filename) {
+                Some(dims) => {
+                    let kv_dtype = if hw.cuda_available && hw.cuda_vram_free_bytes > 0 {
+                        crate::fit::KvDtype::F16
+                    } else {
+                        crate::fit::KvDtype::F32
+                    };
+                    let fp = crate::fit::exact_footprint(
+                        file.size_bytes,
+                        dims,
+                        crate::fit::ADVISORY_CONTEXT_TOKENS,
+                        kv_dtype,
+                    );
+                    (crate::fit::assess(hw, &fp), "exact")
+                }
+                None => (crate::fit::FitVerdict::Unknown, "unknown"),
+            };
         CatalogItemView {
             catalog_id,
             name: file.filename.clone(),
@@ -16180,6 +16368,9 @@ impl CatalogItemView {
             oracle_qualified: false,
             group: "experimental",
             arch_detected: false,
+            fit,
+            task_tags: Vec::new(),
+            fit_confidence,
         }
     }
 }
@@ -16197,6 +16388,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "llama3.2",
+            task_tags: &["general", "tools"],
         },
         CatalogItem {
             catalog_id: "llama32_3b_instruct_q8_0",
@@ -16209,6 +16401,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "llama3.2",
+            task_tags: &["general", "tools"],
         },
         CatalogItem {
             catalog_id: "tinyllama_1_1b_chat_q8_0",
@@ -16223,6 +16416,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "other",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "llama3_8b_instruct_q8_0",
@@ -16235,6 +16429,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "llama3",
+            task_tags: &["general", "reasoning"],
         },
         CatalogItem {
             catalog_id: "mistral_7b_instruct_v0_3_q8_0",
@@ -16247,6 +16442,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "llama",
             license: "apache-2.0",
+            task_tags: &["general", "coding"],
         },
         CatalogItem {
             catalog_id: "qwen3_0_6b_instruct_q8_0",
@@ -16259,6 +16455,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "qwen3_1_7b_instruct_q8_0",
@@ -16271,6 +16468,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["general", "reasoning"],
         },
         CatalogItem {
             catalog_id: "qwen3_4b_instruct_q8_0",
@@ -16283,6 +16481,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
             catalog_id: "qwen3_8b_instruct_q8_0",
@@ -16295,6 +16494,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "qwen3",
             license: "apache-2.0",
+            task_tags: &["reasoning", "coding"],
         },
         CatalogItem {
             catalog_id: "gemma4_e4b_it_q8_0",
@@ -16307,6 +16507,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "gemma4_e2b_it_q8_0",
@@ -16319,6 +16520,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "gemma4_12b_it_q8_0",
@@ -16331,6 +16533,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["general", "reasoning"],
         },
         CatalogItem {
             catalog_id: "gemma4_26b_a4b_it_q4_0",
@@ -16343,6 +16546,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q4_0",
             architecture: "gemma4",
             license: "gemma",
+            task_tags: &["reasoning"],
         },
         CatalogItem {
             catalog_id: "gemma3_1b_it_q8_0",
@@ -16355,6 +16559,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "gemma3",
             license: "gemma",
+            task_tags: &["general"],
         },
         CatalogItem {
             catalog_id: "phi3_mini_4k_instruct_q8_0",
@@ -16367,6 +16572,7 @@ pub fn curated_catalog() -> Vec<CatalogItem> {
             quant: "Q8_0",
             architecture: "phi3",
             license: "mit",
+            task_tags: &["reasoning", "coding"],
         },
     ]
 }
@@ -16806,6 +17012,14 @@ async fn get_catalog(
     let trimmed = query.trim();
 
     // Curated group: filter by query exactly as before, always emitted first.
+    // The fit verdict is host-specific, so probe (cached) once and annotate each row.
+    //
+    // Deliberate: the badge uses the cached startup snapshot, while the load-time
+    // guard (`fit_preload_guard`) re-probes live. So after a model loads and consumes
+    // VRAM, a badge may still read "fits" while the guard now rejects with 422. The
+    // badge is a static capacity hint, not a live reservation; the guard is
+    // authoritative. Re-probing on every GET would re-init CUDA per request.
+    let hw = crate::capability::HardwareProfile::cached();
     let curated: Vec<CatalogItemView> = curated_catalog()
         .iter()
         .filter(|item| {
@@ -16816,9 +17030,13 @@ async fn get_catalog(
                     || item.filename.to_lowercase().contains(&qs)
             }
         })
-        .map(CatalogItemView::from_curated)
+        .map(|item| CatalogItemView::from_curated(item, hw))
         .collect();
 
+    // Serving this page is side-effect-free for the *curated* rows: their dims are
+    // warmed once at server startup via `fit_dims::start_background`, never here. The
+    // Hugging Face search branch below is not side-effect-free — it schedules a
+    // bounded, de-duplicated set of background header fetches (see HF_DIMS_WARM_LIMIT).
     let mut items = curated;
     let mut next_cursor = None;
 
@@ -16833,13 +17051,33 @@ async fn get_catalog(
                     .iter()
                     .map(|c| (c.repo_id.to_string(), c.filename.to_string()))
                     .collect();
+                // Schedule header-dim fetches for the top experimental results so a
+                // random Hugging Face model shows an honest fit on the next render.
+                // The resolver de-dupes and globally rate-limits; we still cap the
+                // per-query scheduling so one search can't enqueue 100+ models.
+                const HF_DIMS_WARM_LIMIT: usize = 5;
+                let mut scheduled = 0usize;
+                for f in &page.files {
+                    if scheduled >= HF_DIMS_WARM_LIMIT {
+                        break;
+                    }
+                    if curated_files.contains(&(f.repo_id.clone(), f.filename.clone())) {
+                        continue;
+                    }
+                    crate::fit_dims::global().schedule(
+                        f.repo_id.clone(),
+                        f.filename.clone(),
+                        f.size_bytes,
+                    );
+                    scheduled += 1;
+                }
                 items.extend(
                     page.files
                         .into_iter()
                         .filter(|f| {
                             !curated_files.contains(&(f.repo_id.clone(), f.filename.clone()))
                         })
-                        .map(CatalogItemView::from_hf),
+                        .map(|f| CatalogItemView::from_hf(f, hw)),
                 );
             }
             // Offline / Hub error: keep curated-only rather than failing the page.
@@ -17069,6 +17307,231 @@ async fn cancel_catalog_download(Json(req): Json<CancelDownloadRequest>) -> Resp
         (StatusCode::OK, "Download canceled").into_response()
     } else {
         (StatusCode::NOT_FOUND, "Download not found").into_response()
+    }
+}
+
+#[cfg(test)]
+mod catalog_fit_tests {
+    use super::{curated_catalog, CatalogItem, CatalogItemView};
+    use crate::capability::{HardwareProfile, SimdCaps};
+    use crate::fit::FitVerdict;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn host(cuda: bool, vram_free: u64, ram_total: u64, ram_free: u64) -> HardwareProfile {
+        HardwareProfile {
+            cuda_available: cuda,
+            cuda_device_count: if cuda { 1 } else { 0 },
+            cuda_device_name: None,
+            cuda_compute_capability: None,
+            cuda_tensor_cores: false,
+            cuda_vram_total_bytes: vram_free,
+            cuda_vram_free_bytes: vram_free,
+            cpu_logical_cores: 8,
+            host_ram_total_bytes: ram_total,
+            host_ram_free_bytes: ram_free,
+            simd: SimdCaps::default(),
+        }
+    }
+
+    fn row(id: &str) -> CatalogItem {
+        curated_catalog()
+            .into_iter()
+            .find(|c| c.catalog_id == id)
+            .expect("known catalog row")
+    }
+
+    #[test]
+    fn curated_view_carries_task_tags_and_a_verdict() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let item = row("tinyllama_1_1b_chat_q8_0");
+        let view = CatalogItemView::from_curated(&item, &hw);
+        assert_eq!(view.task_tags, vec!["general".to_string()]);
+        // ~1.1 GB model on a 64 GB CPU host → comfortably CPU-only.
+        assert_eq!(view.fit, FitVerdict::CpuOnlyOk);
+    }
+
+    #[test]
+    fn curated_huge_model_wont_fit_tiny_cpu_host() {
+        // 8 GB total RAM, no GPU → budget ~ max(80% of 5=4, 25% of 8=2)=4 GB;
+        // the ~8.5 GB Llama-3 8B (+overhead) cannot fit.
+        let hw = host(false, 0, 8 * GIB, 5 * GIB);
+        let item = row("llama3_8b_instruct_q8_0");
+        let view = CatalogItemView::from_curated(&item, &hw);
+        assert_eq!(view.fit, FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn experimental_from_hf_is_unknown_and_untagged() {
+        let file = crate::hf_browse::HfGgufFile {
+            repo_id: "someone/Some-Model-GGUF".to_string(),
+            filename: "Some-Model-Q4_K_M.gguf".to_string(),
+            size_bytes: 2 * GIB,
+            downloads: 10,
+            likes: 1,
+            architecture: "llama".to_string(),
+            quant: "Q4_K_M".to_string(),
+        };
+        // No cached header dims for this repo → no fit claim (Unknown), untagged.
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let view = CatalogItemView::from_hf(file, &hw);
+        assert_eq!(view.fit, FitVerdict::Unknown);
+        assert!(view.task_tags.is_empty());
+        assert_eq!(view.group, "experimental");
+        assert_eq!(view.fit_confidence, "unknown");
+    }
+
+    #[test]
+    fn hf_row_gets_an_exact_fit_once_its_header_dims_are_cached() {
+        let hw = host(false, 0, 4 * GIB, 3 * GIB);
+        let (repo, filename) = ("someone/Huge-Model-GGUF", "Huge-Model-Q8_0.gguf");
+        // Cache real dims for a genuinely too-big model → honest exact WontFit even on
+        // an unverified HF row (capacity is orthogonal to verification).
+        let dims = crate::fit::ModelDims {
+            layers: 80,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        crate::fit_dims::global().insert_for_test(repo, filename, dims);
+        let file = crate::hf_browse::HfGgufFile {
+            repo_id: repo.to_string(),
+            filename: filename.to_string(),
+            size_bytes: 20 * GIB,
+            downloads: 0,
+            likes: 0,
+            architecture: "llama".to_string(),
+            quant: "Q8_0".to_string(),
+        };
+        let view = CatalogItemView::from_hf(file, &hw);
+        assert_eq!(view.fit_confidence, "exact");
+        assert_eq!(view.fit, FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn unknown_host_never_reports_wont_fit_for_any_curated_row() {
+        // macOS-style: RAM unprobed (0) and no CUDA → advisory-blind, never WontFit.
+        let hw = host(false, 0, 0, 0);
+        for item in curated_catalog() {
+            let view = CatalogItemView::from_curated(&item, &hw);
+            assert_eq!(
+                view.fit,
+                FitVerdict::Unknown,
+                "row {} must be Unknown on an unprobed host",
+                view.catalog_id
+            );
+        }
+    }
+
+    #[test]
+    fn every_curated_row_is_tagged_within_the_allowed_set() {
+        for item in curated_catalog() {
+            assert!(
+                !item.task_tags.is_empty(),
+                "curated row {} must carry at least one task tag",
+                item.catalog_id
+            );
+            for tag in item.task_tags {
+                assert!(
+                    matches!(*tag, "general" | "reasoning" | "coding" | "tools"),
+                    "row {} has unexpected task tag {tag}",
+                    item.catalog_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preload_message_suggests_a_fitting_alternative_for_an_oversized_model() {
+        // 8 GB RAM, no GPU: a 40 GB model won't fit → actionable message.
+        let hw = host(false, 0, 8 * GIB, 5 * GIB);
+        let fp = crate::fit::advisory_footprint(40 * GIB);
+        let msg = super::fit_preload_message(&hw, &fp, 40 * GIB).expect("won't fit -> message");
+        assert!(msg.contains("larger than this machine"));
+        assert!(msg.contains("camelid pull"));
+        assert!(msg.contains("CAMELID_SKIP_FIT_CHECK=1"));
+    }
+
+    #[test]
+    fn preload_message_is_none_when_the_model_fits() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let fp = crate::fit::advisory_footprint(2 * GIB);
+        assert!(super::fit_preload_message(&hw, &fp, 2 * GIB).is_none());
+    }
+
+    #[test]
+    fn preload_message_is_none_on_unprobed_host() {
+        // Unknown verdict must never hard-block a load.
+        let hw = host(false, 0, 0, 0);
+        let fp = crate::fit::advisory_footprint(40 * GIB);
+        assert!(super::fit_preload_message(&hw, &fp, 40 * GIB).is_none());
+    }
+
+    #[test]
+    fn preload_message_fires_from_an_exact_dims_footprint() {
+        // 4 GB RAM host, no GPU: a 5 GB-weights model's EXACT footprint (weights + KV
+        // at the default context + scratch) exceeds the budget → typed message.
+        let hw = host(false, 0, 4 * GIB, 3 * GIB);
+        let dims = crate::fit::ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let fp = crate::fit::exact_footprint(
+            5 * GIB,
+            dims,
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F32,
+        );
+        assert!(super::fit_preload_message(&hw, &fp, 5 * GIB).is_some());
+    }
+
+    #[test]
+    fn best_fitting_suggestion_picks_something_on_a_big_host_and_never_panics_on_tiny() {
+        let big = host(false, 0, 64 * GIB, 48 * GIB);
+        let s = super::best_fitting_catalog_suggestion(&big).expect("a row fits a 64 GB host");
+        assert!(s.contains("camelid pull"));
+        // On a tiny host only small rows fit (or none) — must not panic either way.
+        let tiny = host(false, 0, 4 * GIB, 3 * GIB);
+        let _ = super::best_fitting_catalog_suggestion(&tiny);
+    }
+
+    #[test]
+    fn skip_fit_check_override_matches_only_the_exact_flag() {
+        // The override restores the pre-advisor load-attempt behavior. It must engage
+        // for exactly `1` (trimmed) and nothing else, so the preflight can't be turned
+        // off by an unrelated or malformed value.
+        assert!(super::fit_check_skipped(Some("1")));
+        assert!(super::fit_check_skipped(Some("  1  ")));
+        assert!(!super::fit_check_skipped(Some("0")));
+        assert!(!super::fit_check_skipped(Some("true")));
+        assert!(!super::fit_check_skipped(Some("11")));
+        assert!(!super::fit_check_skipped(Some("")));
+        assert!(!super::fit_check_skipped(None));
+    }
+
+    #[test]
+    fn curated_footprint_is_exact_when_dims_known_else_approx() {
+        let hw = host(false, 0, 64 * GIB, 48 * GIB);
+        let size = 8_000_000_000u64;
+        // approx: no dims → coarse size pad.
+        let (fp_approx, conf) = super::curated_footprint(size, None, &hw);
+        assert_eq!(conf, "approx");
+        assert_eq!(fp_approx, crate::fit::advisory_footprint(size));
+        // exact: real dims → precise KV cache sizing.
+        let dims = crate::fit::ModelDims {
+            layers: 32,
+            kv_heads: 8,
+            head_dim: 128,
+        };
+        let (fp_exact, conf) = super::curated_footprint(size, Some(dims), &hw);
+        assert_eq!(conf, "exact");
+        let expected = crate::fit::exact_footprint(
+            size,
+            dims,
+            crate::fit::ADVISORY_CONTEXT_TOKENS,
+            crate::fit::KvDtype::F32, // CPU host
+        );
+        assert_eq!(fp_exact, expected);
     }
 }
 
