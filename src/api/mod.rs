@@ -104,14 +104,12 @@ pub struct AppState {
     model_last_used: Arc<RwLock<HashMap<String, std::time::Instant>>>,
     cached_prompt_prefix: Arc<Mutex<Option<CachedPromptPrefix>>>,
     generation_sessions: Arc<RwLock<HashMap<String, GenerationSessionSummary>>>,
-    /// TRANSITIONAL (engine-inversion Phase 2): serializes the lock-based
-    /// STREAMING path against engine jobs while streaming still runs in the
-    /// SSE generator. Non-streaming decodes now execute on the engine worker
-    /// thread (see `engine::EngineHandle`), whose jobs hold this lock only as
-    /// a bridge. Deleted when streaming moves onto the engine.
-    generation_lock: Arc<tokio::sync::Mutex<()>>,
     /// The engine worker: the single thread where decode compute and
-    /// resident-GPU-state mutations execute (see api/engine.rs).
+    /// resident-GPU-state mutations execute (see api/engine.rs). This
+    /// replaces the old `generation_lock` — serialization is by construction
+    /// (one worker thread), not by a lock whose guard lifetime could be
+    /// decoupled from the compute it guarded (the orphan-decode hazard;
+    /// docs/recon/ENGINE_INVERSION_CONDUCTOR.md).
     engine: engine::EngineHandle,
     planner_env: PlannerEnv,
     configured_threads: Option<usize>,
@@ -135,7 +133,6 @@ impl Default for AppState {
             model_last_used: Arc::new(RwLock::new(HashMap::new())),
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             generation_sessions: Arc::new(RwLock::new(HashMap::new())),
-            generation_lock: Arc::new(tokio::sync::Mutex::new(())),
             engine: engine::EngineHandle::spawn(),
             planner_env: PlannerEnv::capture(),
             configured_threads: None,
@@ -6085,7 +6082,17 @@ async fn unload_model(
     // stayed on the device and starved the next model into a host-RAM spill (NVIDIA
     // sysmem fallback), making decode ~20x slower. (A gemma4 CUDA runtime's VRAM is
     // freed by dropping it from gemma4_runtimes above.)
-    crate::inference::reset_resident_caches();
+    //
+    // The reset mutates engine-owned GPU state, so it runs as an ENGINE JOB —
+    // it can never race a decode. A failed post is surfaced, never skipped
+    // silently (a skipped reset is the 20x-slowdown VRAM leak all over again).
+    if let Err(err) = state
+        .engine
+        .run_exclusive(crate::inference::reset_resident_caches)
+        .await
+    {
+        return *engine_post_error_response(err);
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -6888,12 +6895,10 @@ async fn run_multi_choice_on_engine(
     state: &AppState,
     choices: PreparedMultiChoice,
 ) -> std::result::Result<Vec<GeneratedText>, Box<Response>> {
-    let gen_lock = state.generation_lock.clone();
     let prepared_choices = choices.prepared;
     match state
         .engine
         .run_exclusive(move || {
-            let _bridge = gen_lock.blocking_lock();
             let mut generated = Vec::with_capacity(prepared_choices.len());
             for prepared in prepared_choices {
                 generated.push(run_decode_job_serialized(prepared)?);
@@ -7107,8 +7112,6 @@ async fn completions(
         json_object_mode: false,
     };
     let stream = req.stream.unwrap_or(false);
-    // Serialize generation so only one decode runs against the shared
-    // CUDA-resident KV state at a time (see AppState::generation_lock).
     if n_choices > 1 {
         // Non-streaming independent multi-choice generation: all n choices
         // run inside ONE engine job, so no other request interleaves.
@@ -7122,9 +7125,7 @@ async fn completions(
     if stream {
         // Text-completion streaming does not implement stream_options yet
         // (scope: chat-completions only), so usage is never emitted here.
-        // Streaming still serializes via the transitional lock (Phase 2b/3).
-        let gen_guard = state.generation_lock.clone().lock_owned().await;
-        return stream_completion(prepared, false, gen_guard, false);
+        return stream_completion(&state, prepared, false, false);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -7482,8 +7483,6 @@ async fn chat_completions(
         json_object_mode,
     };
     let stream = req.stream.unwrap_or(false);
-    // Serialize generation so only one decode runs against the shared
-    // CUDA-resident KV state at a time (see AppState::generation_lock).
     if n_choices > 1 {
         // Non-streaming independent multi-choice generation: all n choices
         // run inside ONE engine job, so no other request interleaves.
@@ -7497,11 +7496,9 @@ async fn chat_completions(
         Err(response) => return response,
     };
     if stream {
-        // Streaming still serializes via the transitional lock until it moves
-        // onto the engine (Phase 2b/3); engine decode jobs hold the same lock
-        // as a bridge, so streams and engine decodes never overlap.
-        let gen_guard = state.generation_lock.clone().lock_owned().await;
-        return stream_completion(prepared, true, gen_guard, include_usage);
+        // Streaming decodes are engine jobs too; the SSE layer just maps the
+        // job's events onto chunks.
+        return stream_completion(&state, prepared, true, include_usage);
     }
 
     // The decode runs on the engine worker; CancelOnDrop stops it within one
@@ -9214,26 +9211,10 @@ fn engine_post_error_response(err: engine::EnginePostError) -> Box<Response> {
     }
 }
 
-/// The blocking decode body, run ON THE ENGINE THREAD under the transitional
-/// streaming bridge lock. Compute serialization is the engine thread itself;
-/// the wall-clock timeout is enforced inside the decode loop (see
-/// `GenerationCancel`), so the job always runs to a clean stop — it is never
-/// detached.
-fn run_decode_job(
-    gen_lock: Arc<tokio::sync::Mutex<()>>,
-    prepared: PreparedGeneration,
-) -> std::result::Result<GeneratedText, Box<Response>> {
-    // TRANSITIONAL: hold the generation lock for the job's duration so engine
-    // decodes and the (still lock-based) streaming path never overlap. Safe
-    // here: the engine thread runs outside any async runtime, and no engine
-    // job caller holds this lock while awaiting the engine (deadlock-free by
-    // ordering). Removed when streaming moves onto the engine.
-    let _bridge = gen_lock.blocking_lock();
-    run_decode_job_serialized(prepared)
-}
-
-/// The decode body proper — caller must already be the exclusive compute owner
-/// (the engine thread, holding the streaming bridge).
+/// The decode body — caller must be the exclusive compute owner (the engine
+/// worker thread). The wall-clock timeout is enforced inside the decode loop
+/// (see `GenerationCancel`), so the job always runs to a clean stop — it is
+/// never detached.
 fn run_decode_job_serialized(
     mut prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
@@ -9266,10 +9247,9 @@ async fn generate_decoded_tokens_blocking(
     state: &AppState,
     prepared: PreparedGeneration,
 ) -> std::result::Result<GeneratedText, Box<Response>> {
-    let gen_lock = state.generation_lock.clone();
     match state
         .engine
-        .run_exclusive(move || run_decode_job(gen_lock, prepared))
+        .run_exclusive(move || run_decode_job_serialized(prepared))
         .await
     {
         Ok(result) => result,
@@ -9277,39 +9257,13 @@ async fn generate_decoded_tokens_blocking(
     }
 }
 
-struct TimedGenerationStep {
-    session: LlamaInferenceSession,
-    step: LlamaGenerationStep,
-    /// The generation lock, returned to the stream so it stays held between
-    /// steps. On the error paths it is dropped when the blocking closure ends,
-    /// i.e. exactly when the step's compute finishes.
-    gen_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-}
-
-enum GenerationStepBlockingError {
-    Response(Box<Response>),
-    Timeout {
-        timeout: Duration,
-        elapsed: Duration,
-        generated_tokens: usize,
-    },
-}
-
-struct StreamGenerationStepRequest {
+struct StreamStepRequest {
     /// Try the resident GPU-sampling greedy fast lane before the general step.
     greedy_fast: bool,
-    session: LlamaInferenceSession,
-    /// Generation lock, moved into the blocking step closure so a dropped SSE
-    /// stream cannot free the lock while this step is still running.
-    gen_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     input: Vec<u32>,
     sampler: LlamaSampler,
     history: Vec<u32>,
     collect_dense_diagnostics: bool,
-    step_timeout: Duration,
-    request_timeout: Duration,
-    request_started: Instant,
-    generated_tokens: usize,
 }
 
 /// A generation step whose token was sampled ON the GPU (resident greedy fast lane): no
@@ -9345,128 +9299,62 @@ fn gpu_sampled_generation_step(
     })
 }
 
-async fn generate_stream_step_blocking(
-    request: StreamGenerationStepRequest,
-) -> std::result::Result<TimedGenerationStep, GenerationStepBlockingError> {
-    let StreamGenerationStepRequest {
+/// One streaming decode step, run ON THE ENGINE THREAD. No `spawn_blocking`,
+/// no session ownership ping-pong (D4), no per-step detach window: the step
+/// borrows the job-owned session and runs to completion. Wall-clock budget is
+/// enforced BETWEEN steps by the streaming job (a step stuck inside a single
+/// forward cannot be interrupted safely — same decision as non-streaming).
+fn run_stream_step(
+    session: &mut LlamaInferenceSession,
+    request: StreamStepRequest,
+) -> std::result::Result<LlamaGenerationStep, Box<Response>> {
+    let StreamStepRequest {
         greedy_fast,
-        session,
-        gen_guard,
         input,
         sampler,
         history,
         collect_dense_diagnostics,
-        step_timeout,
-        request_timeout,
-        request_started,
-        generated_tokens,
     } = request;
-    let test_sleep = generation_step_test_sleep_duration();
-    let handle = tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
-        let _decode_probe = decode_probe::enter();
-        if let Some(duration) = test_sleep {
-            std::thread::sleep(duration);
-        }
-        // Held for the step's whole compute; returned on success so the stream
-        // keeps the lock between steps, dropped at closure end on error.
-        let mut gen_guard = gen_guard;
-        let mut session = session;
-        if greedy_fast {
-            if let Some((id, forward_us)) = session
-                .generate_next_token_greedy_resident(input[0])
-                .map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "generation_step_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?
-            {
-                let step = gpu_sampled_generation_step(id, forward_us).map_err(|err| {
-                    Box::new(api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "generation_step_failed",
-                        err.to_string(),
-                        None,
-                    ))
-                })?;
-                return Ok(TimedGenerationStep {
-                    session,
-                    step,
-                    gen_guard: gen_guard.take(),
-                });
-            }
-        }
-        // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
-        // instead of copying the full logits row to the host and sorting it on the
-        // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
-        if !collect_dense_diagnostics {
-            if let LlamaSampler::Sampling(cfg) = &sampler {
-                if let Some((id, forward_us)) = session
-                    .generate_next_token_sampled_resident(input[0], cfg)
-                    .map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "generation_step_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?
-                {
-                    let step = gpu_sampled_generation_step(id, forward_us).map_err(|err| {
-                        Box::new(api_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "generation_step_failed",
-                            err.to_string(),
-                            None,
-                        ))
-                    })?;
-                    return Ok(TimedGenerationStep {
-                        session,
-                        step,
-                        gen_guard: gen_guard.take(),
-                    });
-                }
-            }
-        }
-        let step = session
-            .generate_next_token_with_history_diagnostics(
-                &input,
-                sampler,
-                &history,
-                collect_dense_diagnostics,
-                None,
-            )
-            .map_err(|err| {
-                Box::new(api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "generation_step_failed",
-                    err.to_string(),
-                    None,
-                ))
-            })?;
-        Ok(TimedGenerationStep {
-            session,
-            step,
-            gen_guard: gen_guard.take(),
-        })
-    });
-    match tokio::time::timeout(step_timeout, handle).await {
-        Ok(Ok(result)) => result.map_err(GenerationStepBlockingError::Response),
-        Ok(Err(err)) => Err(GenerationStepBlockingError::Response(Box::new(api_error(
+    let step_error = |err: String| {
+        Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "generation_worker_failed",
-            format!("generation worker failed before completing the stream step: {err}"),
+            "generation_step_failed",
+            err,
             None,
-        )))),
-        Err(_) => Err(GenerationStepBlockingError::Timeout {
-            timeout: request_timeout,
-            elapsed: request_started.elapsed(),
-            generated_tokens,
-        }),
+        ))
+    };
+    if greedy_fast {
+        if let Some((id, forward_us)) = session
+            .generate_next_token_greedy_resident(input[0])
+            .map_err(|err| step_error(err.to_string()))?
+        {
+            return gpu_sampled_generation_step(id, forward_us)
+                .map_err(|err| step_error(err.to_string()));
+        }
     }
+    // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
+    // instead of copying the full logits row to the host and sorting it on the
+    // CPU (~7 ms/token). Other sampler shapes fall through to the CPU path.
+    if !collect_dense_diagnostics {
+        if let LlamaSampler::Sampling(cfg) = &sampler {
+            if let Some((id, forward_us)) = session
+                .generate_next_token_sampled_resident(input[0], cfg)
+                .map_err(|err| step_error(err.to_string()))?
+            {
+                return gpu_sampled_generation_step(id, forward_us)
+                    .map_err(|err| step_error(err.to_string()));
+            }
+        }
+    }
+    session
+        .generate_next_token_with_history_diagnostics(
+            &input,
+            sampler,
+            &history,
+            collect_dense_diagnostics,
+            None,
+        )
+        .map_err(|err| step_error(err.to_string()))
 }
 
 fn generation_timeout_response(
@@ -9520,12 +9408,11 @@ fn generation_step_test_sleep_duration() -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
-/// Test-only concurrency probe for the blocking decode workers. Counts how
-/// many decode tasks are live on the blocking pool at once, independent of
-/// `generation_lock` guard lifetime — the guard and the compute it guards are
-/// decoupled (the orphan-decode hazard), so the lock's own state cannot be
-/// used to observe overlap. Tests reset the probe under `test_support::env_lock`
-/// and assert `max_seen() <= 1` (the invariant the lock is supposed to provide).
+/// Test-only concurrency probe for the decode jobs. Counts how many decode
+/// bodies are live at once, measured on the compute itself rather than on any
+/// serialization primitive — which is what let the Gate 0 tests catch compute
+/// outliving its (since-deleted) generation-lock guard. Tests reset the probe
+/// under `test_support::env_lock` and assert `max_seen() <= 1`.
 #[cfg(test)]
 pub(crate) mod decode_probe {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10862,10 +10749,306 @@ fn stream_first_content_accounting_json(
     })
 }
 
+/// Events emitted by the engine-side streaming decode job and mapped 1:1 onto
+/// SSE chunks by `stream_completion`. Each variant carries exactly what the
+/// SSE layer needs to reproduce the pre-inversion byte stream (chunk shapes
+/// unchanged; only timing VALUES may differ).
+enum StreamDecodeEvent {
+    /// A non-empty text delta (already stop-sequence-truncated and diffed
+    /// against previously streamed text).
+    Delta(String),
+    /// Clean end of generation; terminal.
+    Finished {
+        finish_reason: &'static str,
+        completion_tokens: usize,
+        /// Engine-side timing block for the optional timing-diagnostics JSON
+        /// (boxed: it dwarfs the per-token Delta variant).
+        timings: Box<GenerationTimings>,
+        first_content_ms: Option<u128>,
+    },
+    /// Decode failed; terminal. Maps to `stream_error_message_event`.
+    Failed { code: String, message: String },
+    /// Wall-clock budget exhausted; terminal. Maps to
+    /// `generation_timeout_stream_event` with the exact pre-inversion payload.
+    TimedOut {
+        timeout: Duration,
+        elapsed: Duration,
+        generated_tokens: usize,
+    },
+}
+
+/// The error-code/message pair `stream_error_event` would have produced for a
+/// Response-shaped failure, so the engine job can hand the SSE layer
+/// byte-identical error frames without shipping the `Response` across.
+fn stream_error_parts(response: &Response) -> (String, String) {
+    (
+        "stream_error".to_string(),
+        format!("stream failed after headers: HTTP {}", response.status()),
+    )
+}
+
+/// The streaming decode loop, run ON THE ENGINE THREAD as one exclusive job.
+/// A dropped SSE stream (client disconnect) fires the request's cancel token
+/// via `CancelOnDrop` and closes the events channel; the job observes either
+/// between steps and stops within one step. The job is never detached from
+/// the engine's serialization — the next request's job starts only after this
+/// one returns.
+fn run_stream_decode_job(
+    mut prepared: PreparedGeneration,
+    events: tokio::sync::mpsc::Sender<StreamDecodeEvent>,
+) {
+    #[cfg(test)]
+    let _decode_probe = decode_probe::enter();
+    // Terminal-event send helper: a closed channel means the client is gone —
+    // nothing to report, the job just stops.
+    let send = |event: StreamDecodeEvent| events.blocking_send(event).is_ok();
+    // Lifecycle telemetry: if this job stops without a clean finish (client
+    // disconnect, error), dropping the guard closes the run, so the
+    // observatory never shows a stale "running" state.
+    let telemetry_guard = prepared
+        .telemetry
+        .take()
+        .map(telemetry::RequestGuard::begin);
+    let generation_started = Instant::now();
+    let request_timeout = match generation_timeout_duration() {
+        Ok(timeout) => timeout,
+        Err(response) => {
+            let (code, message) = stream_error_parts(&response);
+            send(StreamDecodeEvent::Failed { code, message });
+            return;
+        }
+    };
+    let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
+    let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
+    if collect_q8_schedule {
+        reset_q8_schedule_telemetry();
+    }
+    if let Some(duration) = generation_step_test_sleep_duration() {
+        std::thread::sleep(duration);
+    }
+    let mut input = prepared.token_ids.clone();
+    let mut history = prepared.token_ids.clone();
+    let mut generated = Vec::new();
+    let mut top_logits = Vec::new();
+    let mut output_projection = Vec::new();
+    let mut dense = None;
+    let mut finish_reason = "length";
+    let mut streamed_text = String::new();
+    let mut reused_prompt_prefix = false;
+    let mut first_content_ms = None;
+    let mut forward_timings = LlamaForwardTimings::default();
+    let mut sample = 0;
+
+    // Bypass the prompt-prefix cache when the CUDA-resident engine drives
+    // decode: reusing a cached session reseeds the GPU KV from f16-rounded
+    // host history (a different reduction order than a clean GPU prefill),
+    // which corrupts the resumed decode â€” mild for greedy (a few near-tie
+    // flips) but catastrophic under temperature sampling, where it produces
+    // garbled, off-topic output. The non-streaming path already gates the
+    // cache this way (see resident_decode_cuda_active); the streaming path
+    // must too. The CPU lane is reduction-order-stable and keeps the cache.
+    if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
+        if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
+            prepared.session = cached.session.clone();
+            input.clear();
+            match sample_cached_prompt_prefix(&cached, &history) {
+                Ok(first_step) => {
+                    let cached_next_token = first_step.next_token_id;
+                    reused_prompt_prefix = true;
+                    prepared.timings.prompt_cache_hit = true;
+                    sample += first_step.sample;
+                    if let Err(response) = consume_generation_step(
+                        &prepared,
+                        first_step,
+                        GenerationStepAccumulator {
+                            generated: &mut generated,
+                            history: &mut history,
+                            top_logits: &mut top_logits,
+                            output_projection: &mut output_projection,
+                            dense: &mut dense,
+                            finish_reason: &mut finish_reason,
+                        },
+                    ) {
+                        let (code, message) = stream_error_parts(&response);
+                        send(StreamDecodeEvent::Failed { code, message });
+                        return;
+                    }
+                    if finish_reason == "length" {
+                        input.push(cached_next_token);
+                    }
+                }
+                Err(response) => {
+                    let (code, message) = stream_error_parts(&response);
+                    send(StreamDecodeEvent::Failed { code, message });
+                    return;
+                }
+            }
+        }
+    }
+
+    for _ in generated.len() as u32..prepared.max_tokens {
+        if finish_reason != "length" {
+            break;
+        }
+        // Cooperative stop: the SSE layer's CancelOnDrop fired (client
+        // disconnected). Nobody is listening — drop the telemetry guard
+        // (closing the run) and stop within this step boundary.
+        if prepared.cancel.token.is_cancelled() {
+            return;
+        }
+        let generated_index = generated.len();
+        let collect_dense_for_step =
+            collect_dense_diagnostics_for_generated_index(&prepared, generated_index);
+        let mut sampling = prepared.sampling.clone();
+        if let Some(seed) = sampling.seed {
+            sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
+        }
+        let sampler = if sampling == SamplingConfig::default() {
+            LlamaSampler::Greedy
+        } else {
+            LlamaSampler::Sampling(sampling)
+        };
+        if request_timeout
+            .checked_sub(generation_started.elapsed())
+            .is_none()
+        {
+            send(StreamDecodeEvent::TimedOut {
+                timeout: request_timeout,
+                elapsed: generation_started.elapsed(),
+                generated_tokens: generated.len(),
+            });
+            return;
+        }
+        // Greedy single-token continuations with no per-step logit consumers
+        // ride the resident GPU-sampling fast lane inside the step.
+        let greedy_fast = input.len() == 1
+            && matches!(sampler, LlamaSampler::Greedy)
+            && !collect_dense_for_step
+            && !top_logits.is_empty();
+        let step = match run_stream_step(
+            &mut prepared.session,
+            StreamStepRequest {
+                greedy_fast,
+                input: input.clone(),
+                sampler,
+                history: history.clone(),
+                collect_dense_diagnostics: collect_dense_for_step,
+            },
+        ) {
+            Ok(step) => step,
+            Err(response) => {
+                let (code, message) = stream_error_parts(&response);
+                send(StreamDecodeEvent::Failed { code, message });
+                return;
+            }
+        };
+        if !reused_prompt_prefix
+            && generated.is_empty()
+            && !prepared.collect_dense_diagnostics
+            && step.diagnostics.is_none()
+        {
+            store_prompt_prefix_cache(&prepared, &step);
+        }
+        if generated.is_empty() && !reused_prompt_prefix {
+            prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
+        }
+        forward_timings.add_assign(&step.timings);
+        sample += step.sample;
+        if let Err(response) = consume_generation_step(
+            &prepared,
+            step,
+            GenerationStepAccumulator {
+                generated: &mut generated,
+                history: &mut history,
+                top_logits: &mut top_logits,
+                output_projection: &mut output_projection,
+                dense: &mut dense,
+                finish_reason: &mut finish_reason,
+            },
+        ) {
+            let (code, message) = stream_error_parts(&response);
+            send(StreamDecodeEvent::Failed { code, message });
+            return;
+        }
+
+        let mut text = match prepared.tokenizer.decode(&generated, true) {
+            Ok(text) => text,
+            Err(err) => {
+                send(StreamDecodeEvent::Failed {
+                    code: "token_decode_failed".to_string(),
+                    message: err.to_string(),
+                });
+                return;
+            }
+        };
+        if finish_reason == "stop" {
+            text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
+        }
+        let delta = text
+            .strip_prefix(&streamed_text)
+            .map(str::to_owned)
+            .unwrap_or_else(|| text.clone());
+        streamed_text = text;
+        if !delta.is_empty() {
+            if first_content_ms.is_none() {
+                first_content_ms = Some(generation_started.elapsed().as_millis());
+            }
+            // A closed channel is a hangup: stop decoding.
+            if !send(StreamDecodeEvent::Delta(delta)) {
+                return;
+            }
+        }
+        if finish_reason != "length" {
+            break;
+        }
+        input.clear();
+        if let Some(last_token) = generated.last().copied() {
+            input.push(last_token);
+        }
+    }
+
+    prepared.timings.generate = generation_started.elapsed().as_millis();
+    prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
+    prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
+    prepared.timings.memory = forward_timings.memory;
+    if collect_q8_schedule {
+        prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
+    }
+    if let Some(guard) = telemetry_guard {
+        let ttft_ms = first_content_ms.map(|ms| ms as u64);
+        let decode_tps = match (first_content_ms, generated.len()) {
+            (Some(first_ms), count) if count > 1 => {
+                let decode_ms = generation_started
+                    .elapsed()
+                    .as_millis()
+                    .saturating_sub(first_ms);
+                (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
+            }
+            _ => None,
+        };
+        guard.finish(telemetry::RequestFinish {
+            status: "ok",
+            finish_reason: Some(finish_reason.to_string()),
+            completion_tokens: generated.len(),
+            ttft_ms,
+            decode_tps,
+            prefill_tps: None,
+            error: None,
+        });
+    }
+    crate::gait::sentinel::mark_healthy();
+    send(StreamDecodeEvent::Finished {
+        finish_reason,
+        completion_tokens: generated.len(),
+        timings: Box::new(prepared.timings),
+        first_content_ms,
+    });
+}
+
 fn stream_completion(
+    state: &AppState,
     mut prepared: PreparedGeneration,
     chat: bool,
-    gen_guard: tokio::sync::OwnedMutexGuard<()>,
     include_usage: bool,
 ) -> Response {
     // Speculation only runs in the non-streaming loop; streaming requests on
@@ -10874,6 +11057,9 @@ fn stream_completion(
     prepared.speculative = None;
     prepared.session.set_resident_paths_disabled(false);
     let model_id = prepared.model_id.clone();
+    // Captured before the job so the streaming usage frame reports the exact
+    // same prompt count as the non-streaming path (single source of truth).
+    let prompt_token_count = prepared.token_ids.len();
     let stream_timing_diagnostics = stream_timing_diagnostics_enabled();
     let stream_poll_yield = stream_poll_yield_enabled();
     let stream_id = if chat {
@@ -10881,23 +11067,28 @@ fn stream_completion(
     } else {
         format!("cmpl-{}", uuid::Uuid::new_v4())
     };
+    let cancel_token = prepared.cancel.token.clone();
+    // Small buffer: the engine may run ahead of a slow client by at most this
+    // many deltas, then parks on the channel send — mirroring pre-inversion
+    // behavior, where an unpolled generator simply stopped decoding.
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+    // Post the decode job before returning the SSE response. A full queue is
+    // the same typed backpressure non-streaming requests get.
+    if let Err(err) = state
+        .engine
+        .post(engine::EngineTask::Exclusive(Box::new(move || {
+            run_stream_decode_job(prepared, events_tx);
+        })))
+    {
+        return *engine_post_error_response(err);
+    }
     let events = async_stream::stream! {
-        // Hold the generation lock for the entire stream. Between steps it
-        // lives here; DURING a step it is moved into the blocking closure
-        // (StreamGenerationStepRequest.gen_guard), so a client disconnect that
-        // drops this generator between polls can never free the lock while a
-        // step's compute is still running. See AppState::generation_lock.
-        let mut gen_guard = Some(gen_guard);
-        // Dropping the generator for any reason fires the request's
-        // CancellationToken (no further steps are driven by a dead generator,
-        // but the signal keeps guard/compute lifetimes equal by construction
-        // and lets Phase-2+ engine code observe the disconnect).
-        let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
+        // Dropping this generator (client disconnect) fires the request's
+        // CancellationToken and closes the events channel; the engine job
+        // observes either within one step and stops cleanly. Compute is never
+        // detached from the engine's serialization.
+        let _cancel_on_drop = CancelOnDrop(cancel_token);
         let stream_started = Instant::now();
-        // Lifecycle telemetry for the streaming path. Dropping the stream
-        // (client disconnect, error return) closes the run via the guard's
-        // Drop, so the observatory never shows a stale "running" state.
-        let telemetry_guard = prepared.telemetry.take().map(telemetry::RequestGuard::begin);
         let mut stream_event_timings = StreamEventTimings {
             poll_yield_enabled: stream_poll_yield,
             ..StreamEventTimings::default()
@@ -10925,343 +11116,144 @@ fn stream_completion(
                 tokio::task::yield_now().await;
             }
         }
-
         stream_event_timings.generate_start = Some(stream_started.elapsed().as_millis());
-        let generation_started = Instant::now();
-        let request_timeout = match generation_timeout_duration() {
-            Ok(timeout) => timeout,
-            Err(response) => {
-                yield stream_error_event(*response);
-                yield Ok(Event::default().data("[DONE]"));
-                return;
-            }
-        };
-        let collect_q8_schedule = stream_timing_diagnostics && q8_schedule_telemetry_enabled();
-        if collect_q8_schedule {
-            reset_q8_schedule_telemetry();
-        }
-        let mut input = prepared.token_ids.clone();
-        let mut history = prepared.token_ids.clone();
-        // Captured before decode so the streaming usage frame reports the exact
-        // same prompt count as the non-streaming path (which also reads
-        // `prepared.token_ids.len()`). `prepared.token_ids` is never mutated
-        // during the stream, but capturing here mirrors the non-streaming path
-        // and binds the two counts by construction (single source of truth).
-        let prompt_token_count = prepared.token_ids.len();
-        let mut generated = Vec::new();
-        let mut top_logits = Vec::new();
-        let mut output_projection = Vec::new();
-        let mut dense = None;
-        let mut finish_reason = "length";
-        let mut streamed_text = String::new();
-        let mut reused_prompt_prefix = false;
-        let mut first_content_ms = None;
-        let mut forward_timings = LlamaForwardTimings::default();
-        let mut sample = 0;
 
-        // Bypass the prompt-prefix cache when the CUDA-resident engine drives
-        // decode: reusing a cached session reseeds the GPU KV from f16-rounded
-        // host history (a different reduction order than a clean GPU prefill),
-        // which corrupts the resumed decode â€” mild for greedy (a few near-tie
-        // flips) but catastrophic under temperature sampling, where it produces
-        // garbled, off-topic output. The non-streaming path already gates the
-        // cache this way (see resident_decode_cuda_active); the streaming path
-        // must too. The CPU lane is reduction-order-stable and keeps the cache.
-        if !prepared.collect_dense_diagnostics && !crate::inference::resident_decode_cuda_active() {
-            if let Some(cached) = lookup_prompt_prefix_cache(&prepared) {
-                prepared.session = cached.session.clone();
-                input.clear();
-                match sample_cached_prompt_prefix(&cached, &history) {
-                    Ok(first_step) => {
-                        let cached_next_token = first_step.next_token_id;
-                        reused_prompt_prefix = true;
-                        prepared.timings.prompt_cache_hit = true;
-                        sample += first_step.sample;
-                        if let Err(response) = consume_generation_step(
-                            &prepared,
-                            first_step,
-                            GenerationStepAccumulator {
-                                generated: &mut generated,
-                                history: &mut history,
-                                top_logits: &mut top_logits,
-                                output_projection: &mut output_projection,
-                                dense: &mut dense,
-                                finish_reason: &mut finish_reason,
-                            },
-                        ) {
-                            yield stream_error_event(*response);
-                            yield Ok(Event::default().data("[DONE]"));
-                            return;
-                        }
-                        if finish_reason == "length" {
-                            input.push(cached_next_token);
-                        }
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                StreamDecodeEvent::Delta(delta) => {
+                    if stream_event_timings.first_content_yield.is_none() {
+                        stream_event_timings.first_content_yield =
+                            Some(stream_started.elapsed().as_millis());
                     }
-                    Err(response) => {
-                        yield stream_error_event(*response);
-                        yield Ok(Event::default().data("[DONE]"));
-                        return;
+                    if chat {
+                        let chunk = ChatCompletionStreamChunk {
+                            id: stream_id.clone(),
+                            object: "chat.completion.chunk",
+                            created: 0,
+                            model: model_id.clone(),
+                            choices: vec![ChatCompletionStreamChoice {
+                                index: 0,
+                                delta: ChatCompletionDelta {
+                                    role: None,
+                                    content: Some(delta),
+                                },
+                                finish_reason: None,
+                            }],
+                            camelid: None,
+                            usage: None,
+                        };
+                        yield sse_json_event(&chunk);
+                    } else {
+                        let chunk = CompletionStreamChunk {
+                            id: stream_id.clone(),
+                            object: "text_completion",
+                            created: 0,
+                            model: model_id.clone(),
+                            choices: vec![CompletionStreamChoice {
+                                index: 0,
+                                text: delta,
+                                finish_reason: None,
+                            }],
+                            camelid: None,
+                        };
+                        yield sse_json_event(&chunk);
+                    }
+                    if stream_poll_yield {
+                        tokio::task::yield_now().await;
                     }
                 }
-            }
-        }
-
-        for _ in generated.len() as u32..prepared.max_tokens {
-            if finish_reason != "length" {
-                break;
-            }
-            let generated_index = generated.len();
-            let collect_dense_for_step =
-                collect_dense_diagnostics_for_generated_index(&prepared, generated_index);
-            let mut sampling = prepared.sampling.clone();
-            if let Some(seed) = sampling.seed {
-                sampling.seed = Some(seed.wrapping_add(generated.len() as u64));
-            }
-            let sampler = if sampling == SamplingConfig::default() {
-                LlamaSampler::Greedy
-            } else {
-                LlamaSampler::Sampling(sampling)
-            };
-            let Some(remaining_timeout) = request_timeout.checked_sub(stream_started.elapsed()) else {
-                yield generation_timeout_stream_event(request_timeout, stream_started.elapsed(), generated.len());
-                yield Ok(Event::default().data("[DONE]"));
-                return;
-            };
-            // Greedy single-token continuations with no per-step logit consumers ride the
-            // resident GPU-sampling fast lane inside the blocking step.
-            let greedy_fast = input.len() == 1
-                && matches!(sampler, LlamaSampler::Greedy)
-                && !collect_dense_for_step
-                && !top_logits.is_empty();
-            let TimedGenerationStep { session, step, gen_guard: returned_guard } = match generate_stream_step_blocking(
-                StreamGenerationStepRequest {
-                    // take_for_step (NOT clone): keeps the resident GPU session and its
-                    // on-GPU KV cache alive across the blocking hand-off.
-                    session: prepared.session.take_for_step(),
-                    gen_guard: gen_guard.take(),
-                    input: input.clone(),
-                    sampler,
-                    history: history.clone(),
-                    collect_dense_diagnostics: collect_dense_for_step,
-                    greedy_fast,
-                    step_timeout: remaining_timeout,
-                    request_timeout,
-                    request_started: stream_started,
-                    generated_tokens: generated.len(),
-                },
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(GenerationStepBlockingError::Response(response)) => {
-                    yield stream_error_event(*response);
+                StreamDecodeEvent::Failed { code, message } => {
+                    yield stream_error_message_event(&code, message);
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
-                Err(GenerationStepBlockingError::Timeout { timeout, elapsed, generated_tokens }) => {
+                StreamDecodeEvent::TimedOut { timeout, elapsed, generated_tokens } => {
                     yield generation_timeout_stream_event(timeout, elapsed, generated_tokens);
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
-            };
-            prepared.session = session;
-            gen_guard = returned_guard;
-            if !reused_prompt_prefix
-                && generated.is_empty()
-                && !prepared.collect_dense_diagnostics
-                && step.diagnostics.is_none()
-            {
-                store_prompt_prefix_cache(&prepared, &step);
-            }
-            if generated.is_empty() && !reused_prompt_prefix {
-                prepared.timings.prompt_evaluation = prompt_evaluation_timings_from_step(&step);
-            }
-            forward_timings.add_assign(&step.timings);
-            sample += step.sample;
-            if let Err(response) = consume_generation_step(
-                &prepared,
-                step,
-                GenerationStepAccumulator {
-                    generated: &mut generated,
-                    history: &mut history,
-                    top_logits: &mut top_logits,
-                    output_projection: &mut output_projection,
-                    dense: &mut dense,
-                    finish_reason: &mut finish_reason,
-                },
-            ) {
-                yield stream_error_event(*response);
-                yield Ok(Event::default().data("[DONE]"));
-                return;
-            }
-
-            let mut text = match prepared.tokenizer.decode(&generated, true) {
-                Ok(text) => text,
-                Err(err) => {
-                    yield stream_error_message_event("token_decode_failed", err.to_string());
+                StreamDecodeEvent::Finished {
+                    finish_reason,
+                    completion_tokens,
+                    timings,
+                    first_content_ms,
+                } => {
+                    stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
+                    let camelid_diagnostics = stream_timing_diagnostics.then(|| {
+                        stream_timing_diagnostics_json(&timings, first_content_ms, stream_event_timings)
+                    });
+                    if chat {
+                        let final_chunk = ChatCompletionStreamChunk {
+                            id: stream_id.clone(),
+                            object: "chat.completion.chunk",
+                            created: 0,
+                            model: model_id.clone(),
+                            choices: vec![ChatCompletionStreamChoice {
+                                index: 0,
+                                delta: ChatCompletionDelta {
+                                    role: None,
+                                    content: None,
+                                },
+                                finish_reason: Some(finish_reason),
+                            }],
+                            camelid: camelid_diagnostics.clone(),
+                            usage: None,
+                        };
+                        yield sse_json_event(&final_chunk);
+                        // OpenAI stream_options.include_usage: exactly one terminal chunk
+                        // with an empty `choices` array, carrying the same usage integers the
+                        // non-streaming endpoint returns for this prompt+output (prompt =
+                        // prepared.token_ids.len(); completion = sampled-token count). Emitted
+                        // after the finish_reason chunk and before [DONE], matching the
+                        // llama-server oracle ordering. Omitted entirely when include_usage is
+                        // false, so the usage-off stream is byte-identical to the baseline.
+                        if include_usage {
+                            let usage_chunk = ChatCompletionStreamChunk {
+                                id: stream_id.clone(),
+                                object: "chat.completion.chunk",
+                                created: 0,
+                                model: model_id.clone(),
+                                choices: Vec::new(),
+                                camelid: None,
+                                usage: Some(CompletionUsage {
+                                    prompt_tokens: prompt_token_count,
+                                    completion_tokens,
+                                    total_tokens: prompt_token_count + completion_tokens,
+                                }),
+                            };
+                            yield sse_json_event(&usage_chunk);
+                        }
+                    } else {
+                        let final_chunk = CompletionStreamChunk {
+                            id: stream_id.clone(),
+                            object: "text_completion",
+                            created: 0,
+                            model: model_id.clone(),
+                            choices: vec![CompletionStreamChoice {
+                                index: 0,
+                                text: String::new(),
+                                finish_reason: Some(finish_reason),
+                            }],
+                            camelid: camelid_diagnostics,
+                        };
+                        yield sse_json_event(&final_chunk);
+                    }
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }
-            };
-            if finish_reason == "stop" {
-                text = truncate_at_stop_sequence(text, &prepared.stop_sequences);
-            }
-            let delta = text
-                .strip_prefix(&streamed_text)
-                .map(str::to_owned)
-                .unwrap_or_else(|| text.clone());
-            streamed_text = text;
-            if !delta.is_empty() {
-                if first_content_ms.is_none() {
-                    first_content_ms = Some(generation_started.elapsed().as_millis());
-                    stream_event_timings.first_content_yield = Some(stream_started.elapsed().as_millis());
-                }
-                if chat {
-                    let chunk = ChatCompletionStreamChunk {
-                        id: stream_id.clone(),
-                        object: "chat.completion.chunk",
-                        created: 0,
-                        model: model_id.clone(),
-                        choices: vec![ChatCompletionStreamChoice {
-                            index: 0,
-                            delta: ChatCompletionDelta {
-                                role: None,
-                                content: Some(delta),
-                            },
-                            finish_reason: None,
-                        }],
-                        camelid: None,
-                        usage: None,
-                    };
-                    yield sse_json_event(&chunk);
-                    if stream_poll_yield {
-                        tokio::task::yield_now().await;
-                    }
-                } else {
-                    let chunk = CompletionStreamChunk {
-                        id: stream_id.clone(),
-                        object: "text_completion",
-                        created: 0,
-                        model: model_id.clone(),
-                        choices: vec![CompletionStreamChoice {
-                            index: 0,
-                            text: delta,
-                            finish_reason: None,
-                        }],
-                        camelid: None,
-                    };
-                    yield sse_json_event(&chunk);
-                    if stream_poll_yield {
-                        tokio::task::yield_now().await;
-                    }
-                }
-            }
-            if finish_reason != "length" {
-                break;
-            }
-            input.clear();
-            if let Some(last_token) = generated.last().copied() {
-                input.push(last_token);
             }
         }
-
-        prepared.timings.generate = generation_started.elapsed().as_millis();
-        prepared.timings.generation = generation_phase_timings_from_forward(&forward_timings, sample);
-        prepared.timings.layers = generation_layer_timings_from_forward(&forward_timings.layers);
-        prepared.timings.memory = forward_timings.memory;
-        if collect_q8_schedule {
-            prepared.timings.q8_schedule = Some(snapshot_q8_schedule_telemetry());
-        }
-        if let Some(guard) = telemetry_guard {
-            let ttft_ms = first_content_ms.map(|ms| ms as u64);
-            let decode_tps = match (first_content_ms, generated.len()) {
-                (Some(first_ms), count) if count > 1 => {
-                    let decode_ms = generation_started.elapsed().as_millis().saturating_sub(first_ms);
-                    (decode_ms > 0).then(|| (count - 1) as f64 * 1000.0 / decode_ms as f64)
-                }
-                _ => None,
-            };
-            guard.finish(telemetry::RequestFinish {
-                status: "ok",
-                finish_reason: Some(finish_reason.to_string()),
-                completion_tokens: generated.len(),
-                ttft_ms,
-                decode_tps,
-                prefill_tps: None,
-                error: None,
-            });
-        }
-        stream_event_timings.final_yield = Some(stream_started.elapsed().as_millis());
-        let camelid_diagnostics = stream_timing_diagnostics
-            .then(|| stream_timing_diagnostics_json(&prepared.timings, first_content_ms, stream_event_timings));
-
-        if chat {
-            let final_chunk = ChatCompletionStreamChunk {
-                id: stream_id.clone(),
-                object: "chat.completion.chunk",
-                created: 0,
-                model: model_id.clone(),
-                choices: vec![ChatCompletionStreamChoice {
-                    index: 0,
-                    delta: ChatCompletionDelta {
-                        role: None,
-                        content: None,
-                    },
-                    finish_reason: Some(finish_reason),
-                }],
-                camelid: camelid_diagnostics.clone(),
-                usage: None,
-            };
-            yield sse_json_event(&final_chunk);
-            // OpenAI stream_options.include_usage: exactly one terminal chunk
-            // with an empty `choices` array, carrying the same usage integers the
-            // non-streaming endpoint returns for this prompt+output (prompt =
-            // prepared.token_ids.len(); completion = sampled-token count). Emitted
-            // after the finish_reason chunk and before [DONE], matching the
-            // llama-server oracle ordering. Omitted entirely when include_usage is
-            // false, so the usage-off stream is byte-identical to the baseline.
-            if include_usage {
-                let usage_chunk = ChatCompletionStreamChunk {
-                    id: stream_id,
-                    object: "chat.completion.chunk",
-                    created: 0,
-                    model: model_id,
-                    choices: Vec::new(),
-                    camelid: None,
-                    usage: Some(CompletionUsage {
-                        prompt_tokens: prompt_token_count,
-                        completion_tokens: generated.len(),
-                        total_tokens: prompt_token_count + generated.len(),
-                    }),
-                };
-                yield sse_json_event(&usage_chunk);
-            }
-        } else {
-            let final_chunk = CompletionStreamChunk {
-                id: stream_id,
-                object: "text_completion",
-                created: 0,
-                model: model_id,
-                choices: vec![CompletionStreamChoice {
-                    index: 0,
-                    text: String::new(),
-                    finish_reason: Some(finish_reason),
-                }],
-                camelid: camelid_diagnostics,
-            };
-            yield sse_json_event(&final_chunk);
-        }
+        // The engine job ended without a terminal event: it was contained
+        // after a panic, or the engine is shutting down. Typed error frame so
+        // the client never sees a silently truncated stream.
+        yield stream_error_message_event(
+            "generation_worker_failed",
+            "generation worker failed before completing the stream".to_string(),
+        );
         yield Ok(Event::default().data("[DONE]"));
     };
 
     Sse::new(events).into_response()
-}
-
-fn stream_error_event(response: Response) -> Result<Event, Infallible> {
-    stream_error_message_event(
-        "stream_error",
-        format!("stream failed after headers: HTTP {}", response.status()),
-    )
 }
 
 fn generation_timeout_stream_event(
@@ -12312,66 +12304,22 @@ mod tests {
 
     use super::*;
 
-    /// Regression test for the concurrent-decode corruption bug: the
-    /// CUDA-resident Q8 runtime shares decode / KV state across requests, so the
-    /// generation handlers (`completions`, `chat_completions`,
-    /// `llama_server_completion`) and `stream_completion` must hold
-    /// `AppState::generation_lock` for the whole decode. This verifies the lock
-    /// actually serializes â€” with many tasks acquiring it the way the handlers
-    /// do, never more than one is inside the critical section at a time.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn generation_lock_serializes_decoding() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let state = AppState::default();
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_seen = Arc::new(AtomicUsize::new(0));
-
-        let mut handles = Vec::new();
-        for _ in 0..32 {
-            let lock = state.generation_lock.clone();
-            let active = active.clone();
-            let max_seen = max_seen.clone();
-            handles.push(tokio::spawn(async move {
-                // Same acquisition every generation handler performs per decode.
-                let _guard = lock.lock_owned().await;
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                max_seen.fetch_max(now, Ordering::SeqCst);
-                // Yield repeatedly while holding the guard. If the lock failed to
-                // serialize, another task would enter here and push `active` > 1.
-                for _ in 0..8 {
-                    tokio::task::yield_now().await;
-                }
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-
-        assert_eq!(
-            max_seen.load(Ordering::SeqCst),
-            1,
-            "generation_lock must serialize decoding: never more than one decode in flight",
-        );
-    }
-
     // ---------------------------------------------------------------------
-    // Engine-inversion Phase 0 repro harness (P0-T1 / P0-T2 / P0-T3).
+    // Engine-inversion orphan-decode harness (P0-T1 / P0-T2 / P0-T3).
     //
-    // `generation_lock_serializes_decoding` above proves guards serialize; it
-    // says nothing about the compute those guards are supposed to cover. The
-    // decode runs on `spawn_blocking`, which cannot be aborted, so any event
-    // that drops the handler frame (client disconnect, the server's own
-    // generation timeout) releases the lock while the decode keeps running.
-    // These tests assert the DESIRED invariant — the lock is never free while
-    // a decode is live, and two decodes never overlap — using the test-only
-    // `decode_probe` counters inside the blocking closures. On the unfixed
-    // tree they FAIL; that failure is the Gate 0 receipt.
+    // The deleted `generation_lock_serializes_decoding` test proved that lock
+    // GUARDS serialized — it could not see compute outliving its guard (the
+    // orphan-decode hazard, Gate 0). Its successor invariant lives in
+    // `engine::tests::engine_executes_at_most_one_job_at_a_time`, measured on
+    // the compute itself. These tests assert the request-level invariant: no
+    // decode is ever live when the next request becomes the exclusive compute
+    // owner, and two decodes never overlap, across client disconnect, server
+    // timeout, and mid-stream hangup. On the pre-inversion tree they FAILED;
+    // that failure is the Gate 0 receipt bundle.
     // ---------------------------------------------------------------------
 
     struct OrphanObservation {
-        /// Decodes still live at the moment the next request acquired the lock.
+        /// Decodes still live when the next request became the compute owner.
         orphans_at_next_acquire: usize,
         /// Peak concurrent decodes over the whole scenario.
         max_concurrent: usize,
@@ -12411,13 +12359,11 @@ mod tests {
     async fn run_request_b_and_observe(state: &AppState) -> OrphanObservation {
         let prepared_b = orphan_test_prepared("model-b.gguf");
         let _cancel_on_drop = CancelOnDrop(prepared_b.cancel.token.clone());
-        let gen_lock = state.generation_lock.clone();
         let outcome = state
             .engine
             .run_exclusive(move || {
-                // Exactly `run_decode_job`, with the probe sampled at the
-                // moment this request becomes the exclusive compute owner.
-                let _bridge = gen_lock.blocking_lock();
+                // Exactly the handler's decode job, with the probe sampled at
+                // the moment this request becomes the exclusive compute owner.
                 let orphans_at_next_acquire = decode_probe::active();
                 let result = run_decode_job_serialized(prepared_b);
                 (orphans_at_next_acquire, result)
@@ -12466,13 +12412,13 @@ mod tests {
         );
         assert_eq!(
             observed.orphans_at_next_acquire, 0,
-            "{scenario}: generation_lock was acquired while a previous request's \
-             decode was still running on the blocking pool (orphaned compute)",
+            "{scenario}: a request became the exclusive compute owner while a \
+             previous request's decode was still running (orphaned compute)",
         );
         assert!(
             observed.max_concurrent <= 1,
             "{scenario}: two decodes overlapped (max concurrent = {}) — the exact \
-             corruption class generation_lock exists to prevent",
+             corruption class the engine's serialization exists to prevent",
             observed.max_concurrent,
         );
     }
@@ -12574,9 +12520,7 @@ mod tests {
         std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
 
         let state = AppState::default();
-        let guard_a = state.generation_lock.clone().lock_owned().await;
-        let response =
-            stream_completion(orphan_test_prepared("model-a.gguf"), true, guard_a, false);
+        let response = stream_completion(&state, orphan_test_prepared("model-a.gguf"), true, false);
 
         // Drive the SSE body the way a client does. The reader task polls the
         // stream into its first token step; aborting it is the hangup — the
@@ -13898,40 +13842,88 @@ mod tests {
         assert!(!serialized.contains("models/"));
     }
 
-    #[tokio::test]
-    async fn stream_step_blocking_timeout_reports_generated_count() {
+    /// D3: prep runs OUTSIDE serialization — a request's validation and
+    /// tokenization complete while another decode occupies the engine, never
+    /// queued behind it. (Here prep returns a validation error since no model
+    /// is loaded; the point is that it RETURNS while the engine is busy.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prep_is_not_serialized_behind_a_running_decode() {
         let _env_guard = crate::test_support::env_lock();
-        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "25");
-        let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
+        drain_decode_probe().await;
+        decode_probe::reset();
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "1500");
 
-        let result = generate_stream_step_blocking(StreamGenerationStepRequest {
-            greedy_fast: false,
-            session,
-            gen_guard: None,
-            input: vec![1, 2],
-            sampler: LlamaSampler::Greedy,
-            history: vec![1, 2],
-            collect_dense_diagnostics: false,
-            step_timeout: Duration::from_millis(1),
-            request_timeout: Duration::from_millis(1),
-            request_started: Instant::now(),
-            generated_tokens: 4,
-        })
-        .await;
+        let state = AppState::default();
+        let state_for_a = state.clone();
+        let handler_a = tokio::spawn(async move {
+            let prepared = orphan_test_prepared("model-a.gguf");
+            let _ = generate_decoded_tokens_blocking(&state_for_a, prepared).await;
+        });
+        let started = Instant::now();
+        while decode_probe::active() == 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "request A's decode never reached the engine",
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
+        let request: GenerationSessionRequest =
+            serde_json::from_value(serde_json::json!({ "prompt": "hello" }))
+                .expect("minimal request deserializes");
+        let prep_started = Instant::now();
+        let result = prepare_generation(&state, request).await;
+        let prep_elapsed = prep_started.elapsed();
+        assert!(result.is_err(), "no model is loaded; prep must error");
+        assert!(
+            prep_elapsed < Duration::from_millis(500),
+            "prep stalled {}ms behind a running decode (D3 regression)",
+            prep_elapsed.as_millis(),
+        );
+
+        let _ = handler_a.await;
         std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
-        match result {
-            Err(GenerationStepBlockingError::Timeout {
+        drain_decode_probe().await;
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+    }
+
+    /// The streaming wall-clock budget is enforced BETWEEN steps by the
+    /// engine-side stream job (the old per-step `tokio::time::timeout` was
+    /// itself a detach hazard and is gone). The timeout event must carry the
+    /// exact pre-inversion payload: request timeout, elapsed, and the count
+    /// of tokens generated so far.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stream_job_timeout_reports_generated_count() {
+        let _env_guard = crate::test_support::env_lock();
+        drain_decode_probe().await;
+        std::env::set_var(GENERATION_TIMEOUT_ENV, "1");
+        std::env::set_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS", "25");
+
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(32);
+        let prepared = orphan_test_prepared("model-a.gguf");
+        let job = tokio::task::spawn_blocking(move || {
+            run_stream_decode_job(prepared, events_tx);
+        });
+        let mut saw_timeout = None;
+        while let Some(event) = events_rx.recv().await {
+            if let StreamDecodeEvent::TimedOut {
                 timeout,
                 generated_tokens,
                 ..
-            }) => {
-                assert_eq!(timeout.as_millis(), 1);
-                assert_eq!(generated_tokens, 4);
+            } = event
+            {
+                saw_timeout = Some((timeout, generated_tokens));
             }
-            Err(GenerationStepBlockingError::Response(_)) => panic!("expected timeout error"),
-            Ok(_) => panic!("expected stream step to time out"),
         }
+        job.await.unwrap();
+
+        std::env::remove_var(GENERATION_TIMEOUT_ENV);
+        std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
+        let (timeout, generated_tokens) =
+            saw_timeout.expect("stream job should emit TimedOut before any step");
+        assert_eq!(timeout.as_millis(), 1);
+        assert_eq!(generated_tokens, 0, "budget expired before the first step");
     }
 
     #[tokio::test]
