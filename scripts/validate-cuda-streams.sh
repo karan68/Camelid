@@ -137,7 +137,7 @@ for leg in $LEGS; do
     2) run_leg "qwen3-4b-q8" "Qwen3-4B-Q8_0.gguf" "" 1600 240 ;;
     3) run_leg "qwen3-4b-q4km" "Qwen3-4B-Q4_K_M.gguf" "" 1881 240 ;;
     4) run_leg "llama3b-q8-nofusion" "Llama-3.2-3B-Instruct-Q8_0.gguf" "CAMELID_RESIDENT_NO_FUSION=1" 1881 240 ;;
-    5) run_leg "ornith9b-q4km-devloop" "ornith-1.0-9b-Q4_K_M.gguf" "CAMELID_QWEN35_CUDA=1" 0 600 ;;
+    5) run_leg "ornith9b-q4km-devloop" "ornith-1.0-9b-Q4_K_M.gguf" "CAMELID_RUNNABLE_SERVE=1 CAMELID_QWEN35_CUDA=1" 0 600 ;;
     *) echo "unknown leg: $leg"; FAILED=1 ;;
   esac
 done

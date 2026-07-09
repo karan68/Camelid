@@ -4801,6 +4801,18 @@ impl CudaResidentDecode {
         // stream switches cudarc to multi-stream event tracking for the whole context,
         // so the default path must not construct these (see `StreamOverlap`).
         let overlap = if cuda_streams_enabled() {
+            // Rung B: without this, cudarc's multi-stream mode auto-records and drops
+            // a CudaEvent per slice argument on every launch (~600 launches × ~7 args
+            // per token) — measured to cost more than the overlap wins (Rung A
+            // receipts: ON regressed 2.5–9.5%). With tracking off WE own all
+            // cross-stream ordering: the per-layer ev_act/ev_k/ev_v/ev_ffn/ev_up
+            // graph in forward_pass (side streams only run downstream of an ev_act
+            // wait recorded after all prior main-stream work, so load-time uploads
+            // and memsets are ordered transitively), plus the one-time drain in
+            // `enable_offload_scratch` covering the offload copy stream's first
+            // read of main-stream-zeroed scratch. Process-wide and permanent, like
+            // the gemma4 runtime's usage.
+            unsafe { k.ctx.disable_event_tracking() };
             let side = || {
                 k.ctx
                     .new_stream()
@@ -5089,6 +5101,17 @@ impl CudaResidentDecode {
             copy_done,
             compute_done,
         });
+        // One-time load-time drain: the scratch buffers were zeroed on the main
+        // stream, and the FIRST prefetch into each buffer waits only on a fresh
+        // compute_done event (which reads as already-occurred) — nothing else orders
+        // the copy stream's first write after the memset. cudarc's auto event
+        // tracking used to insert that ordering; with CAMELID_CUDA_STREAMS on,
+        // tracking is disabled process-wide (see `new`), so make it explicit here.
+        // Unconditional: one sync at load time costs nothing per token.
+        self.k
+            .ctx
+            .synchronize()
+            .map_err(|e| format!("offload scratch drain: {e}"))?;
         Ok(())
     }
 
