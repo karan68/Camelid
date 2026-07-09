@@ -3769,6 +3769,22 @@ fn q4_k_owner_main_side_scalar_matches_avx2() {
 }
 
 #[test]
+fn x86_q8_ffn_gate_up_small_batch_owner_predicate_boundaries() {
+    // STAMPEDE P5 follow-up: 2..=16-row batches route past the bespoke
+    // gate/up arms to the tiled owner; decode (rows==1) and large chunks are
+    // untouched. Both routes are bit-exact vs the same packed-rows4 baseline
+    // (their own twin tests), so the swap cannot change bits — this test pins
+    // the boundary so the routing doesn't silently widen.
+    assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(0));
+    assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(1));
+    assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(2));
+    assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(8));
+    assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(16));
+    assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(17));
+    assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(512));
+}
+
+#[test]
 fn q8_ffn_gate_up_decode_group_chunking_matches_unchunked_pair_projection() {
     let _env_guard = env_lock();
     clear_dense_diagnostic_env();

@@ -3620,7 +3620,7 @@ impl LlamaInferenceSession {
         let total_started = Instant::now();
         metal_seam::start_inference_session();
         let embedding_started = Instant::now();
-        let mut hidden = self
+        let hidden = self
             .weights
             .token_embedding
             .embedding_lookup(token_ids, "token_embedding_verify_chunk")?;
@@ -3633,24 +3633,39 @@ impl LlamaInferenceSession {
         };
         let layers_started = Instant::now();
         let rms_norm_epsilon = diagnostic_rms_norm_epsilon(self.config.rms_norm_epsilon)?;
-        for (layer_idx, layer) in self.weights.layers.iter().enumerate() {
-            let timed = forward_prefill_layer_chunk_timed(
-                &hidden,
-                layer,
-                PrefillLayerChunkParams {
-                    config: &self.config,
-                    rope_freqs: self.weights.rope_freqs.as_ref(),
-                    rms_norm_epsilon,
-                    layer_idx,
-                    base_position: chunk_base_position,
-                    chunk_start: 0,
-                    chunk_rows: token_ids.len(),
-                },
-                &mut self.kv_cache,
-            )?;
-            hidden = timed.output;
-            timings.layers.push(timed.timings);
-        }
+        // Compute-bound batched GEMMs: run on the wider prefill pool, exactly
+        // like every other batched prefill path (P0.6 contract — pool choice
+        // never changes the math). The verify chunk previously ran on the
+        // caller's narrower pool (STAMPEDE P5 follow-up).
+        let config = &self.config;
+        let weights = &self.weights;
+        let kv_cache = &mut self.kv_cache;
+        let layer_results =
+            run_on_prefill_pool(|| -> Result<(CpuTensor, Vec<LlamaLayerTimings>)> {
+                let mut layer_timings = Vec::with_capacity(weights.layers.len());
+                let mut hidden_inner = hidden;
+                for (layer_idx, layer) in weights.layers.iter().enumerate() {
+                    let timed = forward_prefill_layer_chunk_timed(
+                        &hidden_inner,
+                        layer,
+                        PrefillLayerChunkParams {
+                            config,
+                            rope_freqs: weights.rope_freqs.as_ref(),
+                            rms_norm_epsilon,
+                            layer_idx,
+                            base_position: chunk_base_position,
+                            chunk_start: 0,
+                            chunk_rows: token_ids.len(),
+                        },
+                        kv_cache,
+                    )?;
+                    hidden_inner = timed.output;
+                    layer_timings.push(timed.timings);
+                }
+                Ok((hidden_inner, layer_timings))
+            })?;
+        let (hidden, layer_timings) = layer_results;
+        timings.layers = layer_timings;
         timings.layers_total = layers_started.elapsed().as_micros();
 
         let final_norm_started = Instant::now();
@@ -9749,6 +9764,22 @@ fn gated_ffn_activation_batch(
     })
 }
 
+/// STAMPEDE P5 follow-up (small-M verify economics): the bespoke gate/up
+/// prefill arms decline SMALL batches (2..=cutoff rows) so they flow through
+/// `linear_for_role_runtime` → the tiled Q8 MATMUL OWNER, which amortizes
+/// small M ~3.5× better (measured on the 8-row spec-verify chunk: gate/up
+/// ~165k µs → ~48k µs each across 28 layers with the bespoke arms env-flipped
+/// off; ffn_down — which already flows to the owner — sat at that level all
+/// along). Large batches keep the bespoke arms (their receipts were minted at
+/// chunk sizes ≥512; behavior there is unchanged). rows == 1 (decode) is not
+/// affected — the decode consumers are separate arms. Applies only when the
+/// owner is actually on (otherwise the bespoke arms remain the fast path).
+const X86_Q8_FFN_GATE_UP_SMALL_BATCH_OWNER_CUTOFF: usize = 16;
+
+fn x86_q8_ffn_gate_up_small_batch_prefers_owner(rows: usize) -> bool {
+    (2..=X86_Q8_FFN_GATE_UP_SMALL_BATCH_OWNER_CUTOFF).contains(&rows)
+}
+
 fn try_x86_q8_ffn_gate_up_single_owner_path(
     input: &CpuTensor,
     gate_weight: &CpuTensor,
@@ -9762,6 +9793,10 @@ fn try_x86_q8_ffn_gate_up_single_owner_path(
     let name = name.into();
     let rows = input.dim(0)?;
     if rows == 0 {
+        return Ok(None);
+    }
+    if x86_q8_ffn_gate_up_small_batch_prefers_owner(rows) && runtime_plan.q8.q8_matmul_owner.is_on()
+    {
         return Ok(None);
     }
 
@@ -9838,6 +9873,13 @@ fn try_x86_q8_ffn_gate_up_packed_rows4_matmul_path(
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
+        // Small batches flow to the tiled owner instead — see
+        // `x86_q8_ffn_gate_up_small_batch_prefers_owner`.
+        if x86_q8_ffn_gate_up_small_batch_prefers_owner(input.dim(0)?)
+            && runtime_plan.q8.q8_matmul_owner.is_on()
+        {
+            return Ok(None);
+        }
         let Some(route) = resolve_x86_q8_ffn_gate_up_route(
             input,
             gate_weight,
