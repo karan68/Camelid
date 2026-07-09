@@ -94,6 +94,15 @@ impl HardwareProfile {
         }
     }
 
+    /// Process-wide cached probe. The first call probes the machine (opening a
+    /// CUDA context once); every later call reuses the same snapshot. Use this on
+    /// non-hot paths (e.g. the catalog handler) that want the profile without
+    /// re-probing the device on every request.
+    pub fn cached() -> &'static HardwareProfile {
+        static CACHED: std::sync::OnceLock<HardwareProfile> = std::sync::OnceLock::new();
+        CACHED.get_or_init(HardwareProfile::detect)
+    }
+
     /// Emit the detected profile to stderr, in the same `[hw]` voice as the other
     /// startup diagnostics. This is the line every tunable is justified against.
     pub fn log(&self) {

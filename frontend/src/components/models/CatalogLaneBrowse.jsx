@@ -41,6 +41,47 @@ function laneChip(lane) {
   return <EvidenceChip state="unsupported" asText>Experimental · unverified</EvidenceChip>
 }
 
+/* Capacity advisory for THIS host (fit axis, NOT a support claim — kept on its own
+   line, never merged into the lane/support chip). `item.fit` is the backend
+   FitVerdict; `unknown`/missing (e.g. unprobed host, experimental rows) shows
+   nothing rather than guessing. */
+function fitLabel(fit) {
+  switch (fit) {
+    case 'fits_resident':
+      return 'Fits your machine'
+    case 'fits_with_offload':
+      return 'Fits (GPU + RAM offload)'
+    case 'cpu_only_ok':
+      return 'Fits (CPU)'
+    case 'wont_fit':
+      return 'Too big for this machine'
+    default:
+      return null
+  }
+}
+
+/* A small CPU/chip glyph so the capacity chip reads as "your hardware" — distinct
+   from the support/lane chips. A check (fits) or cross (too big) sits in the die. */
+function FitIcon({ bad }) {
+  const stroke = 'currentColor'
+  return (
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <rect x="4.5" y="4.5" width="7" height="7" rx="1.2" stroke={stroke} strokeWidth="1.3" />
+      {bad ? (
+        <path d="M6.4 6.4l3.2 3.2M9.6 6.4l-3.2 3.2" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" />
+      ) : (
+        <path d="M6 8.2l1.4 1.4L10 6.6" stroke={stroke} strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" />
+      )}
+      <path
+        d="M6.5 2.6v1.9M9.5 2.6v1.9M6.5 11.5v1.9M9.5 11.5v1.9M2.6 6.5h1.9M2.6 9.5h1.9M11.5 6.5h1.9M11.5 9.5h1.9"
+        stroke={stroke}
+        strokeWidth="1.1"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
+
 function CatalogRow({
   item,
   capabilities,
@@ -158,6 +199,34 @@ function CatalogRow({
         </div>
         {laneChip(lane)}
       </div>
+      {fitLabel(item.fit) ? (
+        <div className="catalog-fit-row">
+          <span
+            className={`catalog-fit-chip catalog-fit-chip--${item.fit === 'wont_fit' ? 'bad' : 'good'}${
+              item.fit_confidence === 'approx' ? ' catalog-fit-chip--estimate' : ''
+            }`}
+            title={
+              item.fit_confidence === 'exact'
+                ? "Sized from the model's real dimensions (KV cache computed exactly)"
+                : 'Estimate — upgrades to exact once the model header has been read'
+            }
+          >
+            <FitIcon bad={item.fit === 'wont_fit'} />
+            {item.fit_confidence === 'approx' ? '~ ' : ''}
+            {fitLabel(item.fit)}
+          </span>
+          {Array.isArray(item.task_tags) && item.task_tags.length ? (
+            <span className="catalog-fit-tags">
+              <span className="catalog-fit-tags-label">best for</span>
+              {item.task_tags.map((tag) => (
+                <span key={tag} className="catalog-fit-tag">
+                  {tag}
+                </span>
+              ))}
+            </span>
+          ) : null}
+        </div>
+      ) : null}
       {decoration?.blurb ? <p className="catalog-row-blurb">{decoration.blurb}</p> : null}
 
       {installed ? (

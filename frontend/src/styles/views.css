@@ -1101,6 +1101,15 @@
 .catalog-row-meta { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-text-muted); overflow-wrap: anywhere; }
 .catalog-row-faint { font-size: var(--text-xs); color: var(--color-text-faint); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
 .catalog-row-error { font-size: var(--text-sm); color: var(--color-warning); margin: var(--space-2) 0 0; overflow-wrap: anywhere; }
+.catalog-fit-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); margin-top: var(--space-2); }
+.catalog-fit-chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; border: 1px solid transparent; font-size: var(--text-xs); font-weight: 600; letter-spacing: 0.01em; white-space: nowrap; }
+.catalog-fit-chip svg { flex: none; }
+.catalog-fit-chip--estimate { border-style: dashed; }
+.catalog-fit-chip--good { color: var(--color-accent-text); background: var(--color-accent-soft); border-color: color-mix(in srgb, var(--color-accent) 30%, transparent); }
+.catalog-fit-chip--bad { color: var(--color-error); background: color-mix(in srgb, var(--color-error) 12%, transparent); border-color: color-mix(in srgb, var(--color-error) 40%, transparent); }
+.catalog-fit-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.catalog-fit-tags-label { font-size: var(--text-xs); color: var(--color-text-faint); margin-right: 1px; }
+.catalog-fit-tag { display: inline-flex; padding: 1px 8px; border-radius: 999px; font-size: var(--text-xs); color: var(--color-text-muted); background: var(--color-surface-strong); border: 1px solid var(--color-border-soft); text-transform: capitalize; }
 .catalog-row-action { margin-top: var(--space-2); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); border: 1px solid var(--color-border-soft); background: var(--color-bg-elevated); color: var(--color-text); font-size: var(--text-xs); font-weight: 700; }
 .catalog-row-action:hover { background: var(--color-surface-hover); }
 .catalog-row-cancel { margin-top: var(--space-2); margin-left: var(--space-2); padding: var(--space-1) var(--space-3); border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: var(--color-text-muted); font-size: var(--text-xs); font-weight: 600; }

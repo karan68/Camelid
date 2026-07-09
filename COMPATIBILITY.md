@@ -86,6 +86,7 @@ Two rules keep this matrix honest across docs, API signals, and UI copy:
 
 - **Support rule:** nothing adjacent inherits support across model size, quantization, tokenizer lane, API surface, or frontend state.
 - **Credit rule:** visible llama.cpp / ggml acknowledgement and the MIT notice remain part of parity-backed release claims.
+- **Capacity rule:** the model-fit advisor is a *capacity* signal (can this host load/run a row), reported separately from support. A "fits" verdict never implies parity, validation, or support; it does not appear in `model_compatibility` and cannot promote any row. See [`docs/architecture/MODEL_FIT_ADVISOR_PLAN.md`](docs/architecture/MODEL_FIT_ADVISOR_PLAN.md).
 
 README, `STATUS.md`, `/api/capabilities`, and frontend readiness copy should continue to mirror this exact ledger. `/api/capabilities` exposes the same compatibility rows as `model_compatibility`; read each row literally. Metadata parsing does not imply tokenizer parity, tokenizer parity does not imply generation, tensor loading does not imply safe execution, and one supported row must never lend support to adjacent model sizes or quantizations.
 

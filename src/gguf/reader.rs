@@ -312,16 +312,30 @@ impl GgufFile {
 }
 
 pub fn read_metadata(path: &Path) -> Result<GgufFile> {
-    let file = File::open(path).map_err(|source| BackendError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
     let file_len = fs::metadata(path)
         .map_err(|source| BackendError::Io {
             path: path.to_path_buf(),
             source,
         })?
         .len();
+    read_metadata_with_len(path, file_len)
+}
+
+/// Parse a GGUF's metadata and tensor descriptors, validating tensor byte ranges
+/// against `declared_len` rather than the on-disk file length.
+///
+/// A GGUF stores all metadata and the tensor-info block at the file start, so a
+/// caller holding only a ranged header *prefix* can parse it fully by passing the
+/// model's true full length here: every offset bounds check still runs against
+/// the real size, but no tensor data is read and the local file need not be
+/// extended to that size. `read_metadata` is the ordinary path and passes the
+/// actual file length.
+pub fn read_metadata_with_len(path: &Path, declared_len: u64) -> Result<GgufFile> {
+    let file = File::open(path).map_err(|source| BackendError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file_len = declared_len;
     let mut cursor = Cursor::new(file, path.to_path_buf());
 
     let magic = cursor.read_bytes(4)?;
