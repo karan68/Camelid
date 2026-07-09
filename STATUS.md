@@ -1,6 +1,8 @@
 # Camelid Status
 
-Last updated: 2026-06-14
+Last updated: 2026-07-09
+
+Serving-engine note (2026-07-09): the API's decode ownership was inverted (DECISIONS.md D16). One engine worker thread now executes every decode behind a bounded queue; `generation_lock` is gone, client disconnects and timeouts can no longer orphan compute against shared GPU state, and backpressure is a typed 503 with an observable queue depth. Supported-row outputs are receipt-proven byte-identical across the change (`qa/evidence-bundles/engine-inversion-gate*`), so no support claim moves; this is a correctness/ownership change only.
 
 `STATUS.md` is Camelid's current release-evidence checkpoint. It records what Camelid can prove today, what moved recently, and what still blocks the next support change. Treat it as a briefing memo, not a diary. Detailed historical run logs, older validation slices, and superseded tactical notes now live in [`STATUS_ARCHIVE_2026-04.md`](docs/archive/STATUS_ARCHIVE_2026-04.md).
 

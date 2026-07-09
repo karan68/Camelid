@@ -21,8 +21,8 @@ orphan — the exact corruption class the lock exists to prevent.
 | 1 | Cancellation plumbing (token + deadline + guard rides with compute) | **DONE — GATE 1 PASS** | qa/evidence-bundles/engine-inversion-gate1-cancellation-20260709T142537Z-head-0668b206/ |
 | 2 | Engine inversion (engine worker thread, bounded queue, lock removal) | **DONE — GATE 2 PASS** (commits 93dc20c3 + d50e0ab4) | qa/evidence-bundles/engine-inversion-gate2-inversion-20260709T153035Z-head-d50e0ab4/ |
 | 3 | Streaming over events (no per-token spawn_blocking) | **IMPLEMENTED in 2b**; Gate 3 golden-transcript matrix captured identical in the Gate 2 bundle; residual scope: prompt-cache Mutex → engine-owned (deferred cleanup, cache is already engine-thread-only) | see Gate 2 bundle `parity/` stream sections |
-| 4 | Re-certification (parity, receipts, perf, compat) | pending Gate 3 | — |
-| 5 | Multi-slot recon memo (expected KILL/defer) | pending | — |
+| 4 | Re-certification (parity, receipts, perf, compat) | **DONE — GATE 4 PASS for merge** (Mistral row replay owed on a capable host) | qa/evidence-bundles/engine-inversion-gate4-recert-20260709T154139Z-head-d50e0ab4/ + DECISIONS.md D16 + STATUS.md note |
+| 5 | Multi-slot recon memo (expected KILL/defer) | **DONE — KILL** | docs/recon/ENGINE_INVERSION_PHASE5_MULTISLOT_RECON.md |
 
 ## Phase 0 verified source anchors (at `ffada00f`, pre-instrumentation line numbers)
 
@@ -99,8 +99,18 @@ expected failure cannot leak an orphan or a probe underflow into sibling tests).
   within ≤1 step is enforced by P0-T3. Residual Phase-3 scope carried to a
   cleanup item: move `cached_prompt_prefix`'s Mutex to plain engine-owned
   state (it is already touched only from engine jobs).
-- GATE 4: pending (full supported-row re-cert + Mistral replay on a host that
-  has the row + llama-server compat pass + STATUS/DECISIONS updates).
+- GATE 4: **PASS for merge** (2026-07-09). Four supported rows byte-identical
+  baseline-vs-candidate (TinyLlama incl. deterministic-CPU lane, Llama-1B,
+  Llama-3B, Qwen3-1.7B); live llama.cpp-oracle parity (b9632-acd79d603)
+  through the inverted engine; receipt captured, sealed, and FULLY VERIFIED
+  via the now-engine-routed replay; final suite 677/677; fmt+clippy clean;
+  D16 + STATUS note landed. Host-limited: Mistral-7B replay owed on a host
+  that has the row; Qwen3-4B/8B + Llama-8B skipped under the free-RAM rule.
+  Receipt: qa/evidence-bundles/engine-inversion-gate4-recert-20260709T154139Z-head-d50e0ab4/.
+- Upstream note: main moved past the pin during the mission (STAMPEDE #410 +
+  #413 merged). Per the standing pin policy the mission did not chase it; the
+  changes are disjoint (this mission: src/api; STAMPEDE: CPU kernels), so the
+  PR merge is expected clean — CI on the PR merge commit is the arbiter.
 
 ## Phase 1 implementation record (2026-07-09)
 
