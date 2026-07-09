@@ -3761,8 +3761,43 @@ fn generate_run_speculative(
                         let mut batch = Vec::with_capacity(1 + chain.len());
                         batch.push(anchor);
                         batch.extend_from_slice(&chain);
-                        let (predictions, _timings) =
+                        let (predictions, verify_timings) =
                             session.forward_greedy_verify_chunk(&batch)?;
+                        // Small-M verify economics profiling (STAMPEDE P5
+                        // follow-up): component split of the chunk forward.
+                        if std::env::var_os("CAMELID_SPEC_VERIFY_TIMINGS").is_some() {
+                            let mut sums = [0u128; 15];
+                            for l in &verify_timings.layers {
+                                for (slot, v) in sums.iter_mut().zip([
+                                    l.attention_norm,
+                                    l.attention_q,
+                                    l.attention_k,
+                                    l.attention_v,
+                                    l.attention_rope,
+                                    l.kv_cache_write,
+                                    l.attention_context,
+                                    l.attention_output,
+                                    l.attention_residual,
+                                    l.ffn_norm,
+                                    l.ffn_gate,
+                                    l.ffn_up,
+                                    l.ffn_activation,
+                                    l.ffn_down,
+                                    l.ffn_residual,
+                                ]) {
+                                    *slot += v;
+                                }
+                            }
+                            eprintln!(
+                                "[spec-verify] rows={} layers_us={} logits_us={} | anorm={} q={} k={} v={} rope={} kvw={} actx={} aout={} ares={} fnorm={} gate={} up={} act={} down={} fres={}",
+                                batch.len(),
+                                verify_timings.layers_total,
+                                verify_timings.logits,
+                                sums[0], sums[1], sums[2], sums[3], sums[4], sums[5], sums[6],
+                                sums[7], sums[8], sums[9], sums[10], sums[11], sums[12], sums[13],
+                                sums[14]
+                            );
+                        }
                         let accepted = accepted_draft_prefix(&chain, &predictions);
                         session.rollback_to_position(base_position + 1 + accepted)?;
                         run.verify_us += verify_started.elapsed().as_micros();

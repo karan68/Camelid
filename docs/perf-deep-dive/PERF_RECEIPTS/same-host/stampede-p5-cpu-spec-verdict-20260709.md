@@ -49,3 +49,44 @@ ROW_BLOCK=64 design point, attention over full history per row). At the premise 
 (~3x), repetitive = (5.45+1)/3 ~= 2.1x and the gate flips to GO with the latch already in
 place. That investigation is its own kernel slice; the acceptance histogram above is the
 receipt that it is worth doing.
+
+---
+
+## UPDATE 2026-07-09 — small-M chunk-verify fixes (P5 follow-up slice)
+
+Component profiling (env-gated CAMELID_SPEC_VERIFY_TIMINGS split of the chunk forward) found
+two culprits and fixed both:
+1. **The bespoke gate/up prefill arms have no small-M amortization**: at 8 rows they ran at
+   ~6x a single weight pass (gate+up ~330-376k us over 28 layers) while ffn_down — which
+   flows through the cascade to the tiled Q8 MATMUL OWNER — amortized fine (~63k us). FIX:
+   the gate/up arms now decline 2..=16-row batches so they flow to the owner (large chunks
+   unchanged; predicate boundary pinned by test; both routes carry bitwise proofs vs the
+   same packed-rows4 baseline, so the swap cannot change bits).
+2. **The verify chunk never ran on the wider prefill pool** (every other batched prefill
+   path does, P0.6). FIX: the layer loop now runs under run_on_prefill_pool (pool choice
+   never changes math — the established contract).
+
+Re-measured (same protocol):
+
+| cell | before | after |
+|---|---|---|
+| repetitive s_sync (256 tok) | 1.06-1.10x | **1.265x** (spec 11.04 tok/s > plain 8.72) |
+| code / json / chat / adversarial | 0.82-0.94x | 0.905-0.952x |
+| gate+up per verify (28 layers) | ~330-376k us | ~66k us |
+| logits | ~150k us | ~62k us |
+| lossless | yes x5 | yes x5 |
+
+Large-chunk prefill sanity (bench-owner-sweep, 516-token prompt): off 27.3-27.4 /
+owner+vnni4x8 30.4-30.6 tok/s — matches the Lane A revalidation receipts within thermal
+noise; the routing change is invisible outside 2..=16-row batches.
+
+Remaining gate distance: repetitive 1.265x vs the 1.3x default-on bar. The dominant
+remaining cost is attention context (actx ~265-276k us of ~440k layer time at 8 rows,
+position ~700) — inherently per-row KV work; batching/parallelizing small-M chunk attention
+is the next (and last cheap) lever. The lane stays opt-in.
+
+Post-review-fix confirmation (predicate 4..=16 + owner-would-take guards): repetitive 256-tok
+cell s_sync = 1.309x (spec 10.07 / plain 7.69, lossless, 5.45 acc/round) — cells straddle
+1.26-1.31x across thermal conditions, i.e. AT the 1.3x gate line. Default-on remains
+not earned (latched-off classes 0.905-0.952 on 128-token runs = the O(1) probe cost);
+the lane stays opt-in.
