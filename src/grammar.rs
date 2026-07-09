@@ -5,6 +5,8 @@
 //! this is the high-value core of the structured-output lane. Arbitrary GBNF and
 //! full JSON Schema are deliberate follow-ups.
 
+use std::sync::Arc;
+
 /// The container we are currently inside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Frame {
@@ -70,6 +72,128 @@ fn is_hex(b: u8) -> bool {
 /// A byte that can terminate a number (whitespace or a structural close/separator).
 fn is_num_delim(b: u8) -> bool {
     is_ws(b) || matches!(b, b',' | b'}' | b']')
+}
+
+/// One transition of the shared JSON *number* sub-grammar. Both [`JsonState`] and
+/// the schema validator drive numbers through this so the two automata agree
+/// byte-for-byte. `integer_only` forbids the fraction/exponent forms (JSON Schema
+/// `integer`), keeping constrained output in canonical integer shape.
+enum NumStep {
+    /// Still inside the number; carries the new sub-state.
+    Stay(Num),
+    /// A complete number ends here; the caller re-processes `b` as a delimiter.
+    Done,
+    /// `b` cannot extend the number.
+    Reject,
+}
+
+fn num_advance(num: Num, b: u8, integer_only: bool) -> NumStep {
+    // Complete sub-states end the number on a delimiter (re-processed by the caller).
+    let complete = matches!(num, Num::Zero | Num::Int | Num::Frac | Num::Exp);
+    if complete && is_num_delim(b) {
+        return NumStep::Done;
+    }
+    let next = match num {
+        Num::Sign => match b {
+            b'0' => Num::Zero,
+            b'1'..=b'9' => Num::Int,
+            _ => return NumStep::Reject,
+        },
+        Num::Zero => match b {
+            b'.' if !integer_only => Num::DotFirst,
+            b'e' | b'E' if !integer_only => Num::ExpSign,
+            _ => return NumStep::Reject, // no leading-zero digits, e.g. "01"
+        },
+        Num::Int => match b {
+            _ if is_digit(b) => Num::Int,
+            b'.' if !integer_only => Num::DotFirst,
+            b'e' | b'E' if !integer_only => Num::ExpSign,
+            _ => return NumStep::Reject,
+        },
+        Num::DotFirst => {
+            if is_digit(b) {
+                Num::Frac
+            } else {
+                return NumStep::Reject;
+            }
+        }
+        Num::Frac => match b {
+            _ if is_digit(b) => Num::Frac,
+            b'e' | b'E' => Num::ExpSign,
+            _ => return NumStep::Reject,
+        },
+        Num::ExpSign => match b {
+            b'+' | b'-' => Num::ExpFirst,
+            _ if is_digit(b) => Num::Exp,
+            _ => return NumStep::Reject,
+        },
+        Num::ExpFirst => {
+            if is_digit(b) {
+                Num::Exp
+            } else {
+                return NumStep::Reject;
+            }
+        }
+        Num::Exp => {
+            if is_digit(b) {
+                Num::Exp
+            } else {
+                return NumStep::Reject;
+            }
+        }
+    };
+    NumStep::Stay(next)
+}
+
+/// One transition of the shared JSON *string* body sub-grammar (the bytes between
+/// the quotes). Shared by [`JsonState`] and the schema validator so both treat
+/// escapes, `\u` hex, and raw control characters identically.
+enum StrStep {
+    /// Still inside the string; carries the new escape/hex sub-state.
+    Stay { escape: bool, hex: u8 },
+    /// The closing quote was consumed; the string is complete.
+    Close,
+    /// `b` cannot extend the string.
+    Reject,
+}
+
+fn str_advance(escape: bool, hex: u8, b: u8) -> StrStep {
+    if hex > 0 {
+        if is_hex(b) {
+            StrStep::Stay {
+                escape: false,
+                hex: hex - 1,
+            }
+        } else {
+            StrStep::Reject
+        }
+    } else if escape {
+        match b {
+            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => StrStep::Stay {
+                escape: false,
+                hex: 0,
+            },
+            b'u' => StrStep::Stay {
+                escape: false,
+                hex: 4,
+            },
+            _ => StrStep::Reject,
+        }
+    } else {
+        match b {
+            b'"' => StrStep::Close,
+            b'\\' => StrStep::Stay {
+                escape: true,
+                hex: 0,
+            },
+            // Raw control characters are not allowed in a JSON string.
+            0x00..=0x1F => StrStep::Reject,
+            _ => StrStep::Stay {
+                escape: false,
+                hex: 0,
+            },
+        }
+    }
 }
 
 impl JsonState {
@@ -198,58 +322,17 @@ impl JsonState {
                     Err(())
                 }
             }
-            Mode::Str { escape, hex, key } => {
-                if hex > 0 {
-                    if is_hex(b) {
-                        self.mode = Mode::Str {
-                            escape: false,
-                            hex: hex - 1,
-                            key,
-                        };
-                        Ok(())
-                    } else {
-                        Err(())
-                    }
-                } else if escape {
-                    match b {
-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
-                            self.mode = Mode::Str {
-                                escape: false,
-                                hex: 0,
-                                key,
-                            };
-                            Ok(())
-                        }
-                        b'u' => {
-                            self.mode = Mode::Str {
-                                escape: false,
-                                hex: 4,
-                                key,
-                            };
-                            Ok(())
-                        }
-                        _ => Err(()),
-                    }
-                } else {
-                    match b {
-                        b'"' => {
-                            self.mode = if key { Mode::Colon } else { Mode::AfterValue };
-                            Ok(())
-                        }
-                        b'\\' => {
-                            self.mode = Mode::Str {
-                                escape: true,
-                                hex: 0,
-                                key,
-                            };
-                            Ok(())
-                        }
-                        // Raw control characters are not allowed in a JSON string.
-                        0x00..=0x1F => Err(()),
-                        _ => Ok(()),
-                    }
+            Mode::Str { escape, hex, key } => match str_advance(escape, hex, b) {
+                StrStep::Stay { escape, hex } => {
+                    self.mode = Mode::Str { escape, hex, key };
+                    Ok(())
                 }
-            }
+                StrStep::Close => {
+                    self.mode = if key { Mode::Colon } else { Mode::AfterValue };
+                    Ok(())
+                }
+                StrStep::Reject => Err(()),
+            },
             Mode::Lit { rest } => match rest.split_first() {
                 Some((&first, tail)) if first == b => {
                     if tail.is_empty() {
@@ -306,64 +389,680 @@ impl JsonState {
     }
 
     fn advance_num(&mut self, num: Num, b: u8) -> Result<(), ()> {
-        // Complete sub-states end the number on a delimiter, which is then
-        // re-processed in `AfterValue`.
-        let complete = matches!(num, Num::Zero | Num::Int | Num::Frac | Num::Exp);
-        if complete && is_num_delim(b) {
-            self.mode = Mode::AfterValue;
-            return self.advance(b);
+        match num_advance(num, b, false) {
+            NumStep::Done => {
+                // The delimiter that ended the number is re-processed by `AfterValue`.
+                self.mode = Mode::AfterValue;
+                self.advance(b)
+            }
+            NumStep::Stay(next) => {
+                self.mode = Mode::Num(next);
+                Ok(())
+            }
+            NumStep::Reject => Err(()),
         }
-        let next = match num {
-            Num::Sign => match b {
-                b'0' => Num::Zero,
-                b'1'..=b'9' => Num::Int,
-                _ => return Err(()),
-            },
-            Num::Zero => match b {
-                b'.' => Num::DotFirst,
-                b'e' | b'E' => Num::ExpSign,
-                _ => return Err(()), // no leading-zero digits, e.g. "01"
-            },
-            Num::Int => match b {
-                _ if is_digit(b) => Num::Int,
-                b'.' => Num::DotFirst,
-                b'e' | b'E' => Num::ExpSign,
-                _ => return Err(()),
-            },
-            Num::DotFirst => {
-                if is_digit(b) {
-                    Num::Frac
+    }
+}
+
+/// Failure compiling a JSON Schema into the supported subset. The message names
+/// the offending keyword/type so the API can return a precise, honest 400 rather
+/// than silently ignoring a constraint it cannot enforce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaError(String);
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
+fn serr(msg: impl Into<String>) -> SchemaError {
+    SchemaError(msg.into())
+}
+
+/// A compiled node of the supported JSON Schema subset (see `compile_root` for the
+/// exact boundary). Non-container values only ever appear inside a container, so
+/// their completion is always disambiguated by the enclosing `,`/`}`/`]`.
+#[derive(Clone, Debug)]
+enum Schema {
+    Str,
+    Integer,
+    Number,
+    Bool,
+    Null,
+    /// String `enum`/`const`: the value must equal one of these canonical JSON
+    /// encodings (e.g. `"celsius"`).
+    Enum(Arc<Vec<Vec<u8>>>),
+    Object(Arc<ObjectSchema>),
+    Array(Arc<Schema>),
+}
+
+#[derive(Debug)]
+struct ObjectSchema {
+    props: Vec<PropSchema>,
+}
+
+#[derive(Debug)]
+struct PropSchema {
+    name: String,
+    schema: Schema,
+    required: bool,
+}
+
+/// Keywords that are pure annotations — safe to ignore on any node.
+const IGNORED_KEYWORDS: &[&str] = &[
+    "description",
+    "title",
+    "default",
+    "examples",
+    "$schema",
+    "$id",
+    "$comment",
+    "readOnly",
+    "writeOnly",
+    "deprecated",
+    "$defs",
+    "definitions",
+];
+
+/// Reject any keyword that is neither expected for this node nor a known
+/// annotation. This is what makes the subset *fail-closed*: an unrecognized or
+/// unenforceable keyword is an error, never a silently dropped constraint.
+fn reject_unknown(
+    map: &serde_json::Map<String, serde_json::Value>,
+    allowed: &[&str],
+) -> Result<(), SchemaError> {
+    for key in map.keys() {
+        let k = key.as_str();
+        if !allowed.contains(&k) && !IGNORED_KEYWORDS.contains(&k) {
+            return Err(serr(format!("unsupported schema keyword: {k}")));
+        }
+    }
+    Ok(())
+}
+
+/// Compile a root schema. The root must be an object or array so that completion
+/// (`is_done`) is triggered by a unique closing `}`/`]`; top-level scalars have no
+/// terminator and are rejected.
+fn compile_root(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
+    let compiled = compile_node(schema)?;
+    match compiled {
+        Schema::Object(_) | Schema::Array(_) => Ok(compiled),
+        _ => Err(serr("the root schema must be an object or array")),
+    }
+}
+
+fn compile_node(schema: &serde_json::Value) -> Result<Schema, SchemaError> {
+    let map = match schema {
+        serde_json::Value::Object(map) => map,
+        _ => return Err(serr("each schema must be a JSON object")),
+    };
+    if let Some(constant) = map.get("const") {
+        reject_unknown(map, &["const", "type"])?;
+        return compile_string_literals(std::slice::from_ref(constant), "const");
+    }
+    if let Some(values) = map.get("enum") {
+        reject_unknown(map, &["enum", "type"])?;
+        let arr = values
+            .as_array()
+            .ok_or_else(|| serr("`enum` must be an array"))?;
+        return compile_string_literals(arr, "enum");
+    }
+    let ty = match map.get("type") {
+        None => {
+            return Err(serr(
+                "schema must declare a `type` (untyped/any schemas are not supported yet)",
+            ))
+        }
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(_) => {
+            return Err(serr(
+                "`type` must be a single string (type unions are not supported yet)",
+            ))
+        }
+    };
+    match ty {
+        "object" => {
+            reject_unknown(
+                map,
+                &["type", "properties", "required", "additionalProperties"],
+            )?;
+            compile_object(map)
+        }
+        "array" => {
+            reject_unknown(map, &["type", "items"])?;
+            compile_array(map)
+        }
+        "string" => {
+            reject_unknown(map, &["type"])?;
+            Ok(Schema::Str)
+        }
+        "integer" => {
+            reject_unknown(map, &["type"])?;
+            Ok(Schema::Integer)
+        }
+        "number" => {
+            reject_unknown(map, &["type"])?;
+            Ok(Schema::Number)
+        }
+        "boolean" => {
+            reject_unknown(map, &["type"])?;
+            Ok(Schema::Bool)
+        }
+        "null" => {
+            reject_unknown(map, &["type"])?;
+            Ok(Schema::Null)
+        }
+        other => Err(serr(format!("unsupported `type`: {other}"))),
+    }
+}
+
+fn compile_string_literals(
+    values: &[serde_json::Value],
+    keyword: &str,
+) -> Result<Schema, SchemaError> {
+    if values.is_empty() {
+        return Err(serr(format!("`{keyword}` must be non-empty")));
+    }
+    let mut encodings = Vec::with_capacity(values.len());
+    for value in values {
+        match value {
+            serde_json::Value::String(_) => {
+                let encoded = serde_json::to_vec(value)
+                    .map_err(|e| serr(format!("`{keyword}` member is not serializable: {e}")))?;
+                encodings.push(encoded);
+            }
+            _ => {
+                return Err(serr(format!(
+                    "only string `{keyword}` members are supported yet"
+                )))
+            }
+        }
+    }
+    Ok(Schema::Enum(Arc::new(encodings)))
+}
+
+fn compile_object(map: &serde_json::Map<String, serde_json::Value>) -> Result<Schema, SchemaError> {
+    match map.get("additionalProperties") {
+        Some(serde_json::Value::Bool(false)) => {}
+        Some(serde_json::Value::Bool(true)) | None => {
+            return Err(serr(
+                "objects must set additionalProperties:false (open objects are not supported yet)",
+            ))
+        }
+        Some(_) => {
+            return Err(serr(
+                "additionalProperties must be false (schema-valued additionalProperties is not supported yet)",
+            ))
+        }
+    }
+    let required: Vec<&str> = match map.get("required") {
+        None => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| serr("`required` entries must be strings"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(serr("`required` must be an array")),
+    };
+    let mut props = Vec::new();
+    if let Some(properties) = map.get("properties") {
+        let properties = properties
+            .as_object()
+            .ok_or_else(|| serr("`properties` must be an object"))?;
+        for (name, sub) in properties {
+            if !is_simple_key(name) {
+                return Err(serr(format!(
+                    "property name {name:?} requires JSON escaping; not supported yet"
+                )));
+            }
+            props.push(PropSchema {
+                name: name.clone(),
+                schema: compile_node(sub)?,
+                required: required.contains(&name.as_str()),
+            });
+        }
+    }
+    for name in &required {
+        if !props.iter().any(|p| p.name.as_str() == *name) {
+            return Err(serr(format!(
+                "required property {name:?} is not declared in `properties`"
+            )));
+        }
+    }
+    Ok(Schema::Object(Arc::new(ObjectSchema { props })))
+}
+
+fn compile_array(map: &serde_json::Map<String, serde_json::Value>) -> Result<Schema, SchemaError> {
+    match map.get("items") {
+        Some(items) => Ok(Schema::Array(Arc::new(compile_node(items)?))),
+        None => Err(serr(
+            "array schemas must declare `items` (unconstrained arrays are not supported yet)",
+        )),
+    }
+}
+
+/// A property name we can match with a plain byte trie: no characters that JSON
+/// would have to escape (`"`, `\`, or control chars). Constrained decoding then
+/// emits keys in this canonical unescaped form.
+fn is_simple_key(name: &str) -> bool {
+    name.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\')
+}
+
+/// A container we are currently inside, with the schema state needed to validate
+/// its members.
+#[derive(Clone, Debug)]
+enum SchemaFrame {
+    Object {
+        schema: Arc<ObjectSchema>,
+        used: Vec<bool>,
+    },
+    Array {
+        items: Schema,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum SchemaMode {
+    /// Leading whitespace then a value matching this schema.
+    Value(Schema),
+    /// Inside an array: whitespace, a value matching the element schema, or `]`.
+    ArrayElem { allow_close: bool },
+    /// Inside an object: whitespace, a `"` key, or `}`.
+    Key { allow_close: bool },
+    /// Scanning an object key, constrained to the declared property names.
+    KeyStr { matched: Vec<u8> },
+    /// Object: `:` then a value matching the resolved property's schema.
+    Colon(Schema),
+    /// Scanning a string value body.
+    Str { escape: bool, hex: u8 },
+    /// Scanning a number/integer value body.
+    Num { st: Num, integer: bool },
+    /// Matching a `true`/`false`/`null` literal tail.
+    Lit { rest: &'static [u8] },
+    /// Matching a string `enum`/`const`: `viable` are the still-possible candidate
+    /// indices, `pos` the number of bytes matched so far.
+    Enum {
+        cands: Arc<Vec<Vec<u8>>>,
+        viable: Vec<usize>,
+        pos: usize,
+    },
+    /// A value just completed inside a container: `,` or the container's close.
+    AfterValue,
+    /// The root value is complete; only trailing whitespace remains.
+    Done,
+}
+
+/// Incremental validator for the supported JSON Schema subset. Mirrors [`JsonState`]
+/// (same `accepts`/`advance`/`is_done` contract) but every step is directed by the
+/// schema, so only bytes that keep the output a valid prefix of a schema-matching
+/// value are accepted.
+#[derive(Clone, Debug)]
+pub struct SchemaState {
+    stack: Vec<SchemaFrame>,
+    mode: SchemaMode,
+}
+
+impl SchemaState {
+    fn new(schema: Schema) -> Self {
+        Self {
+            stack: Vec::new(),
+            mode: SchemaMode::Value(schema),
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        matches!(self.mode, SchemaMode::Done)
+    }
+
+    fn accepts(&self, bytes: &[u8]) -> bool {
+        let mut probe = self.clone();
+        for &b in bytes {
+            if probe.advance(b).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn advance(&mut self, b: u8) -> Result<(), ()> {
+        match std::mem::replace(&mut self.mode, SchemaMode::Done) {
+            SchemaMode::Value(schema) => {
+                if is_ws(b) {
+                    self.mode = SchemaMode::Value(schema);
+                    Ok(())
                 } else {
-                    return Err(());
+                    self.start_value(schema, b)
                 }
             }
-            Num::Frac => match b {
-                _ if is_digit(b) => Num::Frac,
-                b'e' | b'E' => Num::ExpSign,
-                _ => return Err(()),
-            },
-            Num::ExpSign => match b {
-                b'+' | b'-' => Num::ExpFirst,
-                _ if is_digit(b) => Num::Exp,
-                _ => return Err(()),
-            },
-            Num::ExpFirst => {
-                if is_digit(b) {
-                    Num::Exp
+            SchemaMode::ArrayElem { allow_close } => {
+                if is_ws(b) {
+                    self.mode = SchemaMode::ArrayElem { allow_close };
+                    Ok(())
+                } else if allow_close && b == b']' {
+                    self.pop_close();
+                    Ok(())
                 } else {
-                    return Err(());
+                    let items = match self.stack.last() {
+                        Some(SchemaFrame::Array { items }) => items.clone(),
+                        _ => return Err(()),
+                    };
+                    self.start_value(items, b)
                 }
             }
-            Num::Exp => {
-                if is_digit(b) {
-                    Num::Exp
+            SchemaMode::Key { allow_close } => {
+                if is_ws(b) {
+                    self.mode = SchemaMode::Key { allow_close };
+                    Ok(())
+                } else if allow_close && b == b'}' {
+                    if self.required_satisfied() {
+                        self.pop_close();
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                } else if b == b'"' {
+                    self.mode = SchemaMode::KeyStr {
+                        matched: Vec::new(),
+                    };
+                    Ok(())
                 } else {
-                    return Err(());
+                    Err(())
                 }
             }
+            SchemaMode::KeyStr { matched } => self.advance_key(matched, b),
+            SchemaMode::Colon(schema) => {
+                if is_ws(b) {
+                    self.mode = SchemaMode::Colon(schema);
+                    Ok(())
+                } else if b == b':' {
+                    self.mode = SchemaMode::Value(schema);
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            SchemaMode::Str { escape, hex } => match str_advance(escape, hex, b) {
+                StrStep::Stay { escape, hex } => {
+                    self.mode = SchemaMode::Str { escape, hex };
+                    Ok(())
+                }
+                StrStep::Close => {
+                    self.after_value();
+                    Ok(())
+                }
+                StrStep::Reject => Err(()),
+            },
+            SchemaMode::Num { st, integer } => match num_advance(st, b, integer) {
+                NumStep::Stay(next) => {
+                    self.mode = SchemaMode::Num { st: next, integer };
+                    Ok(())
+                }
+                NumStep::Done => {
+                    // The delimiter that ended the number is re-processed below.
+                    self.after_value();
+                    self.advance(b)
+                }
+                NumStep::Reject => Err(()),
+            },
+            SchemaMode::Lit { rest } => match rest.split_first() {
+                Some((&first, tail)) if first == b => {
+                    if tail.is_empty() {
+                        self.after_value();
+                    } else {
+                        self.mode = SchemaMode::Lit { rest: tail };
+                    }
+                    Ok(())
+                }
+                _ => Err(()),
+            },
+            SchemaMode::Enum { cands, viable, pos } => self.advance_enum(cands, viable, pos, b),
+            SchemaMode::AfterValue => self.advance_after_value(b),
+            SchemaMode::Done => {
+                if is_ws(b) {
+                    self.mode = SchemaMode::Done;
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
+    /// Begin a value of `schema` on its first non-whitespace byte.
+    fn start_value(&mut self, schema: Schema, b: u8) -> Result<(), ()> {
+        match schema {
+            Schema::Object(os) => {
+                if b == b'{' {
+                    let used = vec![false; os.props.len()];
+                    self.stack.push(SchemaFrame::Object { schema: os, used });
+                    self.mode = SchemaMode::Key { allow_close: true };
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Schema::Array(items) => {
+                if b == b'[' {
+                    self.stack.push(SchemaFrame::Array {
+                        items: (*items).clone(),
+                    });
+                    self.mode = SchemaMode::ArrayElem { allow_close: true };
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Schema::Str => {
+                if b == b'"' {
+                    self.mode = SchemaMode::Str {
+                        escape: false,
+                        hex: 0,
+                    };
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Schema::Integer => self.start_number(b, true),
+            Schema::Number => self.start_number(b, false),
+            Schema::Bool => match b {
+                b't' => {
+                    self.mode = SchemaMode::Lit { rest: b"rue" };
+                    Ok(())
+                }
+                b'f' => {
+                    self.mode = SchemaMode::Lit { rest: b"alse" };
+                    Ok(())
+                }
+                _ => Err(()),
+            },
+            Schema::Null => {
+                if b == b'n' {
+                    self.mode = SchemaMode::Lit { rest: b"ull" };
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+            Schema::Enum(cands) => {
+                let viable: Vec<usize> = cands
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.first() == Some(&b))
+                    .map(|(i, _)| i)
+                    .collect();
+                if viable.is_empty() {
+                    return Err(());
+                }
+                let pos = 1;
+                if viable.iter().any(|&i| cands[i].len() == pos) {
+                    self.after_value();
+                } else {
+                    self.mode = SchemaMode::Enum { cands, viable, pos };
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn start_number(&mut self, b: u8, integer: bool) -> Result<(), ()> {
+        let st = match b {
+            b'-' => Num::Sign,
+            b'0' => Num::Zero,
+            b'1'..=b'9' => Num::Int,
+            _ => return Err(()),
         };
-        self.mode = Mode::Num(next);
+        self.mode = SchemaMode::Num { st, integer };
         Ok(())
+    }
+
+    /// Resolve an object key. During scanning (`b` is a content byte) the key is
+    /// constrained to remain a prefix of some not-yet-used declared property; on the
+    /// closing quote it must equal exactly one such property, which is then marked
+    /// used (so duplicate keys are rejected) and whose schema drives the value.
+    fn advance_key(&mut self, mut matched: Vec<u8>, b: u8) -> Result<(), ()> {
+        let schema = match self.stack.last() {
+            Some(SchemaFrame::Object { schema, .. }) => schema.clone(),
+            _ => return Err(()),
+        };
+        if b == b'"' {
+            let Some(i) = schema
+                .props
+                .iter()
+                .position(|p| p.name.as_bytes() == matched.as_slice())
+            else {
+                return Err(());
+            };
+            match self.stack.last_mut() {
+                Some(SchemaFrame::Object { used, .. }) if !used[i] => used[i] = true,
+                _ => return Err(()),
+            }
+            self.mode = SchemaMode::Colon(schema.props[i].schema.clone());
+            Ok(())
+        } else {
+            if b < 0x20 || b == b'\\' {
+                return Err(());
+            }
+            matched.push(b);
+            let used = match self.stack.last() {
+                Some(SchemaFrame::Object { used, .. }) => used,
+                _ => return Err(()),
+            };
+            let feasible = schema
+                .props
+                .iter()
+                .enumerate()
+                .any(|(i, p)| !used[i] && p.name.as_bytes().starts_with(&matched));
+            if feasible {
+                self.mode = SchemaMode::KeyStr { matched };
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+    }
+
+    fn advance_enum(
+        &mut self,
+        cands: Arc<Vec<Vec<u8>>>,
+        viable: Vec<usize>,
+        pos: usize,
+        b: u8,
+    ) -> Result<(), ()> {
+        let next: Vec<usize> = viable
+            .into_iter()
+            .filter(|&i| cands[i].get(pos) == Some(&b))
+            .collect();
+        if next.is_empty() {
+            return Err(());
+        }
+        let npos = pos + 1;
+        if next.iter().any(|&i| cands[i].len() == npos) {
+            // String enum encodings are prefix-free, so a fully matched candidate
+            // cannot be extended: the value is complete.
+            self.after_value();
+        } else {
+            self.mode = SchemaMode::Enum {
+                cands,
+                viable: next,
+                pos: npos,
+            };
+        }
+        Ok(())
+    }
+
+    /// A value just completed inside a container.
+    fn after_value(&mut self) {
+        self.mode = SchemaMode::AfterValue;
+    }
+
+    /// After a value: a `,` continues the container or its close finishes it.
+    fn advance_after_value(&mut self, b: u8) -> Result<(), ()> {
+        if is_ws(b) {
+            self.mode = SchemaMode::AfterValue;
+            return Ok(());
+        }
+        let is_object = match self.stack.last() {
+            Some(SchemaFrame::Object { .. }) => true,
+            Some(SchemaFrame::Array { .. }) => false,
+            None => return Err(()),
+        };
+        if is_object {
+            match b {
+                b',' => {
+                    self.mode = SchemaMode::Key { allow_close: false };
+                    Ok(())
+                }
+                b'}' => {
+                    if self.required_satisfied() {
+                        self.pop_close();
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                }
+                _ => Err(()),
+            }
+        } else {
+            match b {
+                b',' => {
+                    self.mode = SchemaMode::ArrayElem { allow_close: false };
+                    Ok(())
+                }
+                b']' => {
+                    self.pop_close();
+                    Ok(())
+                }
+                _ => Err(()),
+            }
+        }
+    }
+
+    /// Pop the just-closed container; the root closing finishes the whole value.
+    fn pop_close(&mut self) {
+        self.stack.pop();
+        self.mode = if self.stack.is_empty() {
+            SchemaMode::Done
+        } else {
+            SchemaMode::AfterValue
+        };
+    }
+
+    /// Whether every required property of the current object has been emitted.
+    fn required_satisfied(&self) -> bool {
+        match self.stack.last() {
+            Some(SchemaFrame::Object { schema, used }) => schema
+                .props
+                .iter()
+                .enumerate()
+                .all(|(i, p)| !p.required || used[i]),
+            _ => false,
+        }
     }
 }
 
@@ -380,6 +1079,9 @@ impl JsonState {
 pub enum ConstraintState {
     /// `response_format: {"type":"json_object"}` — any valid JSON object.
     Json(JsonState),
+    /// `response_format: {"type":"json_schema", ...}` — a value matching a compiled
+    /// JSON Schema (the supported subset; see [`ConstraintState::new_schema`]).
+    Schema(SchemaState),
 }
 
 impl ConstraintState {
@@ -388,11 +1090,19 @@ impl ConstraintState {
         Self::Json(JsonState::new())
     }
 
+    /// Construct a JSON-Schema constraint by compiling `schema` into the supported
+    /// subset. Returns [`SchemaError`] (naming the offending keyword) for any schema
+    /// feature Camelid cannot enforce byte-for-byte, so the caller can fail closed.
+    pub fn new_schema(schema: &serde_json::Value) -> Result<Self, SchemaError> {
+        Ok(Self::Schema(SchemaState::new(compile_root(schema)?)))
+    }
+
     /// Would appending `bytes` keep the output a valid prefix of the constrained
     /// value? Used to mask a candidate token without mutating the live state.
     pub fn accepts(&self, bytes: &[u8]) -> bool {
         match self {
             Self::Json(state) => state.accepts(bytes),
+            Self::Schema(state) => state.accepts(bytes),
         }
     }
 
@@ -403,6 +1113,7 @@ impl ConstraintState {
     pub fn advance(&mut self, b: u8) -> Result<(), ()> {
         match self {
             Self::Json(state) => state.advance(b),
+            Self::Schema(state) => state.advance(b),
         }
     }
 
@@ -410,6 +1121,7 @@ impl ConstraintState {
     pub fn is_done(&self) -> bool {
         match self {
             Self::Json(state) => state.is_done(),
+            Self::Schema(state) => state.is_done(),
         }
     }
 }
@@ -575,5 +1287,212 @@ mod tests {
         }
         assert_eq!(c2.is_done(), st.is_done());
         assert!(c2.is_done());
+    }
+
+    // ---- JSON Schema subset (SchemaState) ----
+
+    fn schema(v: serde_json::Value) -> Schema {
+        compile_root(&v).expect("schema should compile")
+    }
+
+    fn feed_schema(s: &Schema, input: &str) -> Result<SchemaState, ()> {
+        let mut st = SchemaState::new(s.clone());
+        for &b in input.as_bytes() {
+            st.advance(b)?;
+        }
+        Ok(st)
+    }
+
+    fn schema_complete(s: &Schema, input: &str) -> bool {
+        feed_schema(s, input)
+            .map(|st| st.is_done())
+            .unwrap_or(false)
+    }
+
+    fn schema_prefix(s: &Schema, input: &str) -> bool {
+        feed_schema(s, input).is_ok()
+    }
+
+    #[test]
+    fn compile_rejects_unsupported_shapes() {
+        use serde_json::json;
+        // Root must be an object or array.
+        assert!(compile_root(&json!({"type": "string"})).is_err());
+        assert!(compile_root(&json!({"enum": ["a", "b"]})).is_err());
+        // Untyped / any property.
+        assert!(compile_root(
+            &json!({"type": "object", "additionalProperties": false, "properties": {"a": {}}})
+        )
+        .is_err());
+        // Open objects (additionalProperties not false / absent).
+        assert!(compile_root(&json!({"type": "object", "properties": {}})).is_err());
+        assert!(compile_root(
+            &json!({"type": "object", "additionalProperties": true, "properties": {}})
+        )
+        .is_err());
+        // Type unions.
+        assert!(compile_root(&json!({"type": ["object", "null"]})).is_err());
+        // Combinators / refs.
+        assert!(compile_root(&json!({"anyOf": [{"type": "object"}]})).is_err());
+        assert!(compile_root(&json!({"$ref": "#/$defs/x"})).is_err());
+        // Unenforced constraint keywords must be rejected, not silently ignored.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "string", "minLength": 1}}
+        }))
+        .is_err());
+        // Non-string enum members.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"enum": [1, 2]}}, "required": ["a"]
+        }))
+        .is_err());
+        // required referring to an undeclared property.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "string"}}, "required": ["b"]
+        }))
+        .is_err());
+        // Array without items.
+        assert!(compile_root(&json!({"type": "array"})).is_err());
+        // Annotations are ignored, not rejected.
+        assert!(compile_root(&json!({
+            "type": "object", "additionalProperties": false, "title": "T", "description": "d",
+            "properties": {"a": {"type": "string", "description": "the a"}}, "required": ["a"]
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn object_enforces_required_and_value_types() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name"]
+        }));
+        assert!(schema_complete(&s, r#"{"name":"bob","age":3}"#));
+        assert!(schema_complete(&s, r#"{ "name" : "bob" }"#)); // age optional, whitespace ok
+
+        // Cannot close without the required key.
+        assert!(!schema_complete(&s, r#"{}"#));
+        assert!(!schema_complete(&s, r#"{"age":3}"#));
+        // Wrong value types are rejected at the first offending byte.
+        assert!(!schema_prefix(&s, r#"{"name":1"#)); // string expected, got a number
+        assert!(!schema_prefix(&s, r#"{"age":""#)); // integer expected, got a string
+        assert!(!schema_prefix(&s, r#"{"name":"b","age":1.5"#)); // integer forbids a fraction
+
+        // Unknown key: rejected as soon as it cannot be a declared-property prefix.
+        assert!(!schema_prefix(&s, r#"{"x"#));
+        // Duplicate key rejected (name already used).
+        assert!(!schema_prefix(&s, r#"{"name":"a","n"#));
+        // is_done only at the final close.
+        assert!(schema_prefix(&s, r#"{"name":"a""#));
+        assert!(!schema_complete(&s, r#"{"name":"a""#));
+    }
+
+    #[test]
+    fn scalars_bool_null_number() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"b": {"type": "boolean"}, "z": {"type": "null"}, "n": {"type": "number"}},
+            "required": ["b", "z", "n"]
+        }));
+        assert!(schema_complete(&s, r#"{"b":true,"z":null,"n":-12.5e+3}"#));
+        assert!(schema_complete(&s, r#"{"b":false,"z":null,"n":0}"#));
+        assert!(!schema_prefix(&s, r#"{"b":tru e"#)); // bad literal
+        assert!(!schema_prefix(&s, r#"{"b":true,"z":nul,"#)); // bad null
+        assert!(!schema_prefix(&s, r#"{"b":true,"z":null,"n":01"#)); // leading zero
+    }
+
+    #[test]
+    fn string_enum_and_const() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"unit": {"enum": ["celsius", "fahrenheit"]}},
+            "required": ["unit"]
+        }));
+        assert!(schema_complete(&s, r#"{"unit":"celsius"}"#));
+        assert!(schema_complete(&s, r#"{"unit":"fahrenheit"}"#));
+        assert!(!schema_prefix(&s, r#"{"unit":"kelvin"#)); // not a candidate
+        assert!(!schema_prefix(&s, r#"{"unit":"cel x"#)); // diverges from "celsius"
+        let c = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"kind": {"const": "tool"}}, "required": ["kind"]
+        }));
+        assert!(schema_complete(&c, r#"{"kind":"tool"}"#));
+        assert!(!schema_prefix(&c, r#"{"kind":"other"#));
+    }
+
+    #[test]
+    fn nested_objects_and_arrays() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "meta": {
+                    "type": "object", "additionalProperties": false,
+                    "properties": {"n": {"type": "integer"}}, "required": ["n"]
+                }
+            },
+            "required": ["tags", "meta"]
+        }));
+        assert!(schema_complete(&s, r#"{"tags":["a","b"],"meta":{"n":5}}"#));
+        assert!(schema_complete(&s, r#"{"tags":[],"meta":{"n":0}}"#));
+        // Array element of the wrong type.
+        assert!(!schema_prefix(&s, r#"{"tags":[1"#));
+        // Nested required missing.
+        assert!(!schema_complete(&s, r#"{"tags":[],"meta":{}}"#));
+        // Only complete at the outermost close.
+        assert!(schema_prefix(&s, r#"{"tags":[],"meta":{"n":0}"#));
+        assert!(!schema_complete(&s, r#"{"tags":[],"meta":{"n":0}"#));
+    }
+
+    #[test]
+    fn schema_masks_candidates_without_mutation() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "integer"}}, "required": ["a"]
+        }));
+        let mut st = SchemaState::new(s);
+        for &b in br#"{"a":"# {
+            st.advance(b).unwrap();
+        }
+        // An integer value must start with '-' or a digit.
+        assert!(st.accepts(b"1"));
+        assert!(st.accepts(b"-"));
+        assert!(!st.accepts(b"\""));
+        assert!(!st.accepts(b"{"));
+        // accepts() must not mutate the live state.
+        assert!(!st.is_done());
+        st.advance(b'1').unwrap();
+        // After the value, '}' closes (required satisfied); a stray char does not.
+        assert!(st.accepts(b"}"));
+        assert!(!st.accepts(b"x"));
+        assert!(st.accepts(b"23}")); // multibyte token: extend the number then close
+    }
+
+    #[test]
+    fn object_key_trie_masking() {
+        use serde_json::json;
+        let s = schema(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"colour": {"type": "string"}, "count": {"type": "integer"}}
+        }));
+        let mut st = SchemaState::new(s);
+        st.advance(b'{').unwrap();
+        // A key must start a declared property name.
+        assert!(st.accepts(b"\"c"));
+        assert!(!st.accepts(b"\"x"));
+        // Narrow to "cou": only "count" remains reachable.
+        for &b in b"\"cou" {
+            st.advance(b).unwrap();
+        }
+        assert!(st.accepts(b"nt\""));
+        assert!(!st.accepts(b"lour\""));
     }
 }
