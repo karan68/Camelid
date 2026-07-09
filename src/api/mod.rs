@@ -5276,6 +5276,28 @@ pub struct DgServeRuntime {
     chat: crate::diffusion_gemma::chat::DgChat,
 }
 
+/// Whole-generation serialization for the DiffusionGemma serve lane. On CUDA
+/// builds every dg request funnels through the process-global engine singleton
+/// (`diffusion_gemma::cuda::ENGINE`), whose internal `Mutex` is held only per
+/// kernel op — state like `Engine::last_logits` is handed BETWEEN ops within a
+/// forward step, so two concurrent requests interleaving ops logically corrupt
+/// each other's generations. This lane-global lock mirrors the gemma4 Cuda
+/// pattern (`Gemma4ServeRuntime::Cuda`'s whole-decode `Mutex`): held for the
+/// entire generate call, acquired INSIDE the `spawn_blocking` closure so a
+/// dropped SSE stream (client disconnect drops the async frame, not the
+/// blocking thread) can never release it mid-decode. Unconditional on CPU
+/// builds too — harmless, and it keeps the invariant build-independent.
+static DG_GENERATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the dg whole-generation lock. Poisoning is handled the way the
+/// gemma4 Cuda lane handles its runtime lock (`.expect`): a panicked
+/// generation poisons the lane and later requests fail loudly (surfaced as a
+/// generation_error by the handlers' panic paths) rather than decode against
+/// possibly-corrupt engine state.
+fn dg_generation_guard() -> std::sync::MutexGuard<'static, ()> {
+    DG_GENERATION_LOCK.lock().expect("dg generation lock")
+}
+
 impl DgServeRuntime {
     fn load(path: &std::path::Path) -> std::result::Result<Self, BackendError> {
         Ok(Self {
@@ -5386,6 +5408,9 @@ async fn dg_chat_nonstreaming(
     let n_blocks = dg_serve_blocks();
     let rt = runtime.clone();
     let result = tokio::task::spawn_blocking(move || {
+        // Serialize the WHOLE generation (see `DG_GENERATION_LOCK`): the CUDA
+        // engine is process-global and its internal lock is per-kernel-op only.
+        let _generation_guard = dg_generation_guard();
         let prompt_tokens = rt.chat.render_prompt(&user_msg).map(|v| v.len())?;
         rt.chat
             .generate(&user_msg, &params, n_blocks, 1100, |_, _, _, _| {})
@@ -5469,6 +5494,10 @@ async fn dg_chat_streaming(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamItem>();
     let rt = runtime.clone();
     tokio::task::spawn_blocking(move || {
+        // Serialize the WHOLE generation (see `DG_GENERATION_LOCK`). Acquired
+        // here on the blocking thread — NOT in the async frame — so a dropped
+        // SSE stream cannot release the guard while the decode is in flight.
+        let _generation_guard = dg_generation_guard();
         let send_tx = tx.clone();
         let step_tx = tx.clone();
         let prompt_tokens = match rt.chat.render_prompt(&user_msg) {
@@ -12030,6 +12059,52 @@ mod tests {
             max_seen.load(Ordering::SeqCst),
             1,
             "generation_lock must serialize decoding: never more than one decode in flight",
+        );
+    }
+
+    /// Regression test for the dg-vs-dg CUDA corruption hazard: on CUDA builds
+    /// every DiffusionGemma serve request runs through the process-global
+    /// engine singleton whose internal Mutex is per-kernel-op only, so
+    /// `dg_chat_nonstreaming` / `dg_chat_streaming` must hold
+    /// `DG_GENERATION_LOCK` for the whole generation inside their
+    /// `spawn_blocking` closures. This verifies the lock serializes — with
+    /// many blocking tasks acquiring it the way the handlers do, never more
+    /// than one is inside the critical section at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dg_generation_lock_serializes_generations() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                // Same acquisition both dg handlers perform: the guard is
+                // taken on the blocking thread, around the whole generation.
+                let _generation_guard = dg_generation_guard();
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(now, Ordering::SeqCst);
+                // Linger while holding the guard. If the lock failed to
+                // serialize, another task would enter here and push
+                // `active` > 1.
+                for _ in 0..8 {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "DG_GENERATION_LOCK must serialize dg generations: never more than one in flight",
         );
     }
 
