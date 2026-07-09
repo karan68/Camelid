@@ -17671,7 +17671,9 @@ fn matmul_rhs_transposed_q4_k_block_dot(
     // Lane B v5: fetch-or-build the 8-row repack here — the only site with
     // the owning CpuTensor in scope. Build is lazy, flag/feature/budget gated,
     // and only attempted when the owner will actually run.
-    let repack8 = {
+    // Explicit type: on non-x86 only the `None` arm exists and inference
+    // would otherwise fail (E0282 — caught by the aarch64 cross-check).
+    let repack8: Option<std::sync::Arc<crate::tensor::Q4KPackedRows8>> = {
         #[cfg(target_arch = "x86_64")]
         {
             if input.dim(0)? >= 4 && x86_kquant_matmul_owner_enabled() {
@@ -17719,6 +17721,16 @@ fn x86_kquant_matmul_owner_enabled() -> bool {
 /// (opt-in until the gate receipt): `CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8=1`,
 /// honored only when the owner is on and the CPU has avx512f/bw/vnni (the
 /// 8-row kernel is AVX-512-only; AVX2 hosts keep the single-row inner).
+///
+/// Operational notes (review 2026-07-09): (1) the pack builds lazily inside
+/// the FIRST owner-eligible prefill — ~1–3 s one-time for a 3B Q4_K_M model,
+/// on the request thread; (2) the packed copy is allocated AFTER the KV
+/// predict-and-abort budget snapshots available RAM — on tight hosts size
+/// `CAMELID_X86_KQUANT_REPACK8_BUDGET_MIB` accordingly (reservations are
+/// returned when weights drop); (3) the borrowed-weight linear route passes
+/// no `CpuTensor` and therefore never builds/uses the repack — its batched
+/// calls stay on the single-row inner (bit-identical; dilutes A/B receipts
+/// on models where that route carries prefill traffic).
 #[cfg(target_arch = "x86_64")]
 fn x86_kquant_matmul_owner_repack8_enabled() -> bool {
     #[cfg(test)]
@@ -17763,10 +17775,8 @@ fn kquant_repack8_budget_bytes() -> usize {
     }
 }
 
-/// Bytes already reserved by built repacks (check-and-reserve).
-#[cfg(target_arch = "x86_64")]
-static KQUANT_REPACK8_RESERVED_BYTES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+// Reservation accounting lives on `crate::tensor::KQUANT_REPACK8_RESERVED_BYTES`
+// (reserved here, released by `Q4KPackedRows8::drop` so unload returns budget).
 
 /// Fetch-or-build the 8-row repack for a Q4_K weight tensor. Returns `None`
 /// when the flag/features/budget deny it — callers fall through to the
@@ -17794,14 +17804,16 @@ fn q4_k_repack8_for_weight(
             let bytes = (pack_rows / 8)
                 * superblocks
                 * std::mem::size_of::<crate::tensor::Q4KPackedRows8Block>();
-            // Check-and-reserve against the global budget.
-            let mut reserved = KQUANT_REPACK8_RESERVED_BYTES.load(Ordering::Relaxed);
+            // Check-and-reserve against the global budget; the reservation is
+            // stamped on the pack and RELEASED by its Drop, so model unload
+            // returns budget instead of eroding it.
+            let mut reserved = crate::tensor::KQUANT_REPACK8_RESERVED_BYTES.load(Ordering::Relaxed);
             loop {
                 if reserved + bytes > kquant_repack8_budget_bytes() {
                     Q8_SCHED_KQUANT_OWNER_REPACK8_BUDGET_DENIED.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
-                match KQUANT_REPACK8_RESERVED_BYTES.compare_exchange_weak(
+                match crate::tensor::KQUANT_REPACK8_RESERVED_BYTES.compare_exchange_weak(
                     reserved,
                     reserved + bytes,
                     Ordering::Relaxed,
@@ -17813,12 +17825,14 @@ fn q4_k_repack8_for_weight(
             }
             let pack_wire = &wire[..pack_rows * superblocks * Q4_K_WIRE_BYTES_PER_BLOCK];
             match crate::tensor::Q4KPackedRows8::from_q4_k_wire(pack_rows, superblocks, pack_wire) {
-                Ok(pack) => {
+                Ok(mut pack) => {
+                    pack.reservation_bytes = bytes;
                     Q8_SCHED_KQUANT_OWNER_REPACK8_BUILT.fetch_add(1, Ordering::Relaxed);
                     Some(std::sync::Arc::new(pack))
                 }
                 Err(_) => {
-                    KQUANT_REPACK8_RESERVED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+                    crate::tensor::KQUANT_REPACK8_RESERVED_BYTES
+                        .fetch_sub(bytes, Ordering::Relaxed);
                     None
                 }
             }

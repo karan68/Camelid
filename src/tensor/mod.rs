@@ -288,13 +288,35 @@ pub struct Q4KPackedRows8Block {
     pub qs: [u8; 1024],
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Global bytes currently reserved by live 8-row repacks against the
+/// `CAMELID_X86_KQUANT_REPACK8_BUDGET_MIB` budget. Reserved by the builder
+/// path in `inference`, RELEASED by [`Q4KPackedRows8`]'s `Drop` — so model
+/// unload/reload returns budget instead of eroding it (review finding,
+/// 2026-07-09).
+pub static KQUANT_REPACK8_RESERVED_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Deliberately NOT `Clone` (a struct clone would double-release the budget
+/// reservation on drop); share via `Arc`.
+#[derive(Debug)]
 pub struct Q4KPackedRows8 {
     pub rows: usize,
     pub superblocks_per_row: usize,
     /// `(rows / 8) * superblocks_per_row` blocks, row-group major then
     /// superblock major (group g, superblock i at `g * superblocks_per_row + i`).
     pub blocks: Vec<Q4KPackedRows8Block>,
+    /// Bytes this pack reserved against the global budget (0 for packs built
+    /// outside the budgeted path, e.g. tests). Returned on drop.
+    pub reservation_bytes: usize,
+}
+
+impl Drop for Q4KPackedRows8 {
+    fn drop(&mut self) {
+        if self.reservation_bytes > 0 {
+            KQUANT_REPACK8_RESERVED_BYTES
+                .fetch_sub(self.reservation_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl Q4KPackedRows8 {
@@ -352,6 +374,7 @@ impl Q4KPackedRows8 {
             rows,
             superblocks_per_row,
             blocks,
+            reservation_bytes: 0,
         })
     }
 

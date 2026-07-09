@@ -3474,13 +3474,19 @@ fn q4_k_repack8_owner_bitwise_matches_block_dot_core() {
 
     for (in_dim, out_dim) in [(512usize, 96usize), (768, 40), (512, 19)] {
         let row_bytes = (in_dim / 256) * 144;
+        // d/dmin VARY PER ROW (finite f16s, sign included): uniform values
+        // would mask a per-row lane permutation in the pack's d/dmin arrays
+        // (review finding). Exponent nibbles stay in a finite range.
         let wire: Vec<u8> = (0..out_dim * row_bytes)
-            .map(|i| match i % 144 {
-                0 => 0x66,
-                1 => 0x2e,
-                2 => 0x99,
-                3 => 0x24,
-                _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
+            .map(|i| {
+                let row = i / row_bytes;
+                match i % 144 {
+                    0 => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
+                    1 => 0x28 | ((row % 8) as u8) | ((((row / 8) % 2) as u8) << 7),
+                    2 => ((i as u32).wrapping_mul(0x9E37_79B9) >> 24) as u8,
+                    3 => 0x20 | (((row + 3) % 8) as u8),
+                    _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
+                }
             })
             .collect();
         let superblocks = in_dim / 256;
