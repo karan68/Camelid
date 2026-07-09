@@ -1811,6 +1811,7 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_Q8_0_PACKED_4X4_DOT",
         "CAMELID_Q8_0_PACKED_4X8_DOT",
         "CAMELID_X86_KQUANT_MATMUL_OWNER",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
         "CAMELID_X86_Q6K_AVX2",
         "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
         "CAMELID_Q8_0_FILE_CACHE_BYTES",
@@ -3418,24 +3419,44 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                 CpuTensor::from_f32("owner-test-in", vec![n_rows, in_dim], input_data).unwrap();
             std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
             let base = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
-            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
-            reset_q8_schedule_telemetry();
-            let owner = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
-            // Engaged-check: if the dispatch silently stopped firing, the
-            // "owner" leg would be the base path and this test would pass
-            // vacuously.
-            assert!(
-                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken > 0,
-                "owner leg did not dispatch the owner arm (n_rows={n_rows}) — vacuous comparison"
-            );
-            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
-            assert_eq!(owner.data.len(), base.data.len());
-            for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
+            // Cover BOTH owner inners: VNNI (default when the CPU has it) and
+            // the AVX2 fallback (VNNI sub-flag forced off).
+            for vnni in ["1", "0"] {
+                std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+                std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI", vnni);
+                reset_q8_schedule_telemetry();
+                let owner = q4_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
+                // Engaged-check: if the dispatch silently stopped firing, the
+                // "owner" leg would be the base path and this test would pass
+                // vacuously.
+                let telemetry = snapshot_q8_schedule_telemetry();
+                assert!(
+                    telemetry.kquant_owner_prefill_taken > 0,
+                    "owner leg did not dispatch (n_rows={n_rows}, vnni={vnni}) — vacuous comparison"
                 );
+                // Per-inner engaged check: the vnni=1 leg must actually run
+                // the VNNI inner when the host has the features; on hosts
+                // without them the leg legitimately falls back to AVX2 (the
+                // AVX2 inner is still covered by the vnni=0 leg).
+                let vnni_expected = vnni == "1" && q8_owner_avx512vnni_available();
+                assert_eq!(
+                    vnni_expected,
+                    telemetry.kquant_owner_vnni_taken > 0,
+                    "VNNI inner engagement mismatch (n_rows={n_rows}, vnni={vnni}, \
+                     host_vnni={})",
+                    q8_owner_avx512vnni_available()
+                );
+                std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+                std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI");
+                assert_eq!(owner.data.len(), base.data.len());
+                for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, \
+                         out_dim={out_dim}, vnni={vnni})"
+                    );
+                }
             }
         }
     }

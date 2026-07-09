@@ -68,11 +68,9 @@ use q8_runtime::{
     Q8MatmulOwnerScope, Q8PackedRows4MatmulSchedule, Q8RuntimeFlags, ResolvedRuntimePlan,
 };
 // All remaining callers are arch/OS-gated (aarch64 dotprod dispatch, Apple Accelerate), so
-// this import is unused on other targets.
-#[cfg_attr(
-    not(any(target_arch = "aarch64", target_os = "macos")),
-    allow(unused_imports)
-)]
+// this import is unused on other targets — including aarch64-linux (verified by cross-check:
+// the dotprod dispatch callers are macOS-gated), hence the allow applies everywhere but macOS.
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use q8_runtime::q8_0_env_flag_disabled;
 use q8_telemetry::*;
 pub use q8_telemetry::{
@@ -17689,6 +17687,30 @@ fn x86_kquant_matmul_owner_enabled() -> bool {
     }
 }
 
+/// AVX-512 VNNI inner for the K-quant owner: default ON whenever the owner is
+/// on (the GEMM4 split-flag-trap lesson) and the CPU has the features; runtime
+/// dispatch stays bit-identical either way (exact integers, associative).
+/// Rollback to the AVX2 inner: `CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI=0`.
+#[cfg(target_arch = "x86_64")]
+fn x86_kquant_matmul_owner_vnni_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI")
+    }
+    #[cfg(not(test))]
+    {
+        if q8_runtime::bench_uncached_runtime_plan() {
+            return q8_0_env_flag_enabled_default_on_fail_closed(
+                "CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI",
+            );
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_on_fail_closed("CAMELID_X86_KQUANT_MATMUL_OWNER_VNNI")
+        })
+    }
+}
+
 /// Shared-base output pointer for the K-quant owner's rayon tasks. Tasks
 /// partition the output-channel dimension into disjoint chunks — no two tasks
 /// ever write the same (row, channel) cell despite the shared base pointer.
@@ -17746,6 +17768,80 @@ fn q4_k_owner_main_side_scalar(qs: &[u8], q8: &[i8], scales: &[u8; 8]) -> (i64, 
         sumi2 += hi * scales[2 * j + 1] as i64;
     }
     (sumi1, sumi2)
+}
+
+/// v4 inner (STAMPEDE P3 escalation): AVX-512 VNNI sibling of
+/// [`q4_k_owner_weight_row_block_avx2`]. Per superblock the four 32-byte q4
+/// chunks expand once per row block into zmm pairs `[low_j | high_j]`; per
+/// cell each chunk is ONE 64-byte activation load (q8lo/q8hi are contiguous
+/// in `y.qs[64j..64j+64]`) + ONE `dpbusd` (u8 nibbles × i8 activations —
+/// dpbusd's native signedness, no sign trick needed) + one per-group scale
+/// `mullo` + add, replacing the AVX2 path's maddubs/madd/mullo×2/add×2 per
+/// chunk. Exact-integer envelope: dpbusd lane = quad sum ≤ 4·15·127 = 7620;
+/// ×63 scale ≤ 480,060; vacc lane over 4 adds ≤ 1.93M; 16-lane reduce
+/// ≤ 30.8M ≪ i32::MAX. Integer associativity ⇒ the per-cell total equals the
+/// AVX2/scalar paths bit for bit; the f32 chain is verbatim `q4_k_dot_arm`
+/// order, identical to the AVX2 inner.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn q4_k_owner_weight_row_block_avx512vnni(
+    w_row: &[u8],
+    superblocks: usize,
+    wd: &[f32],
+    wdmin: &[f32],
+    wscales: &[[u8; 8]],
+    wmins: &[[u8; 8]],
+    preps: &[(Vec<Q8KBlock>, Vec<[i32; 8]>)],
+    sumf_block: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let low_mask = _mm256_set1_epi8(0x0f);
+    for i in 0..superblocks {
+        let qs = &w_row[i * Q4_K_WIRE_BYTES_PER_BLOCK + 16..i * Q4_K_WIRE_BYTES_PER_BLOCK + 144];
+        // Hoist per row block: [low_j | high_j] zmm per chunk plus the
+        // matching [scale_2j x8 | scale_2j+1 x8] i32 lanes.
+        let mut wvec = [_mm512_setzero_si512(); 4];
+        let mut svec = [_mm512_setzero_si512(); 4];
+        let sc = &wscales[i];
+        for j in 0..4 {
+            let q4 = _mm256_loadu_si256(qs.as_ptr().add(j * 32) as *const __m256i);
+            let low = _mm256_and_si256(q4, low_mask);
+            let high = _mm256_and_si256(_mm256_srli_epi16(q4, 4), low_mask);
+            wvec[j] = _mm512_inserti64x4(_mm512_castsi256_si512(low), high, 1);
+            svec[j] = _mm512_inserti64x4(
+                _mm512_castsi256_si512(_mm256_set1_epi32(sc[2 * j] as i32)),
+                _mm256_set1_epi32(sc[2 * j + 1] as i32),
+                1,
+            );
+        }
+        let mins = &wmins[i];
+        for ((blocks, sums), sumf) in preps.iter().zip(sumf_block.iter_mut()) {
+            let y = &blocks[i];
+            let d = y.d * wd[i];
+            let dmin = y.d * wdmin[i];
+            let mut prod: i64 = 0;
+            for g in 0..8 {
+                prod += sums[i][g] as i64 * mins[g] as i64;
+            }
+            *sumf = (-dmin).mul_add(prod as f32, *sumf);
+            let q8p = y.qs.as_ptr();
+            let mut vacc = _mm512_setzero_si512();
+            for j in 0..4 {
+                // One contiguous 64-byte activation load: [q8lo_j | q8hi_j].
+                let q = _mm512_loadu_si512(q8p.add(j * 64).cast());
+                let dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wvec[j], q);
+                vacc = _mm512_add_epi32(vacc, _mm512_mullo_epi32(dot, svec[j]));
+            }
+            // Exact-integer 16-lane reduce via the proven 8-lane hsum.
+            let lo = _mm512_castsi512_si256(vacc);
+            let hi = _mm512_extracti64x4_epi64(vacc, 1);
+            let main = crate::diffusion_gemma::refmath::hsum_i32_8(lo) as i64
+                + crate::diffusion_gemma::refmath::hsum_i32_8(hi) as i64;
+            *sumf = d.mul_add(main as f32, *sumf);
+        }
+    }
 }
 
 /// v2 inner: one weight row × a block of input rows, AVX2. Per superblock the
@@ -17850,6 +17946,15 @@ fn q4_k_owner_prefill_tiled(
     let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
     #[cfg(not(target_arch = "x86_64"))]
     let use_avx2 = false;
+    #[cfg(target_arch = "x86_64")]
+    let use_vnni = x86_kquant_matmul_owner_vnni_enabled() && q8_owner_avx512vnni_available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_vnni = false;
+    // Per-inner engaged signal: without it a VNNI A/B leg on a non-VNNI host
+    // silently measures the AVX2 inner (vacuous comparison).
+    if use_vnni {
+        Q8_SCHED_KQUANT_OWNER_VNNI_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // (1) Parallel Q8_K quantize + per-superblock activation group sums.
     let preps: Vec<(Vec<Q8KBlock>, Vec<[i32; 8]>)> = (0..n_rows)
@@ -17920,7 +18025,22 @@ fn q4_k_owner_prefill_tiled(
                 }
                 let block_rows = row_end - row_start;
                 let mut sumf_block = [0f32; ROW_BLOCK];
-                if use_avx2 {
+                if use_vnni {
+                    #[cfg(target_arch = "x86_64")]
+                    // SAFETY: avx512f/bw/vnni confirmed present at dispatch.
+                    unsafe {
+                        q4_k_owner_weight_row_block_avx512vnni(
+                            w_row,
+                            superblocks,
+                            &wd,
+                            &wdmin,
+                            &wscales,
+                            &wmins,
+                            &preps[row_start..row_end],
+                            &mut sumf_block[..block_rows],
+                        );
+                    }
+                } else if use_avx2 {
                     #[cfg(target_arch = "x86_64")]
                     // SAFETY: avx2 confirmed present at dispatch.
                     unsafe {
