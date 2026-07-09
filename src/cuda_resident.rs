@@ -4436,7 +4436,6 @@ struct OffloadState {
 /// `disable_event_tracking` gotcha). The five events are re-recorded every layer;
 /// `cuEventRecord` overwrites and each wait is enqueued (host order) after the record
 /// it consumes, so reuse across layers and tokens is correct — no per-token churn.
-#[allow(dead_code)] // events consumed by the forward_pass stream threading (wired next commit).
 struct StreamOverlap {
     side_a: std::sync::Arc<CudaStream>,
     side_b: std::sync::Arc<CudaStream>,
@@ -4447,8 +4446,10 @@ struct StreamOverlap {
     /// V chain done on side_b → attention on main may read `cache_v[li]`.
     ev_v: CudaEvent,
     /// ffn norm+quantize done on main → up gemv on side_a may read `d_in_*`/`d_q8k_*`.
+    #[allow(dead_code)] // consumed by the FFN block threading (wired next commit).
     ev_ffn: CudaEvent,
     /// up gemv done on side_a → silu on main may read `d_up` (and overwrite `d_in_*`).
+    #[allow(dead_code)] // consumed by the FFN block threading (wired next commit).
     ev_up: CudaEvent,
 }
 
@@ -5716,6 +5717,22 @@ impl CudaResidentDecode {
             // output gate. Both kinds share the attn-norm+quantize above and the FFN below.
             match &self.layers[li].kind {
                 LayerKind::Full => {
+                    // Phase 6 overlap: publish the attn activation (`ev_act` on main,
+                    // recorded after the norm+quantize above) to the side streams,
+                    // then run the K chain on `side_a` and the V chain on `side_b`.
+                    // Q stays on main — largest output, keeps the critical path warm.
+                    // With overlap off both handles alias `s`: every launch below is
+                    // enqueued exactly as today.
+                    let (s_k, s_v): (&Arc<CudaStream>, &Arc<CudaStream>) =
+                        if let Some((a, b)) = ov_streams.as_ref() {
+                            let o = self.overlap.as_ref().expect("overlap state");
+                            o.ev_act.record(&s).map_err(map)?;
+                            a.wait(&o.ev_act).map_err(map)?;
+                            b.wait(&o.ev_act).map_err(map)?;
+                            (a, b)
+                        } else {
+                            (&s, &s)
+                        };
                     // Q,K,V  (qwen35 full-attn: wq is the fused [query|gate] projection -> 2*q_width)
                     if let Some(q) = self.qwen35.as_mut() {
                         dispatch_gemv(
@@ -5761,7 +5778,7 @@ impl CudaResidentDecode {
                         .map_err(map)?;
                     }
                     dispatch_gemv(
-                        &s,
+                        s_k,
                         &self.k,
                         lq[1],
                         &self.d_in_scales,
@@ -5776,7 +5793,7 @@ impl CudaResidentDecode {
                     )
                     .map_err(map)?;
                     dispatch_gemv(
-                        &s,
+                        s_v,
                         &self.k,
                         lq[2],
                         &self.d_in_scales,
@@ -5805,7 +5822,7 @@ impl CudaResidentDecode {
                         )
                         .map_err(map)?;
                         launch_rms_norm_per_head(
-                            &s,
+                            s_k,
                             &self.k.rms_norm_per_head,
                             &mut self.d_k,
                             kn,
@@ -5830,7 +5847,7 @@ impl CudaResidentDecode {
                     )
                     .map_err(map)?;
                     launch_rope(
-                        &s,
+                        s_k,
                         &self.k.rope,
                         &mut self.d_k,
                         &self.d_cos,
@@ -5843,7 +5860,7 @@ impl CudaResidentDecode {
                     .map_err(map)?;
                     // KV write
                     launch_kv_scatter(
-                        &s,
+                        s_k,
                         &self.k.kv_scatter,
                         &self.d_k,
                         &mut self.cache_k[li],
@@ -5854,7 +5871,7 @@ impl CudaResidentDecode {
                     )
                     .map_err(map)?;
                     launch_kv_scatter(
-                        &s,
+                        s_v,
                         &self.k.kv_scatter,
                         &self.d_v,
                         &mut self.cache_v[li],
@@ -5864,6 +5881,19 @@ impl CudaResidentDecode {
                         self.max_pos,
                     )
                     .map_err(map)?;
+                    // Join: K and V (including their cache scatters) are now published;
+                    // attention on main reads both caches, so it waits on the side
+                    // chains here. These event waits also transitively order every
+                    // later main-stream write of the shared activation scratch
+                    // (`d_in_*`/`d_q8k_*`, next written by the O-proj quantize) after
+                    // the side gemvs' reads — the WAR hazard the single stream hides.
+                    if ov_streams.is_some() {
+                        let o = self.overlap.as_ref().expect("overlap state");
+                        o.ev_k.record(s_k).map_err(map)?;
+                        o.ev_v.record(s_v).map_err(map)?;
+                        s.wait(&o.ev_k).map_err(map)?;
+                        s.wait(&o.ev_v).map_err(map)?;
+                    }
                     // attention. At depth, split-K (grid n_heads x n_splits) fills the SMs that
                     // the one-block-per-head launch leaves idle; below SPLITK_THRESHOLD the single
                     // kernel is cheaper (one launch, no scratch). Both are token-parity to the same
