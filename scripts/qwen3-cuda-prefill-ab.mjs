@@ -14,6 +14,10 @@
 const args = parseArgs(process.argv.slice(2))
 const base = (args.get('base') || 'http://127.0.0.1:8185').replace(/\/$/, '')
 const maxTokens = Number.parseInt(args.get('max-tokens') || '50', 10)
+// --depth-tokens N: append one ~N-token prompt so the completion decodes at real
+// depth (split-K attention above SPLITK_THRESHOLD). Default 0 keeps the corpus
+// byte-identical for existing callers.
+const depthTokens = Number.parseInt(args.get('depth-tokens') || '0', 10)
 
 // The three fixed bundle prompts (transitive to llama.cpp via the serial-prefill
 // bundle) plus one long prompt that forces many MAX_VERIFY_K prefill chunks.
@@ -27,6 +31,15 @@ const PROMPTS = [
   'Say hello.',
   longPrompt,
 ]
+if (depthTokens > 0) PROMPTS.push(buildDepthPrompt(depthTokens))
+
+function buildDepthPrompt(approxTokens) {
+  // Same deterministic filler as bench-qwen3-cuda-resident.mjs (~0.75 words/token).
+  const sentence = 'The quick brown fox jumps over the lazy dog near the riverbank. '
+  let s = 'Summarize the following passage in one word.\n\n'
+  while (s.length < approxTokens * 5) s += sentence
+  return s
+}
 
 async function chat(userContent) {
   const res = await fetch(`${base}/v1/chat/completions`, {

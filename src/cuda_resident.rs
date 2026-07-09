@@ -4424,6 +4424,34 @@ struct OffloadState {
     compute_done: Vec<CudaEvent>,
 }
 
+/// STAMPEDE Phase 6 multi-stream overlap state (`CAMELID_CUDA_STREAMS`, default off).
+/// Two side streams run the independent K chain (`side_a`: K gemv → k-norm → rope-K →
+/// scatter, reused for FFN-up) and V chain (`side_b`: V gemv → scatter) of each Full
+/// layer, joined back to the main stream by events before every dependent read. Every
+/// kernel launches unchanged (same grid, same reduction order) — only the stream an
+/// existing launch is enqueued on changes, so the math is bitwise-identical to the
+/// single-stream path. Constructed in `new` ONLY when the flag is on: instantiating a
+/// second stream flips cudarc into multi-stream mode with per-slice-arg event tracking
+/// on every launch, so the default path must never create these (see the gemma4
+/// `disable_event_tracking` gotcha). The five events are re-recorded every layer;
+/// `cuEventRecord` overwrites and each wait is enqueued (host order) after the record
+/// it consumes, so reuse across layers and tokens is correct — no per-token churn.
+#[allow(dead_code)] // events consumed by the forward_pass stream threading (wired next commit).
+struct StreamOverlap {
+    side_a: std::sync::Arc<CudaStream>,
+    side_b: std::sync::Arc<CudaStream>,
+    /// attn norm+quantize done on main → side gemvs may read `d_in_*`/`d_q8k_*`.
+    ev_act: CudaEvent,
+    /// K chain done on side_a → attention on main may read `cache_k[li]`.
+    ev_k: CudaEvent,
+    /// V chain done on side_b → attention on main may read `cache_v[li]`.
+    ev_v: CudaEvent,
+    /// ffn norm+quantize done on main → up gemv on side_a may read `d_in_*`/`d_q8k_*`.
+    ev_ffn: CudaEvent,
+    /// up gemv done on side_a → silu on main may read `d_up` (and overwrite `d_in_*`).
+    ev_up: CudaEvent,
+}
+
 /// Per-projection quantization lane the resident decode dispatches on. Q8_0 is the
 /// historical default (byte-identical to before); Q4K and Q6K are the K-quant lanes
 /// added for Q4_K_M models (mixed quant — Q4_K projections plus Q6_K attn_v/ffn_down
@@ -4630,6 +4658,10 @@ pub struct CudaResidentDecode {
     /// position) are written to device buffers BEFORE replay, so the frozen graph
     /// reads fresh values each step. Captured at the engine's `eps`/`scale`/`max_pos`.
     decode_graph: Option<SendCudaGraph>,
+    /// Phase 6 multi-stream overlap (side streams + join events). `None` unless
+    /// `CAMELID_CUDA_STREAMS` was on at build — the flag-off path constructs
+    /// nothing and stays in cudarc's single-stream mode.
+    overlap: Option<StreamOverlap>,
     /// Lazily-allocated K-batched scratch for the speculative-verify forward.
     verify_scratch: Option<VerifyScratch>,
     /// Lazily-allocated TREE-verify scratch (sized to `TREE_MAX_NODES`, wider than
@@ -4711,6 +4743,20 @@ fn cuda_graphs_enabled() -> bool {
     )
 }
 
+/// Whether decode overlaps the independent K/V and FFN-up GEMV chains of each Full
+/// layer on side CUDA streams (STAMPEDE Phase 6). **Default off** while the win is
+/// unproven on this driver: the side streams flip cudarc into multi-stream event
+/// tracking and WDDM may not co-schedule sub-100µs kernels, so the overlap is opt-in
+/// until the +8% low-ctx gate passes. Bitwise-neutral either way — every kernel
+/// launches unchanged; only the enqueue stream differs. Opt in with
+/// `CAMELID_CUDA_STREAMS=1`.
+fn cuda_streams_enabled() -> bool {
+    matches!(
+        std::env::var("CAMELID_CUDA_STREAMS").ok().as_deref(),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 /// Whether the resident decode uses the fused kernels (rms-norm+quantize, etc.). Default ON:
 /// the fused kernels are bit-identical to the unfused chain (validated by the cuda_resident
 /// parity tests) and cut the per-token kernel count, which is the dominant cost for small
@@ -4752,6 +4798,39 @@ impl CudaResidentDecode {
             .map(|_| s.alloc_zeros::<u16>(kv_width * max_pos))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("kv alloc: {e}"))?;
+        // Phase 6 side streams + join events, ONLY when opted in — creating a second
+        // stream switches cudarc to multi-stream event tracking for the whole context,
+        // so the default path must not construct these (see `StreamOverlap`).
+        let overlap = if cuda_streams_enabled() {
+            let side = || {
+                k.ctx
+                    .new_stream()
+                    .map_err(|e| format!("cuda-streams side stream: {e}"))
+            };
+            let ev = || {
+                k.ctx
+                    .new_event(None)
+                    .map_err(|e| format!("cuda-streams event: {e}"))
+            };
+            let o = StreamOverlap {
+                side_a: side()?,
+                side_b: side()?,
+                ev_act: ev()?,
+                ev_k: ev()?,
+                ev_v: ev()?,
+                ev_ffn: ev()?,
+                ev_up: ev()?,
+            };
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[cuda-streams] armed: 2 side streams + 5 join events constructed");
+            }
+            Some(o)
+        } else {
+            if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                eprintln!("[cuda-streams] off: single stream, no side streams constructed");
+            }
+            None
+        };
         Ok(Self {
             n_layers,
             n_heads,
@@ -4802,6 +4881,7 @@ impl CudaResidentDecode {
             d_sin: alloc_f(rope_dim / 2)?,
             d_position: s.alloc_zeros::<i32>(1).map_err(|e| format!("alloc: {e}"))?,
             decode_graph: None,
+            overlap,
             verify_scratch: None,
             tree_scratch: None,
             offload: None,
@@ -5453,6 +5533,31 @@ impl CudaResidentDecode {
         let map = |e: cudarc::driver::DriverError| format!("cuda forward: {e}");
         let s = self.k.stream.clone();
         let fused = resident_fusion_enabled();
+        // STAMPEDE Phase 6: resolve the overlap side streams once per forward. `None`
+        // keeps every launch on `s` exactly as today (flag off, graph capture, or
+        // offload active — a third stream would contend with the copy engine). Cloned
+        // Arcs rather than a held `&StreamOverlap` because `prefetch_offloaded`
+        // (&mut self) is called inside the layer loop; join events are borrowed
+        // per-statement instead, like the offload events.
+        let ov_streams = match self.overlap.as_ref() {
+            Some(o) if !graph_capture && self.offload.is_none() => {
+                Some((o.side_a.clone(), o.side_b.clone()))
+            }
+            _ => None,
+        };
+        if ov_streams.is_some() {
+            // Engaged-check for receipts: prove the ON leg actually ran the overlap
+            // (a receipt without this line measured the single-stream path).
+            static ENGAGED: std::sync::Once = std::sync::Once::new();
+            ENGAGED.call_once(|| {
+                if std::env::var_os("CAMELID_RESIDENT_TRACE").is_some() {
+                    eprintln!(
+                        "[cuda-streams] overlap ENGAGED: K chain + FFN-up on side_a, \
+                         V chain on side_b, event-joined per Full layer"
+                    );
+                }
+            });
+        }
         let hb = self.hidden / 32; // hidden blocks
         let fb = self.ffn_dim / 32; // ffn blocks
         let qb = self.q_width / 32; // q_width blocks
