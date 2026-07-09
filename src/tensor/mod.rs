@@ -238,6 +238,143 @@ impl Q4_0PackedRows8 {
     }
 }
 
+/// Unpack one Q4_K superblock's 12 packed kmask scale bytes into the eight
+/// 6-bit scales and eight 6-bit mins — the exact KMASK1/2/3 recombination the
+/// per-cell kernels perform (shared here so the 8-row repack and the owner
+/// kernels provably use the same unpack).
+pub fn q4_k_unpack_kmask_scales(sc: &[u8]) -> ([u8; 8], [u8; 8]) {
+    const KMASK1: u32 = 0x3f3f3f3f;
+    const KMASK2: u32 = 0x0f0f0f0f;
+    const KMASK3: u32 = 0x03030303;
+    let utmp0 = u32::from_le_bytes([sc[0], sc[1], sc[2], sc[3]]);
+    let utmp1 = u32::from_le_bytes([sc[4], sc[5], sc[6], sc[7]]);
+    let utmp2 = u32::from_le_bytes([sc[8], sc[9], sc[10], sc[11]]);
+    let mins8 = [
+        utmp1 & KMASK1,
+        ((utmp2 >> 4) & KMASK2) | (((utmp1 >> 6) & KMASK3) << 4),
+    ];
+    let scales_w = [
+        utmp0 & KMASK1,
+        (utmp2 & KMASK2) | (((utmp0 >> 6) & KMASK3) << 4),
+    ];
+    let mut scales = [0u8; 8];
+    let mut mins = [0u8; 8];
+    for g in 0..8 {
+        scales[g] = ((scales_w[g / 4] >> (8 * (g % 4))) & 0xff) as u8;
+        mins[g] = ((mins8[g / 4] >> (8 * (g % 4))) & 0xff) as u8;
+    }
+    (scales, mins)
+}
+
+/// STAMPEDE Lane B v5 — one 8-row group × one 256-column Q4_K superblock,
+/// repacked for the AVX-512 VNNI 8-row prefill GEMM. Everything weight-side
+/// is pre-hoisted at pack time: f16 super-scales pre-widened to f32, kmask
+/// scales/mins pre-unpacked and stored GROUP-major (`[group][row]` — one
+/// 8-byte load per group builds the per-row scale vector), and the nibble
+/// bytes re-laned at 4-byte-quad granularity (below). A straight byte
+/// permutation of wire data — zero numeric transformation.
+///
+/// Nibble layout: `qs[c*256 + qc*32 + r*4 + b]` = wire nibble byte
+/// `(row r, 32-byte chunk c, quad qc, byte b)`, so one 64-byte load yields
+/// quad-columns `qc, qc+1` for all 8 rows (lanes 0..7 = rows at `qc`, lanes
+/// 8..15 = rows at `qc+1`) — each i32 lane is exactly one dpbusd operand.
+#[repr(C, align(64))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q4KPackedRows8Block {
+    pub d: [f32; 8],
+    pub dmin: [f32; 8],
+    pub scales: [[u8; 8]; 8],
+    pub mins: [[u8; 8]; 8],
+    pub qs: [u8; 1024],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Q4KPackedRows8 {
+    pub rows: usize,
+    pub superblocks_per_row: usize,
+    /// `(rows / 8) * superblocks_per_row` blocks, row-group major then
+    /// superblock major (group g, superblock i at `g * superblocks_per_row + i`).
+    pub blocks: Vec<Q4KPackedRows8Block>,
+}
+
+impl Q4KPackedRows8 {
+    /// Interleave `rows` (multiple of 8) Q4_K weight rows read straight from
+    /// the GGUF wire bytes (144 B/superblock, row-major).
+    pub fn from_q4_k_wire(rows: usize, superblocks_per_row: usize, wire: &[u8]) -> Result<Self> {
+        const WIRE: usize = 144;
+        let expected_bytes = rows
+            .checked_mul(superblocks_per_row)
+            .and_then(|blocks| blocks.checked_mul(WIRE))
+            .ok_or_else(|| {
+                BackendError::InvalidTensorData("q4_k packed rows8 size overflow".to_string())
+            })?;
+        if wire.len() != expected_bytes || !rows.is_multiple_of(8) || superblocks_per_row == 0 {
+            return Err(BackendError::InvalidTensorData(format!(
+                "q4_k packed rows8 expects wire bytes for rows multiple of 8; rows={rows}, \
+                 superblocks_per_row={superblocks_per_row}, got {} bytes, expected {expected_bytes}",
+                wire.len()
+            )));
+        }
+        let mut blocks = Vec::with_capacity((rows / 8) * superblocks_per_row);
+        for row_group in (0..rows).step_by(8) {
+            for sb in 0..superblocks_per_row {
+                let mut block = Q4KPackedRows8Block {
+                    d: [0.0; 8],
+                    dmin: [0.0; 8],
+                    scales: [[0; 8]; 8],
+                    mins: [[0; 8]; 8],
+                    qs: [0; 1024],
+                };
+                for r in 0..8 {
+                    let src = ((row_group + r) * superblocks_per_row + sb) * WIRE;
+                    block.d[r] = f16_bits_to_f32(u16::from_le_bytes([wire[src], wire[src + 1]]));
+                    block.dmin[r] =
+                        f16_bits_to_f32(u16::from_le_bytes([wire[src + 2], wire[src + 3]]));
+                    let (scales, mins) = q4_k_unpack_kmask_scales(&wire[src + 4..src + 16]);
+                    for g in 0..8 {
+                        block.scales[g][r] = scales[g];
+                        block.mins[g][r] = mins[g];
+                    }
+                    let qs_src = src + 16;
+                    for c in 0..4 {
+                        for qc in 0..8 {
+                            for b in 0..4 {
+                                block.qs[c * 256 + qc * 32 + r * 4 + b] =
+                                    wire[qs_src + c * 32 + qc * 4 + b];
+                            }
+                        }
+                    }
+                }
+                blocks.push(block);
+            }
+        }
+        Ok(Self {
+            rows,
+            superblocks_per_row,
+            blocks,
+        })
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.blocks.len() * std::mem::size_of::<Q4KPackedRows8Block>()
+    }
+}
+
+/// Lazily-built 8-row repack cell carried on `CpuTensor`. Clones SHARE the
+/// cell (the pack is a derived cache of the immutable wire bytes), and it is
+/// deliberately identity-neutral in `PartialEq` — two tensors with equal wire
+/// bytes are equal whether or not either has built its pack yet.
+#[derive(Debug, Clone, Default)]
+pub struct Q4KRepack8Cell(
+    pub std::sync::Arc<std::sync::OnceLock<Option<std::sync::Arc<Q4KPackedRows8>>>>,
+);
+
+impl PartialEq for Q4KRepack8Cell {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Q8_0AmxPackedBlock {
@@ -993,6 +1130,11 @@ pub struct CpuTensor {
     /// repack them into the `q4k_gemv` SoA layout. Populated by the Q4_K load path;
     /// `None` for non-Q4_K tensors.
     pub q4_k_wire_bytes: Option<std::sync::Arc<Vec<u8>>>,
+    /// STAMPEDE Lane B v5: lazily-built 8-row interleaved repack of the Q4_K
+    /// wire bytes for the batched prefill owner (budget-gated; `None` inside
+    /// the cell = build denied/unpackable). Derived cache — see
+    /// [`Q4KRepack8Cell`] for the clone/equality semantics.
+    pub q4_k_repack8: Q4KRepack8Cell,
     /// Q5_K super-block wire bytes (176 bytes/super-block, row-major), retained when
     /// the tensor's `source_type` is `Q5K` so the CPU block-dot streams them via
     /// `q5_k_wire_row_dot` (and the GPU-resident decode path can feed the `q5k_gemv`
@@ -1171,6 +1313,7 @@ impl Q8_0TensorBlocks {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -1252,6 +1395,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -1341,6 +1485,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -1374,6 +1519,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -1402,6 +1548,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -1430,6 +1577,7 @@ impl CpuTensor {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: Some(backings),
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -3534,6 +3682,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes,
             q6_k_wire_bytes,
             q2_k_wire_bytes,
@@ -3567,6 +3716,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes: None,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes: None,
             q2_k_wire_bytes: None,
@@ -3798,6 +3948,7 @@ impl TensorStore {
             q8_0_wire_pages: None,
             q8_0_split_file_backing: None,
             q4_k_wire_bytes,
+            q4_k_repack8: Q4KRepack8Cell::default(),
             q5_k_wire_bytes: None,
             q6_k_wire_bytes,
             q2_k_wire_bytes,

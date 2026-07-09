@@ -17591,6 +17591,17 @@ fn q4_k_block_dot_core(
     in_dim: usize,
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
+    q4_k_block_dot_core_with_repack(input, wire, out_dim, in_dim, name, None)
+}
+
+fn q4_k_block_dot_core_with_repack(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+    repack8: Option<&crate::tensor::Q4KPackedRows8>,
+) -> Result<CpuTensor> {
     use rayon::prelude::*;
     if !in_dim.is_multiple_of(Q6_K_VALUES_PER_BLOCK) {
         return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -17610,7 +17621,7 @@ fn q4_k_block_dot_core(
     // weight unpack / mins-side sums / serial quantize / transpose.
     if n_rows >= 4 && x86_kquant_matmul_owner_enabled() {
         Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return q4_k_owner_prefill_tiled(input, wire, out_dim, in_dim, name);
+        return q4_k_owner_prefill_tiled(input, wire, out_dim, in_dim, name, repack8);
     }
     let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
         .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
@@ -17657,7 +17668,24 @@ fn matmul_rhs_transposed_q4_k_block_dot(
     }
     // Tied-embed/output transpose passes [in, out]; derive out_dim from the wire.
     let out_dim = wire.len() / row_bytes;
-    q4_k_block_dot_core(input, wire, out_dim, in_dim, name)
+    // Lane B v5: fetch-or-build the 8-row repack here — the only site with
+    // the owning CpuTensor in scope. Build is lazy, flag/feature/budget gated,
+    // and only attempted when the owner will actually run.
+    let repack8 = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if input.dim(0)? >= 4 && x86_kquant_matmul_owner_enabled() {
+                q4_k_repack8_for_weight(weight, wire, out_dim, in_dim)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            None
+        }
+    };
+    q4_k_block_dot_core_with_repack(input, wire, out_dim, in_dim, name, repack8.as_deref())
 }
 
 /// STAMPEDE Phase 3 Lane B — batched K-quant (Q4_K + Q6_K) prefill owner
@@ -17685,6 +17713,117 @@ fn x86_kquant_matmul_owner_enabled() -> bool {
         *ENABLED
             .get_or_init(|| q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER"))
     }
+}
+
+/// STAMPEDE Lane B v5 — 8-row interleaved repack sub-flag. Default OFF
+/// (opt-in until the gate receipt): `CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8=1`,
+/// honored only when the owner is on and the CPU has avx512f/bw/vnni (the
+/// 8-row kernel is AVX-512-only; AVX2 hosts keep the single-row inner).
+#[cfg(target_arch = "x86_64")]
+fn x86_kquant_matmul_owner_repack8_enabled() -> bool {
+    #[cfg(test)]
+    {
+        q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8")
+    }
+    #[cfg(not(test))]
+    {
+        if q8_runtime::bench_uncached_runtime_plan() {
+            return q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8");
+        }
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            q8_0_env_flag_enabled_default_off("CAMELID_X86_KQUANT_MATMUL_OWNER_REPACK8")
+        })
+    }
+}
+
+/// Global byte budget for 8-row repack copies (the packed copy lives BESIDE
+/// the wire bytes — GPU residency and embedding lookups need the wire).
+/// Degrade-never-refuse: an over-budget tensor simply stays on the
+/// bit-identical single-row inner. NOTE: this copy is deliberately invisible
+/// to `guard_cpu_weight_materialization_budget` (wire-only bindings bypass it)
+/// — this flag IS its budget.
+#[cfg(target_arch = "x86_64")]
+fn kquant_repack8_budget_bytes() -> usize {
+    fn read() -> usize {
+        env::var("CAMELID_X86_KQUANT_REPACK8_BUDGET_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(2048)
+            .saturating_mul(1024 * 1024)
+    }
+    #[cfg(test)]
+    {
+        read()
+    }
+    #[cfg(not(test))]
+    {
+        static BUDGET: OnceLock<usize> = OnceLock::new();
+        *BUDGET.get_or_init(read)
+    }
+}
+
+/// Bytes already reserved by built repacks (check-and-reserve).
+#[cfg(target_arch = "x86_64")]
+static KQUANT_REPACK8_RESERVED_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Fetch-or-build the 8-row repack for a Q4_K weight tensor. Returns `None`
+/// when the flag/features/budget deny it — callers fall through to the
+/// single-row inner (bit-identical either way).
+#[cfg(target_arch = "x86_64")]
+fn q4_k_repack8_for_weight(
+    weight: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+) -> Option<std::sync::Arc<crate::tensor::Q4KPackedRows8>> {
+    use std::sync::atomic::Ordering;
+    if !x86_kquant_matmul_owner_repack8_enabled() || !q8_owner_avx512vnni_available() {
+        return None;
+    }
+    let pack_rows = out_dim / 8 * 8;
+    if pack_rows == 0 {
+        return None;
+    }
+    weight
+        .q4_k_repack8
+        .0
+        .get_or_init(|| {
+            let superblocks = in_dim / Q6_K_VALUES_PER_BLOCK;
+            let bytes = (pack_rows / 8)
+                * superblocks
+                * std::mem::size_of::<crate::tensor::Q4KPackedRows8Block>();
+            // Check-and-reserve against the global budget.
+            let mut reserved = KQUANT_REPACK8_RESERVED_BYTES.load(Ordering::Relaxed);
+            loop {
+                if reserved + bytes > kquant_repack8_budget_bytes() {
+                    Q8_SCHED_KQUANT_OWNER_REPACK8_BUDGET_DENIED.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                match KQUANT_REPACK8_RESERVED_BYTES.compare_exchange_weak(
+                    reserved,
+                    reserved + bytes,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => reserved = actual,
+                }
+            }
+            let pack_wire = &wire[..pack_rows * superblocks * Q4_K_WIRE_BYTES_PER_BLOCK];
+            match crate::tensor::Q4KPackedRows8::from_q4_k_wire(pack_rows, superblocks, pack_wire) {
+                Ok(pack) => {
+                    Q8_SCHED_KQUANT_OWNER_REPACK8_BUILT.fetch_add(1, Ordering::Relaxed);
+                    Some(std::sync::Arc::new(pack))
+                }
+                Err(_) => {
+                    KQUANT_REPACK8_RESERVED_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+                    None
+                }
+            }
+        })
+        .clone()
 }
 
 /// AVX-512 VNNI inner for the K-quant owner: default ON whenever the owner is
@@ -17768,6 +17907,112 @@ fn q4_k_owner_main_side_scalar(qs: &[u8], q8: &[i8], scales: &[u8; 8]) -> (i64, 
         sumi2 += hi * scales[2 * j + 1] as i64;
     }
     (sumi1, sumi2)
+}
+
+/// v5 inner (STAMPEDE Lane B v5): 8-row-group AVX-512 VNNI kernel over the
+/// [`crate::tensor::Q4KPackedRows8`] repack. Per activation row, all 8 output
+/// cells of the group advance together: each 64-byte packed-weight load
+/// carries two quad-columns × 8 rows, pairs with one `permutexvar` broadcast
+/// of the matching activation quads, and one `dpbusd` — the activation bytes
+/// are loaded ONCE per superblock and reused by all 8 cells (vs once per cell
+/// in the single-row inner).
+///
+/// Bit-identity: the integer side is exact with headroom (dpbusd lane =
+/// quad-dot ≤ 7620; ≤ 4 quad-dots per lane per chunk ⇒ ≤ 30,480; halves fold
+/// ≤ 60,960; × scale ≤ 63 ⇒ ≤ 3.85M; main over 8 group-folds ≤ 30.8M ≪
+/// i32::MAX) and associative — reorganizing which lanes sum which quads
+/// cannot change any cell's total. The f32 chain is per-LANE IEEE, one lane
+/// per cell: `dvec = y.d × d[r]` (same two operands as the scalar chain),
+/// mins-side `fnmadd(dmin, prod, sumf)` ≡ `(-dmin).mul_add(prod, sumf)`
+/// (negation exact, single-rounded fma), then main-side `fmadd` — same two
+/// mul_adds, mins before main, ascending superblocks, one accumulator per
+/// cell. `cvtepi32_ps` is round-to-nearest-even, identical to the scalar
+/// path's `as f32`.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn q4_k_owner_weight_group8_avx512vnni(
+    group_blocks: &[crate::tensor::Q4KPackedRows8Block],
+    preps: &[(Vec<Q8KBlock>, Vec<[i32; 8]>)],
+    out: KQuantOwnerOutPtr,
+    out_dim: usize,
+    row_start: usize,
+    col_start: usize,
+) {
+    use std::arch::x86_64::*;
+    let low_mask = _mm512_set1_epi8(0x0f);
+    // Activation-quad broadcast indices per quad-pair load: lanes 0..7 pick
+    // quad 2*qcp, lanes 8..15 pick quad 2*qcp+1 (low-nibble groups use act
+    // quads 0..7 of the chunk, high-nibble groups quads 8..15).
+    let idx = |a: i32, b: i32| _mm512_set_epi32(b, b, b, b, b, b, b, b, a, a, a, a, a, a, a, a);
+    let idx_lo = [idx(0, 1), idx(2, 3), idx(4, 5), idx(6, 7)];
+    let idx_hi = [idx(8, 9), idx(10, 11), idx(12, 13), idx(14, 15)];
+    for (r, (blocks, sums_all)) in preps.iter().enumerate() {
+        let mut sumf = _mm256_setzero_ps();
+        for (gb, (y, sums)) in group_blocks.iter().zip(blocks.iter().zip(sums_all.iter())) {
+            let ydv = _mm256_set1_ps(y.d);
+            let dvec = _mm256_mul_ps(ydv, _mm256_loadu_ps(gb.d.as_ptr()));
+            let dminvec = _mm256_mul_ps(ydv, _mm256_loadu_ps(gb.dmin.as_ptr()));
+            // Mins side: per-row Σ_g mins[g][row] × act_group_sum[g], exact
+            // i32 (≤ 8·63·4064 ≈ 2.05M — also < 2^24, so cvtepi32_ps is exact).
+            let mut prodvec = _mm256_setzero_si256();
+            for (mins_row, &group_sum) in gb.mins.iter().zip(sums.iter()) {
+                let m = _mm256_cvtepu8_epi32(_mm_loadl_epi64(mins_row.as_ptr() as *const __m128i));
+                prodvec =
+                    _mm256_add_epi32(prodvec, _mm256_mullo_epi32(m, _mm256_set1_epi32(group_sum)));
+            }
+            sumf = _mm256_fnmadd_ps(dminvec, _mm256_cvtepi32_ps(prodvec), sumf);
+            // Main side.
+            let qp = y.qs.as_ptr();
+            let mut main8 = _mm256_setzero_si256();
+            for c in 0..4 {
+                // 16 activation quads of this chunk: 0..7 = low-nibble group
+                // 2c, 8..15 = high-nibble group 2c+1.
+                let act = _mm512_loadu_si512(qp.add(c * 64).cast());
+                let mut iacc_lo = _mm512_setzero_si512();
+                let mut iacc_hi = _mm512_setzero_si512();
+                for qcp in 0..4 {
+                    let w = _mm512_loadu_si512(gb.qs.as_ptr().add(c * 256 + qcp * 64).cast());
+                    let w_lo = _mm512_and_si512(w, low_mask);
+                    let w_hi = _mm512_and_si512(_mm512_srli_epi16(w, 4), low_mask);
+                    iacc_lo = _mm512_dpbusd_epi32(
+                        iacc_lo,
+                        w_lo,
+                        _mm512_permutexvar_epi32(idx_lo[qcp], act),
+                    );
+                    iacc_hi = _mm512_dpbusd_epi32(
+                        iacc_hi,
+                        w_hi,
+                        _mm512_permutexvar_epi32(idx_hi[qcp], act),
+                    );
+                }
+                let lo8 = _mm256_add_epi32(
+                    _mm512_castsi512_si256(iacc_lo),
+                    _mm512_extracti64x4_epi64(iacc_lo, 1),
+                );
+                let hi8 = _mm256_add_epi32(
+                    _mm512_castsi512_si256(iacc_hi),
+                    _mm512_extracti64x4_epi64(iacc_hi, 1),
+                );
+                let s_lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    gb.scales[2 * c].as_ptr() as *const __m128i
+                ));
+                let s_hi = _mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                    gb.scales[2 * c + 1].as_ptr() as *const __m128i
+                ));
+                main8 = _mm256_add_epi32(main8, _mm256_mullo_epi32(lo8, s_lo));
+                main8 = _mm256_add_epi32(main8, _mm256_mullo_epi32(hi8, s_hi));
+            }
+            sumf = _mm256_fmadd_ps(dvec, _mm256_cvtepi32_ps(main8), sumf);
+        }
+        let mut vals = [0f32; 8];
+        _mm256_storeu_ps(vals.as_mut_ptr(), sumf);
+        for (k, v) in vals.iter().enumerate() {
+            // SAFETY: each rayon task exclusively owns this group's 8 output
+            // columns; rows are serial within the task.
+            *out.0.add((row_start + r) * out_dim + col_start + k) = *v;
+        }
+    }
 }
 
 /// v4 inner (STAMPEDE P3 escalation): AVX-512 VNNI sibling of
@@ -17937,6 +18182,7 @@ fn q4_k_owner_prefill_tiled(
     out_dim: usize,
     in_dim: usize,
     name: impl Into<String>,
+    repack8: Option<&crate::tensor::Q4KPackedRows8>,
 ) -> Result<CpuTensor> {
     use rayon::prelude::*;
     let superblocks = in_dim / Q6_K_VALUES_PER_BLOCK;
@@ -17983,6 +18229,82 @@ fn q4_k_owner_prefill_tiled(
     // rows are the rayon dimension (disjoint output-channel chunks per task).
     const ROW_BLOCK: usize = 64;
     const WEIGHT_CHUNK: usize = 32;
+
+    // Lane B v5: 8-row-group path over the interleaved repack. The packed
+    // copy covers floor(out_dim/8)*8 rows; the ragged tail (test-only for
+    // real model shapes) and non-repacked tensors take the single-row path
+    // below — bit-identical either way.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(pack) = repack8 {
+        if use_vnni && pack.superblocks_per_row == superblocks && pack.rows <= out_dim {
+            Q8_SCHED_KQUANT_OWNER_REPACK8_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let groups = pack.rows / 8;
+            const GROUPS_PER_TASK: usize = 4; // 32 output rows per task, as below
+            for row_start in (0..n_rows).step_by(ROW_BLOCK) {
+                let row_end = (row_start + ROW_BLOCK).min(n_rows);
+                (0..groups.div_ceil(GROUPS_PER_TASK))
+                    .into_par_iter()
+                    .for_each(|task| {
+                        let g_start = task * GROUPS_PER_TASK;
+                        let g_end = (g_start + GROUPS_PER_TASK).min(groups);
+                        for g in g_start..g_end {
+                            let group_blocks = &pack.blocks[g * superblocks..(g + 1) * superblocks];
+                            // SAFETY: avx512f/bw/vnni proven at pack time
+                            // (the pack is only built when available).
+                            unsafe {
+                                q4_k_owner_weight_group8_avx512vnni(
+                                    group_blocks,
+                                    &preps[row_start..row_end],
+                                    out_ptr,
+                                    out_dim,
+                                    row_start,
+                                    g * 8,
+                                );
+                            }
+                        }
+                    });
+            }
+            // Ragged tail rows: single-row scalar per-cell path (same
+            // integers, same f32 chain — see the scalar twin below).
+            for o in pack.rows..out_dim {
+                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                for (r, (blocks, sums)) in preps.iter().enumerate() {
+                    let mut sumf = 0f32;
+                    for i in 0..superblocks {
+                        let y = &blocks[i];
+                        let block = &w_row
+                            [i * Q4_K_WIRE_BYTES_PER_BLOCK..(i + 1) * Q4_K_WIRE_BYTES_PER_BLOCK];
+                        let d = y.d
+                            * crate::tensor::f16_bits_to_f32(u16::from_le_bytes([
+                                block[0], block[1],
+                            ]));
+                        let dmin = y.d
+                            * crate::tensor::f16_bits_to_f32(u16::from_le_bytes([
+                                block[2], block[3],
+                            ]));
+                        let (scales, mins) = crate::tensor::q4_k_unpack_kmask_scales(&block[4..16]);
+                        let mut prod: i64 = 0;
+                        for g in 0..8 {
+                            prod += sums[i][g] as i64 * mins[g] as i64;
+                        }
+                        sumf = (-dmin).mul_add(prod as f32, sumf);
+                        let (sumi1, sumi2) =
+                            q4_k_owner_main_side_scalar(&block[16..144], &y.qs, &scales);
+                        sumf = d.mul_add((sumi1 + sumi2) as f32, sumf);
+                    }
+                    // SAFETY: serial loop, tail columns disjoint from the
+                    // group tasks above (o >= pack.rows).
+                    unsafe {
+                        *out_ptr.0.add(r * out_dim + o) = sumf;
+                    }
+                }
+            }
+            return CpuTensor::from_f32(name, vec![n_rows, out_dim], out);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = repack8;
+
     let chunks = out_dim.div_ceil(WEIGHT_CHUNK);
     for row_start in (0..n_rows).step_by(ROW_BLOCK) {
         let row_end = (row_start + ROW_BLOCK).min(n_rows);

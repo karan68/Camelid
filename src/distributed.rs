@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::error::{BackendError, Result};
 use crate::inference::LlamaInferenceSession;
-use crate::tensor::{CpuTensor, RuntimeDType, TensorShape};
+use crate::tensor::{CpuTensor, Q4KRepack8Cell, RuntimeDType, TensorShape};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +95,7 @@ pub fn deserialize_tensor<R: Read>(reader: &mut R, name: String) -> std::io::Res
         q8_0_wire_pages: None,
         q8_0_split_file_backing: None,
         q4_k_wire_bytes: None,
+        q4_k_repack8: Q4KRepack8Cell::default(),
         q5_k_wire_bytes: None,
         q6_k_wire_bytes: None,
         q2_k_wire_bytes: None,
