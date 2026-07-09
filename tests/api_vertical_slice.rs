@@ -1862,8 +1862,10 @@ async fn chat_completion_accepts_tools_but_rejects_other_tool_fields() {
 
 #[tokio::test]
 async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
-    // response_format json_object is now supported (JSON-grammar-constrained
-    // decoding); json_schema and other types are still rejected before runtime.
+    // response_format json_object and a supported json_schema are honored (JSON /
+    // JSON-Schema constrained decoding). A json_schema whose schema falls outside
+    // the enforceable subset (here a top-level `string`, which must be an object or
+    // array) is still rejected before runtime with a typed error naming the param.
     let app = camelid::api::router();
     let response = app
         .oneshot(
@@ -1872,7 +1874,7 @@ async fn chat_completion_rejects_unsupported_response_format_before_runtime() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema"}}"#,
+                    r#"{"model":"tiny","messages":[{"role":"user","content":"hello"}],"max_tokens":1,"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"string"}}}}"#,
                 ))
                 .unwrap(),
         )

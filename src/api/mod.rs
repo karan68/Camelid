@@ -961,10 +961,10 @@ pub struct GenerationSessionRequest {
     pub unsupported_fields: HashMap<String, serde_json::Value>,
     #[serde(default, skip_deserializing)]
     default_max_tokens_cap: Option<u32>,
-    /// JSON-grammar-constrained decoding (`response_format: json_object`). Set by the
-    /// chat handler; never deserialized from the wire.
+    /// Active output constraint (`response_format: json_object` / `json_schema`),
+    /// compiled by the chat handler; never deserialized from the wire.
     #[serde(default, skip_deserializing)]
-    json_object_mode: bool,
+    constraint: Option<crate::grammar::ConstraintSpec>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1400,9 +1400,10 @@ struct PreparedGeneration {
     /// When set, collect per-token logprobs each step (chosen + this many top
     /// alternatives). Forces the full-host-logits decode path (no GPU greedy-fast).
     logprobs_top_n: Option<usize>,
-    /// JSON-grammar-constrained decoding: each step is masked to tokens that keep a
-    /// valid JSON-object prefix. Forces the full-logits CPU decode path.
-    json_object_mode: bool,
+    /// Active output constraint (`response_format` json_object / json_schema): each
+    /// step is masked to tokens that keep a valid prefix of the constrained value.
+    /// Forces the full-logits CPU decode path.
+    constraint: Option<crate::grammar::ConstraintSpec>,
     stop_sequences: Vec<String>,
     logit_diagnostic_token_ids: Vec<u32>,
     collect_dense_diagnostics: bool,
@@ -2295,7 +2296,7 @@ async fn llama_server_completion(
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
-        json_object_mode: false,
+        constraint: None,
     };
     // Prep runs OUTSIDE any serialization (D3); the decode runs on the engine
     // worker, and CancelOnDrop stops it within one step on client disconnect.
@@ -7252,7 +7253,7 @@ async fn completions(
         tools: None,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: None,
-        json_object_mode: false,
+        constraint: None,
     };
     let stream = req.stream.unwrap_or(false);
     if n_choices > 1 {
@@ -7554,17 +7555,16 @@ async fn chat_completions(
     // request supplied tools and tool_choice is not "none".
     let tools_active = req.tools.as_ref().is_some_and(|t| !t.is_empty())
         && tool_choice_allows_calls(req.tool_choice.as_ref());
-    // response_format: json_object -> JSON-grammar-constrained decoding (non-streaming).
-    let json_object_mode = match json_object_mode_from_response_format(req.response_format.as_ref())
-    {
-        Ok(mode) => mode,
+    // response_format -> constrained decoding (json_object / json_schema, non-streaming).
+    let constraint = match constraint_from_response_format(req.response_format.as_ref()) {
+        Ok(constraint) => constraint,
         Err(response) => return *response,
     };
-    if json_object_mode && req.stream.unwrap_or(false) {
+    if constraint.is_some() && req.stream.unwrap_or(false) {
         return api_error(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "response_format json_object is not supported with stream:true; request it without streaming".to_string(),
+            "response_format constrained decoding is not supported with stream:true; request it without streaming".to_string(),
             Some("response_format"),
         );
     }
@@ -7623,7 +7623,7 @@ async fn chat_completions(
         tools: req.tools,
         unsupported_fields: req.unsupported_fields,
         default_max_tokens_cap: Some(DEFAULT_PUBLIC_CHAT_MAX_TOKENS),
-        json_object_mode,
+        constraint,
     };
     let stream = req.stream.unwrap_or(false);
     if n_choices > 1 {
@@ -7987,7 +7987,7 @@ pub async fn replay_receipt_request(
         tools: None,
         unsupported_fields: HashMap::new(),
         default_max_tokens_cap: None,
-        json_object_mode: false,
+        constraint: None,
     };
     // Prep needs no lock: the GPU-runnable-tier parity probe inside
     // prepare_generation serializes via its own engine job. The replay decode
@@ -8753,7 +8753,7 @@ async fn prepare_generation(
         session,
         sampling,
         logprobs_top_n,
-        json_object_mode: req.json_object_mode,
+        constraint: req.constraint.clone(),
         stop_sequences,
         logit_diagnostic_token_ids,
         collect_dense_diagnostics,
@@ -9874,12 +9874,12 @@ fn generate_token_ids(
     let mut top_logits = Vec::new();
     let mut step_top_logits = Vec::new();
     let mut step_logprobs: Vec<StepLogprob> = Vec::new();
-    // JSON-grammar-constrained decoding setup (response_format json_object). Cache
-    // each token's output bytes once; mask the logits to valid JSON-prefix tokens
-    // each step; stop as soon as the top-level object closes.
-    let json_grammar_active = prepared.json_object_mode;
+    // Constrained-decoding setup (response_format json_object / json_schema). Cache
+    // each token's output bytes once; mask the logits to tokens that keep a valid
+    // prefix of the constrained value each step; stop as soon as it completes.
+    let constraint_active = prepared.constraint.is_some();
     let grammar_vocab = prepared.tokenizer.tokens.len();
-    let grammar_token_bytes: Vec<Vec<u8>> = if json_grammar_active {
+    let grammar_token_bytes: Vec<Vec<u8>> = if constraint_active {
         (0..grammar_vocab as u32)
             .map(|id| {
                 prepared
@@ -9892,16 +9892,12 @@ fn generate_token_ids(
     } else {
         Vec::new()
     };
-    let mut grammar: Option<crate::grammar::ConstraintState> =
-        json_grammar_active.then(crate::grammar::ConstraintState::new_json);
-    let mut grammar_mask: Vec<bool> = vec![
-        false;
-        if json_grammar_active {
-            grammar_vocab
-        } else {
-            0
-        }
-    ];
+    let mut grammar: Option<crate::grammar::ConstraintState> = prepared
+        .constraint
+        .as_ref()
+        .map(crate::grammar::ConstraintSpec::build);
+    let mut grammar_mask: Vec<bool> =
+        vec![false; if constraint_active { grammar_vocab } else { 0 }];
     let collect_step_top_logits = !prepared.logit_diagnostic_token_ids.is_empty();
     let mut output_projection = Vec::new();
     let mut dense = None;
@@ -10519,23 +10515,49 @@ fn build_completion_logprobs(steps: &[StepLogprob]) -> CompletionLogprobs {
     }
 }
 
-/// Interpret OpenAI `response_format`. `Ok(true)` = json_object mode (constrain to
-/// valid JSON), `Ok(false)` = normal decoding (text / absent), `Err` = a typed 400
-/// for shapes Camelid does not support yet (json_schema, unknown types).
-fn json_object_mode_from_response_format(
+/// Interpret OpenAI `response_format` into an optional output constraint.
+/// `Ok(None)` = normal decoding (text / absent); `Ok(Some(_))` = constrained
+/// decoding (`json_object`, or `json_schema` whose schema is inside the supported
+/// subset); `Err` = a typed 400 for an unsupported shape or a schema Camelid cannot
+/// enforce byte-for-byte.
+fn constraint_from_response_format(
     response_format: Option<&serde_json::Value>,
-) -> std::result::Result<bool, Box<Response>> {
+) -> std::result::Result<Option<crate::grammar::ConstraintSpec>, Box<Response>> {
     let Some(value) = response_format.filter(|v| !v.is_null()) else {
-        return Ok(false);
+        return Ok(None);
     };
     match value.get("type").and_then(serde_json::Value::as_str) {
-        Some("json_object") => Ok(true),
-        Some("text") | None => Ok(false),
+        Some("json_object") => Ok(Some(crate::grammar::ConstraintSpec::json_object())),
+        Some("json_schema") => {
+            let schema = value
+                .get("json_schema")
+                .and_then(|json_schema| json_schema.get("schema"))
+                .ok_or_else(|| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        "response_format json_schema requires a `json_schema.schema` object"
+                            .to_string(),
+                        Some("response_format"),
+                    ))
+                })?;
+            crate::grammar::ConstraintSpec::from_schema(schema)
+                .map(Some)
+                .map_err(|err| {
+                    Box::new(api_error(
+                        StatusCode::BAD_REQUEST,
+                        "unsupported_parameter",
+                        format!("response_format json_schema is not supported: {err}"),
+                        Some("response_format"),
+                    ))
+                })
+        }
+        Some("text") | None => Ok(None),
         Some(other) => Err(Box::new(api_error(
             StatusCode::BAD_REQUEST,
             "unsupported_parameter",
             format!(
-                "response_format type {other:?} is not supported yet; only json_object (and text) are honored"
+                "response_format type {other:?} is not supported; only json_object, json_schema, and text are honored"
             ),
             Some("response_format"),
         ))),
@@ -13079,19 +13101,42 @@ mod tests {
     }
 
     #[test]
-    fn response_format_interprets_json_object_mode() {
+    fn response_format_maps_to_constraint() {
         use serde_json::json;
-        // json_object turns constrained decoding on; text / absent leave it off.
+        // json_object and a supported json_schema enable constrained decoding;
+        // text / absent leave it off.
         assert!(
-            json_object_mode_from_response_format(Some(&json!({"type": "json_object"}))).unwrap()
+            constraint_from_response_format(Some(&json!({"type": "json_object"})))
+                .unwrap()
+                .is_some()
         );
-        assert!(!json_object_mode_from_response_format(Some(&json!({"type": "text"}))).unwrap());
-        assert!(!json_object_mode_from_response_format(None).unwrap());
-        assert!(!json_object_mode_from_response_format(Some(&json!(null))).unwrap());
-        // json_schema (and other types) are a typed error, not silently ignored.
         assert!(
-            json_object_mode_from_response_format(Some(&json!({"type": "json_schema"}))).is_err()
+            constraint_from_response_format(Some(&json!({"type": "text"})))
+                .unwrap()
+                .is_none()
         );
+        assert!(constraint_from_response_format(None).unwrap().is_none());
+        assert!(constraint_from_response_format(Some(&json!(null)))
+            .unwrap()
+            .is_none());
+        // A supported json_schema compiles.
+        let good = json!({
+            "type": "json_schema",
+            "json_schema": {"name": "x", "schema": {
+                "type": "object", "additionalProperties": false,
+                "properties": {"a": {"type": "string"}}, "required": ["a"]
+            }}
+        });
+        assert!(constraint_from_response_format(Some(&good))
+            .unwrap()
+            .is_some());
+        // A schema outside the subset is a typed error, not silently ignored.
+        let bad = json!({"type": "json_schema", "json_schema": {"schema": {"type": "string"}}});
+        assert!(constraint_from_response_format(Some(&bad)).is_err());
+        // A json_schema without the schema payload is an error.
+        assert!(constraint_from_response_format(Some(&json!({"type": "json_schema"}))).is_err());
+        // Unknown response_format types remain errors.
+        assert!(constraint_from_response_format(Some(&json!({"type": "yaml"}))).is_err());
     }
 
     #[test]
@@ -15889,7 +15934,7 @@ mod tests {
             session,
             sampling: SamplingConfig::default(),
             logprobs_top_n: None,
-            json_object_mode: false,
+            constraint: None,
             stop_sequences: Vec::new(),
             logit_diagnostic_token_ids: Vec::new(),
             collect_dense_diagnostics: false,

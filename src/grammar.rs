@@ -1090,13 +1090,6 @@ impl ConstraintState {
         Self::Json(JsonState::new())
     }
 
-    /// Construct a JSON-Schema constraint by compiling `schema` into the supported
-    /// subset. Returns [`SchemaError`] (naming the offending keyword) for any schema
-    /// feature Camelid cannot enforce byte-for-byte, so the caller can fail closed.
-    pub fn new_schema(schema: &serde_json::Value) -> Result<Self, SchemaError> {
-        Ok(Self::Schema(SchemaState::new(compile_root(schema)?)))
-    }
-
     /// Would appending `bytes` keep the output a valid prefix of the constrained
     /// value? Used to mask a candidate token without mutating the live state.
     pub fn accepts(&self, bytes: &[u8]) -> bool {
@@ -1122,6 +1115,45 @@ impl ConstraintState {
         match self {
             Self::Json(state) => state.is_done(),
             Self::Schema(state) => state.is_done(),
+        }
+    }
+}
+
+/// A validated, cheaply-clonable description of the active output constraint.
+///
+/// Built once at request time — so a schema outside the supported subset surfaces
+/// as an error before generation starts — and used by the decode loop to spawn a
+/// fresh [`ConstraintState`] per generation via [`ConstraintSpec::build`]. The inner
+/// kind is private so the compiled `Schema` stays an implementation detail.
+#[derive(Clone, Debug)]
+pub struct ConstraintSpec(ConstraintKind);
+
+#[derive(Clone, Debug)]
+enum ConstraintKind {
+    Json,
+    Schema(Schema),
+}
+
+impl ConstraintSpec {
+    /// The `{"type":"json_object"}` constraint: any valid JSON object.
+    pub fn json_object() -> Self {
+        Self(ConstraintKind::Json)
+    }
+
+    /// Compile a JSON Schema into the supported subset. Returns [`SchemaError`]
+    /// (naming the offending keyword) for any feature Camelid cannot enforce
+    /// byte-for-byte, so the caller can fail closed with a precise message.
+    pub fn from_schema(schema: &serde_json::Value) -> Result<Self, SchemaError> {
+        Ok(Self(ConstraintKind::Schema(compile_root(schema)?)))
+    }
+
+    /// Spawn a fresh constraint state for one generation.
+    pub fn build(&self) -> ConstraintState {
+        match &self.0 {
+            ConstraintKind::Json => ConstraintState::new_json(),
+            ConstraintKind::Schema(schema) => {
+                ConstraintState::Schema(SchemaState::new(schema.clone()))
+            }
         }
     }
 }
@@ -1494,5 +1526,27 @@ mod tests {
         }
         assert!(st.accepts(b"nt\""));
         assert!(!st.accepts(b"lour\""));
+    }
+
+    #[test]
+    fn constraint_spec_builds_and_validates() {
+        use serde_json::json;
+        // A json_object spec builds a working JSON-object constraint.
+        let mut c = ConstraintSpec::json_object().build();
+        for &b in br#"{"a":1}"# {
+            c.advance(b).unwrap();
+        }
+        assert!(c.is_done());
+        // A supported schema compiles and enforces its property types.
+        let spec = ConstraintSpec::from_schema(&json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"a": {"type": "string"}}, "required": ["a"]
+        }))
+        .expect("supported schema should compile");
+        let s = spec.build();
+        assert!(!s.accepts(b"{\"a\":1")); // 'a' must be a string
+        assert!(s.accepts(b"{\"a\":\"x\"}"));
+        // A schema outside the subset is an error, not a panic or a silent pass.
+        assert!(ConstraintSpec::from_schema(&json!({"type": "string"})).is_err());
     }
 }
