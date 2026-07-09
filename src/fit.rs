@@ -26,11 +26,15 @@ use crate::capability::HardwareProfile;
 /// independent constant kept in sync by convention (see [`usable_host_ram_bytes`]
 /// for how the two policies relate), not a shared symbol.
 const USABLE_RAM_AVAILABLE_PERCENT: u64 = 80;
-/// Floor as a share of *total* host RAM, mirroring the *value* of
-/// `KV_CACHE_BUDGET_TOTAL_FLOOR_PERCENT`. Guards against a transient dip in the live
-/// `available` reading (which drops sharply as weights fault into the working set)
-/// collapsing the budget below what a normal run needs.
-const USABLE_RAM_TOTAL_FLOOR_PERCENT: u64 = 25;
+
+// NOTE: the KV-cache budget applies a 25%-of-TOTAL floor to survive a transient
+// dip in `available` mid-generation (weights already resident, KV growth still
+// guarded incrementally by predict-and-abort). A PRE-LOAD fit advisor has the
+// opposite risk profile: the weights are NOT yet resident, so flooring usable
+// RAM up to 25% of total would let the advisor claim a model "fits" when the
+// host is genuinely starved — an overcommit vector that can OOM the load. This
+// box has crashed on memory pressure, so the advisor is conservative and uses
+// ONLY actually-available RAM (no total-RAM floor).
 
 /// The advisor's verdict for a single (model footprint, host) pair.
 ///
@@ -130,11 +134,9 @@ fn usable_host_ram_bytes(hw: &HardwareProfile) -> Option<u64> {
         .host_ram_free_bytes
         .saturating_mul(USABLE_RAM_AVAILABLE_PERCENT)
         / 100;
-    let floor = hw
-        .host_ram_total_bytes
-        .saturating_mul(USABLE_RAM_TOTAL_FLOOR_PERCENT)
-        / 100;
-    Some(by_available.max(floor))
+    // Conservative pre-load capacity: available RAM only, no total-RAM floor
+    // (see the constants above — flooring here overcommits a starved host).
+    Some(by_available)
 }
 
 /// Whether the host has a GPU we can actually place weights on.
@@ -158,7 +160,20 @@ fn assess_with_headroom(hw: &HardwareProfile, m: &FitInputs, vram_headroom_mib: 
 
     if has_usable_gpu(hw) {
         match crate::cuda_vram::evaluate(hw.cuda_vram_free_bytes, footprint, vram_headroom_mib) {
-            Ok(_) => return FitVerdict::FitsResident,
+            Ok(_) => {
+                // A VRAM-resident load still stages weights through host RAM:
+                // the GGUF tensors are read/repacked host-side before upload
+                // (cuda_resident repack + clone_htod). If host RAM is KNOWN to
+                // be too starved to stage the footprint, we cannot honestly
+                // promise the load succeeds — abstain with `Unknown` (never a
+                // false-positive fit) rather than assert `FitsResident`. When
+                // host RAM is unprobed (`None`) we don't block a GPU that has
+                // room. (Crash-safety: this box has OOM'd on memory pressure.)
+                return match usable_ram {
+                    Some(ram) if footprint > ram => FitVerdict::Unknown,
+                    _ => FitVerdict::FitsResident,
+                };
+            }
             Err(_) => {
                 return match usable_ram {
                     Some(ram) if footprint <= hw.cuda_vram_free_bytes.saturating_add(ram) => {
@@ -384,21 +399,43 @@ mod tests {
 
     #[test]
     fn wont_fit_cpu_only_when_model_exceeds_ram_budget() {
-        // No GPU, 8 GB RAM → budget ~ max(80% of 5 GB=4 GB, 25% of 8 GB=2 GB)=4 GB;
-        // an 8.5 GB model won't fit.
+        // No GPU, 8 GB RAM with 5 GB free → budget = 80% of 5 GB = 4 GB (no
+        // total-RAM floor); an 8.5 GB model won't fit.
         let hw = profile(false, 0, 8 * GIB, 5 * GIB);
         let m = inputs(8_541_283_552, 512 * MIB);
         assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::WontFit);
     }
 
     #[test]
-    fn ram_floor_dominates_when_available_dips_transiently() {
-        // 32 GB total but a transient low available (2 GB). The 25%-of-total floor
-        // (8 GB) must dominate the 80%-of-available (1.6 GB), so a ~3.4 GB model
-        // still fits CPU-only rather than spuriously "won't fit".
+    fn starved_host_wont_fit_despite_large_total_ram() {
+        // 32 GB total but only 2 GB actually free. A PRE-LOAD advisor must NOT
+        // floor up to 25% of total (8 GB) and claim a 3.4 GB model fits — the
+        // weights are not resident yet, so that would overcommit and OOM the
+        // load. Conservative: budget = 80% of 2 GB = 1.6 GB → WontFit.
         let hw = profile(false, 0, 32 * GIB, 2 * GIB);
         let m = inputs(3_421_898_816, 256 * MIB);
-        assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::CpuOnlyOk);
+        assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::WontFit);
+    }
+
+    #[test]
+    fn resident_downgrades_to_unknown_when_host_ram_cannot_stage() {
+        // 12 GB card easily holds a 4 GB model in VRAM, but the host has only
+        // 2 GB free — too little to stage/repack the weights before upload. The
+        // advisor must not assert a confident FitsResident; abstain (Unknown),
+        // which never blocks the load, rather than promise a fit that may OOM
+        // during staging.
+        let hw = profile(true, 12 * GIB, 32 * GIB, 2 * GIB);
+        let m = inputs(4 * GIB, 256 * MIB);
+        assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::Unknown);
+    }
+
+    #[test]
+    fn resident_when_gpu_and_host_ram_both_have_room() {
+        // Same GPU, but a healthy host (24 GB free) can stage the 4 GB model →
+        // a confident FitsResident.
+        let hw = profile(true, 12 * GIB, 32 * GIB, 24 * GIB);
+        let m = inputs(4 * GIB, 256 * MIB);
+        assert_eq!(assess_with_headroom(&hw, &m, H), FitVerdict::FitsResident);
     }
 
     #[test]
