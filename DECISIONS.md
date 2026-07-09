@@ -679,3 +679,39 @@ single-host receipts promote a default that is cfg-SCOPED to exactly the host cl
 that was measured (win-x86_64), leaving every other target Off. If the treaty should
 bind even scoped flips, revert by deleting the cfg branch in
 `Q8MatmulOwnerScope::from_env`.
+
+## D16 — API engine inversion: one worker thread owns all decode compute (2026-07-09)
+
+**Decision:** `AppState::generation_lock` is deleted. Every decode (streaming,
+non-streaming, multi-choice, receipt replay) and every mutation of
+engine-owned state (the GPU-runnable parity probe, `reset_resident_caches` on
+unload) executes as a job on ONE dedicated engine worker thread behind a
+bounded queue (`CAMELID_QUEUE_DEPTH`, default 8). HTTP handlers validate and
+prepare OUTSIDE any serialization, post a job, and consume its events.
+
+**Ownership invariant (enforced by tests, binding on future work):** only the
+engine thread touches `LlamaInferenceSession` decode state, resident GPU
+decode/KV state, and the prompt-prefix cache; all mutations of that state are
+engine jobs. Anything else is a regression of the orphan-decode SEV.
+
+**Why:** the lock's guard lifetime was decoupled from the `spawn_blocking`
+decode it guarded. Client disconnect, the server's own generation timeout, or
+an SSE hangup dropped the handler future, freed the lock, and left the decode
+running — the next request then decoded concurrently with the orphan against
+shared CUDA-resident KV state (garbled output, non-deterministic greedy,
+OOB-slice panics). Demonstrated on all three triggers at the pin
+(`qa/evidence-bundles/engine-inversion-gate0-*`); fixed structurally
+(`engine-inversion-gate1-*`, `engine-inversion-gate2-*`), mirroring
+llama.cpp's `server_queue` single-consumer ownership model.
+
+**Contract consequences (deliberate):** cancellation is cooperative — a
+dropped request stops its decode within one token step (`GenerationCancel` /
+`CancelOnDrop`); the wall-clock timeout is enforced inside the decode loop and
+never detaches compute; burst beyond queue depth is a typed 503
+(`engine_queue_full` + Retry-After) with depth observable in `/v1/health` and
+`/v1/slots`; a decode wedged inside one forward waits rather than
+503-and-orphan. Parity: supported-row outputs byte-identical pre/post across
+greedy + seeded sampling, stream + non-stream, cache hit + miss, CPU + resident
+CUDA lanes (receipts in the gate bundles). Multi-slot/continuous batching was
+evaluated and KILLED for this hardware class
+(docs/recon/ENGINE_INVERSION_PHASE5_MULTISLOT_RECON.md).
