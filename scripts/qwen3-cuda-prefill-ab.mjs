@@ -11,6 +11,8 @@
 //
 // Usage: node scripts/qwen3-cuda-prefill-ab.mjs --base http://127.0.0.1:8185
 
+import http from 'node:http'
+
 const args = parseArgs(process.argv.slice(2))
 const base = (args.get('base') || 'http://127.0.0.1:8185').replace(/\/$/, '')
 const maxTokens = Number.parseInt(args.get('max-tokens') || '50', 10)
@@ -42,19 +44,32 @@ function buildDepthPrompt(approxTokens) {
 }
 
 async function chat(userContent) {
-  const res = await fetch(`${base}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      messages: [{ role: 'user', content: userContent }],
-      max_tokens: maxTokens,
-      temperature: 0,
-      top_k: 1,
-      camelid_enable_thinking: false,
-    }),
+  // node:http, not fetch: undici's default 300s headers timeout kills legs
+  // whose prefill legitimately exceeds it (K-quant GPU prefill of a ~2080-token
+  // prompt under host load measured 302s). Same fix as the #399 context
+  // harness. No client timeout — the server's generation timeout governs.
+  const payload = JSON.stringify({
+    messages: [{ role: 'user', content: userContent }],
+    max_tokens: maxTokens,
+    temperature: 0,
+    top_k: 1,
+    camelid_enable_thinking: false,
   })
-  if (!res.ok) throw new Error(`chat -> HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`)
-  const body = await res.json()
+  const { status, text } = await new Promise((resolve, reject) => {
+    const u = new URL(`${base}/v1/chat/completions`)
+    const req = http.request(
+      { hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) } },
+      (res) => {
+        let d = ''
+        res.on('data', (c) => (d += c))
+        res.on('end', () => resolve({ status: res.statusCode, text: d }))
+      },
+    )
+    req.on('error', reject)
+    req.end(payload)
+  })
+  if (status !== 200) throw new Error(`chat -> HTTP ${status}: ${text.slice(0, 300)}`)
+  const body = JSON.parse(text)
   const content = body.choices?.[0]?.message?.content
   if (typeof content !== 'string') {
     // A missing/undefined content would be silently DROPPED by JSON.stringify,
