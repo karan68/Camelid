@@ -17519,8 +17519,6 @@ fn matmul_rhs_transposed_q6_k_block_dot(
     weight: &CpuTensor,
     name: impl Into<String>,
 ) -> Result<CpuTensor> {
-    use rayon::prelude::*;
-    let n_rows = input.dim(0)?;
     let in_dim = input.dim(1)?;
     if in_dim % Q6_K_VALUES_PER_BLOCK != 0 {
         return Err(BackendError::RuntimeShapeMismatch(format!(
@@ -17541,26 +17539,12 @@ fn matmul_rhs_transposed_q6_k_block_dot(
         )));
     }
     let out_dim = wire.len() / row_bytes;
-    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
-        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
-        .collect();
-    let cols: Vec<Vec<f32>> = (0..out_dim)
-        .into_par_iter()
-        .map(|o| {
-            let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
-            preps
-                .iter()
-                .map(|q8| q6_k_wire_row_dot_simd(w_row, q8))
-                .collect()
-        })
-        .collect();
-    let mut out = vec![0f32; n_rows * out_dim];
-    for (o, col) in cols.iter().enumerate() {
-        for (r, &v) in col.iter().enumerate() {
-            out[r * out_dim + o] = v;
-        }
-    }
-    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+    // Delegate to the shared core (the Q4_K wrapper's pattern) so EVERY Q6_K
+    // block-dot consumer — including the main linear intercept and the tied
+    // lm-head path, which call this wrapper directly — reaches the batched
+    // owner dispatch. The previous inline duplicate of the core body made the
+    // owner production-unreachable for Q6_K (review finding, 2026-07-08).
+    q6_k_block_dot_core(input, wire, out_dim, in_dim, name)
 }
 
 /// Whether the experimental CPU Q4_K block-dot decode path is enabled. Default
@@ -17678,8 +17662,10 @@ fn matmul_rhs_transposed_q4_k_block_dot(
     q4_k_block_dot_core(input, wire, out_dim, in_dim, name)
 }
 
-/// STAMPEDE Phase 3 Lane B — batched Q4_K prefill owner flag. Default OFF
-/// (opt-in until receipts flip it): `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`.
+/// STAMPEDE Phase 3 Lane B — batched K-quant (Q4_K + Q6_K) prefill owner
+/// flag. Default OFF (opt-in until receipts flip it):
+/// `CAMELID_X86_KQUANT_MATMUL_OWNER=1|on`. The shared telemetry counter
+/// `kquant_owner_prefill_taken` counts dispatches of BOTH quants.
 /// Honors the bench sweep's uncached-plan bypass so in-process A/B configs
 /// take effect (the same fake-null trap as the Q8 owner sweep).
 /// Scope notes: the flag is honored on every arch (the scalar twin is
@@ -17987,6 +17973,207 @@ fn q4_k_owner_prefill_tiled(
     CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
 }
 
+/// Rebuild one Q6_K superblock's 256 signed 6-bit weights — the verbatim loop
+/// from [`q6_k_wire_row_dot`], lifted so the owner can hoist it per weight row
+/// instead of re-running it per (row × weight-row) cell.
+fn q6_k_owner_rebuild_superblock(block: &[u8], a: &mut [i8; Q6_K_VALUES_PER_BLOCK]) {
+    let (mut ql, mut qh, mut w) = (0usize, 128usize, 0usize);
+    for _ in 0..2 {
+        for l in 0..32 {
+            a[w + l] =
+                (((block[ql + l] & 0xF) as i32 | (((block[qh + l] & 3) as i32) << 4)) - 32) as i8;
+            a[w + l + 32] = (((block[ql + l + 32] & 0xF) as i32
+                | ((((block[qh + l] >> 2) & 3) as i32) << 4))
+                - 32) as i8;
+            a[w + l + 64] = (((block[ql + l] >> 4) as i32
+                | ((((block[qh + l] >> 4) & 3) as i32) << 4))
+                - 32) as i8;
+            a[w + l + 96] = (((block[ql + l + 32] >> 4) as i32
+                | ((((block[qh + l] >> 6) & 3) as i32) << 4))
+                - 32) as i8;
+        }
+        w += 128;
+        ql += 64;
+        qh += 32;
+    }
+}
+
+/// Q6_K integer lane dot over a pre-rebuilt superblock: the exact integers of
+/// [`q6_k_wire_row_dot`]'s `aux32` loop (associative — lane/order free), AVX2
+/// body lifted from the in-tree bit-identical `q6_k_wire_row_dot_avx2`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q6_k_owner_aux32_avx2(
+    a: &[i8; Q6_K_VALUES_PER_BLOCK],
+    scales: &[u8; 16],
+    q8: &[i8; Q6_K_VALUES_PER_BLOCK],
+) -> [i32; 8] {
+    use std::arch::x86_64::*;
+    let mut acc = _mm256_setzero_si256();
+    let aptr = a.as_ptr();
+    let qptr = q8.as_ptr();
+    for (j, &scale) in scales.iter().enumerate().take(16) {
+        let off = j * 16;
+        let a16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(aptr.add(off) as *const __m128i));
+        let q16 = _mm256_cvtepi8_epi16(_mm_loadu_si128(qptr.add(off) as *const __m128i));
+        // 16 i16 products (exact, fit i16); low 128 = products[0..8], high = [8..16]
+        let prod = _mm256_mullo_epi16(a16, q16);
+        let pair = _mm_add_epi16(
+            _mm256_castsi256_si128(prod),
+            _mm256_extracti128_si256(prod, 1),
+        ); // 8 i16 = prod[l] + prod[l+8]
+        let scaled = _mm256_mullo_epi32(
+            _mm256_cvtepi16_epi32(pair),
+            _mm256_set1_epi32(scale as i8 as i32),
+        );
+        acc = _mm256_add_epi32(acc, scaled);
+    }
+    let mut aux32 = [0i32; 8];
+    _mm256_storeu_si256(aux32.as_mut_ptr() as *mut __m256i, acc);
+    aux32
+}
+
+/// Scalar twin of [`q6_k_owner_aux32_avx2`] — [`q6_k_wire_row_dot`]'s exact
+/// integer loop over a pre-rebuilt superblock.
+fn q6_k_owner_aux32_scalar(
+    a: &[i8; Q6_K_VALUES_PER_BLOCK],
+    scales: &[u8; 16],
+    q8: &[i8; Q6_K_VALUES_PER_BLOCK],
+) -> [i32; 8] {
+    let mut aux32 = [0i32; 8];
+    for (j, &scale) in scales.iter().enumerate().take(16) {
+        let scale = scale as i8 as i32;
+        let off = j * 16;
+        for l in 0..8 {
+            aux32[l] += scale * (q8[off + l] as i32) * (a[off + l] as i32);
+        }
+        for l in 0..8 {
+            aux32[l] += scale * (q8[off + 8 + l] as i32) * (a[off + 8 + l] as i32);
+        }
+    }
+    aux32
+}
+
+/// STAMPEDE Phase 3 Lane B — batched Q6_K prefill owner (sibling of
+/// [`q4_k_owner_prefill_tiled`], same flag/dispatch/blocking). Bit-identical
+/// to the per-cell [`q6_k_block_dot_core`] path by construction:
+/// * the 6-bit weight rebuild and the f16 super-scale decode are hoisted per
+///   weight row — pure weight unpack, the same values every cell derived
+///   before (today the DEFAULT per-cell path re-runs the full 256-value
+///   scalar rebuild for every (row × weight-row) cell);
+/// * `aux32` is exact integer math (associative), computed by the in-tree
+///   bit-identity-proven AVX2 lane kernel or its scalar twin;
+/// * the LOAD-BEARING per-cell f32 shape is kept verbatim per
+///   `q6_k_wire_row_dot`: 8 f32 lane accumulators, per superblock
+///   `sums[l] += d * aux32[l]` in lane order, ascending superblocks, final
+///   left-fold `sums.iter().sum()` — the shape KQUANT_RECON proved
+///   bits-sensitive is not restructured.
+fn q6_k_owner_prefill_tiled(
+    input: &CpuTensor,
+    wire: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    name: impl Into<String>,
+) -> Result<CpuTensor> {
+    use rayon::prelude::*;
+    let superblocks = in_dim / Q6_K_VALUES_PER_BLOCK;
+    let row_bytes = superblocks * Q6_K_WIRE_BYTES_PER_BLOCK;
+    let n_rows = input.dim(0)?;
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
+
+    // Parallel Q8_K quantize (rows independent ⇒ per-row bit-exact).
+    let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
+        .into_par_iter()
+        .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
+        .collect();
+
+    let mut out = vec![0f32; n_rows * out_dim];
+    let out_ptr = KQuantOwnerOutPtr(out.as_mut_ptr());
+
+    const ROW_BLOCK: usize = 64;
+    const WEIGHT_CHUNK: usize = 32;
+    let chunks = out_dim.div_ceil(WEIGHT_CHUNK);
+    for row_start in (0..n_rows).step_by(ROW_BLOCK) {
+        let row_end = (row_start + ROW_BLOCK).min(n_rows);
+        (0..chunks).into_par_iter().for_each(|chunk_idx| {
+            let o_start = chunk_idx * WEIGHT_CHUNK;
+            let o_end = (o_start + WEIGHT_CHUNK).min(out_dim);
+            // Per-task hoist scratch: rebuilt weights + scales + super-scale
+            // per superblock, reused across the chunk's weight rows.
+            let mut a_all = vec![0i8; superblocks * Q6_K_VALUES_PER_BLOCK];
+            let mut wsc = vec![0u8; superblocks * 16];
+            let mut wd = vec![0f32; superblocks];
+            for o in o_start..o_end {
+                let w_row = &wire[o * row_bytes..(o + 1) * row_bytes];
+                for i in 0..superblocks {
+                    let block =
+                        &w_row[i * Q6_K_WIRE_BYTES_PER_BLOCK..(i + 1) * Q6_K_WIRE_BYTES_PER_BLOCK];
+                    wd[i] = f16_bits_to_f32(u16::from_le_bytes([block[208], block[209]]));
+                    wsc[i * 16..(i + 1) * 16].copy_from_slice(&block[192..208]);
+                    let a_slice = &mut a_all[i * Q6_K_VALUES_PER_BLOCK..];
+                    // SAFETY-free reborrow into the fixed-size rebuild target.
+                    let a_arr: &mut [i8; Q6_K_VALUES_PER_BLOCK] = (&mut a_slice
+                        [..Q6_K_VALUES_PER_BLOCK])
+                        .try_into()
+                        .expect("owner rebuild slice is exactly one superblock");
+                    q6_k_owner_rebuild_superblock(block, a_arr);
+                }
+                let block_rows = row_end - row_start;
+                let mut sumf_block = [0f32; ROW_BLOCK];
+                for (r, blocks) in preps[row_start..row_end].iter().enumerate() {
+                    // Load-bearing f32 shape: 8 lane accumulators per CELL,
+                    // reduced once after all superblocks — verbatim
+                    // `q6_k_wire_row_dot`.
+                    let mut sums = [0f32; 8];
+                    for (i, y) in blocks.iter().enumerate().take(superblocks) {
+                        let d = wd[i] * y.d;
+                        let a: &[i8; Q6_K_VALUES_PER_BLOCK] = a_all
+                            [i * Q6_K_VALUES_PER_BLOCK..(i + 1) * Q6_K_VALUES_PER_BLOCK]
+                            .try_into()
+                            .expect("owner superblock slice is exactly 256 weights");
+                        let scales: &[u8; 16] = wsc[i * 16..(i + 1) * 16]
+                            .try_into()
+                            .expect("owner scale slice is exactly 16 bytes");
+                        // `use_avx2` is read on every target (the cfg split is
+                        // inside the arm), so non-x86 builds see no unused
+                        // binding.
+                        let aux32 = if use_avx2 {
+                            #[cfg(target_arch = "x86_64")]
+                            // SAFETY: avx2 confirmed present at dispatch; the
+                            // fixed-size array refs guarantee the 256/16-byte
+                            // reads are in bounds.
+                            unsafe {
+                                q6_k_owner_aux32_avx2(a, scales, &y.qs)
+                            }
+                            #[cfg(not(target_arch = "x86_64"))]
+                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                        } else {
+                            q6_k_owner_aux32_scalar(a, scales, &y.qs)
+                        };
+                        for l in 0..8 {
+                            sums[l] += d * aux32[l] as f32;
+                        }
+                    }
+                    sumf_block[r] = sums.iter().sum();
+                }
+                let ptr = out_ptr;
+                for (r, sumf) in sumf_block[..block_rows].iter().enumerate() {
+                    // SAFETY: (row, o) cells are disjoint across tasks — this
+                    // task exclusively owns channels [o_start, o_end) and the
+                    // row loop is serial within the task.
+                    unsafe {
+                        *ptr.0.add((row_start + r) * out_dim + o) = *sumf;
+                    }
+                }
+            }
+        });
+    }
+    CpuTensor::from_f32(name, vec![n_rows, out_dim], out)
+}
+
 /// Q5_K analogue of [`q4_k_block_dot_core`] (176 B/super-block, `q5_k_wire_row_dot`).
 /// Quantise each input row to Q8_K once, then dot it against the retained Q5_K wire
 /// super-blocks (rayon over the output dimension) with no f32 materialisation. Scalar
@@ -18083,6 +18270,13 @@ fn q6_k_block_dot_core(
         )));
     }
     let n_rows = input.dim(0)?;
+    // STAMPEDE Phase 3 Lane B: batched forwards (rows >= 4) take the tiled
+    // owner when enabled — bit-identical per cell (see the owner's contract
+    // doc), hoists the per-cell 6-bit rebuild that dominates this path.
+    if n_rows >= 4 && x86_kquant_matmul_owner_enabled() {
+        Q8_SCHED_KQUANT_OWNER_PREFILL_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return q6_k_owner_prefill_tiled(input, wire, out_dim, in_dim, name);
+    }
     let preps: Vec<Vec<Q8KBlock>> = (0..n_rows)
         .map(|r| quantize_q8_k_blocks(&input.data[r * in_dim..(r + 1) * in_dim]))
         .collect();

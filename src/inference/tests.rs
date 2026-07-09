@@ -1810,6 +1810,8 @@ fn clear_dense_diagnostic_env() {
         "CAMELID_MAC_Q8_FFN_DOWN_SINGLE_PROJECTION_COUNTERS",
         "CAMELID_Q8_0_PACKED_4X4_DOT",
         "CAMELID_Q8_0_PACKED_4X8_DOT",
+        "CAMELID_X86_KQUANT_MATMUL_OWNER",
+        "CAMELID_X86_Q6K_AVX2",
         "CAMELID_Q8_0_FILE_READER_BLOCK_DOT",
         "CAMELID_Q8_0_FILE_CACHE_BYTES",
         "CAMELID_Q8_0_FILE_READER_CHUNK_BYTES",
@@ -3394,15 +3396,18 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
     for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
         let row_bytes = (in_dim / 256) * 144;
         // Deterministic wire: small finite f16 d/dmin, adversarial scale/min
-        // and nibble bytes over the FULL 0..=255 range (every bit pattern is
-        // structurally valid Q4_K; the kmask unpack caps live scales at 63).
+        // and nibble bytes with genuine full-byte coverage via a
+        // multiplicative hash (a linear-in-index generator collapses to one
+        // parity class because the 144-byte block stride is even; every bit
+        // pattern is structurally valid Q4_K — the kmask unpack caps live
+        // scales at 63).
         let wire: Vec<u8> = (0..out_dim * row_bytes)
             .map(|i| match i % 144 {
                 0 => 0x66,
                 1 => 0x2e, // d ~= 0.1
                 2 => 0x99,
                 3 => 0x24, // dmin ~= 0.018
-                pos => ((i * 31 + pos * 7 + 11) % 256) as u8,
+                _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
             })
             .collect();
         for n_rows in [4usize, 5, 13, 64, 67] {
@@ -3432,6 +3437,88 @@ fn q4_k_owner_prefill_bitwise_matches_block_dot_core() {
                     "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
                 );
             }
+        }
+    }
+}
+
+/// STAMPEDE Phase 3 Lane B sibling: the batched Q6_K prefill owner must be
+/// bitwise identical to the per-cell block-dot path — its f32 shape (8 lane
+/// accumulators, final left-fold) is the bits-sensitive part KQUANT_RECON
+/// flagged, so this is the load-bearing check.
+#[test]
+fn q6_k_owner_prefill_bitwise_matches_block_dot_core() {
+    let _env_guard = env_lock();
+    clear_dense_diagnostic_env();
+    std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+
+    for (in_dim, out_dim) in [(512usize, 96usize), (768, 40)] {
+        let row_bytes = (in_dim / 256) * 210;
+        // Deterministic wire with genuine full-byte coverage (multiplicative
+        // hash — a linear-in-index generator collapses to one parity class
+        // because the 210-byte block stride is even); d f16 fixed small, and
+        // one scale byte per superblock forced to 0x80 (-128, the i8
+        // extreme) so the scale sign path is pinned end-to-end.
+        let wire: Vec<u8> = (0..out_dim * row_bytes)
+            .map(|i| match i % 210 {
+                192 => 0x80, // first per-16 scale = -128
+                208 => 0x66,
+                209 => 0x2e, // d ~= 0.1
+                _ => ((i as u32).wrapping_mul(2_654_435_761) >> 24) as u8,
+            })
+            .collect();
+        for n_rows in [4usize, 5, 13, 64, 67] {
+            let input_data: Vec<f32> = (0..n_rows * in_dim)
+                .map(|i| ((i as f32) * 0.29).cos() * 2.5 - 0.4)
+                .collect();
+            let input =
+                CpuTensor::from_f32("q6k-owner-in", vec![n_rows, in_dim], input_data).unwrap();
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            let base = q6_k_block_dot_core(&input, &wire, out_dim, in_dim, "base").unwrap();
+            std::env::set_var("CAMELID_X86_KQUANT_MATMUL_OWNER", "1");
+            reset_q8_schedule_telemetry();
+            let owner = q6_k_block_dot_core(&input, &wire, out_dim, in_dim, "owner").unwrap();
+            assert!(
+                snapshot_q8_schedule_telemetry().kquant_owner_prefill_taken > 0,
+                "owner leg did not dispatch (n_rows={n_rows}) — vacuous comparison"
+            );
+            std::env::remove_var("CAMELID_X86_KQUANT_MATMUL_OWNER");
+            assert_eq!(owner.data.len(), base.data.len());
+            for (i, (a, b)) in owner.data.iter().zip(base.data.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "cell {i} diverged (n_rows={n_rows}, in_dim={in_dim}, out_dim={out_dim})"
+                );
+            }
+        }
+    }
+}
+
+/// Scalar-vs-AVX2 twin for the Q6_K owner's lifted integer lane dot.
+#[test]
+fn q6_k_owner_aux32_scalar_matches_avx2() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for salt in 0..4usize {
+            let a: [i8; 256] =
+                std::array::from_fn(|i| ((((i * 17 + salt * 5) % 64) as i16) - 32) as i8);
+            // Includes -128 (0x80) among the i8 scales when salt selects it.
+            let scales: [u8; 16] = std::array::from_fn(|j| {
+                if j == 0 {
+                    0x80
+                } else {
+                    ((j * 37 + salt * 13) % 256) as u8
+                }
+            });
+            let q8: [i8; 256] =
+                std::array::from_fn(|i| (((i * 23 + salt * 11) % 255) as i16 - 127) as i8);
+            let scalar = q6_k_owner_aux32_scalar(&a, &scales, &q8);
+            // SAFETY: avx2 confirmed present above.
+            let simd = unsafe { q6_k_owner_aux32_avx2(&a, &scales, &q8) };
+            assert_eq!(scalar, simd, "aux32 twin diverged (salt={salt})");
         }
     }
 }
