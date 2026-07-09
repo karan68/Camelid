@@ -65,6 +65,18 @@ dynamically at runtime when present).
 - License: NVIDIA CUDA Toolkit EULA — redistributable components (see Attachment A)
 - License text: <https://docs.nvidia.com/cuda/eula/index.html>
 
+### tokio-util (direct Rust dependency)
+
+Camelid's API server uses `tokio-util`'s `CancellationToken` for the generation
+cancellation contract: every decode observes a cooperative stop signal so a dropped
+request (client disconnect, timeout) can never orphan compute against the shared
+GPU-resident decode state (see `docs/recon/ENGINE_INVERSION_CONDUCTOR.md`). The crate
+was already present in the dependency graph transitively (via the axum/tokio
+ecosystem); this records its promotion to a direct, load-bearing dependency.
+
+- Project: <https://github.com/tokio-rs/tokio>
+- License: MIT
+
 ## Maintenance note
 
 Keep this file in sync with any third-party source, binary, fixture, or reference tooling Camelid redistributes or materially depends on for public evidence. Documentation polish, branding cleanup, or repository renaming work must not remove these credits while the underlying technical reliance still exists.

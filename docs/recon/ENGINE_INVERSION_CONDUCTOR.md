@@ -18,7 +18,7 @@ orphan — the exact corruption class the lock exists to prevent.
 | Phase | Scope | Status | Receipts |
 |---|---|---|---|
 | 0 | Repro harness P0-T1/T2/T3 + R1 lane recon | **DONE — GATE 0 GO** | qa/evidence-bundles/engine-inversion-gate0-orphan-repro-20260709T134304Z-head-ffada00f/ + docs/recon/ENGINE_INVERSION_R1_LANE_RECON.md |
-| 1 | Cancellation plumbing (token + deadline + guard rides with compute) | pending Gate 0 | — |
+| 1 | Cancellation plumbing (token + deadline + guard rides with compute) | IMPLEMENTED — Gate 1 validation running | P0 tests flipped to PASS; suite/fmt/clippy/parity/perf pending |
 | 2 | Engine inversion (engine worker thread, bounded queue, lock removal) | pending Gate 1 | — |
 | 3 | Streaming over events (no per-token spawn_blocking) | pending Gate 2 | — |
 | 4 | Re-certification (parity, receipts, perf, compat) | pending Gate 3 | — |
@@ -80,6 +80,32 @@ expected failure cannot leak an orphan or a probe underflow into sibling tests).
   touch main-engine state, so the mission proceeds; fix filed as a separate task
   outside this mission (see ENGINE_INVERSION_R1_LANE_RECON.md).
 - GATE 1..4: pending.
+
+## Phase 1 implementation record (2026-07-09)
+
+- `GenerationCancel` (token + engine-armed deadline) and `gen_guard` added to
+  `PreparedGeneration`; `CancelOnDrop` held in every generation handler frame and
+  inside the SSE generator.
+- `generate_decoded_tokens_blocking`: guard moved INTO the blocking closure; the
+  old detaching `tokio::time::timeout` replaced by an engine-side per-step deadline
+  check + unconditional `handle.await`. Returns the guard so multi-choice keeps the
+  lock across all choices (unchanged coverage). `mark_healthy` no longer fires on a
+  cancelled/timed-out decode (same coverage as the old timeout branch).
+- `generate_token_ids`: cooperative stop check at the top of every step (covers
+  speculative rounds); timeout payload byte-identical to pre-inversion
+  (`generated_tokens` stays null on the non-streaming path).
+- Streaming: guard rides each step via `StreamGenerationStepRequest`/
+  `TimedGenerationStep`; held by the generator only BETWEEN steps.
+- Replay path deliberately keeps its prior unlocked decode (pre-existing
+  documented decision; Phase 2 routes it through the engine queue). NOTE: this is
+  a pre-existing concurrent-decode hole (replay decode vs live decode) — recorded
+  here so Phase 2 closes it explicitly.
+- Behavior notes (documented, not observable by a well-behaved client): the
+  timeout 503 now returns after the decode observes the deadline (≤1 step late)
+  instead of racing it; a decode that completes all tokens just past the deadline
+  now returns its result instead of a 503; a decode wedged INSIDE a single forward
+  no longer produces a 503-with-orphan — the request waits (honest: the lock
+  cannot be safely freed while compute may still touch KV state).
 
 ## Phase 1 design note (locked during Phase 0 test authoring)
 

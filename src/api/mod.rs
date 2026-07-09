@@ -1298,6 +1298,87 @@ pub struct CompletionStreamChoice {
     pub finish_reason: Option<&'static str>,
 }
 
+/// Why a decode loop stopped early, checked cooperatively at the top of every
+/// generated-token step (one relaxed atomic load + one clock read per token).
+enum GenerationStopCause {
+    /// The request's `CancellationToken` fired — the handler frame that owned
+    /// this generation is gone (client disconnect, handler drop).
+    Cancelled,
+    /// The engine-enforced wall-clock deadline passed. Replaces the old
+    /// handler-side `tokio::time::timeout`, which detached (but could not
+    /// stop) the blocking decode.
+    TimedOut,
+}
+
+/// Cooperative stop signal + engine-enforced deadline for one generation.
+/// The token is fired by `CancelOnDrop` when the owning handler frame drops;
+/// the deadline is armed by `generate_decoded_tokens_blocking` from
+/// `CAMELID_GENERATION_TIMEOUT_MS`. The decode loop itself observes both, so
+/// compute always stops within one token step of either trip — the handler
+/// never detaches a running decode.
+#[derive(Clone)]
+struct GenerationCancel {
+    token: tokio_util::sync::CancellationToken,
+    deadline: Option<Instant>,
+    timeout: Duration,
+    started: Instant,
+}
+
+impl GenerationCancel {
+    fn unbounded() -> Self {
+        Self {
+            token: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
+            timeout: Duration::ZERO,
+            started: Instant::now(),
+        }
+    }
+
+    /// Arm the wall-clock deadline at decode entry (same coverage as the old
+    /// handler-side timer: prep/tokenization are not counted).
+    fn arm(&mut self, timeout: Duration) {
+        self.started = Instant::now();
+        self.timeout = timeout;
+        self.deadline = self.started.checked_add(timeout);
+    }
+
+    fn tripped(&self) -> Option<GenerationStopCause> {
+        if self.token.is_cancelled() {
+            return Some(GenerationStopCause::Cancelled);
+        }
+        match self.deadline {
+            Some(deadline) if Instant::now() >= deadline => Some(GenerationStopCause::TimedOut),
+            _ => None,
+        }
+    }
+}
+
+/// RAII: fires the generation's CancellationToken when the owning frame is
+/// dropped for ANY reason — client disconnect (hyper drops the handler
+/// future), panic, or normal return (harmless then; the token is no longer
+/// read). This is the Rust equivalent of llama.cpp's
+/// `~server_response_reader → stop() → SERVER_TASK_TYPE_CANCEL`.
+struct CancelOnDrop(tokio_util::sync::CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Response for a decode stopped by cancellation. Never delivered to the
+/// (already disconnected) client; observable only in logs and tests.
+fn generation_cancelled_response(generated_tokens: usize) -> Box<Response> {
+    Box::new(api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "generation_cancelled",
+        format!(
+            "generation stopped after {generated_tokens} tokens: the request was cancelled before the decode finished"
+        ),
+        None,
+    ))
+}
+
 struct PreparedGeneration {
     model_id: String,
     model_path: PathBuf,
@@ -1306,6 +1387,13 @@ struct PreparedGeneration {
     tokenizer: Arc<Tokenizer>,
     session: LlamaInferenceSession,
     sampling: SamplingConfig,
+    /// Stop signal + deadline observed at the top of every decode step.
+    cancel: GenerationCancel,
+    /// The generation lock, moved INTO the blocking decode so the lock is
+    /// held by the compute itself, not by an abandonable async frame. Freed
+    /// exactly when the decode finishes (or is returned to a multi-choice
+    /// caller for the next choice).
+    gen_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     /// When set, collect per-token logprobs each step (chosen + this many top
     /// alternatives). Forces the full-host-logits decode path (no GPU greedy-fast).
     logprobs_top_n: Option<usize>,
@@ -2195,15 +2283,20 @@ async fn llama_server_completion(
     };
     // Serialize generation so only one decode runs against the shared
     // CUDA-resident KV state at a time (see AppState::generation_lock).
-    let _gen_guard = state.generation_lock.clone().lock_owned().await;
-    let prepared = match prepare_generation(&state, req).await {
+    let gen_guard = state.generation_lock.clone().lock_owned().await;
+    let mut prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
 
+    // The lock rides the blocking decode itself (PreparedGeneration.gen_guard);
+    // CancelOnDrop stops the decode within one step on client disconnect.
+    prepared.gen_guard = Some(gen_guard);
+    let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
-    match generate_decoded_tokens_blocking(prepared).await {
+    let (_gen_lease, generated) = generate_decoded_tokens_blocking(prepared).await;
+    match generated {
         Ok(generated) => {
             let finish_reason = generated.finish_reason;
             (
@@ -6747,11 +6840,12 @@ async fn create_generation_session(
 /// `chat_completions_multi_choice`: each choice is an independent, reproducibly
 /// seeded generation; `camelid` diagnostics mirror the first choice; usage counts
 /// the prompt once and sums completion tokens. Streaming and receipts are rejected
-/// upstream. The caller holds the generation lock across the await.
+/// upstream. The generation lock is passed in and rides every choice's decode.
 async fn completions_multi_choice(
     state: &AppState,
     req: GenerationSessionRequest,
     n_choices: u32,
+    gen_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Response {
     let base_seed = req.seed.unwrap_or(0);
     let mut choices = Vec::with_capacity(n_choices as usize);
@@ -6759,17 +6853,24 @@ async fn completions_multi_choice(
     let mut prompt_token_count = 0usize;
     let mut model_id = String::new();
     let mut first_diagnostics: Option<GenerationDiagnostics> = None;
+    // The lock spans every choice: it rides each choice's blocking decode and
+    // is handed back between choices, so no other request interleaves.
+    let mut gen_guard = Some(gen_guard);
     for index in 0..n_choices {
         let mut req_choice = req.clone();
         req_choice.n = None;
         req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
-        let prepared = match prepare_generation(state, req_choice).await {
+        let mut prepared = match prepare_generation(state, req_choice).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
         model_id = prepared.model_id.clone();
         prompt_token_count = prepared.token_ids.len();
-        let generated = match generate_decoded_tokens_blocking(prepared).await {
+        prepared.gen_guard = gen_guard.take();
+        let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
+        let (returned_guard, result) = generate_decoded_tokens_blocking(prepared).await;
+        gen_guard = returned_guard;
+        let generated = match result {
             Ok(generated) => generated,
             Err(response) => return *response,
         };
@@ -6950,11 +7051,12 @@ async fn completions(
     // CUDA-resident KV state at a time (see AppState::generation_lock).
     let gen_guard = state.generation_lock.clone().lock_owned().await;
     if n_choices > 1 {
-        // Non-streaming independent multi-choice generation. `gen_guard` is held
-        // in this frame across the await, so the lock spans every choice.
-        return completions_multi_choice(&state, req, n_choices).await;
+        // Non-streaming independent multi-choice generation. The guard is
+        // threaded through every choice's blocking decode, so the lock still
+        // spans every choice — held by the compute, not this frame.
+        return completions_multi_choice(&state, req, n_choices, gen_guard).await;
     }
-    let prepared = match prepare_generation(&state, req).await {
+    let mut prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -6964,12 +7066,16 @@ async fn completions(
         return stream_completion(prepared, false, gen_guard, false);
     }
 
-    // Hold the generation lock until the non-streaming response is built.
-    let _gen_guard = gen_guard;
+    // The lock rides the blocking decode itself (PreparedGeneration.gen_guard):
+    // dropping this handler future (client disconnect) can no longer free it
+    // mid-decode, and CancelOnDrop stops the decode within one step.
+    prepared.gen_guard = Some(gen_guard);
+    let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
     let effective_max_tokens = prepared.max_tokens;
-    match generate_decoded_tokens_blocking(prepared).await {
+    let (_gen_lease, generated) = generate_decoded_tokens_blocking(prepared).await;
+    match generated {
         Ok(generated) => {
             let camelid_receipt = match receipt_stamp {
                 Some(stamp) => {
@@ -7049,6 +7155,7 @@ async fn chat_completions_multi_choice(
     state: &AppState,
     req: GenerationSessionRequest,
     n_choices: u32,
+    gen_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Response {
     let base_seed = req.seed.unwrap_or(0);
     let mut choices = Vec::with_capacity(n_choices as usize);
@@ -7057,6 +7164,9 @@ async fn chat_completions_multi_choice(
     let mut model_id = String::new();
     let mut lane: Option<&'static str> = None;
     let mut first_diagnostics: Option<GenerationDiagnostics> = None;
+    // The lock spans every choice: it rides each choice's blocking decode and
+    // is handed back between choices, so no other request interleaves.
+    let mut gen_guard = Some(gen_guard);
     for index in 0..n_choices {
         let mut req_choice = req.clone();
         // Each choice is its own generation with a distinct, reproducible seed
@@ -7064,13 +7174,17 @@ async fn chat_completions_multi_choice(
         // samples that still reproduce exactly for a fixed request seed.
         req_choice.n = None;
         req_choice.seed = Some(base_seed.wrapping_add(u64::from(index)));
-        let prepared = match prepare_generation(state, req_choice).await {
+        let mut prepared = match prepare_generation(state, req_choice).await {
             Ok(prepared) => prepared,
             Err(response) => return response,
         };
         model_id = prepared.model_id.clone();
         prompt_token_count = prepared.token_ids.len();
-        let generated = match generate_decoded_tokens_blocking(prepared).await {
+        prepared.gen_guard = gen_guard.take();
+        let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
+        let (returned_guard, result) = generate_decoded_tokens_blocking(prepared).await;
+        gen_guard = returned_guard;
+        let generated = match result {
             Ok(generated) => generated,
             Err(response) => return *response,
         };
@@ -7331,11 +7445,12 @@ async fn chat_completions(
     // CUDA-resident KV state at a time (see AppState::generation_lock).
     let gen_guard = state.generation_lock.clone().lock_owned().await;
     if n_choices > 1 {
-        // Non-streaming independent multi-choice generation. `gen_guard` is held
-        // in this frame across the await, so the lock spans every choice.
-        return chat_completions_multi_choice(&state, req, n_choices).await;
+        // Non-streaming independent multi-choice generation. The guard is
+        // threaded through every choice's blocking decode, so the lock still
+        // spans every choice — held by the compute, not this frame.
+        return chat_completions_multi_choice(&state, req, n_choices, gen_guard).await;
     }
-    let prepared = match prepare_generation(&state, req).await {
+    let mut prepared = match prepare_generation(&state, req).await {
         Ok(prepared) => prepared,
         Err(response) => return response,
     };
@@ -7343,12 +7458,16 @@ async fn chat_completions(
         return stream_completion(prepared, true, gen_guard, include_usage);
     }
 
-    // Hold the generation lock until the non-streaming response is built.
-    let _gen_guard = gen_guard;
+    // The lock rides the blocking decode itself (PreparedGeneration.gen_guard):
+    // dropping this handler future (client disconnect) can no longer free it
+    // mid-decode, and CancelOnDrop stops the decode within one step.
+    prepared.gen_guard = Some(gen_guard);
+    let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
     let model_id = prepared.model_id.clone();
     let prompt_token_count = prepared.token_ids.len();
     let effective_max_tokens = prepared.max_tokens;
-    match generate_decoded_tokens_blocking(prepared).await {
+    let (_gen_lease, generated) = generate_decoded_tokens_blocking(prepared).await;
+    match generated {
         Ok(generated) => {
             let camelid_receipt = match receipt_stamp {
                 Some(stamp) => {
@@ -7699,7 +7818,11 @@ pub async fn replay_receipt_request(
             Err(response) => return Err(response_error_text(response).await),
         }
     };
-    let generated = match generate_decoded_tokens_blocking(prepared).await {
+    // Replay decode keeps its prior UNLOCKED behavior (gen_guard: None from
+    // prepare_generation) — see the probe-scoped lock note above. Phase 2 of
+    // the engine-inversion mission routes this through the engine queue.
+    let (_gen_lease, result) = generate_decoded_tokens_blocking(prepared).await;
+    let generated = match result {
         Ok(generated) => generated,
         Err(response) => return Err(response_error_text(*response).await),
     };
@@ -8461,6 +8584,8 @@ async fn prepare_generation(
         cached_prompt_prefix: state.cached_prompt_prefix.clone(),
         speculative,
         telemetry: Some(telemetry_start),
+        cancel: GenerationCancel::unbounded(),
+        gen_guard: None,
     })
 }
 
@@ -9017,11 +9142,25 @@ fn parse_logit_bias(
     Ok(parsed)
 }
 
+/// Runs the blocking decode with guard/compute lifetime equivalence: the
+/// generation-lock guard (if any) is moved INTO the blocking closure, so a
+/// dropped handler future (client disconnect) or an expired deadline can never
+/// free the lock while the decode is still running. The wall-clock timeout is
+/// enforced INSIDE the decode loop (see `GenerationCancel`) and the handle is
+/// always awaited — never detached. Returns the guard alongside the result so
+/// multi-choice callers can keep the lock across choices.
 async fn generate_decoded_tokens_blocking(
-    prepared: PreparedGeneration,
-) -> std::result::Result<GeneratedText, Box<Response>> {
-    let timeout = generation_timeout_duration()?;
-    let started = Instant::now();
+    mut prepared: PreparedGeneration,
+) -> (
+    Option<tokio::sync::OwnedMutexGuard<()>>,
+    std::result::Result<GeneratedText, Box<Response>>,
+) {
+    let timeout = match generation_timeout_duration() {
+        Ok(timeout) => timeout,
+        Err(response) => return (prepared.gen_guard.take(), Err(response)),
+    };
+    prepared.cancel.arm(timeout);
+    let cancel = prepared.cancel.clone();
     let test_sleep = generation_step_test_sleep_duration();
     let handle = tokio::task::spawn_blocking(move || {
         #[cfg(test)]
@@ -9029,34 +9168,44 @@ async fn generate_decoded_tokens_blocking(
         if let Some(duration) = test_sleep {
             std::thread::sleep(duration);
         }
-        generate_decoded_tokens(prepared)
+        let gen_guard = prepared.gen_guard.take();
+        let result = generate_decoded_tokens(prepared);
+        (gen_guard, result)
     });
-    match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(result)) => {
+    match handle.await {
+        Ok((gen_guard, result)) => {
             // Â§4 safe-boot: a decode ran to completion under the applied gait
             // without wedging the host, so clear the in-progress marker. Cheap
             // and idempotent (a no-op after the first call, or when no gait was
-            // applied), so it is safe on the hot path.
-            crate::gait::sentinel::mark_healthy();
-            result
+            // applied), so it is safe on the hot path. Not marked when the
+            // decode was cancelled or timed out — those did not prove a healthy
+            // full decode (same coverage as the old timeout branch).
+            if cancel.tripped().is_none() {
+                crate::gait::sentinel::mark_healthy();
+            }
+            (gen_guard, result)
         }
-        Ok(Err(err)) => Err(Box::new(api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "generation_worker_failed",
-            format!("generation worker failed before completing the request: {err}"),
+        Err(err) => (
+            // A panicked decode released the guard during unwind (same exposure
+            // as the pre-inversion code); nothing to hand back.
             None,
-        ))),
-        Err(_) => Err(generation_timeout_response(
-            timeout,
-            started.elapsed(),
-            None,
-        )),
+            Err(Box::new(api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "generation_worker_failed",
+                format!("generation worker failed before completing the request: {err}"),
+                None,
+            ))),
+        ),
     }
 }
 
 struct TimedGenerationStep {
     session: LlamaInferenceSession,
     step: LlamaGenerationStep,
+    /// The generation lock, returned to the stream so it stays held between
+    /// steps. On the error paths it is dropped when the blocking closure ends,
+    /// i.e. exactly when the step's compute finishes.
+    gen_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 enum GenerationStepBlockingError {
@@ -9072,6 +9221,9 @@ struct StreamGenerationStepRequest {
     /// Try the resident GPU-sampling greedy fast lane before the general step.
     greedy_fast: bool,
     session: LlamaInferenceSession,
+    /// Generation lock, moved into the blocking step closure so a dropped SSE
+    /// stream cannot free the lock while this step is still running.
+    gen_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     input: Vec<u32>,
     sampler: LlamaSampler,
     history: Vec<u32>,
@@ -9121,6 +9273,7 @@ async fn generate_stream_step_blocking(
     let StreamGenerationStepRequest {
         greedy_fast,
         session,
+        gen_guard,
         input,
         sampler,
         history,
@@ -9137,6 +9290,9 @@ async fn generate_stream_step_blocking(
         if let Some(duration) = test_sleep {
             std::thread::sleep(duration);
         }
+        // Held for the step's whole compute; returned on success so the stream
+        // keeps the lock between steps, dropped at closure end on error.
+        let mut gen_guard = gen_guard;
         let mut session = session;
         if greedy_fast {
             if let Some((id, forward_us)) = session
@@ -9158,7 +9314,11 @@ async fn generate_stream_step_blocking(
                         None,
                     ))
                 })?;
-                return Ok(TimedGenerationStep { session, step });
+                return Ok(TimedGenerationStep {
+                    session,
+                    step,
+                    gen_guard: gen_guard.take(),
+                });
             }
         }
         // Temperature-only sampling: draw the next token on the GPU (Gumbel-max)
@@ -9185,7 +9345,11 @@ async fn generate_stream_step_blocking(
                             None,
                         ))
                     })?;
-                    return Ok(TimedGenerationStep { session, step });
+                    return Ok(TimedGenerationStep {
+                        session,
+                        step,
+                        gen_guard: gen_guard.take(),
+                    });
                 }
             }
         }
@@ -9205,7 +9369,11 @@ async fn generate_stream_step_blocking(
                     None,
                 ))
             })?;
-        Ok(TimedGenerationStep { session, step })
+        Ok(TimedGenerationStep {
+            session,
+            step,
+            gen_guard: gen_guard.take(),
+        })
     });
     match tokio::time::timeout(step_timeout, handle).await {
         Ok(Ok(result)) => result.map_err(GenerationStepBlockingError::Response),
@@ -9688,6 +9856,24 @@ fn generate_token_ids(
         // emitted count directly.
         if generated.len() >= prepared.max_tokens as usize {
             break;
+        }
+        // Cooperative stop: cancellation (the owning handler frame is gone) or
+        // the engine-enforced wall-clock deadline. Checked once per step (per
+        // speculative ROUND on the spec path), so compute never outlives its
+        // request by more than one step. The timeout payload keeps the exact
+        // pre-inversion shape (generated_tokens stays null on this path).
+        match prepared.cancel.tripped() {
+            Some(GenerationStopCause::TimedOut) => {
+                return Err(generation_timeout_response(
+                    prepared.cancel.timeout,
+                    prepared.cancel.started.elapsed(),
+                    None,
+                ));
+            }
+            Some(GenerationStopCause::Cancelled) => {
+                return Err(generation_cancelled_response(generated.len()));
+            }
+            None => {}
         }
         let generated_index = generated.len();
         let collect_dense_for_step =
@@ -10613,10 +10799,17 @@ fn stream_completion(
         format!("cmpl-{}", uuid::Uuid::new_v4())
     };
     let events = async_stream::stream! {
-        // Hold the generation lock for the entire stream so no other decode
-        // starts until this one finishes â€” or the client disconnects and the
-        // stream is dropped, releasing the guard. See AppState::generation_lock.
-        let _gen_guard = gen_guard;
+        // Hold the generation lock for the entire stream. Between steps it
+        // lives here; DURING a step it is moved into the blocking closure
+        // (StreamGenerationStepRequest.gen_guard), so a client disconnect that
+        // drops this generator between polls can never free the lock while a
+        // step's compute is still running. See AppState::generation_lock.
+        let mut gen_guard = Some(gen_guard);
+        // Dropping the generator for any reason fires the request's
+        // CancellationToken (no further steps are driven by a dead generator,
+        // but the signal keeps guard/compute lifetimes equal by construction
+        // and lets Phase-2+ engine code observe the disconnect).
+        let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
         let stream_started = Instant::now();
         // Lifecycle telemetry for the streaming path. Dropping the stream
         // (client disconnect, error return) closes the run via the guard's
@@ -10757,11 +10950,12 @@ fn stream_completion(
                 && matches!(sampler, LlamaSampler::Greedy)
                 && !collect_dense_for_step
                 && !top_logits.is_empty();
-            let TimedGenerationStep { session, step } = match generate_stream_step_blocking(
+            let TimedGenerationStep { session, step, gen_guard: returned_guard } = match generate_stream_step_blocking(
                 StreamGenerationStepRequest {
                     // take_for_step (NOT clone): keeps the resident GPU session and its
                     // on-GPU KV cache alive across the blocking hand-off.
                     session: prepared.session.take_for_step(),
+                    gen_guard: gen_guard.take(),
                     input: input.clone(),
                     sampler,
                     history: history.clone(),
@@ -10788,6 +10982,7 @@ fn stream_completion(
                 }
             };
             prepared.session = session;
+            gen_guard = returned_guard;
             if !reused_prompt_prefix
                 && generated.is_empty()
                 && !prepared.collect_dense_diagnostics
@@ -12126,13 +12321,16 @@ mod tests {
     }
 
     /// Runs "request B" the way the non-streaming handlers do — acquire the
-    /// generation lock, decode, drop the guard — and reports what the probe
-    /// saw. Callers must have cleared the test-sleep hook so B is fast.
+    /// generation lock, ride it on the blocking decode, hold CancelOnDrop —
+    /// and reports what the probe saw. Callers must have cleared the
+    /// test-sleep hook so B is fast.
     async fn run_request_b_and_observe(state: &AppState) -> OrphanObservation {
         let guard_b = state.generation_lock.clone().lock_owned().await;
         let orphans_at_next_acquire = decode_probe::active();
-        let result_b = generate_decoded_tokens_blocking(orphan_test_prepared("model-b.gguf")).await;
-        drop(guard_b);
+        let mut prepared_b = orphan_test_prepared("model-b.gguf");
+        prepared_b.gen_guard = Some(guard_b);
+        let _cancel_on_drop = CancelOnDrop(prepared_b.cancel.token.clone());
+        let (_gen_lease, result_b) = generate_decoded_tokens_blocking(prepared_b).await;
         let request_b_error = match result_b {
             Ok(_) => None,
             Err(response) => {
@@ -12196,16 +12394,19 @@ mod tests {
 
         let state = AppState::default();
 
-        // Request A, exactly as the non-streaming handlers run it: guard held
-        // in the async frame across the decode await (see chat_completions).
+        // Request A, exactly as the non-streaming handlers run it (see
+        // chat_completions): the guard rides the blocking decode.
         let guard_a = state.generation_lock.clone().lock_owned().await;
-        let result_a = generate_decoded_tokens_blocking(orphan_test_prepared("model-a.gguf")).await;
+        let mut prepared_a = orphan_test_prepared("model-a.gguf");
+        prepared_a.gen_guard = Some(guard_a);
+        let _cancel_on_drop_a = CancelOnDrop(prepared_a.cancel.token.clone());
+        let (gen_lease_a, result_a) = generate_decoded_tokens_blocking(prepared_a).await;
         assert!(
             result_a.is_err(),
             "request A must hit the generation timeout"
         );
-        // The handler returns the 503; its frame drops the guard.
-        drop(guard_a);
+        // The handler returns the 503; its frame drops the (returned) lease.
+        drop(gen_lease_a);
 
         // Request B arrives right after the 503.
         std::env::set_var(GENERATION_TIMEOUT_ENV, "60000");
@@ -12231,8 +12432,13 @@ mod tests {
 
         let lock = state.generation_lock.clone();
         let handler_a = tokio::spawn(async move {
-            let _guard = lock.lock_owned().await;
-            let _ = generate_decoded_tokens_blocking(orphan_test_prepared("model-a.gguf")).await;
+            // Exact handler shape (see chat_completions): guard rides the
+            // decode, CancelOnDrop fires if this frame is dropped.
+            let gen_guard = lock.lock_owned().await;
+            let mut prepared = orphan_test_prepared("model-a.gguf");
+            prepared.gen_guard = Some(gen_guard);
+            let _cancel_on_drop = CancelOnDrop(prepared.cancel.token.clone());
+            let _ = generate_decoded_tokens_blocking(prepared).await;
         });
 
         // Wait until A's decode is actually live on the blocking pool, then
@@ -13602,6 +13808,7 @@ mod tests {
         let result = generate_stream_step_blocking(StreamGenerationStepRequest {
             greedy_fast: false,
             session,
+            gen_guard: None,
             input: vec![1, 2],
             sampler: LlamaSampler::Greedy,
             history: vec![1, 2],
@@ -13636,7 +13843,7 @@ mod tests {
         let session = LlamaInferenceSession::new(tiny_config(), tiny_weights()).unwrap();
         let prepared = prepared_for_cache("tiny", "model-a.gguf", vec![1, 2], session);
 
-        let result = generate_decoded_tokens_blocking(prepared).await;
+        let (_gen_lease, result) = generate_decoded_tokens_blocking(prepared).await;
 
         std::env::remove_var(GENERATION_TIMEOUT_ENV);
         std::env::remove_var("CAMELID_TEST_GENERATION_STEP_SLEEP_MS");
@@ -15411,6 +15618,8 @@ mod tests {
             cached_prompt_prefix: Arc::new(Mutex::new(None)),
             speculative: None,
             telemetry: None,
+            cancel: GenerationCancel::unbounded(),
+            gen_guard: None,
         }
     }
 
