@@ -84,3 +84,9 @@ Remaining gate distance: repetitive 1.265x vs the 1.3x default-on bar. The domin
 remaining cost is attention context (actx ~265-276k us of ~440k layer time at 8 rows,
 position ~700) — inherently per-row KV work; batching/parallelizing small-M chunk attention
 is the next (and last cheap) lever. The lane stays opt-in.
+
+Post-review-fix confirmation (predicate 4..=16 + owner-would-take guards): repetitive 256-tok
+cell s_sync = 1.309x (spec 10.07 / plain 7.69, lossless, 5.45 acc/round) — cells straddle
+1.26-1.31x across thermal conditions, i.e. AT the 1.3x gate line. Default-on remains
+not earned (latched-off classes 0.905-0.952 on 128-token runs = the O(1) probe cost);
+the lane stays opt-in.

@@ -3777,7 +3777,12 @@ fn x86_q8_ffn_gate_up_small_batch_owner_predicate_boundaries() {
     // the boundary so the routing doesn't silently widen.
     assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(0));
     assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(1));
-    assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(2));
+    // 2..=3 stay on the bespoke arms: the owner's floor is rows >= 4, so
+    // declining them would strand short verify chains on the generic
+    // per-row fallback (review finding).
+    assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(2));
+    assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(3));
+    assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(4));
     assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(8));
     assert!(x86_q8_ffn_gate_up_small_batch_prefers_owner(16));
     assert!(!x86_q8_ffn_gate_up_small_batch_prefers_owner(17));
